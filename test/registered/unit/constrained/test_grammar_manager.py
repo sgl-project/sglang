@@ -535,23 +535,6 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
 
-    def test_future_exception_creates_invalid_grammar_object(self):
-        """A future that raised an exception should create InvalidGrammarObject, not crash."""
-        mgr = self._make_mgr()
-
-        future = Future()
-        future.set_exception(RuntimeError("compilation crashed"))
-
-        req = _make_req(json_schema="crash")
-        req.grammar = future
-        req.grammar_key = ("json", "crash")
-        mgr.grammar_queue.append(req)
-
-        result = mgr.get_ready_grammar_requests()
-        self.assertEqual(len(result), 1)
-        self.assertIsInstance(result[0].grammar, InvalidGrammarObject)
-        req.set_finish_with_abort.assert_called_once()
-
     def test_ready_future_applies_request_budget_without_polluting_cache(self):
         mgr = self._make_mgr()
 

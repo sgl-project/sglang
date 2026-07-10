@@ -45,10 +45,7 @@ def _run(rank: int, world: int, port: int):
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-    )
+    from sglang.srt.runtime_context import get_parallel
 
     init_distributed_environment(
         world_size=world,
@@ -66,8 +63,8 @@ def _run(rank: int, world: int, port: int):
         LayerSplitDSATokenToKVPool,
     )
 
-    cp_rank = get_attention_cp_rank()
-    cp_size = get_attention_cp_size()
+    cp_rank = get_parallel().attn_cp_rank
+    cp_size = get_parallel().attn_cp_size
     assert cp_size == world
 
     pool = LayerSplitDSATokenToKVPool(

@@ -929,23 +929,22 @@ class DeepseekV2MoE(nn.Module):
         *,
         use_flashinfer_trtllm_bypass: bool = False,
     ) -> torch.Tensor:
-        # Note(kpham-sgl): launch the shared expert BEFORE the routed call.
-        # The routed deep_gemm pre-permute calls `dispose_tensor` which
-        # `set_()`s `hidden_states` to empty (host-side); any later kernel
-        # launch consuming `hidden_states` then captures `data_ptr() == 0`
-        # into the decode CUDA graph and replays from null.
+        # Note(kpham-sgl): issue order satisfies 3 constraints:
+        # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
+        # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
+        # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
+        #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        has_shared_output = (
+            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
+        )
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb
+            if server_args.enable_eplb and not self.is_nextn
             else None
         )
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         if use_flashinfer_trtllm_bypass:
@@ -967,7 +966,7 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         deferred_finalize = (
-            shared_output is not None
+            has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
@@ -987,6 +986,12 @@ class DeepseekV2MoE(nn.Module):
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
+
+        # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -1036,7 +1041,7 @@ class DeepseekV2MoE(nn.Module):
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb
+            if server_args.enable_eplb and not self.is_nextn
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
@@ -1237,8 +1242,12 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    )
+                    if not self.is_nextn
+                    else None
                 ),
                 **topk_kwargs,
             )
@@ -1471,8 +1480,12 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
+                    expert_location_dispatch_info=(
+                        ExpertLocationDispatchInfo.init_new(
+                            layer_id=self.layer_id,
+                        )
+                        if not self.is_nextn
+                        else None
                     ),
                     **topk_kwargs,
                 )
