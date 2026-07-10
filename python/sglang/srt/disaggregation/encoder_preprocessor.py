@@ -66,6 +66,15 @@ class EncoderPreprocessor:
         )
 
         self._load_mm_processor(server_args)
+        self._supported_modalities = frozenset(
+            modality
+            for modality, processor in (
+                (Modality.IMAGE, self.image_processor),
+                (Modality.VIDEO, self.video_processor),
+                (Modality.AUDIO, self.audio_processor),
+            )
+            if processor is not None or self._model_preprocessor is not None
+        )
         self._build_vision_config(server_args.mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
@@ -335,6 +344,9 @@ class EncoderPreprocessor:
             return await self._process_audio_items(mm_items, self._model_preprocessor)
         else:
             raise ValueError(f"Unsupported modality: {modality}")
+
+    def supports_modality(self, modality: Modality) -> bool:
+        return modality in self._supported_modalities
 
     async def _process_image_items(self, mm_items, model_preprocessor):
         if not (self.image_processor or model_preprocessor):

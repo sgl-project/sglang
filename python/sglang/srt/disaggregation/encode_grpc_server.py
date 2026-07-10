@@ -138,7 +138,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                             )
                         )
                     await asyncio.gather(*tasks)
-                    self.encoder.embedding_to_send.pop(request.req_id, None)
+                    self.encoder.discard_embedding(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
             elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
                 embedding_port = (
@@ -149,7 +149,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     prefill_host=request.prefill_host,
                     embedding_port=embedding_port,
                 )
-                self.encoder.embedding_to_send.pop(request.req_id, None)
+                self.encoder.discard_embedding(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
 
             return sglang_encoder_pb2.EncodeResponse()
@@ -174,7 +174,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     request.buffer_address if request.buffer_address else None
                 ),
             )
-            self.encoder.embedding_to_send.pop(request.req_id, None)
+            self.encoder.discard_embedding(request.req_id)
             return sglang_encoder_pb2.SendResponse()
 
         except Exception as e:

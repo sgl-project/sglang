@@ -382,29 +382,16 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
-    # ------------------------------------------------------------------
-    # Properties forwarded from the preprocessor (for health checks, etc.)
-    # ------------------------------------------------------------------
+    def supports_modality(self, modality: Modality) -> bool:
+        return self.preprocessor.supports_modality(modality)
 
-    @property
-    def image_processor(self):
-        return self.preprocessor.image_processor
+    def has_pending_embeddings(self) -> bool:
+        return bool(getattr(self, "embedding_to_send", None))
 
-    @property
-    def video_processor(self):
-        return self.preprocessor.video_processor
-
-    @property
-    def audio_processor(self):
-        return self.preprocessor.audio_processor
-
-    @property
-    def vision_config(self):
-        return self.preprocessor.vision_config
-
-    @property
-    def model_audio_sr(self):
-        return self.preprocessor.model_audio_sr
+    def discard_embedding(self, req_id: str) -> None:
+        embedding_to_send = getattr(self, "embedding_to_send", None)
+        if embedding_to_send is not None:
+            embedding_to_send.pop(req_id, None)
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
@@ -477,7 +464,7 @@ class MMEncoder:
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
-            merge_size = getattr(self.image_processor, "merge_size", 2)
+            merge_size = getattr(self.preprocessor.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
 
     def slice_embedding(
@@ -1443,14 +1430,59 @@ class MMEncoder:
         task.add_done_callback(self.background_tasks.discard)
         return task
 
-    async def _cleanup_inflight_encode_state(self, req_id: str):
+    async def begin_or_wait_inflight_encode(
+        self, req_id: str
+    ) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
+        """Claim an encode request or wait for its owner's metadata."""
+        if not hasattr(self, "_inflight_encode_events"):
+            return True, None
+
+        async with self._inflight_encode_lock:
+            event = self._inflight_encode_events.get(req_id)
+            if event is None:
+                self._inflight_encode_events[req_id] = asyncio.Event()
+                return True, None
+
+        await event.wait()
+        async with self._inflight_encode_lock:
+            return False, self._inflight_encode_meta.get(req_id)
+
+    async def complete_inflight_encode(
+        self,
+        req_id: str,
+        metadata: Optional[Tuple[int, int, int]],
+    ) -> None:
+        """Publish encode metadata, or signal failure when metadata is None."""
+        if not hasattr(self, "_inflight_encode_events"):
+            return
+
+        async with self._inflight_encode_lock:
+            event = self._inflight_encode_events.get(req_id)
+            if event is not None:
+                if metadata is None:
+                    self._inflight_encode_meta.pop(req_id, None)
+                else:
+                    self._inflight_encode_meta[req_id] = metadata
+                event.set()
+
+        if metadata is None:
+            await self.release_inflight_encode(req_id)
+        else:
+            self._schedule_inflight_encode_cleanup(req_id)
+
+    async def release_inflight_encode(self, req_id: str) -> None:
+        """Release duplicate-request, embedding, and Mooncake forward state."""
         if not hasattr(self, "_inflight_encode_events"):
             return
         async with self._inflight_encode_lock:
             self._inflight_encode_events.pop(req_id, None)
             self._inflight_encode_meta.pop(req_id, None)
             task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
-            if task is not None and not task.done():
+            if (
+                task is not None
+                and task is not asyncio.current_task()
+                and not task.done()
+            ):
                 task.cancel()
         # Also clean up embedding data and forward state
         mm_data = self.embedding_to_send.pop(req_id, None)
@@ -1475,7 +1507,7 @@ class MMEncoder:
 
         async def _cleanup_later():
             await asyncio.sleep(self.send_timeout)
-            await self._cleanup_inflight_encode_state(req_id)
+            await self.release_inflight_encode(req_id)
 
         old_task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
         if old_task is not None and not old_task.done():

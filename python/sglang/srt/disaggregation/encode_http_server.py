@@ -109,7 +109,7 @@ async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
             prefill_host=request["prefill_host"],
             embedding_port=request["embedding_port"],
         )
-        enc.embedding_to_send.pop(req_id, None)
+        enc.discard_embedding(req_id)
         return
 
     if backend == "zmq_to_scheduler":
@@ -125,7 +125,7 @@ async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
                 for p in ports
             )
         )
-        enc.embedding_to_send.pop(req_id, None)
+        enc.discard_embedding(req_id)
 
 
 async def _dp_worker_encode_and_send(
@@ -179,16 +179,15 @@ async def _dp_worker_encode_and_send(
                 f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
             )
         # Free the error EmbeddingData stored during encode, or it leaks in
-        # embedding_to_send and pins /health into "busy" (a non-empty
-        # embedding_to_send reads as busy, skipping the probe). Neither path
+        # pending embedding state and pins /health into "busy". Neither path
         # guarantees cleanup on its own: mooncake's _push_embedding_to_prefill
         # is a no-op, and a swallowed zmq send failure above skips its own pop.
-        # zmq lacks the inflight attrs so _cleanup_inflight_encode_state would
-        # early-return on it — pop directly. Mirrors the non-DP error path.
+        # zmq lacks the Mooncake inflight state, so discard its embedding
+        # directly. Mirrors the non-DP error path.
         if backend == "mooncake":
-            await enc._cleanup_inflight_encode_state(req_id)
+            await enc.complete_inflight_encode(req_id, None)
         else:
-            enc.embedding_to_send.pop(req_id, None)
+            enc.discard_embedding(req_id)
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
     time_stats.set_mm_encode_end_time()
@@ -202,7 +201,9 @@ async def _dp_worker_encode_and_send(
         )
         # Free the held embedding if the follow-up /send never arrives (same
         # send_timeout cleanup the non-DP path uses).
-        enc._schedule_inflight_encode_cleanup(req_id)
+        await enc.complete_inflight_encode(
+            req_id, (nbytes, embedding_len, embedding_dim)
+        )
         return request
 
     await _push_embedding_to_prefill(enc, request)
@@ -220,16 +221,16 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
     carries ``_error`` back to the dispatcher.
     """
     # Busy worker: in-flight traffic already proves liveness, so skip the probe
-    # and report healthy — same `embedding_to_send` signal the non-DP /health
-    # path uses. A wedged-but-busy worker never reaches here (it can't service
-    # the recv), so the dispatcher's broadcast still times out → 503.
-    if enc.embedding_to_send:
+    # and report healthy — the same pending-embedding signal the non-DP
+    # /health path uses. A wedged-but-busy worker never reaches here because
+    # it can't service the recv, so the dispatcher's broadcast still times out → 503.
+    if enc.has_pending_embeddings():
         return None
 
-    if enc.image_processor is not None:
+    if enc.supports_modality(Modality.IMAGE):
         mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
         modality = Modality.IMAGE
-    elif enc.audio_processor is not None:
+    elif enc.supports_modality(Modality.AUDIO):
         mm_items = [f"data:audio/wav;base64,{MINIMUM_WAV_SILENCE_BASE64}"]
         modality = Modality.AUDIO
     else:
@@ -248,7 +249,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
         )
     finally:
         # Never leave the dummy embedding sitting in the send map.
-        enc.embedding_to_send.pop(req_id, None)
+        enc.discard_embedding(req_id)
 
     if error_msg:
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -688,7 +689,7 @@ async def _dp_worker_handle_request(
                 buffer_address=request["buffer_address"],
             )
             # cancels the scheduled cleanup + frees embedding/forward state
-            await enc._cleanup_inflight_encode_state(req_id)
+            await enc.release_inflight_encode(req_id)
             content = None
         else:
             content = await _dp_worker_encode_and_send(enc, sched, request)
@@ -1216,18 +1217,8 @@ async def handle_encode_request(request: dict):
         # with the same req_id, only the first triggers the VIT forward;
         # subsequent callers wait and return the same metadata.
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            async with encoder._inflight_encode_lock:
-                if req_id in encoder._inflight_encode_events:
-                    event = encoder._inflight_encode_events[req_id]
-                    is_duplicate = True
-                else:
-                    event = asyncio.Event()
-                    encoder._inflight_encode_events[req_id] = event
-                    is_duplicate = False
-
-            if is_duplicate:
-                await event.wait()
-                meta = encoder._inflight_encode_meta.get(req_id)
+            is_owner, meta = await encoder.begin_or_wait_inflight_encode(req_id)
+            if not is_owner:
                 if meta is None:
                     return ORJSONResponse(
                         status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1279,6 +1270,8 @@ async def handle_encode_request(request: dict):
                         await encoder_scheduler.submit(request)
                     )
                 except asyncio.TimeoutError:
+                    if encoder.server_args.encoder_transfer_backend == "mooncake":
+                        await encoder.complete_inflight_encode(req_id, None)
                     time_stats.trace_ctx.abort(
                         abort_info={"reason": "encoder batch timed out"}
                     )
@@ -1315,11 +1308,7 @@ async def handle_encode_request(request: dict):
                         )
             # Signal waiters on failure for mooncake
             if encoder.server_args.encoder_transfer_backend == "mooncake":
-                encoder._inflight_encode_meta.pop(req_id, None)
-                evt = encoder._inflight_encode_events.pop(req_id, None)
-                if evt:
-                    evt.set()
-                await encoder._cleanup_inflight_encode_state(req_id)
+                await encoder.complete_inflight_encode(req_id, None)
             if encode_server_module.encoder_metrics_collector is not None:
                 encode_server_module.encoder_metrics_collector.inc_requests_total(
                     modality=modality_str, status="error"
@@ -1330,15 +1319,9 @@ async def handle_encode_request(request: dict):
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
             # Store metadata for duplicate callers and signal them
-            encoder._inflight_encode_meta[req_id] = (
-                nbytes,
-                embedding_len,
-                embedding_dim,
+            await encoder.complete_inflight_encode(
+                req_id, (nbytes, embedding_len, embedding_dim)
             )
-            evt = encoder._inflight_encode_events.get(req_id)
-            if evt:
-                evt.set()
-            encoder._schedule_inflight_encode_cleanup(req_id)
             del request["mm_items"]
             request.update(
                 {
@@ -1370,7 +1353,7 @@ async def handle_encode_request(request: dict):
                         )
                     )
                 await asyncio.gather(*tasks)
-                encoder.embedding_to_send.pop(request["req_id"], None)
+                encoder.discard_embedding(request["req_id"])
             if encode_server_module.encoder_metrics_collector is not None:
                 encode_server_module.encoder_metrics_collector.inc_requests_total(
                     modality=modality_str, status="success"
@@ -1382,7 +1365,7 @@ async def handle_encode_request(request: dict):
                 prefill_host=request["prefill_host"],
                 embedding_port=request["embedding_port"],
             )
-            encoder.embedding_to_send.pop(request["req_id"], None)
+            encoder.discard_embedding(request["req_id"])
             elapsed = time.monotonic() - start_time
             logger.info(
                 f"[{req_id}] /encode completed in {elapsed:.3f}s, "
@@ -1399,11 +1382,7 @@ async def handle_encode_request(request: dict):
         encode_server_module.rid_to_err_msg[req_id] = error_msg
         # Ensure inflight waiters are unblocked on unexpected errors
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            encoder._inflight_encode_meta.pop(req_id, None)
-            evt = encoder._inflight_encode_events.pop(req_id, None)
-            if evt:
-                evt.set()
-            await encoder._cleanup_inflight_encode_state(req_id)
+            await encoder.complete_inflight_encode(req_id, None)
         if encode_server_module.encoder_metrics_collector is not None:
             encode_server_module.encoder_metrics_collector.inc_requests_total(
                 modality=modality_str, status="error"
@@ -1452,9 +1431,9 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     req_id = request["req_id"]
-    # Don't pop embedding_to_send here — other decoder TP ranks may still
+    # Keep the pending embedding here because other decoder TP ranks may still
     # need it for their /send calls. Cleanup is handled by the scheduled
-    # timeout task or _cleanup_inflight_encode_state.
+    # timeout task or release_inflight_encode.
     return ORJSONResponse(content=None)
 
 
@@ -1506,14 +1485,14 @@ async def health_generate():
     # Skip the dummy encode when real requests are already in flight — the
     # ongoing traffic already proves liveness, matching the scheduler's
     # `is_fully_idle`-based health-check skip pattern.
-    if encoder.embedding_to_send:
+    if encoder.has_pending_embeddings():
         return Response(status_code=200)
 
     # Pick the first available modality for the dummy encode
-    if encoder.image_processor is not None:
+    if encoder.supports_modality(Modality.IMAGE):
         mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
         modality = Modality.IMAGE
-    elif encoder.audio_processor is not None:
+    elif encoder.supports_modality(Modality.AUDIO):
         mm_items = [f"data:audio/wav;base64,{MINIMUM_WAV_SILENCE_BASE64}"]
         modality = Modality.AUDIO
     else:
@@ -1549,7 +1528,7 @@ async def health_generate():
         )
 
         # Clean up stored embedding
-        encoder.embedding_to_send.pop(req_id, None)
+        encoder.discard_embedding(req_id)
 
         if error_msg:
             logger.error(f"Encoder health check failed: {error_msg}")
