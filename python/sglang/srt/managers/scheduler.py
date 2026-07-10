@@ -272,6 +272,7 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.scheduler_env_vars import scheduler_envs
 from sglang.srt.request_latency_tracker import RequestLatencyTracker
+from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -398,7 +399,7 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
-        # Init JoyFuture scheduler observability (latency tracking)
+        # Init JoyFuture scheduler observability (latency tracking + KV checksum)
         self.latency_tracker = RequestLatencyTracker(
             enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
             on_phase_complete=(
@@ -409,6 +410,7 @@ class Scheduler(
                 else None
             ),
         )
+        self.kv_checksum_verifier = KVTransferChecksumVerifier() if scheduler_envs.SGLANG_ENABLE_KV_TRANSFER_CHECKSUM.get() else None
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
