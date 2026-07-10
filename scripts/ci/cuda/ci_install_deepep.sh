@@ -38,27 +38,45 @@ if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     exit 1
 fi
 
-# deep_ep is installed via `python3 setup.py install`, i.e. as a setuptools *egg*.
-# `uv pip uninstall` / `pip uninstall` cannot remove eggs (they report "not installed"),
-# so old eggs pile up in easy-install.pth. On shared CI runners a different DeepEP version
-# left behind by another PR (e.g. a 2.0.0 build) then shadows the freshly-built pinned egg
-# and fails to import ("undefined symbol: ncclCommQueryProperties"), which sglang masks as
-# "DeepEP is not installed". Purge every deep_ep egg + its .pth entry so each (re)install
-# starts from a clean slate; the build below re-adds exactly the pinned version.
+# The default install path builds deep_ep via `python3 setup.py install`, i.e. as
+# a setuptools *egg*. `uv pip uninstall` / `pip uninstall` cannot remove eggs (they
+# report "not installed"), so old eggs pile up in easy-install.pth. On a shared CI
+# runner a different DeepEP version left behind by another PR (e.g. a 2.0.0 build)
+# then shadows the freshly-built pinned egg and fails to import ("undefined symbol:
+# ncclCommQueryProperties"), which sglang masks as "DeepEP is not installed". Purge
+# every deep_ep egg + its .pth entry so each (re)install starts clean; the build
+# below re-adds exactly the pinned version.
+#
+# (The Grace-Blackwell branch installs via `pip install .` → a dist-info, not an
+# egg; pip replaces a stale dist-info itself, so this egg purge is a no-op there.)
 purge_deep_ep_eggs() {
     python3 - <<'PYCLEAN'
-import glob, os, shutil, sysconfig
+import glob, os, re, shutil, sysconfig
+
+# Match the egg-name form (deep_ep-<ver>.egg), not a bare "deep_ep" substring, so
+# a co-installed package like deep_ep_utils-*.egg (underscore, not hyphen) — or a
+# path that merely contains "deep_ep" — keeps its easy-install.pth entry.
+egg_line = re.compile(r"deep_ep-[^/\s]*\.egg")
 
 for base in {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}:
     for egg in glob.glob(os.path.join(base, "deep_ep-*.egg")):
-        shutil.rmtree(egg, ignore_errors=True)
-        print(f"purged stale deep_ep egg: {egg}")
+        # deep_ep ships a C extension, so its egg is normally an unpacked dir, but
+        # handle the zip-safe file form too: rmtree is a silent no-op on a file,
+        # which would leave a shadowing egg behind while still logging "purged".
+        try:
+            if os.path.isdir(egg):
+                shutil.rmtree(egg, ignore_errors=True)
+            else:
+                os.remove(egg)
+            print(f"purged stale deep_ep egg: {egg}")
+        except OSError as e:
+            print(f"could not purge {egg}: {e}")
     pth = os.path.join(base, "easy-install.pth")
     if os.path.exists(pth):
         lines = open(pth).read().splitlines()
         # Drop only deep_ep egg entries; leave every other line (including any
         # unrelated duplicates) byte-for-byte intact.
-        kept = [line for line in lines if "deep_ep" not in line]
+        kept = [line for line in lines if not egg_line.search(line)]
         if len(kept) != len(lines):  # only rewrite if a deep_ep entry was actually dropped
             open(pth, "w").write("\n".join(kept) + ("\n" if kept else ""))
             print(f"cleaned deep_ep entries from {pth}")
@@ -68,15 +86,23 @@ PYCLEAN
 if [ "${FORCE_REBUILD_DEEPEP:-0}" = "1" ]; then
     echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
     ${PIP_UNINSTALL_CMD:-pip uninstall -y} deep_ep ${PIP_UNINSTALL_SUFFIX:-} || true
-    purge_deep_ep_eggs
-elif python3 -c "import deep_ep, sys; sys.exit(0 if '${DEEPEP_COMMIT:0:7}' in getattr(deep_ep, '__version__', '') else 1)" >/dev/null 2>&1; then
+    purge_deep_ep_eggs || true
+elif python3 -c "
+import importlib.metadata as md, sys
+try:
+    import deep_ep  # must actually import — a right-version but broken egg rebuilds
+    v = md.version('deep_ep')
+except Exception:
+    sys.exit(1)
+sys.exit(0 if '${DEEPEP_COMMIT:0:7}' in v else 1)
+" >/dev/null 2>&1; then
     echo "deep_ep (pinned ${DEEPEP_COMMIT:0:7}) already installed and importable. Skipping installation."
     exit 0
 else
     # deep_ep is missing, not importable, OR a wrong-version egg from another PR on a shared
     # runner is shadowing the pinned build (imports fine but != pinned commit) — purge eggs so
     # the reinstall below is clean.
-    purge_deep_ep_eggs
+    purge_deep_ep_eggs || true
 fi
 
 # Install system dependencies
