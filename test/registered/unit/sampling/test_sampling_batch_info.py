@@ -30,6 +30,7 @@ def _make_info(batch_size=2, **overrides):
         top_ks=torch.full((batch_size,), TOP_K_ALL, dtype=torch.int32),
         min_ps=torch.zeros(batch_size),
         is_all_greedy=False,
+        is_any_greedy=False,
         need_top_p_sampling=False,
         need_top_k_sampling=False,
         need_min_p_sampling=False,
@@ -512,6 +513,40 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+
+    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    def test_request_seed_with_pytorch_backend_without_deterministic(
+        self, mock_server_args
+    ):
+        """Test that PyTorch sampling can honor request-local seeds."""
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+        mock_server_args.return_value.sampling_backend = "pytorch"
+
+        reqs = [self._make_req(seed=123), self._make_req(seed=None)]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertIsNotNone(info.sampling_seed)
+        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.sampling_seed[1].item(), 42)
+
+    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    def test_request_seed_with_flashinfer_backend_without_deterministic(
+        self, mock_server_args
+    ):
+        """Test that flashinfer keeps old non-deterministic seed behavior."""
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+        mock_server_args.return_value.sampling_backend = "flashinfer"
+
+        reqs = [self._make_req(seed=123)]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertIsNone(info.sampling_seed)
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
     def test_from_schedule_batch_sampling_flags(self, mock_server_args):

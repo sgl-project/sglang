@@ -21,6 +21,8 @@ def speculative_sampling_classic_kernel(
     stride_idx_s,
     stride_uni_b,
     stride_uni_s,
+    stride_uni_final_b,
+    stride_uni_final_s,
     stride_tp_b,
     stride_tp_s,
     stride_tp_v,
@@ -88,7 +90,9 @@ def speculative_sampling_classic_kernel(
 
     # Final Sampling
     all_drafts_accepted = continue_verifying
-    coin_final = tl.load(UniformSamplesFinal + pid)
+    coin_final = tl.load(
+        UniformSamplesFinal + pid * stride_uni_final_b + cur_prob_row * stride_uni_final_s
+    )
     norm_sum = 0.0
 
     tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
@@ -192,6 +196,8 @@ def chain_speculative_sampling_triton(
         retrive_index.stride(1),
         uniform_samples.stride(0),
         uniform_samples.stride(1),
+        uniform_samples_for_final_sampling.stride(0),
+        uniform_samples_for_final_sampling.stride(1),
         target_probs.stride(0),
         target_probs.stride(1),
         target_probs.stride(2),

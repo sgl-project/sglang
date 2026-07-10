@@ -83,6 +83,16 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
+        has_request_seed = any(
+            r.sampling_params.sampling_seed is not None for r in reqs
+        )
+        # Deterministic inference enables both deterministic kernels and seeded
+        # sampling. Some backends/models cannot use the global deterministic
+        # mode yet, but can still use the PyTorch sampler's request-local seed.
+        honor_sampling_seed = enable_deterministic or (
+            has_request_seed
+            and getattr(global_server_args, "sampling_backend", None) == "pytorch"
+        )
         temperatures = (
             torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
@@ -120,7 +130,7 @@ class SamplingBatchInfo:
                 dtype=torch.int64,
                 pin_memory=_pin,
             ).to(device, non_blocking=True)
-            if enable_deterministic
+            if honor_sampling_seed
             else None
         )
 

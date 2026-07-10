@@ -11,7 +11,11 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.dflash_request_validation import (
+    validate_dflash_request_options,
+)
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -122,6 +126,46 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if getattr(sampling_info, "logit_bias", None) is not None:
         return False
     return True
+
+
+def _apply_min_p_filter(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
+    if probs.numel() == 0:
+        return probs
+    thresholds = probs.max(dim=-1).values * min_ps.to(probs.dtype)
+    probs = probs.masked_fill(probs < thresholds.unsqueeze(1), 0.0)
+    normalizer = probs.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(probs.dtype).tiny
+    )
+    return probs / normalizer
+
+
+def _top_k_renorm_prob(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    if top_k_renorm_prob is not None:
+        return top_k_renorm_prob(probs, top_ks)
+
+    out = torch.zeros_like(probs)
+    vocab_size = probs.shape[-1]
+    for row, top_k in enumerate(top_ks.tolist()):
+        k = min(max(int(top_k), 1), vocab_size)
+        values, indices = torch.topk(probs[row], k=k)
+        normalizer = values.sum().clamp_min(torch.finfo(probs.dtype).tiny)
+        out[row, indices] = values / normalizer
+    return out
+
+
+def _top_p_renorm_prob(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    if top_p_renorm_prob is not None:
+        return top_p_renorm_prob(probs, top_ps)
+
+    out = torch.zeros_like(probs)
+    for row, top_p in enumerate(top_ps.tolist()):
+        sorted_probs, sorted_indices = torch.sort(probs[row], descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        keep = (cumsum - sorted_probs) <= float(top_p)
+        kept = sorted_probs * keep.to(sorted_probs.dtype)
+        normalizer = kept.sum().clamp_min(torch.finfo(probs.dtype).tiny)
+        out[row, sorted_indices] = kept / normalizer
+    return out
 
 
 def apply_dflash_verify_logits_adjustments(
@@ -753,6 +797,60 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+def build_seeded_dflash_sampling_uniforms(
+    *,
+    sampling_info: Any,
+    positions_2d: torch.Tensor,
+    draft_token_num: int,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    sampling_seed = getattr(sampling_info, "sampling_seed", None)
+    if sampling_seed is None:
+        return None, None
+
+    if positions_2d.ndim != 2:
+        raise RuntimeError(
+            "DFLASH seeded sampling needs positions_2d to be 2D, "
+            f"got shape={tuple(positions_2d.shape)}."
+        )
+
+    bs = int(positions_2d.shape[0])
+    draft_token_num = int(draft_token_num)
+    if positions_2d.shape[1] < draft_token_num:
+        raise RuntimeError(
+            "DFLASH seeded sampling needs positions_2d shaped at least "
+            f"({bs}, {draft_token_num}), got {tuple(positions_2d.shape)}."
+        )
+
+    if sampling_seed.numel() < bs:
+        raise RuntimeError(
+            "DFLASH seeded sampling needs one seed per request, "
+            f"got {int(sampling_seed.numel())} seeds for batch size {bs}."
+        )
+
+    seed_rows = sampling_seed[:bs].view(bs, 1).expand(bs, draft_token_num)
+    positions = positions_2d[:, :draft_token_num].to(torch.int64).contiguous()
+    stream_accept = torch.zeros((1,), dtype=torch.int64, device=positions.device)
+    accept_hash = murmur_hash32(
+        seed_rows.reshape(-1).to(torch.int64).contiguous(),
+        positions.reshape(-1),
+        stream_accept,
+    ).view(bs, draft_token_num)
+    uniform_samples = accept_hash.to(torch.float32) / float(
+        torch.iinfo(torch.uint32).max
+    )
+
+    stream_final = torch.ones((1,), dtype=torch.int64, device=positions.device)
+    final_hash = murmur_hash32(
+        sampling_seed[:bs].to(torch.int64).contiguous(),
+        positions[:, 0].contiguous(),
+        stream_final,
+    ).view(bs)
+    uniform_samples_for_final_sampling = final_hash.to(torch.float32) / float(
+        torch.iinfo(torch.uint32).max
+    )
+    return uniform_samples, uniform_samples_for_final_sampling
+
+
 def build_dflash_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -766,10 +864,12 @@ def build_dflash_verify_target_probs(
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    need_min_p = bool(getattr(sampling_info, "need_min_p_sampling", False))
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
     scaled_logits = next_token_logits / expanded_temperature
+    repeated_min_ps = None
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:
@@ -802,7 +902,12 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _top_p_renorm_prob(topk_probs, repeated_top_ps)
+            if need_min_p:
+                repeated_min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, draft_token_num, dim=0
+                )
+                topk_probs = _apply_min_p_filter(topk_probs, repeated_min_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -811,34 +916,40 @@ def build_dflash_verify_target_probs(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
-            target_probs = top_k_renorm_prob(
+            target_probs = _top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
+        if need_min_p:
+            if repeated_min_ps is None:
+                repeated_min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, draft_token_num, dim=0
+                )
+            target_probs = _apply_min_p_filter(target_probs, repeated_min_ps)
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+    from sglang.srt.server_args import get_global_server_args
 
-    if enable_overlap and req.return_hidden_states:
-        return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
-
-    return None
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        server_args = None
+    return validate_dflash_request_options(
+        return_logprob=req.return_logprob,
+        return_hidden_states=req.return_hidden_states,
+        sampling_params=req.sampling_params,
+        enable_overlap=enable_overlap,
+        enable_deterministic_inference=bool(
+            server_args and server_args.enable_deterministic_inference
+        ),
+        sampling_backend=(
+            getattr(server_args, "sampling_backend", None) if server_args else None
+        ),
+    )

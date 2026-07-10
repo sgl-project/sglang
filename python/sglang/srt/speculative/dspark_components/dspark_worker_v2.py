@@ -84,6 +84,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify_epilogue import (
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
 )
+from sglang.srt.speculative.dspark_components.dspark_verify_trace import (
+    DsparkVerifyTracer,
+)
 from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
     BuildOutTokens,
 )
@@ -347,6 +350,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._decision_dumper = DsparkDecisionDumper(
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            tp_rank=self.tp_rank,
+        )
+        self._verify_tracer = DsparkVerifyTracer(
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_rank=self.tp_rank,
@@ -851,6 +859,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
                 gamma=self.gamma,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
+                positions_2d=verify_window.positions_2d,
                 cutoff_layout=layout,
             )
             if self._simulate_acc_len > 0:
@@ -873,6 +882,33 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 gamma=self.gamma,
             )
+        self._verify_tracer.maybe_trace(
+            forward_ct=batch.forward_iter,
+            bs=bs,
+            mode=self._verify_planner.mode_value,
+            budget=verify_token_budget,
+            layout_graph_num_tokens=(
+                layout.graph_num_tokens if layout is not None else None
+            ),
+            folded_accept=folded_accept,
+            run_compact=run_compact,
+            can_run_cuda_graph=can_run_cuda_graph,
+            sampling_info=sampling_info,
+            verify_lens=layout.verify_lens if layout is not None else None,
+            req_pool_indices=batch.req_pool_indices,
+            rids=[req.rid for req in batch.reqs],
+            prefix_lens=prefix_lens,
+            candidates=verify_ids_2d,
+            draft_tokens=draft_tokens,
+            target_logits=logits_output.next_token_logits,
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            commit_lens=commit_lens,
+            new_seq_lens=new_seq_lens,
+            out_tokens=out_tokens,
+            simulated_accept=self._simulate_acc_len > 0,
+        )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(

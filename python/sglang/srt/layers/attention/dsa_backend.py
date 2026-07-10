@@ -723,18 +723,48 @@ class DeepseekSparseAttnBackend(
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                1,
-                dtype=torch.int32,
-                device=device,
-            )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
-
             layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
-            if layout is None:
+            if layout is not None:
+                extend_seq_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+                total_verify_tokens = layout.total_verify_tokens
+                if total_verify_tokens is None:
+                    total_verify_tokens = layout.graph_num_tokens
+                if layout.verify_lens_cpu is not None:
+                    extend_seq_lens_cpu = list(layout.verify_lens_cpu)
+                else:
+                    extend_seq_lens_cpu = extend_seq_lens.to("cpu").tolist()
+
+                cache_seqlens_int32 = (
+                    forward_batch.seq_lens.to(torch.int32) + extend_seq_lens
+                ).to(torch.int32)
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                cu_seqlens_q = torch.arange(
+                    0,
+                    total_verify_tokens + 1,
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+                seqlens_expanded = seqlens_expand_triton(
+                    extend_seq_lens,
+                    cache_seqlens_int32,
+                    total_verify_tokens,
+                    max(extend_seq_lens_cpu) if extend_seq_lens_cpu else 1,
+                )
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=extend_seq_lens, dim=0
+                )
+            else:
+                cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
                 expected_out_tokens = batch_size * self.speculative_num_draft_tokens
                 assert (
                     forward_batch.out_cache_loc is not None
@@ -744,21 +774,20 @@ class DeepseekSparseAttnBackend(
                     f"out_cache_loc entries, got "
                     f"{None if forward_batch.out_cache_loc is None else forward_batch.out_cache_loc.numel()}."
                 )
-
-            seqlens_expanded = seqlens_expand_triton(
-                torch.full(
-                    (batch_size,),
+                seqlens_expanded = seqlens_expand_triton(
+                    torch.full(
+                        (batch_size,),
+                        self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    cache_seqlens_int32,
+                    self.speculative_num_draft_tokens * batch_size,
                     self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
-                self.speculative_num_draft_tokens,
-            )
-            page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
-            )
+                )
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                )
         elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None

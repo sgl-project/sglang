@@ -112,6 +112,9 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
+from sglang.srt.speculative.dflash_request_validation import (
+    validate_dflash_request_options,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -126,6 +129,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -313,6 +317,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.spec_algorithm = speculative_algorithm
         if speculative_algorithm.is_eagle():
             # In the current eagle implementation, we store the draft tokens in the output token slots,
             # so we need to reserve the space for the draft tokens.
@@ -1132,6 +1137,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if isinstance(obj, GenerateReqInput):
+            spec_algorithm = getattr(self, "spec_algorithm", None)
+            if spec_algorithm is None:
+                spec_algorithm = SpeculativeAlgorithm.from_string(
+                    self.server_args.speculative_algorithm
+                )
+            if spec_algorithm.is_dflash_or_dspark():
+                error_msg = validate_dflash_request_options(
+                    return_logprob=obj.return_logprob,
+                    return_hidden_states=obj.return_hidden_states,
+                    sampling_params=sampling_params,
+                    enable_overlap=(
+                        not self.server_args.disable_overlap_schedule and not use_mlx()
+                    ),
+                    enable_deterministic_inference=(
+                        self.server_args.enable_deterministic_inference
+                    ),
+                    sampling_backend=getattr(
+                        self.server_args, "sampling_backend", None
+                    ),
+                )
+                if error_msg is not None:
+                    raise ValueError(error_msg)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

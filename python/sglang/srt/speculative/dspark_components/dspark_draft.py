@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
@@ -99,6 +100,7 @@ def sample_draft_block(
     sampling_info,
     markov_head,
     device: torch.device,
+    draft_positions: torch.Tensor | None = None,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -121,6 +123,11 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             if fast_sampling:
+                if sampling_info.sampling_seed is not None:
+                    raise RuntimeError(
+                        "SGLANG_DSPARK_FAST_SAMPLING does not support seeded "
+                        "non-greedy sampling yet."
+                    )
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
@@ -135,7 +142,21 @@ def sample_draft_block(
                     step_logits.float() / temperatures[:, None], dim=-1
                 )
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
-                sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                if sampling_info.sampling_seed is None:
+                    sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(
+                        -1
+                    )
+                else:
+                    if draft_positions is None:
+                        raise RuntimeError(
+                            "DSpark seeded non-greedy sampling needs draft positions."
+                        )
+                    logprobs = probs.to(torch.float64).log_()
+                    sampled_tokens = multinomial_with_seed(
+                        logprobs,
+                        sampling_info.sampling_seed,
+                        draft_positions[:, step_idx].to(torch.int64),
+                    ).view(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
 
     draft_tokens, corrected_logits = markov_head.sample_block(

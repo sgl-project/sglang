@@ -115,6 +115,10 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
         verify_lens = verify_lens.to(torch.int32)
+        if total_verify_tokens is None:
+            total_verify_tokens = int(
+                verify_lens.to("cpu", non_blocking=False).sum().item()
+            )
         indptr = BuildQoIndptr.execute(verify_lens=verify_lens)
         return cls(
             verify_lens=verify_lens,
@@ -148,9 +152,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         *,
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
+        total_verify_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
-            verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            total_verify_tokens=total_verify_tokens,
         )
 
     @classmethod
@@ -205,6 +212,66 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
             total_verify_tokens=self.graph_num_tokens,
+        )
+
+    def padded_to_graph_within_rows(
+        self, *, num_draft_tokens: int
+    ) -> RaggedVerifyLayout:
+        return self.padded_to_total_within_rows(
+            num_draft_tokens=num_draft_tokens,
+            target_total=self.graph_num_tokens,
+        )
+
+    def padded_to_full_rows(self, *, num_draft_tokens: int) -> RaggedVerifyLayout:
+        return self.padded_to_total_within_rows(
+            num_draft_tokens=num_draft_tokens,
+            target_total=self.bs * int(num_draft_tokens),
+        )
+
+    def padded_to_total_within_rows(
+        self, *, num_draft_tokens: int, target_total: int
+    ) -> RaggedVerifyLayout:
+        total = (
+            self.total_verify_tokens
+            if self.total_verify_tokens is not None
+            else int(self.verify_lens.to("cpu", non_blocking=False).sum().item())
+        )
+        target_total = int(target_total)
+        if target_total < int(total):
+            target_total = int(total)
+        extra = target_total - int(total)
+        if extra <= 0:
+            return self
+
+        lens_cpu = (
+            self.verify_lens.detach()
+            .to("cpu", non_blocking=False)
+            .to(torch.int32)
+            .tolist()
+        )
+        capacity = sum(max(0, int(num_draft_tokens) - int(v)) for v in lens_cpu)
+        if extra > capacity:
+            raise ValueError(
+                f"cannot pad verify_lens={lens_cpu} from total={int(total)} to "
+                f"target_total={target_total} within num_draft_tokens={num_draft_tokens}"
+            )
+
+        for i, value in enumerate(lens_cpu):
+            add = min(extra, max(0, int(num_draft_tokens) - int(value)))
+            if add <= 0:
+                continue
+            lens_cpu[i] = int(value) + add
+            extra -= add
+            if extra == 0:
+                break
+
+        padded = torch.tensor(
+            lens_cpu, dtype=torch.int32, device=self.verify_lens.device
+        )
+        return RaggedVerifyLayout._assemble_device(
+            verify_lens=padded,
+            graph_num_tokens=target_total,
+            total_verify_tokens=target_total,
         )
 
 

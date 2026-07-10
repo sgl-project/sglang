@@ -112,6 +112,7 @@ class DraftBlockProposer:
                 sampling_info=sampling_info,
                 markov_head=self.draft_model.markov_head,
                 device=device,
+                draft_positions=verify_window.positions_2d[:, 1 : self.gamma + 1],
             )
         return DraftProposal(
             draft_block_ids=draft_block_ids,

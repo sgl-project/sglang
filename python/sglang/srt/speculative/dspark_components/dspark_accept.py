@@ -26,6 +26,7 @@ def accept_draft_tokens(
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
+    positions_2d: Optional[torch.Tensor] = None,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
@@ -53,6 +54,7 @@ def accept_draft_tokens(
             draft_input=draft_input,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            positions_2d=positions_2d,
             cutoff_verify_lens=cutoff_verify_lens,
         )
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
@@ -69,6 +71,7 @@ def accept_draft_tokens(
         draft_input=draft_input,
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
+        positions_2d=positions_2d,
         cutoff_verify_lens=cutoff_verify_lens,
     )
     selected = SelectMixedAccept.execute(

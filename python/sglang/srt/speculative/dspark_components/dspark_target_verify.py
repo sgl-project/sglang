@@ -181,10 +181,11 @@ class TargetVerifyExecutor:
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        return TargetVerifyResult(
+        result = TargetVerifyResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
         )
+        return result
 
     def run_compact(
         self,
@@ -230,23 +231,28 @@ class TargetVerifyExecutor:
             hidden_strided = hidden_strided[: bs * stride]
         else:
             compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
                 raise RuntimeError(
                     "DSpark verify requires target hidden states, got None."
                 )
-            hidden_strided = ScatterCompactToStrided.execute(
-                compact=compact_hidden,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
+            full_width = bool(torch.all(layout.verify_lens[:bs] == stride).item())
+            if full_width:
+                strided_logits = compact_logits[: bs * stride]
+                hidden_strided = compact_hidden[: bs * stride]
+            else:
+                strided_logits = ScatterCompactToStrided.execute(
+                    compact=compact_logits,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
+                hidden_strided = ScatterCompactToStrided.execute(
+                    compact=compact_hidden,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,

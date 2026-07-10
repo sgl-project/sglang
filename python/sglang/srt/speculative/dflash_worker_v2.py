@@ -23,6 +23,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    build_seeded_dflash_sampling_uniforms,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -1552,12 +1553,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            uniform_samples, uniform_samples_for_final_sampling = (
+                build_seeded_dflash_sampling_uniforms(
+                    sampling_info=sampling_info,
+                    positions_2d=positions_2d,
+                    draft_token_num=int(self.block_size),
+                )
+            )
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(

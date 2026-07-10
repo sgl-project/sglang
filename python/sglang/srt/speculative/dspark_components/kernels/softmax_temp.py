@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -12,14 +14,29 @@ except ImportError:
     _flashinfer_softmax = None
 
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP.get()
+logger = logging.getLogger(__name__)
+_warned_flashinfer_unavailable = False
 
 
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        global _warned_flashinfer_unavailable
+
         if _KERNEL_IMPL == "torch":
             return cls.torch(*args, **kwargs)
         if _KERNEL_IMPL == "flashinfer":
+            if _flashinfer_softmax is None:
+                if not _warned_flashinfer_unavailable:
+                    logger.warning(
+                        "SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP=flashinfer but "
+                        "flashinfer.sampling.softmax is unavailable; falling back to %s",
+                        "triton" if kwargs["logits"].is_cuda else "torch",
+                    )
+                    _warned_flashinfer_unavailable = True
+                if kwargs["logits"].is_cuda:
+                    return cls.triton(*args, **kwargs)
+                return cls.torch(*args, **kwargs)
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 

@@ -868,11 +868,13 @@ class Indexer(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        num_q_rows = q_fp8.shape[0]
 
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-            q_fp8 = q_fp8.unsqueeze(1)
+            q_fp8 = q_fp8[:q_offset].unsqueeze(1)
+            weights = weights[:q_offset]
             batch_size, next_n, heads, _ = q_fp8.shape
             logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
@@ -919,8 +921,8 @@ class Indexer(MultiPlatformOp):
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
+        if q_offset < num_q_rows:
+            pad_len = num_q_rows - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
                 -1,

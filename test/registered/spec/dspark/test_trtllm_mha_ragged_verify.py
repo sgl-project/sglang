@@ -3,17 +3,37 @@ import unittest
 
 import torch
 
+# These CPU-safe layout invariant tests exercise layout helper kernels with CPU
+# tensors, so keep their construction on torch for this module without leaking
+# env defaults to the rest of the test process.
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import (
     TRTLLMHAAttnBackend,
     _resolve_ragged_verify_layout,
     build_ragged_target_verify_geometry,
 )
+from sglang.srt.speculative.dspark_components.kernels import (
+    padded_to_bucket as _padded_to_bucket_mod,
+)
+from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_OLD_QO_INDPTR_KERNEL_IMPL = _qo_indptr_mod._KERNEL_IMPL
+_OLD_PADDED_TO_BUCKET_KERNEL_IMPL = _padded_to_bucket_mod._KERNEL_IMPL
+
+
+def setUpModule():
+    _qo_indptr_mod._KERNEL_IMPL = "torch"
+    _padded_to_bucket_mod._KERNEL_IMPL = "torch"
+
+
+def tearDownModule():
+    _qo_indptr_mod._KERNEL_IMPL = _OLD_QO_INDPTR_KERNEL_IMPL
+    _padded_to_bucket_mod._KERNEL_IMPL = _OLD_PADDED_TO_BUCKET_KERNEL_IMPL
 
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
@@ -51,6 +71,15 @@ class TestResolveRaggedVerifyLayout(CustomTestCase):
             spec_info=types.SimpleNamespace(ragged_verify_layout=layout)
         )
         self.assertIs(_resolve_ragged_verify_layout(fb), layout)
+
+    def test_device_layout_preserves_real_total_under_padded_bucket(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([1, 2, 4], dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=16,
+        )
+        self.assertEqual(layout.total_verify_tokens, 7)
+        self.assertEqual(layout.graph_num_tokens, 16)
+        self.assertEqual(int(layout.qo_indptr_device[-1]), 7)
 
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
@@ -148,6 +177,51 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
 
+    def test_padded_to_graph_within_rows_preserves_capacity(self):
+        raw = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[1, 2, 4, 8],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+        )
+        padded = raw.padded_to_graph_within_rows(num_draft_tokens=8)
+        self.assertEqual(padded.graph_num_tokens, 16)
+        self.assertEqual(padded.total_verify_tokens, 16)
+        self.assertEqual(sum(padded.verify_lens.tolist()), 16)
+        self.assertTrue(all(v <= 8 for v in padded.verify_lens.tolist()))
+        self.assertGreaterEqual(int(padded.verify_lens[0]), int(raw.verify_lens[0]))
+
+    def test_padded_to_graph_within_rows_rejects_over_capacity(self):
+        raw = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 8],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+            graph_num_tokens_floor=32,
+        )
+        with self.assertRaises(ValueError):
+            raw.padded_to_graph_within_rows(num_draft_tokens=8)
+
+    def test_padded_to_full_rows_fills_live_rows(self):
+        raw = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[1, 2],
+            device=_DEVICE,
+            grid=[1, 2, 3],
+        )
+        self.assertEqual(raw.graph_num_tokens, 3)
+        padded = raw.padded_to_full_rows(num_draft_tokens=8)
+        self.assertEqual(padded.graph_num_tokens, 16)
+        self.assertEqual(padded.total_verify_tokens, 16)
+        self.assertEqual(padded.verify_lens.tolist(), [8, 8])
+        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 8, 16])
+
+    def test_padded_to_full_rows_noops_when_already_full(self):
+        raw = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8],
+            device=_DEVICE,
+            grid=[8],
+        )
+        padded = raw.padded_to_full_rows(num_draft_tokens=8)
+        self.assertIs(padded, raw)
+
 
 class TestNegativeSeamGeometry(CustomTestCase):
     def test_uniform_capture_geometry_diverges_from_ragged(self):
@@ -240,7 +314,7 @@ class TestBudgetTierSelection(CustomTestCase):
             ragged_verify_mode=RaggedVerifyMode.COMPACT,
             verify_num_draft_tokens=8,
             model_runner=model_runner,
-            verify_token_budget=50,
+            tier_num_tokens=150,
         )
         self.assertEqual(floor, 150)
         pinned = verify_layout_graph_num_tokens_floor(

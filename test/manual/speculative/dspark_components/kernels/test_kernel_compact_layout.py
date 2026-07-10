@@ -49,8 +49,10 @@ def test_verify_ids_triton_matches_torch(bs, pad):
     layout = RaggedVerifyLayout.from_verify_lens_device(
         verify_lens=verify_lens, graph_num_tokens=padded_total
     )
+    # Production DSpark passes an anchor+draft-token block here, while
+    # draft_tokens only contains the gamma draft-token slots.
     draft_block_ids = torch.randint(
-        0, 129280, (bs, GAMMA), dtype=torch.int64, device=device
+        0, 129280, (bs, T), dtype=torch.int64, device=device
     )
     draft_tokens = torch.randint(
         0, 129280, (bs, GAMMA), dtype=torch.int64, device=device

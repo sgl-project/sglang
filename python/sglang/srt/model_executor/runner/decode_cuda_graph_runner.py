@@ -561,6 +561,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:
             return False
+        if not self._attn_backend_supports_layout_ragged_verify_graph(
+            forward_batch, ragged_layout
+        ):
+            return False
 
         admission_tokens = ragged_layout.graph_num_tokens
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[
@@ -605,6 +609,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
+        )
+
+    def _attn_backend_supports_layout_ragged_verify_graph(
+        self, forward_batch: ForwardBatch, ragged_layout
+    ) -> bool:
+        if type(self.attn_backend).__name__ != "DeepseekSparseAttnBackend":
+            return True
+
+        # The current DSA graph metadata path expands TARGET_VERIFY as a
+        # full-width bs * verify_w block. Non-uniform or token-tier padded
+        # compact layouts must run eager metadata until DSA graph capture uses
+        # the ragged layout too.
+        expected_total = int(forward_batch.batch_size) * int(self.num_tokens_per_bs)
+        if int(ragged_layout.graph_num_tokens) != expected_total:
+            return False
+        if (
+            ragged_layout.total_verify_tokens is not None
+            and int(ragged_layout.total_verify_tokens) != expected_total
+        ):
+            return False
+        if ragged_layout.verify_lens_cpu is not None:
+            return all(
+                int(verify_len) == int(self.num_tokens_per_bs)
+                for verify_len in ragged_layout.verify_lens_cpu
+            )
+        return bool(
+            torch.all(ragged_layout.verify_lens == int(self.num_tokens_per_bs)).item()
         )
 
     def _init_profile_context_and_memory_record(self):
