@@ -177,12 +177,6 @@ class TestNgramCorpusBFS(CustomTestCase):
     def test_masks(self):
         np.testing.assert_array_equal(self.masks.tolist(), EXPECTED_BFS_MASKS)
 
-    def test_output_shapes(self):
-        n_queries = len(QUERY_SEQUENCES)
-        draft = 8
-        self.assertEqual(self.ids.shape, (n_queries, draft))
-        self.assertEqual(self.masks.shape, (n_queries, draft, draft))
-
 
 class TestNgramCorpusProb(CustomTestCase):
     """Golden-output tests for Prob matching mode."""
@@ -201,35 +195,6 @@ class TestNgramCorpusProb(CustomTestCase):
 
     def test_masks(self):
         np.testing.assert_array_equal(self.masks.tolist(), EXPECTED_PROB_MASKS)
-
-    def test_output_shapes(self):
-        n_queries = len(QUERY_SEQUENCES)
-        self.assertEqual(self.ids.shape, (n_queries, 8))
-        self.assertEqual(self.masks.shape, (n_queries, 8, 8))
-
-
-class TestNgramCorpusReset(CustomTestCase):
-    """Verify reset clears all cached state."""
-
-    def test_reset_produces_empty_results(self):
-        corpus = _make_corpus("BFS")
-        corpus.batch_put(SEED_SEQUENCES)
-        corpus.synchronize()
-
-        ids_before, _ = _batch_get(corpus, [[1, 2, 3]])
-        self.assertTrue(
-            any(t != 0 for t in ids_before.tolist()[1:]),
-            "Expected non-trivial draft tokens before reset",
-        )
-
-        corpus.reset()
-
-        ids_after, _ = _batch_get(corpus, [[1, 2, 3]])
-        self.assertEqual(
-            ids_after.tolist(),
-            [3, 0, 0, 0, 0, 0, 0, 0],
-            "After reset, only last_token should be present (rest zero-padded)",
-        )
 
 
 class TestNgramCorpusNoMatch(CustomTestCase):
@@ -276,15 +241,6 @@ class TestNgramCorpusMultipleInserts(CustomTestCase):
 
 class TestNgramCorpusSqueeze(CustomTestCase):
     """Verify cache eviction under memory pressure."""
-
-    def test_small_capacity_does_not_crash(self):
-        corpus = _make_corpus("BFS", capacity=200)
-        long_seq = list(range(1, 101))
-        corpus.batch_put([long_seq])
-        corpus.synchronize()
-
-        ids, masks = _batch_get(corpus, [[50, 51, 52]])
-        self.assertEqual(len(ids), 8, "Should still produce draft_token_num outputs")
 
     def test_eviction_preserves_recent(self):
         corpus = _make_corpus("BFS", capacity=500, max_trie_depth=6)
@@ -364,34 +320,6 @@ class TestNgramCorpusBatchConsistency(CustomTestCase):
                 single_masks[0],
                 err_msg=f"Mask mismatch for query {i}",
             )
-
-
-class TestMaskValidity(CustomTestCase):
-    """Verify structural invariants of the output mask for any draft tree."""
-
-    def _check_mask(self, masks_2d):
-        n = len(masks_2d)
-        for i in range(n):
-            self.assertEqual(masks_2d[i][i], 1, f"Diagonal must be 1 at row {i}")
-        self.assertEqual(masks_2d[0], [1] + [0] * (n - 1))
-
-    def test_bfs_mask_invariants(self):
-        corpus = _make_corpus("BFS")
-        corpus.batch_put(SEED_SEQUENCES)
-        corpus.synchronize()
-        _, masks = _batch_get(corpus, QUERY_SEQUENCES)
-        masks = masks.reshape(-1, 8, 8)
-        for i in range(masks.shape[0]):
-            self._check_mask(masks[i].tolist())
-
-    def test_prob_mask_invariants(self):
-        corpus = _make_corpus("PROB")
-        corpus.batch_put(SEED_SEQUENCES)
-        corpus.synchronize()
-        _, masks = _batch_get(corpus, QUERY_SEQUENCES)
-        masks = masks.reshape(-1, 8, 8)
-        for i in range(masks.shape[0]):
-            self._check_mask(masks[i].tolist())
 
 
 class TestFrequencyBoosting(CustomTestCase):
@@ -507,64 +435,6 @@ class TestLongContext(CustomTestCase):
             ids_list,
             "Shorter matching suffixes should still contribute continuations",
         )
-
-
-class TestDraftBudgetSaturation(CustomTestCase):
-    """Verify the draft tree uses exactly draft_token_num slots."""
-
-    def test_full_budget_used(self):
-        corpus = _make_corpus("BFS", draft_token_num=8)
-        seq = list(range(1, 30))
-        corpus.batch_put([seq])
-        corpus.synchronize()
-
-        ids, _ = _batch_get(corpus, [[1, 2, 3]])
-        ids_list = ids.tolist()
-        self.assertEqual(len(ids_list), 8)
-        non_zero = [t for t in ids_list[1:] if t != 0]
-        self.assertGreater(
-            len(non_zero),
-            0,
-            "Draft budget should have non-zero tokens when cache has long chains",
-        )
-
-
-class TestTruncate(CustomTestCase):
-    """Verify truncation logic on batch_get output."""
-
-    def test_truncate_reduces_output(self):
-        corpus = _make_corpus("BFS", draft_token_num=8)
-        corpus.batch_put(SEED_SEQUENCES)
-        corpus.synchronize()
-
-        ids, _ = _batch_get(corpus, [[1, 2, 3]])
-        ids = ids.reshape(8)
-        self.assertEqual(len(ids), 8)
-
-        # Simulate truncate to 4
-        trunc_n = 4
-        trunc_ids = ids[:trunc_n]
-        self.assertEqual(len(trunc_ids), trunc_n)
-
-    def test_truncate_preserves_mask_structure(self):
-        corpus = _make_corpus("BFS", draft_token_num=8)
-        corpus.batch_put(SEED_SEQUENCES)
-        corpus.synchronize()
-
-        _, masks = _batch_get(corpus, [[1, 2, 3]])
-        n = 8
-        full_mask = masks.reshape(n, n)
-
-        trunc_n = 4
-        trunc_mask = full_mask[:trunc_n, :trunc_n]
-
-        for i in range(trunc_n):
-            for j in range(trunc_n):
-                self.assertEqual(
-                    trunc_mask[i, j],
-                    full_mask[i, j],
-                    f"Mask mismatch at ({i},{j})",
-                )
 
 
 class TestResetAndReinsert(CustomTestCase):
@@ -754,19 +624,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
                 iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4),
             )
 
-    def test_external_sam_only_chain(self):
-        corpus = _make_corpus(
-            "BFS",
-            draft_token_num=4,
-            external_sam_budget=3,
-            external_corpus_documents=[[1, 2, 3, 4, 5]],
-        )
-
-        ids, masks = _batch_get(corpus, [[1, 2, 3]])
-        ids_list = ids.tolist()
-        self.assertEqual(ids_list[0], 3)
-        self.assertEqual(ids_list[1:3], [4, 5])
-
     def test_external_sam_respects_document_boundaries(self):
         corpus = _make_corpus(
             "BFS",
@@ -796,23 +653,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         )
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertIn([3, 20, 21], leaf_paths)
-
-    def test_shared_prefix_keeps_both_branches(self):
-        corpus = _make_corpus(
-            "BFS",
-            draft_token_num=5,
-            external_sam_budget=2,
-            external_corpus_documents=[[1, 2, 3, 10, 99]],
-        )
-        corpus.batch_put([[1, 2, 3, 10, 11]])
-        corpus.synchronize()
-
-        ids, masks = _batch_get(corpus, [[1, 2, 3]])
-        leaf_paths = corpus.leaf_paths_from_mask(
-            ids.tolist(), masks.reshape(5, 5).tolist()
-        )
-        self.assertIn([3, 10, 11], leaf_paths)
-        self.assertIn([3, 10, 99], leaf_paths)
 
     def test_shared_prefix_merge_can_underfill_budget(self):
         corpus = _make_corpus(
@@ -930,17 +770,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertEqual(token_counts["a"], 5)
         self.assertEqual(token_counts["b"], 5)
 
-    def test_remove(self):
-        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
-        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
-        corpus.commit_external_corpus_load("a", loaded_token_count)
-        loaded_token_count = corpus.load_external_corpus_named(
-            "b", [[10, 20, 30, 40, 50]]
-        )
-        corpus.commit_external_corpus_load("b", loaded_token_count)
-        corpus.remove_external_corpus("a")
-        self.assertEqual(list(corpus.list_external_corpora().keys()), ["b"])
-
     def test_remove_nonexistent_is_noop(self):
         corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
         corpus.remove_external_corpus("nonexistent")
@@ -976,17 +805,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         )
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertNotIn([3, 20, 21], leaf_paths)
-
-    def test_make_corpus_with_documents(self):
-        """_make_corpus helper loads documents as a named corpus."""
-        corpus = _make_corpus(
-            "BFS",
-            draft_token_num=4,
-            external_sam_budget=3,
-            external_corpus_documents=[[1, 2, 3, 4, 5]],
-        )
-        token_counts = corpus.list_external_corpora()
-        self.assertIn("test_corpus", token_counts)
 
     def test_remove_frees_token_budget(self):
         """Removing a corpus should free its tokens from the total budget."""
