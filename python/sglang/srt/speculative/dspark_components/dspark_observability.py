@@ -84,6 +84,9 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     acc_len: int
     correct_drafts: int
     cap_trim: int
+    anchor_token: int
+    prefill_tail_start: int
+    prefill_tail_len: int
     bonus_token: int
     draft_tokens: list[int]
     rid: Optional[str] = None
@@ -127,11 +130,14 @@ class DecodeStepObservation(msgspec.Struct):
     confidence: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor
     prefix_lens: torch.Tensor
+    anchor_tokens: torch.Tensor
     draft_tokens: torch.Tensor
     bonus_tokens: torch.Tensor
     correct_len: torch.Tensor
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
+    prefill_tail_start_positions: Optional[torch.Tensor]
+    prefill_tail_valid_lens: Optional[torch.Tensor]
     rids: Optional[list[str]]
 
 
@@ -319,6 +325,7 @@ class DsparkInfoDumper:
         tensors: dict[str, torch.Tensor] = {
             "req_pool_indices": obs.req_pool_indices,
             "prefix_lens": obs.prefix_lens,
+            "anchor_tokens": obs.anchor_tokens,
             "draft_tokens": obs.draft_tokens,
             "bonus_tokens": obs.bonus_tokens,
             "correct_len": obs.correct_len,
@@ -329,6 +336,10 @@ class DsparkInfoDumper:
             tensors["verify_lens"] = obs.verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
+        if obs.prefill_tail_start_positions is not None:
+            tensors["prefill_tail_start_positions"] = obs.prefill_tail_start_positions
+        if obs.prefill_tail_valid_lens is not None:
+            tensors["prefill_tail_valid_lens"] = obs.prefill_tail_valid_lens
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -437,12 +448,15 @@ class DsparkInfoDumper:
     ) -> list[ReqDetail]:
         req_ids = host["req_pool_indices"].tolist()
         prefixes = host["prefix_lens"].tolist()
+        anchors = host["anchor_tokens"].tolist()
         draft_rows = host["draft_tokens"].tolist()
         bonus = host["bonus_tokens"].tolist()
         correct = host["correct_len"].tolist()
         cap_trim = host["cap_trim_lens"].tolist()
         commit = host["commit_lens"].tolist()
         verify_lens = host["verify_lens"].tolist() if "verify_lens" in host else None
+        tail_starts = host["prefill_tail_start_positions"].tolist() if "prefill_tail_start_positions" in host else None
+        tail_lens = host["prefill_tail_valid_lens"].tolist() if "prefill_tail_valid_lens" in host else None
         if "confidence" in host:
             conf_host = host["confidence"].float()
             conf_rows = conf_host.tolist()
@@ -467,6 +481,11 @@ class DsparkInfoDumper:
                     acc_len=int(commit[row]),
                     correct_drafts=int(correct[row]),
                     cap_trim=int(cap_trim[row]),
+                    anchor_token=int(anchors[row]),
+                    prefill_tail_start=(
+                        -1 if tail_starts is None else int(tail_starts[row])
+                    ),
+                    prefill_tail_len=0 if tail_lens is None else int(tail_lens[row]),
                     bonus_token=int(bonus[row]),
                     draft_tokens=[int(t) for t in draft_rows[row]],
                     confidence=(
@@ -827,6 +846,7 @@ class DsparkStepObservers:
         layout,
         confidence: Optional[torch.Tensor],
         prefix_lens: torch.Tensor,
+        anchor_tokens: torch.Tensor,
         draft_tokens: torch.Tensor,
         draft_block,
         sampling_info,
@@ -834,6 +854,8 @@ class DsparkStepObservers:
         cap_trim_lens: torch.Tensor,
         bonus: torch.Tensor,
         commit_lens: torch.Tensor,
+        prefill_tail_start_positions: Optional[torch.Tensor],
+        prefill_tail_valid_lens: Optional[torch.Tensor],
         verify_token_budget: Optional[int],
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
@@ -919,11 +941,14 @@ class DsparkStepObservers:
                     confidence=confidence,
                     req_pool_indices=req_pool_indices,
                     prefix_lens=prefix_lens,
+                    anchor_tokens=anchor_tokens,
                     draft_tokens=draft_tokens,
                     bonus_tokens=bonus,
                     correct_len=correct_len,
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
+                    prefill_tail_start_positions=prefill_tail_start_positions,
+                    prefill_tail_valid_lens=prefill_tail_valid_lens,
                     rids=[req.rid for req in reqs],
                 )
             )

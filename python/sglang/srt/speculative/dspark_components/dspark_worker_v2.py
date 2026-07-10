@@ -520,6 +520,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._run_idle_verify_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
 
+        prefill_tail_start_positions = getattr(
+            draft_input, "prefill_tail_start_positions", None
+        )
+        prefill_tail_valid_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        prefill_tail_valid_lens = (
+            prefill_tail_valid_mask.to(torch.int64).sum(dim=1)
+            if prefill_tail_valid_mask is not None
+            and prefill_tail_valid_mask.numel() > 0
+            else None
+        )
         self._maybe_inject_pd_prefill_tail(batch, draft_input)
 
         batch.seq_lens.record_stream(
@@ -669,6 +679,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             confidence=confidence,
             prefix_lens=prefix_lens,
+            anchor_tokens=draft_block_ids[:, 0],
             draft_tokens=draft_tokens,
             draft_block=draft_block,
             sampling_info=sampling_info,
@@ -676,6 +687,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             cap_trim_lens=accept.cap_trim_lens,
             bonus=accept.bonus,
             commit_lens=accept.commit_lens,
+            prefill_tail_start_positions=prefill_tail_start_positions,
+            prefill_tail_valid_lens=prefill_tail_valid_lens,
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
