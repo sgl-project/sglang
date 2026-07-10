@@ -383,6 +383,47 @@ export const config = {
     },
 
     // ====================================================================
+    // AMD — MI300X + FP8  (tp=8, mem 0.80)
+    // TileLang DSA backends; no speculative decoding (hidden on AMD).
+    // FP8 weights (zai-org/GLM-5.1-FP8) verified and benchmarked on MI300X.
+    // KV cache auto-set to bfloat16 by the DSA backend on SM9 device.
+    // ====================================================================
+    {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
     // AMD — MI300X / MI325X / MI355X + BF16  (tp=8, mem 0.80)
     // TileLang DSA backends; no speculative decoding (hidden on AMD).
     // ====================================================================
