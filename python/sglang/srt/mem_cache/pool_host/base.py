@@ -275,6 +275,7 @@ class HostKVCache(abc.ABC):
         # slot_used[k] is true if slot k is allocated.
         self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
+    @synchronized
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
 
@@ -315,6 +316,9 @@ class HostKVCache(abc.ABC):
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         indices_cpu = indices.cpu()
+        if indices_cpu.numel() == 0:
+            return 0
+
         assert self.slot_used[indices_cpu].all(), (
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
