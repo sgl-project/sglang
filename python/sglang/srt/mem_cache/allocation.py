@@ -1032,36 +1032,69 @@ def alloc_for_spec_decode(
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
     if num_needed_tokens > 0:
-        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
-            )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
-            )
+        page_size = tree_cache.token_to_kv_pool_allocator.page_size
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
         # Updating req_to_token is a write to a shared tensor: it must not overlap
-        # with the previous batch's forward, which also reads req_to_token.
-        assign_req_to_token_pool_func(
-            req_pool_indices,
-            req_to_token_pool.req_to_token,
-            cur_kv_lens,
-            nxt_kv_lens,
-            out_cache_loc,
-            len(reqs),
-        )
+        # with the previous batch's forward, which also reads req_to_token. This
+        # holds for both assign_req_to_token_pool_func and
+        # write_pages_to_req_to_token below.
+        if page_size == 1 or device_type == "npu":
+            if page_size == 1:
+                out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+            else:
+                # Legacy kernel path, kept for NPU (DSV4-NPU spec reserve with
+                # real-lens state pools and backup_state rollback).
+                last_loc = get_last_loc(
+                    req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+                )
+                out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                req_to_token_pool.req_to_token,
+                cur_kv_lens,
+                nxt_kv_lens,
+                out_cache_loc,
+                len(reqs),
+            )
+        else:
+            cur_kv_lens_list: list[int] = cur_kv_lens_cpu.tolist()
+            nxt_kv_lens_list: list[int] = nxt_kv_lens_cpu.tolist()
+            pages_per_req: list[int] = []
+            for cur_kv_len, nxt_kv_len in zip(cur_kv_lens_list, nxt_kv_lens_list):
+                assert (
+                    cur_kv_len % page_size == 0
+                    and (nxt_kv_len - cur_kv_len) % page_size == 0
+                ), (
+                    f"alloc_for_spec_decode expects page-aligned alloc "
+                    f"intervals: {cur_kv_len=}, {nxt_kv_len=}, {page_size=}"
+                )
+                pages_per_req.append((nxt_kv_len - cur_kv_len) // page_size)
+            page_ids = alloc_pages_or_raise(
+                tree_cache, sum(pages_per_req), phase="Prefill"
+            )
+
+            req_pool_indices_cpu = torch.tensor(
+                [req.req_pool_idx for req in reqs], dtype=torch.int64
+            )
+            write_pages_to_req_to_token(
+                req_to_token_pool=req_to_token_pool,
+                req_pool_indices_tensor=req_pool_indices,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                page_ids=page_ids,
+                pages_per_req=pages_per_req,
+                out_starts=cur_kv_lens_list,
+                page_size=page_size,
+            )
 
     for i, req in enumerate(reqs):
         req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
