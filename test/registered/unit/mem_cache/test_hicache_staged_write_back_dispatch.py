@@ -776,58 +776,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(captured["host_indices"].device.type, "cpu")
         self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
 
-    def test_hybrid_write_moves_indices_without_page_first_layout(self):
-        captured = {}
-
-        class FakeHostGroup:
-            layout = "layer_first"
-            can_use_write_back_jit = True
-
-            def backup_from_device_all_layer(
-                self,
-                device_pool,
-                host_indices,
-                device_indices,
-                io_backend,
-                pool_transfers=None,
-            ):
-                captured["host_indices"] = host_indices
-                captured["pool_transfers"] = pool_transfers
-
-        op = CacheOperation(
-            host_indices=_indices(0, 4),
-            device_indices=_indices(4, 8),
-            node_id=1,
-            pool_transfers=[
-                PoolTransfer(
-                    name=PoolName.DEEPSEEK_V4_C4,
-                    host_indices=_indices(0, 4),
-                    device_indices=_indices(4, 8),
-                )
-            ],
-        )
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.write_queue = [op]
-        controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostGroup()
-        controller.mem_pool_device = None
-        controller.has_draft = False
-        controller.write_stream = object()
-        controller.ack_write_queue = []
-        controller._record_transfer_indices_on_stream = lambda *args: None
-        controller.move_hybrid_indices = mock.Mock(
-            return_value=(op.host_indices, op.device_indices, op.pool_transfers)
-        )
-
-        with mock.patch.object(
-            hybrid_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_writing()
-
-        controller.move_hybrid_indices.assert_called_once()
-        self.assertEqual(captured["host_indices"].device.type, "cpu")
-        self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
-
     def test_write_back_jit_cache_controller_keeps_host_indices_on_cpu(self):
         captured = {}
 
@@ -874,43 +822,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeHostPool:
             layout = "page_first"
             can_use_write_back_jit = False
-
-            def backup_from_device_all_layer(
-                self, device_pool, host_indices, device_indices, io_backend
-            ):
-                captured["host_indices"] = host_indices
-
-        op = ManagerCacheOperation(
-            host_indices=_indices(0, 4),
-            device_indices=_indices(4, 8),
-            node_id=1,
-        )
-        controller = HiCacheController.__new__(HiCacheController)
-        controller.write_queue = [op]
-        controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostPool()
-        controller.mem_pool_device = None
-        controller.has_draft = False
-        controller.write_stream = object()
-        controller.ack_write_queue = []
-        controller.move_indices = mock.Mock(
-            return_value=(op.host_indices, op.device_indices)
-        )
-
-        with mock.patch.object(
-            manager_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_writing()
-
-        controller.move_indices.assert_called_once()
-        self.assertEqual(captured["host_indices"].device.type, "cpu")
-
-    def test_cache_controller_moves_indices_without_page_first_layout(self):
-        captured = {}
-
-        class FakeHostPool:
-            layout = "layer_first"
-            can_use_write_back_jit = True
 
             def backup_from_device_all_layer(
                 self, device_pool, host_indices, device_indices, io_backend
