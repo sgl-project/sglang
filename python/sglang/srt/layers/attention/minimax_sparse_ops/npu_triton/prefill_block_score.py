@@ -78,6 +78,13 @@ def _prefill_bnsd_score_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
+    # P3 optimization: number of consecutive logical KV blocks fused into one
+    # tl.dot per step. 1 == original single-block path (unchanged). 2/4 grow the
+    # dot's N dimension and amortise the per-step scalar overhead (block-table
+    # gather, address math, causal mask) that left the prefill score kernel
+    # scalar-bound (mac 5% / scalar 46% in the 64K profile). Power of two so
+    # BLOCK_SIZE_N = BLOCKS_PER_STEP * block_size stays aligned.
+    BLOCKS_PER_STEP: tl.constexpr,
 ):
     """Score one query-block x one kv_head tile.
 
@@ -140,52 +147,119 @@ def _prefill_bnsd_score_kernel(
 
     sm_scale_log2e = sm_scale * 1.4426950409
 
-    num_steps = chunk_end_block - chunk_start_block
-    for step in tl.range(num_steps):
-        logical_block = chunk_start_block + step
-        physical_block = tl.load(
-            block_table_ptr + pid_qb * stride_bt_q + logical_block * stride_bt_n
-        ).to(tl.int64)
+    if BLOCKS_PER_STEP == 1:
+        # Original single-block path: one KV block (block_size tokens) per dot.
+        num_steps = chunk_end_block - chunk_start_block
+        for step in tl.range(num_steps):
+            logical_block = chunk_start_block + step
+            physical_block = tl.load(
+                block_table_ptr + pid_qb * stride_bt_q + logical_block * stride_bt_n
+            ).to(tl.int64)
 
-        key_pos = logical_block * block_size + off_n  # [N]
-        pos_mask = key_pos < seq_len
+            key_pos = logical_block * block_size + off_n  # [N]
+            pos_mask = key_pos < seq_len
 
-        k_offsets = (
-            physical_block * stride_k_block
-            + off_n[None, :] * stride_k_offset
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_offsets,
-            mask=(off_d[:, None] < head_dim) & pos_mask[None, :],
-            other=0.0,
-        )
+            k_offsets = (
+                physical_block * stride_k_block
+                + off_n[None, :] * stride_k_offset
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_offsets,
+                mask=(off_d[:, None] < head_dim) & pos_mask[None, :],
+                other=0.0,
+            )
 
-        qk = tl.dot(q, k) * sm_scale_log2e  # [BSQ*H, N], 2D dot -- no 3D reshape
+            qk = tl.dot(q, k) * sm_scale_log2e  # [BSQ*H, N], 2D dot -- no 3D reshape
 
-        # Causal: query token >= key position (use q_token_raw for correct per-
-        # token position; phantom rows are masked by row_valid downstream).
-        causal = q_token_raw[:, None] >= key_pos[None, :]
-        qk = tl.where(causal & pos_mask[None, :], qk, float("-inf"))
+            # Causal: query token >= key position (use q_token_raw for correct per-
+            # token position; phantom rows are masked by row_valid downstream).
+            causal = q_token_raw[:, None] >= key_pos[None, :]
+            qk = tl.where(causal & pos_mask[None, :], qk, float("-inf"))
 
-        sub_max = tl.max(qk, axis=1)  # [BSQ*H]
-        if SCORE_TYPE == "max":
-            score = sub_max
-        else:
-            score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
-            score = tl.where(score != score, float("-inf"), score)
+            sub_max = tl.max(qk, axis=1)  # [BSQ*H]
+            if SCORE_TYPE == "max":
+                score = sub_max
+            else:
+                score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
+                score = tl.where(score != score, float("-inf"), score)
 
-        s_offsets = (
-            head_flat * stride_s_h
-            + q_token_raw * stride_s_q
-            + logical_block * stride_s_n
-        )
-        tl.store(
-            score_ptr + s_offsets,
-            score.to(score_ptr.dtype.element_ty),
-            mask=row_valid,
-        )
+            s_offsets = (
+                head_flat * stride_s_h
+                + q_token_raw * stride_s_q
+                + logical_block * stride_s_n
+            )
+            tl.store(
+                score_ptr + s_offsets,
+                score.to(score_ptr.dtype.element_ty),
+                mask=row_valid,
+            )
+    else:
+        # Multi-block path (P3): BLOCKS_PER_STEP consecutive logical KV blocks are
+        # gathered into one [D, BLOCKS_PER_STEP*block_size] K tile and scored with
+        # a single larger tl.dot. Same total cube work, but fewer loop iterations
+        # (less per-step scalar/control overhead) and a wider dot (better MAC
+        # utilisation). No 3D reshape (Ascend TBE rejects it); per-block scores are
+        # extracted with a column-select mask + max, which for SCORE_TYPE=="max"
+        # (MiniMax-M3) is a cheap extra max over the masked-out half.
+        sub_id = off_n // block_size  # [BLOCK_SIZE_N] which sub-block in [0, BPS)
+        inn = off_n % block_size  # [BLOCK_SIZE_N] offset within the block
+        num_steps = tl.cdiv(chunk_end_block - chunk_start_block, BLOCKS_PER_STEP)
+        for step in tl.range(num_steps):
+            logical_base = chunk_start_block + step * BLOCKS_PER_STEP
+            logical_block_n = logical_base + sub_id  # [BLOCK_SIZE_N]
+            # Clamp the block-table index to a valid block so the gather never
+            # reads out of bounds; out-of-range sub-blocks are masked away below.
+            logical_block_load = tl.minimum(logical_block_n, chunk_end_block - 1)
+            physical_block_n = tl.load(
+                block_table_ptr + pid_qb * stride_bt_q + logical_block_load * stride_bt_n
+            ).to(tl.int64)
+
+            key_pos = logical_base * block_size + off_n  # [BLOCK_SIZE_N]
+            pos_mask = key_pos < seq_len
+
+            k_offsets = (
+                physical_block_n[None, :] * stride_k_block
+                + inn[None, :] * stride_k_offset
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_offsets,
+                mask=(off_d[:, None] < head_dim) & pos_mask[None, :],
+                other=0.0,
+            )
+
+            qk = tl.dot(q, k) * sm_scale_log2e  # [BSQ*H, BLOCKS_PER_STEP*block_size]
+
+            causal = q_token_raw[:, None] >= key_pos[None, :]
+            qk = tl.where(causal & pos_mask[None, :], qk, float("-inf"))
+
+            # Reduce + store one score per logical block (BLOCKS_PER_STEP stores).
+            for j in tl.static_range(BLOCKS_PER_STEP):
+                logical_block_j = logical_base + j
+                col_lo = j * block_size
+                col_sel = (off_n >= col_lo) & (off_n < col_lo + block_size)
+                qk_j = tl.where(col_sel[None, :], qk, float("-inf"))
+                sub_max_j = tl.max(qk_j, axis=1)  # [BSQ*H]
+                if SCORE_TYPE == "max":
+                    score_j = sub_max_j
+                else:
+                    score_j = sub_max_j + tl.log2(
+                        tl.sum(tl.exp2(qk_j - sub_max_j[:, None]), axis=1)
+                    )
+                    score_j = tl.where(score_j != score_j, float("-inf"), score_j)
+                s_offsets_j = (
+                    head_flat * stride_s_h
+                    + q_token_raw * stride_s_q
+                    + logical_block_j * stride_s_n
+                )
+                tl.store(
+                    score_ptr + s_offsets_j,
+                    score_j.to(score_ptr.dtype.element_ty),
+                    mask=row_valid & (logical_block_j < chunk_end_block),
+                )
 
 
 @triton.jit
@@ -425,6 +499,125 @@ def _build_qblock_mappings(
     )
 
 
+def _prefill_score_matmul(
+    q: torch.Tensor,
+    k_cache_bnsd: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    block_size_k: int,
+    sm_scale: float,
+    score_type: str,
+    blocks_per_chunk: int = 16,
+) -> torch.Tensor:
+    """P0: vendor-matmul (aclnn, cube-bound) replacement for the triton score kernel.
+
+    Computes the same per-(query-token, kv-block) block scores as
+    ``_prefill_bnsd_score_kernel`` but via ``torch.matmul`` -- cube-bound on
+    Ascend -- instead of the plain-triton kernel that was scalar-bound (mac 5% /
+    scalar 46% in the 64K prefill profile). Per the round-7 lesson (Ascend
+    plain-triton loses to aclnn/CANN), this moves the heavy QK onto the cube unit.
+
+    KV is gathered per request as a contiguous zero-copy slice (prefill slots are
+    handed out contiguously by the token pool -- same fast path as
+    ``_forward_npu_sparse_prefill``; the slow ``index_select`` gather is only the
+    fallback for fragmented allocations), then chunked over KV blocks to bound the
+    logits memory. Causal/validity masking replicates the kernel EXACTLY: the
+    query uses its extend-local position (== kernel ``q_token_raw``), keys use
+    absolute position, so block selection is bit-identical -- this is a drop-in.
+
+    Gated by env ``MINIMAX_NPU_PREFILL_SCORE_MATMUL=1`` (chunk size via
+    ``MINIMAX_NPU_PREFILL_SCORE_MATMUL_CHUNK_BLOCKS``, default 16).
+    """
+    total_q, num_idx_heads, head_dim = q.shape
+    num_pages, page_size, num_kv_heads, _ = k_cache_bnsd.shape
+    assert page_size == block_size_k
+    gqa_group_size = num_idx_heads // num_kv_heads
+    device = q.device
+
+    seq_lens_l = seq_lens.to(device=device, dtype=torch.long)
+    cu_l = cu_seqlens.to(device=device, dtype=torch.long)
+    reqs = req_pool_indices.to(device=device, dtype=torch.long)
+
+    max_sl = int(seq_lens_l.max().item())
+    max_seqblock_k = (max_sl + page_size - 1) // page_size
+    score = torch.full(
+        (num_idx_heads, total_q, max_seqblock_k),
+        float("-inf"),
+        device=device,
+        dtype=torch.float32,
+    )
+    if max_seqblock_k == 0:
+        return score
+
+    # sm_scale * log2(e): match the kernel's sm_scale_log2e convention so scores
+    # are bit-comparable with the triton path (and the PyTorch reference test).
+    scale = float(sm_scale) * 1.4426950408883437
+    # KV cache as a flat token-major view for O(1) contiguous per-request slicing.
+    k_flat = k_cache_bnsd.reshape(num_pages * page_size, num_kv_heads, head_dim)
+
+    nb = max(1, int(blocks_per_chunk))
+    n_req = int(reqs.shape[0])
+    neg_inf = float("-inf")
+
+    for r in range(n_req):
+        q0 = int(cu_l[r])
+        q1 = int(cu_l[r + 1])
+        ql = q1 - q0
+        if ql <= 0:
+            continue
+        sl = int(seq_lens_l[r])
+        if sl <= 0:
+            continue
+        req_idx = int(reqs[r])
+        nblk = (sl + page_size - 1) // page_size
+        # Pad the request's KV to whole blocks so every chunk is a full
+        # (nb x page_size) tile -- no partial-last-block reshape edge case.
+        sl_pad = nblk * page_size
+
+        locs = req_to_token[req_idx, :sl].to(device=device, dtype=torch.long)
+        locs0 = int(locs[0].item())
+        # Prefill slots are contiguous in the common case -> zero-copy slice
+        # (avoids the ~33ms NPU index_select gather). Fall back for fragmented.
+        if sl <= 1 or bool((locs[1:] - locs[:-1] == 1).all().item()):
+            k_r = k_flat[locs0 : locs0 + sl]
+        else:
+            k_r = k_flat.index_select(0, locs)
+        if sl_pad != sl:
+            k_r = torch.nn.functional.pad(k_r, (0, 0, 0, 0, 0, sl_pad - sl))
+        k_r_f = k_r.to(torch.float32)  # [sl_pad, num_kv_heads, head_dim], upcast once
+        q_r_f = q[q0:q1].to(torch.float32)  # [ql, num_idx_heads, head_dim]
+
+        # extend-local query positions == kernel q_token_raw for request r.
+        q_pos = torch.arange(q0, q1, device=device, dtype=torch.int32)  # [ql]
+
+        for s_blk in range(0, nblk, nb):
+            gb = min(nb, nblk - s_blk)
+            tok_lo = s_blk * page_size
+            tok_hi = tok_lo + gb * page_size
+            key_pos = torch.arange(tok_lo, tok_hi, device=device, dtype=torch.int32)
+            valid = key_pos < sl  # padded tail tokens are invalid
+            keep = (q_pos[:, None] >= key_pos[None, :]) & valid[None, :]  # [ql, L]
+            for h in range(num_idx_heads):
+                kvh = h // gqa_group_size
+                qh = q_r_f[:, h, :]  # [ql, hd] view
+                kh = k_r_f[tok_lo:tok_hi, kvh, :]  # [L, hd] view
+                logits = torch.matmul(qh, kh.t()) * scale  # [ql, L], cube-bound
+                logits = torch.where(keep, logits, neg_inf)
+                logits = logits.view(ql, gb, page_size)
+                if score_type == "max":
+                    sc = torch.amax(logits, dim=-1)  # [ql, gb]
+                else:
+                    m = torch.amax(logits, dim=-1, keepdim=True)
+                    sc = m.squeeze(-1) + torch.log2(
+                        torch.exp2(logits - m).sum(dim=-1)
+                    )
+                    sc = torch.where(sc != sc, neg_inf, sc)
+                score[h, q0:q1, s_blk : s_blk + gb] = sc
+    return score
+
+
 def flash_prefill_bnsd_score(
     q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     k_cache_bnsd: torch.Tensor,  # [num_pages, page_size, num_kv_heads, head_dim]
@@ -445,6 +638,27 @@ def flash_prefill_bnsd_score(
     2D dot per (query-block, kv-block). varlen multi-token analogue of the decode
     score kernel; the dominant prefill cost.
     """
+    # P0 dispatch: optional vendor-matmul path (cube-bound) replacing the
+    # plain-triton kernel. Default off == the validated triton path unchanged.
+    import os as _os_mm
+
+    if _os_mm.environ.get("MINIMAX_NPU_PREFILL_SCORE_MATMUL"):
+        _chunk_raw = _os_mm.environ.get(
+            "MINIMAX_NPU_PREFILL_SCORE_MATMUL_CHUNK_BLOCKS"
+        )
+        return _prefill_score_matmul(
+            q,
+            k_cache_bnsd,
+            cu_seqlens,
+            seq_lens,
+            req_to_token,
+            req_pool_indices,
+            block_size_k,
+            sm_scale,
+            score_type,
+            blocks_per_chunk=int(_chunk_raw) if _chunk_raw else 16,
+        )
+
     total_q, num_idx_heads, head_dim = q.shape
     num_kv_heads = k_cache_bnsd.shape[2]
     assert num_idx_heads % num_kv_heads == 0
@@ -487,6 +701,19 @@ def flash_prefill_bnsd_score(
 
     BLOCK_SIZE_Q = _next_power_of_2(block_size_q)
 
+    # P3 multi-block score tiling (see _prefill_bnsd_score_kernel BLOCKS_PER_STEP).
+    # Default 1 == bit-identical to the original single-block kernel; set env
+    # MINIMAX_NPU_PREFILL_SCORE_BLOCKS_PER_STEP=2 or 4 to fuse that many
+    # consecutive KV blocks per tl.dot and lift MAC utilisation.
+    import os as _os
+
+    _bps_raw = _os.environ.get("MINIMAX_NPU_PREFILL_SCORE_BLOCKS_PER_STEP")
+    blocks_per_step = int(_bps_raw) if _bps_raw else 1
+    assert blocks_per_step in (1, 2, 4), (
+        "MINIMAX_NPU_PREFILL_SCORE_BLOCKS_PER_STEP must be one of 1/2/4, "
+        f"got {blocks_per_step!r}"
+    )
+
     score = torch.full(
         (num_idx_heads, total_q, max_seqblock_k),
         float("-inf"),
@@ -527,8 +754,9 @@ def flash_prefill_bnsd_score(
         BLOCK_SIZE_Q,
         triton.next_power_of_2(gqa_group_size),
         triton.next_power_of_2(head_dim),
-        triton.next_power_of_2(page_size),
+        triton.next_power_of_2(page_size * blocks_per_step),
         score_type,
+        blocks_per_step,
     )
     return score
 
