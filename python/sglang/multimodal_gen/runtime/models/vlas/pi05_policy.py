@@ -14,12 +14,6 @@ from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
-    PrefixContext,
-    VLADensePrefixCache,
-    VLAPrefixCacheKey,
-    VLAPrefixCacheManager,
-)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     tensor_model_parallel_all_gather,
@@ -31,10 +25,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_world_size,
     get_ulysses_parallel_world_size,
     model_parallel_is_initialized,
-)
-from sglang.multimodal_gen.runtime.distributed.vla import (
-    broadcast_tensor_from_rank,
-    get_vla_split_group,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
@@ -48,13 +38,23 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_core import Pi05CoreModel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vla_denoise_graph import (
+from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
     VLADenoiseGraphRunner,
-    VLADenoiseShapeBucket,
+    VLADenoiseGraphSignature,
 )
-from sglang.multimodal_gen.runtime.utils.vla_observation import (
+from sglang.multimodal_gen.runtime.vla.observation import (
     VLAObservationBatch,
     stable_tensor_sha256,
+)
+from sglang.multimodal_gen.runtime.vla.parallel import (
+    broadcast_tensor_from_rank,
+    get_vla_split_group,
+)
+from sglang.multimodal_gen.runtime.vla.prefix_cache import (
+    PrefixContext,
+    VLADensePrefixCache,
+    VLAPrefixCacheKey,
+    VLAPrefixCacheManager,
 )
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
@@ -917,7 +917,7 @@ class Pi05PolicyModel(nn.Module):
                 f"{parallel_layout}:action_sp"
                 f":rank{get_sp_parallel_rank()}:offset{action_position_offset}"
             )
-        bucket = VLADenoiseShapeBucket(
+        signature = VLADenoiseGraphSignature(
             batch_size=x_t.shape[0],
             prefix_len=prefix_context.prefix_len,
             action_horizon=x_t.shape[1],
@@ -939,7 +939,7 @@ class Pi05PolicyModel(nn.Module):
             )
 
         return self.graph_runner.capture_or_run(
-            bucket,
+            signature,
             step_fn,
             prefix_context,
             x_t,

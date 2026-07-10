@@ -9,24 +9,24 @@ from typing import Any
 import numpy as np
 import torch
 
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
-    VLAPrefixCacheManager,
-    slice_prefix_context,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.vla import (
-    broadcast_prefix_context,
-    broadcast_tensor_from_rank,
-    get_vla_split_group,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.vla_observation import (
+from sglang.multimodal_gen.runtime.vla.observation import (
     collate_vla_observation_batches,
+)
+from sglang.multimodal_gen.runtime.vla.parallel import (
+    broadcast_prefix_context,
+    broadcast_tensor_from_rank,
+    get_vla_split_group,
+)
+from sglang.multimodal_gen.runtime.vla.prefix_cache import (
+    VLAPrefixCacheManager,
+    slice_prefix_context,
 )
 
 

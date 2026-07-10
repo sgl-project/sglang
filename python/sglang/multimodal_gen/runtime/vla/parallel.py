@@ -7,16 +7,16 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
-    PrefixContext,
-    VLADensePrefixCache,
-)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
+from sglang.multimodal_gen.runtime.vla.prefix_cache import (
+    PrefixContext,
+    VLADensePrefixCache,
+)
 
 
 @dataclass(frozen=True)

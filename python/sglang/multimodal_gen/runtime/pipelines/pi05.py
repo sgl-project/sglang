@@ -6,7 +6,6 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import VLAPrefixCacheManager
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.models.vlas import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -24,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.vla.prefix_cache import VLAPrefixCacheManager
 
 logger = init_logger(__name__)
 

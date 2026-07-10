@@ -4,7 +4,7 @@ from array import array
 
 import torch
 
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
+from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLAPrefixCacheKey,
     VLAPrefixCacheManager,

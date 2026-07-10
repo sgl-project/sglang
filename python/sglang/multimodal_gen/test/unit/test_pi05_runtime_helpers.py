@@ -7,11 +7,6 @@ from torch import nn
 
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
-    PrefixContext,
-    VLADensePrefixCache,
-)
-from sglang.multimodal_gen.runtime.distributed.vla import VLASplitGroup
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05SiglipAttention,
     patch_siglip_vision_attention_to_native,
@@ -20,9 +15,14 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
     Pi05CheckpointManifest,
     Pi05PolicyModel,
 )
-from sglang.multimodal_gen.runtime.utils.vla_denoise_graph import (
+from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
     VLADenoiseGraphRunner,
     _CapturedDenoiseGraph,
+)
+from sglang.multimodal_gen.runtime.vla.parallel import VLASplitGroup
+from sglang.multimodal_gen.runtime.vla.prefix_cache import (
+    PrefixContext,
+    VLADensePrefixCache,
 )
 
 
@@ -72,7 +72,7 @@ def test_denoise_graph_skips_prefix_copy_for_same_digest(monkeypatch):
         raise AssertionError("PrefixContext should not be copied on digest hit")
 
     monkeypatch.setattr(
-        "sglang.multimodal_gen.runtime.utils.vla_denoise_graph._copy_prefix_context_",
+        "sglang.multimodal_gen.runtime.vla.denoise_cuda_graph._copy_prefix_context_",
         fail_copy,
     )
 

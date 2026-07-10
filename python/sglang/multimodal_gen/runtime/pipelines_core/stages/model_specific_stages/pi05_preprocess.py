@@ -11,7 +11,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.utils.vla_observation import (
+from sglang.multimodal_gen.runtime.vla.observation import (
     VLAObservationBatch,
     stable_tensor_sha256,
 )

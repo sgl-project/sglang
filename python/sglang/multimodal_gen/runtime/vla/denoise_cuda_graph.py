@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
+from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
 )
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class VLADenoiseShapeBucket:
+class VLADenoiseGraphSignature:
     batch_size: int
     prefix_len: int
     action_horizon: int
@@ -75,19 +75,16 @@ def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
 
 
 class VLADenoiseGraphRunner:
-    """Shape-bucketed action denoise runner.
+    """Full CUDA graph runner for one VLA action-denoise step.
 
-    This runner deliberately targets one action-expert denoise step, not VLM
-    prefix prefill and not token decode.
+    Each signature owns fixed input and output buffers. This does not use
+    diffusion BCG and does not capture prefix encoding or token decode.
     """
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self._captured: dict[VLADenoiseShapeBucket, Any] = {}
-        self._disabled_buckets: set[VLADenoiseShapeBucket] = set()
-
-    def can_replay(self, bucket: VLADenoiseShapeBucket) -> bool:
-        return self.enabled and bucket in self._captured
+        self._captured: dict[VLADenoiseGraphSignature, _CapturedDenoiseGraph] = {}
+        self._disabled_signatures: set[VLADenoiseGraphSignature] = set()
 
     def _sync_context_if_needed(
         self,
@@ -110,8 +107,8 @@ class VLADenoiseGraphRunner:
 
     def _capture(
         self,
-        bucket: VLADenoiseShapeBucket,
-        step_fn: Callable[..., Any],
+        signature: VLADenoiseGraphSignature,
+        step_fn: Callable[..., torch.Tensor],
         prefix_context: PrefixContext,
         x_t: torch.Tensor,
         timestep: torch.Tensor,
@@ -122,8 +119,10 @@ class VLADenoiseGraphRunner:
 
         stream = torch.cuda.Stream(device=x_t.device)
         stream.wait_stream(torch.cuda.current_stream(device=x_t.device))
+
+        # warm up lazy kernel state and allocator work before graph capture
         with torch.cuda.stream(stream), torch.inference_mode():
-            static_output = step_fn(
+            step_fn(
                 static_prefix_context,
                 static_x_t,
                 static_timestep,
@@ -147,32 +146,29 @@ class VLADenoiseGraphRunner:
             current_context_id=id(prefix_context.past_key_values),
             current_context_digest=prefix_context.cache_key_digest,
         )
-        self._captured[bucket] = captured
+        self._captured[signature] = captured
         return captured
 
     def capture_or_run(
         self,
-        bucket: VLADenoiseShapeBucket,
-        step_fn: Callable[..., Any],
-        *args,
-        **kwargs,
-    ) -> Any:
-        if (
-            not self.enabled
-            or kwargs
-            or bucket in self._disabled_buckets
-            or len(args) != 3
-        ):
-            return step_fn(*args, **kwargs)
+        signature: VLADenoiseGraphSignature,
+        step_fn: Callable[..., torch.Tensor],
+        prefix_context: PrefixContext,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.enabled or signature in self._disabled_signatures:
+            return step_fn(prefix_context, x_t, timestep)
 
-        prefix_context, x_t, timestep = args
-        if not isinstance(prefix_context, PrefixContext) or x_t.device.type != "cuda":
-            return step_fn(*args, **kwargs)
+        if x_t.device.type != "cuda":
+            return step_fn(prefix_context, x_t, timestep)
 
-        captured = self._captured.get(bucket)
+        captured = self._captured.get(signature)
         try:
             if captured is None:
-                captured = self._capture(bucket, step_fn, prefix_context, x_t, timestep)
+                captured = self._capture(
+                    signature, step_fn, prefix_context, x_t, timestep
+                )
                 captured.graph.replay()
             else:
                 self._sync_context_if_needed(captured, prefix_context)
@@ -181,11 +177,11 @@ class VLADenoiseGraphRunner:
                 captured.graph.replay()
             return captured.static_output
         except Exception:
-            self._disabled_buckets.add(bucket)
-            self._captured.pop(bucket, None)
+            self._disabled_signatures.add(signature)
+            self._captured.pop(signature, None)
             logger.warning(
-                "VLA denoise CUDA graph disabled for bucket %s",
-                bucket,
+                "VLA denoise CUDA graph disabled for signature %s",
+                signature,
                 exc_info=True,
             )
-            return step_fn(*args, **kwargs)
+            return step_fn(prefix_context, x_t, timestep)

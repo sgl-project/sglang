@@ -16,7 +16,6 @@ from transformers.models.gemma.modeling_gemma import GemmaConfig
 from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import VLADensePrefixCache
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
@@ -32,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.vla.prefix_cache import VLADensePrefixCache
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
