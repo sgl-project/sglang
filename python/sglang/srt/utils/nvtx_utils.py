@@ -71,6 +71,12 @@ _NVTX_COLOR_MAP = {
     "scheduler.event_loop_overlap": "teal",
     "scheduler.update_running_batch": "orange",
     "scheduler.get_new_batch_prefill": "magenta",
+    # Pipeline-parallel event loops
+    "scheduler.event_loop_pp": "dark_blue",
+    "scheduler.event_loop_pp_disagg_prefill": "teal",
+    "scheduler.event_loop_pp_disagg_decode": "magenta",
+    # PP batch launch
+    "scheduler._pp_launch_batch": "red",
 }
 
 _NULL_CONTEXT = nullcontext()

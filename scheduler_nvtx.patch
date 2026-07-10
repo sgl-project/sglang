@@ -1,32 +1,188 @@
+diff --git a/python/sglang/srt/kv_transfer_checksum.py b/python/sglang/srt/kv_transfer_checksum.py
+new file mode 100644
+index 0000000000..c87aad765c
+--- /dev/null
++++ b/python/sglang/srt/kv_transfer_checksum.py
+@@ -0,0 +1,153 @@
++# Copyright 2023-2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""SHA-256 checksum verification for PD disaggregation KV cache transfers.
++
++When ``SGLANG_ENABLE_KV_TRANSFER_CHECKSUM`` is set, each KV cache transfer
++between the prefill and decode workers is verified with a deterministic
++checksum. This catches silent data corruption that can occur over high-speed
++network links during disaggregated serving.
++
++Extended by JoyFuture: initial implementation of KV transfer checksum
++verification for PD disaggregation debugging.
++"""
++
++import hashlib
++import logging
++import threading
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++
++def compute_kv_checksum(kv_tensor: torch.Tensor) -> str:
++    """Compute a deterministic SHA-256 checksum of a KV cache tensor.
++
++    The tensor is moved to CPU and hashed over its raw bytes. The first
++    16 hex characters of the hash are returned as a compact checksum
++    sufficient for collision detection in typical workloads.
++
++    Args:
++        kv_tensor: The KV cache tensor to hash. Can be on any device.
++
++    Returns:
++        A 16-character hex string checksum, or ``"none"`` if the input
++        is ``None``.
++    """
++    if kv_tensor is None:
++        return "none"
++    cpu_tensor = kv_tensor.detach().cpu()
++    h = hashlib.sha256()
++    h.update(cpu_tensor.numpy().tobytes())
++    return h.hexdigest()[:16]
++
++
++@dataclass
++class KVTransferChecksumRecord:
++    """Record of a single KV transfer with before/after checksums."""
++
++    request_id: str
++    layer_idx: int
++    pre_checksum: str
++    post_checksum: str
++    num_tokens: int = 0
++    matched: bool = True
++    timestamp: float = 0.0
++
++    def __post_init__(self):
++        if self.timestamp == 0.0:
++            self.timestamp = __import__("time").monotonic()
++        if self.pre_checksum != self.post_checksum:
++            self.matched = False
++
++
++@dataclass
++class KVTransferChecksumVerifier:
++    """Batch checksum verifier for PD disaggregation transfers.
++
++    Tracks checksums across multiple layers and requests, and reports
++    any mismatches. Designed to be called from the transfer code path
++    when ``SGLANG_ENABLE_KV_TRANSFER_CHECKSUM`` is active.
++
++    Usage::
++
++        verifier = KVTransferChecksumVerifier()
++        # Before transfer
++        pre = compute_kv_checksum(kv_cache)
++        verifier.record_pre(request_id, layer_idx, pre)
++        # ... perform transfer ...
++        # After transfer
++        post = compute_kv_checksum(destination_kv_cache)
++        record = verifier.record_post(request_id, layer_idx, post)
++        if not record.matched:
++            logger.warning("Checksum mismatch: %s", record)
++    """
++
++    records: List[KVTransferChecksumRecord] = field(default_factory=list)
++    _pre_checksums: Dict[str, str] = field(default_factory=dict)
++    lock: threading.Lock = field(default_factory=threading.Lock)
++
++    def _key(self, request_id: str, layer_idx: int) -> str:
++        return f"{request_id}:{layer_idx}"
++
++    def record_pre(self, request_id: str, layer_idx: int, checksum: str) -> None:
++        """Record the checksum before a KV transfer."""
++        with self.lock:
++            self._pre_checksums[self._key(request_id, layer_idx)] = checksum
++
++    def record_post(
++        self, request_id: str, layer_idx: int, post_checksum: str, num_tokens: int = 0
++    ) -> KVTransferChecksumRecord:
++        """Record the checksum after a KV transfer and compare.
++
++        Returns the checksum record. If there is a mismatch, the record's
++        ``matched`` field will be ``False`` and a warning is logged.
++        """
++        key = self._key(request_id, layer_idx)
++        with self.lock:
++            pre_checksum = self._pre_checksums.pop(key, "unknown")
++        record = KVTransferChecksumRecord(
++            request_id=request_id,
++            layer_idx=layer_idx,
++            pre_checksum=pre_checksum,
++            post_checksum=post_checksum,
++            num_tokens=num_tokens,
++        )
++        with self.lock:
++            self.records.append(record)
++        if not record.matched:
++            logger.warning(
++                "KV transfer checksum mismatch: request=%s layer=%d pre=%s post=%s",
++                request_id,
++                layer_idx,
++                pre_checksum,
++                post_checksum,
++            )
++        return record
++
++    def get_mismatches(self) -> List[KVTransferChecksumRecord]:
++        """Return all checksum records that did not match."""
++        return [r for r in self.records if not r.matched]
++
++    def get_summary(self) -> dict:
++        """Return summary statistics for all recorded transfers."""
++        total = len(self.records)
++        mismatches = len(self.get_mismatches())
++        return {
++            "total_transfers": total,
++            "mismatches": mismatches,
++            "match_rate_pct": round((total - mismatches) / total * 100, 2) if total > 0 else 0,
++        }
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index d464e74af2..94aeaf6aab 100644
+index d464e74af2..913a3c34f5 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -270,6 +270,9 @@ from sglang.srt.utils.hf_transformers_utils import (
+@@ -270,6 +270,8 @@ from sglang.srt.utils.hf_transformers_utils import (
  from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
  from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
  from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 +from sglang.srt.scheduler_env_vars import scheduler_envs
 +from sglang.srt.request_latency_tracker import RequestLatencyTracker
-+from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
  from sglang.srt.utils.tensor_bridge import use_mlx
  from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
  from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-@@ -396,6 +399,13 @@ class Scheduler(
+@@ -396,6 +398,11 @@ class Scheduler(
          # Init metrics stats
          self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
  
-+        # Init JoyFuture scheduler observability (latency tracking + KV checksum)
++        # Init JoyFuture scheduler observability (latency tracking)
 +        self.latency_tracker = RequestLatencyTracker(
 +            enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
 +        )
-+        self.kv_checksum_verifier = KVTransferChecksumVerifier() if scheduler_envs.SGLANG_ENABLE_KV_TRANSFER_CHECKSUM.get() else None
-+        self._decode_step_counter = 0
 +
          # Init inter-process communication
          self.init_ipc_channels(port_args)
          self.init_idle_sleeper()
-@@ -1529,6 +1539,7 @@ class Scheduler(
+@@ -1529,6 +1536,7 @@ class Scheduler(
              self.schedule_stream.wait_stream(self.forward_stream)
  
      @DynamicGradMode()
@@ -34,7 +190,7 @@ index d464e74af2..94aeaf6aab 100644
      def event_loop_normal(self):
          """A normal scheduler loop."""
          while True:
-@@ -1563,6 +1574,7 @@ class Scheduler(
+@@ -1563,6 +1571,7 @@ class Scheduler(
                  self.invariant_checker.self_check_during_busy()
  
      @DynamicGradMode()
@@ -42,7 +198,18 @@ index d464e74af2..94aeaf6aab 100644
      def event_loop_overlap(self):
          """A scheduler loop that overlaps the CPU processing and GPU computation."""
          self.result_queue: Deque[
-@@ -1676,6 +1688,12 @@ class Scheduler(
+@@ -1608,7 +1617,9 @@ class Scheduler(
+                     try:
+                         self.token_to_kv_pool_allocator.flush_opportunistic()
+                     except Exception:
+-                        pass
++                        logger.debug(
++                            "Opportunistic KV pool flush failed (non-critical)"
++                        )
+ 
+             # Launch the current batch
+             if batch:
+@@ -1676,6 +1687,12 @@ class Scheduler(
          now = time.monotonic()
          self.session_controller.maybe_reap(now)
          for recv_req in recv_reqs:
@@ -55,7 +222,7 @@ index d464e74af2..94aeaf6aab 100644
              # Skip health check when server is busy — ongoing requests already carry health info.
              if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                  for_health_check=True
-@@ -2740,6 +2758,7 @@ class Scheduler(
+@@ -2740,6 +2757,7 @@ class Scheduler(
          res = min(res, self.req_to_token_pool.available_size())
          return res
  
@@ -63,7 +230,7 @@ index d464e74af2..94aeaf6aab 100644
      def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
          prefill_delayer_single_pass = None
          if self.prefill_delayer:
-@@ -3051,6 +3070,7 @@ class Scheduler(
+@@ -3051,6 +3069,7 @@ class Scheduler(
                  new_lora_set
              )
  
@@ -71,7 +238,7 @@ index d464e74af2..94aeaf6aab 100644
      def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
          """Update the current running decoding batch."""
          initial_bs = batch.batch_size()
-@@ -3465,6 +3485,16 @@ class Scheduler(
+@@ -3465,6 +3484,16 @@ class Scheduler(
      ):
          self.publish_load_snapshot(force=batch.forward_mode.is_extend())
  
@@ -88,7 +255,7 @@ index d464e74af2..94aeaf6aab 100644
          if batch.forward_mode.is_decode():
              self.batch_result_processor.process_batch_result_decode(batch, result)
          elif batch.forward_mode.is_extend():
-@@ -3479,6 +3509,16 @@ class Scheduler(
+@@ -3479,6 +3508,12 @@ class Scheduler(
          elif batch.forward_mode.is_idle():
              self.batch_result_processor.process_batch_result_idle(batch, result)
  
@@ -98,14 +265,21 @@ index d464e74af2..94aeaf6aab 100644
 +                if req.finished() and not req.is_retracted:
 +                    self.latency_tracker.end_request(req.rid)
 +
-+        # JoyFuture: count decode steps for KV cache clear scheduling
-+        if batch.forward_mode.is_decode():
-+            self._decode_step_counter += 1
-+
          self.metrics_reporter.log_batch_result_stats(batch, result)
  
          # Emit forward pass metrics (every iteration when enabled)
-@@ -3880,6 +3920,18 @@ class Scheduler(
+@@ -3549,7 +3584,9 @@ class Scheduler(
+             try:
+                 self.token_to_kv_pool_allocator.flush_opportunistic()
+             except Exception:
+-                pass
++                logger.debug(
++                    "Opportunistic KV pool flush during idle failed (non-critical)"
++                )
+ 
+         # memory leak check (skipped for hisparse — pool counters intentionally
+         # diverge during host-backup, see _get_swa_token_info clamp).
+@@ -3880,6 +3917,18 @@ class Scheduler(
          return RpcReqOutput(success=success, message="" if not exec else str(exec))
  
      def abort_request(self, recv_req: AbortReq):
@@ -124,12 +298,217 @@ index d464e74af2..94aeaf6aab 100644
          if (chunked_req := self.chunked_req) is not None:
              if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                  self._pending_chunked_abort_req = chunked_req
+diff --git a/python/sglang/srt/request_latency_tracker.py b/python/sglang/srt/request_latency_tracker.py
+new file mode 100644
+index 0000000000..eacba03ab7
+--- /dev/null
++++ b/python/sglang/srt/request_latency_tracker.py
+@@ -0,0 +1,199 @@
++# Copyright 2023-2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Per-request latency callback for debugging agentic workloads.
++
++When SGLANG_ENABLE_PER_REQUEST_LATENCY is set, each request tracks the
++end-to-end latency broken down by phase: prefill time, decode time, and
++transfer time. This is emitted as structured log entries that can be
++aggregated offline or streamed to a monitoring backend.
++
++Extended by JoyFuture: initial implementation of the per-request latency
++tracking infrastructure.
++"""
++
++import logging
++import time
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class PhaseLatency:
++    """Latency breakdown for a single phase of request processing."""
++
++    phase: str  # "prefill", "decode", "transfer", "sample"
++    start_time: float = 0.0
++    end_time: float = 0.0
++    num_tokens: int = 0
++
++    @property
++    def elapsed_ms(self) -> float:
++        if self.start_time > 0 and self.end_time > 0:
++            return (self.end_time - self.start_time) * 1000.0
++        return 0.0
++
++    @property
++    def tokens_per_second(self) -> float:
++        if self.elapsed_ms > 0 and self.num_tokens > 0:
++            return self.num_tokens / (self.elapsed_ms / 1000.0)
++        return 0.0
++
++
++@dataclass
++class RequestLatencyRecord:
++    """Complete latency record for a single request lifecycle."""
++
++    request_id: str
++    rid: str
++    start_time: float = 0.0
++    end_time: float = 0.0
++    num_input_tokens: int = 0
++    num_output_tokens: int = 0
++    phases: Dict[str, PhaseLatency] = field(default_factory=dict)
++    retracted_count: int = 0
++    aborted: bool = False
++    abort_reason: Optional[str] = None
++
++    def start_phase(self, phase: str) -> None:
++        self.phases[phase] = PhaseLatency(phase=phase, start_time=time.monotonic())
++
++    def end_phase(self, phase: str, num_tokens: int = 0) -> None:
++        if phase in self.phases:
++            self.phases[phase].end_time = time.monotonic()
++            self.phases[phase].num_tokens = num_tokens
++
++    @property
++    def total_elapsed_ms(self) -> float:
++        if self.start_time > 0 and self.end_time > 0:
++            return (self.end_time - self.start_time) * 1000.0
++        return 0.0
++
++    @property
++    def time_to_first_token_ms(self) -> float:
++        prefill = self.phases.get("prefill")
++        if prefill and prefill.end_time > 0:
++            return (prefill.end_time - self.start_time) * 1000.0
++        return 0.0
++
++    def to_log_dict(self) -> dict:
++        return {
++            "request_id": self.request_id,
++            "rid": self.rid,
++            "total_elapsed_ms": round(self.total_elapsed_ms, 2),
++            "time_to_first_token_ms": round(self.time_to_first_token_ms, 2),
++            "num_input_tokens": self.num_input_tokens,
++            "num_output_tokens": self.num_output_tokens,
++            "retracted_count": self.retracted_count,
++            "aborted": self.aborted,
++            "abort_reason": self.abort_reason or "",
++            "phases": {
++                name: {
++                    "elapsed_ms": round(p.elapsed_ms, 2),
++                    "tokens_per_second": round(p.tokens_per_second, 2),
++                    "num_tokens": p.num_tokens,
++                }
++                for name, p in self.phases.items()
++            },
++        }
++
++
++class RequestLatencyTracker:
++    """Tracks per-request latency across the scheduler pipeline.
++
++    Usage::
++
++        tracker = RequestLatencyTracker(enabled=True)
++        record = tracker.start_request(req)
++        # ... request goes through prefill, decode, etc ...
++        tracker.end_phase(record.rid, "prefill", num_tokens=100)
++        tracker.end_phase(record.rid, "decode", num_tokens=50)
++        record = tracker.end_request(record.rid)
++        if record:
++            logger.info(f"Request {record.rid} completed in {record.total_elapsed_ms:.1f}ms")
++    """
++
++    def __init__(self, enabled: bool = False):
++        self.enabled = enabled
++        self._records: Dict[str, RequestLatencyRecord] = {}
++        self._completed: List[RequestLatencyRecord] = []
++
++    def start_request(self, req) -> Optional[RequestLatencyRecord]:
++        """Start tracking a new request. Returns the latency record, or None if disabled."""
++        if not self.enabled:
++            return None
++        record = RequestLatencyRecord(
++            request_id=getattr(req, "request_id", str(req.rid)),
++            rid=str(req.rid),
++            start_time=time.monotonic(),
++            num_input_tokens=len(getattr(req, "origin_input_ids", [])),
++        )
++        self._records[record.rid] = record
++        return record
++
++    def start_phase(self, rid: str, phase: str) -> None:
++        """Mark the start of a processing phase for a request."""
++        record = self._records.get(rid)
++        if record:
++            record.start_phase(phase)
++
++    def end_phase(self, rid: str, phase: str, num_tokens: int = 0) -> None:
++        """Mark the end of a processing phase for a request."""
++        record = self._records.get(rid)
++        if record:
++            record.end_phase(phase, num_tokens)
++
++    def record_retraction(self, rid: str) -> None:
++        """Record that a request was retracted."""
++        record = self._records.get(rid)
++        if record:
++            record.retracted_count += 1
++
++    def end_request(self, rid: str, aborted: bool = False, abort_reason: str = None) -> Optional[RequestLatencyRecord]:
++        """Mark a request as completed and return its latency record."""
++        record = self._records.pop(rid, None)
++        if record:
++            record.end_time = time.monotonic()
++            record.aborted = aborted
++            record.abort_reason = abort_reason
++            self._completed.append(record)
++            if self.enabled:
++                logger.info(
++                    "Request latency: %s",
++                    record.to_log_dict(),
++                )
++            return record
++        return None
++
++    def get_recent_records(self, n: int = 10) -> List[RequestLatencyRecord]:
++        """Return the N most recently completed latency records."""
++        return self._completed[-n:] if self._completed else []
++
++    def get_summary(self) -> dict:
++        """Return aggregated latency statistics across all completed requests."""
++        if not self._completed:
++            return {}
++        total = len(self._completed)
++        ttfts = [r.time_to_first_token_ms for r in self._completed if not r.aborted]
++        totals = [r.total_elapsed_ms for r in self._completed if not r.aborted]
++        return {
++            "total_requests": total,
++            "completed_requests": len([r for r in self._completed if not r.aborted]),
++            "aborted_requests": len([r for r in self._completed if r.aborted]),
++            "avg_ttft_ms": round(sum(ttfts) / len(ttfts), 2) if ttfts else 0,
++            "avg_total_ms": round(sum(totals) / len(totals), 2) if totals else 0,
++            "p50_total_ms": round(sorted(totals)[len(totals) // 2], 2) if totals else 0,
++            "p95_total_ms": round(sorted(totals)[int(len(totals) * 0.95)], 2) if totals else 0,
++        }
 diff --git a/python/sglang/srt/scheduler_env_vars.py b/python/sglang/srt/scheduler_env_vars.py
 new file mode 100644
-index 0000000000..168931200e
+index 0000000000..76db8a1f54
 --- /dev/null
 +++ b/python/sglang/srt/scheduler_env_vars.py
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,38 @@
 +# Copyright 2023-2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -154,28 +533,17 @@ index 0000000000..168931200e
 +
 +
 +class SchedulerEnvs(Envs):
-+    # Controls whether the scheduler emits per-request latency callbacks to the
-+    # metrics reporter. When enabled, each token generation records the end-to-end
-+    # latency broken down by phase (prefill, decode, transfer). This is useful for
-+    # debugging agentic workloads where request latency is highly variable.
-+    SGLANG_ENABLE_PER_REQUEST_LATENCY = EnvBool(False)
++# Controls whether the scheduler emits per-request latency callbacks to the
++# metrics reporter. When enabled, each token generation records the end-to-end
++# latency broken down by phase (prefill, decode, transfer). This is useful for
++# debugging agentic workloads where request latency is highly variable.
++SGLANG_ENABLE_PER_REQUEST_LATENCY = EnvBool(False)
 +
-+    # Controls whether the scheduler verifies KV cache transfer integrity by
-+    # computing and comparing checksums on PD disaggregation transfers. When
-+    # enabled, mismatches are logged as warnings and the affected requests are
-+    # retried. Adds ~1-2% overhead to PD transfer bandwidth.
-+    SGLANG_ENABLE_KV_TRANSFER_CHECKSUM = EnvBool(False)
-+
-+    # Number of decode steps after which the scheduler forces a KV cache clear
-+    # in the decode pool. This is a tuning knob for long-running decode batches
-+    # where the KV cache pool tends to fragment over time. Set to 0 to disable.
-+    SGLANG_DECODE_CLEAR_STEPS = EnvInt(0)
-+
-+    # When the KV cache pool drops below this percentage of free space (0-100),
-+    # the scheduler will retract running decode requests. This is a more
-+    # aggressive variant of the existing retraction logic. Set to 0 to use
-+    # the default behavior.
-+    SGLANG_KV_POOL_RETRACT_THRESHOLD_PCT = EnvInt(0)
++# Controls whether the scheduler verifies KV cache transfer integrity by
++# computing and comparing checksums on PD disaggregation transfers. When
++# enabled, mismatches are logged as warnings and the affected requests are
++# retried. Adds ~1-2% overhead to PD transfer bandwidth.
++SGLANG_ENABLE_KV_TRANSFER_CHECKSUM = EnvBool(False)
 +
 +
 +scheduler_envs = SchedulerEnvs()

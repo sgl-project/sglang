@@ -39,6 +39,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ class PPBatchMetadata:
 
 class SchedulerPPMixin:
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_pp", color="dark_blue")
     def event_loop_pp(self: Scheduler):
         """
         A scheduler loop for pipeline parallelism.
@@ -174,6 +176,7 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_pp_disagg_prefill", color="teal")
     def event_loop_pp_disagg_prefill(self: Scheduler):
         """
         This is the prefill server event loop for pipeline parallelism.
@@ -358,6 +361,7 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_pp_disagg_decode", color="magenta")
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.init_pp_loop_state()
 
@@ -1255,6 +1259,7 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
+    @scheduler_nvtx_method("scheduler._pp_launch_batch", color="red")
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,
