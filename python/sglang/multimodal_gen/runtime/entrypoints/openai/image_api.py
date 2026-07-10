@@ -91,14 +91,15 @@ def _build_image_response_kwargs(
     result: OutputBatch,
     *,
     b64_list: list[str] | None = None,
-    cloud_url: str | None = None,
+    cloud_urls: list[str | None] | None = None,
     fallback_url: str | None = None,
     is_persistent: bool = True,
 ) -> dict:
     """Build ImageResponse data list.
 
     For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
-    For url: uses cloud_url or fallback_url.
+    For url: one data item per generated image — a cloud url per image, or the
+    local content endpoint with ?variant=N for outputs after the first.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
     ret = None
@@ -115,25 +116,33 @@ def _build_image_response_kwargs(
         ]
         ret = {"data": data}
     elif resp_format == "url":
-        url = cloud_url or fallback_url
-        if not url:
+        urls = list(cloud_urls or [])
+        if urls and any(urls):
+            data = [
+                ImageResponseData(
+                    url=url,
+                    revised_prompt=prompt,
+                    file_path=None,
+                )
+                for url in urls
+            ]
+        elif fallback_url:
+            # variant 0 keeps the bare content URL for backward compatibility;
+            # later outputs are served via ?variant=N.
+            data = [
+                ImageResponseData(
+                    url=(f"{fallback_url}?variant={i}" if i else fallback_url),
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(path) if is_persistent else None,
+                )
+                for i, path in enumerate(save_file_path_list)
+            ]
+        else:
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
             )
-        ret = {
-            "data": [
-                ImageResponseData(
-                    url=url,
-                    revised_prompt=prompt,
-                    file_path=(
-                        os.path.abspath(save_file_path_list[0])
-                        if is_persistent
-                        else None
-                    ),
-                )
-            ],
-        }
+        ret = {"data": data}
     else:
         raise HTTPException(
             status_code=400, detail=f"response_format={resp_format} is not supported"
@@ -246,7 +255,11 @@ async def generations(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_urls = [
+            await cloud_storage.upload_and_cleanup(p) for p in save_file_path_list
+        ]
+        cloud_url = cloud_urls[0]
+        any_cloud = any(cloud_urls)
 
         is_persistent = server_args.output_path is not None
         await IMAGE_STORE.upsert(
@@ -256,6 +269,12 @@ async def generations(
                 "created_at": int(time.time()),
                 "file_path": None if cloud_url or not is_persistent else save_file_path,
                 "url": cloud_url,
+                "file_paths": (
+                    None
+                    if any_cloud or not is_persistent
+                    else list(save_file_path_list)
+                ),
+                "urls": cloud_urls,
             },
         )
 
@@ -266,7 +285,7 @@ async def generations(
             request_id,
             result,
             b64_list=b64_list,
-            cloud_url=cloud_url,
+            cloud_urls=cloud_urls,
             fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
             is_persistent=is_persistent,
         )
@@ -381,7 +400,11 @@ async def edits(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_urls = [
+            await cloud_storage.upload_and_cleanup(p) for p in save_file_path_list
+        ]
+        cloud_url = cloud_urls[0]
+        any_cloud = any(cloud_urls)
 
         is_persistent = server_args.output_path is not None
         is_input_persistent = server_args.input_save_path is not None
@@ -392,6 +415,12 @@ async def edits(
                 "created_at": int(time.time()),
                 "file_path": None if cloud_url or not is_persistent else save_file_path,
                 "url": cloud_url,
+                "file_paths": (
+                    None
+                    if any_cloud or not is_persistent
+                    else list(save_file_path_list)
+                ),
+                "urls": cloud_urls,
                 "input_image_paths": input_paths if is_input_persistent else None,
                 "num_input_images": len(input_paths),
             },
@@ -404,7 +433,7 @@ async def edits(
             request_id,
             result,
             b64_list=b64_list,
-            cloud_url=cloud_url,
+            cloud_urls=cloud_urls,
             fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
             is_persistent=is_persistent,
         )
@@ -420,13 +449,28 @@ async def download_image_content(
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    if item.get("url"):
+    try:
+        idx = int(variant) if variant is not None else 0
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid variant: {variant}")
+
+    # Prefer the per-variant lists; fall back to the single-image fields for
+    # items stored before this field existed.
+    urls = item.get("urls")
+    cloud_url = urls[idx] if urls and idx < len(urls) else item.get("url")
+    if cloud_url:
         raise HTTPException(
             status_code=400,
-            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {item.get('url')}",
+            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
-    file_path = item.get("file_path")
+    file_paths = item.get("file_paths")
+    if file_paths is not None:
+        if idx < 0 or idx >= len(file_paths):
+            raise HTTPException(status_code=404, detail=f"variant {idx} not found")
+        file_path = file_paths[idx]
+    else:
+        file_path = item.get("file_path") if idx == 0 else None
     if not file_path:
         raise HTTPException(
             status_code=404,
