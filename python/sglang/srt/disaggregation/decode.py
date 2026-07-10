@@ -93,6 +93,23 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
+def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
+    sample = hidden.detach()
+    if sample.numel() == 0:
+        return {"shape": list(sample.shape), "sum": 0.0, "absmax": 0.0, "l2": 0.0}
+    flat = sample.reshape(-1)
+    head = flat[: min(8, flat.numel())].float().cpu().tolist()
+    sample_f = sample.float()
+    return {
+        "shape": list(sample.shape),
+        "sum": round(float(sample_f.sum().item()), 6),
+        "absmax": round(float(sample_f.abs().max().item()), 6),
+        "l2": round(float(torch.linalg.vector_norm(sample_f).item()), 6),
+        "head": [round(float(x), 6) for x in head],
+    }
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -2000,6 +2017,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"pp_slices={pp_slice_summary}, "
                     f"row_count={hidden_len}"
                 )
+                if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+                    logger.info(
+                        "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
+                        {
+                            "path": "pd_decode_received",
+                            "rid": decode_req.req.rid,
+                            "hidden_start": received_hidden_start,
+                            "prefill_cached_len": prefill_cached_len,
+                            "summary": _dspark_hidden_debug_summary(hidden),
+                        },
+                    )
                 decode_req.req.prefill_tail_hidden_states_tensor = hidden
                 decode_req.req.prefill_tail_valid_mask = torch.ones(
                     (hidden.shape[0],), dtype=torch.bool, device="cpu"

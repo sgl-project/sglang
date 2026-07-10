@@ -103,6 +103,22 @@ logger = logging.getLogger(__name__)
 _STS_COLLECT_FLUSH_EVERY: int = 256
 
 
+def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
+    sample = hidden.detach()
+    if sample.numel() == 0:
+        return {"shape": list(sample.shape), "sum": 0.0, "absmax": 0.0, "l2": 0.0}
+    flat = sample.reshape(-1)
+    head = flat[: min(8, flat.numel())].float().cpu().tolist()
+    sample_f = sample.float()
+    return {
+        "shape": list(sample.shape),
+        "sum": round(float(sample_f.sum().item()), 6),
+        "absmax": round(float(sample_f.abs().max().item()), 6),
+        "l2": round(float(torch.linalg.vector_norm(sample_f).item()), 6),
+        "head": [round(float(x), 6) for x in head],
+    }
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -593,6 +609,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
+                {
+                    "path": "non_pd_prefill",
+                    "rids": [req.rid for req in batch.reqs],
+                    "positions": [
+                        int(positions[0].item()) if positions.numel() > 0 else -1,
+                        int(positions[-1].item()) if positions.numel() > 0 else -1,
+                    ],
+                    "summary": _dspark_hidden_debug_summary(
+                        logits_output.hidden_states
+                    ),
+                },
+            )
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
@@ -1134,9 +1165,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         cache_loc_2d = req_to_token[
             req_pool_indices.view(-1, 1), positions_2d.clamp_min(0)
         ]
+        target_hidden = tail_hidden.reshape(bs * tail_len, -1)[flat_mask]
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
+                {
+                    "path": "pd_decode_inject",
+                    "rids": [req.rid for req in batch.reqs],
+                    "position_range": [min_pos, max_pos],
+                    "summary": _dspark_hidden_debug_summary(target_hidden),
+                },
+            )
 
         self._kv_injector.inject_target_hidden(
-            target_hidden=tail_hidden.reshape(bs * tail_len, -1)[flat_mask],
+            target_hidden=target_hidden,
             cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
             positions=positions_2d.reshape(-1)[flat_mask],
         )
