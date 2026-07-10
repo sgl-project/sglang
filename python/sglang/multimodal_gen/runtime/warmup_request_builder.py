@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build synthetic diffusion warmup requests.
+"""Build synthetic generation warmup requests.
 
 Default server warmup should cover a representative serving path before the
 first real request, without copying user traffic. It starts from the model's
@@ -292,7 +292,7 @@ def should_include_warmup_image(
     server_args: ServerArgs, server_based_warmup: bool
 ) -> bool:
     task_type = server_args.pipeline_config.task_type
-    if not task_type.is_visual_gen():
+    if not supports_synthetic_warmup(server_args):
         return False
     if not task_type.accepts_image_input():
         return False
@@ -305,8 +305,9 @@ def should_include_warmup_image(
     return True
 
 
-def should_run_visual_warmup(server_args: ServerArgs) -> bool:
-    return server_args.pipeline_config.task_type.is_visual_gen()
+def supports_synthetic_warmup(server_args: ServerArgs) -> bool:
+    task_type = server_args.pipeline_config.task_type
+    return task_type.is_visual_gen() or task_type.is_mesh_gen()
 
 
 def build_warmup_reqs(
@@ -318,7 +319,7 @@ def build_warmup_reqs(
     server_based_warmup: bool = False,
 ) -> list[Req]:
     task_type = server_args.pipeline_config.task_type
-    if not should_run_visual_warmup(server_args):
+    if not supports_synthetic_warmup(server_args):
         return []
     sampling_defaults = get_model_sampling_defaults(server_args)
 

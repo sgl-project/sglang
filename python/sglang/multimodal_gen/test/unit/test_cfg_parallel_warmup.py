@@ -51,7 +51,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
     build_warmup_reqs,
     should_include_warmup_image,
-    should_run_visual_warmup,
+    supports_synthetic_warmup,
 )
 
 
@@ -646,13 +646,12 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             ModelTaskType.TI2V: True,
             ModelTaskType.I2I: True,
             ModelTaskType.I2V: True,
-            ModelTaskType.I2M: False,
+            ModelTaskType.I2M: True,
             ModelTaskType.VLA_ACTION: False,
         }
         request_based_expected = {
             task_type: task_type.accepts_image_input() for task_type in ModelTaskType
         }
-        request_based_expected[ModelTaskType.I2M] = False
         request_based_expected[ModelTaskType.VLA_ACTION] = False
 
         for task_type in ModelTaskType:
@@ -670,7 +669,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 task_type.name,
             )
 
-    def test_action_pipeline_skips_visual_warmup_before_sampling_defaults(self):
+    def test_action_pipeline_skips_synthetic_warmup_before_sampling_defaults(self):
         server_args = MagicMock()
         server_args.pipeline_config.task_type = ModelTaskType.VLA_ACTION
 
@@ -692,16 +691,57 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         get_defaults.assert_not_called()
         resolve_resolution.assert_not_called()
 
-    def test_action_pipeline_disables_client_visual_warmup(self):
+    def test_action_pipeline_disables_synthetic_warmup(self):
         server_args = MagicMock()
         server_args.warmup = True
         server_args.server_warmup = True
         server_args.warmup_resolutions = ["512x512"]
         server_args.pipeline_config.task_type = ModelTaskType.VLA_ACTION
 
-        self.assertFalse(should_run_visual_warmup(server_args))
+        self.assertFalse(supports_synthetic_warmup(server_args))
         self.assertFalse(should_run_synthetic_server_warmup(server_args))
         self.assertFalse(should_run_explicit_client_warmup(server_args))
+
+    def test_mesh_pipeline_builds_image_conditioned_warmup(self):
+        server_args = MagicMock()
+        server_args.warmup = True
+        server_args.server_warmup = True
+        server_args.warmup_steps = 1
+        server_args.warmup_resolutions = None
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.enable_breakable_cuda_graph = False
+        server_args.backend = "native"
+        server_args.pipeline_class_name = None
+        server_args.is_arg_explicitly_set.return_value = False
+        server_args.pipeline_config = SimpleNamespace(
+            task_type=ModelTaskType.I2M,
+            vae_stride=None,
+            vae_scale_factor=None,
+            vae_config=None,
+        )
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                return_value=SamplingParams(width=512, height=512),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_warmup.is_realtime_serving",
+                return_value=False,
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+            self.assertTrue(should_run_synthetic_server_warmup(server_args))
+
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].data_type, ModelTaskType.I2M.data_type())
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
     def test_server_based_warmup_keeps_ti2i_image_input(self):
         server_args = MagicMock()
