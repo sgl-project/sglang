@@ -179,7 +179,7 @@ if _is_cuda:
         fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import topk_softmax
+    from sglang.kernels.ops.moe import topk_softmax
 
     try:
         from sgl_kernel import topk_sigmoid

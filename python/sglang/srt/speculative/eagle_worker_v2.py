@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,

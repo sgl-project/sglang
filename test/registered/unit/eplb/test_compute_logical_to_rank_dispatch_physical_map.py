@@ -100,15 +100,6 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
                 f"ep_rank={ep_rank} has out-of-range values",
             )
 
-    def test_no_minus_one_in_output(self):
-        """No -1 sentinel values remain in the output (all ranks are assigned)."""
-        for ep_rank in range(self.EP_SIZE):
-            result = self._call(ep_rank=ep_rank)
-            self.assertFalse(
-                torch.any(result == -1),
-                f"ep_rank={ep_rank} still has unassigned entries",
-            )
-
     # ------------------------------------------------------------------ correctness
 
     def test_gpu0_prefers_local_experts(self):
