@@ -585,8 +585,8 @@ class Repro:
                 stmt_lines = lines[node.lineno - 1 : node.end_lineno]
                 own = dropped_alias.lineno
                 own_line = lines[own - 1]
-                on_own_line = (
-                    own_line.strip().rstrip(",").strip() == alias_text(dropped_alias)
+                on_own_line = own_line.strip().rstrip(",").strip() == alias_text(
+                    dropped_alias
                 )
                 has_comments = any("#" in ln for ln in stmt_lines)
                 # Preserve the exploded form -- delete just this alias's line -- when the
@@ -692,7 +692,8 @@ class Repro:
         definition whose annotations reference a type needs that type imported there. The
         import sorter orders the block, so the exact insertion point does not matter. A lone
         ``pass`` placeholder (the block's only statement) is dropped: populating an empty
-        ``TYPE_CHECKING`` block makes its placeholder redundant, so the target removes it."""
+        ``TYPE_CHECKING`` block makes its placeholder redundant, so the target removes it.
+        """
 
         def op(root: Path) -> None:
             path = root / rel
@@ -713,7 +714,9 @@ class Repro:
                             indent + import_stmt + nl
                         ]
                     else:
-                        lines.insert(node.body[-1].end_lineno, indent + import_stmt + nl)
+                        lines.insert(
+                            node.body[-1].end_lineno, indent + import_stmt + nl
+                        )
                     _write_source(path, "".join(lines))
                     return
             raise AssertionError(f"no `if TYPE_CHECKING:` block in {rel}")
