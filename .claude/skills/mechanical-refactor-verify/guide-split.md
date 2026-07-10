@@ -66,12 +66,21 @@ The body stays put:
   `Callable` argument.
 - Once `self` is gone → mark `@staticmethod`; the body **does not move**.
 - Call site: `self.foo(args)` → `TheClass.foo(args)`.
+- **Seed the destination's module-level scaffolding here too**, if the target module
+  lacks what the moved body needs — a `logger = logging.getLogger(__name__)`, a
+  module-level constant the body reads (`_is_hip = is_hip()`), and the `import` each
+  requires. This is destination groundwork (like a class skeleton, §4.4), **not** the
+  body: adding it in prep keeps the move a pure cut+paste. Folding it into the move
+  instead bundles a non-relocation edit and breaks the byte proof (the move would both
+  paste the body **and** author a new `logger`, which the whitelist does not forgive).
+  A move into a **new** module is the exception — there the whole header, logger
+  included, is authored in the move itself (§3.3).
 
 - The decorator and the qualifier are the only artifacts the move will carry — exactly
   what the whitelist (`spec-reproduction-utils.md` §2.1) forgives.
 
-**Check:** lint + tests pass; the diff is the body reshape plus the call-site qualifier;
-nothing moved.
+**Check:** lint + tests pass; the diff is the body reshape, the call-site qualifier, and
+any destination scaffolding seeded above; nothing moved.
 
 #### 3.1.2 Commit 2 — move: relocate to the module
 
@@ -221,6 +230,7 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 | Action | Bucket |
 |---|---|
 | target class skeleton + ctor + fields | mechanical (prep) |
+| destination module scaffolding (a `logger`, a module-level constant) the moved symbol needs, when moving into an **existing** module | mechanical (prep) |
 | `@dataclass(frozen=True, slots=True, kw_only=True)` decoration | mechanical (prep) |
 | composition wiring (`self.component = Target(...)`) | mechanical (prep) |
 | `Callable` getter injection for runtime-mutable state | mechanical (prep) |
