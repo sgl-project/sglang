@@ -51,8 +51,6 @@ class HiCacheMemoryPlan:
     budget_bytes: Optional[int]
     component_bytes: tuple[tuple[str, int], ...]
     pool_bytes: int
-    local_process_count: int
-    total_pool_bytes: int
     reserve_bytes: int
     available_bytes: int
     available_source: str
@@ -253,9 +251,8 @@ def build_hicache_memory_plan(
     page_num: Optional[int] = None,
     available_memory: Optional[tuple[int, str]] = None,
     reserve_bytes: int = HICACHE_HOST_MEMORY_RESERVE_BYTES,
-    local_process_count: Optional[int] = None,
 ) -> HiCacheMemoryPlan:
-    """Derive and validate one shared page count for all HiCache pools."""
+    """Derive and validate one per-rank page count for all HiCache pools."""
     if (host_size_gb is None) == (page_num is None):
         raise ValueError(
             "HiCache memory plan requires exactly one of host_size_gb or page_num."
@@ -292,19 +289,17 @@ def build_hicache_memory_plan(
         for name, bytes_per_token in components
     )
     pool_bytes = sum(value for _, value in component_bytes)
-    if local_process_count is None:
-        local_process_count = 1
-    if local_process_count <= 0:
-        raise ValueError(
-            f"HiCache local process count must be positive, got {local_process_count}."
-        )
-    total_pool_bytes = pool_bytes * local_process_count
     available_bytes, available_source = (
         available_memory
         if available_memory is not None
         else get_hicache_available_memory()
     )
-    required_bytes = total_pool_bytes + reserve_bytes
+    # Available memory is a live host/cgroup view. Allocations made by earlier
+    # local ranks are already subtracted from it, so multiplying this rank's
+    # plan by the local process count would double-count those allocations and
+    # make startup depend on rank timing. Validate the current rank here; the
+    # concrete pool allocators repeat the check immediately before allocation.
+    required_bytes = pool_bytes + reserve_bytes
     breakdown = ", ".join(
         f"{name}={value / 1e9:.2f} GB" for name, value in component_bytes
     )
@@ -319,9 +314,8 @@ def build_hicache_memory_plan(
         )
         raise ValueError(
             f"Not enough host memory for HiCache. {sizing} "
-            f"{pool_bytes / 1e9:.2f} GB per rank of pools "
-            f"({breakdown}), {total_pool_bytes / 1e9:.2f} GB across "
-            f"{local_process_count} local ranks, plus "
+            f"{pool_bytes / 1e9:.2f} GB of pools on this rank "
+            f"({breakdown}), plus "
             f"{reserve_bytes / 1e9:.2f} GB reserve, but only "
             f"{available_bytes / 1e9:.2f} GB is available from "
             f"{available_source}. Please reduce {size_option}."
@@ -334,14 +328,11 @@ def build_hicache_memory_plan(
     )
     logger.info(
         "HiCache total host-memory plan: %s, pages=%d, %s, "
-        "pools=%.2f GB/rank, local_ranks=%d, local_pools=%.2f GB, "
-        "reserve=%.2f GB, available=%.2f GB (%s).",
+        "pools=%.2f GB/rank, reserve=%.2f GB, available=%.2f GB (%s).",
         sizing,
         page_num,
         breakdown,
         pool_bytes / 1e9,
-        local_process_count,
-        total_pool_bytes / 1e9,
         reserve_bytes / 1e9,
         available_bytes / 1e9,
         available_source,
@@ -352,8 +343,6 @@ def build_hicache_memory_plan(
         budget_bytes=budget_bytes,
         component_bytes=component_bytes,
         pool_bytes=pool_bytes,
-        local_process_count=local_process_count,
-        total_pool_bytes=total_pool_bytes,
         reserve_bytes=reserve_bytes,
         available_bytes=available_bytes,
         available_source=available_source,

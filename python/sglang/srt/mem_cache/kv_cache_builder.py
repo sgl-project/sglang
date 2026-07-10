@@ -122,13 +122,6 @@ def _get_hicache_component_bytes_per_token(
     return components
 
 
-def _get_hicache_local_process_count(server_args: ServerArgs) -> int:
-    world_size = server_args.tp_size * server_args.pp_size
-    if not server_args.enable_dp_attention:
-        world_size *= server_args.dp_size
-    return world_size // server_args.nnodes
-
-
 def maybe_register_hicache_draft(
     *,
     tree_cache: BasePrefixCache,
@@ -312,7 +305,6 @@ def build_kv_cache(
                 component_bytes_per_token=components,
                 host_size_gb=fixed_host_size,
                 page_num=ratio_page_num,
-                local_process_count=_get_hicache_local_process_count(server_args),
             )
             params.hicache_host_page_num = plan.page_num
 

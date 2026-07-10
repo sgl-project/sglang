@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.mem_cache.kv_cache_builder import (
     _get_hicache_component_bytes_per_token,
-    _get_hicache_local_process_count,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
@@ -198,7 +197,6 @@ class TestHiCacheMemoryPlan(unittest.TestCase):
             },
             available_memory=(2_000_000_000, "test"),
             reserve_bytes=0,
-            local_process_count=1,
         )
 
         self.assertEqual(plan.page_num, 10_000_000)
@@ -225,7 +223,6 @@ class TestHiCacheMemoryPlan(unittest.TestCase):
                 },
                 available_memory=(1_050_000_000, "cgroup v2"),
                 reserve_bytes=100_000_000,
-                local_process_count=1,
             )
 
         message = str(context.exception)
@@ -233,17 +230,6 @@ class TestHiCacheMemoryPlan(unittest.TestCase):
         self.assertIn("draft KV=0.10 GB", message)
         self.assertIn("0.10 GB reserve", message)
         self.assertIn("cgroup v2", message)
-
-    def test_validation_accounts_for_all_local_ranks(self):
-        with self.assertRaisesRegex(ValueError, "4 local ranks"):
-            build_hicache_memory_plan(
-                host_size_gb=1,
-                page_size=10,
-                component_bytes_per_token={"target KV": 10},
-                available_memory=(3_500_000_000, "cgroup v2"),
-                reserve_bytes=0,
-                local_process_count=4,
-            )
 
     def test_ratio_page_count_still_validates_combined_pools(self):
         plan = build_hicache_memory_plan(
@@ -256,7 +242,6 @@ class TestHiCacheMemoryPlan(unittest.TestCase):
             },
             available_memory=(20_000, "test"),
             reserve_bytes=0,
-            local_process_count=1,
         )
 
         self.assertIsNone(plan.budget_bytes)
@@ -327,19 +312,6 @@ class TestHiCacheMemoryPlan(unittest.TestCase):
                 "draft KV": 256 * 8 * 3 * 2,
             },
         )
-
-    def test_local_process_count_includes_non_attention_dp_groups(self):
-        args = SimpleNamespace(
-            tp_size=4,
-            pp_size=2,
-            dp_size=3,
-            nnodes=2,
-            enable_dp_attention=False,
-        )
-        self.assertEqual(_get_hicache_local_process_count(args), 12)
-
-        args.enable_dp_attention = True
-        self.assertEqual(_get_hicache_local_process_count(args), 4)
 
 
 if __name__ == "__main__":
