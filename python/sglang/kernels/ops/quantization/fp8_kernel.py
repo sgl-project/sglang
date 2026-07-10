@@ -707,7 +707,7 @@ def sglang_per_token_group_quant_8bit(
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
 ):
-    from sglang.srt.layers.quantization.int8_kernel import (
+    from sglang.kernels.ops.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
     )
 

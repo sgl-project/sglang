@@ -22,10 +22,10 @@ from sgl_kernel.test_utils import (  # noqa: E402
     create_per_token_group_quant_test_data,
 )
 
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 

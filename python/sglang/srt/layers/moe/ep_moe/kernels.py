@@ -11,7 +11,7 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 
 if _is_cuda or _is_musa:
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
 
