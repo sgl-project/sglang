@@ -1934,9 +1934,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if dspark_pool is None:
                     raise RuntimeError("DSpark hidden row pool disappeared on decode.")
                 pp_slices = decode_req.dspark_hidden_pp_slices or {}
-                hidden_len = len(
+                raw_hidden_len = len(
                     next(iter(decode_req.dspark_hidden_dst_indices_by_pp.values()))
                 )
+                hidden_start = int(decode_req.dspark_hidden_start)
+                prefill_cached_len = int(cached_tokens[0].item())
+                received_hidden_start = min(
+                    max(hidden_start, prefill_cached_len),
+                    hidden_start + raw_hidden_len,
+                )
+                hidden_offset = received_hidden_start - hidden_start
+                hidden_len = raw_hidden_len - hidden_offset
                 full_hidden_size = sum(
                     int(pp_slice.get("slice_len", 0)) for pp_slice in pp_slices.values()
                 )
@@ -1963,9 +1971,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         pp_rank, dynamic_buffers.get(int(pp_rank))
                     )
                     if dynamic_buffer is not None:
-                        slice_hidden = dynamic_buffer[:hidden_len, :slice_len]
+                        slice_hidden = dynamic_buffer[
+                            hidden_offset : hidden_offset + hidden_len,
+                            :slice_len,
+                        ]
                     else:
-                        slice_hidden = dspark_pool.read(dst_indices)[:, :slice_len]
+                        slice_hidden = dspark_pool.read(
+                            dst_indices[hidden_offset : hidden_offset + hidden_len]
+                        )[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
                 received_target_layer_ids = []
                 pp_slice_summary = {}
@@ -1981,7 +1994,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"rid={decode_req.req.rid}, "
                     f"bootstrap_room={decode_req.req.bootstrap_room}, "
                     f"hidden_shape={tuple(hidden.shape)}, "
-                    f"hidden_start={decode_req.dspark_hidden_start}, "
+                    f"hidden_start={received_hidden_start}, "
+                    f"prefill_cached_len={prefill_cached_len}, "
                     f"target_layer_ids={received_target_layer_ids}, "
                     f"pp_slices={pp_slice_summary}, "
                     f"row_count={hidden_len}"
@@ -1991,7 +2005,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     (hidden.shape[0],), dtype=torch.bool, device="cpu"
                 )
                 decode_req.req.prefill_tail_hidden_start = (
-                    decode_req.dspark_hidden_start
+                    received_hidden_start
                 )
             else:
                 decode_req.req.prefill_tail_hidden_states_tensor = (
