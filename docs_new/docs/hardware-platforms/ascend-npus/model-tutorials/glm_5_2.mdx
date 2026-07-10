@@ -568,14 +568,12 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-Unlike other models that have a dedicated best practice page with benchmark data, GLM-5.2 does not yet have a standalone
-best practice page because 0Day support is still on daily build images and the tuning parameters have not been finalized.
-Ready-to-use deployment scripts for single-node, multi-node, and PD disaggregation scenarios are provided directly in the
-[Online service deployment](#online-service-deployment) section above instead. These scripts embed the recommended feature
-combinations and tuning parameters (e.g., DeepEP mode, speculative decoding, overlap schedule) for each scenario.
+GLM-5.2 has no standalone best practice page yet, as 0Day support is still on daily build images and tuning parameters
+are not finalized. Instead, the [Online service deployment](#online-service-deployment) section above provides
+ready-to-use scripts for single-node, multi-node, and PD disaggregation, each embedding the recommended feature
+combinations and tuning parameters (e.g., DeepEP mode, speculative decoding, overlap schedule).
 
-A dedicated best practice page will be added once the support lands in a stable SGLang release. In the meantime, for the
-full catalog of optimization features, their parameter details, and compatibility/conflict information,
+For the full catalog of optimization features and their parameter and compatibility details,
 see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
 
 ## Performance tuning
