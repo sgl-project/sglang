@@ -18,12 +18,11 @@ shards are first-class — not buried inside 70-line per-model loops. Mapping ta
 `StackedParamsDispatch`, `ExpertParamsDispatch`, and `RemapRegistry` instead of being
 copy-pasted 116 times across `srt/models/`.
 
-**Enables advanced weight flows (e.g. P2P / streaming updates).** A mergeable `WeightLoadResult`
-with per-shard records lets callers assert that a partial update batch finished, accumulate
-across multiple `load_weights` calls, and know exactly which runtime slot each HF tensor
-touched. The load / `post_load_weights` split separates tensor placement from optional
-GPU-specific derivation (MLA `w_kc`/`w_vc`, etc.), which advanced transports need to control
-independently.
+**Native weight-loading completeness check.** v2 loads call `verify_complete` to assert every
+expected runtime tensor was updated — no silent skips, no stragglers. A mergeable
+`WeightLoadResult` with per-shard records supports this check across single or batched
+`load_weights` calls. The load / `post_load_weights` split applies completeness verification
+after placement and before optional GPU-specific derivation (MLA `w_kc`/`w_vc`, etc.).
 
 All migrations stay behind `SGLANG_ENABLE_WEIGHT_LOADER_V2` (opt-in, default off). Legacy
 `load_weights` paths remain until explicitly removed per model.
