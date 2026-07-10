@@ -1493,6 +1493,8 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
+                if self.metrics_collector is not None:
+                    self.metrics_collector.observe_scheduler_abort("running_timeout")
 
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
@@ -1559,6 +1561,8 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            _loop_iter_start = time.monotonic()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1574,6 +1578,7 @@ class Scheduler(
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
+            dispatched = bool(batch)
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -1585,6 +1590,13 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=dispatched,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
 
     @DynamicGradMode()
     @scheduler_nvtx_method("scheduler.event_loop_overlap", color="teal")
@@ -1602,6 +1614,8 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+
+            _loop_iter_start = time.monotonic()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1638,6 +1652,7 @@ class Scheduler(
                         )
 
             # Launch the current batch
+            dispatched = bool(batch)
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
@@ -1656,6 +1671,13 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=dispatched,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
 
             # Update last_batch
             self.last_batch = batch
@@ -2440,6 +2462,8 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_scheduler_abort("queue_full")
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2471,6 +2495,8 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_abort("waiting_timeout")
 
     def handle_embedding_request(
         self,
@@ -3969,6 +3995,8 @@ class Scheduler(
                     aborted_rids.add(req.rid)
             for rid in aborted_rids:
                 self.latency_tracker.end_request(rid, aborted=True, abort_reason="user_abort")
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_abort("user_abort")
 
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):

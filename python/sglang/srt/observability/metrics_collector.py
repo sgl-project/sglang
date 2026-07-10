@@ -598,6 +598,36 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Scheduler health dashboard
+        # =================================================================
+        self.scheduler_loop_iterations_total = Counter(
+            name="sglang:scheduler_loop_iterations_total",
+            documentation="Total number of scheduler event loop iterations.",
+            labelnames=labels.keys(),
+        )
+        self.scheduler_loop_batch_dispatches_total = Counter(
+            name="sglang:scheduler_loop_batch_dispatches_total",
+            documentation="Total number of event loop iterations that dispatched a batch.",
+            labelnames=labels.keys(),
+        )
+        self.scheduler_loop_idle_total = Counter(
+            name="sglang:scheduler_loop_idle_total",
+            documentation="Total number of event loop iterations that went idle (no batch).",
+            labelnames=labels.keys(),
+        )
+        self.scheduler_loop_iteration_lag_ms = Histogram(
+            name="sglang:scheduler_loop_iteration_lag_ms",
+            documentation="Histogram of scheduler event loop iteration duration in ms.",
+            labelnames=labels.keys(),
+            buckets=(0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000),
+        )
+        self.scheduler_aborts_total = Counter(
+            name="sglang:scheduler_aborts_total",
+            documentation="Total number of aborted requests by reason.",
+            labelnames={**labels, "reason": ""},
+        )
+
+        # =================================================================
         # Utilization
         # =================================================================
         self.utilization = Gauge(
@@ -1202,6 +1232,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.min_free_slots_allocatable, num_allocatable_reqs)
         if delayed:
             self.min_free_slots_delay_total.labels(**self.labels).inc(1)
+
+    def observe_scheduler_loop_iteration(
+        self, dispatched_batch: bool, lag_ms: float
+    ) -> None:
+        self.scheduler_loop_iterations_total.labels(**self.labels).inc(1)
+        if dispatched_batch:
+            self.scheduler_loop_batch_dispatches_total.labels(**self.labels).inc(1)
+        else:
+            self.scheduler_loop_idle_total.labels(**self.labels).inc(1)
+        self._log_histogram(self.scheduler_loop_iteration_lag_ms, lag_ms)
+
+    def observe_scheduler_abort(self, reason: str) -> None:
+        self.scheduler_aborts_total.labels(**self.labels, reason=reason).inc(1)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
