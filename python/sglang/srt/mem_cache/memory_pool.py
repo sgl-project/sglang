@@ -382,6 +382,7 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
 
@@ -703,7 +704,7 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
-        if self.replayssm_write_pos is not None and envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
             assert bool((src_wp == 0).all().item()), (
@@ -1384,6 +1385,7 @@ class MHATokenToKVPool(KVCache):
         #   X = 16 / dtype_bytes — AITER-only (ignored elsewhere, no consumer kernel).
         # HND and vectorized_5d are mutually exclusive; HND takes precedence.
         self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
+        self.use_native_move_kv_cache = envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
         if kv_cache_layout is not None:
             # Explicit physical-layout selector wins over the platform default.
             # This is a label only; layouts that change buffer identity (e.g. the
@@ -1984,7 +1986,7 @@ class MHATokenToKVPool(KVCache):
         # Physical move strategy. Override for layouts that change buffer identity
         # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
         # per-layer buffers here ignore page_size in move_kv_cache_native.
-        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+        if self.use_native_move_kv_cache:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
 
@@ -3561,6 +3563,9 @@ class MiniMaxSparseKVPool(KVCache):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
+        self.use_minimax_fused_kv_index_store = (
+            envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
+        )
 
         local_dense_layer_ids = [
             lid for lid in dense_layer_ids if start_layer <= lid < end_layer
@@ -3773,7 +3778,7 @@ class MiniMaxSparseKVPool(KVCache):
         head byte size shared by main and index caches."""
         main = self.main_pool
         return (
-            envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
+            self.use_minimax_fused_kv_index_store
             and _is_cuda
             # No dtype conversion / fp8 scaling on either side (the fused kernel
             # is a raw byte copy, it does not quantize).

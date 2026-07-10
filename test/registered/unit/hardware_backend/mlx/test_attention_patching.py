@@ -1135,8 +1135,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
-        scheduler.cur_batch = None
+        scheduler.cur_batch_for_debug = None
         scheduler.last_batch = None
+        scheduler.running_batch = None
         scheduler.tp_worker = SimpleNamespace(
             async_forward_batch_generation_mlx=fake_forward
         )
@@ -1149,7 +1150,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = lambda: batch
+        scheduler.get_next_batch_to_run = (
+            lambda running_batch, last_batch: SimpleNamespace(
+                batch_to_run=batch, running_batch=running_batch
+            )
+        )
 
         with self.assertRaises(_StopLoop):
             scheduler.event_loop_overlap_mlx()

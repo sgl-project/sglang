@@ -147,6 +147,7 @@ class SchedulerMetricsReporter:
         self.kv_transfer_latency_ms: float = 0.0
 
         self.enable_mfu_metrics = False
+        self.decode_log_interval = self.scheduler.server_args.decode_log_interval
 
         if self.enable_metrics:
             self.enable_mfu_metrics = self.scheduler.server_args.enable_mfu_metrics
@@ -708,7 +709,7 @@ class SchedulerMetricsReporter:
                 x.maybe_dump(batch, self.scheduler.waiting_queue)
 
         # Periodic work: log + heavy metrics at decode_log_interval
-        if self.forward_ct_decode % self.scheduler.server_args.decode_log_interval != 0:
+        if self.forward_ct_decode % self.decode_log_interval != 0:
             return
         if (
             not self.is_stats_logging_rank
@@ -728,7 +729,7 @@ class SchedulerMetricsReporter:
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
-                gap_latency / self.scheduler.server_args.decode_log_interval
+                gap_latency / self.decode_log_interval
             )
 
         batch_iter = (
@@ -829,7 +830,7 @@ class SchedulerMetricsReporter:
             )
             msg += self._decode_sol_suffix(
                 batch,
-                gap_latency / max(1, self.scheduler.server_args.decode_log_interval),
+                gap_latency / max(1, self.decode_log_interval),
             )
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
@@ -1072,10 +1073,7 @@ class SchedulerMetricsReporter:
                     self._device_timer_window_gpu_time / cpu_time * 100, 100
                 )
         self._device_timer_window_batch_count += 1
-        if (
-            self._device_timer_window_batch_count
-            >= self.scheduler.server_args.decode_log_interval
-        ):
+        if self._device_timer_window_batch_count >= self.decode_log_interval:
             self._device_timer_window_batch_count = 0
 
     def reset_device_timer_window(self):

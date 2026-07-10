@@ -52,6 +52,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
+    NextBatchPlan,
     Req,
     ScheduleBatch,
 )
@@ -468,24 +469,28 @@ class SchedulerDisaggregationPrefillMixin:
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
-    ) -> Optional[ScheduleBatch]:
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+    ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
-        self.running_batch.batch_is_full = False
+        running_batch.batch_is_full = False
 
-        self.process_prefill_chunk()
+        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 
         self.resolve_waiting_queue_bootstrap()
 
-        batch = self.get_new_batch_prefill()
+        prefill_plan = self.get_new_batch_prefill(running_batch)
+        batch = prefill_plan.batch_to_run
+        running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
 
-        return batch
+        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -501,8 +506,12 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -535,8 +544,12 @@ class SchedulerDisaggregationPrefillMixin:
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -559,7 +572,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -940,7 +953,11 @@ class SchedulerDisaggregationPrefillMixin:
             req, polls[0], defer_release=self.enable_overlap
         )
 
-    def process_prefill_chunk(self: Scheduler) -> None:
+    def process_prefill_chunk(
+        self: Scheduler,
+        last_batch: Optional[ScheduleBatch],
+        running_batch: ScheduleBatch,
+    ) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
@@ -958,20 +975,18 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk(self.chunked_req)
 
             if self.chunked_req is not None:
-                self.running_batch.batch_is_full = False
+                running_batch.batch_is_full = False
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req:
+        if last_batch and last_batch.forward_mode.is_extend():
+            if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+                chunked_req_to_exclude.add(last_batch.chunked_req)
 
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
+            last_bs = last_batch.batch_size()
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            if last_batch.batch_size() < last_bs:
+                running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         # Only bootstrap-finalized requests; staging excluded.

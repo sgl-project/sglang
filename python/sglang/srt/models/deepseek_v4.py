@@ -1610,6 +1610,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
             return hidden_states, None, None, None
 
+        # Return the deferred FFN hc_post state; the next layer consumes it with
+        # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
     def _run_moe_ffn_dp_sync(

@@ -218,7 +218,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -293,7 +292,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        if self.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -1018,7 +1017,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
-            if self.model_runner.server_args.enable_return_hidden_states
+            if self.enable_return_hidden_states
             else CaptureHiddenMode.NULL
         )
 

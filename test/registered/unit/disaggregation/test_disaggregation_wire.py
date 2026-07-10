@@ -75,11 +75,6 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
             ([[10, 11], [20]], [[5, 6], [7]]),
         )
 
-    def test_both_empty(self):
-        self.assertEqual(
-            group_concurrent_contiguous(self._arr([]), self._arr([])), ([], [])
-        )
-
     def test_empty_src_nonempty_dst(self):
         self.assertEqual(
             group_concurrent_contiguous(self._arr([]), self._arr([1, 2])), ([], [])

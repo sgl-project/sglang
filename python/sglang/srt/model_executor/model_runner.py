@@ -3079,7 +3079,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.server_args.elastic_ep_backend is not None:
+        if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
         return output
