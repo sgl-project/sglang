@@ -24,12 +24,12 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.environ import envs
@@ -52,7 +52,6 @@ from sglang.srt.layers.deepseek_v4_rope import (
     v4_rope_inplace_npu,
 )
 from sglang.srt.layers.dp_attention import (
-    _DpGatheredBufferWrapper,
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -76,7 +75,6 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -125,7 +123,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -137,7 +135,7 @@ if _is_xpu:
 else:
     from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -348,7 +346,7 @@ class MQALayer(nn.Module):
             base=rope_base,
             rope_scaling=rope_scaling,
             is_neox_style=False,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
         )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
@@ -470,8 +468,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
-            and attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_parallel().tp_size and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -1090,15 +1087,11 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
-                group_size=128,
-                scale_ue8m0=True,
-            )
+            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                (o_fp8, o_s),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
@@ -1109,7 +1102,7 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
         return o
@@ -2059,7 +2052,7 @@ class DeepseekV4Model(nn.Module):
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
-                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
@@ -2175,7 +2168,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_flags().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2213,11 +2206,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        if get_flags().disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None
-        if get_global_server_args().enforce_shared_experts_fusion:
+        if get_server_args().enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "

@@ -11,7 +11,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
 )
-from sglang.srt.speculative.eagle_utils import TreeMaskMode
+from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
@@ -102,7 +102,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
         self.index_share_for_mtp_iteration = (
@@ -181,7 +181,10 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         )
 
         # Override the context length of the draft model to be the same as the target model.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         # Create our custom draft worker that doesn't share embeddings/lm_head
         self._draft_worker = StandaloneDraftWorker(
