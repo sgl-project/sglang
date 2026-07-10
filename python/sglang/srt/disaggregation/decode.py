@@ -1285,10 +1285,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if self.scheduler.enable_hisparse:
-            # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
-            # so the logical pool is the binding constraint for admission control.
+            # HiSparse pre-alloc allocates full-attention KV for the whole prompt
+            # but only the sliding-window tail for SWA layers (alloc_extend_swa_tail),
+            # so the FULL-attention pool is the binding constraint for the full
+            # request length here. Using logical_attn_allocator.available_size()
+            # (= min(full, swa)) would cap a single request at the SWA pool
+            # (~full/10), making any request with input+output > SWA pool
+            # un-admittable (stuck in PD transfer -> bootstrap timeout / hang).
+            # The SWA (tail) requirement is separately enforced by the swa_tail
+            # gate below.
             available_size = (
-                self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
+                self.token_to_kv_pool_allocator.logical_attn_allocator.full_available_size()
             )
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
@@ -1463,22 +1470,39 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
         if self.scheduler.enable_hisparse:
-            # HiSparse is incompatible with decode-side L1 radix cache. Keep
-            # this path on the upstream full-allocation semantics.
+            # HiSparse is incompatible with decode-side L1 radix cache.
             assert prefix_len == 0
 
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            if self._uses_swa_tail_prealloc():
+                # Tail-only SWA allocation: full-attention layers get the whole
+                # prompt, SWA layers only get the sliding-window tail. Without
+                # this, alloc_logical_only reserves SWA at full prompt length and
+                # a single long request nearly fills the SWA pool, stalling decode
+                # once the few spare pages run out before eviction catches up.
+                swa_tail = self._swa_tail_len(fill_len)
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                    swa_tail_len=swa_tail,
+                )
+                req.swa_evicted_seqlen = fill_len - swa_tail
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                )
 
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
