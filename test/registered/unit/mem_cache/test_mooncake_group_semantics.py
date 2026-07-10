@@ -302,6 +302,14 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             (["sglang-hicache:page0"], 15_000),
         )
 
+    def test_retention_requires_retain_groups_capability(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        delattr(type(fake_store), "retain_groups")
+
+        self.assertFalse(store._can_retain_groups())
+        self.assertEqual(store.retain_pages(["page0"], ttl_seconds=300), 0)
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(

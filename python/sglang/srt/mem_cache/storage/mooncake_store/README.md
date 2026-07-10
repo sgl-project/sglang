@@ -293,7 +293,7 @@ You can enable it in any of the three supported configuration methods:
 
 When `enable_group_semantics` is set to `true`, SGLang passes Mooncake `group_ids` for physical objects derived from the same logical HiCache page. This allows Mooncake to apply group-aware metadata routing, lease refresh, and eviction behavior to related KV objects such as MHA K/V pairs, split-head shards, MLA objects, and supported sidecar objects.
 
-This option is disabled by default. It requires a Mooncake version that exposes `ReplicateConfig.group_ids`. If the installed Mooncake package does not support it, SGLang automatically falls back to the existing write path and prints a warning.
+This option is disabled by default. It requires a Mooncake version that exposes `ReplicateConfig.group_ids`. If the installed Mooncake package does not support it, SGLang automatically falls back to the existing write path and prints a warning. KV retention hints additionally require Mooncake's `retain_groups` API and HiCache's `write_through` policy. SGLang queues retention on the storage worker and bounds each request to four hints, 8,192 unique pages, and a 24-hour TTL by default. The bounds can be changed with `retention_max_hints`, `retention_max_pages`, and `retention_max_ttl_seconds` in `--hicache-storage-backend-extra-config`.
 
 Example:
 

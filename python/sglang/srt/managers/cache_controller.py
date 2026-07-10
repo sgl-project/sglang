@@ -167,6 +167,12 @@ class StorageOperation:
         return self.id < other.id
 
 
+class RetentionOperation:
+    def __init__(self, logical_keys: List[str], ttl_seconds: int):
+        self.logical_keys = logical_keys
+        self.ttl_seconds = ttl_seconds
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -1077,6 +1083,10 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
+    def retain_storage(self, logical_keys: List[str], ttl_seconds: int) -> None:
+        """Queue a storage retention request without blocking the scheduler."""
+        self.backup_queue.put(RetentionOperation(logical_keys, ttl_seconds))
+
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
@@ -1191,6 +1201,12 @@ class HiCacheController:
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
+                    continue
+
+                if isinstance(operation, RetentionOperation):
+                    self.storage_backend.retain_pages(
+                        operation.logical_keys, operation.ttl_seconds
+                    )
                     continue
 
                 if not self.backup_skip:

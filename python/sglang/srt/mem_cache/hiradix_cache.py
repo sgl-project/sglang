@@ -204,6 +204,7 @@ class HiRadixCache(RadixCache):
         self.load_back_threshold = 10
         self._retention_unsupported_logged = False
         self._retention_apply_failed_logged = False
+        self._retention_bounded_logged = False
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -213,7 +214,7 @@ class HiRadixCache(RadixCache):
         super().__init__(params=params)
 
     def apply_kv_hints(self, req) -> int:
-        """Apply bounded L3 retention intent after its prefix is committed."""
+        """Queue bounded L3 retention intent after its prefix is committed."""
         hints = getattr(req, "kv_hints", None)
         retention = (
             hints.get("retention", [])
@@ -226,19 +227,28 @@ class HiRadixCache(RadixCache):
             and self.enable_storage
             and self.cache_controller.storage_backend_type == "mooncake"
             and self.cache_controller.write_policy == "write_through"
-            and getattr(backend, "_can_use_group_semantics", lambda: False)()
+            and getattr(backend, "_can_retain_groups", lambda: False)()
         )
         if not supported:
             if retention and not self._retention_unsupported_logged:
                 logger.warning(
                     "Ignoring KV retention hints: requires HiCache write_through "
-                    "with Mooncake group semantics"
+                    "with Mooncake retain_groups support"
                 )
                 self._retention_unsupported_logged = True
             return 0
 
-        accepted = 0
-        for hint in retention:
+        max_hints = backend.retention_max_hints
+        max_pages = backend.retention_max_pages
+        max_ttl_seconds = backend.retention_max_ttl_seconds
+        applied_indices = getattr(req, "_kv_retention_applied_indices", set())
+        page_ttls = getattr(req, "_kv_retention_page_ttls", {})
+        desired_page_ttls = {}
+        matched_indices = set()
+
+        for index, hint in enumerate(retention[:max_hints]):
+            if index in applied_indices:
+                continue
             try:
                 prefix_tokens = (
                     hint.get("prefix_tokens")
@@ -252,7 +262,8 @@ class HiRadixCache(RadixCache):
                 )
                 prefix_tokens = min(int(prefix_tokens), len(req.origin_input_ids))
                 prefix_tokens -= prefix_tokens % self.page_size
-                if prefix_tokens <= 0 or int(ttl_seconds) <= 0:
+                ttl_seconds = min(int(ttl_seconds), max_ttl_seconds)
+                if prefix_tokens <= 0 or ttl_seconds <= 0:
                     continue
 
                 key = RadixKey(
@@ -272,21 +283,49 @@ class HiRadixCache(RadixCache):
                 page_hashes = node.get_prefix_hash_values(node)
                 if len(page_hashes) != len(key) // self.page_size:
                     continue
-                retained_pages = backend.retain_pages(
-                    page_hashes, int(ttl_seconds)
-                )
-                accepted += retained_pages
-                logger.info(
-                    "Applied KV retention hint to %d/%d pages for %d seconds",
-                    retained_pages,
-                    len(page_hashes),
-                    int(ttl_seconds),
-                )
+                matched_indices.add(index)
+                for page_hash in page_hashes:
+                    desired_page_ttls[page_hash] = max(
+                        ttl_seconds, desired_page_ttls.get(page_hash, 0)
+                    )
             except Exception:
                 if not self._retention_apply_failed_logged:
                     logger.warning("Failed to apply KV retention hint", exc_info=True)
                     self._retention_apply_failed_logged = True
-        return accepted
+
+        updates_by_ttl = {}
+        bounded = len(retention) > max_hints
+        for page_hash, ttl_seconds in desired_page_ttls.items():
+            previous_ttl = page_ttls.get(page_hash, 0)
+            if ttl_seconds <= previous_ttl:
+                continue
+            if page_hash not in page_ttls and len(page_ttls) >= max_pages:
+                bounded = True
+                continue
+            page_ttls[page_hash] = ttl_seconds
+            updates_by_ttl.setdefault(ttl_seconds, []).append(page_hash)
+
+        for ttl_seconds, page_hashes in updates_by_ttl.items():
+            self.cache_controller.retain_storage(page_hashes, ttl_seconds)
+
+        applied_indices.update(matched_indices)
+        req._kv_retention_applied_indices = applied_indices
+        req._kv_retention_page_ttls = page_ttls
+        queued_pages = sum(len(page_hashes) for page_hashes in updates_by_ttl.values())
+        if queued_pages:
+            logger.info(
+                "Queued KV retention for %d pages across %d TTL groups",
+                queued_pages,
+                len(updates_by_ttl),
+            )
+        if bounded and not self._retention_bounded_logged:
+            logger.warning(
+                "Bounded KV retention hints to %d hints and %d unique pages per request",
+                max_hints,
+                max_pages,
+            )
+            self._retention_bounded_logged = True
+        return queued_pages
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
