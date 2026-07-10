@@ -29,7 +29,7 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import psutil
 import setproctitle
@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     async_sock_send,
     sock_recv,
     sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
@@ -122,17 +124,29 @@ def _extract_field_by_index(
     if field is None:
         return None
 
+    should_wrap_result = field_name in ("customized_info", "time_stats")
+    if should_wrap_result:
+        field = unwrap_from_pickle(field)
+        if field is None:
+            return None
+
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            new_field[k] = v[index] if len(v) > index else None
+            if len(v) > index:
+                new_field[k] = [v[index]] if should_wrap_result else v[index]
+            else:
+                new_field[k] = [None] if should_wrap_result else None
+        if should_wrap_result:
+            return wrap_as_pickle(new_field) if new_field else None
         return new_field
 
     if check_length:
         if len(field) <= index:
             return None
 
-    return [field[index]]
+    new_field = [field[index]]
+    return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
 def _handle_output_by_index(output, i):
@@ -587,14 +601,19 @@ class TokenizerWorker(TokenizerManager):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
+        server_args.override(
+            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
+        )
         super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
-        self.server_args.disaggregation_mode = disaggregation_mode
+        self.server_args.override(
+            "tokenizer_worker.restore_disaggregation_mode",
+            disaggregation_mode=disaggregation_mode,
+        )
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -658,6 +677,19 @@ class TokenizerWorker(TokenizerManager):
         if self._pause_continue_future and not self._pause_continue_future.done():
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
+
+
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerWorker
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
+            f"subclass, got {worker_class!r}"
+        )
+
+    return worker_class
 
 
 async def print_exception_wrapper(func):

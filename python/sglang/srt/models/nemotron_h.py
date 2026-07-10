@@ -87,8 +87,7 @@ from sglang.srt.models.nemotron_h_utils import (
     pad_to_original_num_tokens,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
@@ -191,7 +190,7 @@ class NemotronHMoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -495,11 +494,18 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(
+            self.norm,
+            for_attn=True,
+            is_last_layer=layer_idx == len(config.hybrid_override_pattern) - 1,
+        )
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def _forward_mamba(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         """Core Mamba forward logic, called directly or via split op."""
         original_num_tokens = hidden_states.shape[0]
@@ -517,6 +523,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             output=None,
             forward_batch=forward_batch,
             use_triton_causal_conv=True,
+            should_allreduce_fusion=should_allreduce_fusion,
         )
         return pad_to_original_num_tokens(output, original_num_tokens)
 
@@ -544,18 +551,30 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             self.norm, hidden_states, residual
         )
 
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
-            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
-            return output, residual
-
-        if is_in_tc_piecewise_cuda_graph():
+            breakable_nemotron_mamba2_with_output(
+                hidden_states, output, self.layer_id, should_allreduce_fusion
+            )
+        elif is_in_tc_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
-            nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
-            return output, residual
+            nemotron_mamba2_with_output(
+                hidden_states, output, self.layer_id, should_allreduce_fusion
+            )
         else:
-            output = self._forward_mamba(hidden_states, forward_batch)
-            return output, residual
+            output = self._forward_mamba(
+                hidden_states, forward_batch, should_allreduce_fusion
+            )
+
+        if should_allreduce_fusion:
+            output._sglang_needs_allreduce_fusion = True
+        return output, residual
 
 
 class NemotronHAttention(nn.Module):
@@ -625,13 +644,18 @@ class NemotronHAttention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if not is_dp_attention_enabled():
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             attn_output = self.attn.forward(q, k, v, forward_batch)
-            output, _ = self.o_proj(attn_output)
+            output, _ = self.o_proj(
+                attn_output, skip_all_reduce=should_allreduce_fusion
+            )
             return output
 
         padded_shape = hidden_states.shape[0]
@@ -682,7 +706,11 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(
+            self.norm,
+            for_attn=True,
+            is_last_layer=layer_idx == len(config.hybrid_override_pattern) - 1,
+        )
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def forward(
@@ -705,9 +733,19 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
             self.norm, hidden_states, residual
         )
 
-        hidden_states = self.mixer.forward(
-            hidden_states=hidden_states, forward_batch=forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
+
+        hidden_states = self.mixer.forward(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            should_allreduce_fusion=should_allreduce_fusion,
+        )
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states, residual
 
 
@@ -880,7 +918,7 @@ class NemotronHForCausalLM(nn.Module):
                         else lora_config.lora_vocab_padding_size
                     ),
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
@@ -1168,6 +1206,7 @@ def nemotron_mamba2_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
+    should_allreduce_fusion: bool = False,
 ) -> None:
     """Split op for Mamba2 forward in piecewise CUDA graph mode."""
     context = get_tc_piecewise_forward_context()
@@ -1187,7 +1226,9 @@ def nemotron_mamba2_with_output(
     if hidden_states.shape[0] != num_actual_tokens:
         hidden_states = hidden_states[:num_actual_tokens]
 
-    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+    ret = mamba_layer._forward_mamba(
+        hidden_states, forward_batch, should_allreduce_fusion
+    )
 
     # Copy result back; output may be larger (padded) so only fill actual tokens
     output[:num_actual_tokens].view(ret.shape).copy_(ret)

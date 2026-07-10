@@ -88,10 +88,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     run_multi_detokenizer_router_process,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.template_detection import resolve_auto_parsers
-from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.parser.template_detection import resolve_auto_parsers
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
@@ -165,7 +166,7 @@ def init_tokenizer_manager(
         if getattr(server_args, attr) != "auto":
             continue
         if suggested is not None:
-            setattr(server_args, attr, suggested)
+            server_args.override(source="template-detection", **{attr: suggested})
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
@@ -174,7 +175,7 @@ def init_tokenizer_manager(
                 f"--{attr.replace('_', '-')}=auto specified but could not detect "
                 f"{label} from chat template. Disabling {label}."
             )
-            setattr(server_args, attr, None)
+            server_args.override(source="template-detection", **{attr: None})
 
     return tokenizer_manager, template_manager
 
@@ -356,6 +357,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -391,6 +393,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -458,6 +461,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -493,6 +497,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -994,12 +999,14 @@ class Engine(EngineScoreMixin, EngineBase):
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-        return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
-            **self._scheduler_init_result.scheduler_infos[0],
-            "internal_states": internal_states,
-            "version": __version__,
-        }
+        return msgspec_to_builtins(
+            {
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self._scheduler_init_result.scheduler_infos[0],
+                "internal_states": internal_states,
+                "version": __version__,
+            }
+        )
 
     def init_weights_update_group(
         self,
@@ -1296,7 +1303,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.12",
+                "0.6.14",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
