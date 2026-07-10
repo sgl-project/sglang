@@ -387,7 +387,7 @@ class FlexKVComm:
             return []
         t_data = torch.empty(size, dtype=torch.uint8)
         dist.irecv(t_data, src=src, tag=tag, group=group).wait()
-        return pickle.loads(t_data.numpy().tobytes())
+        return safe_pickle_loads(t_data.numpy().tobytes())
 
     def _send_tensor(
         self, tensor: torch.Tensor, dst: int, tag: int = 0, group=None

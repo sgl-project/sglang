@@ -1361,7 +1361,7 @@ class GroupCoordinator:
         )
         work.wait()
 
-        obj = pickle.loads(object_tensor.numpy())
+        obj = safe_pickle_loads(object_tensor.numpy())
         return obj
 
     def broadcast_tensor_dict(

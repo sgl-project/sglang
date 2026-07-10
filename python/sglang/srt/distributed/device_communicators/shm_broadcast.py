@@ -464,13 +464,13 @@ class MessageQueue:
                     # no need to know the size of serialized object
                     # pickle format contains the size information internally
                     # see https://docs.python.org/3/library/pickle.html
-                    obj = pickle.loads(buf[1:])
+                    obj = safe_pickle_loads(buf[1:])
             if overflow:
                 recv = self.local_socket.recv()
-                obj = pickle.loads(recv)
+                obj = safe_pickle_loads(recv)
         elif self._is_remote_reader:
             recv = self.remote_socket.recv()
-            obj = pickle.loads(recv)
+            obj = safe_pickle_loads(recv)
         else:
             raise RuntimeError("Only readers can dequeue")
         return obj

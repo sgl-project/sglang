@@ -54,7 +54,7 @@ def broadcast_pyobj(
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = safe_pickle_loads(serialized_data)
         return data
 
 
