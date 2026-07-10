@@ -80,7 +80,7 @@ parent — but are included in the cumulative file count once smoke-tested.
 | `models/qwen2.py` | v2 gate; `Qwen2Attention` / `Qwen2MLP` submodule loaders |
 | `models/transformers.py` | already on `AutoWeightsLoader`; document as covered (no v2 gate) |
 | `environ.py` | `SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)` |
-| Tests | `test_auto_loader.py`, `test_auto_loader_moe.py`, `test_weight_loader_v2_equiv.py` |
+| Tests | `test_weight_loader_v2_e2e.py` (Qwen2 v1/v2 + transformers backend) |
 
 Quant `process_weights_after_loading` remains in `loader.py` (unchanged).
 
