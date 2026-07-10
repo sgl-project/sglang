@@ -358,6 +358,7 @@ class _DSparkDynamicHiddenBufferCache:
 
     def __init__(self):
         self.free_entries: Dict[Tuple[int, int, int, str, int], deque] = {}
+        self.entry_counts: Dict[Tuple[int, int, int, str, int], int] = {}
 
     @staticmethod
     def _capacity_rows(row_count: int) -> int:
@@ -389,15 +390,21 @@ class _DSparkDynamicHiddenBufferCache:
         row_count: int,
         hidden_size: int,
         dtype: torch.dtype,
-    ) -> Tuple[_DSparkDynamicHiddenBufferEntry, bool]:
+    ) -> Tuple[Optional[_DSparkDynamicHiddenBufferEntry], bool]:
         capacity_rows = self._capacity_rows(row_count)
         key = self._key(kv_manager, pp_rank, hidden_size, dtype, capacity_rows)
         entries = self.free_entries.get(key)
         if entries:
             return entries.pop(), True
 
+        limit = envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get()
+        if limit is not None and int(limit) > 0:
+            if self.entry_counts.get(key, 0) >= int(limit):
+                return None, False
+
         tensor = torch.empty((capacity_rows, hidden_size), dtype=dtype, device="cpu")
         handle = _register_dspark_dynamic_buffer(kv_manager, tensor)
+        self.entry_counts[key] = self.entry_counts.get(key, 0) + 1
         return (
             _DSparkDynamicHiddenBufferEntry(
                 tensor=tensor,
@@ -431,6 +438,7 @@ class _DSparkDynamicHiddenBufferCache:
                 _deregister_dspark_dynamic_buffers(
                     kv_manager, {entry.pp_rank: entry.tensor}, [entry.handle]
                 )
+            self.entry_counts.pop(key, None)
             del self.free_entries[key]
 
 
@@ -1299,6 +1307,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 dspark_hidden_dynamic_register_handles = []
                 dspark_dynamic_reused = 0
                 dspark_dynamic_allocated = 0
+                dspark_dynamic_pool_busy = False
                 for pp_rank, pp_slice in pp_slices.items():
                     cur_indices = [int(x) for x in range(dspark_hidden_len)]
                     try:
@@ -1335,6 +1344,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         indices_to_remove.add(i)
                         dspark_hidden_dst_indices_by_pp = None
                         break
+                    if entry is None:
+                        for acquired_entry in (
+                            dspark_hidden_dynamic_cache_entries_by_pp or {}
+                        ).values():
+                            _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
+                                self.kv_manager, acquired_entry
+                            )
+                        dspark_dynamic_pool_busy = True
+                        dspark_hidden_dst_indices_by_pp = None
+                        break
                     dynamic_buffer = entry.tensor
                     dspark_hidden_dynamic_cache_entries_by_pp[pp_rank] = entry
                     if reused:
@@ -1355,6 +1374,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "item_len": item_len,
                         "row_count": int(dspark_hidden_len),
                     }
+                if dspark_dynamic_pool_busy:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    logger.info(
+                        "DSpark PD hidden receive buffer pool is busy; "
+                        "delaying preallocation: rid=%s, hidden_len=%s, "
+                        "limit=%s, transfer_queue=%s",
+                        decode_req.req.rid,
+                        dspark_hidden_len,
+                        envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get(),
+                        len(self.transfer_queue.queue),
+                    )
+                    break
                 if dspark_hidden_dst_indices_by_pp is None:
                     continue
                 dspark_hidden_pp_slices = pp_slices
