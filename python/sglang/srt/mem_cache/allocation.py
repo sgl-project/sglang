@@ -910,9 +910,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
                 [batch.reqs[i].req_pool_idx for i in crossing_indices],
                 dtype=torch.int64,
             )
-            crossing_rows_device = crossing_rows_cpu.to(
-                batch.device, non_blocking=True
-            )
+            crossing_rows_device = crossing_rows_cpu.to(batch.device, non_blocking=True)
             write_pages_to_req_to_token(
                 req_to_token_pool=batch.req_to_token_pool,
                 req_pool_indices_tensor=crossing_rows_device,
