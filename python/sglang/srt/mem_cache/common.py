@@ -12,7 +12,6 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -144,7 +143,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
-    tree_cache.cache_finished_req(
+    result = tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
@@ -156,7 +155,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None and req.kv is None:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+    start_p, end_p = result.unhandled_kv_start, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
@@ -187,8 +186,12 @@ def _release_overallocated_kv_indices(
             req.effective_kv_committed_len() == req.kv.kv_allocated_len
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+    assert (
+        start_p % page_size == 0
+    ), f"unhandled_kv_start must be page aligned, {start_p=}, {page_size=}"
+    assert (
+        req.cache_protected_len <= start_p
+    ), f"unhandled_kv_start below protected prefix, {start_p=}, {req.cache_protected_len=}"
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][

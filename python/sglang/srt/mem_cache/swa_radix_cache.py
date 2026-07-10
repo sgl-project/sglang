@@ -31,6 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -45,6 +46,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -437,14 +439,16 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return CacheFinishedReqResult(
+                unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+            )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -484,6 +488,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=req.swa_prefix_lock_released,
         )
         req.swa_prefix_lock_released = False
+
+        return CacheFinishedReqResult(
+            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

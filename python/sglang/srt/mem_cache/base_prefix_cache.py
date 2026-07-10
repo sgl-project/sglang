@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+
+import msgspec
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -37,6 +39,17 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+class CacheFinishedReqResult(msgspec.Struct, frozen=True):
+    """Result of a cache_finished_req operation.
+
+    `unhandled_kv_start` is the page-aligned position after which the request's
+    allocated KV indices were neither cached nor freed by the backend; the
+    caller is responsible for freeing `[unhandled_kv_start, kv_allocated_len)`.
+    """
+
+    unhandled_kv_start: int
 
 
 @dataclasses.dataclass
@@ -248,7 +261,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, **kwargs
+    ) -> CacheFinishedReqResult:
         pass
 
     @abstractmethod

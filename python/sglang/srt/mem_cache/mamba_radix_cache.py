@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -524,7 +526,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -532,7 +534,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
-            return
+            return CacheFinishedReqResult(
+                unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+            )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -639,6 +643,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(
+            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

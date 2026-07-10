@@ -8,12 +8,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
     EvictParams,
     EvictResult,
     InsertParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -64,7 +66,7 @@ class PureSWARadixCache(RadixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes.
 
         Only inserts the prefill portion [0, evict_floor) into the radix tree.
@@ -81,7 +83,9 @@ class PureSWARadixCache(RadixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return CacheFinishedReqResult(
+                unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+            )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -134,6 +138,10 @@ class PureSWARadixCache(RadixCache):
 
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(
+            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction

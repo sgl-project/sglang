@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.utils import (
     get_hash_str,
     split_node_hash_value,
 )
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -436,7 +438,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
@@ -447,7 +449,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return CacheFinishedReqResult(
+                unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+            )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -485,6 +489,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(
+            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

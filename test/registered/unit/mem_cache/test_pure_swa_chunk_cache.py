@@ -32,6 +32,7 @@ class _FakeReq:
 class TestPureSWAChunkCache(CustomTestCase):
     def test_finished_req_skips_already_evicted_swa_range(self):
         cache = PureSWAChunkCache.__new__(PureSWAChunkCache)
+        cache.page_size = 1
         cache.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(10, dtype=torch.int64).unsqueeze(0)
         )

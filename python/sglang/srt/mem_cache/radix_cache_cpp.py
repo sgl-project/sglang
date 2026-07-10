@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -171,7 +173,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -207,6 +209,10 @@ class RadixCacheCpp(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(
+            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

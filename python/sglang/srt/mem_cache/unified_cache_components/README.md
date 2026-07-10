@@ -199,7 +199,7 @@ Unlock a previously locked node path.
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int)`
+### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int) → CacheFinishedReqResult`
 
 Cache a completed request's KV data into the tree.
 
@@ -207,7 +207,7 @@ Cache a completed request's KV data into the tree.
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
 | **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
-| **Output** | `None` |
+| **Output** | `CacheFinishedReqResult(unhandled_kv_start=...)` — page-aligned position after which the caller frees the request's remaining allocated KV indices |
 | **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
