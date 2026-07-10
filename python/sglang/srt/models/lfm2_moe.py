@@ -12,7 +12,7 @@ Key MoE characteristics:
 - Post-hoc normalization of top-k weights
 """
 
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -46,6 +46,10 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
+)
+from sglang.srt.models.lfm2 import (
+    register_shortconv_verify_buffers,
+    shortconv_target_verify,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
@@ -320,6 +324,8 @@ class Lfm2MoeShortConv(nn.Module):
         else:
             self.register_parameter("conv_bias", None)
 
+        register_shortconv_verify_buffers(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -346,6 +352,10 @@ class Lfm2MoeShortConv(nn.Module):
                 self.conv_bias,
                 activation=None,
                 conv_state_indices=meta.cache_indices,
+            )
+        elif forward_batch.forward_mode.is_target_verify():
+            conv_out = shortconv_target_verify(
+                self, Bx, meta, forward_batch.spec_info.draft_token_num, "LFM2-MoE"
             )
         else:
             Bx_t = Bx.transpose(0, 1).contiguous()
@@ -382,6 +392,8 @@ class Lfm2MoeDecoderLayer(nn.Module):
         super().__init__()
         self.layer_type = config.layer_types[layer_id]
         self.is_attention_layer = self.layer_type == "full_attention"
+        # Set by Lfm2MoeModel.set_dflash_layers_to_capture for DFlash aux capture.
+        self._is_layer_to_capture = False
 
         self.operator_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -424,9 +436,13 @@ class Lfm2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not forward_batch.forward_mode.is_idle():
+            if captured_last_layer_outputs is not None:
+                captured_last_layer_outputs.append(hidden_states)
+
             residual = hidden_states
             normed = self.operator_norm(hidden_states)
 
@@ -477,6 +493,15 @@ class Lfm2MoeModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
         self.embedding_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.layers_to_capture: List[int] = []
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = list(layers_to_capture)
+        for layer_id in self.layers_to_capture:
+            # A tap on the final layer (layer_id == len(self.layers)) is
+            # captured after the loop in forward(); only mark real layers.
+            if layer_id < len(self.layers):
+                self.layers[layer_id]._is_layer_to_capture = True
 
     def forward(
         self,
@@ -490,16 +515,30 @@ class Lfm2MoeModel(nn.Module):
         )
 
         residual = None
+        aux_hidden_states: List[torch.Tensor] = []
         for i in range(len(self.layers)):
-            hidden_states, residual = self.layers[i](
+            layer = self.layers[i]
+            hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if layer._is_layer_to_capture else None
+                ),
             )
 
-        return self.embedding_norm(hidden_states)
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and len(self.layers) in self.layers_to_capture
+        ):
+            aux_hidden_states.append(hidden_states)
+
+        hidden_states = self.embedding_norm(hidden_states)
+        if not aux_hidden_states:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class Lfm2MoeForCausalLM(nn.Module):
@@ -535,6 +574,23 @@ class Lfm2MoeForCausalLM(nn.Module):
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return bool(self.model.layers_to_capture)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+
+        # Mark layer L to capture its input, which is the output of layer L-1.
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
     @torch.no_grad()
     def forward(
         self,
@@ -545,8 +601,14 @@ class Lfm2MoeForCausalLM(nn.Module):
         **kwargs,
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        aux_hidden_states = None
+        # Capture-enabled idle batches return a bare tensor (layers skip the
+        # append on IDLE), so narrow on the actual return shape.
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def load_weights(

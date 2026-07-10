@@ -310,6 +310,14 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        # Only hybrid (mamba / short-conv) targets need post-verify state commit.
+        self._need_mamba_verify_commit = (
+            self.target_worker.model_runner.mambaish_config is not None
+            and hasattr(
+                self.target_worker.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+        )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
@@ -490,6 +498,49 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _commit_mamba_states_after_verify(
+        self,
+        *,
+        batch,
+        seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Commit hybrid (mamba / short-conv) state for the accepted verify steps.
+        No-op for pure-attention targets."""
+        if not self._need_mamba_verify_commit:
+            return
+        attn_backend = self.target_worker.model_runner.attn_backend
+
+        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        mamba_steps_to_track = None
+
+        if batch.mamba_track_indices is not None:
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
+            )
+            tracking_point = (
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            )
+            mamba_steps_to_track = torch.where(
+                can_track_mask,
+                to_track_ith.to(torch.int64),
+                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
+
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
@@ -633,6 +684,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
+
+        # Verify ran the conv in tape mode; commit the accepted state back so it
+        # doesn't retain rejected drafts (else decoding isn't lossless).
+        self._commit_mamba_states_after_verify(
+            batch=batch,
+            seq_lens_pre_verify=prefix_lens,
+            seq_lens_post_verify=accept.new_seq_lens,
+            commit_lens=accept.commit_lens,
+        )
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
