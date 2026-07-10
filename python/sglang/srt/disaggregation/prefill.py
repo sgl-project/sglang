@@ -502,7 +502,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -536,7 +536,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -559,7 +559,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch

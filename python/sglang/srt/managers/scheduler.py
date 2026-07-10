@@ -319,7 +319,7 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
-        self.cur_batch: Optional[ScheduleBatch] = None
+        self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -965,7 +965,7 @@ class Scheduler(
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
-        self.cur_batch: Optional[ScheduleBatch] = None
+        self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1542,7 +1542,7 @@ class Scheduler(
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -1583,7 +1583,7 @@ class Scheduler(
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
+            self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
             # If we do not need to overlap the current batch with the last batch,
@@ -1617,7 +1617,7 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
+                self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -3415,7 +3415,7 @@ class Scheduler(
         self.future_map.stash(future_indices, payload)
 
     def launch_batch_sample_if_needed(
-        self, batch_result: GenerationBatchResult
+        self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
@@ -3429,8 +3429,8 @@ class Scheduler(
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-                return_hidden_states=self.cur_batch.return_hidden_states,
+                return_logprob=cur_batch.return_logprob,
+                return_hidden_states=cur_batch.return_hidden_states,
             )
 
         # Release the closure and large GPU tensors that are no longer needed.
@@ -3731,7 +3731,7 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
-            self.cur_batch = None
+            self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
@@ -4021,7 +4021,7 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         self.last_batch = None
-        self.cur_batch = None
+        self.cur_batch_for_debug = None
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch()
