@@ -270,6 +270,9 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.scheduler_env_vars import scheduler_envs
+from sglang.srt.request_latency_tracker import RequestLatencyTracker
+from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -395,6 +398,13 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
+
+        # Init JoyFuture scheduler observability (latency tracking + KV checksum)
+        self.latency_tracker = RequestLatencyTracker(
+            enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
+        )
+        self.kv_checksum_verifier = KVTransferChecksumVerifier() if scheduler_envs.SGLANG_ENABLE_KV_TRANSFER_CHECKSUM.get() else None
+        self._decode_step_counter = 0
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -1678,6 +1688,12 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
+            # JoyFuture: start latency tracking for new requests
+            if self.latency_tracker.enabled and hasattr(recv_req, "rid"):
+                record = self.latency_tracker.start_request(recv_req)
+                if record:
+                    record.start_phase("prefill")
+
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -3469,6 +3485,16 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        # JoyFuture: end the appropriate latency phase for each request
+        if self.latency_tracker.enabled:
+            if batch.forward_mode.is_decode():
+                for req in batch.reqs:
+                    self.latency_tracker.end_phase(req.rid, "decode", num_tokens=1)
+            elif batch.forward_mode.is_extend():
+                for req in batch.reqs:
+                    num_tokens = len(getattr(req, "origin_input_ids", []))
+                    self.latency_tracker.end_phase(req.rid, "prefill", num_tokens=num_tokens)
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3482,6 +3508,16 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        # JoyFuture: end latency tracking for naturally completed requests
+        if self.latency_tracker.enabled:
+            for req in batch.reqs:
+                if req.finished() and not req.is_retracted:
+                    self.latency_tracker.end_request(req.rid)
+
+        # JoyFuture: count decode steps for KV cache clear scheduling
+        if batch.forward_mode.is_decode():
+            self._decode_step_counter += 1
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
@@ -3884,6 +3920,18 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # JoyFuture: end latency tracking for aborted requests
+        if self.latency_tracker.enabled:
+            aborted_rids = set()
+            for req in self.waiting_queue:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    aborted_rids.add(req.rid)
+            for req in self.running_batch.reqs if self.running_batch else []:
+                if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    aborted_rids.add(req.rid)
+            for rid in aborted_rids:
+                self.latency_tracker.end_request(rid, aborted=True, abort_reason="user_abort")
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
