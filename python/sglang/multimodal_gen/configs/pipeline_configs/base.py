@@ -35,8 +35,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
