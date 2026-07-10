@@ -1,4 +1,4 @@
-﻿---
+---
 title: "Ascend NPU Reference"
 metatags:
   description: "Hardware concepts, communication libraries, deployment terminology, and common abbreviations for deploying SGLang on Ascend NPUs."
@@ -87,8 +87,8 @@ PD disaggregation separates inference into two stages running on different nodes
 | **1P2D**  | 1 prefill node + 2 decode nodes |
 
 You will see these in [Best Practice](/docs/hardware-platforms/ascend-npus/best_practice)
-section headings, e.g. `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes
-+ 1 decode node, 32 cards total."
+section headings, e.g. `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes +
+1 decode node, 32 cards total."
 
 ### Parallelism strategies
 
@@ -120,7 +120,7 @@ section headings, e.g. `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes
 
 | Term                                  | Description                                                                                                                                              |
 | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **MoE** (Mixture of Experts)          | Model architecture where only a subset of parameters (experts) is activated per token, reducing compute. Common in DeepSeek, Qwen3-A3B, and MiMo models. |
+| **MoE** (Mixture of Experts)          | Model architecture where only a subset of parameters (experts) is activated per token, reducing compute. Common in DeepSeek, Qwen3-30B-A3B, and MiMo models. |
 | **MLA** (Multi-head Latent Attention) | Attention variant that compresses key-value representations into a lower-dimensional latent space. Used by DeepSeek models.                              |
 | **GQA** (Grouped-Query Attention)     | Attention variant where multiple query heads share a single key-value head. Used by Qwen3 dense models.                                                  |
 | **NSA** (Native Sparse Attention)     | Sparse attention mechanism that reduces KV cache overhead for long contexts.                                                                             |
