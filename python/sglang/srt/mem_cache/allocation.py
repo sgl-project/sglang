@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.triton_ops.common import (
+    gather_req_to_token_pool_triton,
     get_last_loc_triton,
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
@@ -88,6 +89,63 @@ def write_cache_indices(
                 out_cache_loc[pt : pt + extend_len],
             )
             pt += extend_len
+
+
+def gather_out_cache_loc_extend(
+    req_pool_indices_tensor: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_tensor: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_lens_tensor: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+    req_to_token_pool: ReqToTokenPool,
+) -> torch.Tensor:
+    req_to_token = req_to_token_pool.req_to_token
+    num_reqs = req_pool_indices_cpu.shape[0]
+    num_out_tokens = int(extend_lens_cpu.sum().item())
+
+    assert req_pool_indices_tensor.shape[0] == num_reqs
+    assert prefix_lens_tensor.shape[0] == prefix_lens_cpu.shape[0] == num_reqs
+    assert seq_lens_tensor.shape[0] == seq_lens_cpu.shape[0] == num_reqs
+    assert extend_lens_tensor.shape[0] == extend_lens_cpu.shape[0] == num_reqs
+    assert int((seq_lens_cpu - prefix_lens_cpu).sum().item()) == num_out_tokens
+    assert req_to_token.dtype == torch.int32
+    assert (
+        req_pool_indices_tensor.device
+        == prefix_lens_tensor.device
+        == seq_lens_tensor.device
+        == extend_lens_tensor.device
+        == req_to_token.device
+    )
+
+    if support_triton(get_server_args().attention_backend):
+        # The kernel output buffer stays int32 (req_to_token dtype) and is
+        # promoted here after the kernel returns, so Triton never issues a
+        # mixed-width store (HIP miscompiles int32->int64 stores; see
+        # get_last_loc_triton_safe).
+        out_cache_loc_i32 = torch.empty(
+            num_out_tokens, dtype=req_to_token.dtype, device=req_to_token.device
+        )
+        gather_req_to_token_pool_triton[(num_reqs,)](
+            req_to_token,
+            req_pool_indices_tensor,
+            prefix_lens_tensor,
+            seq_lens_tensor,
+            extend_lens_tensor,
+            out_cache_loc_i32,
+            req_to_token.shape[1],
+        )
+        return out_cache_loc_i32.to(torch.int64)
+
+    chunks: list[torch.Tensor] = []
+    for i in range(num_reqs):
+        req_idx = req_pool_indices_cpu[i].item()
+        prefix_len = prefix_lens_cpu[i].item()
+        seq_len = seq_lens_cpu[i].item()
+        chunks.append(req_to_token[req_idx, prefix_len:seq_len])
+    return torch.cat(chunks).to(torch.int64)
 
 
 def get_last_loc(

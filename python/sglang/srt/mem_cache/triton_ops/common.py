@@ -57,6 +57,44 @@ def write_req_to_token_pool_triton(
 
 
 @triton.jit
+def gather_req_to_token_pool_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices,
+    pre_lens,
+    seq_lens,
+    extend_lens,
+    out_cache_loc_i32,
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0)
+
+    req_pool_index = tl.load(req_pool_indices + pid)
+    pre_len = tl.load(pre_lens + pid)
+    seq_len = tl.load(seq_lens + pid)
+
+    cumsum_start = tl.cast(0, tl.int64)
+    for i in range(pid):
+        cumsum_start += tl.load(extend_lens + i)
+
+    num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < (seq_len - pre_len)
+        value = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + offset
+            + pre_len,
+            mask=mask,
+        )
+        # Output stays int32 (req_to_token dtype); the caller promotes after
+        # return, so Triton never issues a mixed-width store -- avoiding the
+        # HIP int32->int64 store bug (see get_last_loc_triton_safe).
+        tl.store(out_cache_loc_i32 + cumsum_start + offset, value, mask=mask)
+
+
+@triton.jit
 def _get_last_loc_safe_kernel(
     req_to_token,
     req_pool_indices_tensor,
