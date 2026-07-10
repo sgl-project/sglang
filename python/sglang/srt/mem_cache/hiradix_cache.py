@@ -1495,6 +1495,9 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
+        completed_tokens = operation.pool_storage_result.clamp_to_all_pages_coverage(
+            completed_tokens, self.page_size, operation.pool_transfers
+        )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens

@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
@@ -122,6 +122,7 @@ class PoolTransferResult:
 
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
+    extra_pool_leading_hit_pages: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> PoolTransferResult:
@@ -136,6 +137,31 @@ class PoolTransferResult:
         self.extra_pool_hit_pages.update(
             {name: sum(rs) for name, rs in results.items()}
         )
+        self.extra_pool_leading_hit_pages.update(
+            {
+                name: next((i for i, hit in enumerate(rs) if not hit), len(rs))
+                for name, rs in results.items()
+            }
+        )
+
+    def clamp_to_all_pages_coverage(
+        self,
+        completed_tokens: int,
+        page_size: int,
+        pool_transfers: Optional[List[PoolTransfer]],
+    ) -> int:
+        required_pools = [
+            transfer.name
+            for transfer in pool_transfers or []
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        ]
+        if not required_pools:
+            return completed_tokens
+
+        covered_pages = min(
+            self.extra_pool_leading_hit_pages.get(name, 0) for name in required_pools
+        )
+        return min(completed_tokens, covered_pages * page_size)
 
 
 class HiCacheStorage(ABC):
