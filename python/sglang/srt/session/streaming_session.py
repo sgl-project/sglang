@@ -436,7 +436,7 @@ class StreamingSession(BasePrefixCache):
                 f"protected_len must be page-aligned, got {protected_len} "
                 f"with page_size={self.page_size}"
             )
-            # NPU keeps real-lens (non page-aligned) kv_allocated_len (op2).
+            # NPU keeps real-lens (non page-aligned) kv_allocated_len.
             assert _is_npu or slot.kv.kv_allocated_len % self.page_size == 0, (
                 f"kv_allocated_len must be page-aligned, got "
                 f"{slot.kv.kv_allocated_len} with page_size={self.page_size}"
@@ -577,7 +577,7 @@ class StreamingSession(BasePrefixCache):
         req.kv.kv_allocated_len = min(
             req.kv.kv_allocated_len, ceil_align(target, bookkeeping_page_size)
         )
-        # NPU keeps real-lens (non page-aligned) kv_allocated_len (op2).
+        # NPU keeps real-lens (non page-aligned) kv_allocated_len.
         assert _is_npu or req.kv.kv_allocated_len % self.page_size == 0, (
             f"kv_allocated_len must stay page-aligned after trim, got "
             f"{req.kv.kv_allocated_len} with page_size={self.page_size}"

@@ -108,9 +108,6 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
-        # The configured buffer size (factory default 2 * top_k or user JSON)
-        # carries no page-multiple guarantee; every buffer capacity derives
-        # from it, so align it once here.
         self.device_buffer_size = ceil_align(self.device_buffer_size, self.page_size)
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]

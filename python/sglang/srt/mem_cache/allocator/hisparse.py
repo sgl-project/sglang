@@ -48,8 +48,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        # The hisparse device pool legally receives filtered / page-head /
-        # arange-padded indices; alignment is validated at the wrapper entry.
+        # The device pool legally receives non-page-multiple (filtered/padded) indices.
         self.hisparse_attn_allocator.enforce_aligned_free = False
         self.enforce_aligned_free: bool = True
         self.full_to_hisparse_device_index_mapping = torch.cat(
@@ -315,8 +314,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_kvcache,
             logical_attn_allocator.need_sort,
         )
-        # The hisparse device pool legally receives filtered / page-head /
-        # arange-padded indices; alignment is validated at the wrapper entry.
+        # The device pool legally receives non-page-multiple (filtered/padded) indices.
         self.hisparse_attn_allocator.enforce_aligned_free = False
         self.enforce_aligned_free: bool = True
 

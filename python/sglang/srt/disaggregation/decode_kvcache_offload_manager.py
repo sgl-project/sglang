@@ -273,8 +273,7 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(prefill_indices)
 
         # Free the incremental part of the request (DSA-aware) together with
-        # any over-allocated slots (e.g. from speculative decoding v2), up to
-        # the page-aligned allocation watermark.
+        # any over-allocated slots (e.g. from speculative decoding v2).
         assert start_offset % self.page_size == 0, (
             f"start_offset must be page-aligned, got {start_offset} "
             f"with page_size={self.page_size}"

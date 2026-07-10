@@ -358,12 +358,7 @@ class LMCRadixCache(RadixCache):
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
-        # Keep only whole pages of the fetched span; the loaded tokens on the
-        # trailing partial page are dropped so node values stay whole-page runs.
-        if num_retrieved > 0:
-            kept = floor_align(num_retrieved - prefix_pad, self.page_size)
-        else:
-            kept = 0
+        kept = max(0, floor_align(num_retrieved - prefix_pad, self.page_size))
         self.token_to_kv_pool_allocator.free(token_slots[kept:])
 
         if kept > 0:

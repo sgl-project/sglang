@@ -124,9 +124,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        # Internal sub-allocators that legally receive non-page-multiple inputs
-        # (hisparse device pools, SWA translated/filtered indices) opt out at
-        # their construction points.
+        # Sub-allocators that legally receive non-page-multiple inputs opt out
+        # at their construction points.
         self.enforce_aligned_free: bool = True
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request

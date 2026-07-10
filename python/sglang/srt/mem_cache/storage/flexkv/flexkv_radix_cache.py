@@ -355,8 +355,7 @@ class FlexKVRadixCache(RadixCache):
             return None
 
         # Free the tail of the over-allocation when FlexKV returned
-        # fewer than expected, keeping only whole pages of the fetched
-        # span so node values stay whole-page runs.
+        # fewer than expected.
         kept = floor_align(num_retrieved, self.page_size)
         if kept == 0:
             self.token_to_kv_pool_allocator.free(token_slots)

@@ -76,11 +76,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-            # The swa component receives mapping-translated, `> 0`-filtered
-            # indices; alignment is validated at the composite entry instead.
+            # The swa component receives mapping-translated, filtered indices.
             self.swa_attn_allocator.enforce_aligned_free = False
-        # NPU keeps real-lens (non page-aligned) kv_allocated_len bookkeeping
-        # (op2), so the entry asserts are exempted there.
+        # NPU keeps real-lens (non page-aligned) kv_allocated_len bookkeeping.
         self.enforce_aligned_free: bool = not _is_npu
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
