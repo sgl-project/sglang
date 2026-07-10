@@ -27,7 +27,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -54,7 +53,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as GlmImageTextMLP
 from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP as GlmImageVisionMLP
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -593,7 +592,7 @@ class GlmImageTextAttention(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
