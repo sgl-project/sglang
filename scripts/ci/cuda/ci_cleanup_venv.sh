@@ -15,11 +15,57 @@ set -u
 # loky pool semaphores (sem.loky-*), sglang shm segments (sglang_loads_*),
 # cuda.shm.* — accumulates across jobs and, on a runner with a small --shm-size,
 # eventually fills /dev/shm so the next scheduler SIGBUSes at init ("Fatal
-# Python error: Bus error", scheduler died exit code -7). The 4h age floor never
-# touches a running job's shm (same rationale as the stale-venv sweep below).
+# Python error: Bus error", scheduler died exit code -7).
+#
+# A flat age floor alone is unsafe on a shared runner: /dev/shm is host-wide, so
+# a concurrent job — or a long-running one (nightly can exceed 4h) — that mapped
+# a segment at startup would have that still-live segment unlinked once its mtime
+# (set at creation, never on access) crosses the floor, re-triggering the exact
+# SIGBUS this guards against. So a file is deleted only if it is BOTH older than
+# 4h AND not currently mapped/opened by any process. The in-use scan reads
+# /proc/*/maps and /proc/*/fd (runner runs as root); a file we can't prove is
+# free is kept. Only files actually unlinked are counted (EPERM etc. don't
+# inflate the total), so the summary never claims a cleanup that didn't happen.
 if [ -d /dev/shm ]; then
-    shm_swept=$(find /dev/shm -maxdepth 1 -type f -mmin +240 -print -delete 2>/dev/null | wc -l)
-    [ "${shm_swept:-0}" -gt 0 ] && echo "Swept $shm_swept stale /dev/shm file(s) older than 4h"
+    shm_swept=$(python3 - <<'PY'
+import glob, os, time
+SHM = "/dev/shm"
+FLOOR = 4 * 3600
+now = time.time()
+
+# Paths of /dev/shm segments any live process still has mapped or open.
+in_use = set()
+for maps in glob.glob("/proc/[0-9]*/maps"):
+    try:
+        with open(maps) as fh:
+            for line in fh:
+                if "/dev/shm/" in line:
+                    in_use.add(line.rstrip("\n").split(" ", 5)[-1])
+    except OSError:
+        pass
+for fd in glob.glob("/proc/[0-9]*/fd/*"):
+    try:
+        tgt = os.readlink(fd)
+    except OSError:
+        continue
+    if tgt.startswith("/dev/shm/"):
+        in_use.add(tgt)
+
+swept = 0
+for path in glob.glob(os.path.join(SHM, "*")):
+    if not os.path.isfile(path) or path in in_use:
+        continue
+    try:
+        if now - os.path.getmtime(path) < FLOOR:
+            continue
+        os.remove(path)          # count only on a real unlink
+        swept += 1
+    except OSError:
+        pass                     # gone already, or not ours (EPERM) — skip
+print(swept)
+PY
+)
+    [ "${shm_swept:-0}" -gt 0 ] && echo "Swept $shm_swept stale /dev/shm file(s) (>4h, not in use)"
 fi
 
 # Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
