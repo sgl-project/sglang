@@ -257,8 +257,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             modality="video",
         ),
         LONGLIVE2_T2V_CI_sampling_params,
-        run_perf_check=False,
-        run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
     # TeaCache acceleration test for Wan video model
@@ -389,8 +387,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             modality="video",
         ),
         LONGLIVE2_I2V_CI_sampling_params,
-        run_perf_check=False,
-        run_consistency_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,

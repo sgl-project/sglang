@@ -2602,6 +2602,38 @@
             "expected_median_denoise_ms": 242.79,
             "estimated_full_test_time_s": 170.0
         },
+        "longlive2_t2v": {
+            "stages_ms": {
+                "InputValidationStage": 0.05,
+                "LongLive2TextEncodingStage": 328.32,
+                "LongLive2ImageVAEEncodingStage": 0.0,
+                "LongLive2LatentPreparationStage": 0.17,
+                "LongLive2CausalDenoisingStage": 4879.98,
+                "DecodingStage": 1397.62,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 6610.71,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 153.1
+        },
+        "longlive2_i2v": {
+            "stages_ms": {
+                "InputValidationStage": 23.02,
+                "LongLive2TextEncodingStage": 327.98,
+                "LongLive2ImageVAEEncodingStage": 1048.81,
+                "LongLive2LatentPreparationStage": 0.12,
+                "LongLive2CausalDenoisingStage": 4975.28,
+                "DecodingStage": 3051.96,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 9431.65,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 149.4
+        },
         "lingbot_world_realtime_plastic_beach": {
             "stages_ms": {},
             "denoise_step_ms": {},
