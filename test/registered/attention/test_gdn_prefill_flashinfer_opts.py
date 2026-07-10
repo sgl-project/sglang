@@ -60,9 +60,12 @@ def _build_extend_inputs(num_seqs: int):
     )
     dt = torch.clamp(dt, min=1e-4)
     dt_bias = dt + torch.log(-torch.expm1(-dt))
-    g = -A_log.exp().view(1, 1, num_v_heads) * F.softplus(
+    g_log = -A_log.exp().view(1, 1, num_v_heads) * F.softplus(
         a.float() + dt_bias.view(1, 1, num_v_heads)
     )
+    # FlashInferGDNKernel.extend consumes alpha = exp(g) (extend_gate_form ==
+    # "exp"; produced in serving by fused_gdn_gating(exp_gate=True)).
+    g = torch.exp(g_log)
     beta = torch.sigmoid(b.float())
 
     # Mirror the production MambaSlotAllocator layout: slot 0 is the reserved
@@ -184,6 +187,29 @@ def test_flashinfer_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
 
     assert (o_hoist.float() - o_ref.float()).abs().max().item() == 0
     assert (ssm_hoist - ssm_ref).abs().max().item() == 0
+
+
+def test_fused_gdn_gating_exp_gate_parity():
+    """fused_gdn_gating(exp_gate=True) must equal torch.exp of the log-space
+    output elementwise, with beta byte-identical. Guards the in-kernel exp fold
+    the FlashInfer prefill path relies on (extend_gate_form == "exp"): a gate-
+    form regression here silently corrupts every FlashInfer prefill."""
+    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+
+    T, Hv = 1024, 16
+    a = torch.randn(T, Hv, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(T, Hv, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.log(
+        torch.empty(Hv, device="cuda", dtype=torch.float32).uniform_(0, 16)
+    )
+    dt_bias = torch.rand(Hv, device="cuda", dtype=torch.float32)
+
+    g_log, beta_log = fused_gdn_gating(A_log, a, b, dt_bias)
+    alpha, beta_exp = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
+    torch.cuda.synchronize()
+
+    assert torch.equal(beta_log, beta_exp)
+    assert (alpha - torch.exp(g_log)).abs().max().item() == 0
 
 
 if __name__ == "__main__":

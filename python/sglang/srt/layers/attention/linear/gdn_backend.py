@@ -175,6 +175,10 @@ class GDNKernelDispatcher:
         # SM90 CuteDSL->Triton fallback above). Gates the per-forward
         # extend-prep hoist in forward_extend.
         self.extend_supports_prep = self.extend_kernel.supports_extend_prep
+        # Gate form the extend kernel consumes ("log" or "exp"); "exp" folds the
+        # exp(g) into the gating kernel (FlashInfer). Only ever "exp" on CUDA,
+        # so the exp_gate kwarg never reaches the NPU/CPU gating rebinds.
+        self.extend_gate_form = self.extend_kernel.extend_gate_form
 
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
@@ -347,6 +351,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # by identity; a held reference forecloses id() reuse).
         self._extend_prep_fm = None
         self._extend_prep = None
+        # Same pattern for the extend-path has_initial_states comparison (all
+        # backends: it feeds causal_conv1d upstream of the kernel dispatch).
+        self._has_initial_states_fm = None
+        self._has_initial_states = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -487,7 +495,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
         else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
+            # Layer-invariant per forward (extend_prefix_lens is fixed at batch
+            # prep); compute the comparison once and reuse across the GDN layers.
+            # Same identity-keyed memo pattern as the extend prep below.
+            if self._has_initial_states_fm is not forward_metadata:
+                self._has_initial_states = forward_batch.extend_prefix_lens > 0
+                self._has_initial_states_fm = forward_metadata
+            has_initial_states = self._has_initial_states
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -595,7 +609,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if self.kernel_dispatcher.extend_gate_form == "exp":
+                # FlashInfer consumes alpha = exp(g); compute it in-kernel
+                # instead of a separate torch.exp launch per layer.
+                g, beta = fused_gdn_gating(
+                    layer.A_log, a, b, layer.dt_bias, exp_gate=True
+                )
+            else:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
             # Hoist the layer-invariant extend prep (pool-gather indices; for
             # CuteDSL also cu_seqlens + chunk metadata) out of the per-layer

@@ -17,6 +17,12 @@ class LinearAttnKernelBase(ABC):
     # total_seq_len).
     supports_extend_prep: bool = False
 
+    # The form of the gate tensor extend() expects in its `g` argument:
+    # "log" (default) receives the log-space decay from fused_gdn_gating;
+    # "exp" receives exp(g) (multiplicative alpha) computed in-kernel by
+    # fused_gdn_gating(exp_gate=True), fusing away a separate exp launch.
+    extend_gate_form: str = "log"
+
     @abstractmethod
     def decode(
         self,

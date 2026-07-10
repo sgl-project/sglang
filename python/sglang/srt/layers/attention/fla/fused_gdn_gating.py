@@ -3,10 +3,14 @@ from typing import Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
+# With EXP_GATE, g is stored as exp(g) (the multiplicative decay "alpha" that
+# the FlashInfer GDN prefill kernel consumes), fusing away the separate
+# torch.exp launch and its extra round trip over g.
 @triton.jit
 def fused_gdn_gating_kernel(
     g,
@@ -22,6 +26,7 @@ def fused_gdn_gating_kernel(
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
+    EXP_GATE: tl.constexpr,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
@@ -36,6 +41,10 @@ def fused_gdn_gating_kernel(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    if EXP_GATE:
+        # libdevice.exp is bit-identical to torch.exp (expf); tl.exp's fast
+        # exp2 path is not, and this value feeds the SSM decay directly.
+        blk_g = libdevice.exp(blk_g)
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
     tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
@@ -48,6 +57,7 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
+    exp_gate: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
@@ -70,6 +80,7 @@ def fused_gdn_gating(
         beta,
         threshold,
         8,
+        exp_gate,
         num_warps=1,
     )
     return g, beta_output

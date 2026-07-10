@@ -93,6 +93,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """
 
     supports_extend_prep = True
+    # extend() consumes the multiplicative decay alpha = exp(g); the caller
+    # computes it in-kernel via fused_gdn_gating(exp_gate=True), so no separate
+    # exp launch runs per layer.
+    extend_gate_form = "exp"
 
     def __init__(self):
         (
@@ -278,8 +282,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
         v_fi = v[0].contiguous()
 
-        # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0].to(torch.float32))
+        # `g` arrives as alpha = exp(g) already (extend_gate_form == "exp": the
+        # caller runs fused_gdn_gating(exp_gate=True)), so no exp launch here.
+        # Both are fp32 from the gating kernel; the .to() calls are no-op guards.
+        alpha_fi = g[0].to(torch.float32)
         beta_fi = beta[0].to(torch.float32)
 
         if prep is None:
