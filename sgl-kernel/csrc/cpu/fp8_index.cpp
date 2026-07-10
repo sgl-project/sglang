@@ -2,11 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 
 #include "common.h"
-#include "gemm.h"
-#include "vec.h"
 
 // DSA indexer FP8 index score (ragged, single-batch loop path).
 //
@@ -17,14 +14,6 @@
 //   3) sum over heads -> logits_sum
 //   4) logits_sum * k_s (per-token scale)    -> index_score
 //
-// Step (1) is the expensive contraction over head_dim. It is expressed as a
-// single AMX bf16 GEMM by folding (m, h) into the row dimension:
-//   L[m*H + h, n] = Q[m*H + h, :] @ K[n, :]^T
-// and dispatched through the efficient ``weight_packed_linear`` path from
-// gemm.cpp (bf16 inputs, fp32 accumulation/output). The relu + head-weighted
-// reduction (steps 2-4) stays as a vectorized elementwise pass because the
-// relu nonlinearity between the two contractions cannot be folded into a GEMM.
-//
 // Shapes (all contiguous):
 //   q   : [B, M, H, D]  float8_e4m3fn
 //   q_s : [B, M, H]     float32
@@ -32,77 +21,21 @@
 //   k_s : [B, N]        float32
 //   out : [B, M, N]     float32
 
-// Efficient AMX bf16 GEMM from gemm.cpp: out = mat1 @ mat2^T.
-extern at::Tensor weight_packed_linear(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    bool is_vnni,
-    std::optional<at::ScalarType> out_dtype);
-
-namespace {
+// Fused GEMM + relu + per-head weighted reduction, defined in gemm.cpp.
+extern void fused_linear_relu_reduce(
+    at::Tensor& out,
+    at::Tensor& q,
+    at::Tensor& q_scale,
+    at::Tensor& k,
+    at::Tensor& k_scale,
+    bool is_vnni);
 
 // AMX weight packing requires the GEMM output dimension (here the number of
 // key tokens N) to be a multiple of TILE_N (16). Pad the key rows up so the
-// packed path is always taken; the extra logit columns are dropped during the
-// head-weighted reduction below.
+// packed path is always taken; the padding rows are never read since
+// fused_linear_relu_reduce only produces k_scale.size(0) output columns.
 constexpr int64_t kTileN = 16;
 
-inline int64_t round_up(int64_t x, int64_t m) {
-  return ((x + m - 1) / m) * m;
-}
-
-// out[m, n] = k_s[n] * sum_h relu(logits[m, h, n]) * q_s[m, h]
-void reduce_heads(
-    const float* __restrict__ logits,  // [M, H, N_pad]
-    const float* __restrict__ qs,      // [M, H]
-    const float* __restrict__ ks,      // [N]
-    float* __restrict__ out,           // [M, N]
-    int64_t M,
-    int64_t H,
-    int64_t N,
-    int64_t N_pad) {
-  using fVec = at::vec::Vectorized<float>;
-  const fVec zero(0.0f);
-  const int64_t kVecSize = fVec::size();
-
-  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t m = begin; m < end; ++m) {
-      const float* logits_m = logits + m * H * N_pad;
-      const float* qs_m = qs + m * H;
-      float* out_m = out + m * N;
-
-      std::memset(out_m, 0, N * sizeof(float));
-
-      for (int64_t h = 0; h < H; ++h) {
-        const float* logits_h = logits_m + h * N_pad;
-        const float w = qs_m[h];
-        const fVec wv(w);
-        int64_t n = 0;
-        for (; n <= N - kVecSize; n += kVecSize) {
-          fVec acc = fVec::loadu(out_m + n);
-          fVec l = at::vec::maximum(fVec::loadu(logits_h + n), zero);
-          acc = at::vec::fmadd(l, wv, acc);
-          acc.store(out_m + n);
-        }
-        for (; n < N; ++n) {
-          out_m[n] += std::max(logits_h[n], 0.0f) * w;
-        }
-      }
-
-      int64_t n = 0;
-      for (; n <= N - kVecSize; n += kVecSize) {
-        fVec acc = fVec::loadu(out_m + n) * fVec::loadu(ks + n);
-        acc.store(out_m + n);
-      }
-      for (; n < N; ++n) {
-        out_m[n] *= ks[n];
-      }
-    }
-  });
-}
-
-}  // namespace
 
 at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s) {
   CHECK_INPUT(q);
@@ -136,18 +69,14 @@ at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tens
     return out;
   }
 
-  const int64_t N_pad = round_up(N, kTileN);
+  const int64_t N_pad = ((N + kTileN - 1) / kTileN) * kTileN;
   const auto bf16_opts = q.options().dtype(at::kBFloat16);
-  const auto* qs_ptr = q_s.const_data_ptr<float>();
-  const auto* ks_ptr = k_s.const_data_ptr<float>();
-  auto* out_ptr = out.data_ptr<float>();
 
   for (int64_t b = 0; b < B; ++b) {
-    // Q[b] : [M*H, D] bf16
-    at::Tensor q_bf16 = q.select(0, b).reshape({M * H, D}).to(at::kBFloat16);
-
+    at::Tensor q_bf16, k_bf16;
+    // Q[b] : [M, H, D] bf16.
+    q_bf16 = q.select(0, b).to(at::kBFloat16);
     // K[b] : [N_pad, D] bf16, key rows padded with zeros so N_pad % 16 == 0.
-    at::Tensor k_bf16;
     if (N_pad == N) {
       k_bf16 = k.select(0, b).to(at::kBFloat16);
     } else {
@@ -155,18 +84,10 @@ at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tens
       k_bf16.narrow(0, 0, N).copy_(k.select(0, b).to(at::kBFloat16));
     }
 
-    // L : [M*H, N_pad] fp32  ==  Q @ K^T 
-    at::Tensor logits = weight_packed_linear(q_bf16, k_bf16, c10::nullopt, /*is_vnni=*/false, at::kFloat);
-
-    reduce_heads(
-        logits.const_data_ptr<float>(),
-        qs_ptr + b * M * H,
-        ks_ptr + b * N,
-        out_ptr + b * M * N,
-        M,
-        H,
-        N,
-        N_pad);
+    at::Tensor q_scale_b = q_s.select(0, b);  // [M, H]
+    at::Tensor k_scale_b = k_s.select(0, b);  // [N]
+    at::Tensor out_b = out.select(0, b);      // [M, N]
+    fused_linear_relu_reduce(out_b, q_bf16, q_scale_b, k_bf16, k_scale_b, /*is_vnni=*/false);
   }
 
   return out;

@@ -581,6 +581,147 @@ void weight_packed_linear_kernel_impl(
   });
 }
 
+// bf16/fp16 input, bf16/fp16 weight (vnni packed) -> fp32 output
+template <typename scalar_t>
+void weight_packed_linear_fp32_out_kernel_impl(
+    float* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mat2,
+    const float* __restrict__ bias,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+
+  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+      alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+
+      loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+        int64_t mb_start = mb * BLOCK_M;
+        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+        int64_t nb_start = nb * BLOCK_N;
+        int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+
+        // bf16 * bf16 -> fp32 accumulation via brgemm
+        at::native::cpublas::brgemm(
+            mb_size,
+            nb_size,
+            K,
+            mat1_strideM,
+            nb_size,
+            BLOCK_N,
+            /* add_C */ false,
+            mat1 + mb_start * mat1_strideM,
+            mat2 + nb_start * K,
+            Ctmp);
+
+        // copy Ctmp (fp32) directly to fp32 output
+        for (int64_t m = 0; m < mb_size; ++m) {
+          if constexpr (has_bias) {
+            copy_add_stub(
+                out + mb_start * out_strideM + nb_start + m * out_strideM,
+                Ctmp + m * BLOCK_N,
+                bias + nb_start,
+                nb_size);
+          } else {
+            std::memcpy(
+                out + mb_start * out_strideM + nb_start + m * out_strideM, Ctmp + m * BLOCK_N, nb_size * sizeof(float));
+          }
+        }
+      });
+
+      at::native::cpublas::brgemm_release();
+    });
+  });
+}
+
+template <typename scalar_t>
+void fused_linear_relu_reduce_kernel_impl(
+    float* __restrict__ out,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k_packed,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    int64_t M,
+    int64_t H,
+    int64_t D,
+    int64_t N) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+  const int64_t q_strideM = H * D;
+  const fVec zero(0.f);
+  const int64_t kVecSize = fVec::size();
+
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+    alignas(64) float Acc[BLOCK_M * BLOCK_N];
+
+    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * D, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t mb_start = mb * BLOCK_M;
+      int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+
+      std::memset(Acc, 0, sizeof(float) * BLOCK_M * BLOCK_N);
+
+      for (int64_t h = 0; h < H; ++h) {
+        at::native::cpublas::brgemm(
+            mb_size,
+            nb_size,
+            D,
+            q_strideM,
+            nb_size,
+            BLOCK_N,
+            /* add_C */ false,
+            q + mb_start * q_strideM + h * D,
+            k_packed + nb_start * D,
+            Ctmp);
+
+        for (int64_t i = 0; i < mb_size; ++i) {
+          const float w = q_scale[(mb_start + i) * H + h];
+          const fVec wv(w);
+          float* acc_row = Acc + i * BLOCK_N;
+          const float* c_row = Ctmp + i * BLOCK_N;
+          int64_t j = 0;
+          for (; j <= nb_size - kVecSize; j += kVecSize) {
+            fVec l = at::vec::maximum(fVec::loadu(c_row + j), zero);
+            fVec acc = fVec::loadu(acc_row + j);
+            acc = at::vec::fmadd(l, wv, acc);
+            acc.store(acc_row + j);
+          }
+          for (; j < nb_size; ++j) {
+            acc_row[j] += std::max(c_row[j], 0.f) * w;
+          }
+        }
+      }
+
+      for (int64_t i = 0; i < mb_size; ++i) {
+        const float* acc_row = Acc + i * BLOCK_N;
+        float* out_row = out + (mb_start + i) * N + nb_start;
+        int64_t j = 0;
+        for (; j <= nb_size - kVecSize; j += kVecSize) {
+          fVec acc = fVec::loadu(acc_row + j) * fVec::loadu(k_scale + nb_start + j);
+          acc.store(out_row + j);
+        }
+        for (; j < nb_size; ++j) {
+          out_row[j] = acc_row[j] * k_scale[nb_start + j];
+        }
+      }
+    });
+
+    at::native::cpublas::brgemm_release();
+  });
+}
+
 }  // anonymous namespace
 
 // tinygemm interface
@@ -793,6 +934,59 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   return out.view(input_sizes);
 }
 
+// Fused linear (GEMM) + relu + per-head weighted reduction
+// q       : [M, H, D] bf16/fp16
+// q_scale : [M, H] fp32
+// k       : [N_pad, D] bf16/fp16 (or VNNI-packed if is_vnni), N_pad must
+//           satisfy N_pad % TILE_N == 0 (the padding rows beyond
+//           k_scale.size(0) are packed but never read)
+// k_scale : [N] fp32, N <= k.size(0)
+// is_vnni : whether k is already VNNI-packed (skips convert_weight_packed)
+// out     : [M, N] fp32, pre-allocated contiguous output, written in place
+void fused_linear_relu_reduce(
+    at::Tensor& out,
+    at::Tensor& q,
+    at::Tensor& q_scale,
+    at::Tensor& k,
+    at::Tensor& k_scale,
+    bool is_vnni) {
+  CHECK_INPUT(q);
+  CHECK_INPUT(q_scale);
+  CHECK_INPUT(k);
+  CHECK_INPUT(k_scale);
+  CHECK_INPUT(out);
+  CHECK_DIM(3, q);
+  CHECK_DIM(2, q_scale);
+  CHECK_DIM(2, k);
+  CHECK_DIM(1, k_scale);
+  CHECK_DIM(2, out);
+
+  const int64_t M = q.size(0);
+  const int64_t H = q.size(1);
+  const int64_t D = q.size(2);
+  const int64_t N = k_scale.size(0);
+  TORCH_CHECK(k.size(1) == D, "k last dim must match q head_dim");
+  TORCH_CHECK(k.size(0) >= N, "k must have at least k_scale.size(0) rows");
+  TORCH_CHECK(q_scale.size(0) == M && q_scale.size(1) == H, "q_scale shape mismatch");
+  TORCH_CHECK(out.size(0) == M && out.size(1) == N, "out shape mismatch");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q/k dtype mismatch");
+
+  auto packed_k = is_vnni ? k : convert_weight_packed(k);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "fused_linear_relu_reduce", [&] {
+    fused_linear_relu_reduce_kernel_impl<scalar_t>(
+        out.data_ptr<float>(),
+        q.data_ptr<scalar_t>(),
+        packed_k.data_ptr<scalar_t>(),
+        q_scale.data_ptr<float>(),
+        k_scale.data_ptr<float>(),
+        M,
+        H,
+        D,
+        N);
+  });
+}
+
 // mat1         : [M, K]
 // mat2         : [K, 1]
 // post_mul_mat : [M, K]
@@ -806,7 +1000,7 @@ at::Tensor fused_linear_sigmoid_mul(
     bool is_vnni,
     const at::Tensor& post_mul_mat) {
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
-  TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight")
+  TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight");
 
   int64_t M = mat1.size(0);
   int64_t K = mat1.size(1);
@@ -824,7 +1018,7 @@ at::Tensor fused_linear_sigmoid_mul(
 
   TORCH_CHECK(
       N == 1 && out_strideM % 32 == 0,
-      "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)")
+      "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)");
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
