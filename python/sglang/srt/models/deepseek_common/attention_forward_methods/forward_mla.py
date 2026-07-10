@@ -27,6 +27,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
+)
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -64,7 +67,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -175,7 +178,7 @@ def _should_defer_dsa_cp_kv_gather(
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_global_server_args().flashinfer_mla_disable_ragged
+            get_server_args().flashinfer_mla_disable_ragged
         )
 
     def should_run_indexer(
@@ -324,8 +327,12 @@ class DeepseekMLAForwardMixin:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=None,
                                 output_unquantized_inp1=True,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
+                            if _use_aiter_bpreshuffle_gfx95:
+                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
+                                    q_quanted
+                                )
                             q = q_quanted
                         else:
                             q, _, k_nope, _ = fused_rms_fp8_group_quant(
@@ -339,8 +346,10 @@ class DeepseekMLAForwardMixin:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=None,
                                 output_unquantized_inp1=False,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
+                            if _use_aiter_bpreshuffle_gfx95:
+                                q = materialize_bpreshuffle_fp8_scale_tuple(q)
 
                     elif _use_aiter:
                         q, k_nope = fused_qk_rmsnorm_bf16(
@@ -884,8 +893,12 @@ class DeepseekMLAForwardMixin:
                         _bmm_buf,
                         group_size=128,
                         dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=False,
                     )
+                    if _use_aiter_bpreshuffle_gfx95:
+                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                            attn_bmm_output
+                        )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
@@ -897,8 +910,12 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                     group_size=128,
                     dtype_quant=torch.float8_e4m3fn,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                        attn_bmm_output
+                    )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
@@ -985,8 +1002,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().dsa_decode_backend == "trtllm"
-                or get_global_server_args().dsa_prefill_backend == "trtllm"
+                get_server_args().dsa_decode_backend == "trtllm"
+                or get_server_args().dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -1003,7 +1020,7 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")

@@ -49,8 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -892,7 +891,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_global_server_args().enable_mis and any(
+            if get_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1037,6 +1036,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_input: MultimodalInputs,
         seq_len: int,
     ) -> torch.Tensor:
+        # Some generation models precompute decode positions for future tokens.
+        # For example, GLM-Image needs 2D spatial MRoPE positions instead of
+        # sequential delta-based positions.
+        # This is needed for image generation models (e.g. GlmImage) where
+        # decode tokens require 2D spatial MRoPE positions, not sequential.
+        if (
+            mm_input.mrope_positions is not None
+            and mm_input.mrope_positions.shape[1] >= seq_len
+        ):
+            pos = mm_input.mrope_positions[:, seq_len - 1 : seq_len]
+            return pos
+
         # doing below compute on cpu to avoid frequent small kernels
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (
@@ -1055,7 +1066,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # 3 * N
                 if (
                     mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
+                    or get_server_args().rl_on_policy_target is not None
                 ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
@@ -1074,7 +1085,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 if (
                     mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
+                    or get_server_args().rl_on_policy_target is not None
                 ):
                     # text only
                     mrope_positions = torch.tensor(
