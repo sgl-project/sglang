@@ -960,12 +960,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ],
             }
         if msg_type == "function_call_output":
+            raw_output = message.get("output", "")
+            if isinstance(raw_output, list):
+                # Normalize each content part in the list
+                normalized_parts = [
+                    cls._normalize_response_content_part_for_chat(part)
+                    for part in raw_output
+                ]
+                content = normalized_parts
+            else:
+                content = cls._normalize_response_content_part_for_chat(raw_output)
+
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": cls._normalize_response_content_part_for_chat(
-                    message.get("output", "")
-                ),
+                "content": content,
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
