@@ -417,22 +417,20 @@ class Evo2AttentionLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Pre-norm + Attention + Residual
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.pre_norm(hidden_states)
-        else:
-            hidden_states, residual = self.pre_norm(hidden_states, residual)
-
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+        # Vortex post-norm: u = sublayer(pre_norm(u)) + u
+        normed = self.pre_norm(hidden_states)
+        hidden_states = (
+            self.self_attn(
+                positions=positions,
+                hidden_states=normed,
+                forward_batch=forward_batch,
+            )
+            + hidden_states
         )
 
-        # Post-norm + MLP + Residual
-        hidden_states, residual = self.post_norm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # Vortex post-norm: u = mlp(post_norm(u)) + u
+        normed = self.post_norm(hidden_states)
+        hidden_states = self.mlp(normed) + hidden_states
         return hidden_states, residual
 
 
@@ -596,7 +594,9 @@ class Evo2HyenaFilter(nn.Module):
         if self.column_split_hyena:
             x2, x1, v = _column_split(z_f, self.num_attention_heads, self.head_dim)
         else:
-            x1, x2, v = z_f.split(self.hidden_size, dim=-1)
+            # Vortex parallel_iir splits in (x2, x1, v) order:
+            # gate = x1 * v,  output = (gate_filtered) * x2
+            x2, x1, v = z_f.split(self.hidden_size, dim=-1)
 
         # Prepare filter h
         if self.h is not None:
@@ -776,22 +776,16 @@ class Evo2HyenaConvLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Pre-norm for filter (matches sglang residual pattern)
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.pre_norm(hidden_states)
-        else:
-            hidden_states, residual = self.pre_norm(hidden_states, residual)
-
-        # Input projection: (B, L, D) → (B, L, 3*D)
-        proj_out, _ = self.projections(hidden_states)
+        # Vortex post-norm: u = sublayer(pre_norm(u)) + u
+        normed = self.pre_norm(hidden_states)
+        proj_out, _ = self.projections(normed)
 
         # All-gather if using TP, because the Hyena filter's interleave step
         # mixes channels pairwise across the full hidden dimension.
         if self.tp_size > 1:
             proj_out = tensor_model_parallel_all_gather(proj_out)
 
-        # Hyena filter (causal: requires forward_batch for sequence boundaries)
+        # Hyena filter (causal)
         z = self.filter(proj_out)  # (B, L, D)
 
         # Split back for row-parallel output projection
@@ -800,10 +794,11 @@ class Evo2HyenaConvLayer(nn.Module):
 
         # Output projection
         z_out, _ = self.out_filter_dense(z)
+        hidden_states = z_out + hidden_states
 
-        # Post-norm for MLP (adds filter output to residual stream)
-        hidden_states, residual = self.post_norm(z_out, residual)
-        hidden_states = self.mlp(hidden_states)
+        # Vortex post-norm: u = mlp(post_norm(u)) + u
+        normed = self.post_norm(hidden_states)
+        hidden_states = self.mlp(normed) + hidden_states
         return hidden_states, residual
 
 
@@ -822,6 +817,15 @@ class Evo2Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # TP > 1 is not supported: the Hyena filter's interleave step requires
+        # the full hidden dimension and TP sharding would break channel mixing.
+        # Only assert when the distributed group is already initialised (skip in
+        # unit tests where the TP group hasn't been set up).
+        from sglang.srt.distributed.parallel_state import _TP
+
+        if _TP is not None and get_tensor_model_parallel_world_size() > 1:
+            raise RuntimeError("Evo 2 does not support tensor parallelism (TP > 1)")
+
         self.config = config
         self.vocab_size = config.vocab_size
         self.num_layers = config.num_layers
@@ -903,10 +907,7 @@ class Evo2Model(nn.Module):
                 residual=residual,
             )
 
-        if residual is not None:
-            hidden_states, _ = self.norm(hidden_states, residual)
-        else:
-            hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
 
         return hidden_states
 

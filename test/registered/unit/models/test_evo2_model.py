@@ -21,11 +21,14 @@ class TestEvo2Config(CustomTestCase):
 
         self.assertEqual(_detect_evo2_variant("evo2_7b_base"), "7b-8k")
         self.assertEqual(_detect_evo2_variant("evo2_1b_base"), "1b")
+        # evo2_7b (no suffix) is the 1M-context flagship
+        self.assertEqual(_detect_evo2_variant("evo2_7b"), "7b-1m")
 
-    def test_detect_unknown_defaults(self):
+    def test_detect_unknown_raises(self):
         from sglang.srt.configs.evo2 import _detect_evo2_variant
 
-        self.assertEqual(_detect_evo2_variant("unknown_model"), "7b-8k")
+        with self.assertRaises(ValueError):
+            _detect_evo2_variant("unknown_model")
 
 
 class TestEvo2ForwardSanity(CustomTestCase):

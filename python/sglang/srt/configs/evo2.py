@@ -37,9 +37,9 @@ class Evo2Config(PretrainedConfig):
         max_position_embeddings: int = 32768,
         tie_word_embeddings: bool = True,
         use_cache: bool = True,
-        pad_token_id: int = 0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
+        pad_token_id: int = 1,
+        bos_token_id: int = 0,
+        eos_token_id: int = 0,
         # Hyena-specific parameters
         state_size: int = 16,
         short_filter_length: int = 3,
@@ -297,7 +297,10 @@ _EVO2_VARIANT_DEFAULTS = {
 
 
 def _detect_evo2_variant(model: str) -> str:
-    """Detect Evo2 variant from model name or path."""
+    """Detect Evo2 variant from model name or path.
+
+    Raises ValueError for unrecognised variants.
+    """
     name = str(model).lower()
     if "1b" in name:
         return "1b"
@@ -306,8 +309,15 @@ def _detect_evo2_variant(model: str) -> str:
     if "1m" in name:
         return "7b-1m"
     if "7b" in name:
-        return "7b-8k"
-    return "7b-8k"  # default
+        # evo2_7b (no suffix) is the 1M-context flagship;
+        # evo2_7b_base is the 8k variant.
+        if "base" in name:
+            return "7b-8k"
+        return "7b-1m"
+    raise ValueError(
+        f"Unknown Evo 2 variant for '{model}'. "
+        f"Expected a name containing '1b', '7b', '262k', or '1m'."
+    )
 
 
 def patch_evo2_config_json(model: str) -> None:
@@ -393,6 +403,13 @@ def patch_evo2_config_json(model: str) -> None:
     patched.update(cfg)
     patched["model_type"] = "evo2"
     patched["architectures"] = ["Evo2ForCausalLM"]
+    # Ensure correct token IDs from the auto-generated CharLevelTokenizer
+    patched.setdefault("pad_token_id", 1)
+    patched.setdefault("bos_token_id", 0)
+    patched.setdefault("eos_token_id", 0)
+    # Enforce bfloat16: fp16 overflows in the IIR FFT at deep HCL layers
+    # where the pre-norm scale reaches ~5.5 (layer 23 in 7B).
+    patched.setdefault("torch_dtype", "bfloat16")
 
     # Always write config.json
     out_path = os.path.join(model, "config.json")

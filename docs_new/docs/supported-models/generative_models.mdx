@@ -289,9 +289,9 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Poolside's hybrid sliding-window-attention MoE model (256 routed experts, 1 shared expert, sigmoid router) with per-layer-type RoPE (YARN on full-attention layers, default on sliding-attention layers) and a softplus per-head attention gate.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Evo 2</strong> (1B, 7B, 40B)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Evo 2</strong> (1B, 7B)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>arcinstitute/evo2_1b_base</code>, <code>arcinstitute/evo2_7b</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Arc Institute's autoregressive DNA foundation model using the StripedHyena 2 architecture (interleaved attention + Hyena convolutions). Trained on 9.3T DNA base pairs with up to 1M-token context. Supports DNA sequence generation and embeddings for genomics tasks. Uses a CharLevelTokenizer (UTF-8 byte encoding). Tokenizer and config files are auto-generated on first use. TP &gt; 1 is not yet supported due to the Hyena filter's channel-mixing interleave step.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Arc Institute's autoregressive DNA foundation model using the StripedHyena 2 architecture (interleaved attention + Hyena convolutions). Trained on 9.3T DNA base pairs with up to 1M-token context. Supports DNA sequence generation and embeddings. Uses a CharLevelTokenizer (UTF-8 byte encoding) auto-generated on first use. TP &gt; 1 is not supported.</td>
     </tr>
 </tbody>
 </table>
