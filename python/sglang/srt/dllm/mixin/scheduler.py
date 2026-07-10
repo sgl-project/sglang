@@ -27,8 +27,11 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
-    def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_batch_dllm(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
+        self.running_batch = running_batch
         if self.enable_priority_preemption:
             self.running_batch.batch_is_full = False
 
