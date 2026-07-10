@@ -1,4 +1,4 @@
-import logging 
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
