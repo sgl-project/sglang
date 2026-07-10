@@ -163,7 +163,7 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
 )
 @torch.inference_mode()
 def test_mxfp8_native_moe(T, H, inter, E, top_k):
-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
 
@@ -203,7 +203,7 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
 @requires_gfx950
 @torch.inference_mode()
 def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
 

@@ -117,3 +117,30 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+
+# Triton kernels migrated from srt/layers/moe (RFC #29630, Phase 2.5);
+# registered for inventory. Import them from their modules.
+_PHASE25_TRITON_KERNELS = [
+    ("ep_moe_kernels", "deepep_run_moe_deep_preprocess"),
+    ("ep_moe_kernels", "deepep_permute_triton_kernel"),
+    ("ep_moe_kernels", "deepep_post_reorder_triton_kernel"),
+    ("fused_moe_triton_kernels", "invoke_fused_moe_kernel"),
+    ("fused_moe_triton_kernels", "fused_moe_kernel"),
+    ("fused_moe_triton_kernels", "fused_moe_kernel_gptq_awq"),
+    ("mxfp8_moe_amd_gfx95", "fused_experts_mxfp8"),
+    ("rocm_moe_utils", "upscale"),
+    ("rocm_moe_utils", "upscale_mxfp4"),
+    ("router", "fused_moe_router_shim"),
+    ("deepep_waterfill_kernels", "materialize_waterfill_dispatch_fused"),
+    ("fill_padded_rows", "_fill_padded_rows"),
+]
+for _mod, _fn in _PHASE25_TRITON_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_fn.lstrip('_')}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
