@@ -17,6 +17,7 @@ import subprocess
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List
 
 import requests
@@ -30,6 +31,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+from sglang.utils import download_and_cache_file
 
 register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
@@ -40,6 +42,15 @@ QWEN35_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 ACCURACY_THRESHOLD = 0.94
+
+# bench_sglang.py lives at the repo root (this file is 5 levels below), not under
+# test/. Resolve it absolutely so it works regardless of the CI working directory.
+REPO_ROOT = Path(__file__).resolve().parents[5]
+GSM8K_BENCH_SCRIPT = REPO_ROOT / "benchmark" / "gsm8k" / "bench_sglang.py"
+GSM8K_DATA_URL = (
+    "https://raw.githubusercontent.com/openai/grade-school-math/"
+    "master/grade_school_math/data/test.jsonl"
+)
 
 
 @dataclass
@@ -126,18 +137,23 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN35_FP8_MODEL_PATH
         cls.variants = get_fusion_variants()
+        # Pre-fetch the dataset once (single-threaded) so the two parallel
+        # benchmark subprocesses don't race writing the shared /tmp cache file.
+        cls.gsm8k_data_path = download_and_cache_file(GSM8K_DATA_URL)
 
     def _run_gsm8k(self, base_url: str) -> Dict[str, float]:
         port = int(base_url.rsplit(":", 1)[-1])
         command = [
             "python3",
-            "benchmark/gsm8k/bench_sglang.py",
+            str(GSM8K_BENCH_SCRIPT),
             "--num-questions",
             str(GSM8K_NUM_QUESTIONS),
             "--parallel",
             str(GSM8K_NUM_QUESTIONS),
             "--num-shots",
             "5",
+            "--data-path",
+            str(self.gsm8k_data_path),
             "--port",
             str(port),
         ]
