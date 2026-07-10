@@ -1528,7 +1528,16 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     This entrypoint is currently intended only for HiRadixCache's DSA path.
     """
     try:
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
         kv = radix_cache.kv_cache
+        use_mla = True
+        if isinstance(kv, HybridLinearKVPool):
+            # HybridLinearKVPool wraps an inner full-attention pool (MLA or MHA)
+            # + a per-request linear recurrent state; only the full-attention
+            # layers are offloaded to the host, the linear state stays resident.
+            use_mla = kv.use_mla
+            kv = kv.full_kv_pool
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
@@ -1538,7 +1547,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             full_layer_mapping=layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=server_args.hicache_storage_backend,
-            use_mla=True,
+            use_mla=use_mla,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
             sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
