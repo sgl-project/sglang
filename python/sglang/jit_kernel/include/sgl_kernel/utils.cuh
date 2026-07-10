@@ -89,8 +89,10 @@ using fp32x4_t = float4;
 // DLPack device type for the current platform
 #ifndef USE_ROCM
 inline constexpr auto kDLGPU = kDLCUDA;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
 inline constexpr auto kDLGPU = kDLROCM;
+inline constexpr auto kDLGPUHost = kDLROCMHost;
 #endif
 
 namespace device {
@@ -208,6 +210,15 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
+/// PTX pragma that lets the compiler spill registers into otherwise-unused
+/// shared memory instead of local memory. The radix kernels run at occupancy 2
+/// (32 regs/thread) and rely on this to avoid local-memory traffic.
+SGL_DEVICE void enable_smem_spilling() {
+#if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
+  asm(".pragma \"enable_smem_spilling\";");
+#endif
+}
+
 }  // namespace device
 
 namespace host {
@@ -233,15 +244,21 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
  * Usage:
  * \code
  *   host::LaunchKernel(grid, block, device)
- *       .enable_pdl(true)
- *       (my_kernel, arg1, arg2);
+ *       .enable_pdl(true)(my_kernel, arg0, arg1);
+ *   host::LaunchKernel(grid, block, stream)
+ *       .config({.use_pdl = true, .cluster_dim = cluster_dim})(my_kernel, arg0);
  * \endcode
  *
- * The constructor resolves the CUDA stream from a `DLDevice` (via
- * `TVMFFIEnvGetStream`) or accepts a raw `cudaStream_t`. The call
- * operator launches the kernel and checks for errors.
+ * The constructor resolves the CUDA stream from a `DLDevice` (via `TVMFFIEnvGetStream`)
+ * or accepts a raw `cudaStream_t`. The call operator launches the kernel and checks for errors.
  */
 struct LaunchKernel {
+ private:
+  struct KernelConfig {
+    bool use_pdl = false;
+    std::optional<dim3> cluster_dim = std::nullopt;
+  };
+
  public:
   explicit LaunchKernel(
       dim3 grid_dim,
@@ -294,6 +311,20 @@ struct LaunchKernel {
     return *this;
   }
 
+  /**
+   * \brief Configure the kernel launch with the given options.
+   * \param config The kernel configuration options.
+   * \return A reference to this `LaunchKernel` for chaining.
+   * \note This is a convenience method that applies multiple configurations at once.
+   * We are in favor of this instead of `enable_pdl` and `enable_cluster`.
+   * We enforce use of designated initializers for better readability.
+   */
+  auto config(const KernelConfig& config) -> LaunchKernel& {
+    if (config.use_pdl) this->enable_pdl(true);
+    if (config.cluster_dim) this->enable_cluster(*config.cluster_dim);
+    return *this;
+  }
+
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
 #ifdef USE_ROCM
@@ -308,6 +339,11 @@ struct LaunchKernel {
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
+  }
+
+  template <typename T, typename... Args>
+  auto launch(T&& kernel, Args&&... args) const -> void {
+    return (*this)(std::forward<T>(kernel), std::forward<Args>(args)...);
   }
 
  private:
