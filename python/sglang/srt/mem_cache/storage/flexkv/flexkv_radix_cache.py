@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.utils.common import ceil_align, floor_align
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -327,16 +328,18 @@ class FlexKVRadixCache(RadixCache):
         """Shared allocator + post-load bookkeeping for MP/IP.
 
         Returns ``(token_slots[:fetched], new_node)`` on success.
-        ``None`` on either allocation failure or zero retrieved (in
-        which case all slots are freed).
+        ``None`` on either allocation failure or less than one whole
+        page retrieved (in which case all slots are freed).
         """
         if uncached_len <= 0:
             return None
 
+        aligned_uncached_len = ceil_align(uncached_len, self.page_size)
+
         # Evict to make room when needed.
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(EvictParams(num_tokens=uncached_len))
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        if self.token_to_kv_pool_allocator.available_size() < aligned_uncached_len:
+            self.evict(EvictParams(num_tokens=aligned_uncached_len))
+        token_slots = self.token_to_kv_pool_allocator.alloc(aligned_uncached_len)
         if token_slots is None:
             return None
 
@@ -345,28 +348,31 @@ class FlexKVRadixCache(RadixCache):
         # no concept of "skip these device slots, they're already
         # cached"; we pass it exactly the destinations for the
         # uncached tail).
-        num_retrieved = load_fn(token_slots.to(torch.int64))
+        num_retrieved = load_fn(token_slots[:uncached_len].to(torch.int64))
 
         if num_retrieved <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
             return None
 
         # Free the tail of the over-allocation when FlexKV returned
-        # fewer than expected.
-        if num_retrieved < uncached_len:
-            self.token_to_kv_pool_allocator.free(token_slots[num_retrieved:])
-            fetched_slots = token_slots[:num_retrieved]
-        else:
-            fetched_slots = token_slots
+        # fewer than expected, keeping only whole pages of the fetched
+        # span so node values stay whole-page runs.
+        kept = floor_align(num_retrieved, self.page_size)
+        if kept == 0:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return None
+        if kept < aligned_uncached_len:
+            self.token_to_kv_pool_allocator.free(token_slots[kept:])
+        fetched_slots = token_slots[:kept]
 
         new_node = TreeNode(priority=last_node.priority)
         start = value_numel
-        end = start + num_retrieved
+        end = start + kept
         new_node.key = key[start:end]
         new_node.value = fetched_slots
         new_node.parent = last_node
         last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        self.evictable_size_ += num_retrieved
+        self.evictable_size_ += kept
         self._update_leaf_status(last_node)
         self._update_leaf_status(new_node)
 

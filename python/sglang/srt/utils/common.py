@@ -3723,6 +3723,10 @@ def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
+def floor_align(x: int, y: int) -> int:
+    return x // y * y
+
+
 def spec_decode_alloc_len_per_request(server_args) -> int:
     """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
     topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.

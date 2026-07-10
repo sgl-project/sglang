@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align, floor_align
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -332,53 +333,55 @@ class LMCRadixCache(RadixCache):
         """Alloc slots, run ``load_fn``, attach a TreeNode for what was loaded.
 
         Returns ``(slots, new_node)`` on success, ``None`` if alloc fails
-        or the load returned zero (slots are freed in either case).
+        or the load returned less than one whole page (slots are freed in
+        either case).
         """
         chunk_size = self.lmcache_connector.chunk_size()
         prefix_pad = value_numel % chunk_size
+        aligned_uncached_len = ceil_align(uncached_len, self.page_size)
 
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(EvictParams(num_tokens=uncached_len))
+        if self.token_to_kv_pool_allocator.available_size() < aligned_uncached_len:
+            self.evict(EvictParams(num_tokens=aligned_uncached_len))
 
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        token_slots = self.token_to_kv_pool_allocator.alloc(aligned_uncached_len)
         if token_slots is None:
             return None
 
         slot_mapping = torch.empty(
-            value_numel + token_slots.numel(),
+            value_numel + uncached_len,
             dtype=torch.int64,
             device=self.device,
         )
         slot_mapping[:value_numel].fill_(-1)
-        slot_mapping[value_numel:].copy_(token_slots)
+        slot_mapping[value_numel:].copy_(token_slots[:uncached_len])
 
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
+        # Keep only whole pages of the fetched span; the loaded tokens on the
+        # trailing partial page are dropped so node values stay whole-page runs.
         if num_retrieved > 0:
-            self.token_to_kv_pool_allocator.free(
-                token_slots[(num_retrieved - prefix_pad) :]
-            )
+            kept = floor_align(num_retrieved - prefix_pad, self.page_size)
         else:
-            self.token_to_kv_pool_allocator.free(token_slots)
+            kept = 0
+        self.token_to_kv_pool_allocator.free(token_slots[kept:])
 
-        if num_retrieved > 0:
-            fetched = num_retrieved - prefix_pad
+        if kept > 0:
             new_node = TreeNode(priority=last_node.priority)
             start = value_numel
-            end = start + fetched
+            end = start + kept
             new_node.key = key[start:end]
-            new_node.value = token_slots[:fetched]
+            new_node.value = token_slots[:kept]
             new_node.parent = last_node
             last_node.children[new_node.key.child_key(self.page_size)] = new_node
-            self.evictable_size_ += fetched
+            self.evictable_size_ += kept
             self._update_leaf_status(last_node)
             self._update_leaf_status(new_node)
 
             self._record_store_event(new_node.parent)
             self._record_store_event(new_node)
 
-            return token_slots[:fetched], new_node
+            return token_slots[:kept], new_node
 
         return None
 
