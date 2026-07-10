@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils.common import ceil_align
 
 device_module = get_device_module()
 
@@ -107,6 +108,10 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        # The configured buffer size (factory default 2 * top_k or user JSON)
+        # carries no page-multiple guarantee; every buffer capacity derives
+        # from it, so align it once here.
+        self.device_buffer_size = ceil_align(self.device_buffer_size, self.page_size)
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -398,6 +403,10 @@ class HiSparseCoordinator:
                 total_grow += grow_size
 
             if total_grow > 0:
+                assert total_grow % page_size == 0, (
+                    f"total_grow must be page-aligned, got {total_grow} "
+                    f"with page_size={page_size}"
+                )
                 all_new_indices = (
                     self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
                         total_grow
