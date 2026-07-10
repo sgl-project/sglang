@@ -1199,9 +1199,9 @@ class Scheduler(
             disagg_hidden_states_dtype = self.model_config.dtype
             # DSpark PD decode needs target aux hidden from prefill. Use a compact
             # row pool instead of a per-request fixed-capacity metadata tensor.
-            default_dspark_prefill_tokens = int(
-                self.server_args.max_prefill_buffer_tokens()
-                or self.max_prefill_tokens
+            default_dspark_prefill_tokens = max(
+                int(self.server_args.max_prefill_buffer_tokens() or 0),
+                int(self.max_prefill_tokens or 0),
             )
             dspark_prefill_tokens_env = os.getenv(
                 "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
@@ -1223,9 +1223,9 @@ class Scheduler(
                     self.model_config.hidden_size
                 )
                 disagg_hidden_states_dtype = self.model_config.dtype
-                default_dspark_prefill_tokens = int(
-                    self.server_args.max_prefill_buffer_tokens()
-                    or self.max_prefill_tokens
+                default_dspark_prefill_tokens = max(
+                    int(self.server_args.max_prefill_buffer_tokens() or 0),
+                    int(self.max_prefill_tokens or 0),
                 )
                 dspark_prefill_tokens_env = os.getenv(
                     "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
