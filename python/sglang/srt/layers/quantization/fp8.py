@@ -348,6 +348,13 @@ class Fp8Config(QuantizationConfig):
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
 
+            if is_npu() and self.use_mxfp8:
+                from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+                    NPUMXFP8FusedMoEMethod,
+                )
+
+                return NPUMXFP8FusedMoEMethod(self)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
