@@ -410,7 +410,9 @@ def alloc_for_extend(
         alloc_end_lens_list = [
             ceil_align(seq_len, page_size) for seq_len in seq_lens_list
         ]
-    for alloc_start_len, alloc_end_len in zip(alloc_start_lens_list, alloc_end_lens_list):
+    for alloc_start_len, alloc_end_len in zip(
+        alloc_start_lens_list, alloc_end_lens_list
+    ):
         assert alloc_start_len <= alloc_end_len, (
             f"alloc interval is negative: {alloc_start_len=}, {alloc_end_len=}, "
             f"{page_size=}"
