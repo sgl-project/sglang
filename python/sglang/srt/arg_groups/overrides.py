@@ -380,7 +380,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
 
             # Deferred import to avoid a circular import at module-load
-            # time (dsa.utils imports get_global_server_args).
+            # time (dsa.utils imports the runtime-context accessors).
             from sglang.srt.layers.attention.dsa.utils import (
                 aiter_can_use_preshuffle_paged_mqa,
             )
