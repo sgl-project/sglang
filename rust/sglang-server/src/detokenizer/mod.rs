@@ -181,7 +181,12 @@ impl Runnable for DetokenizerWorker {
                         },
                     );
                 }
-                DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev, &self.backend, &self.tm),
+                // One decode step's chunks for this shard, batched by tm-egress.
+                DetokMsg::Chunks(evs) => {
+                    for ev in evs {
+                        handle_chunk(&mut table, ev, &self.backend, &self.tm);
+                    }
+                }
                 DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
                 DetokMsg::Fail { id, message } => handle_fail(&mut table, id, message),
                 DetokMsg::Deregister { id } => {
