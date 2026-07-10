@@ -1240,14 +1240,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
-    # Per-request chunks of output-token sampling supports. These are copied
-    # from Req.output_token_sampling_* and later accumulated into
-    # meta_info["output_token_sampling_mask"] by TokenizerManager.
-    output_token_sampling_mask: List[List]
+    # Per-request chunks of output-token sampling supports. None when no request
+    # in the batch asks for return_sampling_mask.
+    output_token_sampling_mask: Optional[List[List]]
     # Per-request chunks of selected-token logprobs renormalized over the
-    # corresponding sampling supports; later exposed as
-    # meta_info["output_token_sampling_logprobs"].
-    output_token_sampling_logprobs: List[List]
+    # corresponding sampling supports. None when sampling masks are not returned.
+    output_token_sampling_logprobs: Optional[List[List]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1325,10 +1323,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
-    # TokenizerManager exposes these as `output_token_sampling_mask` and
-    # `output_token_sampling_logprobs` in response meta_info.
-    output_token_sampling_mask: List[List]
-    output_token_sampling_logprobs: List[List]
+    # None when sampling masks are not returned.
+    output_token_sampling_mask: Optional[List[List]]
+    output_token_sampling_logprobs: Optional[List[List]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
