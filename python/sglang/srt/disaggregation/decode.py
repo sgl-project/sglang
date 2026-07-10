@@ -1301,7 +1301,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if dspark_dynamic_pool_busy:
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    logger.info(
+                    logger.debug(
                         "DSpark PD hidden receive buffer pool is busy; "
                         "delaying preallocation: rid=%s, hidden_len=%s, "
                         "limit=%s, transfer_queue=%s",
