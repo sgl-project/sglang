@@ -1269,6 +1269,7 @@ class Scheduler(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+            metrics_collector=self.metrics_collector,
         )
 
         if use_mlx():

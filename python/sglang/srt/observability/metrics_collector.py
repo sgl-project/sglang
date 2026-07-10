@@ -547,6 +547,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # FutureMap overlap relay
+        # =================================================================
+        self.num_future_map_stash_total = Counter(
+            name="sglang:num_future_map_stash_total",
+            documentation="Total number of FutureMap stash (write) operations.",
+            labelnames=labels.keys(),
+        )
+        self.num_future_map_publish_total = Counter(
+            name="sglang:num_future_map_publish_total",
+            documentation="Total number of FutureMap publish operations.",
+            labelnames=labels.keys(),
+        )
+        self.num_future_map_resolve_total = Counter(
+            name="sglang:num_future_map_resolve_total",
+            documentation="Total number of FutureMap resolve (read) operations.",
+            labelnames=labels.keys(),
+        )
+        self.future_map_relay_latency_ms = Histogram(
+            name="sglang:future_map_relay_latency_ms",
+            documentation="Histogram of FutureMap relay operation latency in ms.",
+            labelnames=labels.keys(),
+            buckets=(0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500),
+        )
+
+        # =================================================================
         # Utilization
         # =================================================================
         self.utilization = Gauge(
@@ -1132,6 +1157,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
+
+    def observe_future_map_stash(self) -> None:
+        self.num_future_map_stash_total.labels(**self.labels).inc(1)
+
+    def observe_future_map_publish(self) -> None:
+        self.num_future_map_publish_total.labels(**self.labels).inc(1)
+
+    def observe_future_map_resolve(self, latency_ms: float) -> None:
+        self.num_future_map_resolve_total.labels(**self.labels).inc(1)
+        self._log_histogram(self.future_map_relay_latency_ms, latency_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
