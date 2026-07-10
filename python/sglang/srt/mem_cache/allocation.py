@@ -542,6 +542,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    assert token_per_req == 1
+    out_cache_loc_derived = batch.req_to_token_pool.req_to_token[
+        batch.req_pool_indices, locs
+    ].to(torch.int64)
+    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        assert torch.equal(out_cache_loc_derived, out_cache_loc)
+
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
         maybe_write_dsv4_decode(
@@ -553,7 +560,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
 
-    return out_cache_loc
+    return out_cache_loc_derived
 
 
 @triton.jit
