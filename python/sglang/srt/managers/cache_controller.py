@@ -724,6 +724,10 @@ class HiCacheController:
         """
         Load KV caches from host memory to device memory.
         """
+        assert len(host_indices) % self.page_size == 0, (
+            f"load expects whole pages, got len={len(host_indices)} "
+            f"with page_size={self.page_size}"
+        )
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None

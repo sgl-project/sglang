@@ -141,6 +141,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = max_slots // page_size
         self.min_page_index = (self.min_slot_index + page_size - 1) // page_size
         self.entry_bytes_per_page = self.entry_bytes * page_size
+        self.enforce_aligned_free: bool = True
 
         # v2p / p2v sized by PAGES. Page 0 is the padding anchor; trailing row is
         # the -1 sentinel.
@@ -911,7 +912,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Free virtual TOKEN ids: recover virtual PAGE ids, un-map v2p/p2v,
         (if id-owner) recycle the page ids, trigger eager compaction.
 
-        `free_index` is token-granular and need not be page-aligned. EAGER mode
+        `free_index` is token-granular and must cover whole pages; all
+        externally reachable free paths are validated at the lifecycle-owner
+        allocator. EAGER mode
         drops one `wait_stream(forward_stream)` barrier so v2p/p2v writes and the
         compaction move serialize with the in-flight forward. LAZY mode needs no
         barrier (a freed `v` has no live reader, so the scatters are
@@ -921,6 +924,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
+            if self.enforce_aligned_free:
+                assert free_index.numel() % self.page_size == 0, (
+                    f"free expects whole pages, got numel={free_index.numel()} "
+                    f"with page_size={self.page_size}"
+                )
             if not self.is_not_in_free_group:
                 self.free_group.append(free_index)
                 return

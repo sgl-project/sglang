@@ -443,6 +443,10 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        assert host_indices.numel() % self.page_size == 0, (
+            f"load expects whole pages, got numel={host_indices.numel()} "
+            f"with page_size={self.page_size}"
+        )
         need_load_kv = host_indices.numel() > 0
 
         full_allocator = getattr(

@@ -76,6 +76,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
+            # The swa component receives mapping-translated, `> 0`-filtered
+            # indices; alignment is validated at the composite entry instead.
+            self.swa_attn_allocator.enforce_aligned_free = False
+        # NPU keeps real-lens (non page-aligned) kv_allocated_len bookkeeping
+        # (op2), so the entry asserts are exempted there.
+        self.enforce_aligned_free: bool = not _is_npu
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
         # is -1, and we need to map it to swa_last_loc -1 as well.
@@ -329,6 +335,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        if self.enforce_aligned_free:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free expects whole pages, got numel={free_index.numel()} "
+                f"with page_size={self.page_size}"
+            )
+
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
@@ -357,6 +369,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        if self.enforce_aligned_free:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free_swa expects whole pages, got numel={free_index.numel()} "
+                f"with page_size={self.page_size}"
+            )
 
         if self.page_size == 1:
             mapping_indices = free_index

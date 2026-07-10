@@ -124,6 +124,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        # Internal sub-allocators that legally receive non-page-multiple inputs
+        # (hisparse device pools, SWA translated/filtered indices) opt out at
+        # their construction points.
+        self.enforce_aligned_free: bool = True
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -262,6 +266,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        if self.enforce_aligned_free:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free expects whole pages, got numel={free_index.numel()} "
+                f"with page_size={self.page_size}"
+            )
+
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
@@ -272,6 +282,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_group.append(free_index)
 
         if self.debug_mode:
+            if self.enforce_aligned_free:
+                rows = free_index.reshape(-1, self.page_size)
+                page_offsets = torch.arange(self.page_size, device=rows.device)
+                assert bool(
+                    (rows == rows[:, :1] + page_offsets).all()
+                ), "free expects each page_size-sized row to be one contiguous page"
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):

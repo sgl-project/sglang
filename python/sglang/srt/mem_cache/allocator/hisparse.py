@@ -48,6 +48,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
+        # The hisparse device pool legally receives filtered / page-head /
+        # arange-padded indices; alignment is validated at the wrapper entry.
+        self.hisparse_attn_allocator.enforce_aligned_free = False
+        self.enforce_aligned_free: bool = True
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -258,6 +262,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        if self.enforce_aligned_free:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free expects whole pages, got numel={free_index.numel()} "
+                f"with page_size={self.page_size}"
+            )
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
@@ -306,6 +315,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_kvcache,
             logical_attn_allocator.need_sort,
         )
+        # The hisparse device pool legally receives filtered / page-head /
+        # arange-padded indices; alignment is validated at the wrapper entry.
+        self.hisparse_attn_allocator.enforce_aligned_free = False
+        self.enforce_aligned_free: bool = True
 
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
@@ -561,6 +574,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        if self.enforce_aligned_free:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free expects whole pages, got numel={free_index.numel()} "
+                f"with page_size={self.page_size}"
+            )
 
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
