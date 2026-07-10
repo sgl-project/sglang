@@ -1160,13 +1160,6 @@ def _summarise_dp_broadcast(results: List[dict]) -> Response:
     )
 
 
-async def get_condition(rid):
-    async with encode_server_module.cond_dict_lock:
-        if rid not in encode_server_module.rid_to_cond:
-            encode_server_module.rid_to_cond[rid] = asyncio.Condition()
-        return encode_server_module.rid_to_cond[rid]
-
-
 @app.post("/encode")
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
@@ -1439,18 +1432,11 @@ async def handle_send_request(request: dict):
 
 @app.post("/scheduler_receive_url")
 async def handle_scheduler_receive_url_request(request: dict):
-    rid = request["req_id"]
-    async with encode_server_module.rid_lock:
-        if rid not in encode_server_module.rid_to_receive_endpoint:
-            encode_server_module.rid_to_receive_endpoint[rid] = set()
-            encode_server_module.rid_to_receive_count[rid] = request["receive_count"]
-        assert (
-            encode_server_module.rid_to_receive_count[rid] == request["receive_count"]
-        )
-        encode_server_module.rid_to_receive_endpoint[rid].add(request["receive_url"])
-    cond = await get_condition(rid)
-    async with cond:
-        cond.notify_all()
+    await encoder.register_embedding_destinations(
+        request["req_id"],
+        request["receive_count"],
+        [request["receive_url"]],
+    )
 
 
 @app.get("/health")
