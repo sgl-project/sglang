@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 
 from sglang.multimodal_gen.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestDiffusionBCGZImageTurbo(unittest.TestCase):
+class TestDiffusionBCGZImageTurbo(CustomTestCase):
     def test_zimage_turbo_true_bcg_generate(self):
         artifact_dir = Path(
             os.environ.get(
