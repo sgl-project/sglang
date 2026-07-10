@@ -136,7 +136,7 @@ done
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -323,7 +323,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -343,7 +343,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -528,7 +528,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -548,7 +548,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -733,7 +733,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -753,7 +753,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -936,7 +936,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -956,7 +956,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1141,7 +1141,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -1164,7 +1164,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6655` = `int(66560 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1345,7 +1345,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -1365,7 +1365,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1552,7 +1552,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1576,7 +1576,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1765,7 +1765,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>, <your prefill ip3>, <your prefill ip4>: prefill node IP addresses
@@ -1791,7 +1791,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
