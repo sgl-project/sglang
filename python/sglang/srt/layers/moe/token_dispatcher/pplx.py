@@ -78,7 +78,6 @@ class PplxAllToAllManager:
     _all_to_all: Optional[AllToAll] = None
     _key: Optional[tuple] = None
     _group_name: Optional[str] = None
-    _combined_group: Optional[dist.ProcessGroup] = None
 
     # Name under which the EP process group is registered with c10d so the
     # pplx intranode kernel can resolve it via resolve_process_group().
@@ -109,25 +108,7 @@ class PplxAllToAllManager:
         combined = dist.new_group(ranks=ranks, backend="cpu:gloo,cuda:nccl")
         torch._C._distributed_c10d._register_process_group(cls._GROUP_NAME, combined)
         cls._group_name = cls._GROUP_NAME
-        cls._combined_group = combined
         return cls._group_name
-
-    @classmethod
-    def barrier(cls) -> None:
-        """Barrier across the EP group to keep ranks in lockstep.
-
-        pplx dispatch/combine share one fixed-buffer AllToAll instance across
-        all MoE layers. The calls enqueue asynchronously, so without a
-        per-layer rendezvous a fast (e.g. idle DP) rank can run ahead and
-        overwrite the shared counter/data buffers that a slower rank's in-flight
-        collective is still reading, deadlocking the device-side handshake. A
-        device barrier at each layer boundary forces all ranks past layer K
-        before any starts layer K+1.
-        """
-        if cls._combined_group is not None:
-            dist.barrier(
-                group=cls._combined_group, device_ids=[torch.cuda.current_device()]
-            )
 
     @classmethod
     def get_all_to_all(
@@ -398,8 +379,7 @@ class _PplxEPDispatcherImpl:
             dtype=self.params_dtype,
             device=device,
         )
-        # torch.full (scalar-fill kernel) is CUDA-graph-capturable; a
-        # torch.tensor([...]) host->device copy is not.
+
         bound_m = torch.full((1,), num_tokens, dtype=torch.uint32, device=device)
 
         ata.combine(

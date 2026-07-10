@@ -1,16 +1,3 @@
-"""End-to-end accuracy tests for the ``pplx`` MoE all-to-all backend.
-
-Besides the throughput GSM8K run, each server also runs a **single-stream**
-GSM8K eval (``num_threads=1``). That is deliberate: the pplx EP combine already
-reduces each token's expert outputs back to the source rank, so the model must
-skip the post-experts all-reduce (see
-``should_skip_post_experts_all_reduce`` / ``is_pplx()``). When it does not, the
-extra all-reduce folds *idle* DP ranks' fabricated outputs into the real tokens
--- which only happens when fewer requests are in flight than ``dp_size``. The
-high-concurrency run keeps every rank busy and hides that bug; the single-stream
-run leaves ranks idle and is the regression guard for it.
-"""
-
 import unittest
 from types import SimpleNamespace
 
