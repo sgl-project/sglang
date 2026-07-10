@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -66,8 +67,6 @@ def get_glm_dsa_cp_layer_shard_info(
 
     ``(None, 1)`` disables sharding (feature off or only one CP rank).
     """
-    from sglang.srt.runtime_context import get_parallel
-
     if not is_glm_dsa_cache_layer_split_enabled(model_runner):
         return None, 1
     shard_size = get_parallel().attn_cp_size
@@ -85,8 +84,6 @@ def get_glm_dsa_layer_split_effective_num_layers(
     layers, plus one extra layer for the remote scratch buffer used when reading
     a layer owned by another CP rank.
     """
-    from sglang.srt.runtime_context import get_parallel
-
     if not is_glm_dsa_cache_layer_split_enabled(model_runner):
         return num_layers
     shard_size = get_parallel().attn_cp_size
