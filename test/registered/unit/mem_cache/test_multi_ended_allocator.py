@@ -1425,9 +1425,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             int(full_alloc.free_virtual_ids.numel()),
             int(free_before.numel()),
         )
-        self.assertTrue(
-            torch.equal(full_alloc.virtual_to_physical, v2p_before)
-        )
+        self.assertTrue(torch.equal(full_alloc.virtual_to_physical, v2p_before))
 
     # 12. translate_kv_loc preserves token-level identity end-to-end.
     def test_paged_translate_kv_loc_token_round_trip(self):
