@@ -1046,11 +1046,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         if tail_hidden is None or tail_mask is None or tail_hidden.numel() == 0:
             return
 
+        if tail_hidden.ndim != 3 or tail_mask.ndim != 2:
+            raise RuntimeError(
+                "DSpark PD prefill hidden injection expects hidden=[bs, len, dim] "
+                f"and mask=[bs, len], got hidden={tuple(tail_hidden.shape)}, "
+                f"mask={tuple(tail_mask.shape)}"
+            )
         tail_hidden = tail_hidden.to(device=self.device, non_blocking=True)
         tail_mask = tail_mask.to(device=self.device, non_blocking=True).bool()
         bs, tail_len = tail_mask.shape
         if bs == 0 or tail_len == 0:
             return
+        if int(tail_hidden.shape[0]) != bs or int(tail_hidden.shape[1]) != tail_len:
+            raise RuntimeError(
+                "DSpark PD prefill hidden/mask shape mismatch before injection: "
+                f"hidden={tuple(tail_hidden.shape)}, mask={tuple(tail_mask.shape)}"
+            )
 
         device = torch.device(self.device)
         req_pool_indices = getattr(draft_input, "future_indices", None)
@@ -1094,17 +1105,37 @@ class DSparkWorkerV2(BaseSpecWorker):
         positions_2d = start_pos + row
 
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        flat_mask = tail_mask.reshape(-1)
+        if not bool(flat_mask.any()):
+            return
+        valid_positions = positions_2d.reshape(-1)[flat_mask]
+        min_pos = int(valid_positions.min().item())
+        max_pos = int(valid_positions.max().item())
+        if min_pos < 0 or max_pos >= int(req_to_token.shape[1]):
+            raise RuntimeError(
+                "DSpark PD prefill hidden positions are out of req_to_token range: "
+                f"position_range=({min_pos}, {max_pos}), "
+                f"req_to_token_width={int(req_to_token.shape[1])}, "
+                f"start_positions={start_pos.view(-1).tolist()}, tail_len={tail_len}"
+            )
         cache_loc_2d = req_to_token[
             req_pool_indices.view(-1, 1), positions_2d.clamp_min(0)
         ]
 
-        flat_mask = tail_mask.reshape(-1)
-        if not bool(flat_mask.any()):
-            return
         self._kv_injector.inject_target_hidden(
             target_hidden=tail_hidden.reshape(bs * tail_len, -1)[flat_mask],
             cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
             positions=positions_2d.reshape(-1)[flat_mask],
+        )
+        logger.info(
+            "Injected DSpark PD prefill tail hidden: bs=%s, tail_len=%s, "
+            "valid_rows=%s, hidden_size=%s, position_range=(%s, %s)",
+            bs,
+            tail_len,
+            int(flat_mask.sum().item()),
+            int(tail_hidden.shape[-1]),
+            min_pos,
+            max_pos,
         )
         draft_input.prefill_tail_hidden_states = None
         draft_input.prefill_tail_valid_mask = None

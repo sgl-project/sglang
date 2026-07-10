@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+
+logger = logging.getLogger(__name__)
 
 
 class SpeculativeAlgorithm(Enum):
@@ -185,16 +189,28 @@ class SpeculativeAlgorithm(Enum):
                 int(getattr(req, "prefill_tail_hidden_start", 0))
                 for req in batch.reqs
             ]
-            if (
-                tail_hidden
-                and all(t is not None for t in tail_hidden)
-                and all(t is not None for t in tail_mask)
-            ):
-                max_len = max(int(t.shape[0]) for t in tail_hidden)
-                hidden_size = int(tail_hidden[0].shape[-1])
+            has_tail = [
+                hidden is not None and mask is not None
+                for hidden, mask in zip(tail_hidden, tail_mask)
+            ]
+            if any(has_tail):
+                ref_hidden = next(
+                    hidden for hidden, has_cur in zip(tail_hidden, has_tail) if has_cur
+                )
+                if ref_hidden.ndim != 2:
+                    raise RuntimeError(
+                        "DSpark PD prefill tail hidden must be 2D per request: "
+                        f"shape={tuple(ref_hidden.shape)}"
+                    )
+                max_len = max(
+                    int(hidden.shape[0])
+                    for hidden, has_cur in zip(tail_hidden, has_tail)
+                    if has_cur
+                )
+                hidden_size = int(ref_hidden.shape[-1])
                 prefill_tail_hidden_states = torch.zeros(
                     (len(tail_hidden), max_len, hidden_size),
-                    dtype=tail_hidden[0].dtype,
+                    dtype=ref_hidden.dtype,
                     device=batch.device,
                 )
                 prefill_tail_valid_mask = torch.zeros(
@@ -202,7 +218,34 @@ class SpeculativeAlgorithm(Enum):
                     dtype=torch.bool,
                     device=batch.device,
                 )
-                for i, (hidden, mask) in enumerate(zip(tail_hidden, tail_mask)):
+                for i, (hidden, mask, has_cur) in enumerate(
+                    zip(tail_hidden, tail_mask, has_tail)
+                ):
+                    if not has_cur:
+                        if hidden is not None or mask is not None:
+                            raise RuntimeError(
+                                "DSpark PD prefill tail hidden/mask must be both "
+                                f"present or both absent for batch index {i}."
+                            )
+                        continue
+                    if hidden.ndim != 2 or mask.ndim != 1:
+                        raise RuntimeError(
+                            "DSpark PD prefill tail shape mismatch: "
+                            f"batch_index={i}, hidden={tuple(hidden.shape)}, "
+                            f"mask={tuple(mask.shape)}"
+                        )
+                    if int(hidden.shape[0]) != int(mask.shape[0]):
+                        raise RuntimeError(
+                            "DSpark PD prefill tail length mismatch: "
+                            f"batch_index={i}, hidden_len={int(hidden.shape[0])}, "
+                            f"mask_len={int(mask.shape[0])}"
+                        )
+                    if int(hidden.shape[-1]) != hidden_size:
+                        raise RuntimeError(
+                            "DSpark PD prefill tail hidden size mismatch: "
+                            f"batch_index={i}, hidden_size={int(hidden.shape[-1])}, "
+                            f"expected={hidden_size}"
+                        )
                     cur_len = int(hidden.shape[0])
                     if cur_len == 0:
                         continue
@@ -219,6 +262,15 @@ class SpeculativeAlgorithm(Enum):
                 else:
                     prefill_tail_start_positions = torch.tensor(
                         tail_start, dtype=torch.int64, device=batch.device
+                    )
+                    logger.info(
+                        "Built DSpark PD draft tail hidden: bs=%s, max_len=%s, "
+                        "hidden_size=%s, valid_rows=%s, start_positions=%s",
+                        len(tail_hidden),
+                        max_len,
+                        hidden_size,
+                        int(prefill_tail_valid_mask.sum().item()),
+                        [int(x) for x in tail_start],
                     )
             else:
                 prefill_tail_hidden_states = None
