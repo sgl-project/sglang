@@ -137,7 +137,7 @@ impl Default for AdmissionConfig {
 /// `enabled: false, max_retries: 5` state). The at-most-once invariant is
 /// currently structural in the chat handler (a `retried` bool and a
 /// single-worker URL exclusion), so multi-retry is a redesign, not a knob.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RetryConfig {
     /// Whether the router retries a failed plain-mode dispatch once, onto a
     /// different not-full worker. `false` (default) disables retry.
@@ -149,9 +149,12 @@ pub struct RetryConfig {
     /// with no fresh ITL sample is treated as eligible (unknown ≠ hot).
     pub max_target_itl_ms: Option<u64>,
     /// When the ITL gate is on, a retry target's ITL must also be at or below
-    /// the failed worker's ITL times this factor (default `1.0` — no worse than
-    /// the worker we just left). Applied only when BOTH ITLs are known.
-    pub itl_rel_factor: f32,
+    /// the failed worker's ITL times this factor. Applied only when the gate is
+    /// engaged (`max_target_itl_ms` set) AND both ITLs are known. `None`
+    /// (default) means the factor `1.0` — the target must be no worse than the
+    /// worker we just left. Like the other two knobs it requires retry enabled;
+    /// unlike them it also has no effect without `max_target_itl_ms`.
+    pub itl_rel_factor: Option<f32>,
     /// Per-attempt deadline (ms) on producing a response (headers for streaming,
     /// full body for non-streaming). If it elapses before the attempt yields a
     /// response, the attempt is treated as a retryable timeout so a slow/wedged
@@ -163,20 +166,9 @@ pub struct RetryConfig {
     pub attempt_deadline_ms: Option<u64>,
 }
 
-pub fn default_retry_itl_rel_factor() -> f32 {
-    1.0
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_target_itl_ms: None,
-            itl_rel_factor: default_retry_itl_rel_factor(),
-            attempt_deadline_ms: None,
-        }
-    }
-}
+/// The `itl_rel_factor` applied when the knob is unset: the retry target must
+/// be no worse (ITL) than the worker whose dispatch just failed.
+pub const DEFAULT_RETRY_ITL_REL_FACTOR: f32 = 1.0;
 
 /// Routing policy selector — the enum form lets `clap` reject unknown
 /// values at parse time and removes the runtime string match in the

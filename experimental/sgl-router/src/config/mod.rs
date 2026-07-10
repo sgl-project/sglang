@@ -57,22 +57,26 @@ impl Config {
         if let Some(msg) = retry_without_cap_advisory(&self.retry, &self.admission) {
             tracing::warn!("{msg}");
         }
-        // Retry ITL/deadline knobs only take effect with retry enabled, and the
-        // relative factor must be a sane positive multiplier.
-        if self.retry.enabled
-            && (!self.retry.itl_rel_factor.is_finite() || self.retry.itl_rel_factor <= 0.0)
+        // The retry ITL/deadline knobs only take effect with retry enabled;
+        // reject them otherwise so a set-but-ignored flag fails loudly instead
+        // of silently no-op-ing (all three, including the relative factor).
+        if !self.retry.enabled
+            && (self.retry.max_target_itl_ms.is_some()
+                || self.retry.attempt_deadline_ms.is_some()
+                || self.retry.itl_rel_factor.is_some())
         {
             return Err(anyhow!(
-                "retry.itl_rel_factor must be a finite value > 0 (got {})",
-                self.retry.itl_rel_factor
+                "--retry-max-target-itl-ms / --retry-attempt-deadline-ms / \
+                 --retry-itl-rel-factor require --enable-retry"
             ));
         }
-        if !self.retry.enabled
-            && (self.retry.max_target_itl_ms.is_some() || self.retry.attempt_deadline_ms.is_some())
-        {
-            return Err(anyhow!(
-                "--retry-max-target-itl-ms / --retry-attempt-deadline-ms require --enable-retry"
-            ));
+        // When set, the relative factor must be a sane positive multiplier.
+        if let Some(factor) = self.retry.itl_rel_factor {
+            if !factor.is_finite() || factor <= 0.0 {
+                return Err(anyhow!(
+                    "retry.itl_rel_factor must be a finite value > 0 (got {factor})"
+                ));
+            }
         }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
@@ -253,6 +257,60 @@ mod tests {
         assert!(retry_without_cap_advisory(&enabled, &cap).is_none());
         assert!(retry_without_cap_advisory(&disabled, &AdmissionConfig::Disabled).is_none());
         assert!(retry_without_cap_advisory(&disabled, &cap).is_none());
+    }
+
+    #[test]
+    fn rejects_retry_itl_knobs_without_enable_retry() {
+        // Each retry-scoped knob set without --enable-retry must fail loudly
+        // rather than silently no-op (the ITL relative factor included — it
+        // used to have a CLI default that made this case undetectable).
+        let disabled_variants = [
+            RetryConfig {
+                max_target_itl_ms: Some(80),
+                ..RetryConfig::default()
+            },
+            RetryConfig {
+                attempt_deadline_ms: Some(15_000),
+                ..RetryConfig::default()
+            },
+            RetryConfig {
+                itl_rel_factor: Some(0.8),
+                ..RetryConfig::default()
+            },
+        ];
+        for retry in disabled_variants {
+            assert!(!retry.enabled);
+            let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+            c.retry = retry;
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("require --enable-retry"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_positive_itl_rel_factor_when_retry_enabled() {
+        for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+            c.retry = RetryConfig {
+                enabled: true,
+                itl_rel_factor: Some(bad),
+                ..RetryConfig::default()
+            };
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("itl_rel_factor"), "got: {err} for {bad}");
+        }
+    }
+
+    #[test]
+    fn accepts_all_retry_knobs_with_enable_retry() {
+        let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        c.retry = RetryConfig {
+            enabled: true,
+            max_target_itl_ms: Some(80),
+            itl_rel_factor: Some(1.5),
+            attempt_deadline_ms: Some(15_000),
+        };
+        c.validate().unwrap();
     }
 
     #[test]

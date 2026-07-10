@@ -10,11 +10,11 @@ use clap::Parser;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::{
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_retry_itl_rel_factor,
-    default_shutdown_drain_secs, default_stale_request_timeout_secs, default_tokenizer_shards,
-    resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig,
-    Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    default_cb_cool_down, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
+    default_stale_request_timeout_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
+    AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
+    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -185,14 +185,18 @@ pub struct Cli {
     #[arg(long)]
     pub retry_max_target_itl_ms: Option<u64>,
     /// A retry target's ITL must also be <= the failed worker's ITL times this
-    /// factor (applied only when both ITLs are known and the ITL gate is on).
-    /// Requires `--enable-retry`.
-    #[arg(long, default_value_t = default_retry_itl_rel_factor())]
-    pub retry_itl_rel_factor: f32,
+    /// factor (default 1.0 — no worse than the worker we just left; applied only
+    /// when both ITLs are known). Requires `--enable-retry`, and only engages
+    /// when `--retry-max-target-itl-ms` is also set — it refines that ceiling and
+    /// is a no-op without it.
+    #[arg(long)]
+    pub retry_itl_rel_factor: Option<f32>,
     /// Per-attempt deadline (ms) on producing a response; if it elapses the
-    /// attempt is retried on another worker. Bounds time-to-response (headers for
-    /// streaming), not post-commit TTFT. Unset disables it. Requires
-    /// `--enable-retry`; set below `--request-timeout-secs` to matter.
+    /// attempt is retried on another worker. Bounds time-to-response — response
+    /// headers for streaming, the full response body for non-streaming — NOT
+    /// post-commit inter-token latency (once a streaming response's headers are
+    /// sent it can't be retried). Unset disables it. Requires `--enable-retry`;
+    /// set below `--request-timeout-secs` to matter.
     #[arg(long)]
     pub retry_attempt_deadline_ms: Option<u64>,
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::RetryConfig;
+use crate::config::{RetryConfig, DEFAULT_RETRY_ITL_REL_FACTOR};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
@@ -1188,7 +1188,8 @@ fn itl_target_eligible(
         return false;
     }
     if let Some(s) = source_itl {
-        if t > s * retry.itl_rel_factor as f64 {
+        let factor = retry.itl_rel_factor.unwrap_or(DEFAULT_RETRY_ITL_REL_FACTOR);
+        if t > s * factor as f64 {
             return false;
         }
     }
@@ -1511,7 +1512,7 @@ mod tests {
         RetryConfig {
             enabled: true,
             max_target_itl_ms,
-            itl_rel_factor,
+            itl_rel_factor: Some(itl_rel_factor),
             attempt_deadline_ms: None,
         }
     }
