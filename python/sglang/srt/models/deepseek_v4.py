@@ -2199,6 +2199,23 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            if (
+                get_server_args().disaggregation_mode == "prefill"
+                and getattr(forward_batch, "dspark_hidden_capture_layer_ids", None)
+                is not None
+                and not dsa_use_prefill_cp(forward_batch)
+                and int(hidden_states.shape[0]) != int(positions.shape[0])
+            ):
+                raise RuntimeError(
+                    "DSpark PP proxy hidden/position length mismatch before "
+                    "DeepSeekV4 prefill forward: "
+                    f"pp_rank={self.pp_group.rank_in_group}, "
+                    f"rids={getattr(forward_batch, 'rids', None)}, "
+                    f"hidden_len={int(hidden_states.shape[0])}, "
+                    f"position_len={int(positions.shape[0])}, "
+                    "capture_layer_ids="
+                    f"{getattr(forward_batch, 'dspark_hidden_capture_layer_ids', None)}"
+                )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
