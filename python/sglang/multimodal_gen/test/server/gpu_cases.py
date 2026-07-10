@@ -969,7 +969,7 @@ STANDALONE_FILES = {
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 STANDALONE_FILE_EST_TIMES = {
     "bcg-diffusion": {
-        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 300.0,
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
     },
     "1-gpu": {
         "../single_test_file/test_update_weights_from_disk.py": 1200.0,
