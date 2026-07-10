@@ -298,6 +298,12 @@ class _PplxEPDispatcherImpl:
         ata = self._get_all_to_all()
 
         num_tokens = hidden_states.shape[0]
+        assert num_tokens <= self.num_max_dispatch_tokens_per_rank, (
+            f"num_tokens ({num_tokens}) exceeds num_max_dispatch_tokens_per_rank "
+            f"({self.num_max_dispatch_tokens_per_rank}); raise "
+            f"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK or lower the per-rank "
+            f"decode batch / chunked-prefill size."
+        )
         num_dp_groups = get_attention_dp_size()
         max_batch_tokens = self.num_max_dispatch_tokens_per_rank * num_dp_groups
         device = hidden_states.device
@@ -379,6 +385,12 @@ class _PplxEPDispatcherImpl:
     ):
         ata = self._get_all_to_all()
         num_tokens = topk_ids.shape[0]
+        assert num_tokens <= self.num_max_dispatch_tokens_per_rank, (
+            f"num_tokens ({num_tokens}) exceeds num_max_dispatch_tokens_per_rank "
+            f"({self.num_max_dispatch_tokens_per_rank}); raise "
+            f"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK or lower the per-rank "
+            f"decode batch / chunked-prefill size."
+        )
         device = topk_ids.device
 
         out_tokens = torch.zeros(
