@@ -192,7 +192,7 @@ def _node_is_swa_resident_for_canary(
         return not node.swa_tombstone
 
     if type(radix_cache) is UnifiedRadixCache:
-        if ComponentType.SWA not in radix_cache.tree_components:
+        if not radix_cache.supports_swa():
             return True
         return node.component_data[ComponentType.SWA].value is not None
 
