@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -70,7 +69,7 @@ class PureSWARadixCache(RadixCache):
         """Cache request when it finishes.
 
         Only inserts the prefill portion [0, evict_floor) into the radix tree.
-        The window portion [swa_evicted_seqlen, committed_len) is freed back
+        The window portion [swa_evicted_seqlen, keys_len) is freed back
         to the allocator. The range [evict_floor, swa_evicted_seqlen) was already
         freed by _evict_swa during decode — we skip it to avoid double-free.
         """
@@ -79,13 +78,7 @@ class PureSWARadixCache(RadixCache):
 
         kv_committed_len = kv_len_to_handle
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return CacheFinishedReqResult(
-                unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
-            )
+            return CacheFinishedReqResult(unhandled_kv_start=0)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -96,6 +89,10 @@ class PureSWARadixCache(RadixCache):
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         keys_len = len(radix_key)
+        assert req.kv.swa_evicted_seqlen <= keys_len, (
+            f"SWA evicted range extends past the page-aligned key length, "
+            f"{req.kv.swa_evicted_seqlen=}, {keys_len=}, {kv_committed_len=}"
+        )
 
         old_prefix_len = req.cache_protected_len
         swa_evict_floor = req.swa_evict_floor
@@ -134,14 +131,10 @@ class PureSWARadixCache(RadixCache):
             if swa_evicted_seqlen > 0 and alive_start < keys_len:
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
 
-        self.token_to_kv_pool_allocator.free(kv_indices[keys_len:])
-
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-        return CacheFinishedReqResult(
-            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
-        )
+        return CacheFinishedReqResult(unhandled_kv_start=keys_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
