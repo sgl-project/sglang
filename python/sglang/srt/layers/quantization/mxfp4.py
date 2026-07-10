@@ -318,7 +318,9 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
         if _is_hip:
-            if mxfp_supported():
+            # gfx95 has native MX support; RDNA (gfx11xx/gfx12xx) does not, but can
+            # still run MXFP4 MoE via the OpenAI triton_kernels path.
+            if mxfp_supported() or has_triton_kernels:
                 return cls(
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
@@ -326,7 +328,8 @@ class Mxfp4Config(QuantizationConfig):
 
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
-                    f"Current platform {platform} not support mxfp4 computation"
+                    f"Current platform {platform} does not support mxfp4 computation "
+                    "(no gfx95 MX hardware and triton_kernels is not installed)"
                 )
 
         return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
