@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for Qwen3.5-397B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3.5-397B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3.5-397B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.5-397B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b).
+</Note>
 
 ### Low Latency
 
@@ -27,6 +29,8 @@ This guide describes the best practice data for Qwen3.5-397B on the Ascend NPU.
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.5-397B W4A8 8P IN128K OUT1K 20ms
 
@@ -115,7 +119,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -224,7 +230,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -293,20 +301,15 @@ export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=0
+export HCCL_BUFFSIZE=2200
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
-export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
 export STREAMS_PER_DEVICE=32
-export ZBAL_ENABLE_GRAPH=1
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -322,7 +325,6 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 64 \
     --mem-fraction-static 0.6 \
-    --cuda-graph-bs 2 4 6 8 10 12 16 20 24 32 40 48 56 64 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -334,7 +336,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -451,7 +455,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -564,7 +570,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -577,10 +585,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 144 \
+    --max-concurrency 132 \
     --random-input-len 16384 \
     --random-output-len 1024 \
-    --num-prompts 144 \
+    --num-prompts 132 \
     --random-range-ratio 1 \
     --request-rate inf \
     --warmup-requests 8
@@ -676,7 +684,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -697,8 +707,6 @@ python -m sglang.bench_serving \
     --request-rate inf \
     --warmup-requests 64
 ```
-
-<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.5-397B W4A8 8P IN3K5 OUT1K5 50ms
 
@@ -790,7 +798,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -903,7 +913,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -916,13 +928,13 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 8 \
+    --max-concurrency 6 \
     --random-input-len 65536 \
     --random-output-len 1024 \
-    --num-prompts 8 \
+    --num-prompts 6 \
     --random-range-ratio 1 \
     --request-rate inf \
-    --warmup-requests 8
+    --warmup-requests 6
 ```
 
 ### Qwen3.5-397B W4A8 8P IN64K OUT1K 50ms
@@ -1016,7 +1028,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -1085,20 +1099,15 @@ export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=0
+export HCCL_BUFFSIZE=2200
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
-export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=58672
 export STREAMS_PER_DEVICE=32
-export ZBAL_ENABLE_GRAPH=1
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -1114,7 +1123,6 @@ python3 -m sglang.launch_server \
     --max-running-requests 128 \
     --mem-fraction-static 0.6 \
     --max-total-tokens 1310720 \
-    --cuda-graph-bs 2 4 6 8 10 12 16 20 24 32 40 48 56 64 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -1129,7 +1137,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --speculative-draft-model-quantization unquant
+    --speculative-draft-model-quantization unquant \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -1146,11 +1156,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --gsp-num-groups 1 \
-    --gsp-prompts-per-group 128 \
+    --gsp-prompts-per-group 112 \
     --gsp-system-prompt-len 58982 \
     --gsp-question-len 6553 \
     --gsp-output-len 1024 \
-    --max-concurrency 128 \
-    --num-prompts 128 \
+    --max-concurrency 112 \
+    --num-prompts 112 \
     --request-rate inf
 ```

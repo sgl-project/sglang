@@ -4,28 +4,32 @@ metatags:
   description: "Best Practice for Qwen3.6-35B-A3B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3.6-35B-A3B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3.6-35B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.6-35B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_35b_a3b).
+</Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 254K+1K | 16.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 254K+1K | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 2 | PD Mixed | 984K+1K | 40.91ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 2 | PD Mixed | 984K+1K | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k) |
 
 ## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.6-35B-A3B 1P IN1024X1024 30 OUT1024 50ms
 
@@ -37,7 +41,7 @@ This guide describes the best practice data for Qwen3.6-35B-A3B on the Ascend NP
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 1024x1024 (30)+1024
 
@@ -104,7 +108,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -135,7 +141,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 1080p_30+256
 
@@ -200,7 +206,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -231,7 +239,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 128K+1K
 
@@ -283,13 +291,13 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
+    --max-total-tokens 520960 \
     --max-prefill-tokens 128000 \
     --disable-radix-cache \
     --trust-remote-code \
-    --enable-prefill-delayer \
     --max-running-requests 3 \
     --max-mamba-cache-size 10 \
-    --mem-fraction-static 0.63 \
+    --mem-fraction-static 0.9 \
     --cuda-graph-bs 1 2 3 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
@@ -298,7 +306,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -314,7 +324,7 @@ python -m sglang.bench_serving \
     --max-concurrency 3 \
     --random-input-len 128000 \
     --random-output-len 1000 \
-    --num-prompts 12 \
+    --num-prompts 3 \
     --random-range-ratio 1
 ```
 
@@ -328,7 +338,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 128K+1K (90% prefix cache hit rate)
 
@@ -393,7 +403,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -429,7 +441,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 254K+1K
 
@@ -492,7 +504,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -512,8 +526,6 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
-
 ### Qwen3.6-35B-A3B 1P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3.6-35B-A3B
@@ -524,7 +536,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 3.5K+1.5K
 
@@ -574,15 +586,15 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
+    --max-total-tokens 659840 \
     --max-prefill-tokens 43400 \
     --disable-radix-cache \
     --trust-remote-code \
-    --enable-prefill-delayer \
-    --prefill-delayer-max-delay-passes 50 \
-    --max-running-requests 124 \
-    --max-mamba-cache-size 124 \
-    --mem-fraction-static 0.8 \
-    --cuda-graph-bs 4 16 32 64 96 112 116 120 124 \
+    --prefill-max-requests 12 \
+    --max-running-requests 122 \
+    --max-mamba-cache-size 122 \
+    --mem-fraction-static 0.9 \
+    --cuda-graph-bs 4 16 32 64 96 116 120 122 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -590,7 +602,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -603,10 +617,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 124 \
+    --max-concurrency 122 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 496 \
+    --num-prompts 122 \
     --random-range-ratio 1
 ```
 
@@ -620,7 +634,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 64K+1K
 
@@ -686,7 +700,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -716,7 +732,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 64K+1K (90% prefix cache hit rate)
 
@@ -767,14 +783,14 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
+    --max-total-tokens 470784 \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
-    --enable-prefill-delayer \
     --mamba-scheduler-strategy extra_buffer \
-    --max-running-requests 42 \
-    --max-mamba-cache-size 210 \
-    --mem-fraction-static 0.71 \
-    --cuda-graph-bs 2 8 16 24 32 36 40 42 \
+    --max-running-requests 40 \
+    --max-mamba-cache-size 200 \
+    --mem-fraction-static 0.9 \
+    --cuda-graph-bs 2 8 16 24 32 36 40 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -782,7 +798,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -799,12 +817,12 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --gsp-num-groups 1 \
-    --gsp-prompts-per-group 42 \
+    --gsp-prompts-per-group 40 \
     --gsp-system-prompt-len 58982 \
     --gsp-question-len 6553 \
     --gsp-output-len 1024 \
-    --max-concurrency 42 \
-    --num-prompts 42 \
+    --max-concurrency 40 \
+    --num-prompts 40 \
     --request-rate inf
 ```
 
@@ -818,7 +836,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 984K+1K
 
@@ -883,7 +901,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --context-length 1010000
+    --context-length 1010000 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark

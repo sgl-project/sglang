@@ -114,16 +114,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             f"{self.speculative_algorithm.name}."
         )
 
-        # Draft attention uses target req_to_token + KV allocator (read-only).
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        target_cfg = target_worker.model_runner.memory_pool_config
-        self.draft_pool_config = MemoryPoolConfig(
-            max_total_num_tokens=64,  # Dummy value
-            max_running_requests=target_cfg.max_running_requests,
-        )
+        # Target pools (read-only) are bound in alloc_memory_pool(), not here, so
+        # the worker can be built before the target pool exists (see #29021).
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = None
+        self.draft_pool_config: Optional[MemoryPoolConfig] = None
 
         self.hot_token_id = None
 
@@ -144,9 +139,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=self.draft_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -160,8 +152,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             )
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
-        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
-            self._bind_kv_context()
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -180,22 +170,25 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+        self.draft_pool_config = MemoryPoolConfig(
+            max_total_num_tokens=64,  # Dummy value
+            max_running_requests=memory_pool_config.max_running_requests,
+        )
+
         # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
         # the MRO and its alloc_memory_pool is a no-op stub.
         TpModelWorker.alloc_memory_pool(
             self,
             memory_pool_config=self.draft_pool_config,
-            req_to_token_pool=(
-                req_to_token_pool
-                if req_to_token_pool is not None
-                else self.req_to_token_pool
-            ),
-            token_to_kv_pool_allocator=(
-                token_to_kv_pool_allocator
-                if token_to_kv_pool_allocator is not None
-                else self.token_to_kv_pool_allocator
-            ),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+
+        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
+            self._bind_kv_context()
 
     def init_attention_backends(self):
         with (
@@ -424,8 +417,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
         # NOTE: per-iter bookkeeping (penalty cumulation, maybe_evict_swa,
-        # decode_batch_idx tick) is done by the inherited
-        # EagleDraftInputV2Mixin.prepare_for_decode (scheduler-driven, see
+        # decode_batch_idx tick) is done by the scheduler-driven
+        # eagle_utils.eagle_prepare_for_decode (see
         # ScheduleBatch.prepare_for_decode), not here -- matching EAGLE v2.
         # Repeating evict/tick here would double-run them: the idx clock
         # gates SWA eviction timing and the SWA prefix-lock release.
@@ -441,6 +434,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         assert forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
+
+        # Frozen draft never writes KV; None signals fill_from to skip the slot.
+        forward_batch.out_cache_loc = None
 
         can_run_cuda_graph = (
             self.cuda_graph_runner
@@ -680,7 +676,10 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             target_worker.get_memory_pool()
         )
         # Match the draft context length to the target (assistant reads target KV).
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,

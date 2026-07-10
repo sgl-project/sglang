@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for Qwen3-235B-A22B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3-235B-A22B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-235B-A22B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-235B-A22B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b).
+</Note>
 
 ### Low Latency
 
@@ -20,7 +22,7 @@ This guide describes the best practice data for Qwen3-235B-A22B on the Ascend NP
 
 ## Optimal Configuration
 
-<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3-235B-A22B BF16 8P IN11K OUT1K5 8ms
 
@@ -97,7 +99,9 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --tp 16 \
     --mem-fraction-static 0.78 \
-    --cuda-graph-bs 1
+    --cuda-graph-bs 1 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen25
 ```
 
 #### Benchmark
@@ -171,8 +175,6 @@ export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_FUSED_MOE_MODE=2
-export SGLANG_NPU_PROFILING=0
-export SGLANG_NPU_PROFILING_BS=27
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -192,7 +194,6 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 458880 \
     --sampling-backend ascend \
     --ep-dispatch-algorithm static \
-    --init-expert-location /root/.cache/modelscope/hub/models/hot_map/235B_3_5k_decode.pt \
     --disable-radix-cache \
     --moe-a2a-backend ascend_fuseep \
     --speculative-algorithm EAGLE3 \
@@ -206,7 +207,9 @@ python3 -m sglang.launch_server \
     --enable-dp-attention \
     --enable-dp-lm-head \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 1 2 4 8 16 20 24 26 27
+    --cuda-graph-bs 1 2 4 8 16 20 24 26 27 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen25
 ```
 
 #### Benchmark
