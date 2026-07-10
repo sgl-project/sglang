@@ -661,9 +661,7 @@ class DeepseekV4AttnBackend(
             self.speculative_num_draft_tokens,
             **self.cuda_int32_kwargs,
         )
-        self.extend_start_loc_buffer = torch.zeros(
-            num_reqs, **self.cuda_int32_kwargs
-        )
+        self.extend_start_loc_buffer = torch.zeros(num_reqs, **self.cuda_int32_kwargs)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
