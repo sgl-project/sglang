@@ -1175,6 +1175,8 @@ def _fused_append_shared_experts_kernel(
     scale_factor,  # runtime scalar
     K: tl.constexpr,
     S: tl.constexpr,
+    K_POW2: tl.constexpr,
+    S_POW2: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1192,20 +1194,24 @@ def _fused_append_shared_experts_kernel(
     out_ids_row_ptr = pid * (K + S)
     out_w_row_ptr = pid * (K + S)
 
-    offs_k = tl.arange(0, K)
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
-    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k)
+    # tl.arange requires a power-of-2 length; K (= topk + shared) and S may not
+    # be (e.g. topk=6 + 1 shared = 7). Pad to the next power of 2 and mask.
+    offs_k = tl.arange(0, K_POW2)
+    k_mask = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=k_mask)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=k_mask)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=k_mask)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=k_mask)
 
-    offs_s = tl.arange(0, S)
+    offs_s = tl.arange(0, S_POW2)
+    s_mask = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
-    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([S_POW2], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=s_mask)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=s_mask)
 
 
 def fused_append_shared_experts(
@@ -1231,6 +1237,8 @@ def fused_append_shared_experts(
         scale_factor=scale_factor,
         K=k,
         S=s,
+        K_POW2=triton.next_power_of_2(k),
+        S_POW2=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights

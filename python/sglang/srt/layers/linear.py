@@ -74,6 +74,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "QuarkLinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -776,7 +777,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         Handle block-wise scale loading for MergedColumnParallelLinear.
         Similar to QKVParallelLinear._load_qkv_block_scale, but for merged column layers.
         """
-        weight_block_size = self.quant_method.quant_config.weight_block_size
+        # Quark's block-FP8 scheme records the block size on the layer rather
+        # than on quant_method.quant_config; prefer it when present.
+        if hasattr(self, "weight_block_size"):
+            weight_block_size = self.weight_block_size
+        else:
+            weight_block_size = self.quant_method.quant_config.weight_block_size
         block_n, _ = weight_block_size[0], weight_block_size[1]
         block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
 
@@ -862,7 +868,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = self.quant_method.quant_config.weight_block_size
+            if hasattr(self, "weight_block_size"):
+                weight_block_size = self.weight_block_size
+            else:
+                weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (
@@ -1101,7 +1110,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
 
         if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = self.quant_method.quant_config.weight_block_size
+            if hasattr(self, "weight_block_size"):
+                weight_block_size = self.weight_block_size
+            else:
+                weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (shard_offset + block_n - 1) // block_n

@@ -123,6 +123,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if not _is_hip:
@@ -2135,6 +2136,27 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "mtp.": "model.mtp.",
+            "*.": "model.*.",
+        },
+        orig_to_new_substr={
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+        },
+        orig_to_new_suffix={
+            ".w1": ".gate_proj",
+            ".w2": ".down_proj",
+            ".w3": ".up_proj",
+        },
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2204,13 +2226,22 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    def determine_num_fused_shared_experts(self):
+    def determine_num_fused_shared_experts(self, is_nextn: bool = False):
         self.num_fused_shared_experts = 0
         if get_server_args().disable_shared_experts_fusion:
             return
 
+        # Quark MXFP4 checkpoints that quantize routed and shared experts with
+        # an identical spec can be fused safely; The MTP draft checks its own
+        # block, which may differ from the main layers.
+        quark_can_fuse = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "quark"
+            and self.quant_config.can_fuse_shared_expert(is_nextn=is_nextn)
+        )
+
         disable_reason = None
-        if get_server_args().enforce_shared_experts_fusion:
+        if get_server_args().enforce_shared_experts_fusion or quark_can_fuse:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "
@@ -2368,9 +2399,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                         rest = "shared_head.norm.weight"
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
-                    elif rest == "e_proj.scale":
+                    elif rest in ("e_proj.scale", "e_proj.weight_scale"):
                         rest = "e_proj.weight_scale_inv"
-                    elif rest == "h_proj.scale":
+                    elif rest in ("h_proj.scale", "h_proj.weight_scale"):
                         rest = "h_proj.weight_scale_inv"
                 name = f"model.layers.{num_hidden_layers}." + rest
 
@@ -2381,16 +2412,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if "self_attn" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
+        if "self_attn" in name:
+            if name.endswith(".weight_scale"):
+                name = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+            elif name.endswith(".scale"):
+                name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
+        if "mlp" in name:
+            if name.endswith(".scale"):
+                name = name.removesuffix(".scale") + ".weight_scale_inv"
+            elif name.endswith(".weight_scale") and "mlp.experts." not in name:
+                name = name.removesuffix(".weight_scale") + ".weight_scale_inv"
 
         return name
 
@@ -2468,7 +2505,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
             weights = list(weights)
-            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+            exists_wo_a_scale = any(
+                n.endswith(".wo_a.scale") or n.endswith(".wo_a.weight_scale")
+                for n, t in weights
+            )
             if exists_wo_a_scale:
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
@@ -2551,6 +2591,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                             "mlp.shared_experts",
                             f"mlp.experts.{self.config.n_routed_experts}",
                         )
+                        # A fused shared expert joins the routed MXFP4 MoE, whose
+                        # scale param is ``w*_weight_scale`` (no ``_inv``). The
+                        # generic scale-name normalization above may have turned a
+                        # ``.weight_scale`` into ``.weight_scale_inv``
+                        if name.endswith(".weight_scale_inv"):
+                            name = (
+                                name.removesuffix(".weight_scale_inv") + ".weight_scale"
+                            )
 
                     weight_names.append(name)
 
@@ -2845,6 +2893,8 @@ def _dequant_fp8_wo_a(
         if not name.endswith(".wo_a.weight"):
             continue
         scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
+        if scale_name not in weights_dict:
+            scale_name = name.replace(".wo_a.weight", ".wo_a.weight_scale")
         assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)

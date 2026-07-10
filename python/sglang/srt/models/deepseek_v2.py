@@ -455,10 +455,18 @@ class MoEGate(nn.Module):
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
             if quant_config is not None:
-                if _use_aiter and quant_config.get_name() in (
-                    "fp8",
-                    "compressed_tensors",
-                    "quark",
+                # DSV4 routes through the moe_fused_gate JIT kernel, which
+                # requires a float32 correction bias. The bf16 override below is
+                # only for the aiter fused-MoE gate used by the non-DSV4 models.
+                if (
+                    _use_aiter
+                    and not is_deepseek_v4
+                    and quant_config.get_name()
+                    in (
+                        "fp8",
+                        "compressed_tensors",
+                        "quark",
+                    )
                 ):
                     correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
@@ -775,6 +783,16 @@ class DeepseekV2MoE(nn.Module):
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
                     pass
+                elif hasattr(self.shared_experts.gate_up_proj, "weight_block_size"):
+                    # Quark's block-FP8 linear scheme stores the block size on the
+                    # layer rather than on quant_method.quant_config
+                    assert (
+                        self.shared_experts.gate_up_proj.weight_block_size
+                        == self.shared_experts.down_proj.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = list(
+                        self.shared_experts.gate_up_proj.weight_block_size
+                    )
                 else:
                     assert (
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size

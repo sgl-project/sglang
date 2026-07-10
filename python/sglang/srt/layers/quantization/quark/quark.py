@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A4MXFp4MoE,
     QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
+    QuarkW8A8Fp8Block,
     QuarkW8A8FP8MoE,
 )
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
@@ -43,12 +44,44 @@ _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
     "model.language_model.layers.0",
 )
 
+# The NextN (MTP) draft's transformer block lives under ``model.decoder`` (see
+# deepseek_v4_nextn.py). Its routed/shared experts can be quantized differently
+# from the main layers, so the fusion safety check must inspect this block separately.
+_MOE_SHARED_EXPERT_QUANT_NEXTN_BASES: tuple[str, ...] = ("model.decoder",)
+
 _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "gate_proj",
     "up_proj",
     "gate_up_proj",
     "down_proj",
 )
+
+# The NextN (MTP) draft (deepseek_v4_nextn.py) splits the ``mtp.0`` block across
+# two module scopes: the transformer block lives under ``model.decoder.*`` while
+# the MTP-specific projections sit at ``model.*``, so aliases
+# are needed for the draft's modules to resolve their per-layer spec.
+_DSV4_NEXTN_SRC_PREFIX = "model.mtp.0."
+
+_DSV4_NEXTN_MODEL_LEVEL = ("e_proj", "h_proj", "enorm", "hnorm")
+
+
+def _dsv4_nextn_alias(name: str) -> Optional[str]:
+    if not name.startswith(_DSV4_NEXTN_SRC_PREFIX):
+        return None
+    rest = name[len(_DSV4_NEXTN_SRC_PREFIX) :]
+    if rest.startswith(_DSV4_NEXTN_MODEL_LEVEL):
+        return "model." + rest
+    return "model.decoder." + rest
+
+
+def _add_dsv4_nextn_aliases(names: list[str]) -> list[str]:
+    out = []
+    for name in names:
+        out.append(name)
+        alias = _dsv4_nextn_alias(name)
+        if alias is not None:
+            out.append(alias)
+    return out
 
 
 class QuarkConfig(QuantizationConfig):
@@ -118,7 +151,38 @@ class QuarkConfig(QuantizationConfig):
             expanded.append(name)
             if name.startswith("language_model."):
                 expanded.append(name.removeprefix("language_model."))
-        self.exclude_layers = list(dict.fromkeys(expanded))
+        self.exclude_layers = _add_dsv4_nextn_aliases(expanded)
+        self.exclude_layers = list(dict.fromkeys(self.exclude_layers))
+        # Quark MXFP4 ckpts store per-layer quant specs under
+        # quark naming (e.g. "layers.X.attn.wo_b", "layers.X.ffn.experts.N.w1").
+        # Remap them to sglang module names so exclude / layer_quant_config
+        # fnmatch lookups in _find_matched_config resolve correctly.
+        qc = self.quant_config
+        if isinstance(qc, dict):
+            if "exclude" in qc:
+                qc["exclude"] = _add_dsv4_nextn_aliases(
+                    hf_to_sglang_mapper.apply_list(qc["exclude"])
+                )
+            lqc = qc.get("layer_quant_config")
+            if isinstance(lqc, dict):
+                lqc = hf_to_sglang_mapper.apply_dict(lqc)
+                # The NextN (MTP) draft renames its block from ``model.mtp.0`` to
+                # ``model.decoder`` / ``model.*``; alias the mapped keys so the
+                # draft's modules resolve their per-layer spec.
+                for name in list(lqc):
+                    alias = _dsv4_nextn_alias(name)
+                    if alias is not None:
+                        lqc.setdefault(alias, lqc[name])
+                # DSV4 fuses the ``wq_a`` and ``wkv`` projections into a single
+                # ``wqkv_a`` module. The fused module name has no explicit quant
+                # spec, so it could incorrectly fall back to the global config and
+                # drop the fp8-block scales. wq_a and wkv share the same spec, so mirror
+                # wq_a's onto wqkv_a to keep the fused module on the right scheme.
+                for name in list(lqc):
+                    if name.endswith(".wq_a"):
+                        fused = name[: -len(".wq_a")] + ".wqkv_a"
+                        lqc.setdefault(fused, lqc[name])
+                qc["layer_quant_config"] = lqc
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -337,6 +401,37 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
 
+    def _is_fp8_w8a8_block(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        """Detect Quark's representation of native DeepSeek-V3/V4 blockwise FP8.
+
+        Weights are stored as ``fp8_e4m3`` quantized in 2-D blocks (typically
+        ``[128, 128]``) with one scale per block; activations are quantized
+        dynamically in ``fp8_e4m3`` groups along the last axis (group_size=128).
+        """
+        if weight_quant is None or input_quant is None:
+            return False
+        if (
+            weight_quant.get("dtype") != "fp8_e4m3"
+            or input_quant.get("dtype") != "fp8_e4m3"
+        ):
+            return False
+        if weight_quant.get("qscheme") != "per_block":
+            return False
+        block_size = weight_quant.get("block_size")
+        if not block_size or len(block_size) != 2:
+            return False
+        if weight_quant.get("is_dynamic") is True:
+            return False
+        if input_quant.get("qscheme") != "per_group":
+            return False
+        if not input_quant.get("is_dynamic"):
+            return False
+        return True
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -471,6 +566,9 @@ class QuarkConfig(QuantizationConfig):
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
             )
+        if self._is_fp8_w8a8_block(weight_config, input_config):
+            self._check_scheme_supported(QuarkW8A8Fp8Block.get_min_capability())
+            return QuarkW8A8Fp8Block(weight_config, input_config)
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False
@@ -524,6 +622,12 @@ class QuarkConfig(QuantizationConfig):
         elif self._is_mx_w4a8(weight_config, input_config):
             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
             return QuarkW4A8MXFp4MoE(weight_config, input_config)
+        elif self._is_fp8_w8a8_block(weight_config, input_config):
+            raise NotImplementedError(
+                "Quark blockwise FP8 MoE is not yet implemented; only blockwise FP8 "
+                "Linear is supported. Re-quantize experts to MXFP4 or per-tensor/"
+                "per-channel FP8."
+            )
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
@@ -532,7 +636,7 @@ class QuarkConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def can_fuse_shared_expert(self) -> bool:
+    def can_fuse_shared_expert(self, is_nextn: bool = False) -> bool:
         # Shared-expert body excluded from quant; the gate must not veto fusion.
         if any(
             "shared_expert" in layer
@@ -547,15 +651,26 @@ class QuarkConfig(QuantizationConfig):
         if not layer_quant_config:
             return True
 
-        # Compare routed vs shared specs at layer 0 (stub module needed by
+        # The MTP draft block may quantize routed/shared experts differently from
+        # the main layers, so check the block that actually applies.
+        bases = (
+            _MOE_SHARED_EXPERT_QUANT_NEXTN_BASES
+            if is_nextn
+            else _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
+        )
+
+        # Compare routed vs shared specs (stub module needed by
         # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
         lookup_stub = torch.nn.Module()
         try:
-            for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES:
+            for base in bases:
                 moe_name = f"{base}.mlp.experts"
                 moe_cfg = self._find_matched_config(moe_name, lookup_stub)
                 for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
-                    shared_name = f"{base}.mlp.shared_expert.{suffix}"
+                    # shared expert could also be ``shared_experts``;
+                    # a singular ``shared_expert`` would miss the per-layer entry
+                    # and fall back to the global spec, masking a mismatch.
+                    shared_name = f"{base}.mlp.shared_experts.{suffix}"
                     shared_cfg = self._find_matched_config(shared_name, lookup_stub)
                     if not deep_compare(moe_cfg, shared_cfg):
                         return False

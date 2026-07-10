@@ -216,7 +216,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_parallel().tp_size
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
+        self.determine_num_fused_shared_experts(is_nextn=True)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_rank = get_parallel().attn_cp_rank
