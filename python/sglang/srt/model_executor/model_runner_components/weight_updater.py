@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    get_model_loader,
+    restore_weights_before_loading,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
@@ -118,6 +122,21 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
+
+        if weight_name_filter is None:
+            # Return latched quant state (for example FP8 UE8M0 flags and
+            # repacked scale layouts) to its checkpoint representation before
+            # refilling it. The subsequent load + postprocess then follows the
+            # same state transition as the initial model load.
+            restore_weights_before_loading(self.get_model(), target_device)
+        elif self.model_config.quantization is not None:
+            return False, (
+                "weight_name_filter is not supported for quantized models: "
+                "post-loading processing is model-wide and is only correct "
+                "when every source weight has been refilled."
+            )
+
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
@@ -146,6 +165,7 @@ class WeightUpdater:
             try:
                 iter = get_weight_iter(self.model_config)
             except Exception as e:
+                self.model_config.model_path = original_model_path
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
@@ -156,6 +176,12 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
+                # The failed pass may already have processed some layers.
+                # Restore their checkpoint-facing state before reloading the
+                # pristine boot checkpoint, and ensure the iterator resolves
+                # that original path rather than the failed update path.
+                self.model_config.model_path = original_model_path
+                restore_weights_before_loading(self.get_model(), target_device)
                 iter = get_weight_iter(self.model_config)
                 model_load_weights(self.get_model(), iter)
                 return False, message

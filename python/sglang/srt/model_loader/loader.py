@@ -849,6 +849,25 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
 
 
+def restore_weights_before_loading(model, target_device):
+    """Return quant state to its checkpoint layout before a weight reload.
+
+    The inverse counterpart of the process_weights_after_loading loop above:
+    quant methods that latch flags or repack parameters during processing opt
+    in via a restore_weights_before_loading hook, so a subsequent
+    load + process pass consumes the refilled checkpoint bytes exactly like
+    initial loading. A no-op for methods without the hook (and therefore at
+    initial load, where nothing has been processed yet).
+    """
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(
+            quant_method, "restore_weights_before_loading"
+        ):
+            with device_loading_context(module, target_device):
+                quant_method.restore_weights_before_loading(module)
+
+
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
     layer before loading another to make the peak memory envelope smaller."""
