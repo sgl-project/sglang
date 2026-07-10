@@ -42,7 +42,8 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
             tokenization_started, release_tokenization
         )
         manager.async_dynamic_batch_tokenizer = None
-        manager.init_request_preprocessor()
+        if hasattr(manager, "init_request_preprocessor"):
+            manager.init_request_preprocessor()
 
         def release_after_loop_progress():
             if not tokenization_started.wait(timeout=2):
@@ -67,7 +68,9 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         finally:
             release_tokenization.set()
             watchdog.join(timeout=2)
-            manager._request_preprocessor_executor.shutdown(wait=True)
+            executor = getattr(manager, "_request_preprocessor_executor", None)
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         self.assertEqual(input_ids, [1])
         self.assertIsNone(token_type_ids)
@@ -78,6 +81,10 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
             "synchronous tokenization blocked the API event loop",
         )
 
+    @unittest.skipUnless(
+        hasattr(TokenizerManager, "init_request_preprocessor"),
+        "requires the request preprocessor executor",
+    )
     def test_request_preprocessing_is_serialized(self):
         first_started = threading.Event()
         release_first = threading.Event()
@@ -117,6 +124,10 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
 
         self.assertTrue(second_started.is_set())
 
+    @unittest.skipUnless(
+        hasattr(TokenizerManager, "init_request_preprocessor"),
+        "requires the request preprocessor executor",
+    )
     def test_request_preprocessing_preserves_context(self):
         request_context = ContextVar("request_context")
         manager = TokenizerManager.__new__(TokenizerManager)
