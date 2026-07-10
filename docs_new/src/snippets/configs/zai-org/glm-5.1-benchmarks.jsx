@@ -31,4 +31,35 @@ export const benchmarks = [
         ttft_ms: 20613.80, tpot_ms: 38.73, tokens_per_sec_per_gpu: 151.871 },
     ],
   },
+  {
+    // MI300X ×8 / GLM-5.1-FP8 / BF16 KV cache / tp=8 / low-latency (no DP-Attention).
+    // Measured on AMD Instinct MI300X (8×192 GB), sglang 0.5.13.post1,
+    // docker lmsysorg/sglang:v0.5.13.post1-rocm720-mi30x.
+    // Server flags: --dsa-prefill-backend tilelang --dsa-decode-backend tilelang
+    //   --chunked-prefill-size 131072 --watchdog-timeout 1200 --mem-fraction-static 0.8.
+    // KV cache auto-set to bfloat16 (DSA on SM9 device).
+    // Benchmark: sglang.bench_serving --dataset-name random --random-input-len 1000
+    //   --random-output-len 1000 --warmup-requests 64 --request-rate inf.
+    match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1, num_prompts: 64 },
+        ttft_ms: 585, tpot_ms: 28.38, tokens_per_sec_per_gpu: 4 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 16, num_prompts: 256 },
+        ttft_ms: 338, tpot_ms: 51.63, tokens_per_sec_per_gpu: 37 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 64, num_prompts: 512 },
+        ttft_ms: 634, tpot_ms: 87.27, tokens_per_sec_per_gpu: 85 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 256, num_prompts: 1024 },
+        ttft_ms: 2017, tpot_ms: 169.96, tokens_per_sec_per_gpu: 169 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1024, num_prompts: 2048 },
+        ttft_ms: 104260, tpot_ms: 437.72, tokens_per_sec_per_gpu: 179 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 4096, num_prompts: 4096 },
+        ttft_ms: 570017, tpot_ms: 437.19, tokens_per_sec_per_gpu: 188 },
+    ],
+    accuracy: [
+      // GSM8K via sgl-eval, --no-thinking --max-tokens 8192 --num-threads 4, temperature=0.
+      // 1.06% truncation rate at 8192 max-tokens (thinking model generates long CoT).
+      { benchmark: "gsm8k", score: 0.9621, details: "1319 examples, 1.06% truncated, --no-thinking" },
+    ],
+  },
 ];
