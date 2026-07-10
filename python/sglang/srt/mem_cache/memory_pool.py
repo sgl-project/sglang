@@ -2136,8 +2136,9 @@ class MHATokenToKVPool(KVCache):
                 dq_v[dst_start:dst_end] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
                 cur_batch_start_loc_cpu = cur_end
 
+            workspace_len = prev_len + (extend_len if k_cur_fp8 is not None else 0)
             cur_token_idx_dq = (
-                (cur_token_idx_dq + prev_len + extend_len + page_size - 1)
+                (cur_token_idx_dq + workspace_len + page_size - 1)
                 // page_size
                 * page_size
             )
