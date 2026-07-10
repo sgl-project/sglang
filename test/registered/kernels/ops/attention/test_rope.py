@@ -257,7 +257,6 @@ def test_fused_rope_store(
     is_neox: bool,
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
-
     from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
 
     num_qo_heads = num_kv_heads * gqa_ratio
