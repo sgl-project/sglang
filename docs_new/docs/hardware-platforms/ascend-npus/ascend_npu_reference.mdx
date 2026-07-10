@@ -1,0 +1,150 @@
+﻿---
+title: "Ascend NPU Reference"
+metatags:
+  description: "Hardware concepts, communication libraries, deployment terminology, and common abbreviations for deploying SGLang on Ascend NPUs."
+---
+
+This page covers the hardware concepts, communication libraries, deployment terminology, and common abbreviations
+you will encounter throughout the Ascend NPU documentation. Refer back here when you run into unfamiliar terms.
+
+## Hardware
+
+### Supported devices
+
+SGLang supports the following Ascend inference hardware:
+
+| Hardware           | Chip        | Devices | Dies per card | Memory configuration                 |
+| ------------------ | ----------- | ------- | ------------- | ------------------------------------ |
+| Atlas 800I A2 (A2) | Ascend 910B | 8       | 1             | 8(cards) × 1(die/card) × 64(GB/die)  |
+| Atlas 800I A3 (A3) | Ascend 910C | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die) |
+
+<Note>
+Throughout these docs, **A2** and **A3** are used as shorthand for the hardware above.
+Docker image tags use `910b` for A2 and `a3` for A3.
+For example, `v0.5.13.post1-cann9.0.0-910b` and `v0.5.13.post1-cann9.0.0-a3`.
+
+On A3, each card has 2 dies, giving 16 devices vs 8 on A2.
+Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on A3 means `--tp-size 8`.
+
+From a deployment perspective, the two key differences between A2 and A3 are:
+
+1. dies per card — which drives both total memory and `--tp-size` configuration
+2. PD disaggregation — A2 requires setting `export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"`, while A3 uses the default protocol.
+</Note>
+
+### NPU
+
+**NPU** stands for Neural Processing Unit. Each NPU device is a single `davinci` core.
+The terms "NPU" and "davinci" are used interchangeably in commands and error logs.
+
+On A2, devices are numbered `/dev/davinci0` through `/dev/davinci7` (8 devices).
+On A3, devices are numbered `/dev/davinci0` through `/dev/davinci15` (16 devices).
+
+On either an A2 or A3 server, run `npu-smi info` to view NPU information such as device
+health, memory usage, and chip status. If the command is not found or reports no devices,
+the driver is likely not installed. Follow the
+[Ascend driver installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0005.html?OS=openEuler&InstallType=local)
+to install it.
+
+## Communication libraries
+
+| Library                                            | Description                                                                                                                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **HCCL** (Huawei Collective Communication Library) | The primary communication backend for multi-card data transfer on Ascend NPUs. Equivalent to NVIDIA NCCL. Used in `--nnodes`, `--tp-size`, and all distributed scenarios. |
+| **GLOO**                                           | Meta's collective communications library. Used alongside HCCL for distributed initialization and coordination.                                                            |
+| **DeepEP** (Deep Expert Parallelism)               | A communication library optimized for Mixture-of-Experts (MoE) all-to-all dispatch and combine operations. Used with `--moe-a2a-backend deepep`.                          |
+| **RDMA** (Remote Direct Memory Access)             | Enables direct memory access between nodes over InfiniBand or RoCE networks. Required for multi-node PD disaggregation.                                                   |
+
+## Quantization and precision
+
+| Notation  | Meaning                                                            |
+| --------- | ------------------------------------------------------------------ |
+| **W8A8**  | 8-bit weights, 8-bit activations                                   |
+| **W4A8**  | 4-bit weights, 8-bit activations                                   |
+| **W4A16** | 4-bit weights, 16-bit activations                                  |
+| **BF16**  | Brain Floating Point 16 — 16-bit format optimized for ML workloads |
+| **FP8**   | 8-bit Floating Point — not supported on A2/A3                       |
+| **INT8**  | 8-bit Integer quantization                                         |
+
+To apply quantization, use `--quantization modelslim` for W8A8 INT8, or load a pre-quantized
+checkpoint directly from a model hub.
+
+## Deployment terminology
+
+### Prefill-Decode (PD) disaggregation
+
+PD disaggregation separates inference into two stages running on different nodes:
+
+- **Prefill** (P): Processes the entire input prompt at once. Compute-bound.
+- **Decode** (D): Generates tokens one at a time. Memory-bandwidth-bound.
+
+**PD Mixed**: Both stages run on the same set of nodes.
+
+| Shorthand | Meaning                         |
+| --------- | ------------------------------- |
+| **1P1D**  | 1 prefill node + 1 decode node  |
+| **2P1D**  | 2 prefill nodes + 1 decode node |
+| **1P2D**  | 1 prefill node + 2 decode nodes |
+
+You will see these in [Best Practice](/docs/hardware-platforms/ascend-npus/best_practice)
+section headings, e.g. `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes
++ 1 decode node, 32 cards total."
+
+### Parallelism strategies
+
+| Strategy                      | Flag             | Description                                                             |
+| ----------------------------- | ---------------- | ----------------------------------------------------------------------- |
+| **Tensor Parallelism (TP)**   | `--tp-size`      | Splits model weights across NPUs within a node                          |
+| **Data Parallelism (DP)**     | `--dp-size`      | Replicates the model across nodes for higher throughput                 |
+| **Expert Parallelism (EP)**   | `--ep-size`      | Distributes MoE experts across devices; requires `--moe-a2a-backend`    |
+| **Context Parallelism (CP)**  | `--attn-cp-size` | Splits long context windows across devices for extended sequence length |
+| **Pipeline Parallelism (PP)** | `--pp-size`      | Splits model layers across devices sequentially                         |
+
+### Speculative decoding
+
+| Algorithm                        | Description                                                                                                                                  |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **EAGLE3**                       | Uses an external draft model (specified via `--speculative-draft-model-path`) to propose candidate tokens. Supports top-k sampling.          |
+| **NEXTN**                        | Uses the model's built-in Multi-Token Prediction (MTP) heads — no separate draft model needed. Available for models with native MTP support. |
+| **MTP** (Multi-Token Prediction) | A model architecture feature where the model predicts multiple future tokens per step. The foundation for NEXTN speculative decoding.        |
+
+### Performance metrics
+
+| Metric                            | Description                                                                               |
+| --------------------------------- | ----------------------------------------------------------------------------------------- |
+| **TPOT** (Time Per Output Token)  | Average time to generate each output token. Lower is better.                              |
+| **TTFT** (Time To First Token)    | Latency from request arrival to first generated token. Critical for interactive use.      |
+| **GSP** (Generated Shared Prefix) | A benchmark methodology using dataset-wide shared prefixes to simulate caching scenarios. |
+
+## Model architecture terms
+
+| Term                                  | Description                                                                                                                                              |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MoE** (Mixture of Experts)          | Model architecture where only a subset of parameters (experts) is activated per token, reducing compute. Common in DeepSeek, Qwen3-A3B, and MiMo models. |
+| **MLA** (Multi-head Latent Attention) | Attention variant that compresses key-value representations into a lower-dimensional latent space. Used by DeepSeek models.                              |
+| **GQA** (Grouped-Query Attention)     | Attention variant where multiple query heads share a single key-value head. Used by Qwen3 dense models.                                                  |
+| **NSA** (Native Sparse Attention)     | Sparse attention mechanism that reduces KV cache overhead for long contexts.                                                                             |
+| **DSA** (DeepSeek Sparse Attention)   | DeepSeek's sparse attention mechanism; reduces KV cache overhead for long contexts.                                                                      |
+| **FFN** (Feed-Forward Network)        | The non-attention component of each transformer layer. In MoE models, the FFN is replaced by multiple expert FFN layers selected by a router.            |
+
+## Other common abbreviations
+
+| Abbreviation                                     | Expansion                                                               |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| **ACL** (Ascend Computing Language)              | Low-level Ascend compute API; seen in error logs                        |
+| **DVFS** (Dynamic Voltage and Frequency Scaling) | Hardware frequency scaling to maintain performance stability            |
+| **NUMA** (Non-Uniform Memory Access)             | Memory architecture affecting multi-socket performance                  |
+| **KV Cache** (Key-Value Cache)                   | Cached attention key-value tensors to avoid recomputation during decode |
+| **LoRA** (Low-Rank Adaptation)                   | Parameter-efficient fine-tuning method                                  |
+| **HF** (Hugging Face)                            | Model hub; `HF_TOKEN` / `HF_ENDPOINT` control model download access     |
+| **UB** (Unified Buffer)                          | On-chip NPU memory; referenced in operator optimization                 |
+| **DMA** (Direct Memory Access)                   | Data transfer mechanism between host and device memory                  |
+
+## Where to go next
+
+- [Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — launch your first server
+- [Installation Guide](/docs/hardware-platforms/ascend-npus/ascend_npu) — full installation with component version mapping
+- [Supported Features](/docs/hardware-platforms/ascend-npus/ascend_npu_support_features) — per-parameter Ascend support status
+- [Supported Models](/docs/hardware-platforms/ascend-npus/ascend_npu_support_models) — models verified on Ascend NPU
+- [Model Tutorials](/docs/hardware-platforms/ascend-npus/model-tutorials) — step-by-step deployment guides
+- [Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) — benchmark configurations and results
