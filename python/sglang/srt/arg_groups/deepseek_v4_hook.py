@@ -55,7 +55,17 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             server_args.speculative_eagle_topk == 1
         ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+    if server_args.disable_hybrid_swa_memory:
+        # The DSv4 KV pool always carries per-layer SWA buffers, so a truly
+        # unified pool is equivalent to equal-size pools; dropping the hybrid
+        # machinery instead crashes pool init (swa_max_total_num_tokens unset).
+        server_args.disable_hybrid_swa_memory = False
+        server_args.swa_full_tokens_ratio = 1.0
+        logger.info(
+            f"disable_hybrid_swa_memory on {model_arch} is implemented as "
+            "equal-size full/SWA pools (swa_full_tokens_ratio=1.0)."
+        )
+    elif server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         server_args.swa_full_tokens_ratio = 0.1
         logger.info(
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
