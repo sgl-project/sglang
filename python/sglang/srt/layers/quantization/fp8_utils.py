@@ -1613,8 +1613,10 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
 def _inverse_transform_scale_ue8m0_impl(sf_packed):
     """
     NOTE: We assume k is aligned
-    :param sf_packed: (scale_mn, scale_k/4) int32
-    :return: (scale_mn, scale_k), float32
+    :param sf_packed: (weight_mn, scale_k/4) int32 — transform_scale_ue8m0
+        broadcasts each 128-block's scale to one packed row per WEIGHT row, so
+        weight_mn need not be a multiple of 128 (the last block may be partial)
+    :return: (ceil(weight_mn/128), scale_k), float32
     """
     if len(sf_packed.shape) == 3:
         return torch.stack(
@@ -1625,26 +1627,27 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
-    mn_repeat_128, k_div_4 = sf_packed.shape
-    mn = mn_repeat_128 // block_size
+    weight_mn, k_div_4 = sf_packed.shape
+    num_blocks = ceil_div(weight_mn, block_size)
     k = k_div_4 * 4
 
     # packed u8 -> fp32
-    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
+    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(weight_mn, k)
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
-    # remove repeat
-    sf_reshaped = sf_fp32.view(mn, block_size, k)
-    sf_unrepeated = sf_reshaped[:, 0:1, :]
-    if not torch.all(sf_unrepeated == sf_reshaped):
+    # remove repeat: take the first row of each block, verify the rest match
+    block_first_rows = torch.arange(num_blocks, device=sf_fp32.device) * block_size
+    sf_unrepeated = sf_fp32.index_select(0, block_first_rows)
+    block_ids = torch.arange(weight_mn, device=sf_fp32.device) // block_size
+    if not torch.all(sf_fp32 == sf_unrepeated.index_select(0, block_ids)):
         from sglang.srt.debug_utils.dumper import get_tensor_info
 
         raise AssertionError(
-            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
+            f"scale rows differ within a block ({get_tensor_info(sf_fp32)=} {get_tensor_info(sf_unrepeated)=})"
         )
-    sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
+    sf_unrepeated = sf_unrepeated.contiguous()
 
-    assert sf_unrepeated.shape == (mn, k)
+    assert sf_unrepeated.shape == (num_blocks, k)
     return sf_unrepeated
 
 
