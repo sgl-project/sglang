@@ -987,7 +987,7 @@ class SchedulerBatchResultProcessor:
         self._maybe_collect_customized_info(i, req, logits_output)
 
     def _maybe_register_session_ref(self, req):
-        if self.server_args.enable_session_radix_cache:
+        if getattr(self.tree_cache, "enable_session_radix_cache", False):
             self.tree_cache.register_session_ref(req)
 
     def _maybe_update_reasoning_tokens(
