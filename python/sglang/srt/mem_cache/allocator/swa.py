@@ -224,17 +224,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
         swa_tail_len: int,
+        swa_tail_end: int,
     ):
         """Allocate full KV for the whole extend and SWA KV only for the tail.
 
         This is used by disaggregated decode preallocation: decode receives full
         prompt KV for full-attention layers, but only the sliding-window state is
         transferred for SWA layers.
+
+        ``swa_tail_end`` is the end of the real (logical) fill inside the
+        allocated interval; ``extend_num_tokens`` may exceed it by the
+        page-alignment padding, which must not receive SWA mappings.
         """
         assert self.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
         assert len(prefix_lens_cpu) == 1
-        assert 0 <= swa_tail_len <= extend_num_tokens
+        assert 0 <= swa_tail_len <= swa_tail_end <= extend_num_tokens
 
         num_full_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
@@ -275,13 +280,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
+        swa_tail_start = swa_tail_end - swa_tail_len
         self.set_full_to_swa_mapping(
-            alloc_full_indices[-swa_tail_len:], alloc_swa_indices
+            alloc_full_indices[swa_tail_start:swa_tail_end], alloc_swa_indices
         )
-        if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            ] = 0
+        non_tail_full_indices = torch.cat(
+            [
+                alloc_full_indices[:swa_tail_start],
+                alloc_full_indices[swa_tail_end:],
+            ]
+        )
+        if non_tail_full_indices.numel() > 0:
+            self.full_to_swa_index_mapping[non_tail_full_indices.to(torch.int64)] = 0
         return alloc_full_indices
 
     def alloc_decode(

@@ -86,11 +86,14 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils.common import ceil_align, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -997,8 +1000,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     page_size,
                 )
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
+                # dst_kv_indices covers the page-aligned host allocation; the
+                # transfer target is only the real-fill head slice (in host
+                # token units, which are compressed for DSV4 HiSparse).
+                hisparse_transfer_len = self.scheduler.hisparse_coordinator.host_token_len(
+                    origin_input_len - prefix_len
+                )
                 kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
+                    dst_kv_indices[:hisparse_transfer_len]
                     .cpu()
                     .numpy()
                     .astype(np.int32)
@@ -1391,13 +1400,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator, req=req, fill_len=fill_len
             )
-            # Allocate host indices for the RDMA transfer target.
+            # Allocate host indices for the RDMA transfer target. The length
+            # follows kv_allocated_len (page-aligned) so later reads that size
+            # the host row by the allocation watermark stay in bounds; the
+            # transfer itself only uses the real-fill_len head slice.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                coordinator.host_token_len(fill_len),
+                coordinator.host_token_len(req.kv.kv_allocated_len),
             )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
@@ -1457,18 +1469,21 @@ def alloc_for_decode_prealloc_hisparse(
     req: Req,
     fill_len: int,
 ) -> torch.Tensor:
+    alloc_fill_len = (
+        fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
+    )
     if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+        req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
-        req.kv.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = alloc_fill_len
     device = allocator.device
     kv_loc = allocator.alloc_logical_only(
         prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
         prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-        seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-        seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+        seq_lens=torch.tensor([alloc_fill_len], dtype=torch.int64, device=device),
+        seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
         last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-        extend_num_tokens=fill_len,
+        extend_num_tokens=alloc_fill_len,
     )
     return kv_loc
 
@@ -1485,10 +1500,13 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
+    alloc_fill_len = (
+        fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
+    )
     if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+        req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
-        req.kv.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = alloc_fill_len
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     else:
@@ -1506,11 +1524,14 @@ def alloc_for_decode_prealloc(
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                seq_lens=torch.tensor(
+                    [alloc_fill_len], dtype=torch.int64, device=device
+                ),
+                seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
                 last_loc=last_loc,
-                extend_num_tokens=fill_len,
+                extend_num_tokens=alloc_fill_len,
                 swa_tail_len=swa_tail_len,
+                swa_tail_end=fill_len,
             )
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
@@ -1519,10 +1540,12 @@ def alloc_for_decode_prealloc(
                     [total_prefix_len], dtype=torch.int64, device=device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                seq_lens=torch.tensor(
+                    [alloc_fill_len], dtype=torch.int64, device=device
+                ),
+                seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
                 last_loc=last_loc,
-                extend_num_tokens=delta_len,
+                extend_num_tokens=alloc_fill_len - total_prefix_len,
             )
     return kv_loc
 
