@@ -392,10 +392,78 @@ fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     v
 }
 
-/// Format one streaming frame. Non-incremental (default): the accumulator's
-/// cumulative view. Incremental: this step's delta `text`/`output_ids`/logprobs
-/// but with the cumulative token count in `meta_info` (matching Python). `acc` is
-/// the cumulative fold; `delta` is this chunk.
+/// Cumulative frame JSON from the accumulator's memoized ids/text — O(T), not O(T²).
+/// Byte-identical to `sglang_frame_value(..).to_string()` (a `BTreeMap` keeps keys
+/// alphabetical); pinned by `cumulative_frame_json_matches_serde`. `None` on extras.
+fn cumulative_frame_json(
+    acc: &OutputAccumulator,
+    rid: &str,
+    index: Option<usize>,
+) -> Option<String> {
+    use std::fmt::Write;
+
+    let o = acc.snapshot();
+    if o.extras.is_some() {
+        return None;
+    }
+    // Fixed size regardless of T, so this stays O(1) per frame.
+    let meta = serde_json::json!({
+        "id": rid,
+        "prompt_tokens": o.prompt_tokens,
+        "completion_tokens": o.completion_tokens,
+        "finish_reason": o.finish_reason,
+    })
+    .to_string();
+
+    let mut s = String::with_capacity(acc.text_json.len() + acc.ids_json.len() + meta.len() + 40);
+    s.push('{');
+    if let Some(i) = index {
+        let _ = write!(s, "\"index\":{i},");
+    }
+    s.push_str("\"meta_info\":");
+    s.push_str(&meta);
+    if !acc.ids_json.is_empty() {
+        s.push_str(",\"output_ids\":[");
+        s.push_str(&acc.ids_json);
+        s.push(']');
+    }
+    s.push_str(",\"text\":\"");
+    s.push_str(&acc.text_json);
+    s.push_str("\"}");
+    Some(s)
+}
+
+/// Attach the batch `index` (batch streams only) and render to the SSE `data` text.
+fn tag_value(mut v: serde_json::Value, index: Option<usize>) -> String {
+    if let Some(i) = index {
+        v["index"] = serde_json::json!(i);
+    }
+    v.to_string()
+}
+
+/// One streaming frame's JSON: cumulative ignores `delta`, incremental ships it.
+fn stream_frame_string(
+    delta: ChunkEvent,
+    acc: &OutputAccumulator,
+    incremental: bool,
+    rid_str: &str,
+    index: Option<usize>,
+) -> String {
+    if !incremental {
+        return cumulative_frame_string(acc, rid_str, index);
+    }
+    tag_value(stream_frame_value(delta, acc, true, rid_str), index)
+}
+
+/// A cumulative frame's JSON, built purely from the accumulator (which is why a
+/// backlog can coalesce to its last); falls back to the `Value` builder on extras.
+fn cumulative_frame_string(acc: &OutputAccumulator, rid_str: &str, index: Option<usize>) -> String {
+    cumulative_frame_json(acc, rid_str, index)
+        .unwrap_or_else(|| tag_value(sglang_frame_value(acc.snapshot(), rid_str), index))
+}
+
+/// Format one streaming frame: the accumulator's cumulative view (default), or this
+/// step's delta with the cumulative token count in `meta_info` (matching Python).
 fn stream_frame_value(
     delta: ChunkEvent,
     acc: &OutputAccumulator,
@@ -602,6 +670,22 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 #[derive(Default)]
 struct OutputAccumulator {
     out: ChunkEvent,
+    /// Serialized cumulative `output_ids` body (`"1,2,3"`, no brackets), appended per
+    /// delta so a frame memcpy's it instead of rebuilding the array — O(T), not O(T²).
+    ids_json: String,
+    /// JSON-escaped cumulative text, without the surrounding quotes. Escaping is
+    /// per-character, so `escape(a + b) == escape(a) + escape(b)` and deltas append.
+    text_json: String,
+}
+
+/// Append `s` JSON-escaped (no surrounding quotes) — `serde_json` quotes it, and the
+/// quotes are the first and last bytes of a string encoding.
+fn push_escaped(dst: &mut String, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    let quoted = serde_json::Value::String(s.to_owned()).to_string();
+    dst.push_str(&quoted[1..quoted.len() - 1]);
 }
 
 impl OutputAccumulator {
@@ -609,6 +693,17 @@ impl OutputAccumulator {
     /// hidden states are set-once / last-writer-wins (they ride the prefill/final
     /// chunk), matching the Python `meta_info` assignment.
     fn fold(&mut self, d: &ChunkEvent) {
+        use std::fmt::Write;
+
+        // Grow the memoized serializations alongside the raw cumulative buffers.
+        push_escaped(&mut self.text_json, &d.text);
+        for &id in &d.token_ids {
+            if !self.ids_json.is_empty() {
+                self.ids_json.push(',');
+            }
+            let _ = write!(self.ids_json, "{id}");
+        }
+
         let o = &mut self.out;
         o.rid = d.rid; // constant across the request; keeps the accumulated view coherent
         o.text.push_str(&d.text);
@@ -819,14 +914,22 @@ async fn generate_batch(
     }
 }
 
-/// Await the next item from `rx`, handing the receiver back so a `FuturesUnordered`
-/// (which owns one future per poll) can re-poll it. `None` = the channel closed.
+/// Await the next item from `rx`, then drain whatever queued behind it (so the caller
+/// can coalesce a backlog, as Python's `state.out_list` does), handing the receiver
+/// back for `FuturesUnordered` to re-poll. Empty result = channel closed.
 async fn recv_indexed(
     index: usize,
     mut rx: mpsc::Receiver<EgressItem>,
-) -> (usize, mpsc::Receiver<EgressItem>, Option<EgressItem>) {
-    let item = rx.recv().await;
-    (index, rx, item)
+) -> (usize, mpsc::Receiver<EgressItem>, Vec<EgressItem>) {
+    let mut items = Vec::new();
+    match rx.recv().await {
+        Some(item) => items.push(item),
+        None => return (index, rx, items), // closed
+    }
+    while let Ok(item) = rx.try_recv() {
+        items.push(item);
+    }
+    (index, rx, items)
 }
 
 /// Multiplex `receivers` (one per request) into SSE `data` strings + a final `[DONE]`;
@@ -847,13 +950,8 @@ fn generation_event_stream(
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
 
-        // Tag a frame with its batch position (batch only; a single request omits it).
-        let tag = |mut v: serde_json::Value, i: usize| {
-            if with_index {
-                v["index"] = serde_json::json!(i);
-            }
-            v.to_string()
-        };
+        // Batch position, tagged onto every frame (a single request omits it).
+        let idx = |i: usize| with_index.then_some(i);
 
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
@@ -862,36 +960,55 @@ fn generation_event_stream(
             futs.push(recv_indexed(i, rx));
         }
 
-        while let Some((i, rx, item)) = futs.next().await {
-            match item {
-                Some(EgressItem::Frame(out)) => {
-                    accs[i].fold(&out);
-                    let v = stream_frame_value(out, &accs[i], incremental, &rid_strs[i]);
-                    yield tag(v, i);
-                    futs.push(recv_indexed(i, rx)); // keep this item flowing
+        while let Some((i, rx, items)) = futs.next().await {
+            if items.is_empty() {
+                // Channel closed with no terminal → truncation for this item;
+                // leave its rid armed so the scheduler work is aborted.
+                yield tag_value(error_value(500, "response truncated before completion"), idx(i));
+                continue;
+            }
+
+            // Cumulative frames supersede one another, so a drained backlog collapses
+            // to its last (Python's `out_list[-1]`); deltas can't be dropped.
+            let mut coalesced = false; // a cumulative frame is pending
+            let mut terminal = None;   // (finish_reason) of a `Done` in this batch
+            let mut failed = None;     // an `Error` in this batch
+
+            for item in items {
+                match item {
+                    EgressItem::Frame(out) => {
+                        accs[i].fold(&out);
+                        if incremental {
+                            yield stream_frame_string(out, &accs[i], true, &rid_strs[i], idx(i));
+                        } else {
+                            coalesced = true;
+                        }
+                    }
+                    EgressItem::Done(out) => {
+                        accs[i].fold(&out);
+                        terminal = Some(out);
+                    }
+                    EgressItem::Error(e) => failed = Some(e),
+                    EgressItem::Control(_) => {} // never on /generate
                 }
-                Some(EgressItem::Done(out)) => {
-                    accs[i].fold(&out);
-                    // A validation abort → an error object, not a frame.
-                    let v = match abort_status(&out.finish_reason) {
-                        Some((code, message)) => error_value(code, &message),
-                        None => stream_frame_value(out, &accs[i], incremental, &rid_strs[i]),
-                    };
-                    yield tag(v, i);
-                    guard.disarm(rids[i]); // terminal → not re-pushed
+            }
+
+            if let Some(e) = failed {
+                yield tag_value(error_value(e.http_status(), &e.to_string()), idx(i));
+                guard.disarm(rids[i]);
+            } else if let Some(out) = terminal {
+                // A validation abort → an error object, not a frame. The final frame
+                // carries the full cumulative state, so any coalesced ones are moot.
+                yield match abort_status(&out.finish_reason) {
+                    Some((code, message)) => tag_value(error_value(code, &message), idx(i)),
+                    None => stream_frame_string(out, &accs[i], incremental, &rid_strs[i], idx(i)),
+                };
+                guard.disarm(rids[i]); // terminal → not re-pushed
+            } else {
+                if coalesced {
+                    yield cumulative_frame_string(&accs[i], &rid_strs[i], idx(i));
                 }
-                Some(EgressItem::Error(e)) => {
-                    yield tag(error_value(e.http_status(), &e.to_string()), i);
-                    guard.disarm(rids[i]);
-                }
-                Some(EgressItem::Control(_)) => {
-                    futs.push(recv_indexed(i, rx)); // never on /generate; keep polling
-                }
-                None => {
-                    // Channel closed with no terminal → truncation for this item;
-                    // leave its rid armed so the scheduler work is aborted.
-                    yield tag(error_value(500, "response truncated before completion"), i);
-                }
+                futs.push(recv_indexed(i, rx)); // keep this item flowing
             }
         }
         yield "[DONE]".to_string();
@@ -1287,5 +1404,131 @@ mod tests {
         assert!(v.get("index").is_none(), "single response has no index");
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    /// A backlog of cumulative chunks collapses to a single frame carrying the latest
+    /// state — each cumulative frame supersedes the last, so emitting the intermediate
+    /// ones ships the full O(T) payload again for nothing. Mirrors the Python waiter's
+    /// `out = out_list[-1]`. This is the whole point of draining in `recv_indexed`.
+    #[tokio::test]
+    async fn cumulative_backlog_coalesces_to_latest() {
+        let (tx, rx) = mpsc::channel(8);
+        let receivers = vec![(RequestId(10), rx)];
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        futures::pin_mut!(stream);
+
+        // Three chunks queued before the stream is ever polled (a client falling behind).
+        tx.send(frame(10, "a")).await.unwrap();
+        tx.send(frame(10, "b")).await.unwrap();
+        tx.send(frame(10, "c")).await.unwrap();
+
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["text"], "abc", "one frame, full cumulative text");
+        assert_eq!(v["meta_info"]["completion_tokens"], 3, "no tokens lost");
+
+        // The terminal frame still carries everything, and only then does [DONE] land.
+        tx.send(done(10, "!")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["text"], "abc!");
+        assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    /// Incremental frames are *deltas*, so a backlog must emit every one — dropping
+    /// any would silently lose tokens. Only the cumulative protocol may coalesce.
+    #[tokio::test]
+    async fn incremental_backlog_emits_every_delta() {
+        let (tx, rx) = mpsc::channel(8);
+        let receivers = vec![(RequestId(10), rx)];
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
+        futures::pin_mut!(stream);
+
+        tx.send(frame(10, "a")).await.unwrap();
+        tx.send(frame(10, "b")).await.unwrap();
+        tx.send(frame(10, "c")).await.unwrap();
+
+        for (n, expect) in [(1, "a"), (2, "b"), (3, "c")] {
+            let v = parse(&stream.next().await.unwrap());
+            assert_eq!(v["text"], expect, "delta {n} must not be dropped");
+            assert_eq!(
+                v["meta_info"]["completion_tokens"], n,
+                "count stays cumulative"
+            );
+        }
+    }
+
+    /// The memoized cumulative fast path must emit **byte-identical** JSON to the
+    /// `serde_json::Value` builder it replaces — same keys, same alphabetical order
+    /// (`Map` is a `BTreeMap`; no `preserve_order`), same escaping. Covers unicode
+    /// and control chars, an empty-ids first frame, a finish_reason, and the batch
+    /// `index`. Guards the O(T) rewrite of the O(T²) `output_ids` serialization.
+    #[test]
+    fn cumulative_frame_json_matches_serde() {
+        let deltas = [
+            ChunkEvent {
+                rid: 7,
+                text: String::new(),
+                token_ids: vec![],
+                completion_tokens: 0,
+                prompt_tokens: 128,
+                ..Default::default()
+            },
+            ChunkEvent {
+                rid: 7,
+                text: "He\"llo\n\t".into(),
+                token_ids: vec![1000],
+                completion_tokens: 1,
+                prompt_tokens: 128,
+                ..Default::default()
+            },
+            ChunkEvent {
+                rid: 7,
+                text: " 世界 🌍 \\".into(),
+                token_ids: vec![-2, 3],
+                completion_tokens: 2,
+                prompt_tokens: 128,
+                ..Default::default()
+            },
+            ChunkEvent {
+                rid: 7,
+                text: "!".into(),
+                token_ids: vec![9],
+                completion_tokens: 1,
+                prompt_tokens: 128,
+                finish_reason: Some(serde_json::json!({"type": "stop", "matched": 9})),
+                ..Default::default()
+            },
+        ];
+
+        for index in [None, Some(3usize)] {
+            let mut acc = OutputAccumulator::default();
+            for d in &deltas {
+                acc.fold(d);
+                let fast = cumulative_frame_json(&acc, "7", index).expect("no extras → fast path");
+                let slow = tag_value(sglang_frame_value(acc.snapshot(), "7"), index);
+                assert_eq!(fast, slow, "index={index:?} text={:?}", acc.snapshot().text);
+            }
+        }
+    }
+
+    /// A frame carrying logprobs falls back to the `Value` builder (the fast path
+    /// only knows the plain text/ids shape).
+    #[test]
+    fn cumulative_frame_json_defers_on_extras() {
+        let mut acc = OutputAccumulator::default();
+        acc.fold(&ChunkEvent {
+            rid: 1,
+            token_ids: vec![5],
+            text: "x".into(),
+            extras: Some(Box::new(ChunkExtras {
+                out_lp_val: vec![-0.5],
+                out_lp_idx: vec![5],
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        assert!(cumulative_frame_json(&acc, "1", None).is_none());
     }
 }
