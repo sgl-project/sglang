@@ -32,7 +32,7 @@ in Nsight Systems.
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
+_SCHEDULER_NVTX_SAMPLE_RATE = max(1, envs.SGLANG_SCHEDULER_NVTX_SAMPLE_RATE.get())
 
 _nvtx_module = None
 if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
@@ -154,3 +155,46 @@ def profile_method(
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 scheduler_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+
+# Sampled variants: emit only every SGLANG_SCHEDULER_NVTX_SAMPLE_RATE-th call.
+# Per-call-site counters ensure independent sampling for each decorated function
+# or context manager block. Sample rate of 1 (default) means "always emit".
+_nvtx_sample_counters: Dict[int, int] = {}
+_nvtx_sample_rate = _SCHEDULER_NVTX_SAMPLE_RATE
+
+
+def _should_sample(key: int) -> bool:
+    if _nvtx_sample_rate <= 1:
+        return True
+    count = _nvtx_sample_counters.get(key, 0) + 1
+    _nvtx_sample_counters[key] = count
+    return count % _nvtx_sample_rate == 0
+
+
+def scheduler_nvtx_method_sampled(debug_name: str, *, color: Optional[str] = None):
+    """Decorator that emits NVTX only on sampled calls.
+
+    Controlled by ``SGLANG_SCHEDULER_NVTX_SAMPLE_RATE`` (default 1 = always).
+    Each decorated function is sampled independently.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if _should_sample(id(func)):
+                with profile_range(debug_name, color=color, nvtx_enabled=NVTX_SCHEDULER_ENABLED):
+                    return func(*args, **kwargs)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def scheduler_nvtx_range_sampled(debug_name: str, *, color: Optional[str] = None):
+    """Context manager that emits NVTX only on sampled calls.
+
+    Controlled by ``SGLANG_SCHEDULER_NVTX_SAMPLE_RATE`` (default 1 = always).
+    Each distinct debug_name is sampled independently.
+    """
+    key = hash(debug_name)
+    if _should_sample(key):
+        return profile_range(debug_name, color=color, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
+    return _NULL_CONTEXT
