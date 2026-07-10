@@ -363,6 +363,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
+        self._static_num_tokens = 0
+
+    @property
+    def padded_num_tokens(self) -> int:
+        """Padded static token count of the most recent replay.
+
+        This is the rank-padded buffer extent used for DP-attention state
+        capturer slicing when the prefill cuda graph runs the forward pass.
+        """
+        return self._static_num_tokens
 
     def _is_mamba_track_enabled(self) -> bool:
         return (

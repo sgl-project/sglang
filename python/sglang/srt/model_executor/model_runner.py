@@ -325,6 +325,10 @@ class RankZeroFilter(logging.Filter):
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    # Padded per-rank buffer extent of the cuda graph runner that actually ran
+    # the forward pass, or None for the eager path. When can_run_graph is True
+    # this is never None, so DP-attention state capturers can slice safely.
+    cuda_graph_padded_extent: Optional[int] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -3063,7 +3067,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=output.cuda_graph_padded_extent,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3071,7 +3075,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=output.cuda_graph_padded_extent,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3175,7 +3179,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    cuda_graph_padded_extent=self.decode_cuda_graph_runner.bs,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -3188,6 +3196,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+            # Padded per-rank buffer extent of the runner that runs below.
+            # Only the prefill cuda graph path sets can_run_graph=True here and
+            # thus needs it; eager / split prefill leave it None.
+            cuda_graph_padded_extent: Optional[int] = None
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
@@ -3223,6 +3236,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
+                cuda_graph_padded_extent = (
+                    self.prefill_cuda_graph_runner.padded_num_tokens
+                )
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
                 ret = self.eager_runner.execute(
@@ -3235,7 +3251,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                cuda_graph_padded_extent=cuda_graph_padded_extent,
+            )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
