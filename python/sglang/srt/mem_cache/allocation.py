@@ -362,6 +362,11 @@ def alloc_pages_or_raise(
     """Evict + ``alloc_pages`` (``alloc_pages_decode`` when ``decode``) and
     raise the standard OOM error on failure. Returns page ids (device tensor).
     """
+    # NPU (including DSV4-NPU) must stay on the gated legacy
+    # alloc_extend/alloc_decode paths: its requests are real-lens (not
+    # page-aligned) and the DSV4-NPU c/state pools are tail-window shaped.
+    # Guard so a future refactor cannot silently reroute it here.
+    assert not _is_npu, "alloc_pages is not used on NPU; see dsv4_allocator.py"
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = num_pages * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)

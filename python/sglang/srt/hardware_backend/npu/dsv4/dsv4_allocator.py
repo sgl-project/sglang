@@ -20,6 +20,15 @@ mem_cache/common.py unpacks ``out_full_loc`` and stashes the bundle on
 ``batch.out_cache_loc_dsv4``; ``DSV4NPUReqToTokenPool`` writes the per-req
 ``req_to_token_c{4,128}[_state]`` tables that :meth:`free` and the last_loc
 lookups read back.
+
+This module is the legacy ``alloc_extend``/``alloc_decode`` + ``last_loc``
+path, kept for DSV4-NPU only (op6): the c4/c128 state pools request
+tail-window (inherently non page-aligned) intervals, the compressed-KV
+tables anchor on per-req ``last_loc`` lookups, and the ``DSV4OutCacheLoc``
+bundle needs kernel-ordered token-level out locs -- none of which the
+page-granular ``alloc_pages`` + ``write_pages_to_req_to_token`` path can
+express. The non-NPU entries in ``mem_cache/allocation.py`` gate NPU onto
+this path; see the op6 plan for the follow-up (paging the c/state pools).
 """
 
 from __future__ import annotations
