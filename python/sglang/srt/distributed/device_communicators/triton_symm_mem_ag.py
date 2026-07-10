@@ -478,7 +478,7 @@ class MultimemAllGatherer:
             if (
                 tp_group.world_size > 1
                 and get_server_args().nnodes > 1
-                and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
+                and not all(in_the_same_node_as(tp_group.device_group, source_rank=0))
             ):
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
