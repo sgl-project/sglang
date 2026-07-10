@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 _is_xpu = is_xpu()
 
-
 __all__ = [
     "eager_on_graph",
     "BreakableCUDAGraph",
