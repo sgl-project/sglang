@@ -188,6 +188,9 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        self.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
         self.image_config = mm_process_config.get("image", {})
@@ -436,7 +439,7 @@ class BaseMultimodalProcessor(ABC):
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
-            and not self.server_args.disable_fast_image_processor
+            and not self.disable_fast_image_processor
         ):
             if _is_cpu or get_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
@@ -470,7 +473,7 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.server_args.keep_mm_feature_on_device:
+        if not self.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if SGL_USE_CUDA_IPC:
@@ -832,7 +835,7 @@ class BaseMultimodalProcessor(ABC):
 
         # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
         if (
-            self.server_args.skip_tokenizer_init
+            self.skip_tokenizer_init
             or cnt[Modality.IMAGE] != n_image
             or cnt[Modality.VIDEO] != n_video
             or cnt[Modality.AUDIO] != n_audio
@@ -1234,7 +1237,7 @@ class BaseMultimodalProcessor(ABC):
                 pool_byte_offset=byte_offset,
                 pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
             )
-        if self.server_args.keep_mm_feature_on_device:
+        if self.keep_mm_feature_on_device:
             return tensor
         return tensor.cpu()
 

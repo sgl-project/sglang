@@ -33,9 +33,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
 )
-
-# yapf: enable
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
@@ -47,6 +44,9 @@ from sglang.srt.utils import (
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+# yapf: enable
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
