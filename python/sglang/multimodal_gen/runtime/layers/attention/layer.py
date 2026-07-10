@@ -17,6 +17,9 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_scatter_to_padded,
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -53,9 +56,8 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
-from sglang.srt.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
-    get_current_replay_token,
     is_in_breakable_cuda_graph,
 )
 
@@ -1177,6 +1179,24 @@ class USPAttention(nn.Module):
         return torch.cat([out_shard, out_rep], dim=1)
 
 
+class _BCGBoxedTupleOutput:
+    """Box a tuple-returning break-point output as tensor attributes.
+
+    ``_copy_output`` copies tensors and objects-with-tensor-attributes in
+    place across replays but ignores tuples, so tuple-returning attention
+    forwards (``UlyssesAttention``) are boxed for the break point and
+    unboxed after.
+    """
+
+    def __init__(self, values: tuple) -> None:
+        self.num_values = len(values)
+        for i, value in enumerate(values):
+            setattr(self, f"value_{i}", value)
+
+    def astuple(self) -> tuple:
+        return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
+
+
 def _make_breakable_attention_forward(forward_method):
     """Wrap a DiT attention module's ``forward`` so it becomes a breakable
     CUDA graph (BCG) break point.
@@ -1187,12 +1207,18 @@ def _make_breakable_attention_forward(forward_method):
     cannot (or should not) be captured into a static CUDA graph. When BCG is
     disabled this is a transparent pass-through to the original method.
     """
-    bcg_forward = eager_on_graph(True)(forward_method)
+
+    def _forward_boxing_tuples(*args, **kwargs):
+        out = forward_method(*args, **kwargs)
+        return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
+
+    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
         if is_in_breakable_cuda_graph():
-            return bcg_forward(self, *args, **kwargs)
+            out = bcg_forward(self, *args, **kwargs)
+            return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
         return forward_method(self, *args, **kwargs)
 
     return forward
