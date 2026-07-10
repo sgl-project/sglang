@@ -21,11 +21,6 @@ import torch.nn.functional as F
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.compressor_v2 import (
-    CompressorBackendMixin,
-    FusedCompressMetadata,
-    create_paged_compressor_data,
-)
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
@@ -1321,7 +1316,6 @@ class DeepseekV4AttnBackend(
 
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
         if _is_cpu and _cpu_amx:
-            raw_loc = forward_batch.out_cache_loc
             from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
                 NopeFp8RopeBf16Pack,
             )
@@ -1331,7 +1325,7 @@ class DeepseekV4AttnBackend(
             )
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
-                raw_loc=raw_loc,
+                swa_loc=swa_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
         elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():

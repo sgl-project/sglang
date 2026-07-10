@@ -2602,9 +2602,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        if (
+            _is_npu
+            or _is_cpu
+            or not (
+                envs.SGLANG_DSV4_MHC_PREWARM.get()
+                and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            )
         ):
             return
         layer = next(

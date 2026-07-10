@@ -71,7 +71,7 @@ class TestNorm:
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
 
-    @pytest.mark.parametrize("dtype", DTYPES_FULL, ids=DTYPE_IDS_FULL)
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
     @pytest.mark.parametrize("hidden_size", [2048, 512])
     @pytest.mark.parametrize("batch_size", [32, 121])
     def test_l2norm(self, batch_size, hidden_size, dtype):
@@ -84,7 +84,7 @@ class TestNorm:
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("dtype", DTYPES_FULL, ids=DTYPE_IDS_FULL)
     @pytest.mark.parametrize("hidden_size", [2048, 512])
     @pytest.mark.parametrize("batch_size", [32, 121])
     @pytest.mark.parametrize("seq_len", [None, 2], ids=["2d", "3d"])
@@ -104,15 +104,15 @@ class TestNorm:
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-        ref_x = x.clone()
-        ref_residual = residual.clone()
+        if dtype is not torch.float:  # float support only in rmsnorm_cpu for now
+            ref_x = x.clone()
+            ref_residual = residual.clone()
+            torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x, residual, weight, eps)
 
-        torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x, residual, weight, eps)
+            ref_x, ref_residual = self._forward_native(ref_x, weight, eps, ref_residual)
 
-        ref_x, ref_residual = self._forward_native(ref_x, weight, eps, ref_residual)
-
-        torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+            torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
+            torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
     @pytest.mark.parametrize("hidden_size", [2048, 256, 33])

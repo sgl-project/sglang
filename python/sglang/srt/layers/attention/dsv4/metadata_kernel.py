@@ -299,6 +299,7 @@ def _init_compression_attn_metadata_pytorch(
         c4_seq_lens_clamp1,
         c128_out_loc.to(torch.int32),
         c128_positions,
+        c128_seq_lens_raw,
         c128_seq_lens_clamp1,
         c128_page_indices,
     )
@@ -312,6 +313,7 @@ def init_compression_metadata_torch(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ) -> Tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,

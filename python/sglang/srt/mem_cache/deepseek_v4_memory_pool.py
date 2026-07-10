@@ -918,7 +918,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     overlap=overlap,
                     head_dim=attn_kv_head_dim,
                     device=self.device,
-                    dtype=self.state_dtype,
+                    dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
                     enable_memory_saver=enable_memory_saver,
                 )
             if ratio == 4:
@@ -928,7 +928,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     overlap=overlap,
                     head_dim=self.indexer_head_dim,
                     device=self.device,
-                    dtype=self.state_dtype,
+                    dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
                     enable_memory_saver=enable_memory_saver,
                 )
             self.compress_states.append(compress_state)
