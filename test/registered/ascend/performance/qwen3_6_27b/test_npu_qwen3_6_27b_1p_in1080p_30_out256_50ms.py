@@ -77,6 +77,10 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     "--speculative-num-draft-tokens",
     4,
     "--mm-enable-dp-encoder",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -84,11 +88,12 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     """Test NPU performance for Qwen3.6-27B 1p in1080p 30 out256 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_MM_CUSTOM_GEN
+    dataset_type = AISBENCHMARK_DATASET_MM_CUSTOM_GEN
     model = QWEN3_6_27B_MODEL_PATH
     other_args = QWEN3_6_27B_1080P_OTHER_ARGS
     envs = QWEN3_6_27B_1080P_ENVS
-    dataset_name = "random"
+    backend = "sglang-oai-chat"
+    dataset_name = "image"
     max_concurrency = 30
     num_prompts = 120
     input_len = 30

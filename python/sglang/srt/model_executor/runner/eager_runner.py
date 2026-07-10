@@ -130,6 +130,9 @@ class EagerRunner(BaseRunner):
                 if is_encoder_decoder
                 else 0
             ),
+            encoder_lens_dtype=(
+                torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
+            ),
             dp_size=sa.dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
@@ -213,7 +216,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
         model_runner = self.model_runner
-        if model_runner.server_args.enable_pdmux:
+        if self.enable_pdmux:
             return model_runner.decode_attn_backend, forward_context(
                 ForwardContext(attn_backend=model_runner.decode_attn_backend)
             )
@@ -225,7 +228,7 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = model_runner.server_args.enable_pdmux
+        enable_pdmux = self.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -260,7 +263,7 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not model_runner.server_args.enable_pdmux:
+        if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
@@ -275,7 +278,7 @@ class EagerRunner(BaseRunner):
                         forward_batch.req_pool_indices,
                         get_req_to_token_pool().req_to_token,
                         forward_batch.seq_lens_sum,
-                        get_token_to_kv_pool().get_key_buffer(0).shape,
+                        get_token_to_kv_pool().get_kv_buffer_shape()[0],
                         model_runner.kv_cache_dtype,
                         model_runner.device,
                         create_chunked_prefix_cache_kv_indices,
@@ -302,6 +305,8 @@ class EagerRunner(BaseRunner):
             )
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
+        else:
+            forward_batch.attn_cp_metadata = None
 
         category = (
             "target_verify"
@@ -388,7 +393,7 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not model_runner.server_args.enable_pdmux:
+            if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
