@@ -62,6 +62,50 @@ def write_req_to_token_pool_triton(
 
 
 @triton.jit
+def write_pages_to_req_to_token_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices,
+    page_ids_i32,  # flat per-batch page ids, int32
+    pages_per_req,
+    out_starts,
+    page_size: tl.constexpr,
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0)
+
+    req_pool_index = tl.load(req_pool_indices + pid)
+    num_pages = tl.load(pages_per_req + pid)
+    out_start = tl.load(out_starts + pid)
+
+    cumsum_start = tl.cast(0, tl.int64)
+    for i in range(pid):
+        cumsum_start += tl.load(pages_per_req + i)
+
+    num_tokens = num_pages * page_size
+    num_loop = tl.cdiv(num_tokens, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < num_tokens
+        page_id = tl.load(
+            page_ids_i32 + cumsum_start + offset // page_size, mask=mask, other=0
+        )
+        # The value channel stays int32 end to end (page_ids are cast to int32
+        # on the host, and req_to_token is int32), so Triton never issues a
+        # mixed-width store -- avoiding the HIP int32->int64 store bug (see
+        # get_last_loc_triton_safe). Only address arithmetic uses int64.
+        value = page_id * page_size + offset % page_size
+        tl.store(
+            req_to_token_ptr
+            + req_pool_index.to(tl.int64) * req_to_token_ptr_stride
+            + out_start
+            + offset,
+            value,
+            mask=mask,
+        )
+
+
+@triton.jit
 def gather_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
     req_pool_indices,

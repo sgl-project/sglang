@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
     gather_req_to_token_pool_triton,
     get_last_loc_triton,
     get_last_loc_triton_safe,
+    write_pages_to_req_to_token_triton,
     write_req_to_token_pool_triton,
 )
 from sglang.srt.runtime_context import get_server_args
@@ -97,6 +98,86 @@ def write_cache_indices(
                 out_cache_loc[pt : pt + alloc_extend_len],
             )
             pt += alloc_extend_len
+
+
+def write_pages_to_req_to_token(
+    *,
+    req_to_token_pool: ReqToTokenPool,
+    req_pool_indices_tensor: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    page_ids: torch.Tensor,
+    pages_per_req: list[int],
+    out_starts: list[int],
+    page_size: int,
+) -> None:
+    """Expand each allocated page id to ``page_id * page_size + [0, page_size)``
+    and write it into ``req_to_token[req_row, out_start + j*page_size + k]``.
+
+    All lengths and starts are host ints (zero device sync); ``page_ids`` is
+    the flat device tensor returned by ``alloc_pages``.
+    """
+    req_to_token = req_to_token_pool.req_to_token
+    num_reqs = len(pages_per_req)
+    num_pages_total = sum(pages_per_req)
+
+    assert req_to_token.dtype == torch.int32
+    assert req_pool_indices_tensor.shape[0] == num_reqs
+    assert req_pool_indices_cpu.shape[0] == num_reqs
+    assert req_pool_indices_cpu.device.type == "cpu"
+    assert len(out_starts) == num_reqs
+    assert page_ids.shape[0] == num_pages_total
+    assert all(num_pages >= 0 for num_pages in pages_per_req)
+    assert all(out_start >= 0 for out_start in out_starts)
+    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        assert all(out_start % page_size == 0 for out_start in out_starts)
+        # int32 value channel (see the triton kernel): every expanded slot id
+        # must fit in int32.
+        if num_pages_total > 0:
+            assert (int(page_ids.max().item()) + 1) * page_size <= 2**31
+
+    if num_pages_total == 0:
+        return
+
+    device = req_to_token.device
+    # int32 value channel: keep the kernel's loads/stores same-width (HIP
+    # miscompiles mixed-width stores; see the triton kernel).
+    page_ids_i32 = page_ids.to(torch.int32)
+
+    if support_triton(get_server_args().attention_backend):
+        pages_per_req_device = torch.tensor(pages_per_req, dtype=torch.int64).to(
+            device, non_blocking=True
+        )
+        out_starts_device = torch.tensor(out_starts, dtype=torch.int64).to(
+            device, non_blocking=True
+        )
+        write_pages_to_req_to_token_triton[(num_reqs,)](
+            req_to_token,
+            req_pool_indices_tensor,
+            page_ids_i32,
+            pages_per_req_device,
+            out_starts_device,
+            page_size,
+            req_to_token.shape[1],
+        )
+        return
+
+    page_offsets = torch.arange(page_size, dtype=torch.int64, device=device)
+    pt = 0
+    for i in range(num_reqs):
+        num_pages = pages_per_req[i]
+        if num_pages == 0:
+            continue
+        req_idx = int(req_pool_indices_cpu[i].item())
+        out_start = out_starts[i]
+        req_page_ids = page_ids[pt : pt + num_pages].to(torch.int64)
+        token_ids = (req_page_ids[:, None] * page_size + page_offsets[None, :]).reshape(
+            -1
+        )
+        req_to_token_pool.write(
+            (req_idx, slice(out_start, out_start + num_pages * page_size)),
+            token_ids,
+        )
+        pt += num_pages
 
 
 def gather_out_cache_loc_extend(
