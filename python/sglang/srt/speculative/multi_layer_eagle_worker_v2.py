@@ -277,7 +277,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         seq_lens_sum = batch.seq_lens_sum
         if seq_lens_sum is None:
-            seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if batch.seq_lens_cpu is not None:
+                seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            else:
+                max_context_len = (
+                    self.target_worker.model_runner.attn_backend.max_context_len
+                )
+                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
 
         (
             tree_mask,
