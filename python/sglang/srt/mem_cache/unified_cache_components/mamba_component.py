@@ -80,17 +80,19 @@ class MambaComponent(TreeComponent):
         req = params.req
         last_node = result.best_match_node
 
-        # HiCache can still use prefix matches and load back host-backed Mamba
-        # states. We temporarily skip branching-state fill in that mode and can
-        # add a HiCache-aware branching policy later.
-        if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
-            chunk_size = get_server_args().mamba_cache_chunk_size
-            aligned_seqlen = (
-                sum(len(v) for v in value_chunks) // chunk_size
-            ) * chunk_size
-            branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
-        else:
-            branching_seqlen = None
+        # Full may extend beyond the latest Mamba state. Both lengths use
+        # logical matches: device only without HiCache, device + host with it.
+        full_hit_len = result.full_logical_hit_length
+        mamba_boundary_len = (
+            len(result.device_indices) + result.host_hit_length
+        )
+        chunk_size = get_server_args().mamba_cache_chunk_size
+        aligned_seqlen = (full_hit_len // chunk_size) * chunk_size
+        branching_seqlen = (
+            aligned_seqlen
+            if aligned_seqlen > mamba_boundary_len
+            else None
+        )
 
         mamba_value = last_node.component_data[self.component_type].value
         if cow_mamba and mamba_value is not None:
