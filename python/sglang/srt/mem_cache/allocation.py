@@ -580,7 +580,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    if _alloc_page_size(batch) == 1:
+    page_size = _alloc_page_size(batch)
+    if page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
@@ -610,6 +611,28 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    if page_size > 1 and not _is_npu:
+        # Page-crossing steps get a whole fresh page from the allocator (the
+        # new slot is the page head since seq % page == 0 there); publish the
+        # full page [slot, slot + page) into the request's row so that
+        # [0, kv_allocated_len) stays fully written. Row positions use `locs`
+        # (encoder-offset aware); the crossing test uses the decoder KV length.
+        crossing_idx_cpu = torch.nonzero(batch.seq_lens_cpu % page_size == 0).flatten()
+        if crossing_idx_cpu.numel() > 0:
+            crossing_idx = crossing_idx_cpu.to(batch.device, non_blocking=True)
+            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+                assert torch.all(out_cache_loc[crossing_idx] % page_size == 0)
+            page_offsets = torch.arange(
+                page_size, dtype=torch.int64, device=batch.device
+            )
+            crossing_rows = batch.req_pool_indices[crossing_idx]
+            crossing_positions = locs[crossing_idx].unsqueeze(1) + page_offsets
+            crossing_values = out_cache_loc[crossing_idx].unsqueeze(1) + page_offsets
+            batch.req_to_token_pool.write(
+                (crossing_rows.unsqueeze(1), crossing_positions),
+                crossing_values.to(torch.int32),
+            )
+
     out_cache_loc_derived = batch.req_to_token_pool.req_to_token[
         batch.req_pool_indices, locs
     ].to(torch.int64)
@@ -624,8 +647,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req,
         )
 
-    for req in batch.reqs:
-        req.kv.kv_allocated_len += token_per_req
+    # ceil_align with the NPU real-lens page (1) degenerates to the previous
+    # += token_per_req bookkeeping because allocated == seq before a decode.
+    bookkeeping_page_size = 1 if _is_npu else page_size
+    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+        req.kv.kv_allocated_len = max(
+            req.kv.kv_allocated_len,
+            ceil_align(seq_len + token_per_req, bookkeeping_page_size),
+        )
 
     return out_cache_loc_derived
 
