@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.mem_cache.host_shared_slot_state import (
+import torch
+
+from sglang.srt.mem_cache.storage.tensorcast_store.host_shared_slot_state import (
+    HostSharedPageSlotManager,
     HostSharedPageSlotStaleTokenError,
     HostSharedPageSlotState,
     HostSharedPageSlotStateError,
@@ -101,6 +104,43 @@ class HostSharedPageSlotTrackerTest(unittest.TestCase):
         self.assertEqual(self.tracker.page_start_for_slot_index(2), 64)
         with self.assertRaises(ValueError):
             self.tracker.slot_index_for_page_start(48)
+
+
+class HostSharedPageSlotManagerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = HostSharedPageSlotManager(page_size=2, page_num=4)
+
+    def test_retire_released_page_slots_retires_resident_slot(self) -> None:
+        slot_tokens = self.manager.reserve_page_slots([0], logical_keys=["page-a"])
+        self.manager.mark_page_get_inflight(slot_tokens)
+        self.manager.commit_page_get_success(slot_tokens, logical_keys=["page-a"])
+
+        self.manager.retire_released_page_slots(torch.tensor([0, 1], dtype=torch.int64))
+
+        snapshot = self.manager.describe_page_slot(0)
+        self.assertEqual(snapshot.state, HostSharedPageSlotState.SLOT_FREE)
+        self.assertEqual(snapshot.slot_generation, 1)
+        self.assertIsNone(snapshot.logical_key)
+
+    def test_retire_released_page_slots_retires_invalid_slot(self) -> None:
+        slot_tokens = self.manager.reserve_page_slots([2], logical_keys=["page-b"])
+        self.manager.mark_page_get_inflight(slot_tokens)
+        self.manager.fail_page_get(slot_tokens)
+
+        self.manager.retire_released_page_slots(torch.tensor([2, 3], dtype=torch.int64))
+
+        snapshot = self.manager.describe_page_slot(2)
+        self.assertEqual(snapshot.state, HostSharedPageSlotState.SLOT_FREE)
+        self.assertEqual(snapshot.slot_generation, 1)
+
+    def test_retire_released_page_slots_rejects_inflight_slot(self) -> None:
+        slot_tokens = self.manager.reserve_page_slots([4], logical_keys=["page-c"])
+        self.manager.mark_page_get_inflight(slot_tokens)
+
+        with self.assertRaises(HostSharedPageSlotStateError):
+            self.manager.retire_released_page_slots(
+                torch.tensor([4, 5], dtype=torch.int64)
+            )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+
+import torch
 
 
 class HostSharedPageSlotState(str, Enum):
@@ -308,3 +311,116 @@ class HostSharedPageSlotTracker:
             raise ValueError(
                 f"slot_index must be in [0, {self.page_num}), got {slot_index}"
             )
+
+
+class HostSharedPageSlotManager:
+    """Tensorcast-owned lifecycle manager for direct host-shared page slots."""
+
+    def __init__(self, page_size: int, page_num: int) -> None:
+        self.page_size = page_size
+        self.page_num = page_num
+        self._lock = threading.RLock()
+        self.tracker = HostSharedPageSlotTracker(
+            page_size=page_size,
+            page_num=page_num,
+        )
+
+    def reset(self) -> None:
+        with self._lock:
+            self.tracker.reset()
+
+    def retire_released_page_slots(self, indices: torch.Tensor) -> None:
+        if indices.numel() == 0 or indices.numel() % self.page_size != 0:
+            return
+        with self._lock:
+            retire_tokens: list[HostSharedPageSlotToken] = []
+            for offset in range(0, indices.numel(), self.page_size):
+                page_start = int(indices[offset].item())
+                slot_index = self.tracker.slot_index_for_page_start(page_start)
+                snapshot = self.tracker.snapshot(slot_index)
+                if snapshot.state == HostSharedPageSlotState.SLOT_FREE:
+                    continue
+                if snapshot.state in {
+                    HostSharedPageSlotState.SLOT_RESIDENT,
+                    HostSharedPageSlotState.SLOT_INVALID,
+                }:
+                    retire_tokens.append(self.tracker.current_token(slot_index))
+                    continue
+                raise HostSharedPageSlotStateError(
+                    "cannot free host page slots while they are reserved or in flight"
+                )
+            if retire_tokens:
+                self.tracker.retire_slots(retire_tokens)
+
+    def slot_tokens_for_page_starts(
+        self, page_starts: torch.Tensor | Sequence[int]
+    ) -> tuple[HostSharedPageSlotToken, ...]:
+        with self._lock:
+            return tuple(
+                self.tracker.current_token(slot_index)
+                for slot_index in self._slot_indices_from_page_starts(page_starts)
+            )
+
+    def describe_page_slot(self, page_start: int) -> HostSharedPageSlotSnapshot:
+        with self._lock:
+            slot_index = self.tracker.slot_index_for_page_start(int(page_start))
+            return self.tracker.snapshot(slot_index)
+
+    def reserve_page_slots(
+        self,
+        page_starts: torch.Tensor | Sequence[int],
+        logical_keys: Sequence[str] | None = None,
+    ) -> tuple[HostSharedPageSlotToken, ...]:
+        with self._lock:
+            slot_indices = self._slot_indices_from_page_starts(page_starts)
+            return self.tracker.reserve_slots(slot_indices, logical_keys)
+
+    def mark_page_get_inflight(
+        self, slot_tokens: Sequence[HostSharedPageSlotToken]
+    ) -> None:
+        with self._lock:
+            self.tracker.mark_get_inflight(slot_tokens)
+
+    def commit_page_get_success(
+        self,
+        slot_tokens: Sequence[HostSharedPageSlotToken],
+        logical_keys: Sequence[str] | None = None,
+    ) -> None:
+        with self._lock:
+            self.tracker.commit_get_success(slot_tokens, logical_keys)
+
+    def fail_page_get(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        with self._lock:
+            self.tracker.fail_get(slot_tokens)
+
+    def begin_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        with self._lock:
+            self.tracker.begin_put(slot_tokens)
+
+    def finish_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        with self._lock:
+            self.tracker.finish_put(slot_tokens)
+
+    def mark_page_slots_invalid(
+        self, slot_tokens: Sequence[HostSharedPageSlotToken]
+    ) -> None:
+        with self._lock:
+            self.tracker.mark_invalid(slot_tokens)
+
+    def retire_page_slots(
+        self, slot_tokens: Sequence[HostSharedPageSlotToken]
+    ) -> tuple[HostSharedPageSlotToken, ...]:
+        with self._lock:
+            return self.tracker.retire_slots(slot_tokens)
+
+    def _slot_indices_from_page_starts(
+        self, page_starts: torch.Tensor | Sequence[int]
+    ) -> tuple[int, ...]:
+        if isinstance(page_starts, torch.Tensor):
+            normalized_page_starts = tuple(int(value) for value in page_starts.tolist())
+        else:
+            normalized_page_starts = tuple(int(value) for value in page_starts)
+        return tuple(
+            self.tracker.slot_index_for_page_start(page_start)
+            for page_start in normalized_page_starts
+        )

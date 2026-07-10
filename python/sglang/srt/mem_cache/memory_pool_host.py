@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import abc
-import json
 import logging
 import threading
 from collections import defaultdict
-from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -31,13 +29,6 @@ from sglang.jit_kernel.hicache import (
 )
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
-)
-from sglang.srt.mem_cache.host_shared_slot_state import (
-    HostSharedPageSlotSnapshot,
-    HostSharedPageSlotState,
-    HostSharedPageSlotStateError,
-    HostSharedPageSlotToken,
-    HostSharedPageSlotTracker,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -77,6 +68,14 @@ logger = logging.getLogger(__name__)
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+
+class HostPageSlotLifecycleManager(Protocol):
+    """Lightweight page slot management stub used by TensorcastStore"""
+
+    def reset(self) -> None: ...
+
+    def retire_released_page_slots(self, indices: torch.Tensor) -> None: ...
 
 
 def synchronized(func):
@@ -206,29 +205,16 @@ def get_allocator_from_storage(
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
-    elif allocator_type == "tensorcast":
-        raw_payload = allocator_config
-        if isinstance(raw_payload, str):
-            raw_payload = json.loads(raw_payload)
-        from sglang.srt.mem_cache.storage.tensorcast_store.config import (
-            tensorcast_host_allocator_config_from_extra_config,
-        )
+    if allocator_type == "tensorcast":
         from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
-            TensorcastHostTensorAllocator,
+            build_tensorcast_host_allocator_from_extra_config,
         )
 
-        resolved_config = tensorcast_host_allocator_config_from_extra_config(
-            raw_payload if isinstance(raw_payload, dict) else None
+        return build_tensorcast_host_allocator_from_extra_config(
+            allocator_config,
+            layout=layout,
         )
-        if resolved_config is None:
-            return HostTensorAllocator()
-        if layout != "page_blob_direct":
-            raise ValueError(
-                "TensorCast allocator-backed host residency requires --hicache-mem-layout=page_blob_direct"
-            )
-        return TensorcastHostTensorAllocator(resolved_config)
-    else:
-        return HostTensorAllocator()
+    return HostTensorAllocator()
 
 
 def alloc_with_host_register(
@@ -331,11 +317,21 @@ class HostKVCache(abc.ABC):
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        self.host_page_slot_lifecycle_manager: HostPageSlotLifecycleManager | None = (
+            None
+        )
         self.clear()
 
     @property
     def host_region_binding(self) -> Any | None:
         return self.allocator.binding
+
+    @synchronized
+    def attach_host_page_slot_lifecycle_manager(
+        self,
+        manager: HostPageSlotLifecycleManager,
+    ) -> None:
+        self.host_page_slot_lifecycle_manager = manager
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -405,10 +401,8 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
-        self.page_slot_tracker = HostSharedPageSlotTracker(
-            page_size=self.page_size,
-            page_num=self.page_num,
-        )
+        if self.host_page_slot_lifecycle_manager is not None:
+            self.host_page_slot_lifecycle_manager.reset()
 
     def available_size(self):
         return len(self.free_slots)
@@ -428,104 +422,10 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self._retire_released_page_slots(indices)
+        if self.host_page_slot_lifecycle_manager is not None:
+            self.host_page_slot_lifecycle_manager.retire_released_page_slots(indices)
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
-
-    def _retire_released_page_slots(self, indices: torch.Tensor) -> None:
-        if indices.numel() == 0 or indices.numel() % self.page_size != 0:
-            return
-        retire_tokens: list[HostSharedPageSlotToken] = []
-        for offset in range(0, indices.numel(), self.page_size):
-            page_start = int(indices[offset].item())
-            slot_index = self.page_slot_tracker.slot_index_for_page_start(page_start)
-            snapshot = self.page_slot_tracker.snapshot(slot_index)
-            if snapshot.state == HostSharedPageSlotState.SLOT_FREE:
-                continue
-            if snapshot.state in {
-                HostSharedPageSlotState.SLOT_RESIDENT,
-                HostSharedPageSlotState.SLOT_INVALID,
-            }:
-                retire_tokens.append(self.page_slot_tracker.current_token(slot_index))
-                continue
-            raise HostSharedPageSlotStateError(
-                "cannot free host page slots while they are reserved or in flight"
-            )
-        if retire_tokens:
-            self.page_slot_tracker.retire_slots(retire_tokens)
-
-    def _slot_indices_from_page_starts(
-        self, page_starts: torch.Tensor | Sequence[int]
-    ) -> tuple[int, ...]:
-        if isinstance(page_starts, torch.Tensor):
-            normalized_page_starts = tuple(int(value) for value in page_starts.tolist())
-        else:
-            normalized_page_starts = tuple(int(value) for value in page_starts)
-        return tuple(
-            self.page_slot_tracker.slot_index_for_page_start(page_start)
-            for page_start in normalized_page_starts
-        )
-
-    @synchronized
-    def slot_tokens_for_page_starts(
-        self, page_starts: torch.Tensor | Sequence[int]
-    ) -> tuple[HostSharedPageSlotToken, ...]:
-        return tuple(
-            self.page_slot_tracker.current_token(slot_index)
-            for slot_index in self._slot_indices_from_page_starts(page_starts)
-        )
-
-    @synchronized
-    def describe_page_slot(self, page_start: int) -> HostSharedPageSlotSnapshot:
-        slot_index = self.page_slot_tracker.slot_index_for_page_start(int(page_start))
-        return self.page_slot_tracker.snapshot(slot_index)
-
-    @synchronized
-    def reserve_page_slots(
-        self,
-        page_starts: torch.Tensor | Sequence[int],
-        logical_keys: Sequence[str] | None = None,
-    ) -> tuple[HostSharedPageSlotToken, ...]:
-        slot_indices = self._slot_indices_from_page_starts(page_starts)
-        return self.page_slot_tracker.reserve_slots(slot_indices, logical_keys)
-
-    @synchronized
-    def mark_page_get_inflight(
-        self, slot_tokens: Sequence[HostSharedPageSlotToken]
-    ) -> None:
-        self.page_slot_tracker.mark_get_inflight(slot_tokens)
-
-    @synchronized
-    def commit_page_get_success(
-        self,
-        slot_tokens: Sequence[HostSharedPageSlotToken],
-        logical_keys: Sequence[str] | None = None,
-    ) -> None:
-        self.page_slot_tracker.commit_get_success(slot_tokens, logical_keys)
-
-    @synchronized
-    def fail_page_get(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
-        self.page_slot_tracker.fail_get(slot_tokens)
-
-    @synchronized
-    def begin_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
-        self.page_slot_tracker.begin_put(slot_tokens)
-
-    @synchronized
-    def finish_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
-        self.page_slot_tracker.finish_put(slot_tokens)
-
-    @synchronized
-    def mark_page_slots_invalid(
-        self, slot_tokens: Sequence[HostSharedPageSlotToken]
-    ) -> None:
-        self.page_slot_tracker.mark_invalid(slot_tokens)
-
-    @synchronized
-    def retire_page_slots(
-        self, slot_tokens: Sequence[HostSharedPageSlotToken]
-    ) -> tuple[HostSharedPageSlotToken, ...]:
-        return self.page_slot_tracker.retire_slots(slot_tokens)
 
 
 class MHATokenToKVPoolHost(HostKVCache):

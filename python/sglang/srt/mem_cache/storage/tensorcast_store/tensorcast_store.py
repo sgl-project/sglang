@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.host_shared_slot_state import HostSharedPageSlotToken
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.tensorcast_store.client import (
     DefaultTensorcastPageClient,
@@ -27,6 +26,10 @@ from sglang.srt.mem_cache.storage.tensorcast_store.client import (
 )
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHiCacheConfig,
+)
+from sglang.srt.mem_cache.storage.tensorcast_store.host_shared_slot_state import (
+    HostSharedPageSlotManager,
+    HostSharedPageSlotToken,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,7 @@ class TensorcastStore(HiCacheStorage):
             layout_id=self._layout_id,
             engine_key_prefix=self._rank_suffix,
         )
+        self._host_slot_manager: HostSharedPageSlotManager | None = None
         self._publication_stats = _TensorcastPublicationStats()
         self.register_mem_pool_host(mem_pool_host)
         logger.info(
@@ -119,6 +123,7 @@ class TensorcastStore(HiCacheStorage):
         )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        self._ensure_host_slot_manager(mem_pool_host)
         host_region_binding = mem_pool_host.host_region_binding
         if self._tensorcast_config.host_allocator_enabled:
             if mem_pool_host.layout != "page_blob_direct":
@@ -146,6 +151,32 @@ class TensorcastStore(HiCacheStorage):
                 slot_bytes,
             )
         super().register_mem_pool_host(mem_pool_host)
+
+    def _ensure_host_slot_manager(
+        self,
+        mem_pool_host: HostKVCache,
+    ) -> HostSharedPageSlotManager:
+        manager = self._host_slot_manager
+        if manager is None:
+            manager = HostSharedPageSlotManager(
+                page_size=mem_pool_host.page_size,
+                page_num=mem_pool_host.page_num,
+            )
+            self._host_slot_manager = manager
+        elif (
+            manager.page_size != mem_pool_host.page_size
+            or manager.page_num != mem_pool_host.page_num
+        ):
+            raise ValueError(
+                "Tensorcast host slot manager already attached to incompatible host pool"
+            )
+        mem_pool_host.attach_host_page_slot_lifecycle_manager(manager)
+        return manager
+
+    def _require_host_slot_manager(self) -> HostSharedPageSlotManager:
+        if self._host_slot_manager is None:
+            raise RuntimeError("Tensorcast host slot manager is not attached")
+        return self._host_slot_manager
 
     def _build_rank_suffix(self) -> str:
         if self.is_mla_backend:
@@ -201,7 +232,9 @@ class TensorcastStore(HiCacheStorage):
     ) -> list[HostSharedPageSlotToken] | None:
         if not self._slot_tokens_enabled(extra_info):
             return None
-        return list(self.mem_pool_host.slot_tokens_for_page_starts(page_starts))
+        return list(
+            self._require_host_slot_manager().slot_tokens_for_page_starts(page_starts)
+        )
 
     def _allocator_backed_direct_put_enabled(self) -> bool:
         return (
@@ -255,8 +288,9 @@ class TensorcastStore(HiCacheStorage):
         page_starts = self._page_start_indices(host_indices, len(keys))
         targets = self._host_page_views(page_starts)
         direct_get_enabled = self._allocator_backed_direct_get_enabled()
+        host_slot_manager = self._require_host_slot_manager()
         slot_tokens = (
-            list(self.mem_pool_host.reserve_page_slots(page_starts, keys))
+            list(host_slot_manager.reserve_page_slots(page_starts, keys))
             if direct_get_enabled
             else self._slot_tokens_for_page_starts_if_enabled(page_starts, extra_info)
         )
@@ -264,7 +298,7 @@ class TensorcastStore(HiCacheStorage):
             self.mem_pool_host.host_region_binding if direct_get_enabled else None
         )
         if direct_get_enabled:
-            self.mem_pool_host.mark_page_get_inflight(slot_tokens)
+            host_slot_manager.mark_page_get_inflight(slot_tokens)
         try:
             result = self._page_client.batch_get_into(
                 keys,
@@ -275,17 +309,17 @@ class TensorcastStore(HiCacheStorage):
         except Exception:
             if direct_get_enabled:
                 with suppress(Exception):
-                    self.mem_pool_host.fail_page_get(slot_tokens)
+                    host_slot_manager.fail_page_get(slot_tokens)
             raise
         if direct_get_enabled:
             prefix_success = self._success_prefix_count(result.success_mask)
             if prefix_success > 0:
-                self.mem_pool_host.commit_page_get_success(
+                host_slot_manager.commit_page_get_success(
                     slot_tokens[:prefix_success],
                     keys[:prefix_success],
                 )
             if prefix_success < len(slot_tokens):
-                self.mem_pool_host.fail_page_get(slot_tokens[prefix_success:])
+                host_slot_manager.fail_page_get(slot_tokens[prefix_success:])
         first_key = keys[0] if keys else ""
         first_artifact_id = (
             self._page_client.artifact_id_for(first_key) if first_key else ""
@@ -313,7 +347,11 @@ class TensorcastStore(HiCacheStorage):
         pages = self._host_page_views(page_starts)
         direct_put_enabled = self._allocator_backed_direct_put_enabled()
         slot_tokens = (
-            list(self.mem_pool_host.slot_tokens_for_page_starts(page_starts))
+            list(
+                self._require_host_slot_manager().slot_tokens_for_page_starts(
+                    page_starts
+                )
+            )
             if direct_put_enabled
             else self._slot_tokens_for_page_starts_if_enabled(page_starts, extra_info)
         )

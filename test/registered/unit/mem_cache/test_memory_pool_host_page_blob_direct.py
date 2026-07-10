@@ -24,6 +24,18 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 
 
+class RecordingHostPageSlotLifecycleManager:
+    def __init__(self) -> None:
+        self.reset_calls = 0
+        self.retire_calls: list[torch.Tensor] = []
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def retire_released_page_slots(self, indices: torch.Tensor) -> None:
+        self.retire_calls.append(indices.clone())
+
+
 class PageBlobDirectLayoutTest(unittest.TestCase):
     def _build_mha_pool(self) -> MHATokenToKVPoolHost:
         device_pool = SimpleNamespace(
@@ -88,29 +100,25 @@ class PageBlobDirectLayoutTest(unittest.TestCase):
                 },
             )
 
-    def test_free_retires_resident_page_blob_direct_slot(self) -> None:
+    def test_free_forwards_page_slot_retirement_to_attached_manager(self) -> None:
         pool = self._build_mha_pool()
-        slot_tokens = pool.reserve_page_slots([0], logical_keys=["page-a"])
-        pool.mark_page_get_inflight(slot_tokens)
-        pool.commit_page_get_success(slot_tokens, logical_keys=["page-a"])
+        manager = RecordingHostPageSlotLifecycleManager()
+        pool.attach_host_page_slot_lifecycle_manager(manager)
 
-        pool.free(torch.tensor([0, 1], dtype=torch.int64))
+        indices = torch.tensor([0, 1], dtype=torch.int64)
+        self.assertEqual(pool.free(indices), 2)
 
-        snapshot = pool.describe_page_slot(0)
-        self.assertEqual(snapshot.state.value, "slot_free")
-        self.assertEqual(snapshot.slot_generation, 1)
+        self.assertEqual(len(manager.retire_calls), 1)
+        self.assertTrue(torch.equal(manager.retire_calls[0], indices))
 
-    def test_free_retires_invalid_page_blob_direct_slot(self) -> None:
+    def test_clear_resets_attached_page_slot_manager(self) -> None:
         pool = self._build_mha_pool()
-        slot_tokens = pool.reserve_page_slots([0], logical_keys=["page-a"])
-        pool.mark_page_get_inflight(slot_tokens)
-        pool.fail_page_get(slot_tokens)
+        manager = RecordingHostPageSlotLifecycleManager()
+        pool.attach_host_page_slot_lifecycle_manager(manager)
 
-        pool.free(torch.tensor([0, 1], dtype=torch.int64))
+        pool.clear()
 
-        snapshot = pool.describe_page_slot(0)
-        self.assertEqual(snapshot.state.value, "slot_free")
-        self.assertEqual(snapshot.slot_generation, 1)
+        self.assertEqual(manager.reset_calls, 1)
 
     def test_mla_page_blob_direct_matches_existing_direct_page_shape(self) -> None:
         device_pool = SimpleNamespace(

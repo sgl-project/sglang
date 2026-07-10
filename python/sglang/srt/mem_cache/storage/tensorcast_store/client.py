@@ -20,9 +20,11 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.host_shared_slot_state import HostSharedPageSlotToken
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHiCacheConfig,
+)
+from sglang.srt.mem_cache.storage.tensorcast_store.host_shared_slot_state import (
+    HostSharedPageSlotToken,
 )
 
 logger = logging.getLogger(__name__)

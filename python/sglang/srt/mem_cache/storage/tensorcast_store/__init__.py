@@ -3,14 +3,8 @@
 
 """Tensorcast-backed storage backend for SGLang HiCache."""
 
-from sglang.srt.mem_cache.storage.tensorcast_store.config import (
-    TensorcastHiCacheConfig,
-)
-from sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store import (
-    TensorcastStore,
-)
-
-__all__ = [
-    "TensorcastHiCacheConfig",
-    "TensorcastStore",
-]
+# Keep this initializer lightweight. Generic host-memory code lazily imports
+# tensorcast_store.config/host_allocator for allocator setup; re-exporting
+# TensorcastStore here would import memory_pool_host during package init and can
+# introduce circular import.
+__all__: list[str] = []

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import mmap
 import os
@@ -19,6 +20,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool_host import HostTensorAllocator
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHostAllocatorConfig,
+    tensorcast_host_allocator_config_from_extra_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -255,3 +257,24 @@ class TensorcastHostTensorAllocator(HostTensorAllocator):
                 self._store.release_host_shared_region(state.handle)
             with suppress(Exception):
                 self._store.unregister_region(state.binding.region_id, force=True)
+
+
+def build_tensorcast_host_allocator_from_extra_config(
+    allocator_config: dict[str, Any] | str | None,
+    *,
+    layout: str | None,
+) -> HostTensorAllocator:
+    raw_payload = allocator_config
+    if isinstance(raw_payload, str):
+        raw_payload = json.loads(raw_payload)
+
+    resolved_config = tensorcast_host_allocator_config_from_extra_config(
+        raw_payload if isinstance(raw_payload, dict) else None
+    )
+    if resolved_config is None:
+        return HostTensorAllocator()
+    if layout != "page_blob_direct":
+        raise ValueError(
+            "TensorCast allocator-backed host residency requires --hicache-mem-layout=page_blob_direct"
+        )
+    return TensorcastHostTensorAllocator(resolved_config)

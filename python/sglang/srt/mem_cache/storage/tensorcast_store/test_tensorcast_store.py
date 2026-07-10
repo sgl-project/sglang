@@ -17,10 +17,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.host_shared_slot_state import (
-    HostSharedPageSlotStaleTokenError,
-    HostSharedPageSlotToken,
-)
 from sglang.srt.mem_cache.storage.tensorcast_store.client import (
     TensorcastBatchExistsResult,
     TensorcastBatchTransferResult,
@@ -29,6 +25,12 @@ from sglang.srt.mem_cache.storage.tensorcast_store.client import (
 )
 from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
     TensorcastHostRegionBinding,
+)
+from sglang.srt.mem_cache.storage.tensorcast_store.host_shared_slot_state import (
+    HostSharedPageSlotManager,
+    HostSharedPageSlotStaleTokenError,
+    HostSharedPageSlotState,
+    HostSharedPageSlotToken,
 )
 from sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store import (
     TensorcastStore,
@@ -130,21 +132,16 @@ class FakeHostKVCache:
         self.dtype = torch.float32
         self.size_per_token = size_per_token
         self.kv_buffer = torch.tensor(values, dtype=self.dtype).reshape(-1, page_size)
+        self.page_num = self.kv_buffer.numel() // self.page_size
         self._host_region_binding = host_region_binding
-        self._slot_generations: dict[int, int] = {
-            page_start: (page_start // self.page_size) + 100
-            for page_start in range(0, self.kv_buffer.numel(), self.page_size)
-        }
-        self.reserve_calls: list[tuple[list[int], list[str] | None]] = []
-        self.mark_get_inflight_calls: list[list[HostSharedPageSlotToken]] = []
-        self.commit_get_success_calls: list[
-            tuple[list[HostSharedPageSlotToken], list[str] | None]
-        ] = []
-        self.fail_get_calls: list[list[HostSharedPageSlotToken]] = []
+        self.attached_host_page_slot_lifecycle_manager: object | None = None
 
     @property
     def host_region_binding(self) -> object | None:
         return self._host_region_binding
+
+    def attach_host_page_slot_lifecycle_manager(self, manager: object) -> None:
+        self.attached_host_page_slot_lifecycle_manager = manager
 
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
         page = self.kv_buffer[index // self.page_size]
@@ -156,54 +153,10 @@ class FakeHostKVCache:
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         self.kv_buffer[index // self.page_size] = data_page.reshape(self.page_size)
 
-    def slot_tokens_for_page_starts(
-        self, page_starts: list[int]
-    ) -> tuple[HostSharedPageSlotToken, ...]:
-        return tuple(
-            HostSharedPageSlotToken(
-                slot_index=page_start // self.page_size,
-                slot_generation=self._slot_generations[page_start],
-            )
-            for page_start in page_starts
-        )
 
-    def reserve_page_slots(
-        self,
-        page_starts: list[int],
-        logical_keys: list[str] | None = None,
-    ) -> tuple[HostSharedPageSlotToken, ...]:
-        self.reserve_calls.append(
-            (
-                list(page_starts),
-                list(logical_keys) if logical_keys is not None else None,
-            )
-        )
-        return self.slot_tokens_for_page_starts(page_starts)
-
-    def mark_page_get_inflight(
-        self, slot_tokens: list[HostSharedPageSlotToken]
-    ) -> None:
-        self.mark_get_inflight_calls.append(list(slot_tokens))
-
-    def commit_page_get_success(
-        self,
-        slot_tokens: list[HostSharedPageSlotToken],
-        logical_keys: list[str] | None = None,
-    ) -> None:
-        self.commit_get_success_calls.append(
-            (
-                list(slot_tokens),
-                list(logical_keys) if logical_keys is not None else None,
-            )
-        )
-
-    def fail_page_get(self, slot_tokens: list[HostSharedPageSlotToken]) -> None:
-        self.fail_get_calls.append(list(slot_tokens))
-
-
-class StaleCommitHostKVCache(FakeHostKVCache):
-    def __init__(self, values: list[float], **kwargs: object) -> None:
-        super().__init__(values, **kwargs)
+class StaleCommitHostSlotManager(HostSharedPageSlotManager):
+    def __init__(self, page_size: int, page_num: int) -> None:
+        super().__init__(page_size=page_size, page_num=page_num)
         self.stale_commit_attempts: list[
             tuple[list[HostSharedPageSlotToken], list[str] | None]
         ] = []
@@ -300,8 +253,8 @@ class TensorcastStoreTest(unittest.TestCase):
         self.assertEqual(
             client.last_put_slot_tokens,
             [
-                HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                HostSharedPageSlotToken(slot_index=1, slot_generation=101),
+                HostSharedPageSlotToken(slot_index=0, slot_generation=0),
+                HostSharedPageSlotToken(slot_index=1, slot_generation=0),
             ],
         )
 
@@ -313,8 +266,8 @@ class TensorcastStoreTest(unittest.TestCase):
         self.assertEqual(
             client.last_get_slot_tokens,
             [
-                HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                HostSharedPageSlotToken(slot_index=1, slot_generation=101),
+                HostSharedPageSlotToken(slot_index=0, slot_generation=0),
+                HostSharedPageSlotToken(slot_index=1, slot_generation=0),
             ],
         )
 
@@ -485,8 +438,8 @@ class TensorcastStoreTest(unittest.TestCase):
         self.assertEqual(
             client.last_put_slot_tokens,
             [
-                HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                HostSharedPageSlotToken(slot_index=1, slot_generation=101),
+                HostSharedPageSlotToken(slot_index=0, slot_generation=0),
+                HostSharedPageSlotToken(slot_index=1, slot_generation=0),
             ],
         )
         self.assertIs(client.last_put_source_region_binding, binding)
@@ -528,37 +481,18 @@ class TensorcastStoreTest(unittest.TestCase):
         self.assertEqual(
             client.last_get_slot_tokens,
             [
-                HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                HostSharedPageSlotToken(slot_index=1, slot_generation=101),
+                HostSharedPageSlotToken(slot_index=0, slot_generation=0),
+                HostSharedPageSlotToken(slot_index=1, slot_generation=0),
             ],
         )
         self.assertIs(client.last_get_target_region_binding, binding)
-        self.assertEqual(
-            host_cache.reserve_calls,
-            [([0, 2], ["hash_a", "hash_b"])],
-        )
-        self.assertEqual(
-            host_cache.mark_get_inflight_calls,
-            [
-                [
-                    HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                    HostSharedPageSlotToken(slot_index=1, slot_generation=101),
-                ]
-            ],
-        )
-        self.assertEqual(
-            host_cache.commit_get_success_calls,
-            [
-                (
-                    [
-                        HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                        HostSharedPageSlotToken(slot_index=1, slot_generation=101),
-                    ],
-                    ["hash_a", "hash_b"],
-                )
-            ],
-        )
-        self.assertEqual(host_cache.fail_get_calls, [])
+        slot_manager = store._require_host_slot_manager()
+        first_snapshot = slot_manager.describe_page_slot(0)
+        second_snapshot = slot_manager.describe_page_slot(2)
+        self.assertEqual(first_snapshot.state, HostSharedPageSlotState.SLOT_RESIDENT)
+        self.assertEqual(second_snapshot.state, HostSharedPageSlotState.SLOT_RESIDENT)
+        self.assertEqual(first_snapshot.logical_key, "hash_a")
+        self.assertEqual(second_snapshot.logical_key, "hash_b")
         self.assertTrue(
             torch.equal(
                 host_cache.kv_buffer.flatten(),
@@ -601,18 +535,18 @@ class TensorcastStoreTest(unittest.TestCase):
             [True, False],
         )
         self.assertEqual(
-            host_cache.commit_get_success_calls,
+            client.last_get_slot_tokens,
             [
-                (
-                    [HostSharedPageSlotToken(slot_index=0, slot_generation=100)],
-                    ["hash_a"],
-                )
+                HostSharedPageSlotToken(slot_index=0, slot_generation=0),
+                HostSharedPageSlotToken(slot_index=1, slot_generation=0),
             ],
         )
-        self.assertEqual(
-            host_cache.fail_get_calls,
-            [[HostSharedPageSlotToken(slot_index=1, slot_generation=101)]],
-        )
+        slot_manager = store._require_host_slot_manager()
+        first_snapshot = slot_manager.describe_page_slot(0)
+        failed_snapshot = slot_manager.describe_page_slot(2)
+        self.assertEqual(first_snapshot.state, HostSharedPageSlotState.SLOT_RESIDENT)
+        self.assertEqual(first_snapshot.logical_key, "hash_a")
+        self.assertEqual(failed_snapshot.state, HostSharedPageSlotState.SLOT_INVALID)
 
     def test_allocator_backed_batch_get_propagates_stale_commit_before_visibility(
         self,
@@ -625,7 +559,7 @@ class TensorcastStoreTest(unittest.TestCase):
             region_name="test-region",
         )
         client = FakeTensorcastPageClient()
-        host_cache = StaleCommitHostKVCache(
+        host_cache = FakeHostKVCache(
             [61.0, 62.0],
             layout="page_blob_direct",
             host_region_binding=binding,
@@ -641,6 +575,12 @@ class TensorcastStoreTest(unittest.TestCase):
             host_cache,
             page_client=client,
         )
+        stale_manager = StaleCommitHostSlotManager(
+            page_size=host_cache.page_size,
+            page_num=host_cache.page_num,
+        )
+        store._host_slot_manager = stale_manager
+        host_cache.attach_host_page_slot_lifecycle_manager(stale_manager)
 
         client.data["hash_a"] = torch.tensor([61.0, 62.0], dtype=torch.float32)
         host_indices = torch.tensor([0, 1], dtype=torch.int64)
@@ -649,17 +589,17 @@ class TensorcastStoreTest(unittest.TestCase):
         with self.assertRaises(HostSharedPageSlotStaleTokenError):
             store.batch_get_v1(["hash_a"], host_indices)
 
-        self.assertEqual(host_cache.commit_get_success_calls, [])
         self.assertEqual(
-            host_cache.stale_commit_attempts,
+            stale_manager.stale_commit_attempts,
             [
                 (
-                    [HostSharedPageSlotToken(slot_index=0, slot_generation=100)],
+                    [HostSharedPageSlotToken(slot_index=0, slot_generation=0)],
                     ["hash_a"],
                 )
             ],
         )
-        self.assertEqual(host_cache.fail_get_calls, [])
+        snapshot = stale_manager.describe_page_slot(0)
+        self.assertEqual(snapshot.state, HostSharedPageSlotState.GET_IN_FLIGHT)
 
     def test_cgid_helpers_compact_long_segments_and_hash_keys(self) -> None:
         compact_namespace = _compact_cgid_segment(
