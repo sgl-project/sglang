@@ -1362,7 +1362,7 @@ class NPUMXFP8FusedMoEMethod(_NPUFusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.model_executor.layers.fused_moe.utils import set_weight_attrs
+        from sglang.srt.utils.common import set_weight_attrs
 
         # Fused gate_up_proj: [E, 2*intermediate, hidden]
         w13_up_dim = 2 * intermediate_size_per_partition
