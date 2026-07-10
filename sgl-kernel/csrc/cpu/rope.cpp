@@ -641,26 +641,39 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& cos_sin_cache,
     bool is_neox) {
   CHECK_DIM(1, positions);
-  const auto input_dim = query.dim();
+  const auto query_dim = query.dim();
+  const auto key_dim = key.dim();
   const auto input_dtype = query.scalar_type();
   TORCH_CHECK(
-      input_dim == 2 || input_dim == 3 || input_dim == 4,
+      query_dim == 2 || query_dim == 3 || query_dim == 4,
       " Query/Key must be 2D [num_tokens, num_heads*head_size] or 3D [num_tokens, num_heads, head_size] or 4D "
       "[batch_size, seq_len, num_heads, head_size] tensor");
+  TORCH_CHECK(
+      key_dim == 2 || key_dim == 3 || key_dim == 4,
+      " Key must be 2D [num_tokens, num_kv_heads*head_size] or 3D [num_tokens, num_kv_heads, head_size] or 4D "
+      "[batch_size, seq_len, num_kv_heads, head_size] tensor");
+  TORCH_CHECK(
+      (query_dim == 2 && key_dim == 2) || (query_dim == 3 && (key_dim == 2 || key_dim == 3)) ||
+          (query_dim == 4 && key_dim == 4),
+      " Query/Key dimensions mismatch for rotary_embedding_cpu: query dim=", query_dim, ", key dim=", key_dim);
   CHECK_DIM(2, cos_sin_cache);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
 
   int64_t rotary_dim = cos_sin_cache.size(1);
-  if (input_dim == 3) {
-    // TODO: add support for head_dim != rotary_dim case when input_dim=3
+  bool use_inplace_kernel = query_dim == 2 || query_dim == 4 || (query_dim == 3 && (key_dim == 2 || is_neox));
+  if (query_dim == 3) {
+    // TODO: add support for head_dim != rotary_dim case when query_dim=3
     CHECK_EQ(query.size(-1), rotary_dim);
-    // TODO: add support for kv_head != 1
-    CHECK_EQ(key.size(1), 1);
+    CHECK_EQ(key.size(-1), rotary_dim);
+    if (!use_inplace_kernel) {
+      // TODO: add support for kv_head != 1 in the out-of-place 3D kernel.
+      CHECK_EQ(key.size(1), 1);
+    }
   }
 
   int64_t num_tokens = positions.numel();
-  if (input_dim <= 3) {
+  if (query_dim <= 3) {
     CHECK_EQ(key.size(0), num_tokens);
     CHECK_EQ(query.size(0), num_tokens);
   }
@@ -669,24 +682,24 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
   TORCH_CHECK(input_dtype == cos_sin_cache.scalar_type(), "query and cos_sin_cache must have the same data type");
 
-  int64_t num_heads = input_dim == 2 ? query.size(-1) / head_size : query.size(-2);
-  int64_t num_kv_heads = input_dim == 2 ? key.size(-1) / head_size : key.size(-2);
+  int64_t num_heads = query_dim == 2 ? query.size(-1) / head_size : query.size(-2);
+  int64_t num_kv_heads = key_dim == 2 ? key.size(-1) / head_size : key.size(-2);
   int64_t key_stride_s = key.stride(0);
   int64_t query_stride_s = query.stride(0);
 
-  int64_t query_stride_h = input_dim == 2 ? head_size : query.stride(-2);
-  int64_t key_stride_h = input_dim == 2 ? head_size : key.stride(-2);
-  at::Tensor query_out = at::empty_like(query);
-  at::Tensor key_out = at::empty_like(key);
-  int64_t query_out_stride_s = query_out.stride(0);
-  int64_t key_out_stride_s = key_out.stride(0);
+  int64_t query_stride_h = query_dim == 2 ? head_size : query.stride(-2);
+  int64_t key_stride_h = key_dim == 2 ? head_size : key.stride(-2);
+  at::Tensor query_out;
+  at::Tensor key_out;
+  int64_t query_out_stride_s = 0;
+  int64_t key_out_stride_s = 0;
   // output stride of num head dim is meaningful only when input dim = 3
-  int64_t query_out_stride_h = input_dim == 3 ? query_out.stride(1) : -1;
+  int64_t query_out_stride_h = -1;
   int64_t batch_size = 1;
   int64_t seq_len = num_tokens;
   int64_t query_stride_b = 0;
   int64_t key_stride_b = 0;
-  if (input_dim == 4) {
+  if (query_dim == 4) {
     batch_size = query.size(0);
     seq_len = query.size(1);
     query_stride_b = query.stride(0);
@@ -698,9 +711,16 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     CHECK_EQ(key.size(0) * key.size(1), num_tokens);
     CHECK_EQ(query.size(0) * query.size(1), num_tokens);
   }
+  if (!use_inplace_kernel) {
+    query_out = at::empty_like(query);
+    key_out = at::empty_like(key);
+    query_out_stride_s = query_out.stride(0);
+    key_out_stride_s = key_out.stride(0);
+    query_out_stride_h = query_out.stride(1);
+  }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
-    if (input_dim == 2 || input_dim == 4) {
+    if (use_inplace_kernel) {
       if (is_neox) {
         rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
