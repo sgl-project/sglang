@@ -1327,6 +1327,24 @@ class KVCache(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError()
 
+    def get_kv_cache_quant_method(self) -> Any:
+        """Return the concrete KV quant method, unwrapping composite KV pools."""
+        fallback = None
+        for pool in (
+            self,
+            getattr(self, "full_kv_pool", None),
+            getattr(self, "swa_kv_pool", None),
+        ):
+            if pool is None:
+                continue
+            quant_method = getattr(pool, "quant_method", None)
+            if quant_method is None:
+                continue
+            if getattr(quant_method, "name", None) != "unquantized":
+                return quant_method
+            fallback = quant_method
+        return fallback
+
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 

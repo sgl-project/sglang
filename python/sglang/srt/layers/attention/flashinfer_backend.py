@@ -181,25 +181,6 @@ FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 global_override_indptr_cpu = None
 
 
-def _get_kv_cache_quant_method(kv_pool):
-    """Return the concrete KV quant method, unwrapping composite KV pools."""
-    fallback = None
-    for pool in (
-        kv_pool,
-        getattr(kv_pool, "full_kv_pool", None),
-        getattr(kv_pool, "swa_kv_pool", None),
-    ):
-        if pool is None:
-            continue
-        quant_method = getattr(pool, "quant_method", None)
-        if quant_method is None:
-            continue
-        if getattr(quant_method, "name", None) != "unquantized":
-            return quant_method
-        fallback = quant_method
-    return fallback
-
-
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -340,7 +321,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
 
-        self.kv_cache_quant_method = _get_kv_cache_quant_method(self.token_to_kv_pool)
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         kv_cache_quant_method_name = getattr(self.kv_cache_quant_method, "name", None)
         unsupported_fp4_recipe = kv_cache_quant_method_name not in (
             None,
