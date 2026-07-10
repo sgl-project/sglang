@@ -71,17 +71,22 @@ def _normalize_hicache_kv_pool(pool: Any):
 
 def _get_hicache_bytes_per_token(pool: Any) -> Optional[int]:
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.base import (
+        get_effective_hicache_host_layer_num,
+    )
 
     pool = _normalize_hicache_kv_pool(pool)
     if isinstance(pool, MHATokenToKVPool):
+        host_layer_num = get_effective_hicache_host_layer_num(pool)
         return (
             (pool.head_dim + pool.v_head_dim)
             * pool.head_num
-            * pool.layer_num
+            * host_layer_num
             * pool.store_dtype.itemsize
         )
     if isinstance(pool, MLATokenToKVPool):
-        return pool.kv_cache_dim * pool.layer_num * pool.store_dtype.itemsize
+        host_layer_num = get_effective_hicache_host_layer_num(pool)
+        return pool.kv_cache_dim * host_layer_num * pool.store_dtype.itemsize
     return None
 
 
@@ -89,6 +94,9 @@ def _get_hicache_component_bytes_per_token(
     *, target_kv_pool: Any, draft_kv_pool: Any
 ) -> dict[str, int]:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.base import (
+        get_effective_hicache_host_layer_num,
+    )
 
     target_kv_pool = _normalize_hicache_kv_pool(target_kv_pool)
     target_bytes = _get_hicache_bytes_per_token(target_kv_pool)
@@ -103,7 +111,7 @@ def _get_hicache_component_bytes_per_token(
         )
         components["DSA indexer"] = (
             indexer_elements
-            * target_kv_pool.layer_num
+            * get_effective_hicache_host_layer_num(target_kv_pool)
             * target_kv_pool.index_k_with_scale_buffer_dtype.itemsize
         )
 

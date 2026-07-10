@@ -124,7 +124,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
     def get_ksize_per_token(self):
@@ -947,7 +947,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
         self.v_head_dim = self.device_pool.v_head_dim
         return (
             (self.head_dim + self.v_head_dim)

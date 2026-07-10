@@ -3,15 +3,20 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.kv_cache_builder import (
+    _get_hicache_component_bytes_per_token,
+)
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DSAIndexerPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.pool_host.base import build_hicache_memory_plan
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -147,6 +152,95 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                     device_start : device_start + page_size
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
+
+    @unittest.skipIf(
+        is_hip(),
+        "Concrete DSA pool construction has incompatible page-size requirements "
+        "across current ROCm backends; this allocation-parity check is CUDA-only.",
+    )
+    def test_total_budget_page_parity_for_all_planned_pools(self):
+        page_size = 64
+        device_size = page_size * 4
+        host_page_num = 3
+        target_pool = DSATokenToKVPool(
+            size=device_size,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=10,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+        )
+        target_pool.layer_shard_enabled = True
+        target_pool.layer_shard_size = 4
+        draft_pool = MHATokenToKVPool(
+            size=device_size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=16,
+            layer_num=2,
+            device="cuda",
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        plan = build_hicache_memory_plan(
+            page_num=host_page_num,
+            page_size=page_size,
+            component_bytes_per_token=_get_hicache_component_bytes_per_token(
+                target_kv_pool=target_pool,
+                draft_kv_pool=draft_pool,
+            ),
+            available_memory=(1 << 60, "test"),
+            reserve_bytes=0,
+        )
+
+        target_host = MLATokenToKVPoolHost(
+            device_pool=target_pool,
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+            override_kv_cache_dim=target_pool.kv_cache_dim,
+            host_page_num=plan.page_num,
+        )
+        indexer_host = DSAIndexerPoolHost(
+            device_pool=target_pool,
+            anchor_host=target_host,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+        draft_host = MHATokenToKVPoolHost(
+            device_pool=draft_pool,
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+            host_page_num=plan.page_num,
+        )
+
+        self.assertEqual(
+            (target_host.page_num, indexer_host.page_num, draft_host.page_num),
+            (plan.page_num,) * 3,
+        )
+        self.assertEqual((target_host.layer_num, indexer_host.layer_num), (3, 3))
+        actual_pool_bytes = (
+            target_host.kv_buffer.nbytes
+            + indexer_host.index_k_with_scale_buffer.nbytes
+            + draft_host.kv_buffer.nbytes
+        )
+        self.assertEqual(actual_pool_bytes, plan.pool_bytes)
 
     @unittest.skipIf(
         is_hip(),

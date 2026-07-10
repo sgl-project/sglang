@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import abc
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Mapping, Optional, Sequence
 
 import psutil
@@ -71,6 +72,118 @@ def _read_cgroup_memory_value(path: Path) -> Optional[int]:
         return None
 
 
+def _read_text_lines(path: Path) -> tuple[str, ...]:
+    try:
+        return tuple(path.read_text().splitlines())
+    except (FileNotFoundError, OSError):
+        return ()
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _cgroup_memory_file_pair(cgroup_dir: Path, source: str) -> tuple[Path, Path, str]:
+    if source == "cgroup v2":
+        return cgroup_dir / "memory.max", cgroup_dir / "memory.current", source
+    return (
+        cgroup_dir / "memory.limit_in_bytes",
+        cgroup_dir / "memory.usage_in_bytes",
+        source,
+    )
+
+
+def _discover_cgroup_memory_files(
+    *,
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    proc_mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> tuple[tuple[Path, Path, str], ...]:
+    """Resolve this process' cgroup plus every constraining ancestor."""
+    memberships: dict[str, PurePosixPath] = {}
+    for line in _read_text_lines(proc_cgroup_path):
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy_id, controllers, membership = fields
+        if hierarchy_id == "0" and not controllers:
+            memberships["cgroup v2"] = PurePosixPath(membership)
+        elif "memory" in controllers.split(","):
+            memberships["cgroup v1"] = PurePosixPath(membership)
+
+    mount_candidates: dict[str, list[tuple[Path, Path, bool]]] = {}
+    for line in _read_text_lines(proc_mountinfo_path):
+        try:
+            mount_fields, fs_fields = line.split(" - ", 1)
+        except ValueError:
+            continue
+        mount_parts = mount_fields.split()
+        fs_parts = fs_fields.split()
+        if len(mount_parts) < 5 or len(fs_parts) < 3:
+            continue
+
+        fs_type = fs_parts[0]
+        source: Optional[str] = None
+        if fs_type == "cgroup2":
+            source = "cgroup v2"
+        elif fs_type == "cgroup":
+            controller_options = set(fs_parts[1].split(",")) | set(
+                fs_parts[2].split(",")
+            )
+            if "memory" in controller_options:
+                source = "cgroup v1"
+        if source is None or source not in memberships:
+            continue
+
+        mount_root = PurePosixPath(_decode_mountinfo_path(mount_parts[3]))
+        mount_point = Path(_decode_mountinfo_path(mount_parts[4]))
+        membership = memberships[source]
+        try:
+            relative_membership = membership.relative_to(mount_root)
+            is_direct_match = True
+        except ValueError:
+            # In a cgroup namespace, /proc/self/cgroup is relative to the
+            # namespace root while mountinfo retains the host cgroup root.
+            relative_membership = PurePosixPath(str(membership).lstrip("/"))
+            is_direct_match = False
+
+        current = mount_point.joinpath(*relative_membership.parts)
+        try:
+            current.relative_to(mount_point)
+        except ValueError:
+            continue
+        mount_candidates.setdefault(source, []).append(
+            (mount_point, current, is_direct_match)
+        )
+
+    memory_files: list[tuple[Path, Path, str]] = []
+    seen: set[tuple[Path, Path, str]] = set()
+    for source, candidates in mount_candidates.items():
+        direct_matches = [candidate for candidate in candidates if candidate[2]]
+        if direct_matches:
+            selected = direct_matches
+        else:
+            selected = [
+                candidate
+                for candidate in candidates
+                if all(
+                    path.exists()
+                    for path in _cgroup_memory_file_pair(candidate[1], source)[:2]
+                )
+            ]
+
+        for mount_point, current, _ in selected:
+            while True:
+                entry = _cgroup_memory_file_pair(current, source)
+                if entry not in seen:
+                    seen.add(entry)
+                    memory_files.append(entry)
+                if current == mount_point:
+                    break
+                current = current.parent
+
+    return tuple(memory_files)
+
+
 def get_hicache_available_memory(
     *,
     host_available_bytes: Optional[int] = None,
@@ -85,9 +198,10 @@ def get_hicache_available_memory(
         host_available_bytes = psutil.virtual_memory().available
 
     candidates = [(host_available_bytes, "host")]
-    memory_files = (
-        _CGROUP_MEMORY_FILES if cgroup_memory_files is None else cgroup_memory_files
-    )
+    if cgroup_memory_files is None:
+        memory_files = _discover_cgroup_memory_files() or _CGROUP_MEMORY_FILES
+    else:
+        memory_files = cgroup_memory_files
     for limit_path, usage_path, source in memory_files:
         limit = _read_cgroup_memory_value(limit_path)
         usage = _read_cgroup_memory_value(usage_path)
@@ -98,6 +212,19 @@ def get_hicache_available_memory(
         candidates.append((max(0, limit - usage), source))
 
     return min(candidates, key=lambda item: item[0])
+
+
+def get_effective_hicache_host_layer_num(device_pool: KVCache) -> int:
+    """Return the per-rank layer count allocated by a HiCache host pool."""
+    layer_num = device_pool.layer_num
+    if not device_pool.layer_shard_enabled:
+        return layer_num
+    shard_size = device_pool.layer_shard_size
+    if shard_size <= 0:
+        raise ValueError(
+            f"HiCache layer shard size must be positive, got {shard_size}."
+        )
+    return (layer_num + shard_size - 1) // shard_size
 
 
 def validate_hicache_memory(
@@ -396,10 +523,7 @@ class HostKVCache(abc.ABC):
     def _effective_host_layer_num(self, device_pool=None) -> int:
         """Number of layers the host pool allocates for this rank."""
         device_pool = device_pool or self.device_pool
-        if not self._is_device_layer_sharded(device_pool):
-            return device_pool.layer_num
-        shard_size = device_pool.layer_shard_size
-        return (device_pool.layer_num + shard_size - 1) // shard_size
+        return get_effective_hicache_host_layer_num(device_pool)
 
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
         start, end = self._device_owned_layer_range(device_pool)

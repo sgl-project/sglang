@@ -2032,7 +2032,11 @@ class HostPoolGroup:
 
         self.layout = self.anchor_entry.host_pool.layout
         self.page_size = self.anchor_entry.host_pool.page_size
-        self.page_num = self.anchor_entry.host_pool.page_num
+        self.page_num = getattr(
+            self.anchor_entry.host_pool,
+            "page_num",
+            self.anchor_entry.host_pool.size // self.page_size,
+        )
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
         self.can_use_write_back_jit = all(
