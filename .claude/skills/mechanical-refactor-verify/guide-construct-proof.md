@@ -45,7 +45,8 @@ Self-contained, auditable without the skill installed:
   A contiguous-tail source still uses `extract_to_new_module`.
 - **A source file the commit deletes** once its defs relocated: `delete_file`.
 - **The module-level import diff**, realised directly from the target: gained names added
-  (a wholly new module's statement verbatim, wrapping kept), lost names removed with
+  (a wholly new module's statement verbatim, wrapping kept, or one name folded into an
+  existing `from module import …` with `add_imported_name`), lost names removed with
   `remove_imported_name`.
 - Non-Python files in the commit do not block inference; their diff is noted and left to
   the residual.

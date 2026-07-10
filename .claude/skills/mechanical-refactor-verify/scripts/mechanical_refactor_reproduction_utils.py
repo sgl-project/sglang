@@ -619,6 +619,48 @@ class Repro:
         self.ops.append(op)
         return self
 
+    def add_imported_name(
+        self, rel: str, *, module: str, name: str, asname: str | None = None
+    ) -> "Repro":
+        """Add a single ``name`` to an existing module-level ``from module import a, b`` --
+        the dual of ``remove_imported_name``. A relocated symbol gains a new importer that
+        already imports other names from the same module, so the target extends that line
+        rather than adding a fresh statement (which the sorter would not merge across an
+        intervening non-import statement). The import sorter rewrites the surviving line; an
+        import carrying comments is refused, since a rebuild would drop them."""
+
+        def alias_text(target_name: str, target_asname: str | None) -> str:
+            return target_name + (f" as {target_asname}" if target_asname else "")
+
+        def op(root: Path) -> None:
+            path = root / rel
+            lines = _split_keepends(_read_source(path))
+            nl = _newline_style("".join(lines))
+            for node in ast.parse("".join(lines)).body:
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if "." * node.level + (node.module or "") != module:
+                    continue
+                stmt_lines = lines[node.lineno - 1 : node.end_lineno]
+                if any("#" in ln for ln in stmt_lines):
+                    raise AssertionError(
+                        f"cannot add {name!r} to the import from {module!r} in {rel}: "
+                        f"it holds comments that a rebuild would delete"
+                    )
+                existing = [alias_text(a.name, a.asname) for a in node.names]
+                added = alias_text(name, asname)
+                assert (
+                    added not in existing
+                ), f"{name!r} already imported from {module!r} in {rel}"
+                rebuilt = f"from {module} import " + ", ".join(existing + [added]) + nl
+                lines[node.lineno - 1 : node.end_lineno] = [rebuilt]
+                _write_source(path, "".join(lines))
+                return
+            raise AssertionError(f"no `from {module} import` statement in {rel}")
+
+        self.ops.append(op)
+        return self
+
     def add_import(self, rel: str, import_stmt: str) -> "Repro":
         """Append an import after the last top-level import; the formatter's import sorter
         places it (so the exact insertion point does not matter)."""

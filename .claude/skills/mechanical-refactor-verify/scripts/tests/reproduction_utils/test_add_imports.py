@@ -34,6 +34,49 @@ def test_add_import_appends_after_last_top_level_import(tmp_path: Path) -> None:
     ).read_text() == "import os\nimport sys\nfrom pkg import Thing\n\nx = 1\n"
 
 
+# --- add_imported_name ---------------------------------------------------------
+
+
+def test_add_imported_name_extends_a_single_line_import(tmp_path: Path) -> None:
+    """A new name is appended to an existing from-import on the same statement."""
+    (tmp_path / "m.py").write_text("from pkg import a\n\nx = 1\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import a, b\n\nx = 1\n"
+
+
+def test_add_imported_name_carries_an_asname(tmp_path: Path) -> None:
+    """The added name keeps its `as` alias."""
+    (tmp_path / "m.py").write_text("from pkg import a\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b", asname="c")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import a, b as c\n"
+
+
+def test_add_imported_name_refuses_a_commented_import(tmp_path: Path) -> None:
+    """An import carrying comments is refused, since a rebuild would drop them."""
+    (tmp_path / "m.py").write_text("from pkg import (\n    a,  # keep\n)\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
+def test_add_imported_name_rejects_a_name_already_present(tmp_path: Path) -> None:
+    """Adding a name the import already has fails loudly."""
+    (tmp_path / "m.py").write_text("from pkg import a, b\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
+def test_add_imported_name_raises_without_a_matching_import(tmp_path: Path) -> None:
+    """A file lacking a `from module import` for the module fails loudly."""
+    (tmp_path / "m.py").write_text("from other import a\n")
+    r = Repro("b", "t").add_imported_name("m.py", module="pkg", name="b")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
 # --- repath_import / add_typechecking_import -----------------------------------
 
 

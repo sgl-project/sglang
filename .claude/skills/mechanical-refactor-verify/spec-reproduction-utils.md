@@ -135,6 +135,12 @@
   (the formatter does not keep one name exploded); a name sharing a line (a flat
   single-line import) is likewise rebuilt. Dropping the sole name removes the whole
   statement.
+- `add_imported_name(rel, *, module, name, asname)` — the dual of `remove_imported_name`:
+  adds one name to an existing `from module import a, b`. Use it (over `add_import`) when the
+  target extends an existing line rather than adding a fresh statement — the sorter will not
+  merge a new statement across an intervening non-import (e.g. a module-level assignment
+  between two import blocks). An import carrying comments is refused (a rebuild would drop
+  them); a name already present fails loudly.
 - `add_import(rel, import_stmt)` — the import sorter places it; with no existing imports
   it lands below the module docstring.
 - `add_typechecking_import(rel, import_stmt)` — appends inside the destination's
