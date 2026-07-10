@@ -22,7 +22,7 @@ register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
 class TestQwen3_30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3-30B-A3B"
     tp_size = 4
-    accuracy = 0.75
+    accuracy = 0.90
     # MoE weights split across 4 ranks take several minutes to load on Intel
     # Arc Pro B60; mirror the 32B/70B XPU tests' 1-hour launch budget.
     timeout_for_server_launch = 3600

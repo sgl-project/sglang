@@ -24,6 +24,10 @@ class TestNemotron3Nano30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     tp_size = 4
     accuracy = 0.72
     timeout_for_server_launch = 3600
+    # Generation cap for the GSM8K eval (mixin default is 512).
+    max_tokens = 8192
+    # Client-side eval concurrency (mixin default is 1).
+    num_threads = 4
     env = {"SGLANG_USE_SGL_XPU": "1"}
 
     # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
@@ -36,7 +40,7 @@ class TestNemotron3Nano30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
         "--mem-fraction-static",
         "0.85",
         "--context-length",
-        "8192",
+        "16384",
         "--page-size",
         "64",
         "--chunked-prefill-size",
