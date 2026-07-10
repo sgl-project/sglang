@@ -318,7 +318,7 @@ class SchedulerPPMixin:
                     )
                 )
 
-                if bmbs[next_mb_id] is not None:
+                if self._pp_pd_has_bootstrap_rids(bmbs[next_mb_id]):
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
@@ -326,7 +326,7 @@ class SchedulerPPMixin:
                         next_consensus_bootstrapped_rids
                     )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
-                if tmbs[next_mb_id] is not None:
+                if tmbs[next_mb_id]:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
@@ -338,7 +338,7 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
+                if tmbs[next_mb_id]:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
@@ -800,6 +800,8 @@ class SchedulerPPMixin:
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
+        if not self._pp_pd_has_bootstrap_rids(bootstrapped_rids):
+            return None
         if bootstrapped_rids is not None:
             (
                 good_consensus_bootstrapped_rids,
@@ -815,6 +817,16 @@ class SchedulerPPMixin:
             self.waiting_queue.extend(good_reqs)
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
+
+    @staticmethod
+    def _pp_pd_has_bootstrap_rids(bootstrapped_rids) -> bool:
+        if (
+            not isinstance(bootstrapped_rids, (list, tuple))
+            or len(bootstrapped_rids) != 2
+        ):
+            return False
+        good_rids, bad_rids = bootstrapped_rids
+        return bool(good_rids or bad_rids)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
@@ -881,14 +893,14 @@ class SchedulerPPMixin:
         # 3 (Release): send the release rids from last stage to the first stage
         send_consensus_bootstrapped_work = []
         if self.pp_group.is_last_rank:
-            if bmbs[next_first_rank_mb_id] is not None:
+            if self._pp_pd_has_bootstrap_rids(bmbs[next_first_rank_mb_id]):
                 consensus_bootstrapped_rids = bootstrapped_rids
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
-            if consensus_bootstrapped_rids is not None:
+            if self._pp_pd_has_bootstrap_rids(consensus_bootstrapped_rids):
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
@@ -903,14 +915,14 @@ class SchedulerPPMixin:
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
-            if tmbs[next_first_rank_mb_id] is not None:
+            if tmbs[next_first_rank_mb_id]:
                 release_rids = transferred_rids
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
-            if release_rids is not None:
+            if release_rids:
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
