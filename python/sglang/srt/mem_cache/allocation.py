@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -412,6 +413,20 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    out_cache_loc_derived = gather_out_cache_loc_extend(
+        req_pool_indices_tensor=req_pool_indices_device,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        prefix_lens_tensor=prefix_lens_device,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_tensor=batch.seq_lens,
+        seq_lens_cpu=batch.seq_lens_cpu,
+        extend_lens_tensor=extend_lens_device,
+        extend_lens_cpu=extend_lens_cpu,
+        req_to_token_pool=batch.req_to_token_pool,
+    )
+    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        assert torch.equal(out_cache_loc_derived, out_cache_loc)
+
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
         maybe_write_dsv4_extend(
@@ -429,7 +444,7 @@ def alloc_for_extend(
         else:
             req.kv.kv_allocated_len = seq_len
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+    return out_cache_loc_derived, req_pool_indices_device, req_pool_indices_cpu
 
 
 def alloc_paged_token_slots_decode(
