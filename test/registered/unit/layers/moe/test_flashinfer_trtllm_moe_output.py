@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_routed_moe_wrapper,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
+    finalize_moe_output_copy_add,
     maybe_moe_output_copy_add,
     moe_output_copy_add_ctx,
 )
@@ -32,36 +33,36 @@ def test_moe_output_copy_add_folds_shared_output_on_alt_stream():
     alt_stream = torch.cuda.Stream()
 
     shape = (8, 128)
-    routed = torch.arange(shape[0] * shape[1], device="cuda", dtype=torch.float32)
-    routed = routed.reshape(shape).to(torch.bfloat16)
+    routed_source = torch.arange(
+        shape[0] * shape[1], device="cuda", dtype=torch.float32
+    )
+    routed_source = routed_source.reshape(shape).to(torch.bfloat16)
+    routed_output = torch.empty_like(routed_source)
     shared_source = torch.full(shape, 3.0, device="cuda", dtype=torch.bfloat16)
-    shared_output = torch.empty_like(routed)
-    out = torch.empty_like(routed)
+    shared_output = torch.empty_like(routed_source)
+    out = torch.empty_like(routed_source)
 
-    # Match the production dual-stream shape: routed MoE reads tensors that were
-    # ready before alt_stream starts, while shared experts are produced later on
-    # the current stream and guarded by a ready event.
+    # Match production command ordering: routed MoE is issued on the current
+    # stream before shared experts are issued on the alternate stream.
     alt_stream.wait_stream(current_stream)
-    shared_output.copy_(shared_source)
-    shared_ready_event = current_stream.record_event()
+    routed_output.copy_(routed_source)
 
-    with torch.cuda.stream(alt_stream), moe_output_copy_add_ctx(
-        shared_output, shared_ready_event
-    ) as state:
-        result = maybe_moe_output_copy_add(routed, out)
+    with moe_output_copy_add_ctx() as state:
+        result = maybe_moe_output_copy_add(routed_output, out)
         assert result is out
-        assert state is not None
-        assert state.consumed
+        assert not state.consumed
 
-    current_stream.wait_stream(alt_stream)
-    torch.testing.assert_close(out, routed + shared_source, rtol=0, atol=0)
-
-    fallback_out = torch.empty_like(routed)
     with torch.cuda.stream(alt_stream):
-        result = maybe_moe_output_copy_add(routed, fallback_out)
-        assert result is fallback_out
+        shared_output.copy_(shared_source)
+
     current_stream.wait_stream(alt_stream)
-    torch.testing.assert_close(fallback_out, routed, rtol=0, atol=0)
+    assert finalize_moe_output_copy_add(state, shared_output)
+    torch.testing.assert_close(out, routed_source + shared_source, rtol=0, atol=0)
+
+    fallback_out = torch.empty_like(routed_source)
+    result = maybe_moe_output_copy_add(routed_output, fallback_out)
+    assert result is fallback_out
+    torch.testing.assert_close(fallback_out, routed_source, rtol=0, atol=0)
 
 
 @requires_sm100

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextvars
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,74 +27,80 @@ if TYPE_CHECKING:
     )
 
 
-_moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
-    contextvars.ContextVar("moe_output_buf", default=None)
-)
-
-
 @dataclass
 class MoeOutputCopyAddState:
-    shared_output: torch.Tensor
-    ready_event: Optional[object]
+    routed_output: Optional[torch.Tensor] = None
+    output_buffer: Optional[torch.Tensor] = None
     consumed: bool = False
 
 
-_moe_output_copy_add_state: contextvars.ContextVar[Optional[MoeOutputCopyAddState]] = (
-    contextvars.ContextVar("moe_output_copy_add_state", default=None)
-)
+def moe_output_buffer_ctx(buf: torch.Tensor):
+    """Provide the MoE output buffer for the current forward scope."""
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().scoped(moe_output_buffer=buf)
 
 
 @contextmanager
-def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
-    token = _moe_output_buf.set(buf)
-    try:
-        yield
-    finally:
-        _moe_output_buf.reset(token)
+def moe_output_copy_add_ctx() -> Generator[MoeOutputCopyAddState, None, None]:
+    from sglang.srt.runtime_context import get_forward
 
-
-@contextmanager
-def moe_output_copy_add_ctx(
-    shared_output: torch.Tensor,
-    ready_event: Optional[torch.cuda.Event] = None,
-) -> Generator[MoeOutputCopyAddState, None, None]:
-    state = MoeOutputCopyAddState(
-        shared_output=shared_output,
-        ready_event=ready_event,
-    )
-    token = _moe_output_copy_add_state.set(state)
-    try:
+    state = MoeOutputCopyAddState()
+    with get_forward().scoped(moe_output_copy_add_state=state):
         yield state
-    finally:
-        _moe_output_copy_add_state.reset(token)
 
 
 def maybe_moe_output_copy_add(
     routed: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    state = _moe_output_copy_add_state.get()
+    from sglang.srt.runtime_context import get_forward
+
+    state = get_forward().moe_output_copy_add_state
     if (
         state is not None
-        and state.shared_output.shape == routed.shape
-        and state.shared_output.dtype == routed.dtype
-        and state.shared_output.device == routed.device
+        and state.routed_output is None
+        and state.output_buffer is None
         and out.shape == routed.shape
         and out.dtype == routed.dtype
         and out.device == routed.device
     ):
-        if state.ready_event is not None:
-            torch.cuda.current_stream().wait_event(state.ready_event)
-        # `out=` is the copy destination: this replaces `out.copy_(routed)`
-        # plus a later `routed += shared` with one TensorIterator add store.
-        torch.add(routed, state.shared_output, out=out)
-        state.consumed = True
+        # The shared branch is issued after routed MoE. Keep its destination
+        # alive but defer the copy until the shared result is available.
+        state.routed_output = routed
+        state.output_buffer = out
         return out
 
     if routed is out:
         return out
     out.copy_(routed)
     return out
+
+
+def finalize_moe_output_copy_add(
+    state: Optional[MoeOutputCopyAddState],
+    shared_output: torch.Tensor,
+) -> bool:
+    if state is None or state.routed_output is None or state.output_buffer is None:
+        return False
+    if state.consumed:
+        return True
+
+    routed = state.routed_output
+    out = state.output_buffer
+    if (
+        shared_output.shape == routed.shape
+        and shared_output.dtype == routed.dtype
+        and shared_output.device == routed.device
+    ):
+        # This replaces the deferred out.copy_(routed) and the later shared
+        # expert addition with one TensorIterator store.
+        torch.add(routed, shared_output, out=out)
+        state.consumed = True
+        return True
+
+    out.copy_(routed)
+    return False
 
 
 @dataclass

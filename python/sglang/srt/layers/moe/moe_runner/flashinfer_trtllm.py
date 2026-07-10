@@ -26,7 +26,6 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    _moe_output_buf,
     maybe_moe_output_copy_add,
     register_fused_func,
 )
@@ -112,6 +111,14 @@ else:
 _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
     tuple, dict[str, torch.Tensor]
 ] = {}
+
+
+def clear_mxfp8_shuffle_index_cache() -> None:
+    """Drop the cached MXFP8 MoE row-index permutations.
+    The cached index tensors are GPU-resident; sglang reuses the weights-region
+    memory across weight-update cycles
+    """
+    _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.clear()
 
 
 def _is_gated(layer: Module) -> bool:
@@ -999,7 +1006,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
-        _provided = _moe_output_buf.get()
+        from sglang.srt.runtime_context import get_forward
+
+        _provided = get_forward().moe_output_buffer
         _symm_required = is_allocation_symmetric()
         if (
             _provided is not None

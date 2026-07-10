@@ -423,9 +423,9 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
     chunk. Returns ``floor`` if server args are unavailable."""
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        sa = get_global_server_args()
+        sa = get_server_args()
 
         def g(name: str) -> int:
             v = getattr(sa, name, 0)
@@ -462,6 +462,29 @@ class MultimemAllGatherer:
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
+        if self._state is self._UNINIT:
+            # Lazy import avoids a module-load dependency on the distributed facade.
+            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+            from sglang.srt.runtime_context import get_server_args
+
+            tp_group = get_tp_group()
+            # Only probe node topology when the deployment can actually span
+            # nodes. Check world_size first so a TP=1 gatherer short-circuits
+            # before reading server args (which may be unpublished on offline
+            # paths). On a single node every TP rank is co-located, so skip the
+            # in_the_same_node_as() all-reduce, which can segfault under some
+            # EP/mooncake setups, and keep multimem enabled.
+            if (
+                tp_group.world_size > 1
+                and get_server_args().nnodes > 1
+                and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
+            ):
+                logger.warning(
+                    "multimem all-gather disabled because the TP group spans "
+                    "across nodes."
+                )
+                self._state = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state

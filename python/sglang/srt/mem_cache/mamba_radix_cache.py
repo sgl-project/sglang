@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -46,15 +45,20 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
+
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -409,7 +413,7 @@ class LRUList:
                 evictable_size == lru_list_evictable_size
             ), f"{self.mamba=}, total nodes: {total_nodes}, total lru: {total_lru}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
         except Exception as e:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 msg = f"Mamba Radix tree sanity check failed, ping @yizhang2077: {e}"
                 logger.error(msg)
                 tree_cache.pretty_print()
@@ -420,12 +424,18 @@ class LRUList:
 
 class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
-        assert isinstance(
-            params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
-        ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+        assert (
+            isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
+            or isinstance(
+                params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator
+            )
+            or isinstance(
+                params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            )
+        )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -694,8 +704,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             mamba_value_donated = self._alloc_mamba_slot()
+            # mamba_pool is a pure PHYSICAL store; translate both slot ids
+            # virtual->physical (identity for the non-unified memory pool) before the copy.
+            translate = self.req_to_token_pool.translate_mamba_indices
             self.req_to_token_pool.mamba_pool.copy_from(
-                req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
+                translate(req.mamba_pool_idx.unsqueeze(0)),
+                translate(mamba_value_donated),
             )
 
         result = self.insert(
