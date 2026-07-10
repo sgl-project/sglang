@@ -63,6 +63,11 @@ class EBSampling(DllmAlgorithm):
                 curr_logits = logits_output.full_logits[
                     curr_block_start:curr_block_end,
                 ]
+                # Never select or score the mask token itself: suppress it before
+                # both candidate selection and the entropy computation.
+                if 0 <= self.mask_id < curr_logits.shape[-1]:
+                    curr_logits = curr_logits.clone()
+                    curr_logits[..., self.mask_id] = torch.finfo(curr_logits.dtype).min
                 x = torch.argmax(curr_logits, dim=-1)
 
                 masked_positions = torch.nonzero(
@@ -77,16 +82,12 @@ class EBSampling(DllmAlgorithm):
                 sorted_positions = masked_positions[sort_index]
                 sorted_entropies = masked_entropies[sort_index]
 
-                reveal_count = 1
-                entropy_budget = 0.0
-                for entropy in sorted_entropies[:-1]:
-                    entropy_budget += float(entropy.item())
-                    if entropy_budget <= self.gamma:
-                        reveal_count += 1
-                    else:
-                        break
-
-                transfer_positions = sorted_positions[:reveal_count]
+                # Always reveal the lowest-entropy token, then extend the prefix
+                # while the running entropy budget stays within gamma.
+                reveal_mask = torch.zeros_like(sorted_entropies, dtype=torch.bool)
+                reveal_mask[0] = True
+                reveal_mask[1:] = torch.cumsum(sorted_entropies[:-1], dim=0) <= self.gamma
+                transfer_positions = sorted_positions[reveal_mask]
                 transfer_index = torch.zeros_like(block_mask_index)
                 transfer_index[transfer_positions] = True
 
