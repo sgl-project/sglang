@@ -19,7 +19,8 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 class _BlockingServing(OpenAIServingBase):
     def __init__(self, conversion_started, release_conversion):
         tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
-        tokenizer_manager.init_request_preprocessor()
+        if hasattr(tokenizer_manager, "init_request_preprocessor"):
+            tokenizer_manager.init_request_preprocessor()
         tokenizer_manager.request_logger = SimpleNamespace(
             log_requests=False, log_requests_level=0
         )
@@ -80,7 +81,11 @@ class TestServingBaseEventLoop(CustomTestCase):
         finally:
             release_conversion.set()
             watchdog.join(timeout=2)
-            serving.tokenizer_manager._request_preprocessor_executor.shutdown(wait=True)
+            executor = getattr(
+                serving.tokenizer_manager, "_request_preprocessor_executor", None
+            )
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         self.assertEqual(result, "ok")
         self.assertFalse(conversion_did_not_start.is_set())
