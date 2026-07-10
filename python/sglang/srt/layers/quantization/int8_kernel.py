@@ -20,7 +20,12 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = True
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_int8
+        try:
+            from sgl_kernel import sgl_per_token_group_quant_int8
+        except ImportError:
+            # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+            # diffusion runtime does not use these LLM kernels.
+            sgl_per_token_group_quant_int8 = None
 
         enable_sgl_per_token_group_quant_8bit = False
 

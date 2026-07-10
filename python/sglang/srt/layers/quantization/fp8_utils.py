@@ -157,7 +157,12 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    try:
+        from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    except ImportError:
+        # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+        # diffusion runtime does not use these LLM kernels.
+        fp8_blockwise_scaled_mm = fp8_scaled_mm = None
 
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
