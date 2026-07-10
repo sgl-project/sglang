@@ -499,6 +499,18 @@ class CompressorBackendMixin:
                 compressor=compressor,
                 layer_id=layer_id,
             )
+        elif token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
+            # trtllm-gen uniform-FP8 pool: the packed compress_norm_rope_store
+            # JIT epilogue does not apply; norm+rope then cast+scatter into
+            # the uniform pool. The indexer compressor keeps its own
+            # (blockwise-FP8) path above.
+            self._forward_compress_uniform_fp8(
+                token_to_kv_pool=token_to_kv_pool,
+                kv_score_input=kv_score_input,
+                state_pool=state_pool,
+                compressor=compressor,
+                layer_id=layer_id,
+            )
         else:
             out_loc = self._get_out_loc(compressor.ratio)
             use_fp4_indexer = (
@@ -661,6 +673,86 @@ class CompressorBackendMixin:
             else:
                 pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_to_store.bfloat16())
                 token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc_to_store, pack)
+
+    def _forward_compress_uniform_fp8(
+        self,
+        *,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        kv_score_input: torch.Tensor,
+        state_pool,
+        compressor: Compressor,
+        layer_id: int,
+    ) -> None:
+        """Core-compressor store for the uniform-FP8 (trtllm-gen) KV pool.
+
+        The compressor MATH is unchanged: ``compress_forward`` is the same JIT
+        kernel as the packed path. Only the epilogue differs — norm + RoPE via
+        the existing Triton kernel, then a plain all-512-dim e4m3 cast +
+        scatter (per-tensor scale 1.0) in the uniform pool setter, instead of
+        the packed ``compress_norm_rope_store`` JIT. Fusing the store is
+        deferred to the perf phase. Plan interpretation (decode boundary
+        zeroing, prefill ragged out_loc, RoPE positions) mirrors
+        ``_forward_unified_hip``.
+        """
+        from sglang.srt.layers.deepseek_v4_rope import fused_norm_rope_inplace_triton
+
+        compress_ratio = compressor.ratio
+        head_dim = compressor.head_dim
+        assert not compressor.is_in_indexer
+        assert head_dim == 512, f"unexpected core compressor {head_dim=}"
+        assert not _use_online_compress(compress_ratio), (
+            "SGLANG_OPT_USE_ONLINE_COMPRESS is not supported with the "
+            "uniform-FP8 trtllm-gen KV layout yet."
+        )
+
+        plan = self._get_paged_compress_metadata(compress_ratio)
+        out_loc = self._get_out_loc(compress_ratio)
+
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        kv_score_buffer = state_pool.kv_score_buffer.kv_score.view(
+            -1, compress_ratio, 2 * head_dim * coff
+        )
+
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape.view(-1, head_dim),
+            plan=plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            is_online=False,
+        )
+        if kv_compressed.shape[0] == 0:
+            return
+
+        plan_raw = plan[1].view(torch.int32)
+        if plan.is_decode:
+            # Zero non-boundary tokens so the store to the dummy slot (loc 0)
+            # cannot corrupt real cache entries with un-normed garbage.
+            seq_lens_plan = plan_raw[:, 0].to(torch.int32)
+            is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
+            kv_compressed = torch.where(
+                is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
+            )
+            out_loc_to_store = out_loc
+        else:
+            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+            out_loc_to_store = out_loc[ragged_ids.long()]
+
+        positions = _extract_positions_from_plan(plan, compress_ratio).clamp(min=0)
+
+        fused_norm_rope_inplace_triton(
+            kv_compressed,
+            compressor.norm.weight,
+            compressor.norm.variance_epsilon,
+            compressor.freqs_cis,
+            positions=positions,
+        )
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc_to_store,
+            cache_k=kv_compressed,
+        )
 
     # NOTE: alias for backward compatibility
     forward_indexer_compressor = forward_unified

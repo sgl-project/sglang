@@ -41,6 +41,37 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         "bfloat16",
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
+    dsv4_decode_backend = envs.SGLANG_DSV4_ATTN_DECODE_BACKEND.get()
+    if dsv4_decode_backend not in ("auto", "flashmla", "trtllm_gen"):
+        raise ValueError(
+            f"Invalid SGLANG_DSV4_ATTN_DECODE_BACKEND={dsv4_decode_backend!r}; "
+            "expected 'auto', 'flashmla', or 'trtllm_gen'."
+        )
+    if dsv4_decode_backend == "trtllm_gen":
+        # Opt-in SM100 trtllm-gen decode + sparse varlen prefill on a uniform
+        # 512-dim FP8 KV cache. kv_cache_dtype stays fp8_e4m3; only the
+        # in-pool layout changes.
+        assert (
+            server_args.device == "cuda"
+        ), "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen is CUDA (SM100) only."
+        assert server_args.kv_cache_dtype == "fp8_e4m3", (
+            "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen requires "
+            f"kv_cache_dtype=fp8_e4m3, got {server_args.kv_cache_dtype}."
+        )
+        assert server_args.speculative_algorithm is None, (
+            "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen does not support "
+            "speculative decoding (MTP) yet."
+        )
+        assert not server_args.enable_hisparse, (
+            "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen does not support "
+            "enable_hisparse (the hisparse c4 pool uses the packed layout)."
+        )
+        logger.info(
+            "DeepSeek V4 attention (decode + sparse prefill): trtllm-gen "
+            "uniform-FP8 path enabled "
+            "(SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen)."
+        )
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
         logger.warning(
