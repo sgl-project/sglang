@@ -1,0 +1,14 @@
+---
+title: Release Lookup
+description: Find which SGLang release first included a specific PR or commit.
+---
+
+Find which SGLang release first included a specific PR or commit. The lookup runs
+entirely in your browser against a static index generated from the git history.
+
+import { ReleaseLookup } from '/src/snippets/release-lookup.jsx'
+
+<ReleaseLookup />
+
+Enter a PR number (e.g. `1425`), a PR URL, or a commit hash (7–40 hex characters).
+Results link to the matching GitHub release tag.
