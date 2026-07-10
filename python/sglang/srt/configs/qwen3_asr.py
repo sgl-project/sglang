@@ -164,5 +164,18 @@ class Qwen3ASRConfig(PretrainedConfig):
         return self.thinker_config.text_config
 
 
-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+# transformers >= 5.13 ships native Qwen3-ASR support and registers these
+# model types itself at import time. AutoConfig.register() refuses duplicates, so
+# calling it again would raise "already used" and crash config import for EVERY
+# model. Make registration best-effort: register when the name is free (older
+# transformers), and defer to the native config when it's already taken.
+for _name, _cls in (
+    ("qwen3_asr", Qwen3ASRConfig),
+    ("qwen3_asr_thinker", Qwen3ASRThinkerConfig),
+):
+    try:
+        AutoConfig.register(_name, _cls)
+    except ValueError as e:
+        err = str(e).lower()
+        if "already registered" not in err and "already used" not in err:
+            logger.warning("Failed to register config %s: %s", _name, e)
