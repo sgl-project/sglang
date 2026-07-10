@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_xpu, print_warning_once
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -79,17 +79,24 @@ def timestep_embedding(
 ) -> torch.Tensor:
     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         t = t.to(dtype)
-    
+
     # XPU path - delegate to sgl_kernel.jit with fallback
     if is_xpu() and t.device.type == "xpu":
         if _HAS_SGL_KERNEL_JIT:
             try:
                 return _xpu_timestep_embedding(
-                    t, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period, dtype
+                    t,
+                    dim,
+                    flip_sin_to_cos,
+                    downscale_freq_shift,
+                    scale,
+                    max_period,
+                    dtype,
                 )
             except (ValueError, RuntimeError) as e:
-                logger.warning(
-                    f"XPU JIT kernel failed ({e}), falling back to native implementation"
+                print_warning_once(
+                    f"XPU JIT timestep_embedding kernel failed ({e}), "
+                    "falling back to native implementation"
                 )
         else:
             logger.debug("sgl-kernel-xpu not installed, using native implementation")

@@ -25,10 +25,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
-from sglang.kernels.ops.layernorm.norm import (
-    can_use_fused_inplace_qknorm,
-    fused_inplace_qknorm,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
@@ -43,6 +39,18 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
+
+# Guard the JIT QK-norm import: sglang.kernels.ops.layernorm.norm pulls in
+# JIT/compiler dependencies that may be unavailable on some backends.
+try:
+    from sglang.kernels.ops.layernorm.norm import (
+        can_use_fused_inplace_qknorm,
+        fused_inplace_qknorm,
+    )
+
+    _HAS_JIT_QKNORM = True
+except ImportError:
+    _HAS_JIT_QKNORM = False
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -491,6 +499,7 @@ def apply_qk_norm(
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         and get_server_args().cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
+        and _HAS_JIT_QKNORM
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -737,4 +746,7 @@ def fused_qk_gemma_rmsnorm_with_gate(
 
 
 # Register the inplace op
-fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
+if _HAS_JIT_QKNORM:
+    fused_inplace_qknorm = register_custom_op(
+        fused_inplace_qknorm, mutates_args=["q", "k"]
+    )

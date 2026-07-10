@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_xpu, print_warning_once
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -172,22 +172,22 @@ def rmsnorm(
                 _xpu_rmsnorm(input, weight, out, eps)
                 return
             except (ValueError, RuntimeError) as e:
-                logger.warning(
-                    f"XPU JIT kernel failed ({e}), falling back to native implementation"
+                print_warning_once(
+                    f"XPU JIT rmsnorm kernel failed ({e}), "
+                    "falling back to native implementation"
                 )
                 # Fall through to generic implementation below
         else:
             logger.debug("sgl-kernel-xpu not installed, using native implementation")
-        
+
         # Generic PyTorch fallback for XPU
-        orig_dtype = input.dtype
         x = input.float()
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + eps)
-        x = (x * weight.float()).to(orig_dtype)
-        out.copy_(x)
+        x = x * weight.float()  # keep in fp32
+        out.copy_(x)  # single round, to the output dtype
         return
-    
+
     # CUDA path with hidden size validation
     if not _is_supported_rmsnorm_hidden_size(hidden_size):
         raise RuntimeError(

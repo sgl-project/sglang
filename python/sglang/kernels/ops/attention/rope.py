@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_xpu, print_warning_once
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -24,6 +24,7 @@ try:
         apply_rope_inplace as _xpu_apply_rope_inplace,
         apply_rope_inplace_with_kvcache as _xpu_apply_rope_inplace_with_kvcache,
     )
+
     _HAS_SGL_KERNEL_JIT = True
 except ImportError:
     _HAS_SGL_KERNEL_JIT = False
@@ -200,8 +201,9 @@ def apply_rope_inplace(
                 )
                 return
             except (ValueError, RuntimeError) as e:
-                logger.warning(
-                    f"XPU JIT kernel failed ({e}), falling back to native implementation"
+                print_warning_once(
+                    f"XPU JIT rope kernel failed ({e}), "
+                    "falling back to native implementation"
                 )
         else:
             logger.debug("sgl-kernel-xpu not installed, using native implementation")
@@ -254,13 +256,22 @@ def apply_rope_inplace_with_kvcache(
         if _HAS_SGL_KERNEL_JIT:
             try:
                 _xpu_apply_rope_inplace_with_kvcache(
-                    q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc,
-                    is_neox=is_neox, rope_dim=rope_dim
+                    q,
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    cos_sin_cache,
+                    positions,
+                    out_loc,
+                    is_neox=is_neox,
+                    rope_dim=rope_dim,
                 )
                 return
             except (ValueError, RuntimeError) as e:
-                logger.warning(
-                    f"XPU JIT kernel failed ({e}), falling back to native implementation"
+                print_warning_once(
+                    f"XPU JIT rope+kvcache kernel failed ({e}), "
+                    "falling back to native implementation"
                 )
         else:
             logger.debug("sgl-kernel-xpu not installed, using native implementation")

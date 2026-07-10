@@ -183,18 +183,15 @@ def test_rope(
     )
     cos_sin_cache = create_cos_sin_cache(rope_dim)
 
+    q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
-    q_ref, k_ref = q.clone(), k.clone()
 
+    reference_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
     sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
-    if DEVICE == "xpu":
-        torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-    else:
-        flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-    triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
