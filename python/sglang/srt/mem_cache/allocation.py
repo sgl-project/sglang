@@ -250,6 +250,38 @@ def _compute_dsv4_state_lens(batch, *, is_decode: bool):
     )
 
 
+def assert_alloc_extend_lens_page_aligned(
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_num_tokens: int,
+    page_size: int,
+) -> None:
+    """Guardrail for the op2 request-side alignment: every alloc_extend request
+    must have page-aligned lens. Host-only (CPU mirrors / host ints, no sync).
+    Skipped for DSV4-NPU (real-lens requests by design). Under DCP the
+    allocator page is page_size * dcp_size while radix matches align fresh
+    prefixes only to the tree (server) page, so the check downgrades to
+    tree-page granularity there.
+    """
+    if _is_npu or page_size == 1:
+        return
+
+    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
+        page_size = get_server_args().page_size
+        if page_size == 1:
+            return
+
+    assert bool(
+        torch.all(prefix_lens_cpu % page_size == 0)
+    ), f"alloc_extend prefix lens must be page-aligned: {prefix_lens_cpu=}, {page_size=}"
+    assert bool(
+        torch.all(seq_lens_cpu % page_size == 0)
+    ), f"alloc_extend seq lens must be page-aligned: {seq_lens_cpu=}, {page_size=}"
+    assert (
+        extend_num_tokens % page_size == 0
+    ), f"alloc_extend token count must be page-aligned: {extend_num_tokens=}, {page_size=}"
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -265,6 +297,12 @@ def alloc_paged_token_slots_extend(
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
+    assert_alloc_extend_lens_page_aligned(
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+        extend_num_tokens=extend_num_tokens,
+        page_size=allocator.page_size,
+    )
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 

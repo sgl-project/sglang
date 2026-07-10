@@ -64,6 +64,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import assert_alloc_extend_lens_page_aligned
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1477,6 +1478,12 @@ def alloc_for_decode_prealloc_hisparse(
     else:
         req.kv.kv_allocated_len = alloc_fill_len
     device = allocator.device
+    assert_alloc_extend_lens_page_aligned(
+        prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
+        extend_num_tokens=alloc_fill_len,
+        page_size=allocator.page_size,
+    )
     kv_loc = allocator.alloc_logical_only(
         prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
         prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
@@ -1533,6 +1540,12 @@ def alloc_for_decode_prealloc(
             )
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
+            assert_alloc_extend_lens_page_aligned(
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
+                extend_num_tokens=alloc_fill_len - total_prefix_len,
+                page_size=allocator.page_size,
+            )
             kv_loc = allocator.alloc_extend(
                 prefix_lens=torch.tensor(
                     [total_prefix_len], dtype=torch.int64, device=device
