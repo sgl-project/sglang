@@ -696,6 +696,16 @@ class SchedulerDisaggregationPrefillMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        self._prepare_dspark_hidden_capture_for_batch(batch)
+
+        if batch:
+            set_schedule_time_batch(batch)
+
+        return batch
+
+    def _prepare_dspark_hidden_capture_for_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> None:
         dspark_capture_layers = None
         if batch:
             for req in batch.reqs:
@@ -709,11 +719,6 @@ class SchedulerDisaggregationPrefillMixin:
         _set_dspark_hidden_capture_layers(
             self.tp_worker.model_runner, dspark_capture_layers
         )
-
-        if batch:
-            set_schedule_time_batch(batch)
-
-        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
