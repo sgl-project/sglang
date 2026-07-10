@@ -401,6 +401,13 @@ class Scheduler(
         # Init JoyFuture scheduler observability (latency tracking)
         self.latency_tracker = RequestLatencyTracker(
             enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
+            on_phase_complete=(
+                lambda stage, elapsed: self.metrics_collector.observe_per_stage_req_latency(
+                    stage, elapsed
+                )
+                if self.metrics_collector is not None
+                else None
+            ),
         )
 
         # Init inter-process communication

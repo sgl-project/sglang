@@ -125,10 +125,11 @@ class RequestLatencyTracker:
             logger.info(f"Request {record.rid} completed in {record.total_elapsed_ms:.1f}ms")
     """
 
-    def __init__(self, enabled: bool = False):
+    def __init__(self, enabled: bool = False, on_phase_complete=None):
         self.enabled = enabled
         self._records: Dict[str, RequestLatencyRecord] = {}
         self._completed: List[RequestLatencyRecord] = []
+        self._on_phase_complete = on_phase_complete
 
     def start_request(self, req) -> Optional[RequestLatencyRecord]:
         """Start tracking a new request. Returns the latency record, or None if disabled."""
@@ -154,6 +155,10 @@ class RequestLatencyTracker:
         record = self._records.get(rid)
         if record:
             record.end_phase(phase, num_tokens)
+            # Emit to metrics backend if a callback is registered
+            if self._on_phase_complete and phase in record.phases:
+                elapsed = record.phases[phase].elapsed_ms / 1000.0
+                self._on_phase_complete(phase, elapsed)
 
     def record_retraction(self, rid: str) -> None:
         """Record that a request was retracted."""
