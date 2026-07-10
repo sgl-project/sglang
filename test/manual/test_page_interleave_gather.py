@@ -111,13 +111,13 @@ def _check(rank, name, got, expect, atol=0.0):
 def _run_mla(rank, world, port):
     _dist_init(rank, world, port, attn_cp_size=1)
 
-    from sglang.srt.layers.dp_attention import get_attention_tp_group
     from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
     from sglang.srt.mem_cache.page_interleave_pool import (
         PageInterleaveMLATokenToKVPool,
     )
+    from sglang.srt.runtime_context import get_parallel
 
-    group = get_attention_tp_group()
+    group = get_parallel().attn_tp_group
     assert group.world_size == world
     # Topology-first shard-group selection: no CP here, so MLA falls back to
     # the attn-TP axis, while GQA has no replicated axis (world_size 1).
@@ -226,13 +226,13 @@ def _run_mla(rank, world, port):
 def _run_mha(rank, world, port):
     _dist_init(rank, world, port, attn_cp_size=world)
 
-    from sglang.srt.layers.dp_attention import get_attention_cp_group
     from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
     from sglang.srt.mem_cache.page_interleave_pool import (
         PageInterleaveMHATokenToKVPool,
     )
+    from sglang.srt.runtime_context import get_parallel
 
-    group = get_attention_cp_group()
+    group = get_parallel().attn_cp_group
     assert group.world_size == world
     # Topology-first shard-group selection: with an active CP group, both
     # GQA and MLA shard across CP (CP replicates KV for every attention

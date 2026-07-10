@@ -8,6 +8,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -117,12 +118,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self._need_mamba_verify_commit = (
-            self.model_runner.mambaish_config is not None
-            and hasattr(
-                self.model_runner.attn_backend, "update_mamba_state_after_mtp_verify"
-            )
-        )
+        self._need_mamba_verify_commit = False
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -285,9 +281,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        self._need_mamba_verify_commit = (
+            self.model_runner.mambaish_config is not None
+            and hasattr(
+                self.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+        )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        capture_decode_cuda_graph = (
+            self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+        )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:

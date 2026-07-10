@@ -90,10 +90,8 @@ def maybe_register_hicache_draft(
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
-    from sglang.srt.mem_cache.memory_pool_host import (
-        MLATokenToKVPoolHost,
-        get_mha_host_pool_cls,
-    )
+    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):

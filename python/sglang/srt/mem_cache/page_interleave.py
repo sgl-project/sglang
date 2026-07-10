@@ -110,16 +110,13 @@ def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
       the returned trivial CP group has world_size 1, which disables
       sharding in get_kv_shard_group_info.
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_group,
-        get_attention_tp_group,
-    )
+    from sglang.srt.runtime_context import get_parallel
 
-    cp_group = get_attention_cp_group()
+    cp_group = get_parallel().attn_cp_group
     if cp_group.world_size > 1:
         return cp_group
     if use_mla_backend:
-        return get_attention_tp_group()
+        return get_parallel().attn_tp_group
     return cp_group
 
 
@@ -144,7 +141,7 @@ def compute_page_shard_scratch_bytes(model_runner: ModelRunner) -> int:
     if shard_rank is None:
         return 0
 
-    from sglang.srt.layers.dp_attention import get_attention_tp_size
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.utils.common import ceil_align
 
     model_config = model_runner.model_config
@@ -161,7 +158,7 @@ def compute_page_shard_scratch_bytes(model_runner: ModelRunner) -> int:
         ) * kv_size
     else:
         row_bytes = (
-            model_config.get_num_kv_heads(get_attention_tp_size())
+            model_config.get_num_kv_heads(get_parallel().attn_tp_size)
             * (model_config.head_dim + model_config.v_head_dim)
             * kv_size
         )
