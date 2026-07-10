@@ -1,21 +1,19 @@
-"""SWA-path coverage for the decode-side radix cache (unified radix tree).
+"""SWA coverage for decode-side radix cache on gpt-oss-20b.
 
-gpt-oss-20b is a hybrid SWA model: full-attention layers reuse the decode radix
-prefix while the sliding-window state is transferred fresh per turn. SWA +
-decode-side radix cache is supported only via the unified radix tree, so the
-servers launch with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (see extra_*_env below);
-without it the decode server rejects the combination.
-
-Reuses the registered decode-radix mixin (multi-turn cache-hit + 2-pass gsm8k).
-gpt-oss-20b is cached on the 8-gpu-h20 CI runners (resolved via
-try_cached_model in the mixin), so this runs in CI alongside the non-SWA
-decode-radix coverage.
+The decode worker reuses full-attention prefix KV while transferring the SWA
+window fresh per request. This path requires the unified radix tree and validates
+both multi-turn cache hits and two-pass GSM8K accuracy.
 """
 
+import os
+import shutil
+import tempfile
+import time
 import unittest
 
 from test_disaggregation_decode_radix_cache import (
     DisaggregationDecodeRadixCacheTestMixin,
+    _has_mooncake,
     _has_nixl,
 )
 
@@ -39,9 +37,8 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
 ):
     transfer_backend_name = "nixl"
     model_name = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
-    # mxfp4 gpt-oss with the 512-token eval cap truncates reasoning, so absolute
-    # gsm8k accuracy is low (~0.55), hence the lower min score. The second gsm8k
-    # pass hits the decode radix cache (the reuse correctness check).
+    # The 512-token eval cap truncates mxfp4 gpt-oss reasoning, so use a lower
+    # absolute floor while checking that the cached second pass does not regress.
     gsm8k_min_score = 0.45
     # SWA + decode-side radix cache is gated to the unified radix tree.
     extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
@@ -51,6 +48,149 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
         "--disaggregation-decode-enable-radix-cache",
         *SWA_SERVER_ARGS,
     ]
+
+
+@unittest.skipUnless(
+    is_in_ci() or _has_mooncake(),
+    "Mooncake is required for HiCache storage SWA disaggregation coverage.",
+)
+class TestDisaggregationDecodeRadixSWAHiCacheFileBackend(PDDisaggregationServerBase):
+    """SWA + HiCache file backend coverage.
+
+    Inherits HiCache server args from the non-SWA HiCache test class and adds
+    SWA-specific configuration: unified radix tree env, triton attention backend,
+    and page size 64.
+    """
+
+    extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
+    extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
+    extra_prefill_args = [
+        "--enable-hierarchical-cache",
+        "--hicache-ratio",
+        "1.2",
+        "--hicache-write-policy",
+        "write_through",
+        "--hicache-storage-backend",
+        "file",
+        "--hicache-storage-prefetch-policy",
+        "wait_complete",
+        "--hicache-io-backend",
+        "kernel",
+        "--hicache-mem-layout",
+        "page_first",
+        "--page-size",
+        "64",
+        "--attention-backend",
+        "triton",
+    ]
+    extra_decode_args = [
+        "--disaggregation-decode-enable-radix-cache",
+        *extra_prefill_args,
+    ]
+    transfer_backend_name = "mooncake"
+    model_name = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hicache_dir = tempfile.mkdtemp(prefix="sglang-hicache-swa-")
+        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
+
+        from test_disaggregation_decode_radix_cache import try_cached_model
+
+        super().setUpClass()
+        cls.model = try_cached_model(cls.model_name)
+        cls.transfer_backend = [
+            "--disaggregation-transfer-backend",
+            cls.transfer_backend_name,
+        ]
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
+        shutil.rmtree(cls.hicache_dir, ignore_errors=True)
+
+    def _post_ok(self, url):
+        import requests
+
+        response = requests.post(url, timeout=60)
+        response.raise_for_status()
+
+    def _flush_memory_cache(self):
+        self._post_ok(f"{self.prefill_url}/flush_cache?timeout=30")
+        self._post_ok(f"{self.decode_url}/flush_cache?timeout=30")
+
+    def _generate(self, input_ids, output_len):
+        import asyncio
+
+        from sglang.test.test_utils import (
+            async_request_sglang_generate,
+            gen_payload,
+        )
+
+        output = asyncio.run(
+            async_request_sglang_generate(
+                gen_payload(input_ids, output_len),
+                f"{self.base_url}/generate",
+            )
+        )
+        self.assertTrue(output.success, output.error)
+        return output
+
+    def _sample_token_ids(self, input_len, output_len, num_prompts=1):
+        from sglang.benchmark.datasets.random import sample_random_requests
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(self.model)
+        return [
+            list(request.prompt)
+            for request in sample_random_requests(
+                input_len=input_len,
+                output_len=output_len,
+                num_prompts=num_prompts,
+                range_ratio=1.0,
+                tokenizer=tokenizer,
+                dataset_path="",
+                return_text=False,
+            )
+        ]
+
+    def test_decode_hicache_file_backend_restores_swa_prefix_after_flush(self):
+        self._post_ok(f"{self.decode_url}/hicache/storage-backend/clear")
+        self._flush_memory_cache()
+
+        output_len = 32
+        history = self._sample_token_ids(
+            input_len=192, output_len=output_len, num_prompts=1
+        )[0]
+        suffixes = self._sample_token_ids(
+            input_len=32, output_len=output_len, num_prompts=3
+        )
+
+        cold = self._generate(history, output_len)
+        self.assertEqual(cold.cached_tokens, 0)
+
+        history.extend(cold.output_ids)
+        history.extend(suffixes[0])
+        primed = self._generate(history, output_len)
+        self.assertGreaterEqual(primed.cached_tokens, 64)
+
+        history.extend(primed.output_ids)
+        history.extend(suffixes[1])
+        time.sleep(1)
+        self._flush_memory_cache()
+
+        restored = self._generate(history, output_len)
+        self.assertGreaterEqual(restored.cached_tokens, 64)
+
+        history.extend(restored.output_ids)
+        history.extend(suffixes[2])
+        time.sleep(1)
+        self._flush_memory_cache()
+
+        restored_again = self._generate(history, output_len)
+        self.assertGreaterEqual(restored_again.cached_tokens, 64)
 
 
 if __name__ == "__main__":

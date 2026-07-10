@@ -142,7 +142,12 @@ def flash_attn_with_kvcache(
     # When only_qv=True the caller may pass k_cache=None (synthetic K is
     # allocated inside the sgl-kernel wrapper). Skip the stride check in that
     # case so the rope=0 path doesn't trip the assertion.
-    if k_cache is not None:
+    if k_cache is None:
+        assert only_qv, (
+            "k_cache=None is only valid when only_qv=True "
+            "(sgl-kernel allocates synthetic K for the QK-rope-dim=0 path)."
+        )
+    else:
         assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
@@ -217,6 +222,11 @@ def flash_attn_varlen_func(
     if not _is_fa3_supported():
         # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
         # (e.g. ROCm, or CUDA < sm90)
+        if only_qv:
+            raise NotImplementedError(
+                "only_qv=True requires sgl-kernel FA3 (sm90+). "
+                "The flash_attn (FA2) fallback path does not support the qv option."
+            )
         if cu_seqlens_q is not None:
             from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
 

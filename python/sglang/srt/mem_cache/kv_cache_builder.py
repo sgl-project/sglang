@@ -114,6 +114,7 @@ def maybe_register_hicache_draft(
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
     )
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = MHATokenToKVPoolHost(pool, **kw)

@@ -260,6 +260,7 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    hicache_restored_lock_params: Any = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -438,8 +439,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.last_node = self.tree_cache.root_node
         req.swa_uuid_for_lock = None
 
-    # SWA caches make the flat size accessors raise and expose full-pool sizes
-    # via full_*() instead; pick the full-pool view for SWA, flat otherwise.
+    # SWA caches expose full-attention accounting through full_* accessors.
     def _radix_full_evictable(self) -> int:
         if self.scheduler.tp_worker.is_hybrid_swa:
             return self.tree_cache.full_evictable_size()
@@ -633,12 +633,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 cow_mamba=self.tree_cache.supports_mamba(),
                 include_req=True,
             )
-        # Always lock to match aggregated scheduling behavior. SWA locks only
-        # span the sliding window and return a boundary uuid; store it so the
-        # matching dec_lock_ref stops there instead of underflowing toward root.
+        # Keep aggregated scheduling semantics while preserving the SWA lock
+        # boundary needed for the matching dec_lock_ref.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
-        return self._build_decode_prefix_match(req, result)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        prefix_match.lock_params = lock_result.to_dec_params()
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -985,6 +986,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
+            fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
             prefix_match: Optional[DecodePrefixMatch] = None
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
@@ -1006,18 +1008,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     prefix_indices = prefix_indices[:prefix_len]
                     total_prefix_len = min(total_prefix_len, prefix_len)
 
-                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
-
                 # Cap full-attention prefix reuse at the sliding-window start so
                 # the SWA window lands entirely in the fresh delta, keeping
-                # alloc_extend_swa_tail's tail->full mapping in range. Costs reuse
-                # of only the last ~window_size full-attention tokens.
-                if uses_swa_tail_prealloc and prefix_len > 0:
+                # alloc_extend_swa_tail's tail->full mapping in range. This must
+                # apply to the full prefix promised to prefill, including HiCache
+                # L2/L3 hits; otherwise the fresh delta can be shorter than the
+                # live SWA tail.
+                if uses_swa_tail_prealloc and total_prefix_len > 0:
                     swa_prefix_cap = fill_len - self._swa_tail_len(fill_len)
-                    if prefix_len > swa_prefix_cap:
-                        prefix_len = swa_prefix_cap
+                    if total_prefix_len > swa_prefix_cap:
+                        prefix_len = min(prefix_len, swa_prefix_cap)
                         prefix_indices = prefix_indices[:prefix_len]
-                        total_prefix_len = min(total_prefix_len, prefix_len)
+                        prefix_match.prefix_indices = prefix_indices
+                        remaining_prefix_len = swa_prefix_cap - prefix_len
+                        prefix_match.l2_host_hit_length = min(
+                            prefix_match.l2_host_hit_length, remaining_prefix_len
+                        )
+                        remaining_prefix_len -= prefix_match.l2_host_hit_length
+                        prefix_match.l3_storage_hit_length = min(
+                            prefix_match.l3_storage_hit_length, remaining_prefix_len
+                        )
+                        if prefix_match.l3_storage_hit_length == 0:
+                            prefix_match.last_host_node = None
+                            prefix_match.prefetch_registered = False
+                        # Cap the prefill-committed prefix too: tokens past the
+                        # cap are neither device-resident nor HiCache-restored,
+                        # so prefill must transfer them.
+                        total_prefix_len = prefix_match.decode_prefix_len
 
                 dsv4_safe_prefix_len = self._dsv4_safe_prefix_len(prefix_len)
                 if dsv4_safe_prefix_len < prefix_len:
@@ -1039,7 +1056,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self._release_decode_radix_match(decode_req.req)
 
                 required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
+                    fill_len=fill_len, prefix_len=total_prefix_len
                 )
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
@@ -1099,6 +1116,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self._release_decode_radix_match(decode_req.req)
                     break
 
+            if uses_swa_tail_prealloc:
+                # Make the SWA live-window boundary available before storage
+                # prefetch so FULL-only prefixes before the window do not request
+                # unnecessary SWA storage.
+                decode_req.req.swa_evicted_seqlen = max(
+                    decode_req.req.swa_evicted_seqlen,
+                    fill_len - self._swa_tail_len(fill_len),
+                )
+            if self.scheduler.enable_decode_hicache:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    total_prefix_len = prefix_match.decode_prefix_len
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1106,8 +1136,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1472,7 +1500,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # instead of re-allocating from scratch. See resume_retracted_reqs.
         delta_len = fill_len - total_prefix_len
         required_alloc_tokens = self._required_alloc_tokens(
-            fill_len=fill_len, prefix_len=prefix_len
+            fill_len=fill_len, prefix_len=total_prefix_len
         )
 
         # Evict cached entries if the pool doesn't have enough free pages.
@@ -1531,24 +1559,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
             if self._uses_swa_tail_prealloc():
-                # Full-attention layers extend from the (reused) prefix; SWA
-                # layers allocate only the window tail.
+                # Full-attention layers reuse prefix KV; SWA layers allocate
+                # only the live window tail.
                 swa_tail_len = self._swa_tail_len(fill_len)
-                # Tokens before the window have no SWA slot, so mark them
-                # SWA-evicted: cache_(un)finished_req inserts them as tombstones
-                # instead of phantom swa_evictable tokens (else the SWA pool
-                # leaks). window_start (fill_len - swa_tail_len) is page-aligned.
+                # Prefix tokens outside the SWA window have no SWA slot. Mark
+                # them evicted so cache insertion creates tombstones instead of
+                # counting phantom SWA tokens.
                 req.swa_evicted_seqlen = max(
                     req.swa_evicted_seqlen, fill_len - swa_tail_len
                 )
+                full_alloc_prefix_len = total_prefix_len
+                full_last_loc = last_loc
+                if full_alloc_prefix_len != prefix_len:
+                    assert (
+                        full_alloc_prefix_len
+                        % self.token_to_kv_pool_allocator.page_size
+                        == 0
+                    )
+                    full_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
                     prefix_lens=torch.tensor(
-                        [prefix_len], dtype=torch.int64, device=device
+                        [full_alloc_prefix_len], dtype=torch.int64, device=device
                     ),
-                    prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                    prefix_lens_cpu=torch.tensor(
+                        [full_alloc_prefix_len], dtype=torch.int64
+                    ),
                     seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
+                    last_loc=full_last_loc,
                     extend_num_tokens=delta_len,
                     swa_tail_len=swa_tail_len,
                 )

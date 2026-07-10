@@ -28,12 +28,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -65,9 +67,6 @@ from sglang.srt.session.streaming_session import StreamingSession
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        PrefetchOperation,
-    )
     from sglang.srt.server_args import ServerArgs
 
 
@@ -431,6 +430,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_loaded_nodes_by_reqid: dict[str, UnifiedTreeNode] = {}
         self.ongoing_prefetch: dict[
             str,
             tuple[
@@ -780,12 +780,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # return_full_match: repoint by full full-attention residency, not the
-        # SWA-window-safe match. A reused decode-worker prefix can be fully
-        # full-resident but SWA-tombstoned (window slid out + page-aligned key
-        # clips the live remnant below W), collapsing the window-safe match to 0
-        # while the cards to repoint number in the hundreds — which would trip the
-        # assert below. inc_lock_ref's SWA walk already stops at the tombstone.
+        # Repoint by full-attention residency, not the SWA-window-safe match.
+        # A reused prefix can remain full-resident after its SWA window is
+        # tombstoned, so the window-safe match may be shorter than the KV
+        # indices that must be preserved.
         match_result = self.match_prefix(
             MatchPrefixParams(key=radix_key, return_full_match=True)
         )
@@ -846,9 +844,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
-        # Deepest device-resident matched node (owns value[-1]), NOT gated by the
-        # per-component validators, so it reflects full full-attention residency
-        # even when SWA is tombstoned. Used by return_full_match.
+        # Deepest device-resident full-attention node. Component validators can
+        # cap the normal match earlier when SWA is tombstoned.
         full_last_device_node = node
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
@@ -949,12 +946,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         if params.return_full_match:
-            # Decode-side dedup/repoint: return the full device-resident match and
-            # the deepest device node, not the SWA-window-safe truncation. On a
-            # reused, tombstoned prefix the full residency exceeds the validator-
-            # capped best_match_device_value_len; sizing the repoint by the latter
-            # would dangle cards. The window-safe length still drives
-            # finalize_match_result below, which this must not perturb.
+            # Decode-side repointing needs all full-attention KV indices. Keep
+            # the window-safe length for component finalization below.
             device_indices = (
                 torch.cat(value) if value else self._empty_match_result.device_indices
             )
@@ -1759,6 +1752,102 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return transfers
 
+    def _build_storage_hit_query_transfers(
+        self, prefetch_tokens: int
+    ) -> list[PoolTransfer]:
+        transfers: list[PoolTransfer] = []
+        source_transfers: dict[PoolName, PoolTransfer] = {}
+        prefetch_pages = prefetch_tokens // self.page_size
+
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+
+            if comp.component_type == ComponentType.SWA:
+                window_pages = (
+                    getattr(comp, "sliding_window_size", 0) + self.page_size - 1
+                ) // self.page_size
+                if window_pages == 0 or prefetch_pages < window_pages:
+                    continue
+                transfer = PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["__placeholder__"] * window_pages,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            elif comp.component_type == ComponentType.MAMBA:
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__placeholder__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            else:
+                continue
+
+            transfers.append(transfer)
+            source_transfers[transfer.name] = transfer
+
+        for spec in self.sidecar_pool_specs:
+            keys = None
+            if spec.indices_from_pool != PoolName.KV:
+                source_transfer = source_transfers.get(spec.indices_from_pool)
+                if source_transfer is None:
+                    continue
+                keys = source_transfer.keys
+            transfers.append(
+                PoolTransfer(
+                    name=spec.pool_name,
+                    keys=keys,
+                    hit_policy=spec.hit_policy,
+                    indices_from_pool=spec.indices_from_pool,
+                )
+            )
+
+        return transfers
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: UnifiedTreeNode,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+        full_only: bool = False,
+    ) -> int:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys=prefix_keys,
+            pool_transfers=(
+                None
+                if full_only
+                else self._build_storage_hit_query_transfers(len(prefetch_key))
+            ),
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        return storage_hit_count - (storage_hit_count % self.page_size)
+
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
         if node.evicted or chunked:
@@ -1829,6 +1918,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        full_only: bool = False,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1868,21 +1958,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         alloc_failed = False
-        for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            transfers = comp.build_hicache_transfers(
-                last_host_node,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                last_hash=last_hash,
-            )
-            if transfers == []:
-                alloc_failed = True
-                break
-            if transfers:
-                comp_xfers[comp.component_type] = transfers
+        if not full_only:
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                transfers = comp.build_hicache_transfers(
+                    last_host_node,
+                    CacheTransferPhase.PREFETCH,
+                    token_ids=prefetch_key.token_ids,
+                    prefetch_tokens=len(prefetch_key),
+                    last_hash=last_hash,
+                )
+                if transfers == []:
+                    alloc_failed = True
+                    break
+                if transfers:
+                    comp_xfers[comp.component_type] = transfers
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
@@ -2022,6 +2113,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        if insert_result.inserted_host_node is not None:
+            self.prefetch_loaded_nodes_by_reqid[req_id] = insert_result.inserted_host_node
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2047,8 +2140,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_prefetch_loaded_node(self, req_id: str) -> Optional[UnifiedTreeNode]:
+        return self.prefetch_loaded_nodes_by_reqid.pop(req_id, None)
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_loaded_nodes_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 
@@ -2432,6 +2529,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete."""
+        if consumer_index < 0 or self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
