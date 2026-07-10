@@ -5,9 +5,9 @@ paths:
 
 # Mutate ScheduleBatch fields out of place
 
-Never mutate a `ScheduleBatch` direct field in place — no `.extend()` /
-`.append()`, no `+=` / `-=` / `|=`, no tensor `.add_()` / `.fill_()`, no
-slice or index assignment. Build the new value and rebind the field:
+Never mutate a `ScheduleBatch` direct field in place — no `.extend()`/`.append()`,
+`+=`/`-=`/`|=`, tensor `.add_()`/`.fill_()`, or slice/index assignment. Build the
+new value and rebind the field:
 
 ```python
 # Bad
@@ -18,21 +18,13 @@ self.extend_lens[i] -= encoder_len
 # Good
 self.reqs = self.reqs + other.reqs
 self.seq_lens = self.seq_lens + 1
-extend_lens = self.extend_lens[:]   # mutate a local copy in loops,
-extend_lens[i] -= encoder_len       # then rebind once afterwards
-self.extend_lens = extend_lens
+lens = self.extend_lens[:]; lens[i] -= encoder_len; self.extend_lens = lens  # loop a copy, rebind once
 ```
 
-Why:
+Why: `copy()` snapshots and the overlap scheduler's queued references rely on old
+objects staying frozen (the prerequisite for the per-step immutable ScheduleBatch
+refactor); derived values like `seq_lens_sum` only recompute safely when fields
+are rebound.
 
-- `ScheduleBatch.copy()` snapshots and the overlap scheduler's queued
-  references rely on old objects staying frozen; in-place writes punch
-  through those snapshots.
-- Rebinding is the prerequisite for the per-step immutable ScheduleBatch
-  refactor.
-- Derived values (e.g. `seq_lens_sum`) can only be lazily recomputed safely
-  when the underlying fields change by rebinding.
-
-Out of scope (mutation is the intended semantics there): penalizer
-cumulative buffers, CUDA graph static buffers, `ForwardBatch` fields, and
-attention-backend metadata.
+Out of scope (mutation intended): penalizer buffers, CUDA graph static buffers,
+`ForwardBatch` fields, attention-backend metadata.
