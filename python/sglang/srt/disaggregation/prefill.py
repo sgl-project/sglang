@@ -76,6 +76,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _set_dspark_hidden_capture_layers(
+    model_runner, layer_ids: Optional[List[int]]
+) -> None:
+    model = getattr(model_runner, "model", None)
+    if model is None:
+        return
+
+    if layer_ids:
+        if hasattr(model, "set_dspark_layers_to_capture"):
+            model.set_dspark_layers_to_capture(layer_ids)
+            return
+        if hasattr(model, "set_dflash_layers_to_capture"):
+            model.set_dflash_layers_to_capture(layer_ids)
+            return
+        raise RuntimeError(
+            f"Model {model.__class__.__name__} cannot capture DSpark aux hidden."
+        )
+
+    if hasattr(model, "capture_aux_hidden_states"):
+        model.capture_aux_hidden_states = False
+    inner_model = getattr(model, "model", None)
+    for obj in (model, inner_model):
+        if obj is None:
+            continue
+        if hasattr(obj, "dspark_layers_to_capture"):
+            obj.dspark_layers_to_capture = None
+        if hasattr(obj, "layers_to_capture"):
+            obj.layers_to_capture = None
+
+
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
@@ -109,6 +139,7 @@ def maybe_release_metadata_buffer(
         if indices:
             dspark_hidden_pool.free(indices)
             req.dspark_hidden_src_indices = None
+            req.dspark_hidden_capture_layer_ids = None
 
 
 class PrefillBootstrapQueue:
@@ -461,17 +492,7 @@ class PrefillBootstrapQueue:
                 f"outside={outside}"
             )
 
-        model = getattr(model_runner, "model", None)
-        if model is None:
-            return
-        if hasattr(model, "set_dspark_layers_to_capture"):
-            model.set_dspark_layers_to_capture(target_layer_ids)
-        elif hasattr(model, "set_dflash_layers_to_capture"):
-            model.set_dflash_layers_to_capture(target_layer_ids)
-        else:
-            raise RuntimeError(
-                f"Model {model.__class__.__name__} cannot capture DSpark aux hidden."
-            )
+        req.dspark_hidden_capture_layer_ids = [int(x) for x in target_layer_ids]
         logger.info(
             "Configured DSpark PD hidden capture on prefill: rid=%s, pp_rank=%s, "
             "local_layer_ids=%s, all_target_layer_ids=%s, hidden_size=%s",
@@ -675,10 +696,19 @@ class SchedulerDisaggregationPrefillMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-        if batch and any(
-            getattr(req, "dspark_hidden_meta", None) for req in batch.reqs
-        ):
+        dspark_capture_layers = None
+        if batch:
+            for req in batch.reqs:
+                if getattr(req, "dspark_hidden_meta", None):
+                    dspark_capture_layers = getattr(
+                        req, "dspark_hidden_capture_layer_ids", None
+                    )
+                    break
+        if dspark_capture_layers:
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        _set_dspark_hidden_capture_layers(
+            self.tp_worker.model_runner, dspark_capture_layers
+        )
 
         if batch:
             set_schedule_time_batch(batch)
@@ -1501,6 +1531,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.dspark_hidden_dst_indices = None
             req.dspark_hidden_meta = None
             req.dspark_hidden_written = None
+            req.dspark_hidden_capture_layer_ids = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         if req.prefill_attempt_count >= max_attempts:
