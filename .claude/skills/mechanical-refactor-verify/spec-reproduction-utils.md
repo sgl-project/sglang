@@ -127,8 +127,11 @@
   removes exactly the matched import even on a semicolon-joined line.
 - `remove_imported_name(rel, *, module, name, asname)` — drops one name from a
   `from m import a, b` (or a plain `import x`), realising a lost import directly (this
-  repo's ruff has no F811); an import carrying comments loses only the dropped alias's own
-  line.
+  repo's ruff has no F811). A name on its own line — an exploded, parenthesized import —
+  is deleted in place, so the surrounding parens, the magic trailing comma, and any
+  comments on the surviving lines are preserved and the formatter leaves the import
+  multi-line; a name sharing a line (a flat single-line import) is dropped by rebuilding
+  the statement. Dropping the sole name removes the whole statement.
 - `add_import(rel, import_stmt)` — the import sorter places it; with no existing imports
   it lands below the module docstring.
 - `add_typechecking_import(rel, import_stmt)` — appends inside the destination's

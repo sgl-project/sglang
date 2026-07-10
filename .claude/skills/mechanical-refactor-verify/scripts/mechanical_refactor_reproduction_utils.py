@@ -584,16 +584,24 @@ class Repro:
                     edits.append((node.lineno, node.end_lineno, None))
                     continue
                 stmt_lines = lines[node.lineno - 1 : node.end_lineno]
-                if any("#" in ln for ln in stmt_lines):
-                    own = dropped_alias.lineno
-                    own_line = lines[own - 1]
-                    assert own_line.strip().rstrip(",").strip() == alias_text(
-                        dropped_alias
-                    ), (
+                own = dropped_alias.lineno
+                own_line = lines[own - 1]
+                on_own_line = (
+                    own_line.strip().rstrip(",").strip() == alias_text(dropped_alias)
+                )
+                if on_own_line:
+                    # An exploded (parenthesized, one-name-per-line) import: delete just
+                    # this alias's line so the surrounding parens and the magic trailing
+                    # comma survive. The formatter then keeps the import multi-line, which
+                    # is how the target was actually edited. A flat rebuild would drop the
+                    # magic comma and collapse an import the target left multi-line.
+                    # Comments on the surviving lines are preserved for free.
+                    edits.append((own, own, None))
+                elif any("#" in ln for ln in stmt_lines):
+                    raise AssertionError(
                         f"cannot drop {name!r}: it shares a line with other text and "
                         f"the import holds comments that a rebuild would delete"
                     )
-                    edits.append((own, own, None))
                 else:
                     keyword = "import " if module is None else f"from {module} import "
                     rebuilt = keyword + ", ".join(alias_text(a) for a in kept) + nl
