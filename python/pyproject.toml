@@ -16,7 +16,7 @@ classifiers = [
 
 # Please keep dependency lists in this file sorted alphabetically by package name.
 dependencies = [
-  "aiohttp",
+  "aiohttp>=3.14.1",
   "anthropic>=0.20.0",
   "apache-tvm-ffi==0.1.11",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
@@ -47,11 +47,11 @@ dependencies = [
   "nvidia-ml-py",
   "openai==2.6.1",
   "openai-harmony==0.0.4",
-  "orjson",
+  "orjson>=3.11.6",
   "outlines==0.1.11",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  "pillow>=12.2.0",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
@@ -228,3 +228,4 @@ binding = "PyO3"
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1
+
