@@ -48,11 +48,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
     && cd /usr/lib/python3/dist-packages/ \
     && ln -s apt_pkg.cpython-312-*-linux-gnu.so apt_pkg.so
@@ -815,11 +810,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
