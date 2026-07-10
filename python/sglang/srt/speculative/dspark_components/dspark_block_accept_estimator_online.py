@@ -11,6 +11,12 @@ import msgspec
 import torch
 
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
+from sglang.srt.speculative.dspark_components.dspark_utils import (
+    SKIP_STEP_WARNING,
+    block_accept_skip_reason,
+    gather_chunked_token_logprobs,
+    warn_once,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
@@ -722,17 +728,13 @@ class OnlineBlockAcceptEstimateRecorder:
         if row_indices.numel() == 0:
             return torch.zeros(0, dtype=torch.float32, device=logits.device)
         per_row_temps = temps[row_indices].clamp_min(1e-5)
-        results: List[torch.Tensor] = []
-        for start in range(0, row_indices.shape[0], _GATHER_ROW_CHUNK):
-            end = start + _GATHER_ROW_CHUNK
-            rows = logits[row_indices[start:end]].to(torch.float32)
-            rows = rows / per_row_temps[start:end, None]
-            log_norm = torch.logsumexp(rows, dim=-1)
-            token_logits = rows.gather(
-                dim=1, index=token_indices[start:end, None]
-            ).squeeze(1)
-            results.append(token_logits - log_norm)
-        return torch.cat(results)
+        return gather_chunked_token_logprobs(
+            logits=logits,
+            row_indices=row_indices,
+            token_indices=token_indices,
+            per_row_temps=per_row_temps,
+            chunk_size=_GATHER_ROW_CHUNK,
+        )
 
     def _sweep_states(self, *, forward_ct: int) -> None:
         expired = [
@@ -752,26 +754,14 @@ class OnlineBlockAcceptEstimateRecorder:
         logits_adjustments_are_noop: bool,
         corrected_logits: Optional[torch.Tensor],
     ) -> Optional[str]:
-        if not logits_adjustments_are_noop:
-            return (
-                "non-noop logits adjustments (penalizer/logit_bias/grammar) "
-                "in batch; cross-step conditioning of the gathered target "
-                "probabilities would be state-dependent"
-            )
-        if corrected_logits is None:
-            return "corrected_logits unavailable (folded draft path)"
-        return None
+        return block_accept_skip_reason(
+            logits_adjustments_are_noop=logits_adjustments_are_noop,
+            corrected_logits=corrected_logits,
+        )
 
     def _skip_step(self, *, reason: str) -> None:
         self._skipped_step_ct += 1
-        self._warn_once(
-            reason=f"skipping step: {reason} (pending blocks of affected requests "
-            "are dropped by the seq-len continuity check)"
-        )
+        self._warn_once(reason=SKIP_STEP_WARNING.format(reason))
 
     def _warn_once(self, *, reason: str) -> None:
-        if reason not in self._warned_skip_reasons:
-            self._warned_skip_reasons.add(reason)
-            logger.warning(
-                "DSPARK block accept estimate recorder: %s (warned once)", reason
-            )
+        warn_once(self._warned_skip_reasons, reason=reason)

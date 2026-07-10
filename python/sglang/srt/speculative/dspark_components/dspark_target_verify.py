@@ -77,6 +77,30 @@ class TargetVerifyExecutor:
                 batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
                 batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
+        result = self._forward_prepared_verify(
+            batch=batch,
+            verify_input=verify_input,
+            seq_lens_cpu_backup=seq_lens_cpu_backup,
+            seq_lens_sum_backup=seq_lens_sum_backup,
+        )
+
+        if sampling_info is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=result.logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=verify_w,
+            )
+
+        return result
+
+    def _forward_prepared_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        seq_lens_cpu_backup,
+        seq_lens_sum_backup,
+    ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -89,19 +113,9 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True,
         )
-        logits_output = target_out.logits_output
-        can_run_cuda_graph = target_out.can_run_cuda_graph
-
-        if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                draft_token_num=verify_w,
-            )
-
         return TargetVerifyResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
+            logits_output=target_out.logits_output,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
         )
 
     def commit_hidden(
@@ -167,24 +181,11 @@ class TargetVerifyExecutor:
             )
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
-        logits_output = target_out.logits_output
-        can_run_cuda_graph = target_out.can_run_cuda_graph
-
-        return TargetVerifyResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
+        return self._forward_prepared_verify(
+            batch=batch,
+            verify_input=verify_input,
+            seq_lens_cpu_backup=seq_lens_cpu_backup,
+            seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
     def run_compact(
