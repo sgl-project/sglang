@@ -643,7 +643,9 @@ def alloc_for_extend(
                     ].to(torch.int64)
                     if req.kv is not None and alloc_start_len > 0
                     else (
-                        t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device)
+                        t[-1:]
+                        if len(t) > 0
+                        else torch.tensor([-1], device=batch.device)
                     )
                 )
                 for req, t, alloc_start_len in zip(
