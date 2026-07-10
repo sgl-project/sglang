@@ -29,10 +29,12 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -429,6 +431,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Initialize blocking request preprocessor
+        self.init_request_preprocessor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -543,6 +548,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--mm-feature-transport=cuda_vmm is not supported by model class "
                 f"{model_class.__name__}"
             )
+
+    def init_request_preprocessor(self):
+        self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        func_call = partial(copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._request_preprocessor_executor, func_call
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -933,7 +947,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
 
-            input_ids, token_type_ids = await asyncio.to_thread(tokenize_sync)
+            input_ids, token_type_ids = await self.run_in_request_preprocessor(
+                tokenize_sync
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
