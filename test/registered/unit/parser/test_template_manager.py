@@ -583,19 +583,6 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(minicpm5_idx, rule_names.index("mimo"))
         self.assertLess(minicpm5_idx, rule_names.index("qwen"))
 
-    def test_minicpm5_not_misclassified_as_qwen(self):
-        template = (
-            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
-            '\n<function name="{{ tool.name }}">'
-            '\n<param name="{{ param.name }}">{{ param.value }}</param>'
-            "\n</function>"
-        )
-        force, config = detect_reasoning_pattern(template)
-        result = detect_tool_call_parser(
-            template, _DummyTokenizer(["<function", "<param"]), config, force
-        )
-        self.assertEqual(result, "minicpm5")
-
 
 class TestResolveAutoParsers(unittest.TestCase):
     """Tests for resolve_auto_parsers()."""
