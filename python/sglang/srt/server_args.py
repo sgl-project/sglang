@@ -7263,10 +7263,12 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                deepseek_deterministic_attention_backends = ["fa3", "triton"]
-                if attention_backend not in deepseek_deterministic_attention_backends:
+                if (
+                    attention_backend
+                    not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                ):
                     raise ValueError(
-                        f"Currently only {deepseek_deterministic_attention_backends} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
