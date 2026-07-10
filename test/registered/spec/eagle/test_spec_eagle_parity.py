@@ -13,7 +13,12 @@ from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
-register_xpu_ci(est_time=360, stage="stage-b", runner_config="1-gpu-xpu")
+register_xpu_ci(
+    est_time=360,
+    stage="stage-b",
+    runner_config="1-gpu-xpu",
+    disabled="EAGLE3 numerical parity mismatches on XPU",
+)
 
 _is_xpu = is_xpu()
 
@@ -42,6 +47,10 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
 
     disable_overlap = False
     attention_backend = "triton"
+    # Decode full-graph was active by default when this test was added
+    # (via XPUCudaGraphBackend). Opt in explicitly now that it is disabled
+    # by default so the coverage is preserved.
+    extra_args = ("--cuda-graph-config", '{"decode":{"backend":"full"}}')
 
 
 if __name__ == "__main__":

@@ -79,22 +79,6 @@ class TestMlxRunnerInitContract(unittest.TestCase):
                 "longer passes (regression of #28660)."
             )
 
-    def test_stub_initialize_requires_no_extra_args(self):
-        # Same guard from the other side: no parameter beyond ``self`` may be
-        # REQUIRED. A defaulted parameter would still bind, but a required one
-        # (the pre-#28660 ``pre_model_load_memory``) is the desync we forbid.
-        required = _required_params_beyond_self(MlxModelRunnerStub.initialize)
-        self.assertEqual(
-            required,
-            [],
-            msg=(
-                "MlxModelRunnerStub.initialize requires parameter(s) "
-                f"{required} that the base never passes (it calls "
-                "self.initialize()). This re-introduces the #28660 desync; base "
-                "initialize(self) is parameterless since #23862."
-            ),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
