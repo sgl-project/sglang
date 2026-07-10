@@ -1605,13 +1605,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "mamba_radix_cache_strategy": "extra_buffer",
             },
         )
-        # auto + no extra-buffer support (Lfm2) -> no_buffer + overlap disable
+        # auto + no extra-buffer support (Zaya) -> no_buffer + overlap disable
         self.assertEqual(
-            _mamba_radix_cache_resolution(_view("Lfm2ForCausalLM")),
+            _mamba_radix_cache_resolution(_view("ZayaForCausalLM")),
             {
                 "uses_mamba_radix_cache": True,
                 "mamba_radix_cache_strategy": "no_buffer",
                 "disable_overlap_schedule": True,
+            },
+        )
+        # Lfm2 supports the extra buffer: DSpark TARGET_VERIFY needs the
+        # speculative conv tape it allocates.
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Lfm2ForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
             },
         )
         # neither overlap nor paging wanted -> no_buffer even when supported
