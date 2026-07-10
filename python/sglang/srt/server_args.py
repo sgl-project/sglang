@@ -5412,6 +5412,36 @@ class ServerArgs:
                     "Remove --enforce-shared-experts-fusion when using "
                     "--moe-a2a-backend deepep_v2."
                 )
+            # Prefill capacity pre-check: the ElasticBuffer per-rank capacity
+            # must cover the largest extend forward, which is bounded by the
+            # chunked prefill budget. self.chunked_prefill_size is already the
+            # per-rank value here (_handle_data_parallelism divides the CLI
+            # value by dp_size under DP attention and runs before this
+            # handler). Without this check the server boots and only fails at
+            # the first full prefill chunk (the dispatcher's runtime capacity
+            # guard), which small smoke traffic may never trigger. Decode does
+            # not need a boot check: with CUDA graphs the padded capture batch
+            # goes through the same runtime guard during startup, and without
+            # graphs the guard still fails fast at runtime. Mirrors the MORI
+            # chunk check and the CuteDSL token-budget check below.
+            if (
+                self.chunked_prefill_size
+                and self.chunked_prefill_size > 0
+                and (self.disaggregation_mode != "decode")
+            ):
+                deepep_v2_cap = (
+                    envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                )
+                if self.chunked_prefill_size > deepep_v2_cap:
+                    raise ValueError(
+                        "DeepEP v2 MoE: the per-rank chunked prefill budget "
+                        f"({self.chunked_prefill_size} tokens; the CLI "
+                        "--chunked-prefill-size is divided by dp_size under DP "
+                        "attention) exceeds the per-rank dispatch buffer "
+                        "capacity SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_"
+                        f"RANK={deepep_v2_cap}. Raise the env (it sizes the "
+                        "communication buffer) or lower --chunked-prefill-size."
+                    )
             self.ep_size = self.tp_size
             self.disable_shared_experts_fusion = True
             # CUDA graph is safe on the DeepEP v2 decode masked-GEMM path under ANY
