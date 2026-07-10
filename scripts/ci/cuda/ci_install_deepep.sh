@@ -24,6 +24,13 @@ export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export CUDA_HOME=/usr/local/cuda
 
 GRACE_BLACKWELL=${GRACE_BLACKWELL:-0}
+# Pinned DeepEP commit. Used both for the version-shadow check below and the
+# `git checkout` further down — keep them in sync via this single variable.
+if [ "$GRACE_BLACKWELL" = "1" ]; then
+    DEEPEP_COMMIT=d28bd676c2120573c9f1425f0c16c39faa4117e6
+else
+    DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+fi
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
@@ -49,14 +56,10 @@ for base in {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}
     pth = os.path.join(base, "easy-install.pth")
     if os.path.exists(pth):
         lines = open(pth).read().splitlines()
-        kept, seen = [], set()
-        for line in lines:
-            if "deep_ep" in line:  # drop every deep_ep egg entry; reinstall re-adds the right one
-                continue
-            if line not in seen:
-                seen.add(line)
-                kept.append(line)
-        if kept != lines:
+        # Drop only deep_ep egg entries; leave every other line (including any
+        # unrelated duplicates) byte-for-byte intact.
+        kept = [line for line in lines if "deep_ep" not in line]
+        if len(kept) != len(lines):  # only rewrite if a deep_ep entry was actually dropped
             open(pth, "w").write("\n".join(kept) + ("\n" if kept else ""))
             print(f"cleaned deep_ep entries from {pth}")
 PYCLEAN
@@ -66,12 +69,13 @@ if [ "${FORCE_REBUILD_DEEPEP:-0}" = "1" ]; then
     echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
     ${PIP_UNINSTALL_CMD:-pip uninstall -y} deep_ep ${PIP_UNINSTALL_SUFFIX:-} || true
     purge_deep_ep_eggs
-elif python3 -c "import deep_ep" >/dev/null 2>&1; then
-    echo "deep_ep is already installed or importable. Skipping installation."
+elif python3 -c "import deep_ep, sys; sys.exit(0 if '${DEEPEP_COMMIT:0:7}' in getattr(deep_ep, '__version__', '') else 1)" >/dev/null 2>&1; then
+    echo "deep_ep (pinned ${DEEPEP_COMMIT:0:7}) already installed and importable. Skipping installation."
     exit 0
 else
-    # deep_ep is present but not importable (a stale/incompatible egg from another PR on a
-    # shared runner is shadowing a good build) — purge eggs so the reinstall below is clean.
+    # deep_ep is missing, not importable, OR a wrong-version egg from another PR on a shared
+    # runner is shadowing the pinned build (imports fine but != pinned commit) — purge eggs so
+    # the reinstall below is clean.
     purge_deep_ep_eggs
 fi
 
@@ -138,13 +142,13 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     GRACE_BLACKWELL_DEEPEP_BRANCH=hybrid-ep
     git clone https://github.com/deepseek-ai/DeepEP.git -b ${GRACE_BLACKWELL_DEEPEP_BRANCH} ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
-    git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+    git checkout ${DEEPEP_COMMIT} && \
     sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
     popd
 else
     git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
-    git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
+    git checkout ${DEEPEP_COMMIT} && \
     popd
 fi
 
