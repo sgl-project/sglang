@@ -27,10 +27,6 @@ class TestLlama31_8BInstructXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     tp_size = 2
     accuracy = 0.80
 
-    # Server args follow the mem 0.8 / max-total 65536 pattern used by the
-    # other Qwen entries in /data/pgirijal/scripts/run_upstream_key_models.sh
-    # (that script covers Llama-3.3-70B but not 3.1-8B; TP=2 keeps the
-    # Level Zero driver stable on Arc/BMG, see class docstring).
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--max-total-tokens",
         "65536",

@@ -23,21 +23,11 @@ class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 4
     accuracy = 0.90
-    # The earlier num_threads=4 accuracy drop (0.245 vs 0.60) was an artifact
-    # of the default max_tokens=512 truncating GSM8K CoT mid-answer. At
-    # max_tokens=8192 the CoT completes and concurrency no longer hurts:
-    # tp=4, num_threads=4, max_tokens=8192, gsm8k n=50 scored 0.96 (reproduced
-    # across two runs), at ~98 tok/s and ~29 min wall clock. num_threads=4
-    # sharing 4 tiles cleared the Level Zero wedge that single-stream tp=1 was
-    # working around, so the 4-gpu suite is the right home for this test.
+    # max_tokens=8192 lets the GSM8K CoT complete under num_threads=4.
     num_examples = 50
     num_threads = 4
     max_tokens = 8192
 
-    # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
-    # accuracy_commands["Qwen/Qwen3.5-9B"]. --disable-radix-cache /
-    # --disable-overlap-schedule / --dtype bfloat16 / --trust-remote-code /
-    # --attention-backend intel_xpu / --device xpu come from the mixin base.
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--page-size",
         "128",

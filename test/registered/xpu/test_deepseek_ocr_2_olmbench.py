@@ -1,24 +1,11 @@
 """DeepSeek-OCR-2 olmOCR-bench accuracy on Intel XPU (1-GPU nightly).
 
-Unlike ``test_deepseek_ocr_2.py`` (a boot + short-decode smoke test), this
-launches the server with the tuned OCR serving config and runs the full
-olmOCR-bench via ``benchmark/ocr/bench_sglang.py``, then asserts the
-aggregate score and records the per-split breakdown to the GitHub step
-summary.
+Launches the server with the OCR serving config, runs the full olmOCR-bench
+via ``benchmark/ocr/bench_sglang.py``, asserts the aggregate score >= 0.80,
+and writes the per-split breakdown to the GitHub step summary.
 
-Threshold: the full-bench aggregate must be >= 0.80. A full XPU run scored
-86.6% overall (arxiv_math/old_scans_math ~99.6%, headers_footers 93.6%,
-multi_column 84.0%, table_tests 78.4%, long_tiny_text 53.4%, old_scans
-26.0% — the last dragged down by transient broken-pipe drops at concurrency
-26, not model quality). 0.80 leaves headroom above that baseline. For
-reference, olmOCR v0.4.0 ~= 82.4 on the same bench.
-
-Dataset: the olmOCR-bench bench_data/ directory (~1,403 PDFs) is downloaded
-by the nightly workflow step before this runs:
-
-    hf download --repo-type dataset allenai/olmOCR-bench --local-dir ./olmOCR-bench
-
-and its location is passed via the OLMOCR_BENCH_DIR env var.
+The olmOCR-bench dataset is downloaded by the nightly workflow step and its
+location passed via the OLMOCR_BENCH_DIR env var.
 """
 
 import json
@@ -55,21 +42,15 @@ _DEFAULT_BENCH_DIR = _REPO_ROOT / "olmOCR-bench" / "bench_data"
 )
 class TestDeepSeekOCR2OlmBenchXPU(CustomTestCase):
     model = "deepseek-ai/DeepSeek-OCR-2"
-    # Aggregate olmOCR-bench score (total_passed / total_tests) must clear
-    # this. Validated at 86.6% on a full XPU run; 0.80 leaves headroom.
+    # Aggregate score (total_passed / total_tests) must clear this.
     accuracy = 0.80
-    # Full olmOCR-bench run at concurrency 26 is long; give the whole flow a
-    # generous budget (matches register est_time / the workflow per-file cap).
     timeout_for_server_launch = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
-    # Defaults match the runbook (full bench). Overridable via env for quick
-    # sanity runs without editing the test (e.g. OLMOCR_BENCH_SPLIT=arxiv_math
-    # OLMOCR_BENCH_MAX_SAMPLES=5).
+    # Full bench by default; overridable via env for quick sanity runs.
     concurrency = int(os.environ.get("OLMOCR_BENCH_CONCURRENCY", "26"))
     split = os.environ.get("OLMOCR_BENCH_SPLIT", "all")
     max_samples = int(os.environ.get("OLMOCR_BENCH_MAX_SAMPLES", "-1"))
 
-    # Server args mirror the DeepSeek-OCR-2 XPU launch command in the runbook.
     other_args = [
         "--dtype",
         "bfloat16",
@@ -173,8 +154,7 @@ class TestDeepSeekOCR2OlmBenchXPU(CustomTestCase):
         )
         write_github_step_summary("\n".join(lines) + "\n")
 
-        # Guard against a silent empty run (server up but zero tests scored)
-        # before comparing the score, so a 0/0 reads clearly.
+        # Guard against a silent empty run before comparing the score.
         self.assertGreater(
             total_tests, 0, f"olmOCR-bench scored 0 tests for {self.model}"
         )
