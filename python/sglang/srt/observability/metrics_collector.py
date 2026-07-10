@@ -517,6 +517,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of bootstrap failed requests.",
             labelnames=labels.keys(),
         )
+        self.num_decode_bootstrap_timeout_reqs = Counter(
+            name="sglang:num_decode_bootstrap_timeout_reqs_total",
+            documentation="The number of decode-side early bootstrap timeout requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_decode_bootstrap_timeout_reqs.labels(**self.labels).inc(0)
         self.num_transfer_failed_reqs = Counter(
             name="sglang:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
@@ -1107,6 +1113,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_decode_bootstrap_timeout_reqs(self) -> None:
+        self.num_decode_bootstrap_timeout_reqs.labels(**self.labels).inc(1)
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)

@@ -257,6 +257,8 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    bootstrap_start_time: float = 0.0
+    decode_bootstrap_timeout_recorded: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -335,6 +337,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
+        self.decode_bootstrap_timeout: Optional[int] = (
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            if self.transfer_backend == TransferBackend.MOONCAKE
+            else None
+        )
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -576,7 +583,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         decode_req = DecodeRequest(
-            req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+            req=req,
+            kv_receiver=kv_receiver,
+            is_rebootstrap=is_rebootstrap,
+            bootstrap_start_time=time.time(),
         )
         self.queue.append(decode_req)
         return decode_req
@@ -717,6 +727,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self.queue:
             return
 
+        self._mark_decode_bootstrap_timeouts(rids_to_check)
+
         # Still poll if any receiver was aborted, otherwise it stays stuck.
         if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
             decode_req.kv_receiver.conclude_state == KVPoll.Failed
@@ -730,6 +742,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 continue
 
             if poll == KVPoll.Bootstrapping:
@@ -759,6 +773,68 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+
+    def _mark_decode_bootstrap_timeouts(
+        self, rids_to_check: Optional[List[str]] = None
+    ) -> None:
+        decode_bootstrap_timeout = getattr(self, "decode_bootstrap_timeout", None)
+        if decode_bootstrap_timeout is None or decode_bootstrap_timeout <= 0:
+            return
+
+        now = time.time()
+        for decode_req in self.queue:
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+                continue
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                continue
+            if decode_req.kv_receiver is None:
+                continue
+            if decode_req.kv_receiver.conclude_state == KVPoll.Failed:
+                continue
+
+            bootstrap_start_time = getattr(decode_req, "bootstrap_start_time", None)
+            if bootstrap_start_time is None:
+                continue
+
+            elapsed = now - bootstrap_start_time
+            if elapsed < decode_bootstrap_timeout:
+                continue
+
+            error_message = (
+                f"Decode bootstrap timed out for request rank={self.tp_rank} "
+                f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=} "
+                f"after {elapsed:.1f}s before decode transfer"
+            )
+            logger.error(error_message)
+            decode_req.kv_receiver.kv_mgr.record_failure(
+                decode_req.req.bootstrap_room,
+                error_message,
+            )
+            decode_req.kv_receiver.kv_mgr.update_status(
+                decode_req.req.bootstrap_room, KVPoll.Failed
+            )
+            if (
+                not getattr(decode_req.kv_receiver, "abort_notified", False)
+                and hasattr(decode_req.kv_receiver, "bootstrap_infos")
+                and decode_req.kv_receiver.bootstrap_infos is not None
+            ):
+                decode_req.kv_receiver._send_abort_notification()
+                decode_req.kv_receiver.abort_notified = True
+            prepare_abort(
+                decode_req.req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            if (
+                not getattr(
+                    decode_req, "decode_bootstrap_timeout_recorded", False
+                )
+                and self.scheduler.metrics_reporter.enable_metrics
+            ):
+                self.scheduler.metrics_collector.increment_decode_bootstrap_timeout_reqs()
+                decode_req.decode_bootstrap_timeout_recorded = True
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -808,6 +884,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
         if not self.pending_reqs:
             return
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if not isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+        ]
+        if not self.pending_reqs:
+            return
 
         # Group pending requests by bootstrap_addr
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
@@ -852,6 +935,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        self._mark_decode_bootstrap_timeouts(rids_to_check)
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
@@ -1202,6 +1286,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if failed_reqs and logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "Removed failed decode prealloc requests: %s, remaining_prealloc_queue=%d",
+                [
+                    {
+                        "rid": decode_req.req.rid,
+                        "bootstrap_room": decode_req.req.bootstrap_room,
+                    }
+                    for decode_req in failed_reqs
+                ],
+                len(self.queue),
+            )
 
         return preallocated_reqs, failed_reqs
 

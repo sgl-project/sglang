@@ -1,9 +1,11 @@
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
+    DecodeRequest,
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
@@ -28,7 +30,107 @@ class FakeReceiver:
         return None
 
 
+class FakeBootstrapReceiver:
+    def __init__(self):
+        self.conclude_state = KVPoll.Bootstrapping
+        self.kv_mgr = MagicMock()
+        self.abort_notified = False
+        self.bootstrap_infos = object()
+        self._send_abort_notification = MagicMock()
+
+
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_decode_bootstrap_timeout_marks_request_failed_once(self):
+        receiver = FakeBootstrapReceiver()
+        req = SimpleNamespace(
+            rid="decode-timeout",
+            bootstrap_room=11,
+            bootstrap_host="127.0.0.1",
+            finished_reason=None,
+        )
+        decode_req = DecodeRequest(
+            req=req,
+            kv_receiver=receiver,
+            bootstrap_start_time=100.0,
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.decode_bootstrap_timeout = 10
+        queue.tp_rank = 0
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(disaggregation_transfer_backend="mooncake"),
+            metrics_reporter=SimpleNamespace(enable_metrics=True),
+            metrics_collector=MagicMock(),
+        )
+
+        def mark_aborted(req, *args, **kwargs):
+            req.finished_reason = FINISH_ABORT("timed out")
+
+        with (
+            patch("sglang.srt.disaggregation.decode.time.time", return_value=111.0),
+            patch(
+                "sglang.srt.disaggregation.decode.prepare_abort",
+                side_effect=mark_aborted,
+            ) as mock_prepare_abort,
+        ):
+            queue._mark_decode_bootstrap_timeouts()
+            queue._mark_decode_bootstrap_timeouts()
+
+        receiver.kv_mgr.record_failure.assert_called_once()
+        receiver.kv_mgr.update_status.assert_called_once_with(11, KVPoll.Failed)
+        receiver._send_abort_notification.assert_called_once()
+        self.assertTrue(receiver.abort_notified)
+        mock_prepare_abort.assert_called_once()
+        self.assertEqual(
+            mock_prepare_abort.call_args.kwargs["status_code"],
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        metrics_collector = queue.scheduler.metrics_collector
+        metrics_collector.increment_decode_bootstrap_timeout_reqs.assert_called_once()
+        self.assertTrue(decode_req.decode_bootstrap_timeout_recorded)
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+
+    def test_decode_bootstrap_timeout_skips_fake_transfer(self):
+        receiver = FakeBootstrapReceiver()
+        req = SimpleNamespace(
+            rid="fake-transfer",
+            bootstrap_room=12,
+            bootstrap_host=None,
+            finished_reason=None,
+        )
+        decode_req = DecodeRequest(
+            req=req,
+            kv_receiver=receiver,
+            bootstrap_start_time=100.0,
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.decode_bootstrap_timeout = 10
+        queue.tp_rank = 0
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(disaggregation_transfer_backend="fake"),
+            metrics_reporter=SimpleNamespace(enable_metrics=True),
+            metrics_collector=MagicMock(),
+        )
+
+        with (
+            patch("sglang.srt.disaggregation.decode.time.time", return_value=111.0),
+            patch(
+                "sglang.srt.disaggregation.decode.prepare_abort"
+            ) as mock_prepare_abort,
+        ):
+            queue._mark_decode_bootstrap_timeouts()
+
+        receiver.kv_mgr.record_failure.assert_not_called()
+        receiver.kv_mgr.update_status.assert_not_called()
+        receiver._send_abort_notification.assert_not_called()
+        mock_prepare_abort.assert_not_called()
+        metrics_collector = queue.scheduler.metrics_collector
+        metrics_collector.increment_decode_bootstrap_timeout_reqs.assert_not_called()
+        self.assertFalse(decode_req.decode_bootstrap_timeout_recorded)
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
