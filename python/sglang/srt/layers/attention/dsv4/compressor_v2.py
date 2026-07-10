@@ -226,6 +226,17 @@ class CompressorBackendMixin:
                 compressor=compressor,
                 layer_id=layer_id,
             )
+        elif token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
+            # The fused JIT epilogue only writes the packed layout; the
+            # uniform-FP8 pool goes through the unfused pipeline. The indexer
+            # compressor keeps its own (blockwise-FP8) path above.
+            self._forward_compress_uniform_fp8(
+                token_to_kv_pool=token_to_kv_pool,
+                kv_score_input=kv_score_input,
+                state_pool=state_pool,
+                compressor=compressor,
+                layer_id=layer_id,
+            )
         else:
             out_loc = self._get_out_loc(compressor.ratio)
             use_fp4_indexer = (
@@ -280,36 +291,33 @@ class CompressorBackendMixin:
                 or forward_batch.forward_mode,
             )
 
-    def _forward_unified_hip(
+    def _compress_norm_rope_unfused(
         self,
-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        *,
         kv_score_input: torch.Tensor,
         state_pool,
         compressor: Compressor,
-        layer_id: int,
-    ) -> None:
-        """HIP-specific forward path using PyTorch/Triton fallbacks."""
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
-            fused_norm_rope_inplace_triton,
-        )
-        from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-            quant_to_nope_fp8_rope_bf16_pack_triton,
-        )
-        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+    ):
+        """Shared unfused compress pipeline: compress_forward, decode
+        boundary zeroing, out_loc resolution, then norm + RoPE.
+
+        Returns ``(kv_compressed, out_loc_to_store)`` ready for a
+        pool-specific store, or ``None`` when there is nothing to compress.
+        The compression math is the same JIT kernel as the fused path; only
+        the epilogue is left to the caller.
+        """
+        from sglang.kernels.ops.attention.deepseek_v4_rope import fused_norm_rope_inplace_triton
 
         compress_ratio = compressor.ratio
         head_dim = compressor.head_dim
-        is_indexer = compressor.is_in_indexer
 
         plan = self._get_paged_compress_metadata(compress_ratio)
         out_loc = self._get_out_loc(compress_ratio)
 
-        # Step 1: compress_forward (always use JIT for both C4 and C128)
         coff = 2 if is_overlap_compress(compress_ratio) else 1
-        last_dim = 2 * head_dim * coff
-        kv_score_buffer = state_pool.kv_score_buffer.kv_score
-        kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        kv_score_buffer = state_pool.kv_score_buffer.kv_score.view(
+            -1, compress_ratio, 2 * head_dim * coff
+        )
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -320,49 +328,59 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             is_online=False,
         )
-
         if kv_compressed.shape[0] == 0:
-            return
+            return None
 
-        # For decode: zero out non-boundary tokens to prevent corrupting kvcache loc 0.
+        plan_raw = plan[1].view(torch.int32)
         if plan.is_decode:
-            plan_raw = plan[1].view(torch.int32)
+            # Zero out non-boundary tokens to prevent corrupting kvcache loc 0.
             seq_lens_plan = plan_raw[:, 0].to(torch.int32)
             is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
             kv_compressed = torch.where(
                 is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
             )
+            out_loc_to_store = out_loc
+        else:
+            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+            out_loc_to_store = out_loc[ragged_ids.long()]
 
-        # Step 2: norm + rope (Triton fallback for precision parity with V1)
-        positions = _extract_positions_from_plan(plan, compress_ratio)
-        positions_safe = positions.clamp(min=0)
-
+        positions = _extract_positions_from_plan(plan, compress_ratio).clamp(min=0)
         fused_norm_rope_inplace_triton(
             kv_compressed,
             compressor.norm.weight,
             compressor.norm.variance_epsilon,
             compressor.freqs_cis,
-            positions=positions_safe,
+            positions=positions,
         )
+        return kv_compressed, out_loc_to_store
 
-        # Step 3: optional Hadamard rotation for indexer
-        if compressor.rotate:
-            kv_compressed = rotate_activation(kv_compressed)
+    def _forward_unified_hip(
+        self,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        kv_score_input: torch.Tensor,
+        state_pool,
+        compressor: Compressor,
+        layer_id: int,
+    ) -> None:
+        """HIP-specific forward path: the shared unfused pipeline + HIP stores."""
+        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+            quant_to_nope_fp8_rope_bf16_pack_triton,
+        )
+        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
-        # Step 4: store to kvcache
-        # For decode: store ALL tokens. Non-boundary tokens have out_loc=0 (safe).
-        # For prefill: plan_c already only contains valid entries.
-        if plan.is_decode:
-            kv_to_store = kv_compressed
-            out_loc_to_store = out_loc
-        else:
-            kv_to_store = kv_compressed
-            plan_raw = plan[1].view(torch.int32)
-            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
-            out_loc_to_store = out_loc[ragged_ids.long()]
-
-        if kv_to_store.shape[0] == 0:
+        result = self._compress_norm_rope_unfused(
+            kv_score_input=kv_score_input,
+            state_pool=state_pool,
+            compressor=compressor,
+        )
+        if result is None:
             return
+        kv_to_store, out_loc_to_store = result
+
+        is_indexer = compressor.is_in_indexer
+        if compressor.rotate:
+            kv_to_store = rotate_activation(kv_to_store)
 
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             # fused kernel: BF16 in -> FP8 quant + paged scatter in one launch
@@ -390,6 +408,38 @@ class CompressorBackendMixin:
             else:
                 pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_to_store.bfloat16())
                 token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc_to_store, pack)
+
+    def _forward_compress_uniform_fp8(
+        self,
+        *,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        kv_score_input: torch.Tensor,
+        state_pool,
+        compressor: Compressor,
+        layer_id: int,
+    ) -> None:
+        """Uniform-FP8 pool: the shared unfused pipeline + e4m3 cast store."""
+        assert not compressor.is_in_indexer
+        assert compressor.head_dim == 512, f"{compressor.head_dim=}"
+        assert not _use_online_compress(compressor.ratio), (
+            "SGLANG_OPT_USE_ONLINE_COMPRESS is not supported with the "
+            "uniform-FP8 KV layout yet."
+        )
+
+        result = self._compress_norm_rope_unfused(
+            kv_score_input=kv_score_input,
+            state_pool=state_pool,
+            compressor=compressor,
+        )
+        if result is None:
+            return
+        kv_compressed, out_loc_to_store = result
+
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc_to_store,
+            cache_k=kv_compressed,
+        )
 
     # NOTE: alias for backward compatibility
     forward_indexer_compressor = forward_unified

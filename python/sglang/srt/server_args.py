@@ -357,6 +357,8 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
+DSV4_ATTN_BACKEND_CHOICES = ["auto", "flashmla", "trtllm"]
+
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
 DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
@@ -1795,6 +1797,17 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
+    dsv4_attn_backend: A[
+        str,
+        Arg(
+            help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
+            "'flashmla'. 'trtllm' (SM100/SM103 Blackwell only) switches the "
+            "SWA/compressed KV pools to a uniform 512-dim FP8 layout and runs "
+            "decode and sparse prefill through the flashinfer trtllm-gen "
+            "sparse MLA kernel. The backend choice is shared by prefill and decode.",
+            choices=DSV4_ATTN_BACKEND_CHOICES,
+        ),
+    ] = "auto"
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False
