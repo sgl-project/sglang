@@ -454,9 +454,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         )
         self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
-            expand_page_ids_to_token_ids(
-                hisparse_pages, self.hisparse_page_size
-            ).to(torch.int64)
+            expand_page_ids_to_token_ids(hisparse_pages, self.hisparse_page_size).to(
+                torch.int64
+            )
         )
         return logical_pages
 
