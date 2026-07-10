@@ -2026,13 +2026,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Get expected vs actual arguments
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        if isinstance(expected_args, str):
+            expected_call = expected_args
+        else:
+            expected_call = json.dumps(expected_args, ensure_ascii=False)
         actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send
         remaining_call = (
-            expected_call.replace(actual_call, "", 1)
-            if actual_call in expected_call
+            expected_call[len(actual_call) :]
+            if expected_call.startswith(actual_call)
             else ""
         )
 
