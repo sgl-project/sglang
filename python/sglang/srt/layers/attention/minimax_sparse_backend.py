@@ -133,7 +133,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
-        self._use_msa_decode = self.use_msa and not _decode_cuda_graph
+        self._use_msa_decode = self.use_msa and (
+            not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
+        )
 
         # MSA + spec decode + cuda graph crashes mid-capture: TARGET_VERIFY batches
         # route to forward_extend, dereferencing absent extend metadata. Fail at startup.
