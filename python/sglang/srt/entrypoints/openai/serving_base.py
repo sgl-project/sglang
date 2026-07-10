@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -89,9 +90,9 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            # Chat template rendering and tokenization can block the event loop.
+            adapted_request, processed_request = await asyncio.to_thread(
+                self._convert_to_internal_request, request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
