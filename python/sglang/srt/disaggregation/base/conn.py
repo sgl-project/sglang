@@ -112,6 +112,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        routed_dp_rank: Optional[int] = None,
     ): ...
 
     @abstractmethod

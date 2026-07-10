@@ -1611,35 +1611,61 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
-                    tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
-                    tokenized_obj.mm_inputs.mm_items = [
-                        copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
-                    ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
-                self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+            # Cache the common prefix for parallel sampling. In disaggregated
+            # mode, this synthetic request would consume a bootstrap room that
+            # belongs to a real sample.
+            if not any(room is not None for room in obj.bootstrap_room):
+                for i in range(batch_size):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                    if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+                    if tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
+                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    tokenized_obj.sampling_params = copy.copy(
+                        tokenized_obj.sampling_params
+                    )
+                    tokenized_obj.sampling_params.max_new_tokens = 0
+                    tokenized_obj.stream = False
+                    self._init_req_state(tmp_obj)
+                    self._send_one_request(tokenized_obj)
+                    await self._wait_one_response(tmp_obj, request).__anext__()
+
+            # Expand requests, assign new rids for them, and send them
+            for i in range(batch_size):
+                for sample_idx in range(obj.parallel_sample_num):
+                    # Expanded layout: [sample0_batch0, sample0_batch1, ...,
+                    # sample1_batch0, sample1_batch1, ...].
+                    expanded_idx = sample_idx * batch_size + i
+                    tmp_obj = copy.copy(objs[i])
+                    tokenized_obj = copy.copy(tokenized_objs[i])
+                    # Ensure independent mm_items so wrap_shm_features won't mutate the original
+                    if tokenized_obj.mm_inputs:
+                        tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                        tokenized_obj.mm_inputs.mm_items = [
+                            copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                        ]
+                    tmp_obj.bootstrap_host = obj.bootstrap_host[expanded_idx]
+                    tmp_obj.bootstrap_port = obj.bootstrap_port[expanded_idx]
+                    tmp_obj.bootstrap_room = obj.bootstrap_room[expanded_idx]
+                    tmp_obj.bootstrap_pair_key = obj.bootstrap_pair_key[expanded_idx]
+                    tmp_obj.decode_tp_size = obj.decode_tp_size[expanded_idx]
+
+                    tokenized_obj.bootstrap_host = tmp_obj.bootstrap_host
+                    tokenized_obj.bootstrap_port = tmp_obj.bootstrap_port
+                    tokenized_obj.bootstrap_pair_key = tmp_obj.bootstrap_pair_key
+                    tokenized_obj.decode_tp_size = tmp_obj.decode_tp_size
+                    # Preserve a room assigned while tokenizing fake transfers
+                    # when the raw request has no room.
+                    if not (
+                        tmp_obj.bootstrap_room is None
+                        and objs[i].bootstrap_room is None
+                        and tokenized_obj.bootstrap_room is not None
+                    ):
+                        tokenized_obj.bootstrap_room = tmp_obj.bootstrap_room
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]

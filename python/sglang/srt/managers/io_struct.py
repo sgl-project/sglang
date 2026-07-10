@@ -448,7 +448,7 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_rid(num)
+        self._normalize_rid()
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
@@ -557,12 +557,12 @@ class GenerateReqInput:
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
-    def _normalize_rid(self, num):
+    def _normalize_rid(self):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
-            self.rid = [uuid.uuid4().hex for _ in range(num)]
+            self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            new_rids = [f"{self.rid}_{i}" for i in range(self.batch_size)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
             # Note: the length of rid shall be the same as the batch_size,
@@ -643,45 +643,92 @@ class GenerateReqInput:
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
+
+        def normalize_list(values, name):
+            if len(values) == num:
+                return list(values)
+            if len(values) == self.batch_size:
+                return values * self.parallel_sample_num
+            raise ValueError(
+                f"The length of {name} should be equal to the batch size "
+                f"({self.batch_size}) or expanded batch size ({num})."
+            )
+
+        def validate_unique_rooms(rooms):
+            non_null_rooms = [room for room in rooms if room is not None]
+            if len(non_null_rooms) != len(set(non_null_rooms)):
+                raise ValueError(
+                    "bootstrap_room values must be unique across expanded requests."
+                )
+
+        def expand_rooms(rooms):
+            expanded_rooms = []
+            used_rooms = set()
+            step = max(self.batch_size, 1)
+            for sample_idx in range(self.parallel_sample_num):
+                for room in rooms:
+                    if room is None:
+                        expanded_rooms.append(None)
+                        continue
+
+                    candidate = room + sample_idx * step
+                    while candidate in used_rooms:
+                        candidate += step
+                    used_rooms.add(candidate)
+                    expanded_rooms.append(candidate)
+            return expanded_rooms
+
         # Normalize bootstrap_host
         if self.bootstrap_host is None:
             self.bootstrap_host = [None] * num
         elif not isinstance(self.bootstrap_host, list):
             self.bootstrap_host = [self.bootstrap_host] * num
-        elif isinstance(self.bootstrap_host, list):
-            self.bootstrap_host = self.bootstrap_host * self.parallel_sample_num
+        else:
+            self.bootstrap_host = normalize_list(self.bootstrap_host, "bootstrap_host")
 
         # Normalize bootstrap_port
         if self.bootstrap_port is None:
             self.bootstrap_port = [None] * num
         elif not isinstance(self.bootstrap_port, list):
             self.bootstrap_port = [self.bootstrap_port] * num
-        elif isinstance(self.bootstrap_port, list):
-            self.bootstrap_port = self.bootstrap_port * self.parallel_sample_num
+        else:
+            self.bootstrap_port = normalize_list(self.bootstrap_port, "bootstrap_port")
 
         # Normalize bootstrap_room
         if self.bootstrap_room is None:
             self.bootstrap_room = [None] * num
         elif not isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
-        elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            base_rooms = [self.bootstrap_room + i for i in range(self.batch_size)]
+            self.bootstrap_room = expand_rooms(base_rooms)
+        elif len(self.bootstrap_room) == num:
+            validate_unique_rooms(self.bootstrap_room)
+            self.bootstrap_room = list(self.bootstrap_room)
+        elif len(self.bootstrap_room) == self.batch_size:
+            validate_unique_rooms(self.bootstrap_room)
+            self.bootstrap_room = expand_rooms(self.bootstrap_room)
+        else:
+            raise ValueError(
+                "The length of bootstrap_room should be equal to the batch size "
+                f"({self.batch_size}) or expanded batch size ({num})."
+            )
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
             self.bootstrap_pair_key = [None] * num
         elif not isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
-        elif isinstance(self.bootstrap_pair_key, list):
-            self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
+        else:
+            self.bootstrap_pair_key = normalize_list(
+                self.bootstrap_pair_key, "bootstrap_pair_key"
+            )
 
         # Normalize decode_tp_size
         if self.decode_tp_size is None:
             self.decode_tp_size = [None] * num
         elif not isinstance(self.decode_tp_size, list):
             self.decode_tp_size = [self.decode_tp_size] * num
-        elif isinstance(self.decode_tp_size, list):
-            self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
+        else:
+            self.decode_tp_size = normalize_list(self.decode_tp_size, "decode_tp_size")
 
     def _get_positional_embed_overrides_item(
         self, i: int

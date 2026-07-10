@@ -957,6 +957,7 @@ class CommonKVSender(BaseKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        routed_dp_rank: Optional[int] = None,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -976,27 +977,46 @@ class CommonKVSender(BaseKVSender):
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if self.kv_mgr.server_args.dp_size > 1:
-            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
+            # A DP-aware P/D router sends the selected prefill rank to decode
+            # explicitly, so its transfer room does not need to encode that rank.
+            if (
+                routed_dp_rank is not None
+                and routed_dp_rank != self.kv_mgr.attn_dp_rank
+            ):
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"routed_dp_rank conflict: request targets dp_rank "
+                    f"{routed_dp_rank} but arrived at dp_rank "
+                    f"{self.kv_mgr.attn_dp_rank}.",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
+
+            # Decode queries the bootstrap server for every request when this
+            # override is enabled, so prefill must register even when the room
+            # happens to be modulo-aligned with its DP rank.
+            if (
+                envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+                or self.kv_mgr.server_args.load_balance_method
+                != "follow_bootstrap_room"
+            ):
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank
+                routed_dp_rank is None
+                and self.kv_mgr.attn_dp_rank
                 != self.bootstrap_room % self.kv_mgr.server_args.dp_size
             ):
-                # follow_bootstrap_room was overridden by external routed_dp_rank
-                if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
-                    self._register_prefill_dp_rank()
-                else:
-                    self.kv_mgr.record_failure(
-                        self.bootstrap_room,
-                        f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
-                        f"{self.bootstrap_room} implies dp_rank "
-                        f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
-                        f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
-                        f"to allow mixed routing.",
-                    )
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                    return
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"follow_bootstrap_room conflict: dispatched to dp_rank "
+                    f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                    f"{self.bootstrap_room} implies dp_rank "
+                    f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
+                    f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
+                    f"to allow mixed routing.",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
