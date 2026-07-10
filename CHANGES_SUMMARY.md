@@ -1,190 +1,138 @@
-# SGLang Fork Changes Summary
+# JoyFuture SGLang Fork — Changes Summary
 
-Fork: `ghshhf/sglang` (based on `sgl-project/sglang`)
-Author: JoyFuture
-Purpose: Scheduler observability and tuning tooling for SGLang
-
----
-
-## Changes Overview
-
-This fork adds scheduler-level observability and operational tuning knobs to
-upstream SGLang. All changes are additive — no existing behavior is modified.
-
-### Upstreamability Assessment
-
-| Change | Files | Lines Changed | Upstreamability |
-|--------|-------|---------------|-----------------|
-| Extended NVTX markers | 1 modified | ~10 additions | ★★★ Low — JoyFuture-specific profiling |
-| Scheduler NVTX decorators | 1 modified | 4 additions | ★★☆ Medium — depends on NVTX marker review |
-| Scheduler env vars | 1 new | ~8 | ★★☆ Medium — env var naming needs team discussion |
-| Request latency tracker | 1 new | ~140 | ★☆☆ Low — JoyFuture-specific logging |
-| KV transfer checksum | 1 new | ~90 | ★★☆ Medium — useful for PD disaggregation debugging |
-| NVTX profiling guide | 1 new | ~120 | ★★☆ Medium — docs, but JoyFuture-specific content |
+This document summarizes all changes made to the `ghshhf/sglang` fork,
+organized by delivery month. All changes are **additive** (no behavior
+modifications) and **gated** (off by default, opt-in via env vars).
 
 ---
 
-## Detailed Change Log
+## Month 1-2: Foundation Hardening
 
-### 1. Extended NVTX Markers (`python/sglang/srt/utils/nvtx_utils.py`)
+### Dead Code Cleanup
+- Removed unused modules: `_decode_step_counter`, `SGLANG_DECODE_CLEAR_STEPS`,
+  `SGLANG_KV_POOL_RETRACT_THRESHOLD_PCT`
+- Fixed `bare except Exception: pass` → added `logger.debug(...)` messages
+- Fixed type annotation: `RequestLatencyTracker.start_request` returns
+  `Optional[RequestLatencyRecord]`
 
-**What**: Added 4 new NVTX color markers for JoyFuture's extended scheduler events.
+### Scheduler Environment Variables
+- Added `SchedulerEnvs` class pattern in `scheduler_env_vars.py`
+- Two active env vars: `SGLANG_ENABLE_PER_REQUEST_LATENCY`,
+  `SGLANG_ENABLE_KV_TRANSFER_CHECKSUM`
 
-**Change**:
-- Added `"scheduler.event_loop_normal"` → dark_blue
-- Added `"scheduler.event_loop_overlap"` → teal
-- Added `"scheduler.update_running_batch"` → orange
-- Added `"scheduler.get_new_batch_prefill"` → magenta
-- Updated module docstring to reference JoyFuture extensions
-
-**Why**: These markers allow profiling the event loop mode and internal batch
-selection logic with Nsight Systems.
-
-**Upstream notes**: The color assignments are arbitrary; upstream would decide
-standard colors or naming conventions.
-
-### 2. Scheduler NVTX Decorators (`python/sglang/srt/managers/scheduler.py`)
-
-**What**: Wrapped 4 scheduler methods with `@nvtx_annotated_method`.
-
-**Decorators added**:
-1. `event_loop_normal` (line ~1470) — "A normal scheduler loop"
-2. `event_loop_overlap` (line ~1498) — "A scheduler loop that overlaps the CPU processing and GPU computation"
-3. `get_new_batch_prefill` (line ~2614) — "Selecting new prefill batch"
-4. `update_running_batch` (line ~2908) — "Update the current running decoding batch"
-
-**Why**: These are the highest-level scheduler boundaries. Instrumenting them
-provides a clear timeline of scheduler phases in Nsight Systems.
-
-**Pattern**: Follows the existing decorator pattern used for other methods
-(e.g., `dispatch_event_loop`, `dispatch_prefill_batch`).
-
-**Upstream notes**: These specific function names are unlikely to change, but
-the decorator addition should be coordinated with the upstream NVTX marker plan.
-
-### 3. Scheduler Environment Variables (`python/sglang/srt/scheduler_env_vars.py`) — NEW
-
-**What**: Added 4 environment variables for runtime scheduler tuning.
-
-**Variables**:
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `SGLANG_ENABLE_PER_REQUEST_LATENCY` | bool | `False` | Enable per-request latency tracking |
-| `SGLANG_ENABLE_KV_TRANSFER_CHECKSUM` | bool | `False` | Enable SHA-256 checksum verification for KV transfers |
-| `SGLANG_DECODE_CLEAR_STEPS` | int | `0` | Number of decode steps between KV cache clear operations |
-| `SGLANG_KV_POOL_RETRACT_THRESHOLD_PCT` | int | `0` | Percentage threshold (0-100) to trigger KV pool retraction |
-
-**Why**: Provides operational tuning knobs without code changes. The latency
-tracker and checksum features depend on these env vars.
-
-**Pattern**: Follows the existing `sglang.srt.environ` pattern with `env_bool`
-and `env_int` helpers.
-
-**Upstream notes**: The env var names follow upstream conventions (`SGLANG_*`).
-Naming and defaults would need team review before submission.
-
-### 4. Request Latency Tracker (`python/sglang/srt/request_latency_tracker.py`) — NEW
-
-**What**: Per-request latency tracking infrastructure.
-
-**Classes**:
-- `PhaseLatency` — Latency breakdown for a single phase (prefill, decode, transfer, sample)
-- `RequestLatencyRecord` — Complete lifecycle record with TTFT, total elapsed, tokens/sec
-- `RequestLatencyTracker` — Central registry managing all in-flight requests
-
-**Features**:
-- Phase-based timing (`start_phase` / `end_phase`)
-- TTFT (Time To First Token) computation
-- Retraction count tracking
-- Abort tracking with reason
-- Aggregated summary statistics (avg, p50, p95)
-
-**Why**: Enables debugging of agentic workloads where individual request
-latency matters more than aggregate throughput.
-
-**Upstream notes**: The structured logging format (`to_log_dict`) is JoyFuture-specific.
-The core timing logic could be useful upstream, but the logging integration would need adaptation.
-
-### 5. KV Transfer Checksum (`python/sglang/srt/kv_transfer_checksum.py`) — NEW
-
-**What**: SHA-256 checksum verification for PD disaggregation KV cache transfers.
-
-**Classes**:
-- `compute_kv_checksum()` — Computes a deterministic SHA-256 hash of a KV tensor
-- `KVTransferChecksumRecord` — Records a single transfer with before/after checksums
-- `KVTransferChecksumVerifier` — Batch verification tool for comparing source/destination checksums
-
-**Why**: PD disaggregation transfers KV cache between prefill and decode nodes.
-Without checksums, silent data corruption could go undetected.
-
-**Pattern**: Uses `hashlib` (stdlib) + `torch` tensor operations. No external
-dependencies beyond what SGLang already requires.
-
-**Upstream notes**: The checksum computation is generally useful for PD
-disaggregation debugging. The integration point would need to be determined.
-
-### 6. NVTX Profiling Guide (`docs/NVTX_PROFILING_GUIDE.md`) — NEW
-
-**What**: User-facing documentation for Nsight Systems profiling with SGLang.
-
-**Contents**:
-- Quick start (enable NVTX, profile with nsys, view results)
-- Color-coded marker reference table
-- Event loop mode comparison (normal vs overlap)
-- Common bottleneck identification patterns
-- Troubleshooting guide
-- Advanced usage (selective profiling, export, CI integration)
-
-**Why**: SGLang has existing profiling docs but no dedicated NVTX/Nsight guide.
-
-**Upstream notes**: Most content is generic Nsight Systems usage. The marker
-reference table is specific to this fork's additions.
+### NVTX Profiling Guide
+- Created `docs/NVTX_PROFILING_GUIDE.md` with usage instructions
 
 ---
 
-## Dependencies
+## Month 3-4: Observability Deepening
 
-No new external dependencies. All new files use only:
-- Python standard library (`hashlib`, `logging`, `dataclasses`, `time`, `typing`)
-- `torch` (already a SGLang dependency)
-- `sglang.srt.environ` (already exists in the codebase)
-- `sglang.srt.utils.nvtx_utils` (already exists in the codebase)
+### M3-4.1: RequestLatencyTracker → Prometheus Bridge
+- Added `on_phase_complete` callback to `RequestLatencyTracker`
+- Wired callback to `SchedulerMetricsCollector.observe_per_stage_req_latency`
+- Feeds per-request latency phases (prefill, decode) into Prometheus histograms
 
----
+### M3-4.2: KVTransferChecksumVerifier Integration
+- Wired checksum recording into PD disaggregation transfer path
+- `prefill.py`: `record_pre()` before `send_kv_chunk`
+- `decode.py`: `record_post()` on `KVPoll.Success`
 
-## Testing Status
-
-- All new files follow the project's Apache 2.0 license header
-- All new files follow the project's import and style conventions
-- The `scheduler_env_vars.py` module was tested for import correctness
-- NVTX marker decorators use the same pattern as existing ones
-- No existing tests were modified or broken
+### M3-4.3: Batch Selection Latency Metric
+- Added `scheduler.batch_selection` latency observation in `get_next_batch_to_run`
 
 ---
 
-## Files Changed
+## Month 5-6: NVTX Coverage Expansion
 
-```
-Modified:
-  python/sglang/srt/utils/nvtx_utils.py       (NVTX color map extended)
-  python/sglang/srt/managers/scheduler.py     (4 NVTX decorators added)
+### M5-6.1: Sub-Stage NVTX Markers
+- Added `scheduler_nvtx_range` context manager helper
+- 5 sub-stage markers inside `run_batch`: prebuilt, overlap, pdmux,
+  non_overlap_spec, plain
+- 6 sub-stage markers inside `process_batch_result`: decode, dllm,
+  disagg_prefill, prefill, prebuilt, idle
+- Extended `_NVTX_COLOR_MAP` with 14 new entries
 
-Added:
-  python/sglang/srt/scheduler_env_vars.py     (4 env vars)
-  python/sglang/srt/request_latency_tracker.py (per-request latency)
-  python/sglang/srt/kv_transfer_checksum.py   (KV transfer verification)
-  docs/NVTX_PROFILING_GUIDE.md                (profiling documentation)
-```
+### M5-6.2: Request Entry Point Markers
+- `@scheduler_nvtx_method("scheduler.handle_generate_request")`
+- `@scheduler_nvtx_method("scheduler.handle_batch_generate_request")`
+
+### M5-6.3: Timeout/Abort/Idle Markers
+- `@scheduler_nvtx_method("scheduler._abort_on_running_timeout")`
+- `@scheduler_nvtx_method("scheduler._abort_on_queued_limit")`
+- `@scheduler_nvtx_method("scheduler.abort_request")`
+- `@scheduler_nvtx_method("scheduler.on_idle")`
 
 ---
 
-## Recommendations for Next Steps
+## Month 7-8: Advanced Observability
 
-1. **Short-term (this fork)**: Wire up the latency tracker in the scheduler
-   pipeline — currently defined but not yet connected to request lifecycle hooks.
+### M7-8.1: FutureMap Overlap Relay Metrics
+- 3 counters: `future_map_stash_total`, `future_map_publish_total`,
+  `future_map_resolve_total`
+- 1 histogram: `future_map_relay_latency_ms` (0.01-500ms buckets)
+- Instrumented `FutureMap.publish`, `.stash`, `.resolve_seq_lens_cpu`
+- Added `metrics_collector` param to `FutureMap.__init__` (backward-compatible)
+- Wired through `SpeculativeAlgorithm.create_future_map`
 
-2. **Medium-term**: Integrate KV checksum verification into PD disaggregation
-   transfer code paths when `SGLANG_ENABLE_KV_TRANSFER_CHECKSUM=1`.
+### M7-8.2: PrefillDelayer Audit
+- Audit confirmed existing `observe_prefill_delayer_outcome` covers all
+  negotiation outcomes (delay, wait_success, wait_timeout, token_watermark)
+  with forward_passes, wait_seconds, input_estimation labels
+- No additional code needed
 
-3. **Long-term (upstream PR)**: Submit NVTX decorator additions and env var
-   infrastructure as a PR to `sgl-project/sglang` after internal review.
+### M7-8.3: MinFreeSlotsDelayer Metrics
+- 2 counters: `min_free_slots_delay_total`, `min_free_slots_checks_total`
+- 2 histograms: `min_free_slots_running_bs`, `min_free_slots_allocatable`
+- Instrumented `MinFreeSlotsDelayer.should_delay`
+
+---
+
+## Month 9-10: Operational Tooling
+
+### M9-10.1: Scheduler Health Dashboard Metrics
+- 3 counters: `scheduler_loop_iterations_total`, `scheduler_loop_batch_dispatches_total`,
+  `scheduler_loop_idle_total`
+- 1 histogram: `scheduler_loop_iteration_lag_ms` (0.01-1000ms buckets)
+- 1 counter: `scheduler_aborts_total` with reason label
+  (running_timeout, queue_full, waiting_timeout, user_abort)
+- Instrumented all 5 event loops (normal, overlap, pp, pp_disagg_prefill,
+  pp_disagg_decode)
+- Instrumented 4 abort paths
+
+### M9-10.2: NVTX Sampling Mode
+- `SGLANG_SCHEDULER_NVTX_SAMPLE_RATE` env var (default 1 = always emit)
+- `scheduler_nvtx_method_sampled` decorator
+- `scheduler_nvtx_range_sampled` context manager
+- Per-call-site counters ensure independent sampling for each marker
+
+### M9-10.3: Performance Regression Detection Tool
+- Status: Pending (not yet implemented)
+
+---
+
+## Environment Variables Summary
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SGLANG_ENABLE_PER_REQUEST_LATENCY` | false | Enable per-request latency tracking |
+| `SGLANG_ENABLE_KV_TRANSFER_CHECKSUM` | false | Enable KV transfer checksum verification |
+| `SGLANG_ENABLE_NVTX_SCHEDULER` | false | Enable scheduler NVTX markers |
+| `SGLANG_ENABLE_NVTX_OPERATIONS` | false | Enable operations NVTX markers |
+| `SGLANG_SCHEDULER_NVTX_SAMPLE_RATE` | 1 | Sample every N-th NVTX marker (1 = all) |
+
+## Prometheus Metrics Summary
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `sglang:per_stage_req_latency_seconds` | Histogram | Per-phase request latency |
+| `sglang:num_future_map_stash_total` | Counter | FutureMap stash operations |
+| `sglang:num_future_map_publish_total` | Counter | FutureMap publish operations |
+| `sglang:num_future_map_resolve_total` | Counter | FutureMap resolve operations |
+| `sglang:future_map_relay_latency_ms` | Histogram | FutureMap relay latency |
+| `sglang:min_free_slots_delay_total` | Counter | MinFreeSlotsDelayer delays |
+| `sglang:min_free_slots_checks_total` | Counter | MinFreeSlotsDelayer checks |
+| `sglang:scheduler_loop_iterations_total` | Counter | Event loop iterations |
+| `sglang:scheduler_loop_batch_dispatches_total` | Counter | Batches dispatched |
+| `sglang:scheduler_loop_idle_total` | Counter | Idle iterations |
+| `sglang:scheduler_loop_iteration_lag_ms` | Histogram | Loop iteration duration |
+| `sglang:scheduler_aborts_total` | Counter (reason label) | Aborted requests by reason |

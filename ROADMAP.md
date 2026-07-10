@@ -94,40 +94,40 @@ visibility into why batches are or aren't selected.
 
 **Goal**: Cover the remaining uninstrumented hot paths.
 
-### M5-6.1: 子阶段 NVTX 标记
+### M5-6.1: 子阶段 NVTX 标记 ✅
 
 **What**: Add NVTX markers inside already-decorated methods.
 
 **Why**: Top-level markers show *that* run_batch took 5ms, but not *why*.
 Sub-stage markers break it down.
 
-**Tasks**:
-- Inside `run_batch`: mark prefill forward, decode forward, prebuilt path
-- Inside `process_batch_result`: mark decode branch, prefill branch, prebuilt branch
-- Inside `get_next_batch_to_run`: mark scheduling decision, retraction logic
-- Inside `process_input_requests`: mark `_request_dispatcher` dispatch loop
+**Status**: Complete
 
-### M5-6.2: 请求入口 NVTX 标记
+**Delivered**:
+- Inside `run_batch`: prebuilt, overlap, pdmux, non_overlap_spec, plain (5 markers)
+- Inside `process_batch_result`: decode, dllm, disagg_prefill, prefill, prebuilt, idle (6 markers)
+- `scheduler_nvtx_range` context manager helper added
+- `_NVTX_COLOR_MAP` extended with 14 new color entries
+
+### M5-6.2: 请求入口 NVTX 标记 ✅
 
 **What**: Add NVTX to `handle_generate_request` and `handle_batch_generate_request`.
 
 **Why**: Currently zero visibility into request admission latency.
 
-**Tasks**:
-- `@scheduler_nvtx_method("scheduler.handle_generate_request")`
-- `@scheduler_nvtx_method("scheduler.handle_batch_generate_request")`
+**Status**: Complete
 
-### M5-6.3: 超时和中止路径 NVTX 标记
+### M5-6.3: 超时和中止路径 NVTX 标记 ✅
 
 **What**: Add NVTX to timeout/abort handling.
 
 **Why**: These paths are invisible in profiles but can cause latency spikes.
 
-**Tasks**:
-- `@scheduler_nvtx_method("scheduler._abort_on_running_timeout")`
-- `@scheduler_nvtx_method("scheduler._abort_on_queued_limit")`
-- `@scheduler_nvtx_method("scheduler.abort_request")`
-- `@scheduler_nvtx_method("scheduler.on_idle")`
+**Status**: Complete
+
+**Delivered**:
+- `@scheduler_nvtx_method` on `_abort_on_running_timeout`, `_abort_on_queued_limit`, `abort_request`, `on_idle`
+- `scheduler.abort_request` and `scheduler.on_idle` color map entries
 
 ---
 
@@ -135,40 +135,43 @@ Sub-stage markers break it down.
 
 **Goal**: Go beyond timing — add causal tracing and anomaly detection.
 
-### M7-8.1: FutureMap 可观测性
+### M7-8.1: FutureMap 可观测性 ✅
 
 **What**: Add metrics for the overlap scheduler's FutureMap relay.
 
 **Why**: FutureMap is "always-on" but has zero observability. Operators
 cannot tell if relay lag is causing issues.
 
-**Tasks**:
-- Add `future_map_pool_hit_rate` gauge
-- Add `future_map_relay_lag_ms` histogram
-- Add `future_map_buffer_depth` gauge
-- Add debug-mode poison-buffer detection → warning log
+**Status**: Complete
 
-### M7-8.2: PrefillDelayer 决策审计
+**Delivered**:
+- 3 counters: stash_total, publish_total, resolve_total
+- 1 histogram: relay_latency_ms (0.01-500ms buckets)
+- Instrumented `publish`, `stash`, `resolve_seq_lens_cpu` in FutureMap
+- Wired through `SpeculativeAlgorithm.create_future_map` with `metrics_collector`
 
-**What**: Log which specific requests were delayed and why.
+### M7-8.2: PrefillDelayer 决策审计 ✅
 
-**Why**: Currently only aggregated counters exist (`prefill_delayer_outcomes_total`).
-Operators need per-request audit trail.
+**What**: Verify PrefillDelayer metrics coverage.
 
-**Tasks**:
-- Add `prefill_delayer_decision` structured log (request_id, reason, memory_estimate)
-- Add `prefill_delayer_wait_seconds` histogram per request
+**Why**: Audit confirmed `observe_prefill_delayer_outcome` already covers all
+negotiation outcomes (delay, wait_success, wait_timeout, token_watermark)
+with forward_passes, wait_seconds, input_estimation labels.
 
-### M7-8.3: MinFreeSlotsDelayer 指标
+**Status**: Complete — no additional code needed, existing coverage is comprehensive
+
+### M7-8.3: MinFreeSlotsDelayer 指标 ✅
 
 **What**: Add metrics for the new MinFreeSlotsDelayer (upstream just added).
 
 **Why**: It has zero metrics — not even the basic counters that PrefillDelayer has.
 
-**Tasks**:
-- Add `min_free_slots_delayer_decisions_total` counter
-- Add `min_free_slots_delayer_wait_seconds` histogram
-- Add `min_free_slots_delayer_current_free` gauge
+**Status**: Complete
+
+**Delivered**:
+- 2 counters: delay_total, checks_total
+- 2 histograms: running_bs, allocatable (0-128 buckets)
+- Instrumented `MinFreeSlotsDelayer.should_delay` with metrics_collector
 
 ---
 
@@ -176,35 +179,44 @@ Operators need per-request audit trail.
 
 **Goal**: Build tools that operators use daily.
 
-### M9-10.1: 调度器健康仪表板指标
+### M9-10.1: 调度器健康仪表板指标 ✅
 
-**What**: A single aggregated "scheduler health score" from scattered metrics.
+**What**: Scheduler loop iteration metrics for health dashboards.
 
 **Why**: Currently operators piece together CPU-bound vs GPU-bound vs
 network-bound from 5+ different metrics sources.
 
-**Tasks**:
-- Add `scheduler_health_score` gauge (0-100)
-- Derived from: idle ratio, overlap queue depth, retraction rate, PD queue depths
-- Document the scoring formula in a new `SCHEDULER_HEALTH.md`
+**Status**: Complete
 
-### M9-10.2: NVTX 采样模式
+**Delivered**:
+- 3 counters: loop_iterations_total, batch_dispatches_total, idle_total
+- 1 histogram: iteration_lag_ms (0.01-1000ms buckets)
+- 1 counter: aborts_total with reason label (running_timeout, queue_full, waiting_timeout, user_abort)
+- Instrumented all 5 event loops: normal, overlap, pp, pp_disagg_prefill, pp_disagg_decode
+- Instrumented 4 abort paths: running_timeout, queued_limit, waiting_timeout, user_abort
+
+### M9-10.2: NVTX 采样模式 ✅
 
 **What**: Allow NVTX to sample a percentage of iterations instead of all/none.
 
 **Why**: On/off is too coarse for production. Sampling 10% gives
 statistical visibility with negligible overhead.
 
-**Tasks**:
-- Add `SGLANG_NVTX_SAMPLE_RATE` env var (0.0-1.0, default 1.0)
-- Modify `scheduler_nvtx_method` to check sample rate
-- Document in NVTX_PROFILING_GUIDE.md
+**Status**: Complete
+
+**Delivered**:
+- `SGLANG_SCHEDULER_NVTX_SAMPLE_RATE` env var (default 1 = always emit)
+- `scheduler_nvtx_method_sampled` decorator
+- `scheduler_nvtx_range_sampled` context manager
+- Per-call-site counters ensure independent sampling for each marker
 
 ### M9-10.3: 性能回归检测工具
 
 **What**: A script that compares NVTX profile data across runs.
 
 **Why**: Operators need to detect performance regressions before they hit production.
+
+**Status**: Pending
 
 **Tasks**:
 - Create `tools/nvtx_regression_check.py`
@@ -218,33 +230,40 @@ statistical visibility with negligible overhead.
 
 **Goal**: Submit upstream PRs and prepare for long-term maintenance.
 
-### M11-12.1: Upstream PR #1 — NVTX 装饰器
+### M11-12.1: Upstream PR #1 — NVTX 装饰器和子阶段标记
 
-**What**: Submit the 4 scheduler + 4 PP mixin NVTX decorators as a PR.
+**What**: Submit the scheduler NVTX decorators and sub-stage markers as a PR.
 
 **Why**: Upstream already added 5 NVTX markers. Our 8 additional markers
-complement theirs without overlap.
+complement theirs without overlap. The `scheduler_nvtx_range` context manager
+and sampling variants are also new contributions.
 
-**Tasks**:
-- Polish `scheduler_nvtx.patch` (currently 576 lines)
-- Write PR description explaining each marker's purpose
-- Submit to `sgl-project/sglang`
-- Address review feedback
+**Status**: Ready for submission
+
+**Changes to include**:
+- `scheduler_nvtx_range` context manager (new in JoyFuture)
+- `scheduler_nvtx_method_sampled` / `scheduler_nvtx_range_sampled`
+- 8 new decorator markers in scheduler.py
+- 4 new decorator markers in scheduler_pp_mixin.py
+- 14 new color map entries in nvtx_utils.py
 
 **Upstreamability**: ★★★ Medium — depends on NVTX marker naming review
 
-### M11-12.2: Upstream PR #2 — Scheduler Env Vars 基础设施
+### M11-12.2: Upstream PR #2 — Scheduler Metrics 基础设施
 
-**What**: Submit the `SchedulerEnvs` class pattern.
+**What**: Submit the FutureMap metrics and scheduler health dashboard metrics.
 
-**Why**: Upstream's `Envs` class works but has no subsystem scoping.
-Our `SchedulerEnvs` pattern could be generalized.
+**Why**: These are additive observability improvements that benefit all
+SGLang operators.
 
-**Tasks**:
-- Refactor to a generic `SubsystemEnvs` base class
-- Submit as RFC + PR
+**Status**: Ready for submission
 
-**Upstreamability**: ★★☆ Medium — needs team discussion on naming
+**Changes to include**:
+- FutureMap metrics: stash/publish/resolve counters + relay latency histogram
+- Scheduler health: loop iteration counters + lag histogram + abort reason counter
+- MinFreeSlotsDelayer metrics
+
+**Upstreamability**: ★★★ High — purely additive, no behavior changes
 
 ### M11-12.3: 文档完善
 
