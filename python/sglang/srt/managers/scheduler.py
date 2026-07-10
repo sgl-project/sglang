@@ -965,7 +965,6 @@ class Scheduler(
                 "disabling session radix cache.",
                 type(self.tree_cache).__name__,
             )
-            self.server_args.enable_session_radix_cache = False
             if isinstance(self.tree_cache, RadixCache):
                 self.tree_cache.enable_session_radix_cache = False
 
@@ -2112,9 +2111,8 @@ class Scheduler(
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
         # Radix-native sessions use only the top-level session_id.
-        radix_native_session = (
-            recv_req.session_id is not None
-            and self.server_args.enable_session_radix_cache
+        radix_native_session = recv_req.session_id is not None and getattr(
+            self.tree_cache, "enable_session_radix_cache", False
         )
 
         if session_id is None or radix_native_session:
@@ -4451,7 +4449,7 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
+        if getattr(self.tree_cache, "enable_session_radix_cache", False):
             self.tree_cache.open_radix_session(recv_req.session_id)
         output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -4459,10 +4457,10 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
+        if getattr(self.tree_cache, "enable_session_radix_cache", False):
             self.tree_cache.release_radix_session(recv_req.session_id)
         if recv_req.session_id in self.session_controller or not (
-            self.server_args.enable_session_radix_cache
+            getattr(self.tree_cache, "enable_session_radix_cache", False)
         ):
             self.session_controller.close(recv_req)
 
