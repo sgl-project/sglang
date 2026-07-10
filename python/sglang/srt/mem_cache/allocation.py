@@ -1085,7 +1085,7 @@ def alloc_for_spec_decode(
                 )
                 pages_per_req.append((nxt_kv_len - cur_kv_len) // page_size)
             page_ids = alloc_pages_or_raise(
-                tree_cache, sum(pages_per_req), phase="Prefill"
+                tree_cache, sum(pages_per_req), phase="Spec-decode"
             )
 
             req_pool_indices_cpu = torch.tensor(

@@ -793,8 +793,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if need_tokens > self.available_size():
                 if not self._flush_peer_for_alloc(need_tokens):
                     return None
-            if self.need_sort and num_pages > len(self.free_virtual_ids):
-                self.merge_and_sort_free()
 
             v_pages = self.free_virtual_ids[:num_pages]
             self.free_virtual_ids = self.free_virtual_ids[num_pages:]
