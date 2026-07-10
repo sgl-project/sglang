@@ -373,22 +373,19 @@ class Req:
         if self.is_warmup or self.suppress_logs:
             return
         if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
-            display_prompt = (
-                self.prompt
-                if logger.isEnabledFor(logging.DEBUG)
-                else _sanitize_for_logging(self.prompt, key_hint="prompt")
+            if not logger.isEnabledFor(logging.DEBUG):
+                return
+            logger.debug(
+                "VLA request: prompt=%s seed=%s steps=%s outputs=%s action=%sx%s "
+                "save_output=%s",
+                _sanitize_for_logging(self.prompt, key_hint="prompt"),
+                self.seed,
+                self.num_inference_steps,
+                self.num_outputs_per_prompt,
+                getattr(self, "action_horizon", None),
+                getattr(self, "action_dim", None),
+                self.save_output,
             )
-            debug_str = f"""VLA sampling params:
-                      prompt: {display_prompt}
-                        seed: {self.seed}
-                 infer_steps: {self.num_inference_steps}
-      num_outputs_per_prompt: {self.num_outputs_per_prompt}
-              action_horizon: {getattr(self, "action_horizon", None)}
-                  action_dim: {getattr(self, "action_dim", None)}
-                 save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
-        """  # type: ignore[attr-defined]
-            logger.info(debug_str)
             return
 
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment

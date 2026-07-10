@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
@@ -19,7 +19,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -168,6 +168,15 @@ class VLADenoiseGraphRunner:
             current_context_digest=prefix_context.cache_key_digest,
         )
         self._captured[signature] = captured
+        logger.info(
+            "Captured VLA denoise CUDA graph: batch=%d prefix=%d action=%dx%d "
+            "dtype=%s",
+            signature.batch_size,
+            signature.prefix_len,
+            signature.action_horizon,
+            signature.action_dim,
+            signature.dtype,
+        )
         return captured
 
     def capture_or_run(
