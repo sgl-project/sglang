@@ -20,11 +20,14 @@ Page-aligned memory pool.
 """
 
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    expand_page_ids_to_token_ids,
+)
 from sglang.srt.mem_cache.triton_ops.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
@@ -156,7 +159,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             f"with page_size={self.page_size}"
         )
 
-        num_pages = need_size // self.page_size
+        out_pages = self.alloc_pages(need_size // self.page_size)
+        if out_pages is None:
+            return None
+
+        return expand_page_ids_to_token_ids(out_pages, self.page_size)
+
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        if num_pages <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
         if self.need_sort and num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
@@ -164,13 +176,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
-
-        out_indices = (
-            out_pages[:, None] * self.page_size
-            + torch.arange(self.page_size, device=self.device)
-        ).reshape(-1)
-
-        return out_indices
+        return out_pages
 
     def alloc_extend(
         self,

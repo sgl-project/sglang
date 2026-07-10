@@ -24,6 +24,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+def expand_page_ids_to_token_ids(
+    page_ids: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    page_offsets = torch.arange(
+        page_size, dtype=page_ids.dtype, device=page_ids.device
+    )
+    return (page_ids[:, None] * page_size + page_offsets[None, :]).reshape(-1)
+
+
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def __init__(
@@ -96,6 +105,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError("alloc_decode is only for paged allocator")
+
+    def alloc_pages(self, num_pages: int):
+        raise NotImplementedError("alloc_pages is only for paged allocator")
+
+    def alloc_pages_decode(self, num_pages: int):
+        return self.alloc_pages(num_pages)
 
     def resize(self, config) -> None:
         self.size = config.max_total_num_tokens

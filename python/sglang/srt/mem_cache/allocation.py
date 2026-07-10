@@ -317,6 +317,39 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+def alloc_pages_or_raise(
+    tree_cache: BasePrefixCache,
+    num_pages: int,
+    *,
+    phase: str,
+    decode: bool = False,
+) -> torch.Tensor:
+    """Evict + ``alloc_pages`` (``alloc_pages_decode`` when ``decode``) and
+    raise the standard OOM error on failure. Returns page ids (device tensor).
+    """
+    allocator = tree_cache.token_to_kv_pool_allocator
+    num_tokens = num_pages * allocator.page_size
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    if decode:
+        page_ids = allocator.alloc_pages_decode(num_pages)
+    else:
+        page_ids = allocator.alloc_pages(num_pages)
+
+    if page_ids is None:
+        error_msg = (
+            f"{phase} out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
+
+    return page_ids
+
+
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
     """Per-req c{4,128}_state pool alloc lens (``DSV4StateLens``) for this step.
     None on CUDA / non-V4 paths (allocator has no ``compute_dsv4_state_lens_*``).
