@@ -431,6 +431,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.target_worker.device
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            self.draft_runner.graph_mem_usage += before_mem - after_mem
             log_info_on_rank0(
                 logger,
                 "Capture draft decode CUDA graph end. "
@@ -501,6 +502,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            self.draft_runner.graph_mem_usage += before_mem - after_mem
             log_info_on_rank0(
                 logger,
                 "Capture draft extend CUDA graph end. "
