@@ -41,7 +41,7 @@ class ViolationLog:
     violation_write_index: torch.Tensor
 
     @classmethod
-    def allocate(cls, *, ring_capacity: int, device: torch.device) -> "ViolationLog":
+    def allocate(cls, *, ring_capacity: int, device: torch.device) -> ViolationLog:
         if ring_capacity <= 0:
             raise ValueError(
                 f"kv-canary: ViolationLog ring_capacity must be positive, got {ring_capacity}"
@@ -102,7 +102,7 @@ class CanaryDeviceState:
         num_tags: int,
         req_to_token_alloc_size: Optional[int] = None,
         max_context_len: Optional[int] = None,
-    ) -> "CanaryDeviceState":
+    ) -> CanaryDeviceState:
         if num_tags <= 0:
             raise ValueError(
                 f"kv-canary: CanaryDeviceState num_tags must be positive, got {num_tags}"

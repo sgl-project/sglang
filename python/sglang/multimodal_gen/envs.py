@@ -57,7 +57,10 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
+    SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
+    SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
@@ -294,6 +297,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
+    "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW": _lazy_bool(
+        "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"
+    ),
+    "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES": _lazy_int(
+        "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
+    ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
     # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
     # Supported values:
@@ -304,6 +313,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy aliases `cudnn` and `trtllm` are also accepted.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # Experimental opt-in for W8A8 FP8 GEMM in diffusion weight-only FP8 linears.
+    # When disabled, FP8 weights are dequantized to compute dtype before matmul.
+    "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

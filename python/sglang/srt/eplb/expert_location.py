@@ -253,7 +253,7 @@ class ExpertLocationMetadata:
 
     def update(
         self,
-        other: "ExpertLocationMetadata",
+        other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
         for field in [
@@ -305,17 +305,18 @@ class ExpertLocationMetadata:
         ]
 
 
-_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
-
-
 def get_global_expert_location_metadata():
-    return _global_expert_location_metadata
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value):
-    global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
-    _global_expert_location_metadata = value
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    assert resources.expert_location_metadata is None
+    resources.expert_location_metadata = value
 
 
 def broadcast_global_expert_location_metadata(

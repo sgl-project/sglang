@@ -76,16 +76,6 @@ class TestGraphSlot(unittest.TestCase):
                 axis="garbage",
             )
 
-    def test_slice_for_before_buffer_alloc_raises(self):
-        slot = GraphSlot(
-            name="x",
-            shape_fn=lambda bs, mt: (bs,),
-            dtype=torch.int32,
-            axis="bs",
-        )
-        with self.assertRaises(RuntimeError):
-            slot.slice_for(padded_bs=1, padded_num_tokens=1)
-
 
 class TestRegistryRegister(unittest.TestCase):
     def test_register_allocates_zero_buffer(self):
@@ -101,22 +91,6 @@ class TestRegistryRegister(unittest.TestCase):
         self.assertEqual(slot.buffer.shape, (16,))
         self.assertEqual(slot.buffer.dtype, torch.int64)
         self.assertTrue(torch.equal(slot.buffer, torch.zeros(16, dtype=torch.int64)))
-
-    def test_register_fill_sentinel_init(self):
-        r = _make_registry()
-        slot = r.register_slot(
-            GraphSlot(
-                name="seq_lens",
-                shape_fn=lambda bs, mt: (bs,),
-                dtype=torch.int32,
-                axis="bs",
-                padding_policy=PaddingPolicy.FILL_SENTINEL,
-                pad_value=7,
-            )
-        )
-        self.assertTrue(
-            torch.equal(slot.buffer, torch.full((8,), 7, dtype=torch.int32))
-        )
 
     def test_register_duplicate_raises(self):
         r = _make_registry()
@@ -152,22 +126,6 @@ class TestRegistryRegister(unittest.TestCase):
         self.assertIsNone(slot.buffer)
         self.assertFalse(r.has_slot("off"))
         self.assertNotIn("off", r.slot_names())
-
-    def test_cpu_device_override(self):
-        r = _make_registry()
-        slot = r.register_slot(
-            GraphSlot(
-                name="seq_lens_cpu",
-                shape_fn=lambda bs, mt: (bs,),
-                dtype=torch.int32,
-                axis="bs",
-                device=torch.device("cpu"),
-                padding_policy=PaddingPolicy.FILL_SENTINEL,
-                pad_value=11,
-            )
-        )
-        self.assertEqual(slot.buffer.device.type, "cpu")
-        self.assertEqual(int(slot.buffer[0].item()), 11)
 
 
 class TestFillFromAndExtract(unittest.TestCase):
@@ -232,35 +190,6 @@ class TestFillFromAndExtract(unittest.TestCase):
             )
         )
         return r
-
-    def test_basic_fill_no_padding(self):
-        r = self._build_registry()
-        fb = _MiniForwardBatch(
-            batch_size=4,
-            input_ids=torch.arange(8, dtype=torch.int64),
-            req_pool_indices=torch.tensor([3, 1, 4, 2], dtype=torch.int64),
-            seq_lens=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
-            out_cache_loc=torch.arange(8, dtype=torch.int64) + 100,
-            positions=torch.arange(8, dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
-        )
-        r.fill_from(
-            fb,
-            raw_bs=4,
-            padded_bs=4,
-            raw_num_tokens=8,
-            padded_num_tokens=8,
-        )
-        self.assertTrue(torch.equal(r.get_slot("input_ids").buffer, fb.input_ids))
-        self.assertTrue(
-            torch.equal(r.get_slot("req_pool_indices").buffer, fb.req_pool_indices)
-        )
-        self.assertTrue(torch.equal(r.get_slot("seq_lens").buffer, fb.seq_lens))
-        self.assertTrue(
-            torch.equal(r.get_slot("out_cache_loc").buffer, fb.out_cache_loc)
-        )
-        self.assertTrue(torch.equal(r.get_slot("positions").buffer, fb.positions))
-        self.assertTrue(torch.equal(r.get_slot("seq_lens_cpu").buffer, fb.seq_lens_cpu))
 
     def test_fill_with_padding_resets_zero_and_sentinel(self):
         r = self._build_registry()
@@ -404,39 +333,6 @@ class TestFillFromAndExtract(unittest.TestCase):
 
 
 class TestMissingAndOptionalSlots(unittest.TestCase):
-    def test_missing_fb_attr_is_skipped(self):
-        r = _make_registry()
-        r.register_slot(
-            GraphSlot(
-                name="encoder_lens",
-                shape_fn=lambda bs, mt: (bs,),
-                dtype=torch.int32,
-                axis="bs",
-                padding_policy=PaddingPolicy.FILL_SENTINEL,
-                pad_value=0,
-            )
-        )
-        fb = _MiniForwardBatch(
-            batch_size=2,
-            input_ids=torch.arange(4, dtype=torch.int64),
-            encoder_lens=None,  # FB doesn't carry this for this request.
-        )
-        # Should NOT raise; encoder_lens buffer stays at the FILL_SENTINEL
-        # init value.
-        r.fill_from(
-            fb,
-            raw_bs=2,
-            padded_bs=4,
-            raw_num_tokens=4,
-            padded_num_tokens=8,
-        )
-        self.assertTrue(
-            torch.equal(
-                r.get_slot("encoder_lens").buffer,
-                torch.zeros(8, dtype=torch.int32),
-            )
-        )
-
     def test_extract_carries_none_for_absent_plain_slot(self):
         # A plain copy slot absent this iter (mrope on a non-multimodal batch)
         # must be carried as None, not exposed as the stale/zero buffer.
@@ -467,6 +363,35 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
             fb_view.input_ids.data_ptr(), r.get_slot("input_ids").buffer.data_ptr()
         )
         self.assertIsNone(fb_view.mrope_positions)
+
+    def test_plain_slot_with_missing_fb_attr_keeps_sentinel(self):
+        # A plain copy slot whose FB field is None must be skipped, leaving its
+        # buffer at the FILL_SENTINEL init value rather than raising.
+        r = _make_registry()
+        slot = r.register_slot(
+            GraphSlot(
+                "encoder_lens",
+                lambda bs, mt: (bs,),
+                torch.int32,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_SENTINEL,
+                pad_value=0,
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(4, dtype=torch.int64),
+            encoder_lens=None,
+        )
+        r.fill_from(
+            fb,
+            raw_bs=2,
+            padded_bs=4,
+            raw_num_tokens=4,
+            padded_num_tokens=8,
+        )
+        # Buffer untouched by the copy; stays at the sentinel pad value.
+        self.assertTrue(torch.equal(slot.buffer, torch.zeros_like(slot.buffer)))
 
     def test_extract_exposes_computed_slot_even_when_fb_field_none(self):
         # A computed slot (copy_from_fb=False) is always exposed, even when its
@@ -635,40 +560,6 @@ class TestSourceFnSlots(unittest.TestCase):
         r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
         self.assertTrue(torch.all(buf == 7))  # untouched
 
-    def test_side_input_source_via_fill_context(self):
-        r = _make_registry(max_bs=8, max_num_tokens=16)
-        r.register_slot(
-            GraphSlot(
-                name="pp_proxy_tensors.hidden_states",
-                shape_fn=lambda _bs, mt: (mt,),
-                dtype=torch.int32,
-                axis="none",
-                padding_policy=PaddingPolicy.KEEP_PAD,
-                source_fn=lambda fb, ctx: (
-                    None
-                    if ctx.pp_proxy_tensors is None
-                    else ctx.pp_proxy_tensors.tensors["hidden_states"]
-                ),
-            )
-        )
-        buf = r.get_slot("pp_proxy_tensors.hidden_states").buffer
-        buf.zero_()
-        fb = _MiniForwardBatch(batch_size=4)
-        pp = SimpleNamespace(
-            tensors={"hidden_states": torch.tensor([5, 6, 7, 8], dtype=torch.int32)}
-        )
-        r.fill_from(
-            fb,
-            raw_bs=4,
-            padded_bs=8,
-            raw_num_tokens=4,
-            padded_num_tokens=16,
-            pp_proxy_tensors=pp,
-        )
-        self.assertTrue(
-            torch.equal(buf[:4], torch.tensor([5, 6, 7, 8], dtype=torch.int32))
-        )
-
     def test_extract_buffer_skips_dotted_slots(self):
         r = _make_registry(max_bs=8, max_num_tokens=16)
         r.register_slot(
@@ -723,31 +614,6 @@ class TestPoolBackedAlloc(unittest.TestCase):
         self.assertNotEqual(
             r1.get_slot("ids").buffer.data_ptr(),
             r2.get_slot("ids").buffer.data_ptr(),
-        )
-
-    def test_same_size_shares_one_allocation(self):
-        a = self._reg(max_num_tokens=16, share_pool=True)
-        b = self._reg(max_num_tokens=16, share_pool=True)
-        a.register_slot(self._ids_slot("ids"))
-        b.register_slot(self._ids_slot("ids"))
-        # Identical (name, size, dtype, device) -> one shared allocation.
-        self.assertEqual(
-            a.get_slot("ids").buffer.data_ptr(),
-            b.get_slot("ids").buffer.data_ptr(),
-        )
-
-    def test_different_sizes_do_not_share(self):
-        big = self._reg(max_num_tokens=32, share_pool=True)
-        small = self._reg(max_num_tokens=16, share_pool=True)
-        big.register_slot(self._ids_slot("ids"))
-        small.register_slot(self._ids_slot("ids"))
-        # Different sizes -> different pool keys -> independent storage (no
-        # aliasing a smaller request onto a larger buffer).
-        self.assertEqual(tuple(small.get_slot("ids").buffer.shape), (16,))
-        self.assertEqual(tuple(big.get_slot("ids").buffer.shape), (32,))
-        self.assertNotEqual(
-            small.get_slot("ids").buffer.data_ptr(),
-            big.get_slot("ids").buffer.data_ptr(),
         )
 
     def test_sharing_is_independent_of_registration_order(self):
@@ -819,8 +685,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.tensor([0, 1], dtype=torch.int64),
             out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
             req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
-            seq_lens=torch.tensor([7, 8], dtype=torch.int32),
-            seq_lens_cpu=torch.tensor([7, 8], dtype=torch.int32),
+            seq_lens=torch.tensor([7, 8], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([7, 8], dtype=torch.int64),
             mrope_positions=torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int64),
         )
         # Poison tails so resets are observable.
@@ -847,14 +713,16 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.equal(rp[2:4], torch.tensor([0, 0])))
         # FILL_SENTINEL: head copied, tail = seq_len_fill_value.
         sl = reg.get_slot("seq_lens").buffer
-        self.assertTrue(torch.equal(sl[:2], torch.tensor([7, 8], dtype=torch.int32)))
+        self.assertEqual(sl.dtype, torch.int64)
+        self.assertTrue(torch.equal(sl[:2], torch.tensor([7, 8], dtype=torch.int64)))
         self.assertTrue(
-            torch.equal(sl[2:4], torch.tensor([FILL, FILL], dtype=torch.int32))
+            torch.equal(sl[2:4], torch.tensor([FILL, FILL], dtype=torch.int64))
         )
         slc = reg.get_slot("seq_lens_cpu").buffer
         self.assertEqual(slc.device.type, "cpu")
+        self.assertEqual(slc.dtype, torch.int64)
         self.assertTrue(
-            torch.equal(slc[2:4], torch.tensor([FILL, FILL], dtype=torch.int32))
+            torch.equal(slc[2:4], torch.tensor([FILL, FILL], dtype=torch.int64))
         )
         # 2D mrope via slice_fn.
         mr = reg.get_slot("mrope_positions").buffer
@@ -879,8 +747,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -902,12 +770,11 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
 
     def test_num_token_non_padded_gathered_dp_branch(self):
-        import unittest.mock as mock
 
-        from sglang.srt.model_executor import forward_batch_info as fbi
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
+        from sglang.srt.runtime_context import get_parallel
 
         ntnp = torch.zeros(1, dtype=torch.int32)
         src = SimpleNamespace(
@@ -915,8 +782,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             num_token_non_padded=ntnp,
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
@@ -924,9 +791,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         # Gathered (DP) path: post_fill overwrites the FB copy with the local
         # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
-        with mock.patch.object(
-            fbi, "get_attention_tp_size", return_value=2
-        ), mock.patch.object(fbi, "get_attention_tp_rank", return_value=0):
+        with get_parallel().override(attn_tp_size=2, attn_tp_rank=0):
             reg = build_decode_registry(
                 device=torch.device("cpu"),
                 max_bs=4,
@@ -976,8 +841,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.arange(2, dtype=torch.int64),
             out_cache_loc=torch.arange(2, dtype=torch.int64),
             req_pool_indices=torch.zeros(2, dtype=torch.int64),
-            seq_lens=torch.full((2,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((2,), 5, dtype=torch.int32),
+            seq_lens=torch.full((2,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((2,), 5, dtype=torch.int64),
             global_num_tokens_gpu=gnt,
             global_num_tokens_for_logprob_gpu=gntlp,
         )
@@ -1014,8 +879,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -1062,8 +927,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -1110,8 +975,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),

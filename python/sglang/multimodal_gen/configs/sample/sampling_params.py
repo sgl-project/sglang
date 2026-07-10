@@ -103,6 +103,9 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Video inputs (video-to-video conditioning)
+    video_path: str | list[str] | None = None
+
     # Text inputs
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -157,6 +160,9 @@ class SamplingParams:
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
+
+    # Output audio duration in seconds (models without an audio modality ignore this).
+    sound_duration: float = 0.0
 
     # Denoising parameters
     num_inference_steps: int = None
@@ -842,6 +848,11 @@ class SamplingParams:
             help="Number of frames to generate",
         )
         add_argument(
+            "--sound-duration",
+            type=float,
+            help="Duration of generated audio in seconds; 0 disables audio output (audio-capable models only)",
+        )
+        add_argument(
             "--height",
             type=int,
             help="Height of generated output",
@@ -938,22 +949,24 @@ class SamplingParams:
         )
         add_argument(
             "--image-path",
+            "--image-paths",
             type=str,
             nargs="+",
             help=(
                 "Path(s) to input image(s) for image-to-image / image-to-video "
-                "generation. For multiple images, pass them as space-separated "
-                "values, e.g.: "
-                '--image-path "img1.png" "img2.png"'
+                "generation. For multiple images, pass them space-separated "
+                "(alias: --image-paths), e.g.: "
+                '--image-paths "img1.png" "img2.png"'
             ),
         )
         add_argument(
             "--action",
             type=str,
             help=(
-                "SANA-WM WASD/IJKL action DSL, e.g. "
-                "'w-80,jw-40,w-40,lw-60,w-100'. Model-specific fields are "
-                "ignored by other pipelines."
+                "Action input. SANA-WM uses a WASD/IJKL DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'. Cosmos3 uses a JSON array of "
+                "shape [T, D], e.g. '[[0.1, 0.2, ...], ...]'. Model-specific "
+                "fields are ignored by other pipelines."
             ),
         )
         add_argument(
@@ -976,6 +989,57 @@ class SamplingParams:
             type=float,
             dest="pitch_limit_deg",
             help="SANA-WM action DSL absolute pitch clamp in degrees.",
+        )
+        add_argument(
+            "--video-path",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to input video(s) for video-to-video generation. "
+                "The first/last frames of the video become the conditioning "
+                "frames for the generated output."
+            ),
+        )
+        add_argument(
+            "--action-mode",
+            type=str,
+            dest="action_mode",
+            help=(
+                "Cosmos3 action mode: 'forward_dynamics' (predict next frame "
+                "from action), 'policy' (predict action from frame), or "
+                "'inverse_dynamics' (predict action from two frames)."
+            ),
+        )
+        add_argument(
+            "--domain-id",
+            type=int,
+            dest="domain_id",
+            help="Action embodiment domain ID (integer). Overrides --domain-name.",
+        )
+        add_argument(
+            "--domain-name",
+            type=str,
+            dest="domain_name",
+            help="Action embodiment domain name (e.g. 'av', 'camera_pose', 'umi').",
+        )
+        add_argument(
+            "--raw-action-dim",
+            type=int,
+            dest="raw_action_dim",
+            help=(
+                "Number of active action dimensions to predict; remaining "
+                "dimensions are zero-padded. Required for 'policy' and "
+                "'inverse_dynamics' modes."
+            ),
+        )
+        add_argument(
+            "--action-fps",
+            type=float,
+            dest="action_fps",
+            help=(
+                "Frame rate used for action token temporal mRoPE positions. "
+                "Defaults to the video fps when not set."
+            ),
         )
         add_argument(
             "--moba-config-path",
