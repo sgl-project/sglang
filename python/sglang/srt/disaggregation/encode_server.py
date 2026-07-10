@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -37,6 +38,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import (
     ProfileReq,
+    ProfileReqType,
+    async_sock_recv,
     sock_send,
     wrap_as_pickle,
 )
@@ -2105,6 +2108,54 @@ class EncoderScheduler:
                 )
                 if not p.future.done():
                     p.future.set_exception(e)
+
+
+async def run_encoder(
+    server_args: ServerArgs, schedule_path, dist_init_method, rank: int
+):
+    encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
+    while True:
+        request = await async_sock_recv(encoder.schedule_socket)
+        await _handle_encoder_worker_request(encoder, request)
+
+
+async def _handle_encoder_worker_request(encoder: MMEncoder, request):
+    if isinstance(request, ProfileReq):
+        if request.req_type == ProfileReqType.START_PROFILE:
+            if encoder.profiler is None:
+                encoder.profiler = EncoderProfiler(encoder.rank)
+            encoder.profiler.start(request)
+        else:
+            encoder.profiler.stop()
+    elif isinstance(request, dict) and request.get("type") == "batch_encode":
+        await encoder.batch_encode(
+            request["requests"],
+            Modality.from_str(request["modality"]),
+        )
+    elif (
+        isinstance(request, dict)
+        and isinstance(request.get("req_id"), str)
+        and request["req_id"].startswith(HEALTH_CHECK_RID_PREFIX)
+    ):
+        await encoder.encode(
+            mm_items=request["mm_items"],
+            modality=Modality.from_str(request["modality"]),
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+            hashes=request.get("hashes"),
+        )
+    else:
+        await encoder.encode_request(request, Modality.from_str(request["modality"]))
+
+
+def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    try:
+        asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))
+    except KeyboardInterrupt:
+        logger.info(f"Exit rank {rank}")
+    except Exception:
+        traceback.print_exc()
 
 
 # Per-process encoder metrics collector. Set by encode_http_server in
