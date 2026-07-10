@@ -1003,8 +1003,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # dst_kv_indices covers the page-aligned host allocation; the
                 # transfer target is only the real-fill head slice (in host
                 # token units, which are compressed for DSV4 HiSparse).
-                hisparse_transfer_len = self.scheduler.hisparse_coordinator.host_token_len(
-                    origin_input_len - prefix_len
+                hisparse_transfer_len = (
+                    self.scheduler.hisparse_coordinator.host_token_len(
+                        origin_input_len - prefix_len
+                    )
                 )
                 kv_indices = (
                     dst_kv_indices[:hisparse_transfer_len]
@@ -1469,9 +1471,7 @@ def alloc_for_decode_prealloc_hisparse(
     req: Req,
     fill_len: int,
 ) -> torch.Tensor:
-    alloc_fill_len = (
-        fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
-    )
+    alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
@@ -1500,9 +1500,7 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    alloc_fill_len = (
-        fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
-    )
+    alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
