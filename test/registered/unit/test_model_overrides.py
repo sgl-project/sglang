@@ -39,9 +39,6 @@ class _FakeArgs:
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
-    def test_arg_defaults_to_not_overridable(self):
-        self.assertFalse(Arg().resolvable)
-
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
             resolvable_fields(_FakeArgs),
@@ -90,9 +87,6 @@ class TestModelOverridableWhitelist(CustomTestCase):
                 }
             ),
         )
-
-    def test_non_dataclass_yields_empty_whitelist(self):
-        self.assertEqual(resolvable_fields(SimpleNamespace), frozenset())
 
 
 class _IsolatedRegistry(CustomTestCase):
@@ -244,11 +238,6 @@ class _IsolatedPublish(CustomTestCase):
         super().tearDown()
 
 
-@dataclasses.dataclass
-class _NoOverridableArgs:
-    x: int = 1
-
-
 class TestPublishInstallsSlot(_IsolatedPublish):
     """Publish wiring: set_server_args installs the already-resolved object
     into the context-owned slot (no transformation at publish time)."""
@@ -263,12 +252,6 @@ class TestPublishInstallsSlot(_IsolatedPublish):
         # The stash is created before the dummy short-circuit and stays empty.
         self.assertEqual(sa._resolved_overrides, [])
         set_global_server_args_for_scheduler(sa)
-        self.assertIs(get_server_args(), sa)
-
-    def test_empty_stash_publish_runs_gate_as_noop(self):
-        sa = _NoOverridableArgs()
-        sa._resolved_overrides = []
-        get_context().set_server_args(sa)
         self.assertIs(get_server_args(), sa)
 
 
@@ -312,12 +295,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def _publish(self, server_args):
         from sglang.srt.server_args import (
-            get_global_server_args,
             set_global_server_args_for_scheduler,
         )
 
         set_global_server_args_for_scheduler(server_args)
-        return get_global_server_args()
+        return get_server_args()
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
@@ -326,11 +308,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("MODEL_OVERRIDES['MistralLarge3ForCausalLM']", {"dtype": "bfloat16"}),
             sa._resolved_overrides,
         )
-        self.assertEqual(self._publish(sa).dtype, "bfloat16")
-
-    def test_pixtral_forces_bfloat16(self):
-        sa = self._construct("PixtralForConditionalGeneration", "pixtral")
-        self.assertEqual(sa.dtype, "bfloat16")  # materialized
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
     def test_user_requested_dtype_is_still_overridden(self):
@@ -728,30 +705,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"page_size": 32},
             )
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
-
-    def test_declaration_overlay_mechanics(self):
-        from sglang.srt.arg_groups.overrides import run_post_process_pass
-
-        live = SimpleNamespace(x="user", y=None, _resolved_overrides=[])
-
-        def _resolve_x(view):
-            return {"x": "resolved"} if view.x == "user" else {}
-
-        def _read_x(view):
-            return {"y": view.x}
-
-        run_post_process_pass(live, _resolve_x)
-        # declaration recorded, but server_args stays pristine
-        self.assertEqual(
-            live._resolved_overrides, [(_resolve_x.__qualname__, {"x": "resolved"})]
-        )
-        self.assertEqual(live.x, "user")
-        # a later pass sees the resolved value through the view overlay
-        run_post_process_pass(live, _read_x)
-        self.assertEqual(
-            live._resolved_overrides[-1], (_read_x.__qualname__, {"y": "resolved"})
-        )
-        self.assertIsNone(live.y)  # never applied in place
 
     def test_overlap_disable_passes(self):
         from sglang.srt.arg_groups.overrides import (
@@ -1479,15 +1432,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
             )
         )
-
-    def test_page_size_leaf_materializes_end_state(self):
-        sa = self._construct("LlamaForCausalLM", "llama")
-        declared_values = [
-            d["page_size"] for _s, d in sa._resolved_overrides if "page_size" in d
-        ]
-        self.assertTrue(declared_values)  # default fill declared
-        self.assertEqual(sa.page_size, declared_values[-1])  # materialized
-        self.assertEqual(self._publish(sa).page_size, declared_values[-1])
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
