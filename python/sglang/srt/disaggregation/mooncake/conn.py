@@ -1037,6 +1037,17 @@ class MooncakeKVManager(CommonKVManager):
                     and len(dst_indices_local) == 0
                 ):
                     continue
+                if st == StateType.DSPARK_HIDDEN:
+                    dynamic_dst = (
+                        (req.spec_metadata or {})
+                        .get("pp_slice", {})
+                        .get("dynamic_dst")
+                    )
+                    if dynamic_dst:
+                        row_count = int(dynamic_dst.get("row_count", 0))
+                        dst_data_ptrs = [int(dynamic_dst["ptr"])]
+                        src_item_lens = [int(dynamic_dst["item_len"])]
+                        dst_indices_local = list(range(row_count))
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
@@ -1932,6 +1943,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             local_state_indices = state_indices
+            local_spec_metadata = spec_metadata
             if spec_metadata and spec_metadata.get("pp_slices"):
                 pp_rank = int(
                     bootstrap_info.get(
@@ -1939,6 +1951,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     )
                 )
                 pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_spec_metadata = {
+                    **spec_metadata,
+                    "target_pp_rank": int(pp_rank),
+                    "pp_slice": pp_slice,
+                }
                 local_state_indices = list(
                     state_indices
                     if state_indices is not None
@@ -1966,8 +1983,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
                         (
-                            json.dumps(spec_metadata).encode("utf-8")
-                            if spec_metadata
+                            json.dumps(local_spec_metadata).encode("utf-8")
+                            if local_spec_metadata
                             else b""
                         ),
                     ]
