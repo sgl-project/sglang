@@ -371,6 +371,14 @@ class Envs:
     # an accurate TTFT for benchmarking; the upstream default of 50 trades
     # off some TTFT-metric accuracy for less IPC overhead.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).
+    # Budget <= 0 disables; >0 sets the max prefix-extend tiles per batch.
+    SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)
+    # Tile-budget mode: "compact" (default, counts actual per-request tiles) or
+    # "legacy" (rectangular grid, max_extend_len-shaped).
+    SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
+    # BLOCK_M for tile estimation; matches extend_attention default.
+    SGLANG_PREFILL_TILE_BLOCK_M = EnvInt(64)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -586,6 +594,10 @@ class Envs:
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # Compact extend-attention query-tile grid: AMD/HIP-only optimization
+    # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
+    # explicitly in code; this env var allows override (0=force off, 1=force on).
+    SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)

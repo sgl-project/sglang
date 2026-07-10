@@ -1,9 +1,14 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    estimate_prefill_extend_tile_metrics,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
@@ -554,6 +559,62 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def _adder_with_extend_lens(self, extend_lens):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.can_run_list = [
+            SimpleNamespace(extend_input_len=length) for length in extend_lens
+        ]
+        return adder
+
+    def test_estimate_prefill_extend_tile_metrics(self):
+        metrics = estimate_prefill_extend_tile_metrics([1, 7, 13, 129], block_m=64)
+
+        self.assertEqual(metrics["q_tiles_per_request"], [1, 1, 1, 3])
+        self.assertEqual(metrics["legacy_q_tiles_per_head"], 12)
+        self.assertEqual(metrics["compact_q_tiles_per_head"], 6)
+        self.assertEqual(metrics["saved_q_tiles_per_head"], 6)
+        self.assertEqual(metrics["saved_q_tile_ratio"], 0.5)
+
+    def test_compact_prefill_tile_budget_admits_more_than_legacy(self):
+        adder = self._adder_with_extend_lens([1, 7, 13])
+
+        # The tile-budget admission is gated on HIP in production; force the gate
+        # on so this vendor-neutral admission-math check runs on any CI runner.
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(129))
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+        ):
+            self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+
+    def test_prefill_tile_budget_always_allows_first_request(self):
+        adder = self._adder_with_extend_lens([])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 1),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(4096))
+
+    def test_prefill_tile_budget_disabled_on_non_hip(self):
+        # AMD-only: on non-HIP vendors the tile-budget admission must be a no-op
+        # even when the budget env is set, so scheduler behavior is unchanged.
+        adder = self._adder_with_extend_lens([1, 7, 13])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", False),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(129))
 
 
 if __name__ == "__main__":

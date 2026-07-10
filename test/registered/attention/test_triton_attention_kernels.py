@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.triton_ops.decode_attention import (
     decode_attention_fwd_normal,
 )
 from sglang.srt.layers.attention.triton_ops.extend_attention import (
+    _compact_extend_q_tiles_per_head,
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
@@ -19,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
@@ -336,6 +338,131 @@ class TestTritonAttention(CustomTestCase):
         # head_dim > 256: falls back to the default on all HIP archs
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
+        )
+
+    def test_compact_extend_attention_tile_count(self):
+        self.assertEqual(
+            _compact_extend_q_tiles_per_head(
+                batch_size=16,
+                max_len_extend=1000,
+                total_extend_tokens=1015,
+                block_m=64,
+                extend_seq_lens_cpu=[1] * 15 + [1000],
+            ),
+            31,
+        )
+        self.assertEqual(
+            _compact_extend_q_tiles_per_head(
+                batch_size=2,
+                max_len_extend=4224,
+                total_extend_tokens=5376,
+                block_m=64,
+                extend_seq_lens_cpu=[1152, 4224],
+            ),
+            84,
+        )
+        self.assertIsNone(
+            _compact_extend_q_tiles_per_head(
+                batch_size=4,
+                max_len_extend=64,
+                total_extend_tokens=256,
+                block_m=64,
+                extend_seq_lens_cpu=[64, 64, 64, 64],
+            )
+        )
+
+    def test_extend_attention_compact_grid(self):
+        dtype = torch.bfloat16
+        device = get_device()
+        B, H_Q, H_KV, D = 4, 8, 2, 64
+
+        b_seq_len_prefix = torch.tensor(
+            [8, 16, 32, 64], dtype=torch.int32, device=device
+        )
+        b_seq_len_extend = torch.tensor(
+            [1, 7, 13, 129], dtype=torch.int32, device=device
+        )
+        b_seq_len = b_seq_len_prefix + b_seq_len_extend
+        b_start_loc = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+        b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
+
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len_prefix, dim=0)
+        kv_indices = torch.empty(
+            (int(b_seq_len_prefix.sum().item()),), dtype=torch.int32, device=device
+        )
+        for i in range(B):
+            kv_indices[int(kv_indptr[i]) : int(kv_indptr[i + 1])] = torch.arange(
+                int(b_start_loc[i].item()),
+                int(b_start_loc[i].item()) + int(b_seq_len_prefix[i].item()),
+                device=device,
+            )
+
+        total_token_num = int(b_seq_len.sum().item())
+        extend_token_num = int(b_seq_len_extend.sum().item())
+        k_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+        v_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+        k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        v_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        q_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device=device)
+        for i in range(B):
+            extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
+            extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
+            extend_start = b_start_loc_extend[i]
+            extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
+            k_extend[extend_start:extend_end] = k_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            v_extend[extend_start:extend_end] = v_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            q_extend[extend_start:extend_end] = torch.empty(
+                (int(b_seq_len_extend[i].item()), H_Q, D),
+                dtype=dtype,
+                device=device,
+            ).normal_(mean=0.1, std=0.2)
+
+        max_len_extend = int(b_seq_len_extend.max().item())
+        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend, dim=0)
+        extend_seq_lens_cpu = b_seq_len_extend.cpu().tolist()
+
+        o_legacy = torch.empty_like(q_extend)
+        o_compact = torch.empty_like(q_extend)
+        for output, use_compact in ((o_legacy, False), (o_compact, True)):
+            with temp_set_env(
+                allow_sglang=True,
+                SGLANG_TRITON_COMPACT_EXTEND_ATTENTION=str(use_compact),
+            ):
+                extend_attention_fwd(
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    output,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    custom_mask=None,
+                    is_causal=True,
+                    mask_indptr=None,
+                    max_len_extend=max_len_extend,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    extend_seq_lens_cpu=extend_seq_lens_cpu,
+                )
+
+        self.assertTrue(
+            torch.allclose(o_legacy, o_compact, rtol=1e-2, atol=1e-3),
+            f"compact grid output differs from legacy grid. "
+            f"Max diff: {(o_legacy - o_compact).abs().max()}",
         )
 
     def _test_extend_attention_sliding_window_once(

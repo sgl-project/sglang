@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_ops.decode_attention import _extract_kv_strides
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
@@ -123,6 +124,53 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
         num_warps = 4 if Lq <= 64 else 8
 
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
+
+
+def _compact_extend_q_tiles_per_head(
+    *,
+    batch_size: int,
+    max_len_extend: int,
+    total_extend_tokens: int,
+    block_m: int,
+    extend_seq_lens_cpu=None,
+) -> int | None:
+    """Return compact query tiles per head when it reduces launch work.
+
+    The legacy extend grid is rectangular -- ``batch_size * cdiv(max_len_extend,
+    BLOCK_M)`` -- so in a ragged mixed-prefill batch every short row pays tile
+    work sized by the longest row. This computes the *compact* tile count
+    (``sum_i cdiv(extend_len_i, BLOCK_M)``), i.e. work proportional to the real
+    per-request lengths. That is the same ragged-aware launch the flash-attn
+    varlen kernels (used by the aiter backend via ``flash_attn_varlen_func`` /
+    ``mha_batch_prefill_func``) already get from their cu_seqlens scheduler --
+    this closes that triton-vs-flash-attn gap rather than inventing a new
+    technique. Returns ``None`` (keep the legacy grid) when compacting would not
+    reduce launch work, e.g. a uniform batch.
+    """
+    if batch_size <= 1 or max_len_extend <= 0:
+        return None
+
+    legacy_tiles = batch_size * triton.cdiv(max_len_extend, block_m)
+    if legacy_tiles <= 0:
+        return None
+
+    if extend_seq_lens_cpu is not None:
+        if isinstance(extend_seq_lens_cpu, torch.Tensor):
+            extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
+        if len(extend_seq_lens_cpu) < batch_size:
+            return None
+        compact_tiles = sum(
+            triton.cdiv(max(0, int(extend_seq_lens_cpu[i])), block_m)
+            for i in range(batch_size)
+        )
+    else:
+        if total_extend_tokens == batch_size * max_len_extend:
+            return None
+        compact_tiles = (total_extend_tokens + batch_size * (block_m - 1)) // block_m
+
+    if compact_tiles <= 0 or compact_tiles >= legacy_tiles:
+        return None
+    return int(compact_tiles)
 
 
 @triton.jit
@@ -276,6 +324,7 @@ def _fwd_kernel(
     stride_buf_ktok,
     stride_buf_vpage,
     stride_buf_vtok,
+    compact_batch_size,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -294,11 +343,36 @@ def _fwd_kernel(
     SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    USE_COMPACT_TILE_GRID: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
 ):
-    cur_seq = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    cur_block_m = tl.program_id(2)
+    if USE_COMPACT_TILE_GRID:
+        output_tile = tl.program_id(0)
+        cur_head = tl.program_id(1)
+
+        cur_seq = tl.full((), 0, tl.int64)
+        cum_tiles = tl.full((), 0, tl.int64)
+        found = tl.full((), 0, tl.int32)
+        while (cur_seq < compact_batch_size) & (found == 0):
+            seq_q_start = tl.load(qo_indptr + cur_seq)
+            seq_q_end = tl.load(qo_indptr + cur_seq + 1)
+            seq_q_len = seq_q_end - seq_q_start
+            seq_tiles = (seq_q_len + BLOCK_M - 1) // BLOCK_M
+            next_cum_tiles = cum_tiles + seq_tiles
+            if next_cum_tiles > output_tile:
+                found = 1
+            else:
+                cum_tiles = next_cum_tiles
+                cur_seq = cur_seq + 1
+
+        if found == 0:
+            return
+
+        cur_block_m = output_tile - cum_tiles
+    else:
+        cur_seq = tl.program_id(0)
+        cur_head = tl.program_id(1)
+        cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
 
     cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
@@ -646,6 +720,7 @@ def extend_attention_fwd(
     skip_prefix=False,
     skip_extend=False,
     page_size: int = 1,
+    extend_seq_lens_cpu=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -681,7 +756,26 @@ def extend_attention_fwd(
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
+    # launch). Explicitly check _is_hip and allow env var override.
+    use_compact_tile_grid = (
+        _is_hip and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
+    )
+    compact_q_tiles = None
+    if use_compact_tile_grid:
+        compact_q_tiles = _compact_extend_q_tiles_per_head(
+            batch_size=batch_size,
+            max_len_extend=max_len_extend,
+            total_extend_tokens=q_extend.shape[0],
+            block_m=BLOCK_M,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+        )
+
+    use_compact_tile_grid = compact_q_tiles is not None
+    if use_compact_tile_grid:
+        grid = (compact_q_tiles, head_num)
+    else:
+        grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
     extra_kargs = {}
@@ -732,6 +826,7 @@ def extend_attention_fwd(
         k_tok_stride,
         v_page_stride,
         v_tok_stride,
+        batch_size,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -750,6 +845,7 @@ def extend_attention_fwd(
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
+        USE_COMPACT_TILE_GRID=use_compact_tile_grid,
         PAGE_SIZE=page_size,
         num_warps=num_warps,
         num_stages=num_stages,

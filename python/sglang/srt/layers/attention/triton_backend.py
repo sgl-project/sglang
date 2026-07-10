@@ -1364,6 +1364,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
             page_size=self.page_size,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
 
