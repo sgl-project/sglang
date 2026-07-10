@@ -23,7 +23,6 @@ def flash_attn_varlen_ref(
     cu_seqlens_k,
     is_causal,
     enable_gqa,
-    softmax_scale=None,
 ):
     cu_q = cu_seqlens_q.tolist()
     cu_k = cu_seqlens_k.tolist()
@@ -44,7 +43,6 @@ def flash_attn_varlen_ref(
             v[:, :, start_k:end_k, :],
             is_causal=is_causal,
             enable_gqa=enable_gqa,
-            scale=softmax_scale,
         )
 
     # [1, H, T, D] -> [T, H, D]
@@ -60,7 +58,6 @@ def flash_attn_non_varlen_ref(
     cu_seqlens_k,
     is_causal,
     enable_gqa,
-    softmax_scale=None,
 ):
     cu_q = cu_seqlens_q.tolist()
     cu_k = cu_seqlens_k.tolist()
@@ -78,7 +75,6 @@ def flash_attn_non_varlen_ref(
         v,
         is_causal=is_causal,
         enable_gqa=enable_gqa,
-        scale=softmax_scale,
     )
     # [B, H, T, D] -> [B * T, H, D]
     return out.transpose(1, 2).reshape(batch * T, H, D)
@@ -95,7 +91,6 @@ class TestFlashAttn(CustomTestCase):
         head_dim=[32, 48],  # test when D is not 32x
         head_dim_v=[32],
         is_causal=[True, False],
-        softmax_scale=[None, 0.2],
     )
     def test_flash_attn_varlen(
         self,
@@ -107,7 +102,6 @@ class TestFlashAttn(CustomTestCase):
         head_dim,
         head_dim_v,
         is_causal,
-        softmax_scale,
     ):
         dtype = torch.bfloat16
 
@@ -133,7 +127,6 @@ class TestFlashAttn(CustomTestCase):
             cu_seqlens_k,
             is_causal=is_causal,
             enable_gqa=num_heads != num_heads_kv,
-            softmax_scale=softmax_scale,
         )
 
         out = flash_attn_varlen_func(
@@ -145,7 +138,6 @@ class TestFlashAttn(CustomTestCase):
             seqlens_q.max().item(),
             seqlens_k.max().item(),
             is_causal,
-            softmax_scale,
         )
 
         atol = rtol = precision[dtype]
@@ -161,7 +153,6 @@ class TestFlashAttn(CustomTestCase):
         head_dim=[32],
         head_dim_v=[32],
         is_causal=[False],
-        softmax_scale=[None, 0.2],
     )
     def test_flash_attn_large_size(
         self,
@@ -173,7 +164,6 @@ class TestFlashAttn(CustomTestCase):
         head_dim,
         head_dim_v,
         is_causal,
-        softmax_scale,
     ):
         dtype = torch.bfloat16
 
@@ -200,7 +190,6 @@ class TestFlashAttn(CustomTestCase):
             cu_seqlens_k,
             is_causal=is_causal,
             enable_gqa=num_heads != num_heads_kv,
-            softmax_scale=softmax_scale,
         )
 
         out = flash_attn_varlen_func(
@@ -212,7 +201,6 @@ class TestFlashAttn(CustomTestCase):
             seqlens_q.max().item(),
             seqlens_k.max().item(),
             is_causal,
-            softmax_scale,
         )
 
         atol = rtol = precision[dtype]
@@ -238,7 +226,7 @@ class TestFlashAttn(CustomTestCase):
             q, k, v, cu_seqlens, cu_seqlens, is_causal=True, enable_gqa=True
         )
         out = flash_attn_varlen_func(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True, None
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True
         )
 
         atol = rtol = precision[dtype]

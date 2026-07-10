@@ -39,7 +39,7 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
     fake_args = SimpleNamespace(moe_dense_tp_size=None, attention_backend="fa3")
     with get_parallel().override(attn_tp_size=1), patch.object(
-        tbo, "get_global_server_args", lambda: fake_args
+        tbo, "get_server_args", lambda: fake_args
     ):
         return TboForwardBatchPreparer.filter_batch(
             batch,
