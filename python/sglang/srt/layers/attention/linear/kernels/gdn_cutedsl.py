@@ -11,10 +11,9 @@ import logging
 from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -30,61 +29,6 @@ def _is_blackwell() -> bool:
     return major >= 10
 
 
-@triton.jit
-def _l2norm_row_block(
-    x, y, eps, i_t, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr
-):
-    # Byte-identical to fla.l2norm.l2norm_fwd_kernel (the D<=512 branch): fp32
-    # reduction, division form (not the * rstd reciprocal), round-to-nearest store
-    # in the input dtype. Kept 0-ULP so the fused q/k prologue is a pure launch
-    # merge with no numeric change vs the two separate l2norm_fwd calls.
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_var = tl.sum(b_x * b_x, axis=1)
-    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.jit
-def l2norm_fwd_qk_kernel(
-    xq, yq, xk, yk, eps, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr,
-    BD: tl.constexpr,
-):
-    i_t = tl.program_id(0)
-    # program_id(1) is CTA-uniform (0 -> q, 1 -> k) so there is no warp divergence:
-    # each CTA does exactly one row-block of one tensor, same work as the original.
-    if tl.program_id(1) == 0:
-        _l2norm_row_block(xq, yq, eps, i_t, T, D, BT, BD)
-    else:
-        _l2norm_row_block(xk, yk, eps, i_t, T, D, BT, BD)
-
-
-def l2norm_fwd_qk(xq: torch.Tensor, xk: torch.Tensor, eps: float = 1e-6):
-    """L2-normalize q and k (last dim) in a single Triton launch.
-
-    Replaces two ``fla.l2norm.l2norm_fwd`` calls in the CuteDSL GDN prefill
-    prologue. q and k share shape/dtype (GDN uses ``num_q_heads == num_k_heads``
-    heads of ``head_k_dim``), so both fold into one grid whose second axis selects
-    the tensor. Result is bit-identical to the two separate calls.
-    """
-    assert xq.shape == xk.shape and xq.dtype == xk.dtype
-    shape_og = xq.shape
-    xq2 = xq.view(-1, shape_og[-1])
-    xk2 = xk.view(-1, shape_og[-1])
-    T, D = xq2.shape
-    assert D <= 512, "only the l2norm block-ptr (D<=512) branch is fused here"
-    yq = torch.empty_like(xq2)
-    yk = torch.empty_like(xk2)
-    assert yq.stride(-1) == 1 and yk.stride(-1) == 1
-    BD = min(65536 // xq2.element_size(), triton.next_power_of_2(D))
-    grid = (triton.cdiv(T, 16), 2)  # axis0 = row-block (== original i_t), axis1 = q/k
-    l2norm_fwd_qk_kernel[grid](
-        xq2, yq, xk2, yk, eps, T=T, D=D, BT=16, BD=BD, num_warps=8, num_stages=3
-    )
-    return yq.view(shape_og), yk.view(shape_og)
-
-
 class CuteDSLGDNKernel(LinearAttnKernelBase):
     """CuTe DSL kernel for GDN.
 
@@ -94,6 +38,8 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
     unsupported; callers should query :attr:`supports_prefill` and fall back
     to another backend (e.g. Triton).
     """
+
+    supports_extend_prep = True
 
     def __init__(self):
         # The Blackwell extend kernel uses tcgen05/TMA-bulk-swizzle features

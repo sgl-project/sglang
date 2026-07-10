@@ -92,6 +92,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     Requires flashinfer >= 0.6.7.
     """
 
+    supports_extend_prep = True
+
     def __init__(self):
         (
             available,
@@ -220,6 +222,37 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     # ---- extend (prefill) ----
 
+    def build_extend_prep(
+        self,
+        *,
+        head_k_dim: int,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        ssm_states: torch.Tensor,
+        total_seq_len: int,
+    ) -> tuple:
+        """Compute the layer-invariant extend metadata once per forward.
+
+        The pool-gather indices depend only on per-request cache slot indices,
+        which are identical across all GDN layers of a forward, so the caller
+        (forward_extend) builds this once and reuses it across the per-layer
+        extend() calls. Bit-identical to the recompute in extend()'s prep=None
+        fallback. Same keyword signature as the CuteDSL kernel's method.
+        """
+        if self.use_state_pool:
+            # Negative indices (e.g. -1) are padding markers for slots not yet
+            # assigned to a real sequence; clamp them to 0 (the reserved dummy
+            # slot) so the FlashInfer kernel never reads out-of-bounds state.
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+        else:
+            # SM90: preserve original negative-index handling (remap to last slot).
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            ).to(torch.int64)
+        return (ssm_cache_indices,)
+
     def extend(
         self,
         q: torch.Tensor,
@@ -231,27 +264,49 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        prep: Optional[tuple] = None,
         **kwargs,
     ) -> tuple:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
+        # Fused single-launch q/k L2 norm (was two separate l2norm_fwd calls).
+        q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
         v_fi = v[0].contiguous()
 
         # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
+        if prep is None:
+            # Fallback for direct extend() callers (e.g. unit tests). On the
+            # per-layer hot path, forward_extend passes prep= once per forward
+            # so this layer-invariant metadata is not recomputed per layer.
+            prep = self.build_extend_prep(
+                head_k_dim=k.shape[-1],
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                ssm_states=ssm_states,
+                total_seq_len=total_seq_len,
+            )
+        (ssm_cache_indices,) = prep
+
+        # Direct-write epilogue: when the caller supplies its final output slice
+        # (shape [1, T, Hv, V]), the kernel writes [T, Hv, V] straight into it,
+        # eliminating the caller's device-to-device copy.
+        output_buf = None
+        if out is not None:
+            assert out.shape == (1, total_seq_len, num_v_heads, head_v_dim), (
+                f"direct-write out buffer {tuple(out.shape)} != expected "
+                f"{(1, total_seq_len, num_v_heads, head_v_dim)}"
+            )
+            output_buf = out.squeeze(0)
+
         if self.use_state_pool:
-            # Negative indices (e.g. -1) are padding markers for slots not yet
-            # assigned to a real sequence; clamp them to 0 (the reserved dummy
-            # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
             initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
             # Pre-allocate bf16 output_state so the kernel compiles and writes the
             # bf16 state path directly, avoiding a fp32 allocation and a subsequent
@@ -268,15 +323,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output_final_state=True,
                 cu_seqlens=query_start_loc,  # already int32
                 use_qk_l2norm_in_kernel=False,
+                output=output_buf,
                 output_state=output_state_fi,
             )
         else:
-            # SM90: preserve original negative-index handling (remap to last slot).
-            ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                ssm_states.shape[0] - 1,
-            ).to(torch.int64)
             # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
             output_fi, output_state_fi = self._prefill_fn(
@@ -290,6 +340,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output_final_state=True,
                 cu_seqlens=query_start_loc.to(torch.int64),
                 use_qk_l2norm_in_kernel=False,
+                output=output_buf,
             )
 
         # Write back state to pool
@@ -299,7 +350,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             output_state_fi.to(ssm_states.dtype),
         )
 
-        # Output: [seq, HV, V] -> [1, seq, HV, V]
+        # Output: [seq, HV, V] -> [1, seq, HV, V]. When out= was honored this is
+        # a view of the caller's buffer, so its data_ptr matches and the caller
+        # skips its copy.
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
         # Return (output, last_recurrent_state, h) to match Triton kernel interface.

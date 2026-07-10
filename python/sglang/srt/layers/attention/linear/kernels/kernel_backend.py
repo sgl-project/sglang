@@ -10,6 +10,13 @@ class LinearAttnKernelBase(ABC):
     and provides decode/extend/target_verify methods with a unified interface.
     """
 
+    # Whether extend() accepts a hoisted layer-invariant prep tuple built once
+    # per forward via build_extend_prep() (opaque, backend-specific contents).
+    # Kernels that set this True must define build_extend_prep with the common
+    # keyword signature (head_k_dim, query_start_loc, cache_indices, ssm_states,
+    # total_seq_len).
+    supports_extend_prep: bool = False
+
     @abstractmethod
     def decode(
         self,
