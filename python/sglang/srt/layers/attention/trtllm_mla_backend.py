@@ -379,22 +379,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Shared decode / target-verify / draft-extend capture+replay body.
 
-        One fused triton kernel (update_trtllm_mla_graph_metadata) rebuilds
-        seq_lens_k and block_kv_indices. The previous implementation issued
-        several small host dispatches per graph replay (slice, allocating
-        add, copy_, kv-indices launch); the fused launch is recorded into
-        the captured graph, so replay pays no host dispatches for it.
-
-        The draft-extend max_seq_len_q / sum_seq_lens_q refresh is dropped:
-        both are static per captured shape and already set by
-        :py:meth:`_init_cuda_graph_metadata`.
+        One fused triton kernel rebuilds seq_lens_k and block_kv_indices;
+        the launch is recorded into the captured graph, so replay pays no
+        host dispatches for it. The q-side metadata (max_seq_len_q,
+        sum_seq_lens_q, cu_seqlens_q) is static per captured shape and set
+        by :py:meth:`_init_cuda_graph_metadata`.
 
         Public entry: :py:meth:`init_forward_metadata_in_graph` (which routes
         the non-decode-family modes to the FlashInferMLA parent).
         """
         metadata = self.decode_cuda_graph_metadata[bs]
-        # Target-verify scores num_draft_tokens extra KV entries per request;
-        # decode and draft-extend read seq_lens as-is.
+        # Target-verify scores num_draft_tokens extra KV entries per request.
         seqlen_offset = self.num_draft_tokens if forward_mode.is_target_verify() else 0
         update_trtllm_mla_graph_metadata(
             req_pool_indices=req_pool_indices[:bs],
@@ -448,8 +443,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
         else:
-            # The metadata rebuild itself is recorded inside the captured
-            # graph (init_forward_metadata_in_graph); replay-prep only points
+            # The rebuild is recorded inside the captured graph
+            # (init_forward_metadata_in_graph); replay-prep only repoints
             # forward_decode_metadata at the captured per-bs buffers.
             self.forward_decode_metadata = self.decode_cuda_graph_metadata[bs]
 

@@ -1,23 +1,16 @@
 """Fused CUDA-graph metadata update for the TRTLLM MLA backend.
 
-`TRTLLMMLABackend._apply_cuda_graph_metadata` used to rebuild the replay
-metadata with several small host dispatches per graph replay: a seq_lens
-slice, an allocating `seq_lens + num_draft_tokens` add, a `seq_lens_k.copy_`,
-and the block-KV-indices triton launch. Repeated several times per decode
-step (draft-decode steps + target-verify + draft-extend) on every TP rank,
-the per-rank CPU jitter skews `cudaGraphLaunch` across ranks and is paid as
-spin time inside the first custom all-reduce of every replayed graph.
-
-This kernel performs the whole update in ONE launch (recordable into the
-captured graph, so replay pays zero host dispatches for it):
+One launch, recordable into a captured cuda graph:
   - seq_lens_k[i]          = seq_lens[i] + seqlen_offset   (int32, optional)
   - block_kv_indices[i, p] = req_to_token[req_pool_indices[i],
                                           p * page_size] // page_size
     for p < cdiv(seq_lens[i] + seqlen_offset, page_size)
 
-The block-KV-indices part mirrors ``create_flashmla_kv_indices_triton``
-(same 2D grid: one CTA per (row, page-block)) with the always-None
-``kv_start_idx`` dropped and the seqlen offset folded in.
+Rebuilding this metadata with separate aten ops and kernel launches costs
+per-replay host dispatch on every TP rank, several times per decode step
+(draft-decode steps + target-verify + draft-extend); the per-rank jitter
+skews `cudaGraphLaunch` across ranks and is paid as spin time inside the
+first custom all-reduce of every replayed graph.
 """
 
 from typing import Optional
