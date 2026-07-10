@@ -31,6 +31,8 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 
 class GFusionForDiffusionLM(DeepseekV2ForCausalLM):
+    packed_modules_mapping = {}
+
     def __init__(
         self,
         config: PretrainedConfig,
