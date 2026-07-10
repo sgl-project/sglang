@@ -34,8 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_buffer, get_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -226,9 +225,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_chunk_kv = (
             not skip_prefill
-            and get_global_server_args().disaggregation_mode != "decode"
-            and not get_global_server_args().disable_chunked_prefix_cache
-            and not get_global_server_args().flashinfer_mla_disable_ragged
+            and get_server_args().disaggregation_mode != "decode"
+            and not get_server_args().disable_chunked_prefix_cache
+            and not get_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
@@ -404,7 +403,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not get_global_server_args().flashinfer_mla_disable_ragged
+                not get_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
                 and not is_in_tc_piecewise_cuda_graph()
