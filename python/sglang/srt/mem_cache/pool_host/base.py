@@ -168,6 +168,41 @@ class HostKVCache(abc.ABC):
     def get_size_per_token(self):
         raise NotImplementedError()
 
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        device_pool = device_pool or self.device_pool
+        return bool(device_pool.layer_shard_enabled)
+
+    def _device_owned_layer_range(self, device_pool=None) -> tuple[int, int]:
+        """Contiguous ``[start, end)`` local device layers this rank stores.
+
+        ``(0, layer_num)`` when the device pool is not layer-sharded.
+        """
+        device_pool = device_pool or self.device_pool
+        if not self._is_device_layer_sharded(device_pool):
+            return 0, device_pool.layer_num
+        return device_pool._owned_local_layer_range()
+
+    def _effective_host_layer_num(self, device_pool=None) -> int:
+        """Number of layers the host pool allocates for this rank."""
+        device_pool = device_pool or self.device_pool
+        if not self._is_device_layer_sharded(device_pool):
+            return device_pool.layer_num
+        shard_size = device_pool.layer_shard_size
+        return (device_pool.layer_num + shard_size - 1) // shard_size
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        start, end = self._device_owned_layer_range(device_pool)
+        return start <= layer_id < end
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        """Map a full local device layer id to its compacted host-buffer slot."""
+        start, _ = self._device_owned_layer_range(device_pool)
+        return layer_id - start
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        start, end = self._device_owned_layer_range(device_pool)
+        return list(range(start, end))
+
     @abc.abstractmethod
     def init_kv_buffer(self):
         raise NotImplementedError()

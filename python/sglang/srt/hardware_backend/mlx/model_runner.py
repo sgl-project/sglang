@@ -49,7 +49,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     uses_sliding_window_attention,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +281,7 @@ class MlxModelRunner:
         ):
             return None
 
-        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        chunk_size = get_server_args().mamba_cache_chunk_size
         track_len = prefix_len + (new_token_count // chunk_size) * chunk_size
         branching_len = getattr(req, "mamba_branching_seqlen", None)
         if (
