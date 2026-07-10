@@ -355,8 +355,13 @@ class EagerRunner(BaseRunner):
                     pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
                 )
                 aux_hidden_states = None
-                capture_aux_hidden_states = getattr(
-                    model_runner.model, "capture_aux_hidden_states", False
+                batch_dspark_capture = (
+                    getattr(forward_batch, "dspark_hidden_capture_layer_ids", None)
+                    is not None
+                )
+                capture_aux_hidden_states = batch_dspark_capture or (
+                    getattr(model_runner.model, "capture_aux_hidden_states", False)
+                    and model_runner.server_args.disaggregation_mode != "prefill"
                 )
                 if capture_aux_hidden_states and not isinstance(
                     hidden_states, PPProxyTensors

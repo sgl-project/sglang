@@ -49,7 +49,6 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -74,36 +73,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
-
-
-def _set_dspark_hidden_capture_layers(
-    model_runner, layer_ids: Optional[List[int]]
-) -> None:
-    model = getattr(model_runner, "model", None)
-    if model is None:
-        return
-
-    if layer_ids:
-        if hasattr(model, "set_dspark_layers_to_capture"):
-            model.set_dspark_layers_to_capture(layer_ids)
-            return
-        if hasattr(model, "set_dflash_layers_to_capture"):
-            model.set_dflash_layers_to_capture(layer_ids)
-            return
-        raise RuntimeError(
-            f"Model {model.__class__.__name__} cannot capture DSpark aux hidden."
-        )
-
-    if hasattr(model, "capture_aux_hidden_states"):
-        model.capture_aux_hidden_states = False
-    inner_model = getattr(model, "model", None)
-    for obj in (model, inner_model):
-        if obj is None:
-            continue
-        if hasattr(obj, "dspark_layers_to_capture"):
-            obj.dspark_layers_to_capture = None
-        if hasattr(obj, "layers_to_capture"):
-            obj.layers_to_capture = None
 
 
 def should_force_retry(req: Req) -> bool:
@@ -715,10 +684,9 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     break
         if dspark_capture_layers:
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        _set_dspark_hidden_capture_layers(
-            self.tp_worker.model_runner, dspark_capture_layers
-        )
+            batch.dspark_hidden_capture_layer_ids = [
+                int(x) for x in dspark_capture_layers
+            ]
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
