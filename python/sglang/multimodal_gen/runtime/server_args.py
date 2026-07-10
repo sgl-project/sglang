@@ -1106,6 +1106,20 @@ class ServerArgs(DisaggServerArgsMixin):
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
             self.layerwise_offload_components = None
+            if (
+                self.dit_cpu_offload
+                or self.text_encoder_cpu_offload
+                or self.image_encoder_cpu_offload
+                or self.vae_cpu_offload
+            ):
+                logger.warning(
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
+                )
+            self.dit_cpu_offload = False
+            self.text_encoder_cpu_offload = False
+            self.image_encoder_cpu_offload = False
+            self.vae_cpu_offload = False
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names

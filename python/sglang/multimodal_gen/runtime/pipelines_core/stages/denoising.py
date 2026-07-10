@@ -5,6 +5,7 @@
 Denoising stage for diffusion pipelines.
 """
 
+import gc
 import inspect
 import math
 import time
@@ -109,6 +110,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
@@ -1222,13 +1226,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # 5. Advance the scheduler state with the predicted noise.
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
+            latents_dtype = ctx.latents.dtype
+            latents = ctx.scheduler.step(
                 model_output=noise_pred,
                 timestep=step.t_device,
                 sample=ctx.latents,
                 **ctx.extra_step_kwargs,
                 return_dict=False,
             )[0]
+            if latents.dtype != latents_dtype and latents.device.type == "mps":
+                latents = latents.to(latents_dtype)
+            ctx.latents = latents
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1353,10 +1361,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self._component_residency_manager.remove_nvtx_hooks_for_module(
                     self.transformer
                 )
+                self._component_residency_manager.strategy_for.cache_clear()
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
             server_args.model_loaded["transformer"] = False
+            gc.collect()
+            torch.mps.empty_cache()
             logger.info(
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -1592,11 +1603,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=ctx.target_dtype,
-                enabled=ctx.autocast_enabled,
-            ),
+            precision_autocast_context(ctx.target_dtype, server_args.disable_autocast),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
             with self.progress_bar(
@@ -1658,6 +1665,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        if "step" in locals():
+            del step
         self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so

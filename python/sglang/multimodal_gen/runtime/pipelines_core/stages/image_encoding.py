@@ -41,11 +41,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
+    autocast_context,
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
@@ -609,11 +609,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         )
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             try:
                 if server_args.pipeline_config.vae_tiling:
                     self.vae.enable_tiling()
@@ -650,13 +646,8 @@ class LTX2ImageEncodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, "vae", precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             return self._condition_image_encoder(video_condition)
 
     @staticmethod
@@ -932,11 +923,7 @@ class ImageVAEEncodingStage(PipelineStage):
                 )
 
                 # Encode Image
-                with torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=vae_dtype,
-                    enabled=vae_autocast_enabled,
-                ):
+                with autocast_context(vae_dtype, server_args.disable_autocast):
                     if server_args.pipeline_config.vae_tiling:
                         self.vae.enable_tiling()
                     # if server_args.vae_sp:

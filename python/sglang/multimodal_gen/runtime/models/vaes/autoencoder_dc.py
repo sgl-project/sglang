@@ -41,6 +41,31 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         self._loaded_state_dict: dict[str, torch.Tensor] = {}
         self._spatial_parallel_decode_enabled = False
 
+    @staticmethod
+    def _target_device_type(args, kwargs) -> str | None:
+        device = kwargs.get("device")
+        if device is None and args:
+            first_arg = args[0]
+            if isinstance(first_arg, torch.Tensor):
+                device = first_arg.device
+            elif isinstance(first_arg, (str, torch.device)):
+                device = first_arg
+        if device is None:
+            return None
+        return torch.device(device).type
+
+    @staticmethod
+    def _target_dtype(args, kwargs) -> torch.dtype | None:
+        dtype = kwargs.get("dtype")
+        if dtype is not None:
+            return dtype
+        for arg in args:
+            if isinstance(arg, torch.dtype):
+                return arg
+            if isinstance(arg, torch.Tensor) and arg.is_floating_point():
+                return arg.dtype
+        return None
+
     def _ensure_inner_model(self, state_dict: dict[str, torch.Tensor] | None = None):
         if self._inner_model is not None:
             return
@@ -115,6 +140,13 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
 
     def decode(self, z: torch.Tensor, **kwargs):
         self._ensure_inner_model()
+        if z.device.type == "mps":
+            torch.mps.synchronize()
+            self._inner_model = self._inner_model.to("cpu", dtype=torch.float32)
+            torch.mps.empty_cache()
+            z = z.to(device="cpu", dtype=torch.float32)
+            return self._inner_model.decode(z, **kwargs)
+
         z = z.to(dtype=self.dtype)
         if not self._spatial_parallel_decode_enabled:
             return self._inner_model.decode(z, **kwargs)
@@ -161,6 +193,15 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         return loaded_params
 
     def to(self, *args, **kwargs):
+        if self._target_device_type(args, kwargs) == "mps":
+            # AutoencoderDC decode is unstable on MPS in the full Sana pipeline.
+            dtype = self._target_dtype(args, kwargs)
+            if dtype is not None:
+                if self._inner_model is not None:
+                    self._inner_model = self._inner_model.to(dtype=dtype)
+                return super().to(dtype=dtype)
+            return self
+
         if self._inner_model is not None:
             self._inner_model = self._inner_model.to(*args, **kwargs)
         return super().to(*args, **kwargs)

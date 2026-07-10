@@ -28,10 +28,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context,
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
@@ -223,13 +223,12 @@ class DecodingStage(PipelineStage):
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
         )
+        if latents.device.type == "mps":
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
         # Decode latents
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             try:
                 # TODO: make it more specific
                 if server_args.pipeline_config.vae_tiling:
