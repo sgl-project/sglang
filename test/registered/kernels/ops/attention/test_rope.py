@@ -208,18 +208,15 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=dtype)
     cos_sin_cache = create_cos_sin_cache(rope_dim)
 
+    q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
-    q_ref, k_ref = q.clone(), k.clone()
 
+    reference_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
     sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
-    if DEVICE == "xpu":
-        torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-    else:
-        flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions.long(), is_neox)
-    triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -237,19 +234,16 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE)
     cos_sin_cache = create_cos_sin_cache(rope_dim)
 
+    q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
-    q_ref, k_ref = q.clone(), k.clone()
     rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
 
+    reference_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
     sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
-    if DEVICE == "xpu":
-        torch_impl_rope(q_ref[rope], k_ref[rope], cos_sin_cache, positions, is_neox)
-    else:
-        flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions.long(), is_neox)
-    triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_jit, q_fi, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_jit, k_fi, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)

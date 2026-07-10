@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import get_device, is_hip, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -17,11 +17,10 @@ register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 EPS = 1e-6
 DTYPES = [torch.float16, torch.bfloat16]
 
-if hasattr(torch, "xpu") and torch.xpu.is_available():
-    DEVICE = "xpu"
-elif torch.cuda.is_available():
-    DEVICE = "cuda"
-else:
+# Determine device: prefer XPU if available, otherwise CUDA
+try:
+    DEVICE = get_device()
+except RuntimeError:
     DEVICE = None
 
 
