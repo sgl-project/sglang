@@ -1426,7 +1426,7 @@ class DeepseekV4AttnBackend(
                 )
 
             if _is_sm120:
-                from sglang.srt.layers.attention.flash_mla_sm120 import (
+                from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
 

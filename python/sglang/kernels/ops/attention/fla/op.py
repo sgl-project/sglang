@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from sglang.srt.layers.attention.fla.utils import is_gather_supported
+from sglang.kernels.ops.attention.fla.utils import is_gather_supported
 
 if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
     exp = tldevice.fast_expf

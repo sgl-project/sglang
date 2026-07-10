@@ -5,14 +5,14 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.chunk_intra_token_parallel import (
+from sglang.kernels.ops.attention.fla.chunk_intra_token_parallel import (
     chunk_kda_fwd_intra_token_parallel,
 )
-from sglang.srt.layers.attention.fla.index import (
+from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.srt.layers.attention.fla.op import exp, exp2, gather
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.op import exp, exp2, gather
+from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_gather_supported,
     is_tf32_supported,
@@ -1036,7 +1036,7 @@ def chunk_kda_fwd_intra(
         FUSE_DIAGONAL=fuse_diagonal,
     )
 
-    from sglang.srt.layers.attention.fla.kda import (
+    from sglang.kernels.ops.attention.fla.kda import (
         recompute_w_u_fwd as kda_recompute_w_u_fwd,
     )
 

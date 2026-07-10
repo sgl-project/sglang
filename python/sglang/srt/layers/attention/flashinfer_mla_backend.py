@@ -17,11 +17,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import (
+from sglang.kernels.ops.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
@@ -48,7 +48,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.flashinfer_mla_backend import (
+    from sglang.kernels.ops.attention.flashinfer_mla_backend import (
         FlashInferMlaAttnBackend,
     )
     from sglang.srt.layers.radix_attention import RadixAttention

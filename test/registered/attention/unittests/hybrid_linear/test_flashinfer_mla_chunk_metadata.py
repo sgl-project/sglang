@@ -88,7 +88,7 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
         fp8_kv_cache=False,
     )
     try:
-        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        from sglang.kernels.ops.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
 

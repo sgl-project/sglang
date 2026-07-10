@@ -2,11 +2,11 @@ import unittest
 
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashattention_backend import (
+from sglang.kernels.ops.attention.flashattention_backend import (
     FlashAttentionBackend,
     draft_decode_set_expand_metadata,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool

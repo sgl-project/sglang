@@ -12,19 +12,19 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
-from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.fused_norm_gate import layer_norm_gated_fwd
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
 )
-from sglang.srt.layers.attention.fla.index import (
+from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.fla.op import exp, log
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.op import exp, log
+from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
     is_intel,
 )

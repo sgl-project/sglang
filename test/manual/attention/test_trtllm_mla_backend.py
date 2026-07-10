@@ -10,8 +10,8 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
+from sglang.kernels.ops.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,

@@ -36,7 +36,9 @@ def create_flashinfer_backend(runner):
     import torch
 
     if not runner.use_mla_backend:
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.kernels.ops.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
 
         # Init streams
         if runner.server_args.speculative_algorithm == "EAGLE":
@@ -49,7 +51,7 @@ def create_flashinfer_backend(runner):
             runner, init_new_workspace=runner.init_new_workspace
         )
     else:
-        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        from sglang.kernels.ops.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
 
@@ -179,7 +181,7 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
-    from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+    from sglang.kernels.ops.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
 
@@ -193,7 +195,7 @@ def create_flashattention_v3_backend(runner):
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
-        from sglang.srt.layers.attention.flashattention_backend import (
+        from sglang.kernels.ops.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
 
@@ -212,7 +214,9 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+    from sglang.kernels.ops.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
 
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
@@ -259,7 +263,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     if cfg := runner.mambaish_config:
-        from sglang.srt.layers.attention.fla.utils import check_environments
+        from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,

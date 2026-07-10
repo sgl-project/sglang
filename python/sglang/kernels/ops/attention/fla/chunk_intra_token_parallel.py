@@ -6,8 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.op import exp2
-from sglang.srt.layers.attention.fla.utils import autotune_cache_kwargs
+from sglang.kernels.ops.attention.fla.op import exp2
+from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
 
 @triton.heuristics(

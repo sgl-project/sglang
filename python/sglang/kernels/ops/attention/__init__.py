@@ -41,3 +41,20 @@ for _mod, _fn in _TRITON_KERNELS:
 del _mod, _fn
 
 __all__ = []
+
+
+# Vendored linear-attention (flash-linear-attention port) kernels relocated
+# in Phase 2.5 (RFC #29630); representative entry points for inventory.
+for _mod, _fn in [
+    ("fla.chunk", "chunk_gated_delta_rule"),
+    ("fla.fused_recurrent", "fused_recurrent_gated_delta_rule"),
+    ("fla.kda", "fused_recurrent_kda_fwd"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn

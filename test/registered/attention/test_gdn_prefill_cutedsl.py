@@ -23,10 +23,10 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 1
         allow_module_level=True,
     )
 
-from sglang.srt.layers.attention.fla.fused_recurrent import (  # noqa: E402
+from sglang.kernels.ops.attention.fla.fused_recurrent import (  # noqa: E402
     fused_recurrent_gated_delta_rule,
 )
-from sglang.srt.layers.attention.fla.index import (  # noqa: E402
+from sglang.kernels.ops.attention.fla.index import (  # noqa: E402
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
