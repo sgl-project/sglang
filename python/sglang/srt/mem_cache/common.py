@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -22,6 +23,8 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 # Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -191,9 +194,19 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
+        # The allocated watermark is page-aligned (op2); DSV4-NPU keeps the
+        # real-lens equality. The allocator's page_size is the alloc
+        # granularity (page_size * dcp_size under DCP).
+        if _is_npu:
+            expected_kv_allocated_len = effective_kv_committed_len
+        else:
+            expected_kv_allocated_len = ceil_align(
+                effective_kv_committed_len,
+                tree_cache.token_to_kv_pool_allocator.page_size,
+            )
         assert (
-            effective_kv_committed_len == req.kv.kv_allocated_len
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+            expected_kv_allocated_len == req.kv.kv_allocated_len
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}, {expected_kv_allocated_len=}"
 
     assert (
         start_p % page_size == 0

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
+    is_npu,
     raise_error_or_warn,
 )
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -33,6 +34,8 @@ from sglang.srt.utils.watchdog import WatchdogRaw
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +254,11 @@ class SchedulerInvariantChecker:
 
                 allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
+                    if not _is_npu:
+                        assert allocated_len % self.page_size == 0, (
+                            f"kv_allocated_len must be page-aligned: "
+                            f"{allocated_len=}, {self.page_size=}, req={req.rid}"
+                        )
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
 
@@ -309,6 +317,11 @@ class SchedulerInvariantChecker:
 
         def _add_owner(req_or_slot, label, rpi, committed, allocated):
             assert 0 <= committed <= allocated <= row_width
+            if not _is_npu:
+                assert allocated % self.page_size == 0, (
+                    f"kv_allocated_len must be page-aligned: {label}, "
+                    f"{allocated=}, {self.page_size=}"
+                )
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []
