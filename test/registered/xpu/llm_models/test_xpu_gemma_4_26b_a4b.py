@@ -1,7 +1,6 @@
 """gemma-4-26B-A4B GSM8K accuracy on Intel XPU (TP=4).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval`` (the same evaluator AMD and
-NVIDIA nightlies use).
+Scored by ``simple_eval_gsm8k.GSM8KEval``.
 """
 
 import unittest
