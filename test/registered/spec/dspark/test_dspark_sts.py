@@ -10,9 +10,9 @@ from sglang.benchmark.dspark_sts_fit import (
     fit_sts_temperatures,
 )
 from sglang.srt.models.dspark import DSparkConfidenceHead
-from sglang.srt.speculative.dspark_components.dspark_sts_recorder import StsDataRecorder
-from sglang.srt.speculative.dspark_components.dspark_sts_table import (
+from sglang.srt.speculative.dspark_components.dspark_sts import (
     DSparkStsCalibration,
+    StsDataRecorder,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

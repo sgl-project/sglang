@@ -59,7 +59,7 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
 from sglang.srt.speculative.dspark_components.dspark_sps_recorder import (
     SpsDataRecorder,
 )
-from sglang.srt.speculative.dspark_components.dspark_sts_recorder import (
+from sglang.srt.speculative.dspark_components.dspark_sts import (
     StsDataRecorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_target_verify import (

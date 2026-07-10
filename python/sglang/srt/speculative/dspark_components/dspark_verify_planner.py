@@ -27,7 +27,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps_table import (
     SpsCostTable,
     is_uninitialized_sps_table,
 )
-from sglang.srt.speculative.dspark_components.dspark_sts_table import (
+from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (

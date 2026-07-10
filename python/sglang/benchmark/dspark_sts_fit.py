@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_sts_table import (
+from sglang.srt.speculative.dspark_components.dspark_sts import (
     DSparkStsCalibration,
 )
 
