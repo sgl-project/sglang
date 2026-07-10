@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -257,8 +256,6 @@ class DecodeKVCacheOffloadManager:
         if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
 
-        kv_committed_len = req.effective_kv_committed_len()
-
         # Free the prefill-aligned slots. Previously this was done
         # eagerly in offload_kv_cache (mid-decode), which raced with
         # concurrent admission. Now consolidated here at request
@@ -266,26 +263,26 @@ class DecodeKVCacheOffloadManager:
         # to those slots.
         state = self.offloaded_state.get(req.rid)
         if state is not None and state.prefill_len > 0:
+            assert state.prefill_len % self.page_size == 0, (
+                f"prefill_len must be page-aligned, got {state.prefill_len} "
+                f"with page_size={self.page_size}"
+            )
             prefill_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : state.prefill_len
             ]
             self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = start_offset
-        end = kv_committed_len
-        # Free the incremental part of the request (DSA-aware)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
 
-        # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
-        # Without spec v2, start_p == end_p so this is a no-op.
-        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
-        if self.page_size > 1:
-            start_p = ceil_align(start_p, self.page_size)
-        if start_p < end_p:
-            overalloc_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, start_p:end_p
-            ]
-            self.token_to_kv_pool_allocator.free(overalloc_indices)
+        # Free the incremental part of the request (DSA-aware) together with
+        # any over-allocated slots (e.g. from speculative decoding v2), up to
+        # the page-aligned allocation watermark.
+        assert start_offset % self.page_size == 0, (
+            f"start_offset must be page-aligned, got {start_offset} "
+            f"with page_size={self.page_size}"
+        )
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start_offset : req.kv.kv_allocated_len
+        ]
+        self.token_to_kv_pool_allocator.free(kv_indices)
 
         self.req_to_token_pool.free(req)
         req.kv = None
