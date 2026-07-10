@@ -1861,6 +1861,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === One-shot per-forward overrides; init_new consumes and resets ===
     seq_lens_cpu_cache: torch.Tensor = None
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
+    dspark_hidden_capture_layer_ids: Optional[List[int]] = None
     return_hidden_states_before_norm: bool = False
 
     @classmethod

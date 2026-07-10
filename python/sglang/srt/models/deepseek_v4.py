@@ -2225,7 +2225,15 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_layers_to_capture = getattr(
+            forward_batch, "dspark_hidden_capture_layer_ids", None
+        )
+        if (
+            dspark_layers_to_capture is None
+            and get_server_args().disaggregation_mode != "prefill"
+        ):
+            dspark_layers_to_capture = self.dspark_layers_to_capture
+        capture_dspark = dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
@@ -2263,7 +2271,7 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
-                if capture_dspark and i in self.dspark_layers_to_capture:
+                if capture_dspark and i in dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
                             hidden_states, prev_residual, prev_post, prev_comb
@@ -2462,7 +2470,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        batch_dspark_capture = (
+            getattr(forward_batch, "dspark_hidden_capture_layer_ids", None) is not None
+        )
+        capture_aux_hidden_states = batch_dspark_capture or (
+            self.capture_aux_hidden_states
+            and get_server_args().disaggregation_mode != "prefill"
+        )
+        if capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
