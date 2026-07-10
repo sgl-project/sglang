@@ -2068,6 +2068,7 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    @scheduler_nvtx_method("scheduler.handle_generate_request")
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2298,6 +2299,7 @@ class Scheduler(
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
 
+    @scheduler_nvtx_method("scheduler.handle_batch_generate_request")
     def handle_batch_generate_request(
         self,
         recv_req: BatchTokenizedGenerateReqInput,

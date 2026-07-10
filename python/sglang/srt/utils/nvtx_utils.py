@@ -90,6 +90,9 @@ _NVTX_COLOR_MAP = {
     "scheduler.process_batch_result.prefill": "purple",
     "scheduler.process_batch_result.prebuilt": "cyan",
     "scheduler.process_batch_result.idle": "gray",
+    # Request entry points
+    "scheduler.handle_generate_request": "blue",
+    "scheduler.handle_batch_generate_request": "light_blue",
 }
 
 _NULL_CONTEXT = nullcontext()
