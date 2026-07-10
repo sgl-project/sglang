@@ -70,6 +70,7 @@ _TRITON_KERNELS = [
     ("trtllm_fp8_kv_kernel", "fused_fp8_set_kv_buffer"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("trtllm_mla_graph_metadata", "update_trtllm_mla_graph_metadata"),
     ("aiter_unified_attention", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_attention", "scatter_req_to_token_to_page_table_kernel"),
     ("cache_move", "store_cache_4d"),
