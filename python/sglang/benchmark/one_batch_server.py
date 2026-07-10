@@ -483,25 +483,21 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
-# FIXME: this mirrors the chat-encoding dispatch in
-# serving_chat._resolve_chat_encoding_spec (DeepSeek-V4 custom encoding vs HF
-# chat template) so the benchmark reproduces the serving token stream. Unify
-# the dispatch into a shared resolver instead of duplicating it client-side.
 @lru_cache(maxsize=None)
-def _is_deepseek_v4_model(name_or_path: str) -> bool:
+def _load_hf_config(name_or_path: str):
+    if not name_or_path:
+        return None
+
     from transformers import AutoConfig
 
-    from sglang.srt.configs.model_config import is_deepseek_v4
-
     try:
-        hf_config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
+        return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception as e:
         print(
             f"Warning: could not load config for {name_or_path!r} ({e}); "
-            "assuming a non-DeepSeek-V4 model for --apply-chat-template."
+            "falling back to the HF chat template for --apply-chat-template."
         )
-        return False
-    return is_deepseek_v4(hf_config)
+        return None
 
 
 def _encode_fixed_prompt(
@@ -510,21 +506,21 @@ def _encode_fixed_prompt(
     if not apply_chat_template:
         return tok_inner.encode(prompt_text)
 
-    messages = [{"role": "user", "content": prompt_text}]
-    # DeepSeek-V4 chat encoding does not go through the HF chat template; use
-    # its own encoder so the token stream matches /v1/chat/completions.
-    if _is_deepseek_v4_model(getattr(tok_inner, "name_or_path", "") or ""):
-        from sglang.srt.entrypoints.openai import encoding_dsv4
+    from sglang.srt.entrypoints.openai.chat_encoding import (
+        encode_simple_chat,
+        resolve_chat_encoding_spec,
+    )
 
-        real_input = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-        return tok_inner.encode(real_input)
-    if getattr(tok_inner, "chat_template", None) is None:
-        raise ValueError(
-            "--apply-chat-template requires a tokenizer with a chat template, "
-            f"but {getattr(tok_inner, 'name_or_path', tok_inner)!r} has none."
-        )
-    return tok_inner.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True
+    hf_config = _load_hf_config(getattr(tok_inner, "name_or_path", "") or "")
+    spec = (
+        resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=tok_inner)
+        if hf_config is not None
+        else None
+    )
+    return encode_simple_chat(
+        tokenizer=tok_inner,
+        spec=spec,
+        messages=[{"role": "user", "content": prompt_text}],
     )
 
 
