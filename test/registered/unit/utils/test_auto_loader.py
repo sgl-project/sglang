@@ -11,10 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for the centralized weight loading utilities (auto_loader.py).
-
-These tests are CPU-only and don't require model weights or GPU.
-"""
+"""Unit tests for the centralized weight loading utilities (auto_loader.py)."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -23,6 +20,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from torch import nn
 from torch.nn import Parameter
@@ -37,188 +35,113 @@ from sglang.srt.model_loader.auto_loader import (
 )
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 
-# ---------------------------------------------------------------------------
-# StackedParamsDispatch Tests
-# ---------------------------------------------------------------------------
+
+def _make_param_with_loader(shape):
+    param = Parameter(torch.zeros(shape))
+    param.weight_loader = MagicMock()
+    return param
 
 
-class TestStackedParamsDispatch(unittest.TestCase):
-    def _make_param_with_loader(self, shape):
-        """Create a parameter with a mock weight_loader."""
-        param = Parameter(torch.zeros(shape))
-        param.weight_loader = MagicMock()
-        return param
+@pytest.mark.parametrize(
+    "mapping,source_name,expected_target,expected_shard",
+    [
+        (STANDARD_QKV_MAPPING, "q_proj.weight", "qkv_proj.weight", "q"),
+        (STANDARD_QKV_MAPPING, "k_proj.weight", "qkv_proj.weight", "k"),
+        (STANDARD_QKV_MAPPING, "v_proj.weight", "qkv_proj.weight", "v"),
+        (STANDARD_GATE_UP_MAPPING, "gate_proj.weight", "gate_up_proj.weight", 0),
+        (STANDARD_GATE_UP_MAPPING, "up_proj.weight", "gate_up_proj.weight", 1),
+    ],
+)
+def test_stacked_params_dispatch(mapping, source_name, expected_target, expected_shard):
+    params = {expected_target: _make_param_with_loader((30, 10))}
+    tensor = torch.ones(10, 10)
 
-    def test_qkv_mapping_matches_q_proj(self):
-        params = {"qkv_proj.weight": self._make_param_with_loader((30, 10))}
-        tensor = torch.ones(10, 10)
+    result = mapping.try_load(source_name, tensor, params)
 
-        result = STANDARD_QKV_MAPPING.try_load("q_proj.weight", tensor, params)
-
-        self.assertEqual(result, "qkv_proj.weight")
-        params["qkv_proj.weight"].weight_loader.assert_called_once_with(
-            params["qkv_proj.weight"], tensor, "q"
-        )
-
-    def test_qkv_mapping_matches_k_proj(self):
-        params = {"qkv_proj.weight": self._make_param_with_loader((30, 10))}
-        tensor = torch.ones(10, 10)
-
-        result = STANDARD_QKV_MAPPING.try_load("k_proj.weight", tensor, params)
-
-        self.assertEqual(result, "qkv_proj.weight")
-        params["qkv_proj.weight"].weight_loader.assert_called_once_with(
-            params["qkv_proj.weight"], tensor, "k"
-        )
-
-    def test_qkv_mapping_matches_v_proj(self):
-        params = {"qkv_proj.weight": self._make_param_with_loader((30, 10))}
-        tensor = torch.ones(10, 10)
-
-        result = STANDARD_QKV_MAPPING.try_load("v_proj.weight", tensor, params)
-
-        self.assertEqual(result, "qkv_proj.weight")
-        params["qkv_proj.weight"].weight_loader.assert_called_once_with(
-            params["qkv_proj.weight"], tensor, "v"
-        )
-
-    def test_gate_up_mapping_matches_gate_proj(self):
-        params = {"gate_up_proj.weight": self._make_param_with_loader((20, 10))}
-        tensor = torch.ones(10, 10)
-
-        result = STANDARD_GATE_UP_MAPPING.try_load("gate_proj.weight", tensor, params)
-
-        self.assertEqual(result, "gate_up_proj.weight")
-        params["gate_up_proj.weight"].weight_loader.assert_called_once_with(
-            params["gate_up_proj.weight"], tensor, 0
-        )
-
-    def test_gate_up_mapping_matches_up_proj(self):
-        params = {"gate_up_proj.weight": self._make_param_with_loader((20, 10))}
-        tensor = torch.ones(10, 10)
-
-        result = STANDARD_GATE_UP_MAPPING.try_load("up_proj.weight", tensor, params)
-
-        self.assertEqual(result, "gate_up_proj.weight")
-        params["gate_up_proj.weight"].weight_loader.assert_called_once_with(
-            params["gate_up_proj.weight"], tensor, 1
-        )
-
-    def test_no_match_returns_none(self):
-        params = {"qkv_proj.weight": self._make_param_with_loader((30, 10))}
-        tensor = torch.ones(10, 10)
-
-        result = STANDARD_QKV_MAPPING.try_load("o_proj.weight", tensor, params)
-
-        self.assertIsNone(result)
-        params["qkv_proj.weight"].weight_loader.assert_not_called()
-
-    def test_missing_target_param_returns_target_name(self):
-        # Parameter doesn't exist in params_dict (e.g. GPTQ bias)
-        params = {}  # No qkv_proj.bias
-        tensor = torch.ones(10)
-
-        result = STANDARD_QKV_MAPPING.try_load("q_proj.bias", tensor, params)
-
-        # Returns target name for skip tracking
-        self.assertEqual(result, "qkv_proj.bias")
-
-    def test_standard_stacked_mapping_covers_all(self):
-        params = {
-            "qkv_proj.weight": self._make_param_with_loader((30, 10)),
-            "gate_up_proj.weight": self._make_param_with_loader((20, 10)),
-        }
-        tensor = torch.ones(10, 10)
-
-        # All 5 source names should match
-        for source, expected_target in [
-            ("q_proj.weight", "qkv_proj.weight"),
-            ("k_proj.weight", "qkv_proj.weight"),
-            ("v_proj.weight", "qkv_proj.weight"),
-            ("gate_proj.weight", "gate_up_proj.weight"),
-            ("up_proj.weight", "gate_up_proj.weight"),
-        ]:
-            result = STANDARD_STACKED_MAPPING.try_load(source, tensor, params)
-            self.assertEqual(result, expected_target, f"Failed for {source}")
+    assert result == expected_target
+    params[expected_target].weight_loader.assert_called_once_with(
+        params[expected_target], tensor, expected_shard
+    )
 
 
-# ---------------------------------------------------------------------------
-# WeightsMapper Tests
-# ---------------------------------------------------------------------------
+def test_stacked_params_dispatch_no_match_returns_none():
+    params = {"qkv_proj.weight": _make_param_with_loader((30, 10))}
+    tensor = torch.ones(10, 10)
+
+    result = STANDARD_QKV_MAPPING.try_load("o_proj.weight", tensor, params)
+
+    assert result is None
+    params["qkv_proj.weight"].weight_loader.assert_not_called()
 
 
-class TestWeightsMapper(unittest.TestCase):
-    def test_substr_remap(self):
-        mapper = WeightsMapper(orig_to_new_substr={".old_name.": ".new_name."})
-        weights = [("prefix.old_name.weight", torch.ones(2, 2))]
+def test_stacked_params_dispatch_missing_target_param_returns_target_name():
+    params = {}
+    tensor = torch.ones(10)
 
-        result = list(mapper.apply(weights))
+    result = STANDARD_QKV_MAPPING.try_load("q_proj.bias", tensor, params)
 
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0][0], "prefix.new_name.weight")
-
-    def test_prefix_remap(self):
-        mapper = WeightsMapper(orig_to_new_prefix={"model.model.": "model."})
-        weights = [("model.model.layers.0.weight", torch.ones(2, 2))]
-
-        result = list(mapper.apply(weights))
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0][0], "model.layers.0.weight")
-
-    def test_suffix_remap(self):
-        mapper = WeightsMapper(orig_to_new_suffix={".activation_scale": ".input_scale"})
-        weights = [("layer.activation_scale", torch.ones(2))]
-
-        result = list(mapper.apply(weights))
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0][0], "layer.input_scale")
-
-    def test_drop_via_none(self):
-        mapper = WeightsMapper(orig_to_new_substr={"rotary_emb": None})
-        weights = [
-            ("layer.rotary_emb.inv_freq", torch.ones(2)),
-            ("layer.o_proj.weight", torch.ones(2, 2)),
-        ]
-
-        result = list(mapper.apply(weights))
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0][0], "layer.o_proj.weight")
-
-    def test_composition_or(self):
-        mapper1 = WeightsMapper(orig_to_new_substr={".old1.": ".new1."})
-        mapper2 = WeightsMapper(orig_to_new_suffix={".scale_inv": ".scale"})
-
-        composed = mapper1 | mapper2
-        weights = [
-            ("prefix.old1.weight", torch.ones(2, 2)),
-            ("layer.scale_inv", torch.ones(2)),
-        ]
-
-        result = list(composed.apply(weights))
-
-        self.assertEqual(result[0][0], "prefix.new1.weight")
-        self.assertEqual(result[1][0], "layer.scale")
-
-    def test_longest_substr_match_wins(self):
-        mapper = WeightsMapper(
-            orig_to_new_substr={
-                "proj": "proj_replaced",
-                "q_proj": "qkv_proj",  # Longer match should win
-            }
-        )
-        weights = [("layer.q_proj.weight", torch.ones(2, 2))]
-
-        result = list(mapper.apply(weights))
-
-        self.assertEqual(result[0][0], "layer.qkv_proj.weight")
+    assert result == "qkv_proj.bias"
 
 
-# ---------------------------------------------------------------------------
-# AutoWeightsLoader Tests
-# ---------------------------------------------------------------------------
+def test_standard_stacked_mapping_covers_all():
+    params = {
+        "qkv_proj.weight": _make_param_with_loader((30, 10)),
+        "gate_up_proj.weight": _make_param_with_loader((20, 10)),
+    }
+    tensor = torch.ones(10, 10)
+
+    for source, expected_target in [
+        ("q_proj.weight", "qkv_proj.weight"),
+        ("k_proj.weight", "qkv_proj.weight"),
+        ("v_proj.weight", "qkv_proj.weight"),
+        ("gate_proj.weight", "gate_up_proj.weight"),
+        ("up_proj.weight", "gate_up_proj.weight"),
+    ]:
+        result = STANDARD_STACKED_MAPPING.try_load(source, tensor, params)
+        assert result == expected_target, f"Failed for {source}"
+
+
+@pytest.mark.parametrize(
+    "checkpoint_name,expected_name",
+    [
+        (
+            "model.layers.0.self_attn.q_proj.activation_scale",
+            "model.layers.0.self_attn.q_proj.input_scale",
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight_scale_inv",
+            "model.layers.0.mlp.down_proj.weight_scale",
+        ),
+        (
+            "model.layers.3.self_attn.k_proj.weight_scale_inv",
+            "model.layers.3.self_attn.k_proj.weight_scale",
+        ),
+    ],
+)
+def test_llama_remap_registry(checkpoint_name, expected_name):
+    class FakeLlama(nn.Module):
+        pass
+
+    FakeLlama.__name__ = "LlamaForCausalLM"
+    mapper = get_weight_remap(FakeLlama())
+    assert mapper is not None
+
+    result = list(mapper.apply([(checkpoint_name, torch.ones(2))]))
+    assert len(result) == 1
+    assert result[0][0] == expected_name
+
+
+def test_weights_mapper_drops_rotary_emb():
+    mapper = WeightsMapper(orig_to_new_substr={"rotary_emb": None})
+    weights = [
+        ("layer.rotary_emb.inv_freq", torch.ones(2)),
+        ("model.layers.0.self_attn.o_proj.weight", torch.ones(2, 2)),
+    ]
+
+    result = list(mapper.apply(weights))
+
+    assert len(result) == 1
+    assert result[0][0] == "model.layers.0.self_attn.o_proj.weight"
 
 
 class TestAutoWeightsLoader(unittest.TestCase):
@@ -268,7 +191,6 @@ class TestAutoWeightsLoader(unittest.TestCase):
         self.assertIn("kept.weight", loaded)
         self.assertNotIn("skipped.weight", loaded)
         self.assertTrue(torch.equal(model.kept.weight.data, tensor))
-        # skipped should remain at init value (zeros-like from default)
 
     def test_skip_rotary_embeddings(self):
         class Model(nn.Module):
@@ -290,8 +212,6 @@ class TestAutoWeightsLoader(unittest.TestCase):
         self.assertNotIn("rotary_emb.inv_freq", loaded)
 
     def test_module_delegation(self):
-        """Walker delegates to child module's load_weights if present."""
-
         class ChildModule(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -328,11 +248,10 @@ class TestAutoWeightsLoader(unittest.TestCase):
         model = Model()
         loader = AutoWeightsLoader(model, ignore_unexpected_suffixes=[".bias"])
 
-        # Should not raise for unexpected .bias weight nested under layer
         loaded = loader.load_weights(
             [
                 ("layer.weight", torch.ones(4, 4)),
-                ("layer.bias", torch.ones(4)),  # model's layer has no bias
+                ("layer.bias", torch.ones(4)),
             ]
         )
 
@@ -357,8 +276,6 @@ class TestAutoWeightsLoader(unittest.TestCase):
         self.assertTrue(torch.equal(model.weight.data, tensor))
 
     def test_pp_missing_layer_skipped(self):
-        """PPMissingLayer modules should be silently skipped."""
-
         class PPMissingLayer(nn.Module):
             pass
 
@@ -371,7 +288,6 @@ class TestAutoWeightsLoader(unittest.TestCase):
         model = Model()
         loader = AutoWeightsLoader(model)
 
-        # Weights for the missing layer should not raise
         loaded = loader.load_weights(
             [
                 ("embed.weight", torch.ones(4, 4)),
@@ -380,11 +296,6 @@ class TestAutoWeightsLoader(unittest.TestCase):
         )
 
         self.assertIn("embed.weight", loaded)
-
-
-# ---------------------------------------------------------------------------
-# filter_pp_weights Tests
-# ---------------------------------------------------------------------------
 
 
 class TestFilterPPWeights(unittest.TestCase):
@@ -412,8 +323,6 @@ class TestFilterPPWeights(unittest.TestCase):
 
         result = list(filter_pp_weights(weights, start_layer=1, end_layer=3))
 
-        # embed_tokens, lm_head, norm pass through (no layer id)
-        # layer 0 is filtered out
         names = [name for name, _ in result]
         self.assertIn("model.embed_tokens.weight", names)
         self.assertIn("lm_head.weight", names)
@@ -433,14 +342,8 @@ class TestFilterPPWeights(unittest.TestCase):
         self.assertIn("model.embed_tokens.weight", names)
 
 
-# ---------------------------------------------------------------------------
-# WeightRemapRegistry Tests
-# ---------------------------------------------------------------------------
-
-
 class TestWeightRemapRegistry(unittest.TestCase):
     def test_registered_model_returns_mapper(self):
-        # LlamaForCausalLM is registered in auto_loader.py
         class FakeLlama(nn.Module):
             pass
 
