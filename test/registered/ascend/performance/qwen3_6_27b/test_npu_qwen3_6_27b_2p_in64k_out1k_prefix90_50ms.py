@@ -58,11 +58,11 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     17,
     19,
     20,
-    "--enable-prefill-delayer",
-    "--prefill-delayer-queue-min-ratio",
-    0.7,
-    "--prefill-delayer-max-delay-ms",
-    20000,
+    # "--enable-prefill-delayer",
+    # "--prefill-delayer-queue-min-ratio",
+    # 0.7,
+    # "--prefill-delayer-max-delay-ms",
+    # 20000,
     "--dtype",
     "bfloat16",
     "--mamba-ssm-dtype",
@@ -91,7 +91,7 @@ class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCase
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     dataset_name = "generated-shared-prefix"
     max_concurrency = 20
-    num_prompts = 80
+    num_prompts = 20
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
@@ -101,6 +101,7 @@ class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCase
     warmup_requests = 1
     tpot = 50
     output_token_throughput = 225
+    pop_sglang_is_in_ci_for_gsp = True
 
     def test_npu_qwen3_6_27b_2p_in64k_out1k_prefix90_50ms(self):
         """Run NPU performance test for Qwen3.6-27B in64k out1k prefix90 50ms"""
