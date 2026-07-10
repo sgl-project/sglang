@@ -73,6 +73,34 @@ impl AppContext {
         policies: Arc<PolicyRegistry>,
         active_load: Arc<ActiveLoadRegistry>,
     ) -> Self {
+        Self::with_active_load_and_itl(
+            config,
+            tokenizers,
+            proxy,
+            registry,
+            policies,
+            active_load,
+            ItlTable::new(),
+        )
+    }
+
+    /// As [`Self::with_active_load`], but with an explicit [`ItlTable`].
+    /// Production ([`crate::main`]) builds the table BEFORE the worker
+    /// manager is spawned and passes the same handle to both the manager
+    /// (so it prunes the table on `Removed`) and here (so the chat handler
+    /// and `/metrics` read it) — the manager is spawned before the
+    /// `AppContext` exists, so the table can't be owned solely by the
+    /// context. [`Self::with_active_load`] / [`Self::new`] mint a private
+    /// table for tests that don't exercise discovery-driven pruning.
+    pub fn with_active_load_and_itl(
+        config: Config,
+        tokenizers: Arc<TokenizerRegistry>,
+        proxy: Arc<Proxy>,
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        active_load: Arc<ActiveLoadRegistry>,
+        itl: Arc<ItlTable>,
+    ) -> Self {
         let metrics = MetricsRegistry::new();
         // Wire the per-worker active-load gauge so `sgl_router_active_load`
         // mirrors the live counter on every register / drop / sweep.
@@ -100,7 +128,7 @@ impl AppContext {
             active_load,
             metrics,
             admission,
-            itl: ItlTable::new(),
+            itl,
             ready: AtomicBool::new(false),
         }
     }

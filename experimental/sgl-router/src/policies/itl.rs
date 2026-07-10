@@ -11,20 +11,26 @@
 //!
 //! # How the sample is produced (router-observed)
 //!
-//! The SSE pump reports, once per completed streaming response, the **mean
-//! inter-chunk latency**: `(last_chunk_at - first_byte_at) / (n_chunks - 1)` in
-//! ms, for streams with ≥ 2 chunks. Most engines emit one token per SSE chunk,
-//! so this approximates mean ITL; when an engine batches multiple tokens per
-//! chunk it *over*-estimates per-token latency, but stays a faithful **relative**
-//! congestion signal across workers, which is all the gate needs.
+//! The SSE pump fires the `on_inter_chunk` hook **once per non-empty upstream
+//! chunk after the first**, handing it the gap (ms) since the previous chunk —
+//! the router-observed inter-token latency. The chat handler folds *each* such
+//! per-chunk gap into the worker's EWMA (see the handler's `make_itl_hook`), so
+//! a single streaming response contributes one EWMA update per token-chunk, not
+//! one per-stream summary. Most engines emit one token per SSE chunk, so the
+//! gap approximates per-token latency; when an engine batches multiple tokens
+//! per chunk it *over*-estimates, but stays a faithful **relative** congestion
+//! signal across workers, which is all the gate needs.
 //!
-//! Each sample is folded into a per-worker EWMA. This is a coarse, **lagging**
-//! signal: it only updates when a stream *completes*, and only for streaming
-//! traffic. A non-streaming (buffered) workload produces no samples at all, in
-//! which case the table stays empty and the ITL gate degrades to a no-op (retry
-//! then behaves exactly as the load-count path). Engine-published ITL over the
-//! ZMQ load channel (a future step) would remove both the lag and the
-//! streaming-only limitation.
+//! Because the fold is per chunk, the EWMA updates continuously *during* a
+//! stream, not only at completion — the signal is live, not per-response. A
+//! sustained-slow stream contributes many high-gap samples and so pulls the
+//! worker's EWMA up (and holds it there across the freshness window); that is
+//! the intended congestion signal, not noise — a worker slow across many chunks
+//! *is* decode-congested. It remains **streaming-only**: a non-streaming
+//! (buffered) workload emits no chunks, so the table stays empty and the ITL
+//! gate degrades to a no-op (retry then behaves exactly as the load-count
+//! path). Engine-published ITL over the ZMQ load channel (a future step) would
+//! remove the streaming-only limitation.
 //!
 //! # Freshness
 //!
@@ -39,7 +45,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 /// EWMA smoothing factor: `ewma = alpha*sample + (1-alpha)*ewma`. 0.3 favours
-/// recent samples while still absorbing a single outlier stream.
+/// recent samples while still absorbing a single outlier *chunk*. (Samples are
+/// per chunk, so a sustained-slow stream — many high-gap chunks — does move the
+/// average; that is the intended congestion signal, not an outlier to absorb.)
 const EWMA_ALPHA: f64 = 0.3;
 
 #[derive(Debug, Clone, Copy)]
@@ -49,10 +57,10 @@ struct Entry {
 }
 
 /// Per-worker EWMA of router-observed inter-token latency (ms). Shared
-/// (`Arc`) between the SSE pump (writer, via the streaming completion hook) and
-/// the retry path (reader). Cheap `parking_lot::Mutex` around a small map — the
-/// write rate is one update per completed streaming response, the read rate is
-/// one snapshot per retry.
+/// (`Arc`) between the SSE pump (writer, via the per-chunk `on_inter_chunk`
+/// hook) and the retry path (reader). Cheap `parking_lot::Mutex` around a small
+/// map — the write rate is one update per streamed chunk, the read rate is one
+/// snapshot per retry.
 #[derive(Debug, Default)]
 pub struct ItlTable {
     inner: Mutex<HashMap<String, Entry>>,
@@ -66,9 +74,10 @@ impl ItlTable {
         Arc::new(Self::default())
     }
 
-    /// Fold one observed mean-ITL sample (ms) for `worker_url` into its EWMA.
-    /// Non-finite or non-positive samples are ignored (a degenerate stream must
-    /// not corrupt the average).
+    /// Fold one observed per-chunk inter-token-latency sample (ms) for
+    /// `worker_url` into its EWMA. Called once per streamed chunk (see the chat
+    /// handler's `make_itl_hook`). Non-finite or non-positive samples are
+    /// ignored (a degenerate gap must not corrupt the average).
     pub fn record(&self, worker_url: &str, sample_ms: f64, now: Instant) {
         if !sample_ms.is_finite() || sample_ms <= 0.0 {
             return;

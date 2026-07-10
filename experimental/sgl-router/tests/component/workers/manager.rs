@@ -628,6 +628,7 @@ async fn manager_emits_single_server_info_fetch_per_worker() {
         None,
         Some(kv_index.clone()),
         None,
+        None,
     ));
 
     tx.send(DiscoveryEvent::Added(spec_for(
@@ -713,6 +714,7 @@ async fn reconcile_recovers_worker_with_unresolved_model_ids() {
     let h = tokio::spawn(manager::run_with_introspector_and_reconcile(
         rx,
         registry.clone(),
+        None,
         None,
         None,
         None,

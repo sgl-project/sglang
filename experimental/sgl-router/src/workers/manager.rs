@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::itl::ItlTable;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
 use crate::workers::{WireProtocol, WorkerRegistry};
@@ -65,13 +66,14 @@ fn resolve_protocol(enable_http2: Option<bool>, worker_url: &str) -> WireProtoco
 }
 
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
-    run_with_config(rx, registry, None, None, None).await;
+    run_with_config(rx, registry, None, None, None, None).await;
 }
 
 /// Run the worker manager, optionally honoring per-model circuit-breaker
 /// configuration from `cfg`, an optional KV-event index that is notified
-/// on every worker add / remove, and an optional active-load registry
-/// that is asked to forget per-worker counters on `Removed`.
+/// on every worker add / remove, an optional active-load registry that is
+/// asked to forget per-worker counters on `Removed`, and an optional
+/// per-worker ITL table that is asked to forget its EWMA entry on `Removed`.
 ///
 /// The forwarding wire protocol (HTTP/1.1 vs cleartext h2c) is resolved per
 /// worker from its `/server_info` and stamped onto the registered
@@ -83,7 +85,9 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `active_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
-/// `cfg` is `None` the default CB config is used for every worker
+/// `itl` is `None` the per-worker ITL table is not pruned on removal
+/// (same leak shape as `active_load`; production passes `Some(...)`);
+/// when `cfg` is `None` the default CB config is used for every worker
 /// (threshold = 3).
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
@@ -95,6 +99,7 @@ pub async fn run_with_config(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
+    itl: Option<Arc<ItlTable>>,
 ) {
     run_with_introspector(
         rx,
@@ -102,6 +107,7 @@ pub async fn run_with_config(
         cfg,
         kv_index,
         active_load,
+        itl,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -118,6 +124,7 @@ pub async fn run_with_introspector(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
+    itl: Option<Arc<ItlTable>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     run_with_introspector_and_reconcile(
@@ -126,6 +133,7 @@ pub async fn run_with_introspector(
         cfg,
         kv_index,
         active_load,
+        itl,
         introspector,
         RECONCILE_INTERVAL,
     )
@@ -164,6 +172,7 @@ pub async fn run_with_introspector_and_reconcile(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
+    itl: Option<Arc<ItlTable>>,
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
@@ -204,6 +213,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &cfg,
                     &kv_index,
                     &active_load,
+                    &itl,
                     &introspector,
                     &mut pending,
                 )
@@ -246,6 +256,7 @@ async fn handle_discovery_event(
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
     active_load: &Option<Arc<ActiveLoadRegistry>>,
+    itl: &Option<Arc<ItlTable>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -279,12 +290,14 @@ async fn handle_discovery_event(
                 let _ = prev.await;
             }
             // Look up the URL before dropping the entry so the
-            // KV-event index can clear its per-(url, dp_rank) state.
+            // KV-event index (and the ITL table below) can clear their
+            // per-URL state. Borrowed (`as_deref`) so `worker_url`
+            // stays available for the ITL prune after this match.
             let worker_url = registry.get(&id).map(|w| w.url.clone());
             registry.remove(&id);
-            match (kv_index, worker_url) {
+            match (kv_index, worker_url.as_deref()) {
                 (Some(idx), Some(url)) => {
-                    idx.remove_worker(&url).await;
+                    idx.remove_worker(url).await;
                 }
                 (Some(_), None) => {
                     // Registry didn't know this worker but kv-events
@@ -310,6 +323,15 @@ async fn handle_discovery_event(
             // requests can register against it).
             if let Some(al) = active_load {
                 al.forget_worker(&id);
+            }
+            // Drop the per-worker ITL EWMA entry. Unlike active_load
+            // (keyed by WorkerId), the ITL table is keyed by URL — the
+            // same identity the hot-path writer/reader and the ITL gauge
+            // use — so it prunes on the resolved `worker_url`. A Removed
+            // without a known URL (duplicate / out-of-order event) skips
+            // this; a lingering entry ages out via `ItlTable::FRESHNESS`.
+            if let (Some(itl), Some(url)) = (itl, worker_url.as_deref()) {
+                itl.forget_worker(url);
             }
         }
         DiscoveryEvent::ModeChanged { id, mode } => {
@@ -672,6 +694,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             fast_introspector(),
         ));
 
@@ -713,6 +736,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             None,
@@ -761,6 +785,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             None,
@@ -836,6 +861,7 @@ mod tests {
             None,
             Some(kv_index.clone()),
             None,
+            None,
         ));
 
         let spec = WorkerSpec {
@@ -896,6 +922,7 @@ mod tests {
             None,
             Some(kv_index.clone()),
             None,
+            None,
         ));
 
         tx.send(DiscoveryEvent::Removed {
@@ -935,6 +962,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&active_load)),
+            None,
             fast_introspector(),
         ));
 
@@ -989,6 +1017,88 @@ mod tests {
         let _ = manager_handle.await;
     }
 
+    /// `DiscoveryEvent::Removed` calls `ItlTable::forget_worker` so the
+    /// per-worker ITL EWMA entry is reaped. Without this, a long-lived
+    /// cluster with worker churn (each rotated pod is a fresh URL) would
+    /// leak one map entry per departed worker — the entries stay
+    /// value-correct via `FRESHNESS` but the map never shrinks. Keyed by
+    /// URL (not `WorkerId`), so this exercises the URL-resolution path.
+    #[tokio::test]
+    async fn manager_calls_itl_forget_on_removed() {
+        use crate::policies::itl::ItlTable;
+        use std::time::Instant;
+        use tokio::time::timeout;
+
+        // Fake worker so introspection succeeds and the Removed path
+        // observes a known URL to resolve the ITL key from.
+        let (worker_url, _shutdown) =
+            spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
+        let key = worker_url.clone();
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let itl = ItlTable::new();
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            Some(Arc::clone(&itl)),
+            fast_introspector(),
+        ));
+
+        let id = WorkerId("w-1".into());
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        let added = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_some() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(added.is_ok(), "manager failed to register worker");
+
+        // Seed a fresh ITL sample so the table holds a live entry for
+        // this worker's URL.
+        itl.record(&key, 25.0, Instant::now());
+        assert!(
+            itl.get_fresh(&key, Instant::now()).is_some(),
+            "precondition: ITL entry must exist before Removed",
+        );
+
+        tx.send(DiscoveryEvent::Removed { id: id.clone() })
+            .await
+            .unwrap();
+        // The entry must vanish because it was FORGOTTEN, not merely aged
+        // out — the read below is well inside `ItlTable::FRESHNESS`.
+        let removed = timeout(Duration::from_secs(2), async {
+            loop {
+                if itl.get_fresh(&key, Instant::now()).is_none() && registry.get(&id).is_none() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            removed.is_ok(),
+            "manager must call itl.forget_worker on Removed",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
     /// Discovery backend emits a `Plain` worker with no bootstrap port,
     /// but `/server_info` says `disaggregation_mode="prefill"` with
     /// `disaggregation_bootstrap_port=8998`. The manager must trust
@@ -1011,6 +1121,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             None,
@@ -1116,6 +1227,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             fast_introspector(),
             Duration::from_millis(150),
         ));
@@ -1202,6 +1314,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             None,
@@ -1325,6 +1438,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             None,
@@ -1457,6 +1571,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             introspector,
             Duration::from_millis(60),
         ));
@@ -1524,6 +1639,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
             rx,
             registry.clone(),
+            None,
             None,
             None,
             None,

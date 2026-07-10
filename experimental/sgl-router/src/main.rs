@@ -143,6 +143,12 @@ async fn main() -> Result<()> {
     let janitor_handle =
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
+    // Per-worker ITL table, built BEFORE the manager is spawned (like
+    // `active_load`) so the same handle can be shared with the manager
+    // (which prunes it on `DiscoveryEvent::Removed`) and the AppContext
+    // (whose chat handler feeds it and whose `/metrics` reads it).
+    let itl = sgl_router::policies::itl::ItlTable::new();
+
     let proxy = Arc::new(
         sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
             cfg.proxy.request_timeout_secs,
@@ -165,6 +171,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
         Some(Arc::clone(&active_load)),
+        Some(Arc::clone(&itl)),
     ));
 
     // Backstop the per-worker admission counter: reclaim any in-flight slot
@@ -179,13 +186,14 @@ async fn main() -> Result<()> {
     );
 
     let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
+        sgl_router::server::app_context::AppContext::with_active_load_and_itl(
             cfg.clone(),
             tokenizers,
             proxy,
             registry,
             policies,
             active_load,
+            itl,
         ),
     );
     ctx.mark_ready();

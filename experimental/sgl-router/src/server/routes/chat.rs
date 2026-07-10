@@ -26,6 +26,11 @@ use crate::server::metrics::{
 fn abort_reason_from_api_error(err: &ApiError) -> AbortReason {
     match err {
         ApiError::UpstreamTimeout { .. } => AbortReason::UpstreamTimeout,
+        // The per-attempt deadline elapsed on a slow/wedged worker — a
+        // timeout in the same family as UpstreamTimeout (the router gave up
+        // on THIS worker), so it shares that label rather than falling
+        // through to the transport-error catch-all.
+        ApiError::AttemptTimeout { .. } => AbortReason::UpstreamTimeout,
         ApiError::StaleRequestExpired { .. } => AbortReason::StaleRequestExpired,
         // Everything else is a router-side transport / configuration failure.
         // The abort still fires (the engine may have started work), but its
@@ -1588,6 +1593,10 @@ mod tests {
                 ApiError::StaleRequestExpired { model: "m".into() },
                 AbortReason::StaleRequestExpired,
             ),
+            (
+                ApiError::AttemptTimeout { model: "m".into() },
+                AbortReason::UpstreamTimeout,
+            ),
             // Every other variant falls through to `TransportError`. Each
             // row is a decision — do not silently accept a default without
             // considering whether a distinct label would be more useful.
@@ -1665,7 +1674,7 @@ mod tests {
         // variant. If someone adds a new variant without adding a row,
         // this count assertion catches it — a coarse but effective net.
         // Keep the expected count in sync with the ApiError enum.
-        const EXPECTED_APIERROR_VARIANTS: usize = 14;
+        const EXPECTED_APIERROR_VARIANTS: usize = 15;
         assert_eq!(
             cases.len(),
             EXPECTED_APIERROR_VARIANTS,

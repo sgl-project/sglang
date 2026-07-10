@@ -66,6 +66,7 @@ async fn failover_when_one_worker_dies() {
         Some(Arc::new(cfg.clone())),
         None,
         None,
+        None,
     ));
 
     // Poll for the registry to converge — `register_one` introspect is
@@ -209,6 +210,7 @@ async fn retry_recovers_request_that_lands_on_a_dead_worker() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        None,
         None,
         None,
     ));
@@ -356,6 +358,7 @@ async fn retry_skipped_when_the_only_other_worker_is_full() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        None,
         None,
         None,
     ));
@@ -517,6 +520,7 @@ async fn retry_recovers_streaming_request_that_lands_on_a_dead_worker() {
         Some(Arc::new(cfg.clone())),
         None,
         None,
+        None,
     ));
 
     let converged = tokio::time::timeout(Duration::from_secs(5), async {
@@ -659,6 +663,7 @@ async fn retry_is_bounded_to_one_when_every_worker_is_dead() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        None,
         None,
         None,
     ));
@@ -808,6 +813,7 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
         Some(Arc::new(cfg.clone())),
         None,
         None,
+        None,
     ));
 
     let converged = tokio::time::timeout(Duration::from_secs(5), async {
@@ -921,6 +927,7 @@ async fn retry_skipped_when_only_alternative_is_itl_hot() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        None,
         None,
         None,
     ));
@@ -1070,6 +1077,7 @@ async fn attempt_deadline_fails_over_a_wedged_worker() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        None,
         None,
         None,
     ));
