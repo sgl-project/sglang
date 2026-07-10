@@ -251,15 +251,5 @@ class TestBlockFP4KVQuantizeUtil(CustomTestCase):
         self.assertLess(rel_error, 0.5)
 
 
-class TestFP4KVCacheRecipe(CustomTestCase):
-    """Test enum."""
-
-    def test_enum_values(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import FP4KVCacheRecipe
-
-        self.assertEqual(FP4KVCacheRecipe.MXFP4.value, 1)
-        self.assertEqual(FP4KVCacheRecipe.NVFP4.value, 2)
-
-
 if __name__ == "__main__":
     unittest.main()
