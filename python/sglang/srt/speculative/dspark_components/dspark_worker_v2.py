@@ -40,9 +40,6 @@ from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator impo
 from sglang.srt.speculative.dspark_components.dspark_confidence_metrics import (
     ConfidenceMetricsProbe,
 )
-from sglang.srt.speculative.dspark_components.dspark_decision_dump import (
-    DsparkDecisionDumper,
-)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DsparkDraftSampler,
     make_next_draft_input,
@@ -341,12 +338,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._confidence_probe = ConfidenceMetricsProbe(
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.tp_rank,
-        )
-
-        self._decision_dumper = DsparkDecisionDumper(
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_rank=self.tp_rank,
@@ -911,23 +902,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_logits=logits_output.next_token_logits,
                 bs=bs,
             )
-        self._decision_dumper.maybe_dump(
-            forward_ct=batch.forward_iter,
-            bs=bs,
-            mode=self._verify_planner.mode_value,
-            budget=verify_token_budget,
-            lag_steps=self._verify_planner.lag_steps,
-            verify_lens=layout.verify_lens if layout is not None else None,
-            confidence=confidence,
-            req_pool_indices=batch.req_pool_indices,
-            rids=[req.rid for req in batch.reqs],
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-            bonus_tokens=bonus,
-            correct_len=correct_len,
-            cap_trim_lens=cap_trim_lens,
-            commit_lens=commit_lens,
-        )
         if self._block_accept_recorder is not None and not proposal.folded:
             self._block_accept_recorder.observe_verify_step(
                 forward_ct=int(batch.forward_iter),
