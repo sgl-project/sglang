@@ -93,11 +93,11 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
       <td><strong style={{color: 'red'}}>x</strong></td>
     </tr>
     <tr>
-      <td><a href="https://github.com/sgl-project/sglang/pull/20922">MXFP8</a></td>
+      <td><a href="https://github.com/sgl-project/sglang/pull/20922">MXFP8</a> (LLM MoE)</td>
       <td>MoE</td>
       <td><strong style={{color: 'red'}}>x</strong></td>
       <td><strong style={{color: 'red'}}>x</strong></td>
-      <td><strong style={{color: 'blue'}}>WIP</strong></td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
       <td><strong style={{color: 'red'}}>x</strong></td>
     </tr>
   </tbody>
@@ -353,7 +353,39 @@ python3 -m sglang.launch_server \
 > **Implementation Notes:**
 > - Online path: `Fp8Config.get_quant_method()` dispatches to `NPUMXFP8LinearMethod`. Weights are quantized once at load via `npu_dynamic_mx_quant(weight, dst_type=torch_npu.float8_e4m3fn)` and pre-transposed to `[in, out]`; activations are per-token quantized at inference and matmul runs via `npu_quant_matmul(..., group_sizes=[1, 1, 32])` (block_size = 32).
 > - Offline path: `ModelSlimMXFP8Scheme` loads `float8_e4m3fn` weights + `float8_e8m0fnu` block scales pre-exported by msmodelslim. Transpose is kept as a non-contiguous view (`.data` assignment) — calling `.contiguous()` would physically reorder the pre-quantized layout and break the block-scale mapping.
-> - MoE MXFP8 (FusedMoE/TP) for LLMs is tracked separately and not part of this PR.
+> - MoE MXFP8 (FusedMoE, TP) for LLMs is documented in **MXFP8 for LLM MoE models** below.
+
+**MXFP8 for LLM MoE models (e.g. Qwen3-30B-A3B / Qwen3.5 MoE):**
+
+LLM MoE W8A8 MXFP8 (FusedMoE, TP) support builds on the dense MXFP8 path. Requires Ascend A5 series or newer — the fused MoE MX kernels (`npu_grouped_matmul_swiglu_quant_v2`, `npu_dynamic_mx_quant`) are A5-only.
+
+- Online MXFP8 quantization (BF16/FP16 expert weights → MXFP8 at load time):
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-30B-A3B \
+    --quantization mxfp8 \
+    --device npu --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 \
+    --mem-fraction-static 0.8 --tp-size 1
+```
+
+- Offline MXFP8 quantization (msmodelslim pre-quantized weights, `W8A8_MXFP8` scheme; selected via `--quantization modelslim` and detected from `quant_model_description.json`):
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path /path/to/Qwen3-30B-A3B-W8A8-MXFP8 \
+    --quantization modelslim \
+    --device npu --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 \
+    --mem-fraction-static 0.8 --tp-size 1
+```
+
+> **Implementation Notes:**
+> - Online path: `Fp8Config.get_quant_method()` dispatches FusedMoE layers to `NPUMXFP8FusedMoEMethod`. BF16 expert weights `w13`/`w2` are quantized once at load via `npu_dynamic_mx_quant(dst_type=torch_npu.float8_e4m3fn)` (a 3D `[E, N, K]` input is accepted directly) and kept as non-contiguous transpose views. Forward runs `npu_moe_init_routing_v2` → per-token MX activation quant → gmm1 `npu_grouped_matmul_swiglu_quant_v2` (cumulative `group_list`) → gmm2 `npu_grouped_matmul` (count `group_list`). The UE8M0 (`float8_e8m0fnu`) scale dtypes are passed explicitly; the e4m3 `x`/`weight` dtypes are left implicit.
+> - Offline path: `ModelSlimMXFP8MoEScheme` loads `float8_e4m3fn` expert weights + uint8 (e8m0, exponent + 127) block scales and delegates to the same kernel. The scale is reshaped `[E, N, K/32] → [E, N, K/64, 2]` (contiguous pairing, matching `npu_dynamic_mx_quant`) then transposed — no `.contiguous()`.
+> - **Router gate**: msmodelslim may also quantize `mlp.gate` (`W8A8_MXFP8`). The gate is a `ReplicatedLinear`, so its quantization must be **description-driven**: for the offline `modelslim` path the gate is passed the quant config and dequantized correctly; the online path keeps it in BF16. Loading a quantized gate as BF16 without its block scale scrambles routing and produces garbage output.
+> - MoE is TP-only (`StandardDispatchOutput`); EP / DeepEP is not yet supported. Validated end-to-end on Ascend A5.
 
 **MXFP4 W4A8 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 
