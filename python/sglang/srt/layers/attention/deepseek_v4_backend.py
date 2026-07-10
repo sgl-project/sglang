@@ -654,14 +654,22 @@ class DeepseekV4AttnBackend(
 
         # Allocated in __init__ (outside inference_mode) deliberately: lazy
         # allocation inside FlashInfer autotune's inference_mode tags them as
-        # inference tensors, which cannot be inplace-updated during CUDA-graph capture.
-        num_reqs = self.req_to_token.shape[0]
-        self.extend_seq_lens_buffer = torch.full(
-            (num_reqs,),
-            self.speculative_num_draft_tokens,
-            **self.cuda_int32_kwargs,
-        )
-        self.extend_start_loc_buffer = torch.zeros(num_reqs, **self.cuda_int32_kwargs)
+        # inference tensors, which cannot be inplace-updated during CUDA-graph
+        # capture.
+        #
+        # Guarded under speculative_num_draft_tokens to avoid allocating
+        # when the backend is used without speculative decoding (the buffers
+        # are only consumed by the target-verify path).
+        if self.speculative_num_draft_tokens is not None:
+            num_reqs = self.req_to_token.shape[0]
+            self.extend_seq_lens_buffer = torch.full(
+                (num_reqs,),
+                self.speculative_num_draft_tokens,
+                **self.cuda_int32_kwargs,
+            )
+            self.extend_start_loc_buffer = torch.zeros(
+                num_reqs, **self.cuda_int32_kwargs
+            )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
