@@ -6288,8 +6288,11 @@ class ServerArgs:
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
                 )
 
-        if not (0 < self.swa_full_tokens_ratio <= 1.0):
-            raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+        if not (0 < self.swa_full_tokens_ratio <= 4.0):
+            # >1 is meaningful for models whose full-attention KV lives mostly
+            # in separate compressed pools (e.g. DSv4), leaving the SWA pool as
+            # the per-request-dominant consumer.
+            raise ValueError("--swa-full-tokens-ratio should be in range (0, 4.0].")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
