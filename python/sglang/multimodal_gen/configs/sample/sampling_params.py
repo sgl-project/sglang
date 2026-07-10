@@ -103,6 +103,9 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Video inputs (video-to-video conditioning)
+    video_path: str | list[str] | None = None
+
     # Text inputs
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -158,6 +161,9 @@ class SamplingParams:
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
 
+    # Output audio duration in seconds (models without an audio modality ignore this).
+    sound_duration: float = 0.0
+
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = 1.0
@@ -166,6 +172,10 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+
+    progressive_mode: str = "fullres"
+    progressive_levels: int = 1
+    progressive_delta: float = 0.01
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -378,6 +388,28 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
+            raise ValueError(
+                "progressive_mode must be one of 'fullres', 'dct', or "
+                f"'dct_rewind', got {self.progressive_mode!r}"
+            )
+        if (
+            isinstance(self.progressive_levels, bool)
+            or not isinstance(self.progressive_levels, int)
+            or self.progressive_levels <= 0
+        ):
+            raise ValueError(
+                f"progressive_levels must be a positive int, got {self.progressive_levels!r}"
+            )
+        if (
+            isinstance(self.progressive_delta, bool)
+            or not isinstance(self.progressive_delta, (int, float))
+            or not 0 < float(self.progressive_delta) < 1
+        ):
+            raise ValueError(
+                f"progressive_delta must be in (0, 1), got {self.progressive_delta!r}"
+            )
 
         # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
         # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
@@ -676,7 +708,7 @@ class SamplingParams:
                 raise
 
         user_kwargs = dict(kwargs)
-        user_kwargs.pop("diffusers_kwargs", None)
+        diffusers_kwargs = user_kwargs.pop("diffusers_kwargs", None)
 
         user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
@@ -684,6 +716,8 @@ class SamplingParams:
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
         sampling_params._explicit_fields = set(user_kwargs.keys())
+        if diffusers_kwargs is not None:
+            sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -738,6 +772,28 @@ class SamplingParams:
             help="",
         )
 
+        # Progressive resolution growing (DCT spectral upsampling)
+        add_argument(
+            "--progressive-mode",
+            type=str,
+            dest="progressive_mode",
+            choices=["fullres", "dct", "dct_rewind"],
+            help="Progressive resolution mode. 'fullres' disables (default). "
+            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+        )
+        add_argument(
+            "--progressive-levels",
+            type=int,
+            dest="progressive_levels",
+            help="Number of resolution halvings for progressive generation (default: 1).",
+        )
+        add_argument(
+            "--progressive-delta",
+            type=float,
+            dest="progressive_delta",
+            help="Noise-dominated tolerance δ for stage-transition thresholds (default: 0.01).",
+        )
+
         add_argument(
             "--prompt",
             type=str,
@@ -790,6 +846,11 @@ class SamplingParams:
             "--num-frames",
             type=int,
             help="Number of frames to generate",
+        )
+        add_argument(
+            "--sound-duration",
+            type=float,
+            help="Duration of generated audio in seconds; 0 disables audio output (audio-capable models only)",
         )
         add_argument(
             "--height",
@@ -888,13 +949,96 @@ class SamplingParams:
         )
         add_argument(
             "--image-path",
+            "--image-paths",
             type=str,
             nargs="+",
             help=(
                 "Path(s) to input image(s) for image-to-image / image-to-video "
-                "generation. For multiple images, pass them as space-separated "
-                "values, e.g.: "
-                '--image-path "img1.png" "img2.png"'
+                "generation. For multiple images, pass them space-separated "
+                "(alias: --image-paths), e.g.: "
+                '--image-paths "img1.png" "img2.png"'
+            ),
+        )
+        add_argument(
+            "--action",
+            type=str,
+            help=(
+                "Action input. SANA-WM uses a WASD/IJKL DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'. Cosmos3 uses a JSON array of "
+                "shape [T, D], e.g. '[[0.1, 0.2, ...], ...]'. Model-specific "
+                "fields are ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--translation-speed",
+            "--translation_speed",
+            type=float,
+            dest="translation_speed",
+            help="SANA-WM action DSL per-frame translation speed.",
+        )
+        add_argument(
+            "--rotation-speed-deg",
+            "--rotation_speed_deg",
+            type=float,
+            dest="rotation_speed_deg",
+            help="SANA-WM action DSL per-frame rotation speed in degrees.",
+        )
+        add_argument(
+            "--pitch-limit-deg",
+            "--pitch_limit_deg",
+            type=float,
+            dest="pitch_limit_deg",
+            help="SANA-WM action DSL absolute pitch clamp in degrees.",
+        )
+        add_argument(
+            "--video-path",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to input video(s) for video-to-video generation. "
+                "The first/last frames of the video become the conditioning "
+                "frames for the generated output."
+            ),
+        )
+        add_argument(
+            "--action-mode",
+            type=str,
+            dest="action_mode",
+            help=(
+                "Cosmos3 action mode: 'forward_dynamics' (predict next frame "
+                "from action), 'policy' (predict action from frame), or "
+                "'inverse_dynamics' (predict action from two frames)."
+            ),
+        )
+        add_argument(
+            "--domain-id",
+            type=int,
+            dest="domain_id",
+            help="Action embodiment domain ID (integer). Overrides --domain-name.",
+        )
+        add_argument(
+            "--domain-name",
+            type=str,
+            dest="domain_name",
+            help="Action embodiment domain name (e.g. 'av', 'camera_pose', 'umi').",
+        )
+        add_argument(
+            "--raw-action-dim",
+            type=int,
+            dest="raw_action_dim",
+            help=(
+                "Number of active action dimensions to predict; remaining "
+                "dimensions are zero-padded. Required for 'policy' and "
+                "'inverse_dynamics' modes."
+            ),
+        )
+        add_argument(
+            "--action-fps",
+            type=float,
+            dest="action_fps",
+            help=(
+                "Frame rate used for action token temporal mRoPE positions. "
+                "Defaults to the video fps when not set."
             ),
         )
         add_argument(

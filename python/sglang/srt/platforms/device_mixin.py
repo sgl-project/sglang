@@ -32,6 +32,8 @@ from typing import NamedTuple, Optional
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
+
 
 class PlatformEnum(enum.Enum):
     """Enumeration of known platform types.
@@ -77,6 +79,16 @@ class DeviceCapability(NamedTuple):
         """Express capability as ``<major><minor>`` (minor is single digit)."""
         assert 0 <= self.minor < 10
         return self.major * 10 + self.minor
+
+
+_DEVICE_TO_DISTRIBUTED_BACKEND: dict[str, str] = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
+    "musa": "mccl",
+}
 
 
 class DeviceMixin:
@@ -192,8 +204,13 @@ class DeviceMixin:
     # ---- Distributed ----
 
     def get_torch_distributed_backend_str(self) -> str:
-        """[Planned] Return the torch.distributed backend string (e.g. "nccl", "hccl")."""
-        raise NotImplementedError
+        """Return the torch.distributed backend string (e.g. "nccl", "hccl").
+
+        Default: lookup ``self.device_type`` in ``_DEVICE_TO_DISTRIBUTED_BACKEND``,
+        falling back to ``"gloo"``. Subclasses override only when they need a
+        non-default backend (e.g. mooncake, or a brand-new device).
+        """
+        return _DEVICE_TO_DISTRIBUTED_BACKEND.get(self.device_type, "gloo")
 
     def get_communicator_class(self) -> type | None:
         """[Planned] Return platform-specific communicator class, or None for default."""

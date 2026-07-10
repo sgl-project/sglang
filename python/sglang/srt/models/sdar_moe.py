@@ -11,9 +11,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -21,8 +19,6 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -61,7 +57,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -85,7 +81,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -100,8 +96,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -121,9 +116,9 @@ class SDARMoeSparseMoeBlock(nn.Module):
 
         # Deepep / FuseEP support
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                config.num_experts + get_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -212,8 +207,8 @@ class SDARMoeAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -284,7 +279,7 @@ class SDARMoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -312,7 +307,7 @@ class SDARMoeAttention(nn.Module):
             ),
         )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -348,7 +343,7 @@ class SDARMoeBlock(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(
@@ -486,7 +481,7 @@ class SDARMoeModel(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target is not None
+                if get_server_args().rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps, **norm_kwargs)
@@ -547,7 +542,7 @@ class SDARMoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         self.model = SDARMoeModel(
             config,
@@ -557,7 +552,7 @@ class SDARMoeForCausalLM(nn.Module):
         )
 
         if self.pp_group.is_last_rank:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
             if (
                 self.pp_group.world_size == 1
                 and getattr(config, "tie_word_embeddings", False)
@@ -569,7 +564,7 @@ class SDARMoeForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

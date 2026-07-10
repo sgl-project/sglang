@@ -35,8 +35,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -145,43 +145,24 @@ def pad_text_embeddings_with_mask(
 
 
 def shard_rotary_emb_for_sp(emb):
-    """
-    Shard rotary embeddings [S, D] along sequence for SP.
-    If S is not divisible by SP degree, pad by repeating the last row.
-    """
-    # Sequence Parallelism: slice image RoPE to local shard if enabled
+    """Shard rotary embeddings [S, D] along the sequence for SP; non-divisible
+    lengths pad by repeating the last row (position labels, never attention
+    K/V, so the pad value only needs to stay finite)."""
     try:
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_parallel_rank,
-            get_sp_world_size,
-        )
+        from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import shard_seq
 
-        sp_world_size = get_sp_world_size()
+        return shard_seq(emb, dim=0, pad_mode="repeat_last")[0]
     except Exception:
-        sp_world_size = 1
-    seq_len = emb.shape[0]
-    if seq_len % sp_world_size != 0:
-        pad_len = sp_world_size - (seq_len % sp_world_size)
-        pad = emb[-1:].repeat(pad_len, 1)
-        emb = torch.cat([emb, pad], dim=0)
-    if sp_world_size > 1:
-        try:
-            rank = get_sp_parallel_rank()
-        except Exception:
-            rank = 0
-        seq_len = emb.shape[0]
-        local_len = seq_len // sp_world_size
-        start = rank * local_len
-        end = start + local_len
-        emb = emb[start:end]
-        return emb
-    else:
+        # Distributed state not initialized (single-process utilities).
         return emb
 
 
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
     raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 5 and latents.dim() == 5:
+        return latents[:, :, : raw_shape[2], :, :]
+
     if len(raw_shape) == 3:
         # Sequence format [B, S, D]: use seq_len directly
         target_tokens = raw_shape[1]
@@ -214,6 +195,7 @@ class PipelineConfig:
     cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
     generator_device: str | None = None
     flow_shift: float | None = None
+    scheduler_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -241,9 +223,6 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
-
     def postprocess_image(self, image):
         return image.last_hidden_state
 
@@ -270,9 +249,6 @@ class PipelineConfig:
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
-
-    # Compilation
-    # enable_torch_compile: bool = False
 
     # calculate the adjust size for condition image
     # width: original condition image width
@@ -311,11 +287,14 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
-    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
-        return False
-
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
+
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        """Realtime hook: optionally preprocess the first-frame condition image
+        in-place. Return True if handled (skip the standard path), False to fall
+        back to the normal condition-image preprocessing. Default: not handled."""
+        return False
 
     def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
@@ -537,18 +516,15 @@ class PipelineConfig:
             return latents, False
         time_dim = latents.shape[2]
 
-        # Pad to next multiple of SP degree if needed
+        # Zero-padding a non-divisible time dim would enter self-attention
+        # unmasked (video models pass no attn_mask) and corrupt real tokens;
+        # keep such shapes unsharded until models consume the sp_shard meta.
         if time_dim > 0 and time_dim % sp_world_size != 0:
-            logger.debug(
-                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            logger.warning_once(
+                f"Latent time dim {time_dim} is not divisible by SP degree "
+                f"{sp_world_size}; skipping sequence shard for correctness."
             )
-            pad_len = sp_world_size - (time_dim % sp_world_size)
-            pad = torch.zeros(
-                (*latents.shape[:2], pad_len, *latents.shape[3:]),
-                dtype=latents.dtype,
-                device=latents.device,
-            )
-            latents = torch.cat([latents, pad], dim=2)
+            return latents, False
 
         assert latents.shape[2] % sp_world_size == 0
         sharded_tensor = rearrange(
@@ -737,11 +713,43 @@ class PipelineConfig:
             help="Flow shift parameter",
         )
         parser.add_argument(
+            f"--{prefix_with_dot}scheduler-class-override",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}scheduler_class_override",
+            default=PipelineConfig.scheduler_class_override,
+            help="Override the scheduler class from scheduler_config.json.",
+        )
+        parser.add_argument(
             f"--{prefix_with_dot}resolution",
             type=int,
             dest=f"{prefix_with_dot.replace('-', '_')}resolution",
             default=None,
             help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
+
+        # SANA-WM streaming knobs. default=None so they only apply to pipeline
+        # configs that define these fields (e.g. SanaWMPipelineConfig); other
+        # configs are left untouched by update_config_from_args.
+        parser.add_argument(
+            f"--{prefix_with_dot}streaming",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}streaming",
+            default=None,
+            help="SANA-WM: enable chunk-causal streaming (forward_long) generation.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}refiner-chunked",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}refiner_chunked",
+            default=None,
+            help="SANA-WM: chunk-wise streaming refiner (vs whole-clip dense refiner).",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}num-frame-per-block",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}num_frame_per_block",
+            default=None,
+            help="SANA-WM: latent frames per streaming chunk (default 3).",
         )
 
         # DiT configuration
@@ -941,6 +949,30 @@ class PipelineConfig:
                 )
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
+            # If an explicit pipeline_class_name refines the model-default config
+            # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
+            # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
+            # config so realtime-only wiring (the /v1/realtime_video adapter) is
+            # selected. Only applies when the explicit config strictly subclasses
+            # the model default, so non-realtime pipelines are unaffected.
+            if pipeline_class_name:
+                explicit_config_classes = get_pipeline_config_classes(
+                    pipeline_class_name
+                )
+                if explicit_config_classes is not None:
+                    explicit_config_cls = explicit_config_classes[0]
+                    if (
+                        isinstance(explicit_config_cls, type)
+                        and isinstance(pipeline_config_cls, type)
+                        and explicit_config_cls is not pipeline_config_cls
+                        and issubclass(explicit_config_cls, pipeline_config_cls)
+                    ):
+                        logger.info(
+                            f"Refining pipeline config {pipeline_config_cls.__name__} "
+                            f"-> {explicit_config_cls.__name__} for explicit "
+                            f"pipeline_class_name={pipeline_class_name}"
+                        )
+                        pipeline_config_cls = explicit_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
         if vae_path is None:
             component_paths = kwargs.get(

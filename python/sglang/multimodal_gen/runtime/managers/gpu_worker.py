@@ -5,6 +5,7 @@ import gc
 import logging
 import multiprocessing as mp
 import os
+import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -37,14 +38,11 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    WeightsUpdater,
-    get_updatable_modules,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
-    iter_materialized_weights,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -54,6 +52,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
+    GPUWorkerPostTrainingMixin,
+)
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
 )
@@ -77,6 +78,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -102,7 +104,7 @@ class _ExpandedOutputParts:
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
-class GPUWorker:
+class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
     """
@@ -130,6 +132,7 @@ class GPUWorker:
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+        self.memory_occupation: MemoryOccupationController | None = None
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -148,6 +151,47 @@ class GPUWorker:
                 torch.cuda.empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
+    def _configure_persistent_torch_compile_cache(self) -> None:
+        """Persist torch.compile's Inductor/Triton cache across restarts"""
+        compile_cache_root = os.path.join(
+            envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
+        )
+        tmp_root = tempfile.gettempdir()
+        for env_name, sub in (
+            ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+            ("TRITON_CACHE_DIR", "triton"),
+        ):
+            current = os.environ.get(env_name)
+            if current and not current.startswith(tmp_root):
+                # Respect an explicit, non-ephemeral user-provided cache dir.
+                continue
+            cache_path = os.path.join(compile_cache_root, sub)
+            try:
+                os.makedirs(cache_path, exist_ok=True)
+            except OSError as e:
+                logger.warning(
+                    "Could not create torch.compile cache dir %s: %s", cache_path, e
+                )
+                continue
+            os.environ[env_name] = cache_path
+        logger.info(
+            "torch.compile cache: TORCHINDUCTOR_CACHE_DIR=%s TRITON_CACHE_DIR=%s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+            os.environ.get("TRITON_CACHE_DIR"),
+        )
+
+    def is_sleeping(self) -> bool:
+        return self.memory_occupation.is_sleeping() if self.memory_occupation else False
+
+    def _get_memory_occupation(self) -> MemoryOccupationController:
+        if self.memory_occupation is None:
+            self.memory_occupation = MemoryOccupationController(
+                pipeline=self.pipeline,
+                rank=self.rank,
+                use_fsdp_inference=self.server_args.use_fsdp_inference,
+            )
+        return self.memory_occupation
+
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         torch.get_device_module().set_device(self.local_rank)
@@ -157,6 +201,7 @@ class GPUWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+        self._configure_persistent_torch_compile_cache()
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
@@ -894,47 +939,17 @@ class GPUWorker:
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        flush_cache: bool = True,
-        target_modules: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """Update model weights from disk inplace without restarting the server."""
-        if not self.pipeline:
-            return False, "Pipeline is not initialized"
+    def release_memory_occupation(self) -> dict:
+        return self._get_memory_occupation().release_memory_occupation()
 
-        updater = WeightsUpdater(self.pipeline)
-        success, message = updater.update_weights_from_disk(
-            model_path,
-            flush_cache=flush_cache,
-            target_modules=target_modules,
-        )
-        if success:
-            self.server_args.model_path = model_path
-            self.pipeline.model_path = model_path
-        return success, message
-
-    def get_weights_checksum(
-        self, module_names: list[str] | None = None
-    ) -> dict[str, str]:
-        """Compute SHA-256 checksum of each module's weights."""
-        if not self.pipeline:
-            return {"error": "Pipeline is not initialized"}
-
-        all_modules = get_updatable_modules(self.pipeline)
-        names = module_names if module_names is not None else list(all_modules.keys())
-
-        checksums: dict[str, str] = {}
-        for name in names:
-            module = all_modules.get(name)
-            if module is None:
-                checksums[name] = "not_found"
-                continue
-            checksums[name] = compute_weights_checksum(
-                iter_materialized_weights(module)
-            )
-        return checksums
+    def resume_memory_occupation(self) -> dict:
+        if self.memory_occupation is None:
+            return {
+                "success": True,
+                "sleeping": False,
+                "message": "already awake",
+            }
+        return self.memory_occupation.resume_memory_occupation()
 
 
 OOM_MSG = """
@@ -985,6 +1000,7 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
     if current_platform.is_cuda():

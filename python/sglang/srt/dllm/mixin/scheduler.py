@@ -27,8 +27,11 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
-    def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_batch_dllm(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
+        self.running_batch = running_batch
         if self.enable_priority_preemption:
             self.running_batch.batch_is_full = False
 
@@ -80,7 +83,9 @@ class SchedulerDllmMixin:
                 if new_tokens == 0:
                     continue
 
-                req.fill_ids[-new_tokens:] = array("q", next_token_ids)
+                req.full_untruncated_fill_ids[
+                    req.extend_range.end - new_tokens : req.extend_range.end
+                ] = array("q", next_token_ids)
                 self.metrics_reporter.num_generated_tokens += new_tokens
 
                 req.output_ids.extend(next_token_ids)
