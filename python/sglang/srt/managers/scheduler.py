@@ -2639,6 +2639,9 @@ class Scheduler(
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
+
+        # JoyFuture: time the batch selection decision
+        batch_selection_start = time.monotonic()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout(running_batch)
         if self.dllm_config is not None:
@@ -2758,6 +2761,12 @@ class Scheduler(
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
+
+        # JoyFuture: record batch selection latency
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_per_stage_req_latency(
+                "scheduler.batch_selection", (time.monotonic() - batch_selection_start)
+            )
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
