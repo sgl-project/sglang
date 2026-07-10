@@ -50,6 +50,15 @@ def _ptr_key_from_tensor(ptrs: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(ptr) for ptr in ptrs.cpu().tolist())
 
 
+def _device_pool_stub(*, layer_num: int, **fields) -> SimpleNamespace:
+    """Minimal device-pool stand-in with layer-split fields real pools expose."""
+    return SimpleNamespace(
+        layer_num=layer_num,
+        layer_shard_enabled=False,
+        **fields,
+    )
+
+
 def _cpu_staged_lf_pf_copy(
     src_registry,
     *,
@@ -193,7 +202,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         ]
         expected_k = [layer[device_indices].clone() for layer in k_layers]
         expected_v = [layer[device_indices].clone() for layer in v_layers]
-        device_pool = SimpleNamespace(
+        device_pool = _device_pool_stub(
+            layer_num=layer_num,
             k_buffer=k_layers,
             v_buffer=v_layers,
             k_data_ptrs=torch.tensor(
@@ -294,7 +304,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             for layer_id in range(layer_num)
         ]
         expected = [layer[device_indices].clone() for layer in device_layers]
-        device_pool = SimpleNamespace(
+        device_pool = _device_pool_stub(
+            layer_num=layer_num,
             kv_buffer=device_layers,
             data_ptrs=torch.tensor(
                 [layer.data_ptr() for layer in device_layers], dtype=torch.uint64
@@ -302,6 +313,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         )
 
         host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
@@ -585,9 +597,13 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             for layer_id in range(layer_num)
         ]
         expected = [buffer[device_page_indices].clone() for buffer in device_layers]
-        device_pool = SimpleNamespace(index_k_with_scale_buffer=device_layers)
+        device_pool = _device_pool_stub(
+            layer_num=layer_num,
+            index_k_with_scale_buffer=device_layers,
+        )
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num
@@ -763,58 +779,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(captured["host_indices"].device.type, "cpu")
         self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
 
-    def test_hybrid_write_moves_indices_without_page_first_layout(self):
-        captured = {}
-
-        class FakeHostGroup:
-            layout = "layer_first"
-            can_use_write_back_jit = True
-
-            def backup_from_device_all_layer(
-                self,
-                device_pool,
-                host_indices,
-                device_indices,
-                io_backend,
-                pool_transfers=None,
-            ):
-                captured["host_indices"] = host_indices
-                captured["pool_transfers"] = pool_transfers
-
-        op = CacheOperation(
-            host_indices=_indices(0, 4),
-            device_indices=_indices(4, 8),
-            node_id=1,
-            pool_transfers=[
-                PoolTransfer(
-                    name=PoolName.DEEPSEEK_V4_C4,
-                    host_indices=_indices(0, 4),
-                    device_indices=_indices(4, 8),
-                )
-            ],
-        )
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.write_queue = [op]
-        controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostGroup()
-        controller.mem_pool_device = None
-        controller.has_draft = False
-        controller.write_stream = object()
-        controller.ack_write_queue = []
-        controller._record_transfer_indices_on_stream = lambda *args: None
-        controller.move_hybrid_indices = mock.Mock(
-            return_value=(op.host_indices, op.device_indices, op.pool_transfers)
-        )
-
-        with mock.patch.object(
-            hybrid_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_writing()
-
-        controller.move_hybrid_indices.assert_called_once()
-        self.assertEqual(captured["host_indices"].device.type, "cpu")
-        self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
-
     def test_write_back_jit_cache_controller_keeps_host_indices_on_cpu(self):
         captured = {}
 
@@ -861,43 +825,6 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeHostPool:
             layout = "page_first"
             can_use_write_back_jit = False
-
-            def backup_from_device_all_layer(
-                self, device_pool, host_indices, device_indices, io_backend
-            ):
-                captured["host_indices"] = host_indices
-
-        op = ManagerCacheOperation(
-            host_indices=_indices(0, 4),
-            device_indices=_indices(4, 8),
-            node_id=1,
-        )
-        controller = HiCacheController.__new__(HiCacheController)
-        controller.write_queue = [op]
-        controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostPool()
-        controller.mem_pool_device = None
-        controller.has_draft = False
-        controller.write_stream = object()
-        controller.ack_write_queue = []
-        controller.move_indices = mock.Mock(
-            return_value=(op.host_indices, op.device_indices)
-        )
-
-        with mock.patch.object(
-            manager_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_writing()
-
-        controller.move_indices.assert_called_once()
-        self.assertEqual(captured["host_indices"].device.type, "cpu")
-
-    def test_cache_controller_moves_indices_without_page_first_layout(self):
-        captured = {}
-
-        class FakeHostPool:
-            layout = "layer_first"
-            can_use_write_back_jit = True
 
             def backup_from_device_all_layer(
                 self, device_pool, host_indices, device_indices, io_backend

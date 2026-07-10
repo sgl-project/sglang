@@ -1054,6 +1054,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_input: MultimodalInputs,
         seq_len: int,
     ) -> torch.Tensor:
+        # Some generation models precompute decode positions for future tokens.
+        # For example, GLM-Image needs 2D spatial MRoPE positions instead of
+        # sequential delta-based positions.
+        # This is needed for image generation models (e.g. GlmImage) where
+        # decode tokens require 2D spatial MRoPE positions, not sequential.
+        if (
+            mm_input.mrope_positions is not None
+            and mm_input.mrope_positions.shape[1] >= seq_len
+        ):
+            pos = mm_input.mrope_positions[:, seq_len - 1 : seq_len]
+            return pos
+
         # doing below compute on cpu to avoid frequent small kernels
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (
@@ -1066,14 +1078,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
+        rl_on_policy_target = get_server_args().rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if (
-                    mm_input is None
-                    or get_server_args().rl_on_policy_target is not None
-                ):
+                if mm_input is None or rl_on_policy_target is not None:
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -1089,10 +1099,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     batch.extend_lens[batch_idx],
                     batch.prefix_lens[batch_idx],
                 )
-                if (
-                    mm_input is None
-                    or get_server_args().rl_on_policy_target is not None
-                ):
+                if mm_input is None or rl_on_policy_target is not None:
                     # text only
                     mrope_positions = torch.tensor(
                         [

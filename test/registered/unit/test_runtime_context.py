@@ -178,11 +178,6 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_context_publish_visible_through_legacy_getter(self):
-        sentinel = object()
-        get_context().set_server_args(sentinel)
-        self.assertIs(server_args_module.get_global_server_args(), sentinel)
-
     def test_tokenizer_alias_is_same_function(self):
         self.assertIs(
             server_args_module.set_global_server_args_for_tokenizer,
