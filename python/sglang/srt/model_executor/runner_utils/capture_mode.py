@@ -66,8 +66,13 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
 @contextmanager
 def model_capture_mode():
     global is_capture_mode
+    from sglang.srt.runtime_context import get_flags
+
+    # Disable dispose_tensor() during capture: freeing mid-capture records data_ptr()==0 into the graph.
     is_capture_mode = True
+    get_flags().capture.disable_dispose_tensor = True
     try:
         yield
     finally:
         is_capture_mode = False
+        get_flags().capture.disable_dispose_tensor = False
