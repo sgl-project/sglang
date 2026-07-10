@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -202,17 +201,10 @@ class RadixCacheCpp(BasePrefixCache):
                 kv_indices[old_prefix_len:page_aligned_overall_len]
             )
 
-        # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < kv_len_to_handle:
-            # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
-
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
-        return CacheFinishedReqResult(
-            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
-        )
+        return CacheFinishedReqResult(unhandled_kv_start=page_aligned_overall_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
