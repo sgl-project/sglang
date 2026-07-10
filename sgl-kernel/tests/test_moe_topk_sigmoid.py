@@ -52,10 +52,9 @@ def test_topk_sigmoid(num_tokens, num_experts, topk):
         topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
     ), f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
 
-    assert torch.equal(
-        torch.gather(sigmoid_output, 1, topk_indices_ref),
-        torch.gather(sigmoid_output, 1, topk_indices.long()),
-    ), f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={sigmoid_output}"
+    assert torch.allclose(
+        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
+    ), f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
 
 
 @pytest.mark.parametrize(
@@ -189,10 +188,9 @@ def test_topk_sigmoid_renormalize_correction_bias(num_tokens, num_experts, topk)
         topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
     ), f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
 
-    assert torch.equal(
-        torch.gather(sigmoid_scores, 1, topk_indices_ref),
-        torch.gather(sigmoid_scores, 1, topk_indices.long()),
-    ), f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={sigmoid_scores}"
+    assert torch.allclose(
+        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
+    ), f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
 
 
 if __name__ == "__main__":
