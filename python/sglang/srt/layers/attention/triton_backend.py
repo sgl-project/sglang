@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -13,10 +17,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
-    create_flashinfer_kv_indices_triton,
-)
-from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -115,15 +115,15 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+        from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
         )
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+        from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
-        from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
+        from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
         )
 
