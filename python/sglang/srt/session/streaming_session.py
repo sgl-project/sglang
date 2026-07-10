@@ -529,12 +529,20 @@ class StreamingSession(BasePrefixCache):
         before alloc_for_extend overwrites it. The gap appears when spec
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
+
+        The freed range starts at ceil_align(prefix_len) (_free_kv_aligned
+        frees whole pages), so the partial page [prefix_len,
+        ceil_align(prefix_len)) stays allocated and the watermark keeps the
+        page-aligned account.
         """
+        allocated_after_free = min(
+            slot.kv.kv_allocated_len, ceil_align(prefix_len, self.page_size)
+        )
         self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
-        slot.kv.kv_allocated_len = prefix_len
+        slot.kv.kv_allocated_len = allocated_after_free
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
-        req.kv.kv_allocated_len = prefix_len
+        req.kv.kv_allocated_len = allocated_after_free
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
 
@@ -543,10 +551,15 @@ class StreamingSession(BasePrefixCache):
         max_new_tokens (verify round commits M+1 at a time); next turn's
         input is output_ids[:finished_len], so positions past that must
         be released to avoid token/KV mismatch.
+
+        As in _free_tail, the allocated watermark stays page-aligned: the
+        partial page [target, ceil_align(target)) is still attached.
         """
         target = len(req.origin_input_ids) + finished_len
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
-        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
+        req.kv.kv_allocated_len = min(
+            req.kv.kv_allocated_len, ceil_align(target, self.page_size)
+        )
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
