@@ -10,7 +10,7 @@ import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -102,6 +102,7 @@ class GlobalCacheEncodeContext:
     mm_inputs: dict
     get_feature_fn: Any
     grid_thw: List
+    token_counts: List[int]
     mm_feature: Any
     num_items: int
     aux_data: dict
@@ -441,41 +442,19 @@ class MMEncoder:
         else:
             return int(grid[0] * grid[1] * grid[2])
 
-    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
-        if isinstance(grid, torch.Tensor):
-            flat = grid.flatten()
-            _t, h, w = (int(x) for x in flat[:3].tolist())
-        else:
-            _t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
-        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
-        return (h * w) // (merge_h * merge_w)
-
-    def get_num_tokens(
-        self, grid: Union[torch.Tensor, List[int]], modality: Modality
-    ) -> int:
-        """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing."""
-        if modality == Modality.AUDIO:
-            input_length = self.get_num_patches(grid, modality)
-            return self.preprocessor._get_feat_extract_output_lengths(input_length)
-        else:
-            if (
-                self.model_type in ["kimi_k25", "kimi_vl"]
-                and modality == Modality.IMAGE
-            ):
-                return self._kimi_tokens_from_patch_grid(grid)
-            merge_size = getattr(self.preprocessor.image_processor, "merge_size", 2)
-            return self.get_num_patches(grid, modality) // (merge_size**2)
-
     def slice_embedding(
-        self, mm_embedding: torch.Tensor, grid_thw: List, modality: Modality
+        self, mm_embedding: torch.Tensor, token_counts: Iterable[int]
     ) -> List[torch.Tensor]:
-        """Slice a concatenated embedding tensor into individual image embeddings."""
+        """Slice a concatenated embedding tensor using preprocessor metadata."""
         slices, offset = [], 0
-        for grid in grid_thw:
-            count = self.get_num_tokens(grid, modality)
+        for count in token_counts:
             slices.append(mm_embedding[offset : offset + count])
             offset += count
+        if mm_embedding.shape[0] != offset:
+            raise InternalError(
+                f"Encoder produced {mm_embedding.shape[0]} tokens, but "
+                f"preprocessor metadata expected {offset}"
+            )
         return slices
 
     def _calculate_hashes_from_features(
@@ -506,6 +485,7 @@ class MMEncoder:
         mm_feature,
         mm_inputs: dict,
         indices: List[int],
+        token_counts: List[int],
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
         grid_thw: Optional[List] = None,
@@ -569,8 +549,31 @@ class MMEncoder:
                 time.perf_counter() - forward_start, modality=modality.name.lower()
             )
 
-        sub_grids = [grid_thw[i] for i in indices]
-        return self.slice_embedding(new_embeddings, sub_grids, modality)
+        return self.slice_embedding(new_embeddings, (token_counts[i] for i in indices))
+
+    async def _process_mm_items(
+        self, mm_items, modality: Modality, log_metrics: bool = True
+    ):
+        preprocess_start = time.perf_counter()
+        processor_input, token_counts = await self.preprocessor.process_mm_items(
+            mm_items, modality
+        )
+        if encoder_metrics_collector is not None and log_metrics:
+            item_count = len(token_counts)
+            encoder_metrics_collector.observe_preprocess(
+                time.perf_counter() - preprocess_start,
+                modality=modality.name.lower(),
+            )
+            encoder_metrics_collector.observe_mm_items_per_request(
+                item_count, modality=modality.name.lower()
+            )
+            encoder_metrics_collector.observe_mm_items_per_batch(
+                item_count, modality=modality.name.lower()
+            )
+
+        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
+        get_feature_method = getattr(target, f"get_{modality.name.lower()}_feature")
+        return processor_input, token_counts, get_feature_method
 
     async def _prepare_global_cache_context(
         self,
@@ -579,10 +582,17 @@ class MMEncoder:
         req_id: str,
         hashes: Optional[List[str]] = None,
     ) -> GlobalCacheEncodeContext:
-        mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+        mm_inputs, token_counts, get_feature_fn = await self._process_mm_items(
+            mm_items, modality
+        )
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
+        if len(token_counts) != num_items:
+            raise InternalError(
+                f"Preprocessor returned {len(token_counts)} token counts for "
+                f"{num_items} {modality.name.lower()} grid entries"
+            )
 
         # Hashes must be grid-space; a leaf-space list would size-mismatch
         # rank>0's mask (zeros(num_items)) and deadlock TP.
@@ -610,6 +620,7 @@ class MMEncoder:
             mm_inputs=mm_inputs,
             get_feature_fn=get_feature_fn,
             grid_thw=grid_thw,
+            token_counts=token_counts,
             mm_feature=mm_feature,
             num_items=num_items,
             aux_data=_build_mm_aux_data(mm_inputs, self.model_type),
@@ -652,9 +663,7 @@ class MMEncoder:
             return []
 
         hit_hashes = [ctx.str_mm_hashes[i] for i in hit_indices]
-        hit_tokens = [
-            self.get_num_tokens(ctx.grid_thw[i], ctx.modality) for i in hit_indices
-        ]
+        hit_tokens = [ctx.token_counts[i] for i in hit_indices]
         self.mm_global_cache.prefetch(ctx.req_id, hit_hashes, hit_tokens, ctx.modality)
         return hit_hashes
 
@@ -739,9 +748,7 @@ class MMEncoder:
         miss_slice_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
         fallback_slice_pos = {idx: pos for pos, idx in enumerate(fallback_indices)}
         fallback_index_set = set(fallback_indices)
-        token_counts = [
-            self.get_num_tokens(grid, ctx.modality) for grid in ctx.grid_thw
-        ]
+        token_counts = ctx.token_counts
         dim = self.mm_global_cache.get_embedding_dim(ctx.modality)
 
         mm_embedding = torch.empty(
@@ -804,9 +811,7 @@ class MMEncoder:
     ) -> torch.Tensor:
         miss_slice_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
         fallback_slice_pos = {idx: pos for pos, idx in enumerate(fallback_indices)}
-        token_counts = [
-            self.get_num_tokens(grid, ctx.modality) for grid in ctx.grid_thw
-        ]
+        token_counts = ctx.token_counts
         embedding_dim = self.mm_global_cache.get_embedding_dim(ctx.modality)
         mm_embedding = torch.empty(
             (sum(token_counts), embedding_dim),
@@ -865,6 +870,7 @@ class MMEncoder:
                 ctx.mm_feature,
                 ctx.mm_inputs,
                 missing_indices,
+                ctx.token_counts,
                 ctx.modality,
                 ctx.get_feature_fn,
                 ctx.grid_thw,
@@ -893,6 +899,7 @@ class MMEncoder:
                 ctx.mm_feature,
                 ctx.mm_inputs,
                 fallback_indices,
+                ctx.token_counts,
                 ctx.modality,
                 ctx.get_feature_fn,
                 ctx.grid_thw,
@@ -967,6 +974,7 @@ class MMEncoder:
                     num_parts,
                     part_idx,
                     ctx.grid_thw,
+                    ctx.token_counts,
                     ctx.modality,
                     ctx.aux_data,
                 )
@@ -988,6 +996,7 @@ class MMEncoder:
                             ctx.mm_feature,
                             ctx.mm_inputs,
                             missing_indices,
+                            ctx.token_counts,
                             ctx.modality,
                             ctx.get_feature_fn,
                             ctx.grid_thw,
@@ -1008,6 +1017,7 @@ class MMEncoder:
                             ctx.mm_feature,
                             ctx.mm_inputs,
                             fallback_indices,
+                            ctx.token_counts,
                             ctx.modality,
                             ctx.get_feature_fn,
                             ctx.grid_thw,
@@ -1092,9 +1102,9 @@ class MMEncoder:
     ) -> torch.Tensor:
         modality_str = modality.name.lower()
         try:
-            # preprocess latency is observed inside _process_mm_items so all
-            # callers (encode / batch_encode / global-cache) are covered.
-            mm_inputs, get_feature_fn = await self._process_mm_items(
+            # Single-request preprocess metrics are recorded by _process_mm_items;
+            # batch_encode records its combined preprocessing separately.
+            mm_inputs, _, get_feature_fn = await self._process_mm_items(
                 mm_items, modality, log_metrics=log_metrics
             )
         except NotImplementedError as e:
@@ -1375,12 +1385,13 @@ class MMEncoder:
         num_parts: int,
         part_idx: int,
         grid_thw,
+        token_counts: List[int],
         modality: Modality,
         aux_data: dict,
     ):
         """Setup metadata and event management for mooncake async encode.
         Returns (nbytes, total_tokens, embedding_dim, event)."""
-        total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)
+        total_tokens = sum(token_counts)
         embedding_dim = self._embedding_dims[modality]
         nbytes = total_tokens * embedding_dim * self._element_size
 
@@ -1523,14 +1534,27 @@ class MMEncoder:
         """Async encode for mooncake: all ranks participate in VIT forward via background task,
         rank 0 returns metadata immediately."""
         try:
-            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            mm_inputs, token_counts, get_feature_fn = await self._process_mm_items(
+                mm_items, modality
+            )
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            if len(token_counts) != len(grid_thw):
+                raise InternalError(
+                    f"Preprocessor returned {len(token_counts)} token counts for "
+                    f"{len(grid_thw)} {modality.name.lower()} grid entries"
+                )
             aux_data = _build_mm_aux_data(mm_inputs)
 
             # Setup metadata and event management
             nbytes, total_tokens, embedding_dim, event = (
                 self._setup_mooncake_async_encode(
-                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    grid_thw,
+                    token_counts,
+                    modality,
+                    aux_data,
                 )
             )
 
@@ -1553,6 +1577,11 @@ class MMEncoder:
                         emb = get_feature_fn([mm_item])
                         if len(emb.shape) != 2:
                             emb = emb.reshape(-1, emb.shape[-1])
+                        if emb.shape[0] != total_tokens:
+                            raise InternalError(
+                                f"Encoder produced {emb.shape[0]} tokens, but "
+                                f"preprocessor metadata expected {total_tokens}"
+                            )
                         # mooncake's transfer_sync is a host-side
                         # RDMA read that bypasses the CUDA stream. Without an
                         # explicit sync here, sibling-TP /send handlers can
@@ -1624,18 +1653,51 @@ class MMEncoder:
         self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Cross-request encoder fusion (image/audio). No cache path."""
-        # items_per_req counts grid entries (post-expansion) so per-request
-        # slicing of grid_dim/final_slices stays aligned for processors that
-        # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
-        flat_items, items_per_req = [], []
-        for req in requests:
-            leaves = EncoderPreprocessor._flatten_nested_items(req["mm_items"])
-            flat_items.extend(leaves)
-            items_per_req.append(
-                sum(self.preprocessor._grid_count_per_leaf(leaves, modality))
+        try:
+            preprocess_start = time.perf_counter()
+            mm_inputs, token_counts, items_per_req = (
+                await self.preprocessor.process_batch_mm_items(requests, modality)
             )
-        total = sum(items_per_req)
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_preprocess(
+                    time.perf_counter() - preprocess_start,
+                    modality=modality.name.lower(),
+                )
+            target = (
+                self.model.thinker if hasattr(self.model, "thinker") else self.model
+            )
+            get_feat = getattr(target, f"get_{modality.name.lower()}_feature")
+        except NotImplementedError as e:
+            return self._batch_set_error(
+                requests, modality, InternalError(f"Not implemented error: {e}")
+            )
+        except Exception as e:
+            return self._batch_set_error(
+                requests, modality, BadRequestError(f"Failed to process mm items: {e}")
+            )
 
+        if len(items_per_req) != len(requests) or any(
+            isinstance(n, bool) or not isinstance(n, int) or n <= 0
+            for n in items_per_req
+        ):
+            return self._batch_set_error(
+                requests,
+                modality,
+                InternalError(
+                    f"Invalid batch layout {items_per_req} for {len(requests)} requests"
+                ),
+            )
+
+        total = sum(items_per_req)
+        if len(token_counts) != total:
+            return self._batch_set_error(
+                requests,
+                modality,
+                InternalError(
+                    f"Preprocessor returned {len(token_counts)} token counts for "
+                    f"batch layout {items_per_req}"
+                ),
+            )
         if encoder_metrics_collector is not None:
             modality_str = modality.name.lower()
             for n in items_per_req:
@@ -1647,17 +1709,6 @@ class MMEncoder:
             )
 
         try:
-            mm_inputs, get_feat = await self._process_mm_items(flat_items, modality)
-        except NotImplementedError as e:
-            return self._batch_set_error(
-                requests, modality, InternalError(f"Not implemented error: {e}")
-            )
-        except Exception as e:
-            return self._batch_set_error(
-                requests, modality, BadRequestError(f"Failed to process mm items: {e}")
-            )
-
-        try:
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
             grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
             if len(grid_dim) != total:
@@ -1666,11 +1717,11 @@ class MMEncoder:
                     modality,
                     InternalError(
                         f"Grid count mismatch for {self.model_type}/"
-                        f"{modality.name}: {len(flat_items)} leaves across "
-                        f"{len(requests)} requests → expected {total} grids "
+                        f"{modality.name}: {len(requests)} requests expected "
+                        f"{total} grids "
                         f"(per-req {items_per_req}), but processor produced "
-                        f"{len(grid_dim)}. Add tile-expansion handling in "
-                        f"_grid_count_per_leaf."
+                        f"{len(grid_dim)}. Processor batch layout must report "
+                        f"one entry per encoder grid."
                     ),
                 )
 
@@ -1678,6 +1729,7 @@ class MMEncoder:
                 mm_feature,
                 mm_inputs,
                 list(range(total)),
+                token_counts,
                 modality,
                 get_feat,
             )
@@ -2113,21 +2165,6 @@ class EncoderScheduler:
                 if encoder_metrics_collector is not None:
                     encoder_metrics_collector.observe_queue_wait(
                         max(0.0, start - p.submit_time), modality=modality_str
-                    )
-                    # Count like batch_encode: flatten nested items and expand
-                    # per-leaf grids so {"type": "image", "image": [p1, p2, ...]}
-                    # counts as N, not 1.
-                    leaves = EncoderPreprocessor._flatten_nested_items(
-                        req.get("mm_items", [])
-                    )
-                    mm_count = sum(
-                        self.encoder.preprocessor._grid_count_per_leaf(leaves, modality)
-                    )
-                    encoder_metrics_collector.observe_mm_items_per_request(
-                        mm_count, modality=modality_str
-                    )
-                    encoder_metrics_collector.observe_mm_items_per_batch(
-                        mm_count, modality=modality_str
                     )
                 for sock in self.send_sockets:
                     sock_send(sock, wrap_as_pickle(req))

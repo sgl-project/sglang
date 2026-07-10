@@ -25,6 +25,12 @@ from sglang.srt.utils import load_audio, load_image, load_video
 
 logger = logging.getLogger(__name__)
 
+_MM_GRID_ATTRS = {
+    Modality.IMAGE: ("image_grid_thw", "image_grid_hws", "grid_thws"),
+    Modality.VIDEO: ("video_grid_thw",),
+    Modality.AUDIO: ("audio_feature_lens_raw",),
+}
+
 
 class EncoderPreprocessor:
     """CPU-bound multimodal preprocessing pipeline.
@@ -242,7 +248,7 @@ class EncoderPreprocessor:
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
-    def submit_data_loading_tasks(self, items, modalities):
+    def _submit_data_loading_tasks(self, items, modalities):
         futures = []
         task_info = []
 
@@ -260,7 +266,7 @@ class EncoderPreprocessor:
 
     async def _flatten_and_load_data_by_modality(self, mm_items, modality):
         if not isinstance(mm_items, (list, tuple)):
-            futures, _ = self.submit_data_loading_tasks([mm_items], [modality])
+            futures, _ = self._submit_data_loading_tasks([mm_items], [modality])
             return await asyncio.wrap_future(futures[0])
 
         if len(mm_items) > 0 and isinstance(mm_items[0], (list, tuple)):
@@ -271,7 +277,7 @@ class EncoderPreprocessor:
                     flat_data.append(item)
                     flat_indices.append(group_idx)
 
-            futures, _ = self.submit_data_loading_tasks(
+            futures, _ = self._submit_data_loading_tasks(
                 flat_data, [modality] * len(flat_data)
             )
 
@@ -285,7 +291,7 @@ class EncoderPreprocessor:
             return nested_results
 
         else:
-            futures, _ = self.submit_data_loading_tasks(
+            futures, _ = self._submit_data_loading_tasks(
                 mm_items, [modality] * len(mm_items)
             )
             async_futures = [asyncio.wrap_future(f) for f in futures]
@@ -298,7 +304,7 @@ class EncoderPreprocessor:
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
 
-        futures, _ = self.submit_data_loading_tasks(
+        futures, _ = self._submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
         )
         async_futures = [asyncio.wrap_future(f) for f in futures]
@@ -329,24 +335,55 @@ class EncoderPreprocessor:
     # HF Processor Calls
     # ------------------------------------------------------------------
 
-    async def process_mm_items(self, mm_items, modality: Modality) -> dict:
+    async def process_mm_items(
+        self, mm_items, modality: Modality
+    ) -> tuple[dict, List[int]]:
         """Process multimodal items through the HF processor pipeline.
 
         Returns the ``mm_inputs`` dict produced by the HF image/video/audio
-        processor.  Does NOT look up ``get_feature_fn`` — that stays in
-        :class:`MMEncoder`.
+        processor and one output token count per grid entry. Does not look up
+        ``get_feature_fn``; that stays in :class:`MMEncoder`.
         """
         if modality == Modality.IMAGE:
-            return await self._process_image_items(mm_items, self._model_preprocessor)
+            mm_inputs = await self._process_image_items(
+                mm_items, self._model_preprocessor
+            )
         elif modality == Modality.VIDEO:
-            return await self._process_video_items(mm_items, self._model_preprocessor)
+            mm_inputs = await self._process_video_items(
+                mm_items, self._model_preprocessor
+            )
         elif modality == Modality.AUDIO:
-            return await self._process_audio_items(mm_items, self._model_preprocessor)
+            mm_inputs = await self._process_audio_items(
+                mm_items, self._model_preprocessor
+            )
         else:
             raise ValueError(f"Unsupported modality: {modality}")
+        return mm_inputs, self._get_token_counts(mm_inputs, modality)
 
     def supports_modality(self, modality: Modality) -> bool:
         return modality in self._supported_modalities
+
+    def _get_image_merge_size(self) -> int:
+        return getattr(self.image_processor, "merge_size", 2)
+
+    async def process_batch_mm_items(
+        self, requests: List[dict], modality: Modality
+    ) -> tuple[dict, List[int], List[int]]:
+        """Flatten requests, run the processor once, and return batch layout."""
+        flat_items, items_per_req = self._flatten_batch_requests(requests, modality)
+        mm_inputs, token_counts = await self.process_mm_items(flat_items, modality)
+        return mm_inputs, token_counts, items_per_req
+
+    def _flatten_batch_requests(
+        self, requests: List[dict], modality: Modality
+    ) -> tuple[List, List[int]]:
+        flat_items = []
+        items_per_req = []
+        for req in requests:
+            leaves = self._flatten_nested_items(req["mm_items"])
+            flat_items.extend(leaves)
+            items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
+        return flat_items, items_per_req
 
     async def _process_image_items(self, mm_items, model_preprocessor):
         if not (self.image_processor or model_preprocessor):
@@ -473,6 +510,45 @@ class EncoderPreprocessor:
             )
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
+
+    def _get_grid_dims(self, mm_inputs: dict, modality: Modality):
+        attrs = _MM_GRID_ATTRS[modality]
+        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
+            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+        for attr in attrs:
+            if attr in mm_inputs and mm_inputs[attr] is not None:
+                return mm_inputs[attr]
+        raise ValueError(
+            f"Grid dim ({_MM_GRID_ATTRS[modality]}) not found in mm_inputs"
+        )
+
+    def _get_token_counts(self, mm_inputs: dict, modality: Modality) -> List[int]:
+        if modality == Modality.AUDIO:
+            output_lengths = mm_inputs.get("audio_feature_lens")
+            if output_lengths is None:
+                grid_dims = self._get_grid_dims(mm_inputs, modality)
+                output_lengths = self._get_feat_extract_output_lengths(grid_dims)
+            if isinstance(output_lengths, torch.Tensor):
+                return [int(v) for v in output_lengths.tolist()]
+            return [int(v) for v in output_lengths]
+
+        grid_dims = self._get_grid_dims(mm_inputs, modality)
+        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
+            merge_h, merge_w = (
+                self.model_config.hf_config.vision_config.merge_kernel_size
+            )
+            token_counts = []
+            for grid in grid_dims:
+                flat_grid = grid.flatten() if isinstance(grid, torch.Tensor) else grid
+                token_counts.append(
+                    int(flat_grid[-2] * flat_grid[-1]) // (merge_h * merge_w)
+                )
+            return token_counts
+
+        merge_size = self._get_image_merge_size()
+        return [
+            int(grid[0] * grid[1] * grid[2]) // (merge_size**2) for grid in grid_dims
+        ]
 
     # ------------------------------------------------------------------
     # Video Timestamp Computation
