@@ -1019,6 +1019,7 @@ class OpenAIServingChat(OpenAIServingBase):
             rid=request.rid,
             session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
+            cache_salt=request.cache_salt,
             require_reasoning=processed_messages.require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
