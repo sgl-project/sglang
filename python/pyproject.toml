@@ -31,8 +31,7 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn-4==4.0.0b15",
-  "flashinfer_cubin==0.6.12",
-  "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.6.14", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "interegular",
   "IPython",
