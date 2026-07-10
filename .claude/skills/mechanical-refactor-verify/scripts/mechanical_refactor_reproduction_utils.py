@@ -649,21 +649,30 @@ class Repro:
     def add_typechecking_import(self, rel: str, import_stmt: str) -> "Repro":
         """Append ``import_stmt`` inside the file's ``if TYPE_CHECKING:`` block -- a moved
         definition whose annotations reference a type needs that type imported there. The
-        import sorter orders the block, so the exact insertion point does not matter."""
+        import sorter orders the block, so the exact insertion point does not matter. A lone
+        ``pass`` placeholder (the block's only statement) is dropped: populating an empty
+        ``TYPE_CHECKING`` block makes its placeholder redundant, so the target removes it."""
 
         def op(root: Path) -> None:
             path = root / rel
             lines = _split_keepends(_read_source(path))
+            nl = _newline_style("".join(lines))
             for node in ast.parse("".join(lines)).body:
                 if isinstance(node, ast.If) and ast.unparse(node.test) in (
                     "TYPE_CHECKING",
                     "typing.TYPE_CHECKING",
                 ):
                     indent = " " * node.body[0].col_offset
-                    at = node.body[-1].end_lineno
-                    lines.insert(
-                        at, indent + import_stmt + _newline_style("".join(lines))
+                    lone_pass = len(node.body) == 1 and isinstance(
+                        node.body[0], ast.Pass
                     )
+                    if lone_pass:
+                        placeholder = node.body[0]
+                        lines[placeholder.lineno - 1 : placeholder.end_lineno] = [
+                            indent + import_stmt + nl
+                        ]
+                    else:
+                        lines.insert(node.body[-1].end_lineno, indent + import_stmt + nl)
                     _write_source(path, "".join(lines))
                     return
             raise AssertionError(f"no `if TYPE_CHECKING:` block in {rel}")

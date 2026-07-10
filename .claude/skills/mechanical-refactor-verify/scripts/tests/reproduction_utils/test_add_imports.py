@@ -140,3 +140,50 @@ def test_add_typechecking_import_raises_without_a_block(tmp_path: Path) -> None:
     r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)
+
+
+def test_add_typechecking_import_drops_a_lone_pass_placeholder(tmp_path: Path) -> None:
+    """Populating a `pass`-only TYPE_CHECKING block replaces the placeholder."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    pass\n"
+        "\n"
+        "x = 1\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from b import Y\n"
+        "\n"
+        "x = 1\n"
+    )
+
+
+def test_add_typechecking_import_keeps_a_pass_that_is_not_alone(tmp_path: Path) -> None:
+    """A `pass` beside a real import is left untouched; only the new import is appended."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import X\n"
+        "    pass\n"
+        "\n"
+        "x = 1\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import X\n"
+        "    pass\n"
+        "    from b import Y\n"
+        "\n"
+        "x = 1\n"
+    )

@@ -138,7 +138,8 @@
 - `add_import(rel, import_stmt)` — the import sorter places it; with no existing imports
   it lands below the module docstring.
 - `add_typechecking_import(rel, import_stmt)` — appends inside the destination's
-  `if TYPE_CHECKING:` block; the sorter orders it.
+  `if TYPE_CHECKING:` block; the sorter orders it. A lone `pass` placeholder (the block's
+  only statement) is dropped, since populating an empty block makes its placeholder redundant.
 - `repath_import(rel, *, old_module, new_module, name)` — repaths a function-scoped
   `from old import … name …` (relative imports included) in place; module-level repaths
   fall out of add/remove + the sorter.
