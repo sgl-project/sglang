@@ -18,6 +18,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -573,6 +577,15 @@ class UMBPStore(HiCacheStorage):
             #      .default_dram_page_size (2 MiB by default). The
             #      partial-tail safety net in PoolClient handles any
             #      size mismatch.
+            #
+            # Logical-anchor host pools (the DeepSeek-V4 HiCache HostPoolGroup
+            # whose KV anchor is a LogicalHostPool that owns only page indices
+            # and no physical KV tensor) return None from get_page_buffer_meta()
+            # by design — the real per-page byte sizes live in the v2 side pools
+            # (SWA / compressed KV / indexer / state), which each carry their own
+            # dimensions. There is no single page size that fits all of them, so
+            # we leave dram_page_size at 0 and let the mori master use its
+            # default with the PoolClient partial-tail safety net.
             page_byte_size = None
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
@@ -584,14 +597,17 @@ class UMBPStore(HiCacheStorage):
                 # would over-count by the indexer buffer that is never put to UMBP).
                 dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
                 if self.is_mla_backend:
-                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                    meta = mem_pool_host.get_page_buffer_meta(dummy)
                 elif storage_config is not None and getattr(
                     storage_config, "should_split_heads", False
                 ):
                     sf = storage_config.tp_lcm_size // storage_config.tp_size
-                    _, esz = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                    meta = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
                 else:
-                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                    meta = mem_pool_host.get_page_buffer_meta(dummy)
+                # meta is None for a logical-anchor group (see note above);
+                # esz is the per-page element-size list otherwise.
+                esz = meta[1] if meta else None
                 page_byte_size = int(esz[0]) if esz else 0
 
             if (
@@ -861,11 +877,23 @@ class UMBPStore(HiCacheStorage):
     # ------------------------------------------------------------------
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # Ensure the name->pool map used by the v2 multi-pool path exists even
+        # before register_mem_host_pool_v2() is called.
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
+
+        self._zero_copy_registered = False
+        # Hybrid logical anchors (e.g. DeepSeek-V4's KV anchor LogicalHostPool)
+        # own only allocation indices and hold no physical KV tensor. There is
+        # nothing to register for RDMA here; the real per-pool buffers are
+        # registered through register_mem_host_pool_v2().
+        if getattr(mem_pool_host, "kv_buffer", None) is None:
+            return
 
         # In distributed mode, pre-register the entire host KV buffer with the
         # underlying RDMA IOEngine so PoolClient can take the zero-copy path
@@ -873,17 +901,27 @@ class UMBPStore(HiCacheStorage):
         # buffer memcpy + lock and removes the per-call `staging_buffer_size`
         # cap).  Standalone returns true as no-op by IUMBPClient contract;
         # we still gate on is_distributed() below to avoid a pointless call.
-        self._zero_copy_registered = False
+        if self._register_host_buffer_for_zero_copy(mem_pool_host):
+            self._zero_copy_registered = True
+
+    def _register_host_buffer_for_zero_copy(self, host_pool: HostKVCache) -> bool:
+        """Register a host pool's KV buffer with the RDMA IOEngine for zero-copy.
+
+        Shared by the single-pool path (register_mem_pool_host) and the
+        multi-pool path (register_mem_host_pool_v2). Returns True when the
+        buffer was successfully registered, False on any skip/failure (the
+        caller then transparently falls back to the staging-buffer path).
+        """
         if self.client is None:
-            return
+            return False
         try:
             is_distributed = bool(self.client.is_distributed())
         except Exception:
             is_distributed = False
         if not is_distributed:
-            return
+            return False
         if not hasattr(self.client, "register_memory"):
-            return
+            return False
         if getattr(self, "_disable_zero_copy_register", False):
             logger.info(
                 "UMBPStore: skipping host KV buffer RDMA registration because "
@@ -891,9 +929,11 @@ class UMBPStore(HiCacheStorage):
                 "Falling back to the staging-buffer transfer path; per-transfer "
                 "size is capped by distributed.staging_buffer_size."
             )
-            return
+            return False
+        kv_buffer = getattr(host_pool, "kv_buffer", None)
+        if kv_buffer is None:
+            return False
         try:
-            kv_buffer = mem_pool_host.kv_buffer
             host_ptr = int(kv_buffer.data_ptr())
             host_size = int(kv_buffer.numel() * kv_buffer.element_size())
             # When the buffer is backed by hugepages the mmap region is
@@ -901,7 +941,7 @@ class UMBPStore(HiCacheStorage):
             # some NICs (AINIC / ROCm) requires the registered region to
             # cover complete hugepages, so use the full mapped_size
             # instead of the logical tensor size.
-            allocator = getattr(mem_pool_host, "allocator", None)
+            allocator = getattr(host_pool, "allocator", None)
             mapped_size_fn = getattr(allocator, "mapped_size_for", None)
             if mapped_size_fn is not None:
                 mapped_size = mapped_size_fn(host_ptr)
@@ -917,20 +957,39 @@ class UMBPStore(HiCacheStorage):
                 "distributed.staging_buffer_size.",
                 exc,
             )
-            return
+            return False
         if ok:
-            self._zero_copy_registered = True
             logger.info(
                 "UMBPStore: registered host KV buffer for RDMA zero-copy "
                 "(ptr=0x%x, size=%d MB)",
                 host_ptr,
                 host_size // (1024 * 1024),
             )
-        else:
-            logger.warning(
-                "UMBPStore: register_memory returned false; staying on staging "
-                "buffer fallback path."
-            )
+            return True
+        logger.warning(
+            "UMBPStore: register_memory returned false; staying on staging "
+            "buffer fallback path."
+        )
+        return False
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        """Register an additional hybrid side pool (DeepSeek-V4 HostPoolGroup).
+
+        The controller calls this once per PoolEntry in the group, including the
+        KV anchor. The KV anchor is logical (no physical tensor) so we skip it;
+        its allocation-index role is unrelated to storage I/O. Every other pool
+        (SWA / compressed KV / indexer / state) carries a real page_first KV
+        buffer that must be (a) resolvable by name at v2 I/O time and (b)
+        registered with the RDMA IOEngine for zero-copy transfers.
+        """
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        # KV anchor is either already registered via register_mem_pool_host()
+        # (non-hybrid single pool) or purely logical (hybrid group). Skip it.
+        if host_pool_name == PoolName.KV:
+            return
+        self.registered_pools[host_pool_name] = host_pool
+        self._register_host_buffer_for_zero_copy(host_pool)
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
@@ -1007,6 +1066,11 @@ class UMBPStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            # DeepSeek-V4's KV anchor is logical only; the physical KV data is
+            # carried by the v2 side pools, so there is nothing to read here.
+            return [True] * len(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         # Normalize sizes to list of per-key sizes
@@ -1076,6 +1140,11 @@ class UMBPStore(HiCacheStorage):
             page_count = len(host_indices) // self.mem_pool_host.page_size
             return [True] * page_count
 
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            # DeepSeek-V4's KV anchor is logical only; the physical KV data is
+            # written by the v2 side pools, so there is nothing to write here.
+            return [True] * len(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         if isinstance(buffer_sizes, int):
@@ -1137,6 +1206,167 @@ class UMBPStore(HiCacheStorage):
 
         hit_count = self.client.batch_exists_consecutive(query_keys)
         return hit_count // key_multiplier
+
+    # ------------------------------------------------------------------
+    # Multi-pool v2 interface (DeepSeek-V4 hybrid HiCache HostPoolGroup)
+    #
+    # The DeepSeek-V4 HiCache stack splits KV state across several page_first
+    # side pools (SWA / compressed KV / indexer / state), coordinated by a
+    # logical KV anchor that owns only page indices. The controller registers
+    # each real pool through register_mem_host_pool_v2() and drives storage
+    # via these _v2 methods, one PoolTransfer per pool. This mirrors the proven
+    # MooncakeStore / HiCacheHF3FS design, specialized for UMBP's page_first,
+    # single-object-per-page layout (each page -> exactly one storage object).
+    # ------------------------------------------------------------------
+    def _get_hybrid_page_component_keys(self, page_keys, transfer: PoolTransfer):
+        """Map per-page logical keys to per-object storage keys for a side pool.
+
+        For UMBP every registered side pool is page_first and stores one object
+        per page (MLA: a single K object; MHA: a K and a V object), so the
+        component-key count is an exact multiple of the page count. The pool
+        name is embedded in the suffix so pages that share a hash across pools
+        never collide.
+        """
+        pool_name = transfer.name
+        host_pool = getattr(self, "registered_pools", {}).get(pool_name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
+
+        if self.is_mla_backend:
+            # Single compressed object per page.
+            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        elif getattr(host_pool, "v_buffer", None) is not None:
+            # Ordinary MHA side pool mirrors a K/V pool.
+            suffixes = [
+                f"_{self.mha_suffix}_{pool_name}_k",
+                f"_{self.mha_suffix}_{pool_name}_v",
+            ]
+        else:
+            suffixes = [f"_{self.mha_suffix}_{pool_name}"]
+
+        key_multiplier = len(suffixes)
+        component_keys = [
+            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
+        ]
+        return component_keys, key_multiplier
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            # Logical KV anchor: no physical KV object exists in UMBP, so the
+            # usable prefix is bounded entirely by the required side pools.
+            kv_pages = len(keys)
+        else:
+            kv_pages = self.batch_exists(keys, extra_info)
+
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            exists = self.client.batch_exists(component_keys)
+            # Collapse per-object results into per-page presence.
+            page_exists = [
+                all(exists[i * key_multiplier : (i + 1) * key_multiplier])
+                for i in range(kv_pages)
+            ]
+
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool) -> dict:
+        """Unified per-pool zero-copy I/O. Returns {pool_name: per-page bools}."""
+        results: dict = {}
+        for transfer in transfers:
+            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            if host_pool is None:
+                raise ValueError(f"Unregistered UMBP hybrid pool: {transfer.name}")
+            keys = transfer.keys or []
+            host_indices = transfer.host_indices
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            if not keys or host_indices is None:
+                results[transfer.name] = [False] * len(keys)
+                continue
+            assert len(keys) == len(host_indices) // page_size
+
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            # page_first side pools emit exactly one (ptr, size) per component
+            # key; assert the invariant so any future layout change is caught
+            # loudly instead of silently corrupting the key<->buffer zip.
+            assert len(key_strs) == len(ptr_list) == len(element_size_list), (
+                f"UMBP v2 buffer-meta mismatch for pool {transfer.name}: "
+                f"keys={len(key_strs)} ptrs={len(ptr_list)} sizes={len(element_size_list)}"
+            )
+
+            if is_set:
+                exist_result = self.client.batch_exists(key_strs)
+                io_results = [True if hit else False for hit in exist_result]
+                missing_idx = [i for i, hit in enumerate(exist_result) if not hit]
+                if missing_idx:
+                    put_results = self.client.batch_put_from_ptr(
+                        [key_strs[i] for i in missing_idx],
+                        [ptr_list[i] for i in missing_idx],
+                        [element_size_list[i] for i in missing_idx],
+                    )
+                    for idx, res in zip(missing_idx, put_results):
+                        io_results[idx] = bool(res)
+            else:
+                io_results = [
+                    bool(r)
+                    for r in self.client.batch_get_into_ptr(
+                        key_strs, list(ptr_list), list(element_size_list)
+                    )
+                ]
+
+            # Collapse per-object results back to per-page results.
+            results[transfer.name] = [
+                all(io_results[i * key_multiplier : (i + 1) * key_multiplier])
+                for i in range(len(keys))
+            ]
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
 
     # ------------------------------------------------------------------
     # Legacy ABC interface (required by HiCacheStorage)
