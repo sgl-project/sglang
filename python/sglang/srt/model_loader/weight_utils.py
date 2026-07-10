@@ -74,6 +74,7 @@ logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 
+
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
 # layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
@@ -258,8 +259,24 @@ def get_quant_config(
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
-        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        return quant_cls.from_config(hf_quant_config)
+
+        # For modelopt_mixed, config.json's quantization_config may not
+        # contain all runtime metadata. Fall through to the file-based
+        # hf_quant_config.json path when the per-layer map or KV-cache
+        # quantization metadata is missing.
+        modelopt_mixed_config_incomplete = (
+            model_config.quantization == "modelopt_mixed"
+            and (
+                "quantized_layers" not in hf_quant_config
+                or (
+                    "kv_cache_quant_algo" not in hf_quant_config
+                    and "kv_cache_scheme" not in hf_quant_config
+                )
+            )
+        )
+        if not modelopt_mixed_config_incomplete:
+            hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+            return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":

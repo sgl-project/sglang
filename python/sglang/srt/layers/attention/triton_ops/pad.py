@@ -347,7 +347,12 @@ def seqlens_expand_kernel(
     offs = tl.arange(0, BLOCK)
     mask = offs < qo_len
 
-    values = start + offs
+    # Clamp to >= 0: rows with kv_len < qo_len (DP-padded / idle-companion
+    # rows whose kv is the CUDA-graph fill value) would otherwise produce
+    # negative lengths, which unsigned consumers (e.g. the top-k v2 kernel,
+    # which reads lengths as uint32) turn into ~4e9-token lengths and an
+    # illegal memory access.
+    values = tl.maximum(start + offs, 0)
     tl.store(output_ptr + out_offset + offs, values, mask=mask)
 
 

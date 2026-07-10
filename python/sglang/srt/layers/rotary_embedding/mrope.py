@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
@@ -43,6 +43,8 @@ if _is_xpu:
 
 import triton
 import triton.language as tl
+
+from sglang.srt.runtime_context import get_server_args
 
 
 @triton.jit
@@ -214,7 +216,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.register_buffer("axis_map", axis_map, persistent=False)
         else:
             self.axis_map = None
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
     def get_cos_sin_with_position(self, positions):
@@ -226,7 +228,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_global_server_args().attention_backend):
+            if support_triton(get_server_args().attention_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:

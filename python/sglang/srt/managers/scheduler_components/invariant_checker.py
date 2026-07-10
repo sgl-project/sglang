@@ -470,14 +470,16 @@ def create_scheduler_watchdog(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
         return (
-            f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
+            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
+            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
         )
 
     return WatchdogRaw(
         debug_name="Scheduler",
         get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
+        is_active=lambda: (
+            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+        ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,

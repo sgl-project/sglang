@@ -13,9 +13,9 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CrossAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
+    pred_noise_to_pred_video,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -1094,6 +1094,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         device,
         *,
         sequence_shard_enabled: bool = False,
+        kv_cache_size: int | None = None,
     ) -> None:
         """
         Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
@@ -1102,9 +1103,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
             sequence_shard_enabled=sequence_shard_enabled
         )
         attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size(
-            sequence_shard_enabled=sequence_shard_enabled
-        )
+        if kv_cache_size is None:
+            kv_cache_size = self._get_causal_kv_cache_size(
+                sequence_shard_enabled=sequence_shard_enabled
+            )
         self.causal_kv_cache = self._allocate_causal_kv_cache(
             batch_size=batch_size,
             kv_cache_size=kv_cache_size,

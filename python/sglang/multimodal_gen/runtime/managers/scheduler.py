@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
     SchedulerWarmupMixin,
+    get_first_generation_req,
     is_warmup_req,
     should_return_warmup_result,
 )
@@ -571,6 +572,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ) -> List[OutputBatch]:
         return [OutputBatch(error=error_msg) for _ in reqs]
 
+    def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
+        req = get_first_generation_req(processed_req)
+        return (req is not None and bool(req.extra.get("server_internal_prewarm"))) or (
+            is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
+        )
+
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -725,6 +732,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.audio, start, end, total_items
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
+                action_pred=self._slice_batched_value(
+                    output_batch.action_pred, start, end, total_items
+                ),
                 trajectory_timesteps=self._slice_batched_value(
                     output_batch.trajectory_timesteps, start, end, total_items
                 ),
@@ -1048,8 +1058,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     is_warmup = is_warmup_req(processed_req)
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    if is_warmup and should_return_warmup_result(processed_req):
-                        # only keep the necessary lightweight payloads
+                    should_return_lightweight_warmup_result = (
+                        self._should_return_lightweight_warmup_result(processed_req)
+                    )
+                    if should_return_lightweight_warmup_result:
+                        # internal prewarm is a real-path request; reply but drop payloads
                         output_batch.drop_payload_for_warmup()
                         self.return_result(
                             output_batch, identity, should_not_return=False

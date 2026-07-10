@@ -202,8 +202,6 @@ class TestEnvVarAliases(unittest.TestCase):
             "SGLANG_NSA_FUSE_TOPK",
             "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
             "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
-            "SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA",
-            "SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA",
         ]:
             os.environ.pop(key, None)
         # Re-import to reset descriptor state

@@ -4,13 +4,25 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, next_power_of_2
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    next_power_of_2,
+)
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu, assign_req_to_token_pool_cpu
 
 
 @triton.jit
@@ -56,6 +68,16 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    if _is_cpu:
+        assign_req_to_token_pool_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+        return
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -374,6 +396,23 @@ def assign_extend_cache_locs_func(
             start_offset,
             end_offset,
             out_cache_loc,
+        )
+
+        return out_cache_loc
+
+    elif _is_cpu:
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+        assign_extend_cache_locs_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
         )
 
         return out_cache_loc

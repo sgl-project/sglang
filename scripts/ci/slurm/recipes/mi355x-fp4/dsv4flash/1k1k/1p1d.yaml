@@ -35,6 +35,7 @@ runtime:
   mem_fraction_static: 0.90
   page_size: 256
   max_running_requests: 256
+  max_total_tokens: 8551168
   chunked_prefill_size: 8192
   swa_full_tokens_ratio: 0.1
 

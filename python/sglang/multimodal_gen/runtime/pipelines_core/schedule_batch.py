@@ -85,6 +85,7 @@ class Req:
     vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
+    preprocessed_video: torch.Tensor | None = None
 
     output_file_ext: str | None = None
     # Primary encoder embeddings
@@ -135,6 +136,9 @@ class Req:
 
     # Audio Parameters
     generate_audio: bool = True
+
+    # Action Latents (Cosmos3 action-conditioned generation)
+    action_latents: torch.Tensor | None = None
 
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
@@ -215,6 +219,7 @@ class Req:
     realtime_output_pacing: bool = False
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
+    realtime_causal_kv_sample_tokens: int | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 
@@ -414,6 +419,10 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    action_pred: torch.Tensor | None = None
+    action_mode: str | None = None
+    action_domain_id: int | None = None
+    action_raw_action_dim: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None

@@ -320,11 +320,6 @@ def build_memory_self_attention_block_mask(
 # --- Memory VAE encode ---
 
 
-import torch
-from PIL import Image
-from torchvision.transforms import functional as TVF
-
-
 def frames_to_video_tensor(
     frames: list[Image.Image], target_h: int, target_w: int
 ) -> torch.Tensor:
@@ -510,11 +505,6 @@ def build_memory_audio_rope_coords(
 
 
 # --- Paired audio-video memory bank ---
-
-
-import torch
-import torchaudio
-from PIL import Image
 
 
 @dataclass

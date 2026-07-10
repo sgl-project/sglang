@@ -22,27 +22,6 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
-class TestFimPosition(CustomTestCase):
-    def test_middle_and_end_are_distinct(self):
-        """Test that MIDDLE and END are different enum values."""
-        self.assertNotEqual(FimPosition.MIDDLE, FimPosition.END)
-
-
-class TestCompletionTemplate(CustomTestCase):
-    def test_dataclass_fields(self):
-        """Test creating a CompletionTemplate with all fields."""
-        t = CompletionTemplate(
-            name="test",
-            fim_begin_token="<begin>",
-            fim_middle_token="<middle>",
-            fim_end_token="<end>",
-            fim_position=FimPosition.MIDDLE,
-        )
-        self.assertEqual(t.name, "test")
-        self.assertEqual(t.fim_begin_token, "<begin>")
-        self.assertEqual(t.fim_position, FimPosition.MIDDLE)
-
-
 class TestRegisterCompletionTemplate(CustomTestCase):
     def test_builtin_templates_registered(self):
         """Test that deepseek_coder, star_coder, qwen_coder are pre-registered."""

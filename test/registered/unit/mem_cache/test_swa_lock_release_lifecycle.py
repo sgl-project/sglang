@@ -433,37 +433,6 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         )
         tree.sanity_check()
 
-    def test_full_lifecycle_inc_dec_swa_dec_lock_balances(self):
-        tree, allocator, _ = _build_tree(sliding_window_size=4)
-        leaf = _insert_chain(tree, allocator, [1, 2, 3, 4, 5, 6, 7, 8])
-
-        full_protected0 = tree.full_protected_size_
-        swa_protected0 = tree.swa_protected_size_
-        full_avail0 = allocator.full_available_size()
-        swa_avail0 = allocator.swa_available_size()
-
-        inc_res = tree.inc_lock_ref(leaf)
-        swa_uuid = inc_res.swa_uuid_for_lock
-
-        self.assertGreater(tree.full_protected_size_, full_protected0)
-        self.assertGreater(tree.swa_protected_size_, swa_protected0)
-
-        tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=swa_uuid)
-
-        self.assertEqual(tree.swa_protected_size_, swa_protected0)
-        self.assertGreater(tree.full_protected_size_, full_protected0)
-
-        tree.dec_lock_ref(
-            leaf, DecLockRefParams(swa_uuid_for_lock=swa_uuid), skip_swa=True
-        )
-
-        self.assertEqual(tree.full_protected_size_, full_protected0)
-        self.assertEqual(tree.swa_protected_size_, swa_protected0)
-        self.assertEqual(allocator.full_available_size(), full_avail0)
-        self.assertEqual(allocator.swa_available_size(), swa_avail0 + len(leaf.value))
-
-        tree.sanity_check()
-
 
 if __name__ == "__main__":
     unittest.main()

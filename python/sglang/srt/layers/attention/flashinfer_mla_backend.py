@@ -23,18 +23,18 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     dcp_enabled,
     get_attention_dcp_world_size,
-    plan_dcp_decode_metadata,
     update_local_kv_lens_for_dcp,
 )
+from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_buffer, get_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -80,7 +80,6 @@ class PrefillMetadata:
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
-global_workspace_buffer = None
 
 
 class FlashInferMhaChunkKVRunner:
@@ -226,22 +225,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_chunk_kv = (
             not skip_prefill
-            and get_global_server_args().disaggregation_mode != "decode"
-            and not get_global_server_args().disable_chunked_prefix_cache
-            and not get_global_server_args().flashinfer_mla_disable_ragged
+            and get_server_args().disaggregation_mode != "decode"
+            and not get_server_args().disable_chunked_prefix_cache
+            and not get_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
         # Allocate buffers
-        global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_buffer = torch.empty(
+        # different from flashinfer zero_init_global_workspace_buffer
+        self.workspace_buffer = get_buffer(
+            "flashinfer_mla_workspace",
+            lambda: torch.empty(
                 envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
-            )
-        self.workspace_buffer = global_workspace_buffer
+            ),
+        )
 
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
@@ -404,7 +403,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not get_global_server_args().flashinfer_mla_disable_ragged
+                not get_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
                 and not is_in_tc_piecewise_cuda_graph()

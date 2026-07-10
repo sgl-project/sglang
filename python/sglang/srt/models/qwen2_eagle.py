@@ -135,6 +135,7 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:

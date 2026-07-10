@@ -87,6 +87,10 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     "unquant",
     "--dtype",
     "bfloat16",
+    "--reasoning-parser",
+    "minimax-append-think",
+    "--tool-call-parser",
+    "minimax-m2",
 ]
 
 
@@ -122,7 +126,7 @@ class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_GPQA(TestNpuAccuracyTestCaseBase):
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
-    max_concurrency = 64
+    eval_batch_size = 64
 
     def test_accuracy(self):
         self.run_accuracy()

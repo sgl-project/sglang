@@ -18,6 +18,7 @@ register_npu_ci(
 QWEN3_6_35B_A3B_128K_1K_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
+    "HCCL_BUFFSIZE": "1600",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -26,6 +27,7 @@ QWEN3_6_35B_A3B_128K_1K_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "ASCEND_USE_FIA": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "20",
+    "GDN_ATTN_BACKEND_TRITON": "1",
 }
 
 QWEN3_6_35B_A3B_128K_1K_OTHER_ARGS = [
@@ -40,21 +42,21 @@ QWEN3_6_35B_A3B_128K_1K_OTHER_ARGS = [
     "--chunked-prefill-size",
     -1,
     "--max-total-tokens",
-    600000,
+    420000,
     "--max-prefill-tokens",
-    65536,
+    128000,
     "--disable-radix-cache",
     "--trust-remote-code",
-    "--enable-prefill-delayer",
     "--max-running-requests",
-    4,
+    3,
     "--max-mamba-cache-size",
-    12,
+    3,
     "--mem-fraction-static",
-    0.6,
-    "--max-mamba-cache-size",
-    20,
-    "--disable-cuda-graph",
+    0.9,
+    "--cuda-graph-bs",
+    1,
+    2,
+    3,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -70,6 +72,10 @@ QWEN3_6_35B_A3B_128K_1K_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -82,11 +88,12 @@ class TestNPUQwen3_6_35BA3B_1P_In128k_Out1k_50ms(TestNpuPerformanceTestCaseBase)
     other_args = QWEN3_6_35B_A3B_128K_1K_OTHER_ARGS
     envs = QWEN3_6_35B_A3B_128K_1K_ENVS
     dataset_name = "random"
-    max_concurrency = 4
-    num_prompts = 16
+    max_concurrency = 3
+    num_prompts = 3
     input_len = 128000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 60.57
 

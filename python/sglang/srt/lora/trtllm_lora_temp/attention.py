@@ -10,7 +10,6 @@ preserved and called for batches where two-stream isn't active.
 import torch
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -24,6 +23,7 @@ from sglang.srt.lora.trtllm_lora_temp import (
     is_two_stream_active,
     lora_overlap_alloc_stream,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 def qkv_proj_lora_forward(self, input_: torch.Tensor):
@@ -93,7 +93,7 @@ def row_parallel_lora_forward(
     if self.base_layer.input_is_parallel:
         input_parallel = input_
     else:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         splitted_input = split_tensor_along_last_dim(
             input_, num_partitions=self.base_layer.tp_size
         )

@@ -32,6 +32,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -84,7 +85,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
@@ -294,6 +295,15 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         def run_once():
+            # Record the metadata rebuild against the committed target-prefix
+            # geometry (spec_info nulled → plain target-length decode), matching
+            # every other frozen-KV metadata init. Without the view, backends
+            # that key seqlen offsets off spec_info (trtllm_mha's draft-decode
+            # branch adds speculative_step_id + 1) bake a +1 offset into the
+            # captured graph and replay reads one extra, never-written KV slot.
+            with self.frozen_kv_mtp_worker._frozen_kv_target_view(forward_batch):
+                self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
+
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,

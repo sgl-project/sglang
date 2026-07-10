@@ -64,9 +64,24 @@ _MM_GEN_SUBDIR_BACKENDS = {
     "server/musa": ("MUSA",),
     "server/ascend": ("NPU",),
     "layers": ("CUDA",),
-    "unit": ("CUDA",),
+    # unit/ are portable CPU-style unit tests. pr-test-amd now runs the `unit`
+    # suite on ROCm (multimodal-gen-unit-test-amd, both 7.0.0 and 7.2.0), so
+    # they are AMD-covered too, not CUDA-only.
+    "unit": ("CUDA", "AMD"),
     "cli": ("CUDA",),
     "manual": ("CUDA",),
+    # Standalone server/CLI single-file tests (restructured out of server/).
+    # Run on CUDA CI; AMD parity for these standalone files is TBD, so
+    # CUDA-only for now (previously matched no rule and were dropped entirely).
+    "single_test_file": ("CUDA",),
+    "single_test_file/component_accuracy": ("CUDA",),
+    # Nested unit suites run only on the CUDA lane today (they are not part of
+    # the AMD `unit` suite that multimodal-gen-unit-test-amd executes).
+    "unit/realtime": ("CUDA",),
+    "unit/sana_wm": ("CUDA",),
+    "unit/progressive_resolution": ("CUDA",),
+    # musa-named unit layer kernels.
+    "unit/musa/layers": ("MUSA",),
 }
 
 # Filenames that match `test_*.py` by convention but contain no real tests

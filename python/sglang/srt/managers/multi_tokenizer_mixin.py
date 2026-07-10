@@ -29,7 +29,7 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import psutil
 import setproctitle
@@ -601,14 +601,19 @@ class TokenizerWorker(TokenizerManager):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
+        server_args.override(
+            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
+        )
         super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
-        self.server_args.disaggregation_mode = disaggregation_mode
+        self.server_args.override(
+            "tokenizer_worker.restore_disaggregation_mode",
+            disaggregation_mode=disaggregation_mode,
+        )
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -672,6 +677,19 @@ class TokenizerWorker(TokenizerManager):
         if self._pause_continue_future and not self._pause_continue_future.done():
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
+
+
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerWorker
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
+            f"subclass, got {worker_class!r}"
+        )
+
+    return worker_class
 
 
 async def print_exception_wrapper(func):

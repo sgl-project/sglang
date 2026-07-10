@@ -20,6 +20,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import fast_topk
 
@@ -496,6 +497,7 @@ class _EagleDraftExtendV2WorkerHarness:
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
         self.draft_runner.model = model_forward
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
 
 def _build_eagle_draft_extend_fixture(
@@ -554,14 +556,10 @@ def _capture_eagle_draft_extend_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftExtendCudaGraphRunner(

@@ -2,6 +2,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import copy_all_layer_kv_cache_cpu
+
 
 @triton.jit
 def set_kv_buffer_prefix_valid_tiled(
@@ -84,6 +91,37 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+
+def copy_all_layer_kv_cache_func(
+    data_ptrs: torch.Tensor,
+    strides: torch.Tensor,
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+    num_locs: int,
+    num_locs_upper: int,
+    kv_copy_config: dict,
+):
+    if _is_cpu:
+        copy_all_layer_kv_cache_cpu(
+            data_ptrs,
+            strides,
+            tgt_loc[:num_locs],
+            src_loc[:num_locs],
+        )
+        return
+    grid = (data_ptrs.numel(), kv_copy_config["byte_tiles"])
+    copy_all_layer_kv_cache_tiled[grid](
+        data_ptrs,
+        strides,
+        tgt_loc,
+        src_loc,
+        num_locs,
+        num_locs_upper,
+        BYTES_PER_TILE=kv_copy_config["bytes_per_tile"],
+        num_warps=kv_copy_config["num_warps"],
+        num_stages=2,
+    )
 
 
 # ---------------------------------------------------------------------------

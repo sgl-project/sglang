@@ -104,7 +104,19 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
-    if _has_flashinfer and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES:
+    # torch.compiler.is_dynamo_compiling(): FlashInfer norm paths are not safe under
+    # torch.compile(..., fullgraph=True). Dynamo traces into FlashInfer's JIT module
+    # loading path, which calls Path.exists() / os.stat() — both untraceable — causing
+    # the entire compilation to fail. We fall back to the internal implementation while
+    # tracing as a temporary workaround. Once the upstream fix is merged and we upgrade
+    # FlashInfer, this check can be removed.
+    # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
+    #      https://github.com/flashinfer-ai/flashinfer/pull/2733
+    if (
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
+    ):
         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
     else:
         return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
@@ -140,7 +152,11 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if _has_flashinfer and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES:
+    if (
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
+    ):
         _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
         _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
@@ -177,7 +193,11 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    if _has_flashinfer and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES:
+    if (
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
+    ):
         return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
     else:
         return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
@@ -213,7 +233,11 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if _has_flashinfer and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES:
+    if (
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
+    ):
         _flashinfer_norm.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )

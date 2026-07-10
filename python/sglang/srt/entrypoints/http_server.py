@@ -146,10 +146,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
+    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
@@ -158,6 +158,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -236,7 +237,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = TokenizerWorker(server_args, port_args)
+    tokenizer_worker_class = get_tokenizer_worker_class(server_args)
+    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -260,6 +262,8 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    grpc_handle = None
+    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -375,20 +379,38 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Execute the general warmup
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        kwargs=warmup_thread_kwargs,
-    )
-    warmup_thread.start()
-
-    # Start the HTTP server
+    # Start the native gRPC server and warmup inside the try so a failure in
+    # either still runs the finally cleanup below. Native gRPC is enabled via
+    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
+    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if (
+            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            and server_args.grpc_port is not None
+            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+        ):
+            grpc_handle = _start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                scheduler_info=_global_state.scheduler_info,
+            )
+
+        # Execute the general warmup
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            kwargs=warmup_thread_kwargs,
+        )
+        warmup_thread.start()
+
+        # Start the HTTP server
         yield
     finally:
+        _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
-        warmup_thread.join()
+        if warmup_thread is not None:
+            warmup_thread.join()
 
 
 # Fast API
@@ -731,7 +753,7 @@ async def server_info():
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
 
-    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
     historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
     num_pending_tokens, ts_tic) so existing clients keep working.
     """
@@ -1335,7 +1357,9 @@ async def update_weight_version(
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
         # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        _global_state.tokenizer_manager.server_args.override(
+            "http.update_weight_version", weight_version=obj.new_version
+        )
 
         return ORJSONResponse(
             {
@@ -1517,7 +1541,11 @@ async def parse_function_call_request(
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools,
+        tool_call_parser=obj.tool_call_parser,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -1541,7 +1569,11 @@ async def separate_reasoning_request(
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+    parser = ReasoningParser(
+        model_type=obj.reasoning_parser,
+        request=request,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     if obj.return_blocks:
@@ -2466,6 +2498,51 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+):
+    try:
+        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+        from sglang.srt.grpc import _core as grpc_native
+    except ImportError as e:
+        raise RuntimeError(
+            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
+            "but --grpc-port was set. The extension is built from "
+            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
+            "install a wheel that includes the extension or unset --grpc-port."
+        ) from e
+
+    runtime_handle = RuntimeHandle(
+        tokenizer_manager=tokenizer_manager,
+        template_manager=template_manager,
+        server_args=server_args,
+        scheduler_info=scheduler_info or {},
+    )
+
+    grpc_handle = grpc_native.start_server(
+        host=server_args.host,
+        port=server_args.grpc_port,
+        runtime_handle=runtime_handle,
+        worker_threads=server_args.grpc_worker_threads,
+    )
+    logger.info(
+        f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
+    )
+    return grpc_handle
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")
 
 
 def launch_server(

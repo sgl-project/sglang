@@ -1,5 +1,13 @@
+import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils import is_cpu, next_power_of_2
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import fill_accept_out_cache_loc_cpu, fill_bonus_tokens_cpu
 
 
 @triton.jit
@@ -21,6 +29,29 @@ def fill_bonus_tokens(
     tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
+def fill_bonus_tokens_func(
+    accept_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    bonus_tokens: torch.Tensor,  # mutable
+    accept_stride: int,
+    batch_size: int,
+):
+    if _is_cpu:
+        fill_bonus_tokens_cpu(
+            accept_tokens,
+            accept_lens,
+            bonus_tokens,
+            accept_stride,
+        )
+        return
+    fill_bonus_tokens[(batch_size,)](
+        accept_tokens,
+        accept_lens,
+        bonus_tokens,
+        accept_stride,
+    )
+
+
 @triton.jit
 def fill_accept_out_cache_loc(
     accept_index,
@@ -37,3 +68,24 @@ def fill_accept_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accept_out_cache_loc + dst, value)
+
+
+def fill_accept_out_cache_loc_func(
+    accept_index: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    accept_out_cache_loc: torch.Tensor,  # mutable
+    size: int,
+):
+    if _is_cpu:
+        fill_accept_out_cache_loc_cpu(
+            accept_index,
+            out_cache_loc,
+            accept_out_cache_loc,
+        )
+        return
+    fill_accept_out_cache_loc[(size,)](
+        accept_index,
+        out_cache_loc,
+        accept_out_cache_loc,
+        next_power_of_2(size),
+    )

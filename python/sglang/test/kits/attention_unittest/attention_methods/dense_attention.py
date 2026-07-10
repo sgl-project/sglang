@@ -19,11 +19,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-from ..mock_server_args import make_mock_server_args
 
 # Unit tests run without distributed initialization. Backends that size buffers by
 # attention tensor-parallel degree should see the single-rank default.
@@ -338,7 +335,7 @@ class MockModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -363,7 +360,6 @@ class MockModelRunner(ModelRunner):
             is_embedding=False,
             kv_cache_dtype="auto",
             max_running_requests=None,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -374,7 +370,7 @@ class MockModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,

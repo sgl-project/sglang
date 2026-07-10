@@ -88,6 +88,33 @@ class DSATopKBackend(Enum):
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
+        # Decode-shaped PAGED top-k (plain decode AND spec verify / draft-extend,
+        # whose expanded rows match the same shape) routes to the DeepSeek-V4 top-k
+        # v2 JIT kernel, which fuses top-k selection and the page-table transform in
+        # one launch and consumes the indexer's own page_size>=1 table directly, so
+        # no page_size=1 table is materialized. Shared by DeepSeek-V3.2 and GLM DSA.
+        # This is a deterministic dispatch on the work shape, not a best-effort
+        # attempt: the fused-decode CUDA graph drops the page_size=1 table for
+        # exactly this case (see dsa_drop_wide_page_table), so once the shape
+        # matches we commit to v2 and never silently fall back to the legacy
+        # page_size=1 path from here.
+        if (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and row_starts is None
+            and batch_idx_list is None
+            and 0 < topk <= 2048
+            and lengths.shape[0]
+            == logits.shape[0]
+            == attn_metadata.real_page_table.shape[0]
+        ):
+            return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+
+        # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
+        # which is always present here: the fold only drops it for the decode case
+        # dispatched to v2 above.
+        assert attn_metadata.page_table_1 is not None
+
         if self.is_sgl_kernel():
             from sgl_kernel import (
                 fast_topk_transform_fused,
@@ -205,6 +232,75 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _topk_transform_v2_paged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+) -> torch.Tensor:
+    """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
+
+    Returns the transformed page indices ``(num_rows, topk)`` int32 (physical
+    page_size=1 KV slots, ``-1`` padded) -- identical in meaning to
+    ``fast_topk_transform_fused`` / ``flashinfer.top_k_page_table_transform``.
+    The kernel selects, per row, the top-k of ``logits[row, :lengths[row]]`` and
+    maps each selected position ``p`` through the page table as
+    ``real_page_table[row, p // page_size] * page_size + (p % page_size)``. Feeding
+    it the indexer's compact ``real_page_table`` (page_size = pool page size,
+    typically 64) yields the same physical slots as gathering the page_size=1
+    table, without materializing that wide table.
+
+    This is a committed contract, not a best-effort path: ``topk_transform`` routes
+    here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
+    drops the page_size=1 table for exactly this case (see
+    ``dsa_drop_wide_page_table``). The preconditions below are therefore
+    invariants the caller must uphold -- they assert (raise) on violation rather
+    than fall back to the slow legacy path (which may not even have a page_size=1
+    table to fall back to) or silently paper over bad input (padding, recomputing
+    the plan) at the cost of the performance this path exists to deliver.
+
+    ``lengths`` entries must be NON-NEGATIVE: the kernel reads them as
+    ``uint32_t``, so a negative row length (DP-padded / idle-companion rows)
+    reinterprets as ~4e9 tokens and illegal-addresses. Metadata producers clamp
+    padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
+    ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
+    """
+    from sglang.jit_kernel.dsv4.topk import topk_transform_512_v2
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    num_rows = logits.shape[0]
+
+    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
+    # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
+    # score_stride % 4 == 0 with strides {S, 1}). This holds even though the scores
+    # may be a padded view (stride(0) > width, so not `is_contiguous()`); assert the
+    # real requirement rather than force a contiguous copy of the wide score buffer.
+    assert (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
+
+    page_table = attn_metadata.real_page_table
+    assert page_table.dtype == torch.int32
+    lengths_i32 = lengths.to(torch.int32)
+
+    # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
+    # refreshed in-place under CUDA graph) and reused across layers. A missing or
+    # mismatched plan means the caller skipped that preprocessing -- fail loudly
+    # rather than silently recompute it per layer.
+    plan = attn_metadata.topk_v2_plan
+    assert (
+        plan is not None and plan.shape[0] == num_rows + 1
+    ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+
+    page_size = get_token_to_kv_pool().page_size
+    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
+    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    return out
 
 
 def _build_flashinfer_paged_args(

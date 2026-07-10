@@ -27,7 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 
 class ViTNpuGraphRunner(ViTCudaGraphRunner):
@@ -70,7 +70,7 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         graph = torch_npu.npu.NPUGraph()
         vit = self.vit
 
-        override_backend = get_global_server_args().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
         with torch_npu.npu.graph(graph, pool=ViTNpuGraphRunner._graph_memory_pool):
             y = None
             deepstack_outs: List[torch.Tensor] = []

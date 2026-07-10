@@ -16,7 +16,7 @@ cuda_graph_config, and the --cuda-graph-config JSON CLI parser.
 
 Module-level imports are pure stdlib — no torch / sglang.srt deps — so
 ServerArgs can import everything here without pulling in backend
-classes. check_cuda_graph_backend lazy-imports get_global_server_args
+classes. check_cuda_graph_backend lazy-imports get_server_args
 inside the function body to preserve that invariant.
 """
 
@@ -52,10 +52,15 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
-    # full is rejected for prefill — full CUDA graph capture only
-    # fits fixed-shape and prefill is variable-shape. Use breakable
-    # or tc_piecewise for prefill.
-    Phase.PREFILL: (Backend.BREAKABLE, Backend.TC_PIECEWISE, Backend.DISABLED),
+    # full for prefill captures one whole-forward graph per num_tokens
+    # bucket (bs=1 only); replay pads num_tokens up to the nearest
+    # captured bucket. Opt-in: the padding waste is the operator's call.
+    Phase.PREFILL: (
+        Backend.FULL,
+        Backend.BREAKABLE,
+        Backend.TC_PIECEWISE,
+        Backend.DISABLED,
+    ),
 }
 
 # Per-phase settings schema. Keys other than backend are runner-level
@@ -63,9 +68,10 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # backend-specific knob (only meaningful when backend == tc_piecewise).
 # For prefill, bs carries the captured shape size (token count for
 # tc_piecewise, request count for breakable) — one shape knob per phase.
+# full_prefill_max_req is prefill-only and only meaningful when backend == full.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
-    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler"),
+    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler", "full_prefill_max_req"),
 }
 
 
@@ -78,6 +84,12 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Only meaningful for the prefill phase with backend == full: max number of
+    # request slots baked into each captured graph. Real bs <= full_prefill_max_req
+    # reuses the graph (unused slots become zero-length sentinels); larger
+    # batches fall back to eager. Ignored by BCG (bs=1 only) and TC_PIECEWISE
+    # (bs-invariant via torch.compile). None auto-derives chunked_prefill_size // 512.
+    full_prefill_max_req: Optional[int] = None
 
 
 def default_prefill_backend() -> str:
@@ -152,10 +164,10 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
     global server args. Returns False if the global server args have not
     been initialized yet (e.g. unit tests, early startup)."""
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     try:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
     except ValueError:
         return False
     cfg = server_args.cuda_graph_config

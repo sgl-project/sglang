@@ -101,7 +101,7 @@ your dispatch prompt, or ask for it.
   upgraded); §3.2 tips → new §2; §4 invocation examples → new §3 (keep real
   Output Examples verbatim); §5 benchmark blocks → transcribe each measured
   block: deploy command used, bench command (dataset/isl/osl/num-prompts/
-  concurrency), Mean TTFT/TPOT, output tok/s, hardware, version string.
+  concurrency), P50 (median) TTFT/TPOT, output tok/s, hardware, version string.
 - Inbound-anchor sweep: `grep -rn "<PageName>" docs_new/ --include='*.mdx'` —
   find links/`#fragments` into this page (`mint broken-links` does NOT check
   fragments). Fix referrers or add `<a id="old-anchor" />` shims in the same PR.
@@ -174,7 +174,11 @@ hardware owners sign off on at review.
 ### 4. Benchmarks file
 One entry per measured block only (cells without entries already render
 "pending" — bare `{match}` stubs are unnecessary). `tokens_per_sec_per_gpu` =
-output tok/s ÷ (tp × nnodes); TTFT/TPOT take the Mean rows; put the workload's
+total (in+out) tok/s/GPU = `output tok/s ÷ (tp × nnodes) ×
+(isl+osl)/osl` — stored directly (the card shows it as-is). TTFT/TPOT
+take the P50 (median) rows; set `config.latencyPercentile` (default `"P50"`; use
+`"Mean"` only for legacy Mean-recorded data — temporary, being migrated to P50).
+Put the workload's
 `num_prompts` into `workload`. **`config.accuracyLabels` is required whenever
 the benchmarks carry accuracy data** — the engine ships no default eval set
 (#27842), so missing labels means the accuracy rows silently don't render;

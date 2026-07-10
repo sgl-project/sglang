@@ -244,14 +244,14 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
         f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
     )
 
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     # CuteDSL wrapper preallocates CG buffers used by any captured graph
     # that routes through this MoE — decode and prefill alike.
     use_cuda_graph = not cuda_graph_fully_disabled()

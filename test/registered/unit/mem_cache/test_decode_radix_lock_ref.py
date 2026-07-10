@@ -310,6 +310,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         decode_req = MagicMock()
         decode_req.req = req
         decode_req.waiting_for_input = True
+        # Non-rebootstrap request: exercise the normal decode radix-cache path
+        # (a truthy MagicMock would disable use_decode_radix_cache via the
+        # `not decode_req.is_rebootstrap` gate in pop_preallocated).
+        decode_req.is_rebootstrap = False
 
         queue.queue = [decode_req]
         queue.pending_reqs = []

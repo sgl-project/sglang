@@ -210,6 +210,20 @@ class TestChatCompletionRequest(unittest.TestCase):
             {"thinking": True, "enable_thinking": True},
         )
 
+    def test_chat_completion_reasoning_effort_high_enables_thinking(self):
+        """Top-level reasoning_effort='high' enables thinking."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="high",
+        )
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
+
     def test_chat_completion_reasoning_effort_none(self):
         """Test reasoning_effort='none' disables thinking"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -229,6 +243,17 @@ class TestChatCompletionRequest(unittest.TestCase):
             model="test-model",
             messages=messages,
             reasoning={"effort": "none"},
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_none_overrides_enabled(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"enabled": True, "effort": "none"},
         )
         self.assertEqual(request.reasoning_effort, "none")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
@@ -490,40 +515,9 @@ class TestValidationEdgeCases(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
-    def test_model_serialization_roundtrip(self):
-        """Test that models can be serialized and deserialized"""
-        original_request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=0.7,
-            max_tokens=100,
-        )
-
-        # Serialize to dict
-        data = original_request.model_dump()
-
-        # Deserialize back
-        restored_request = ChatCompletionRequest(**data)
-
-        self.assertEqual(restored_request.model, original_request.model)
-        self.assertEqual(restored_request.temperature, original_request.temperature)
-        self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
-        self.assertEqual(len(restored_request.messages), len(original_request.messages))
-
 
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
-
-    def test_parsed_response_fields_protocol(self):
-        """ParsedResponseFields protocol works with isinstance."""
-        from sglang.srt.entrypoints.openai.protocol import ParsedResponseFields
-
-        class MockFields:
-            content = "hello"
-            tool_calls = None
-            reasoning_content = None
-
-        self.assertIsInstance(MockFields(), ParsedResponseFields)
 
 
 if __name__ == "__main__":

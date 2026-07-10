@@ -101,7 +101,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self._enable_metrics_flag = params.enable_metrics
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
@@ -1028,9 +1030,9 @@ class HiMambaRadixCache(MambaRadixCache):
             node_update = node_update.parent
 
         if len(value) > best_value_len:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
             mamba_cache_chunk_aligned_seqlen = (
                 sum(len(v) for v in value) // mamba_cache_chunk_size
             ) * mamba_cache_chunk_size
@@ -1270,10 +1272,10 @@ class HiMambaRadixCache(MambaRadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
             storage_cls = resolve_collector_class(
-                get_global_server_args(),
+                get_server_args(),
                 STAT_LOGGER_ROLE_STORAGE,
                 StorageMetricsCollector,
             )

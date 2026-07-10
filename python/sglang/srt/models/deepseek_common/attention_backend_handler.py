@@ -11,7 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
@@ -114,7 +114,7 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 def handle_attention_fa3(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")
@@ -183,7 +183,7 @@ def handle_attention_triton(attn, forward_batch):
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (

@@ -97,6 +97,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
+    def resize(self, config) -> None:
+        self.size = config.max_total_num_tokens
+        if self.page_size > 1:
+            self.num_pages = config.max_total_num_tokens // self.page_size
+        self.clear()
+
     @abc.abstractmethod
     def clear(self):
         raise NotImplementedError()

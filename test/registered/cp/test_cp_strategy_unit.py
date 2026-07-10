@@ -371,9 +371,8 @@ class TestCPZigzagStrategy(CustomTestCase):
             fb = self._forward_batch(metas[rank], extend_seq_lens)
 
             with (
-                patch(
-                    "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
-                    return_value=_FakeCPGroup(padded_rank_tensors),
+                get_parallel().override(
+                    attn_cp_group=_FakeCPGroup(padded_rank_tensors)
                 ),
                 patch(
                     "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
@@ -405,9 +404,8 @@ class TestCPZigzagStrategy(CustomTestCase):
             fb = self._forward_batch(metas[rank], extend_seq_lens)
 
             with (
-                patch(
-                    "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
-                    return_value=_FakeCPGroup(padded_rank_tensors),
+                get_parallel().override(
+                    attn_cp_group=_FakeCPGroup(padded_rank_tensors)
                 ),
                 patch(
                     "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",

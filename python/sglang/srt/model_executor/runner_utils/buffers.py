@@ -169,6 +169,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     req_lens=torch.ones([max_bs], dtype=torch.int32),
                     out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
                     out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                    skip_token_table_update=torch.zeros([max_bs], dtype=torch.bool),
                 )
                 if ne_token_table is not None
                 else None

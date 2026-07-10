@@ -34,7 +34,6 @@ from sglang.srt.compilation.compile_phase import (
     enable_torch_compile_warmup,
     set_pcg_capture_stream,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -49,6 +48,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -191,11 +191,11 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                             tqdm.tqdm(
                                 list(reversed(cuda_graph_runner.capture_num_tokens))
                             )
-                            if get_tensor_model_parallel_rank() == 0
+                            if get_parallel().tp_rank == 0
                             else reversed(cuda_graph_runner.capture_num_tokens)
                         )
                         for num_tokens in compile_range:
-                            if get_tensor_model_parallel_rank() == 0:
+                            if get_parallel().tp_rank == 0:
                                 compile_range.set_description(
                                     f"Compiling num tokens ({num_tokens=})"
                                 )

@@ -135,8 +135,13 @@ struct l2norm_kernel<at::BFloat16, D, has_scale> {
 
 template <typename scalar_t, int CHUNK_SIZE, int BLOCK_H>
 struct cumsum_kernel {
-  static inline void
-  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int size, int ld_src, int ld_dst) {
+  static inline void apply(
+      scalar_t* __restrict__ out,
+      const scalar_t* __restrict__ input,
+      int mb_size,
+      int hb_size,
+      int ld_src,
+      int ld_dst) {
     TORCH_CHECK(false, "cumsum_kernel: scalar path not implemented!");
   }
 };
@@ -144,9 +149,12 @@ struct cumsum_kernel {
 #if defined(CPU_CAPABILITY_AVX512)
 template <int CHUNK_SIZE, int BLOCK_H>
 struct cumsum_kernel<float, CHUNK_SIZE, BLOCK_H> {
-  static inline void apply(float* __restrict__ out, const float* __restrict__ input, int size, int ld_src, int ld_dst) {
+  static inline void
+  apply(float* __restrict__ out, const float* __restrict__ input, int mb_size, int hb_size, int ld_src, int ld_dst) {
     // vector length of fp32 for avx512
     static_assert(BLOCK_H == 16);
+    TORCH_CHECK(hb_size > 0 && hb_size <= BLOCK_H);
+    const __mmask16 vmask = static_cast<__mmask16>((1u << hb_size) - 1u);
 
     __m512i va[16];
     __m512 vsum = _mm512_set1_ps(0.f);
@@ -154,14 +162,23 @@ struct cumsum_kernel<float, CHUNK_SIZE, BLOCK_H> {
     for (int i = 0; i < CHUNK_SIZE; i += 16) {
       // load input data
       Unroll<16>{}([&](auto j) {
-        __m512 v = (i + j < size) ? _mm512_loadu_ps(input + (i + j) * ld_src) : _mm512_setzero_ps();
+        __m512 v;
+        if (i + j < mb_size) {
+          v = _mm512_maskz_loadu_ps(vmask, input + (i + j) * ld_src);
+        } else {
+          v = _mm512_setzero_ps();
+        }
         vsum = _mm512_add_ps(vsum, v);
         va[j] = _mm512_castps_si512(vsum);
       });
       // transpose
       transpose_16x16_32bit(va);
       // store output data
-      Unroll<16>{}([&](auto j) { _mm512_storeu_si512(out + j * ld_dst + i, va[j]); });
+      Unroll<16>{}([&](auto j) {
+        if (j < hb_size) {
+          _mm512_storeu_si512(out + j * ld_dst + i, va[j]);
+        }
+      });
     }
   }
 };
@@ -633,9 +650,7 @@ void chunk_local_cumsum_kernel_impl(
     int64_t Hv,
     int64_t NT) {
   constexpr int BLOCK_H = 16;
-  // TODO: now we only support qwen3.5 configs (H/Hv == 16/32)
-  TORCH_CHECK(Hv % BLOCK_H == 0);
-  int64_t HB = Hv / BLOCK_H;
+  int64_t HB = div_up(Hv, int64_t(BLOCK_H));
 
   // parallel on [NT * HB] to increase parallelism
   at::parallel_for(0, NT * HB, 0, [&](int64_t begin, int64_t end) {
@@ -648,10 +663,11 @@ void chunk_local_cumsum_kernel_impl(
       int32_t seqlen = cu_seqlens[bs + 1] - cu_seqlens[bs];
       int64_t mb_start = chunk_indices[nt * 2 + 1] * CHUNK_SIZE;
       int64_t mb_size = std::min(seqlen - mb_start, int64_t(CHUNK_SIZE));
+      int64_t hb_size = std::min(Hv - hb * BLOCK_H, int64_t(BLOCK_H));
 
       const scalar_t* __restrict__ g_ptr = g + (batch_offset + mb_start) * Hv + hb * BLOCK_H;
       scalar_t* __restrict__ gsum_ptr = g_ + nt * (Hv * CHUNK_SIZE) + hb * (BLOCK_H * CHUNK_SIZE);
-      cumsum_kernel<scalar_t, CHUNK_SIZE, BLOCK_H>::apply(gsum_ptr, g_ptr, mb_size, Hv, CHUNK_SIZE);
+      cumsum_kernel<scalar_t, CHUNK_SIZE, BLOCK_H>::apply(gsum_ptr, g_ptr, mb_size, hb_size, Hv, CHUNK_SIZE);
 
       // move to the next index
       data_index_step(nt, NT, hb, HB);

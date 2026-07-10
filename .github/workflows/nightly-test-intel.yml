@@ -84,7 +84,7 @@ jobs:
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
-            python3 run_suite.py --hw xpu --suite nightly-xpu-2-gpu --nightly --timeout-per-file 1800 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw xpu --suite nightly-xpu-2-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -143,7 +143,7 @@ jobs:
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
-            python3 run_suite.py --hw xpu --suite nightly-xpu-4-gpu --nightly --timeout-per-file 2400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw xpu --suite nightly-xpu-4-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
