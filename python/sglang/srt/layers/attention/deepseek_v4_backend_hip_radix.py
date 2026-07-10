@@ -590,6 +590,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
         seq_lens_cpu: Optional[List[int]] = None,
+        num_draft_tokens: Optional[int] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly even when
         # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
@@ -603,6 +604,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            num_draft_tokens=num_draft_tokens,
         )
 
     def init_forward_metadata_target_verify_old(
@@ -613,13 +615,15 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        num_draft_tokens: Optional[int] = None,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
-        seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+        num_draft_tokens = int(num_draft_tokens or self.speculative_num_draft_tokens)
+        seq_lens = seq_lens + num_draft_tokens
+        seq_lens_cpu = [x + num_draft_tokens for x in seq_lens_cpu]
+        extend_seq_lens_cpu = [num_draft_tokens] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
-        num_tokens = self.speculative_num_draft_tokens * batch_size
+        num_tokens = num_draft_tokens * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -971,6 +975,11 @@ class DeepseekV4HipRadixBackend(
                 extend_seq_lens=forward_batch.extend_seq_lens,
                 seq_lens_cpu=(
                     seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+                ),
+                num_draft_tokens=getattr(
+                    getattr(forward_batch, "spec_info", None),
+                    "draft_token_num",
+                    None,
                 ),
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
