@@ -23,9 +23,12 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    BlockStoredMetadata,
+    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.utils import (
+    compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
 )
@@ -43,15 +46,22 @@ class KVCacheEventMixin:
             # Compute hash_value lazily if not already set
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
+            event_hash_values = (
+                compute_node_event_hash_values(node, self.page_size)
+                if node.key.cache_salt is not None
+                else node.hash_value
+            )
 
             # Get parent's last hash value for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
-                if (
-                    node.parent.hash_value is not None
-                    and len(node.parent.hash_value) > 0
-                ):
-                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+                parent_hash_values = (
+                    compute_node_event_hash_values(node.parent, self.page_size)
+                    if node.key.cache_salt is not None
+                    else node.parent.hash_value
+                )
+                if parent_hash_values:
+                    parent_block_hash = hash_str_to_int64(parent_hash_values[-1])
 
             page_index = 0
             logical_len = len(node.key)
@@ -67,18 +77,24 @@ class KVCacheEventMixin:
                 else:
                     page_tokens = list(raw[start:end])
 
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
+                block_hash = hash_str_to_int64(event_hash_values[page_index])
 
-                self.kv_event_queue.append(
-                    BlockStored(
-                        block_hashes=[block_hash],
-                        parent_block_hash=parent_block_hash,
-                        token_ids=page_tokens,
-                        block_size=len(page_tokens),
-                        lora_id=None,
-                        medium=medium,
+                event_args = {
+                    "block_hashes": [block_hash],
+                    "parent_block_hash": parent_block_hash,
+                    "token_ids": page_tokens,
+                    "block_size": len(page_tokens),
+                    "lora_id": None,
+                    "medium": medium,
+                }
+                if node.key.cache_salt is None:
+                    event = BlockStored(**event_args)
+                else:
+                    event = BlockStoredWithMetadata(
+                        **event_args,
+                        metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
                     )
-                )
+                self.kv_event_queue.append(event)
 
                 parent_block_hash = block_hash
                 page_index += 1
@@ -94,6 +110,11 @@ class KVCacheEventMixin:
             # Compute hash_value lazily if not already set (must match what was stored)
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
+            event_hash_values = (
+                compute_node_event_hash_values(node, self.page_size)
+                if node.key.cache_salt is not None
+                else node.hash_value
+            )
 
             block_hashes = []
             logical_len = len(node.key)
@@ -103,7 +124,7 @@ class KVCacheEventMixin:
                 if end <= start:
                     continue
 
-                block_hashes.append(hash_str_to_int64(node.hash_value[page_index]))
+                block_hashes.append(hash_str_to_int64(event_hash_values[page_index]))
                 page_index += 1
 
             if block_hashes:

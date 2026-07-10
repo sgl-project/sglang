@@ -13,6 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
+import hashlib
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -129,6 +130,28 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
+
+    hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
+    assert isinstance(hash_values, list)
+    return hash_values
+
+
+def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
+    """Compute namespace-aware hashes without changing internal cache hashes."""
+    cache_salt = getattr(node.key, "cache_salt", None)
+    if cache_salt is None:
+        return compute_node_hash_values(node, page_size)
+
+    parent_hash = None
+    if node.parent is not None and len(node.parent.key) > 0:
+        parent_hash_values = compute_node_event_hash_values(node.parent, page_size)
+        if parent_hash_values:
+            parent_hash = parent_hash_values[-1]
+
+    if parent_hash is None:
+        parent_hash = hashlib.sha256(
+            b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
+        ).hexdigest()
 
     hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)

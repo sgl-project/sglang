@@ -697,7 +697,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 kv_indices = kv_indices[:effective_cache_len]
 
             radix_key = RadixKey(
-                token_ids, req.extra_key, is_bigram=self.tree_core.is_eagle
+                token_ids,
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=getattr(req, "cache_salt", None),
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -790,6 +793,7 @@ class UnifiedRadixCache(BasePrefixCache):
             token_ids[:effective_cache_len],
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
+            cache_salt=getattr(req, "cache_salt", None),
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -1218,11 +1222,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
+            cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         if (

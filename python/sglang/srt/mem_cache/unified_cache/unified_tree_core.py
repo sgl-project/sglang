@@ -1722,10 +1722,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = t
         return kv_xfer, comp_xfers
 
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         node = self.node_by_id(node_id)
-        return node.key.extra_key if node.key else None
+        if node.key is None:
+            return None, None
+        return node.key.extra_key, node.key.cache_salt
 
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
