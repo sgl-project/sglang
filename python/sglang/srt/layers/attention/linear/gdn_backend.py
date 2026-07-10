@@ -171,18 +171,14 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Whether the resolved extend kernel accepts a hoisted layer-invariant
-        # prep tuple (CuteDSL and FlashInfer; False for Triton, including the
-        # SM90 CuteDSL->Triton fallback above). Gates the per-forward
-        # extend-prep hoist in forward_extend.
-        self.extend_supports_prep = self.extend_kernel.supports_extend_prep
-        # Gate form the extend kernel consumes ("log" or "exp"); "exp" folds the
-        # exp(g) into the gating kernel (FlashInfer). Only ever "exp" on CUDA,
-        # so the exp_gate kwarg never reaches the NPU/CPU gating rebinds.
-        self.extend_gate_form = self.extend_kernel.extend_gate_form
-        # Whether the resolved extend kernel implements extend_prenormed (the
-        # gdn_prefill_glue path: pre-normalized q/k, gate in extend_gate_form).
-        self.extend_supports_prenormed = self.extend_kernel.supports_prenormed_extend
+        # Capability of the RESOLVED extend kernel (which may be the SM90
+        # CuteDSL->Triton fallback above); semantics documented on
+        # LinearAttnKernelBase. extend_expects_exp_gate is only ever True on
+        # CUDA, so the exp_gate kwarg never reaches the NPU/CPU
+        # fused_gdn_gating rebinds.
+        self.extend_supports_glue = self.extend_kernel.supports_prenormed_extend and (
+            is_cuda() or is_hip()
+        )
 
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
@@ -278,8 +274,6 @@ class GDNKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        prep: Optional[tuple] = None,
-        no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
         return self.extend_kernel.extend(
@@ -291,37 +285,6 @@ class GDNKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            prep=prep,
-            no_prefix=no_prefix,
-            **kwargs,
-        )
-
-    def extend_prenormed(
-        self,
-        q_normed: torch.Tensor,
-        k_normed: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        *,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        prep: Optional[tuple] = None,
-        no_prefix: bool = False,
-        **kwargs,
-    ) -> tuple:
-        return self.extend_kernel.extend_prenormed(
-            q_normed,
-            k_normed,
-            v,
-            g,
-            beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            prep=prep,
-            no_prefix=no_prefix,
             **kwargs,
         )
 
@@ -381,17 +344,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        # Memoized layer-invariant extend prep (CuteDSL/FlashInfer), keyed on the
-        # forward_metadata object (rebuilt each forward/replay -> auto-invalidated
-        # by identity; a held reference forecloses id() reuse).
-        self._extend_prep_fm = None
-        self._extend_prep = None
-        # Same pattern for the extend-path has_initial_states comparison (all
-        # backends: it feeds causal_conv1d upstream of the kernel dispatch) and
-        # the CPU-side no-prefix signal derived alongside it.
-        self._has_initial_states_fm = None
+        # Per-forward extend memo, keyed on the forward_metadata object (rebuilt
+        # each forward/replay -> auto-invalidated by identity; a held reference
+        # forecloses id() reuse). Owns every layer-invariant value the per-layer
+        # extend calls reuse.
+        self._extend_memo_fm = None
         self._has_initial_states = None
         self._extend_no_prefix = False
+        self._extend_prep = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -510,42 +470,138 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_target_verify(
+                layer=layer, forward_batch=forward_batch, mixed_qkv=mixed_qkv, a=a, b=b
+            )
+        return self._forward_extend_tokens(
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            out=out,
+        )
+
+    def _split_qkv_prefill(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        layer: RadixLinearAttention,
+        actual_seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+            return fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        return (
+            query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim),
+            key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim),
+            value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim),
+        )
+
+    def _forward_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ):
         seq_len = mixed_qkv.shape[0]
-
-        is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
-
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
-        retrieve_next_token = forward_metadata.retrieve_next_token
-        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
-        retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+        conv_states = mamba_cache_params.conv[0]
+        intermediate_state_indices = self.verify_intermediate_state_indices
+
+        batch_size = seq_len // forward_batch.spec_info.draft_token_num
+        mixed_qkv_reshaped = mixed_qkv.view(
+            batch_size, forward_batch.spec_info.draft_token_num, -1
+        ).transpose(1, 2)
+        mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_reshaped,
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=cache_indices[:batch_size],
+            intermediate_conv_window=mamba_cache_params.intermediate_conv_window[0],
+            intermediate_state_indices=intermediate_state_indices[:batch_size],
+            retrieve_next_token=forward_metadata.retrieve_next_token,
+            retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
+            retrieve_parent_token=forward_metadata.retrieve_parent_token,
+        )
+        mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+
+        query, key, value = self._split_qkv_prefill(
+            mixed_qkv=mixed_qkv, layer=layer, actual_seq_len=mixed_qkv.shape[0]
+        )
+        return self.kernel_dispatcher.target_verify(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            ssm_states=mamba_cache_params.temporal,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=forward_batch.spec_info.draft_token_num,
+            retrieve_parent_token=forward_metadata.retrieve_parent_token,
+        )
+
+    def _forward_extend_tokens(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: Optional[torch.Tensor],
+    ):
+        seq_len = mixed_qkv.shape[0]
+        forward_metadata = self.forward_metadata
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = (
-                mamba_cache_params.intermediate_conv_window[0]
-            )
-            intermediate_state_indices = self.verify_intermediate_state_indices
-        else:
+
+        if self._extend_memo_fm is not forward_metadata:
             # Layer-invariant per forward (extend_prefix_lens is fixed at batch
-            # prep); compute the comparison once and reuse across the GDN layers.
-            # Same identity-keyed memo pattern as the extend prep below.
-            if self._has_initial_states_fm is not forward_metadata:
-                self._has_initial_states = forward_batch.extend_prefix_lens > 0
-                # CPU-side "no request has a prefix" signal (no GPU sync): lets
-                # backends skip the SSM initial-state pool gather entirely and
-                # zero-seed in-kernel (bit-identical: freed slots are cleared).
-                self._extend_no_prefix = (
-                    forward_batch.extend_prefix_lens_cpu is not None
-                    and not any(forward_batch.extend_prefix_lens_cpu)
-                )
-                self._has_initial_states_fm = forward_metadata
-            has_initial_states = self._has_initial_states
+            # prep): compute once, reuse across the GDN layers.
+            self._has_initial_states = forward_batch.extend_prefix_lens > 0
+            # CPU-side "no request has a prefix" signal (no GPU sync): lets
+            # backends skip the SSM initial-state pool gather entirely and
+            # zero-seed in-kernel (bit-identical: freed slots are cleared).
+            self._extend_no_prefix = (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+            )
+            self._extend_prep = None
+            self._extend_memo_fm = forward_metadata
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -555,7 +611,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
         # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
         # int64 indexing, like packed_decode / causal_conv1d_update already do.
-        needs_state_gather = (not is_target_verify) and (
+        needs_state_gather = (
             not conv_states.is_contiguous() or not ssm_states.is_contiguous()
         )
         if needs_state_gather:
@@ -571,199 +627,112 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
-        if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-        else:
-            mixed_qkv = mixed_qkv.transpose(0, 1)
-            if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
-                    :, forward_metadata.track_conv_indices
-                ].transpose(0, 1)
-                conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
-                )
+        mixed_qkv = mixed_qkv.transpose(0, 1)
+        if forward_metadata.has_mamba_track_mask:
+            mixed_qkv_to_track = mixed_qkv[
+                :, forward_metadata.track_conv_indices
+            ].transpose(0, 1)
+            conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv,
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states_contig,
+            has_initial_state=self._has_initial_states,
+            cache_indices=state_cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)[:seq_len]
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        # Prologue glue: one launch replacing split + gating + q/k l2norm,
-        # available only when the extend kernel accepts pre-normalized q/k
-        # (extend_prenormed) and the geometry matches the verified clone shape.
-        # Fall back to the legacy chain otherwise — do not generalize the gate.
+        # Prologue glue: one launch for split + gating + q/k l2norm. Usable only
+        # when the extend kernel accepts pre-normalized q/k (extend_prenormed)
+        # and the geometry matches the glue's pinned clone shape; otherwise fall
+        # back to the unfused chain — do not loosen this gate.
         glue_applicable = (
-            not is_target_verify
-            and self.kernel_dispatcher.extend_supports_prenormed
-            and (is_cuda() or is_hip())
+            self.kernel_dispatcher.extend_supports_glue
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and mixed_qkv.stride(1) == 1
             and layer.num_q_heads == layer.num_k_heads
             and layer.head_q_dim == layer.head_k_dim == 128
+            and layer.num_v_heads & (layer.num_v_heads - 1) == 0
+        )
+        if not glue_applicable:
+            query, key, value = self._split_qkv_prefill(
+                mixed_qkv=mixed_qkv, layer=layer, actual_seq_len=actual_seq_len
+            )
+
+        # Layer-invariant prep (pool-gather indices; for CuteDSL also cu_seqlens
+        # + chunk metadata), built on the first layer of each forward. Keyed by
+        # the memo generation above, NOT by state_cache_indices (a fresh arange
+        # per layer in the envelope pool). needs_state_gather and pool contiguity
+        # are layer-invariant, so layer-1's tensors are exact for all layers;
+        # build_extend_prep sees the same ssm_states_contig / state_cache_indices
+        # the kernel's extend receives.
+        if self._extend_prep is None:
+            self._extend_prep = self.kernel_dispatcher.extend_kernel.build_extend_prep(
+                head_k_dim=layer.head_k_dim,
+                query_start_loc=query_start_loc,
+                cache_indices=state_cache_indices,
+                ssm_states=ssm_states_contig,
+                total_seq_len=actual_seq_len,
+            )
+
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        state_kwargs = dict(
+            ssm_states=ssm_states_contig,
+            cache_indices=state_cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            prep=self._extend_prep,
+            no_prefix=self._extend_no_prefix,
         )
         if glue_applicable:
-            pass  # split+gating+norm run fused in the glue branch below
-        elif (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            query, key, value = fused_qkv_split_gdn_prefill(
+            # The glue call and the extend_prenormed dispatch must stay adjacent
+            # in this branch: q/k leave the glue ALREADY normalized — routing
+            # them through plain extend() would double-normalize.
+            query, key, value, g, beta = gdn_prefill_glue(
                 mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
+                a,
+                b,
+                layer.A_log,
+                layer.dt_bias,
+                num_qk_heads=layer.num_q_heads,
+                num_v_heads=layer.num_v_heads,
+                head_qk_dim=layer.head_q_dim,
+                head_v_dim=layer.head_v_dim,
+                exp_gate=extend_kernel.extend_expects_exp_gate,
+            )
+            core_attn_out, last_recurrent_state, h = extend_kernel.extend_prenormed(
+                q_normed=query, k_normed=key, v=value, g=g, beta=beta, **state_kwargs
             )
         else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
-
-        if is_target_verify:
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-        else:
-            # Hoist the layer-invariant extend prep (pool-gather indices; for
-            # CuteDSL also cu_seqlens + chunk metadata) out of the per-layer
-            # calls into one compute per forward. Key = the forward_metadata
-            # object (fresh per forward/replay), NOT state_cache_indices (a fresh
-            # arange per layer in the envelope pool). needs_state_gather and pool
-            # contiguity are layer-invariant, so layer-1's tensors are exact for
-            # all layers; build_extend_prep sees the same ssm_states_contig /
-            # state_cache_indices the dispatcher passes to extend.
-            prep = None
-            if self.kernel_dispatcher.extend_supports_prep:
-                if self._extend_prep_fm is not forward_metadata:
-                    self._extend_prep = (
-                        self.kernel_dispatcher.extend_kernel.build_extend_prep(
-                            head_k_dim=layer.head_k_dim,
-                            query_start_loc=query_start_loc,
-                            cache_indices=state_cache_indices,
-                            ssm_states=ssm_states_contig,
-                            total_seq_len=actual_seq_len,
-                        )
-                    )
-                    self._extend_prep_fm = forward_metadata
-                prep = self._extend_prep
-
-            if glue_applicable:
-                # The glue call and the extend_prenormed dispatch must stay
-                # adjacent in this branch: q/k leave the glue ALREADY normalized
-                # and g in extend_gate_form — routing them through plain
-                # extend() would double-normalize.
-                query, key, value, g, beta = gdn_prefill_glue(
-                    mixed_qkv,
-                    a,
-                    b,
-                    layer.A_log,
-                    layer.dt_bias,
-                    num_qk_heads=layer.num_q_heads,
-                    num_v_heads=layer.num_v_heads,
-                    head_qk_dim=layer.head_q_dim,
-                    head_v_dim=layer.head_v_dim,
-                    exp_gate=(self.kernel_dispatcher.extend_gate_form == "exp"),
-                )
-                core_attn_out, last_recurrent_state, h = (
-                    self.kernel_dispatcher.extend_prenormed(
-                        q_normed=query,
-                        k_normed=key,
-                        v=value,
-                        g=g,
-                        beta=beta,
-                        ssm_states=ssm_states_contig,
-                        cache_indices=state_cache_indices,
-                        query_start_loc=query_start_loc,
-                        out=out,
-                        prep=prep,
-                        no_prefix=self._extend_no_prefix,
-                    )
+            if extend_kernel.extend_expects_exp_gate:
+                g, beta = fused_gdn_gating(
+                    layer.A_log, a, b, layer.dt_bias, exp_gate=True
                 )
             else:
-                if self.kernel_dispatcher.extend_gate_form == "exp":
-                    # FlashInfer consumes alpha = exp(g); compute it in-kernel
-                    # instead of a separate torch.exp launch per layer.
-                    g, beta = fused_gdn_gating(
-                        layer.A_log, a, b, layer.dt_bias, exp_gate=True
-                    )
-                else:
-                    g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query, k=key, v=value, g=g, beta=beta, **state_kwargs
+            )
 
-                core_attn_out, last_recurrent_state, h = (
-                    self.kernel_dispatcher.extend(
-                        q=query,
-                        k=key,
-                        v=value,
-                        g=g,
-                        beta=beta,
-                        ssm_states=ssm_states_contig,
-                        cache_indices=state_cache_indices,
-                        query_start_loc=query_start_loc,
-                        out=out,
-                        prep=prep,
-                        no_prefix=self._extend_no_prefix,
-                    )
-                )
+        if is_npu() and last_recurrent_state is not None:
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            ssm_states[cache_indices] = last_recurrent_state
 
-            if is_npu() and last_recurrent_state is not None:
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
-                ssm_states[cache_indices] = last_recurrent_state
+        if needs_state_gather:
+            # Scatter the in-place-updated contiguous copies back to the strided
+            # envelope pool (advanced indexing handles the strides).
+            conv_states[cache_indices] = conv_states_contig
+            ssm_states[cache_indices] = ssm_states_contig
 
-            if needs_state_gather:
-                # Scatter the in-place-updated contiguous copies back to the
-                # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
-
-            if h is not None:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+        if h is not None:
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
 
         return core_attn_out

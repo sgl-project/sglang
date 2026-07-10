@@ -52,6 +52,22 @@ def l2norm_fwd_kernel1(
 #     key=["D", "NB"],
 # )
 @triton.jit
+def _l2norm_row_block(
+    x, y, eps, i_t, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr
+):
+    # Must stay byte-identical to l2norm_fwd_kernel's D<=512 branch (fp32
+    # reduce, division form — not * rstd — eps inside sqrt, round-to-nearest
+    # store in the input dtype): the fused q/k variant's 0-ULP contract
+    # depends on it.
+    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit
 def l2norm_fwd_kernel(
     x,
     y,
@@ -62,13 +78,7 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_var = tl.sum(b_x * b_x, axis=1)
-    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    _l2norm_row_block(x, y, eps, tl.program_id(0), T, D, BT, BD)
 
 
 def l2norm_fwd(
@@ -123,29 +133,20 @@ def l2norm_fwd(
 
 
 @triton.jit
-def _l2norm_row_block(
-    x, y, eps, i_t, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr
-):
-    # Byte-identical to l2norm_fwd_kernel (the D<=512 branch): fp32 reduction,
-    # division form (not the * rstd reciprocal), round-to-nearest store in the
-    # input dtype. Kept 0-ULP so the fused q/k variant below is a pure launch
-    # merge with no numeric change vs two separate l2norm_fwd calls.
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_var = tl.sum(b_x * b_x, axis=1)
-    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.jit
 def l2norm_fwd_qk_kernel(
-    xq, yq, xk, yk, eps, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr,
+    xq,
+    yq,
+    xk,
+    yk,
+    eps,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
     BD: tl.constexpr,
 ):
     i_t = tl.program_id(0)
-    # program_id(1) is CTA-uniform (0 -> q, 1 -> k) so there is no warp divergence:
-    # each CTA does exactly one row-block of one tensor, same work as the original.
+    # program_id(1) is CTA-uniform (0 -> q, 1 -> k), so the branch adds no warp
+    # divergence: each CTA handles one row-block of one tensor.
     if tl.program_id(1) == 0:
         _l2norm_row_block(xq, yq, eps, i_t, T, D, BT, BD)
     else:
@@ -155,11 +156,9 @@ def l2norm_fwd_qk_kernel(
 def l2norm_fwd_qk(xq: torch.Tensor, xk: torch.Tensor, eps: float = 1e-6):
     """L2-normalize q and k (last dim) in a single Triton launch.
 
-    Replaces two ``l2norm_fwd`` calls in the GDN prefill prologue (CuteDSL and
-    FlashInfer backends). q and k share shape/dtype (GDN uses
-    ``num_q_heads == num_k_heads`` heads of ``head_k_dim``), so both fold into
-    one grid whose second axis selects the tensor. Result is bit-identical to
-    the two separate calls.
+    Requires q/k of identical shape/dtype (GDN: num_q_heads == num_k_heads of
+    head_k_dim); the second grid axis selects the tensor. Bit-identical to two
+    separate ``l2norm_fwd`` calls (pinned by test_gdn_prefill_cutedsl.py).
     """
     assert xq.shape == xk.shape and xq.dtype == xk.dtype
     shape_og = xq.shape
@@ -171,7 +170,7 @@ def l2norm_fwd_qk(xq: torch.Tensor, xk: torch.Tensor, eps: float = 1e-6):
     yk = torch.empty_like(xk2)
     assert yq.stride(-1) == 1 and yk.stride(-1) == 1
     BD = min(65536 // xq2.element_size(), triton.next_power_of_2(D))
-    grid = (triton.cdiv(T, 16), 2)  # axis0 = row-block (== original i_t), axis1 = q/k
+    grid = (triton.cdiv(T, 16), 2)  # axis0 = row-block, axis1 = q/k
     l2norm_fwd_qk_kernel[grid](
         xq2, yq, xk2, yk, eps, T=T, D=D, BT=16, BD=BD, num_warps=8, num_stages=3
     )

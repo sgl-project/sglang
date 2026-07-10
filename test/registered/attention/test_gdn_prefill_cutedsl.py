@@ -172,6 +172,25 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
     assert buffer_state_error.max().item() == 0
 
 
+def _run(kernel, inp, *, out=None, prep=None):
+    ssm = inp["ssm_states"].clone()
+    o, s1, s2 = kernel.extend(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        ssm_states=ssm,
+        cache_indices=inp["cache_indices"],
+        query_start_loc=inp["query_start_loc"],
+        out=out,
+        prep=prep,
+    )
+    torch.cuda.synchronize()
+    assert s1 is None and s2 is None
+    return o, ssm
+
+
 def _build_extend_inputs(num_seqs: int):
     """Synthetic GDN extend inputs mirroring the kernel test's init."""
     seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
@@ -242,7 +261,7 @@ def _build_extend_inputs(num_seqs: int):
 
 @pytest.mark.parametrize("num_seqs", [1, 5, 257])
 def test_cutedsl_extend_direct_write(num_seqs: int):
-    """P1: `CuteDSLGDNKernel.extend(out=...)` must (1) produce bit-identical
+    """`CuteDSLGDNKernel.extend(out=...)` must (1) produce bit-identical
     output and SSM-state writeback as the fresh-allocation path, and (2) return
     a tensor that aliases the supplied buffer so the caller can skip its copy."""
     from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
@@ -255,24 +274,7 @@ def test_cutedsl_extend_direct_write(num_seqs: int):
 
     inp = _build_extend_inputs(num_seqs)
 
-    def run(out):
-        ssm = inp["ssm_states"].clone()
-        o, s1, s2 = kernel.extend(
-            q=inp["q"],
-            k=inp["k"],
-            v=inp["v"],
-            g=inp["g"],
-            beta=inp["beta"],
-            ssm_states=ssm,
-            cache_indices=inp["cache_indices"],
-            query_start_loc=inp["query_start_loc"],
-            out=out,
-        )
-        torch.cuda.synchronize()
-        assert s1 is None and s2 is None
-        return o, ssm
-
-    o_ref, ssm_ref = run(None)
+    o_ref, ssm_ref = _run(kernel, inp)
 
     out_buf = torch.empty(
         1,
@@ -282,7 +284,7 @@ def test_cutedsl_extend_direct_write(num_seqs: int):
         device="cuda",
         dtype=o_ref.dtype,
     )
-    o_buf, ssm_buf = run(out_buf)
+    o_buf, ssm_buf = _run(kernel, inp, out=out_buf)
 
     # (1) direct-write is numerically identical to fresh-allocation.
     assert (o_buf.float() - o_ref.float()).abs().max().item() == 0
@@ -294,16 +296,20 @@ def test_cutedsl_extend_direct_write(num_seqs: int):
 
     # A mis-shaped out buffer must fail loud, not silently corrupt.
     with pytest.raises(AssertionError):
-        run(out_buf[:, :-1] if inp["total_tokens"] > 1 else out_buf.unsqueeze(0))
+        _run(
+            kernel,
+            inp,
+            out=out_buf[:, :-1] if inp["total_tokens"] > 1 else out_buf.unsqueeze(0),
+        )
 
 
 @pytest.mark.parametrize("total_tokens", [1, 3, 127, 1024, 4096])
 def test_l2norm_qk_fusion_bitexact(total_tokens: int):
-    """P2: the fused q/k l2norm must be bit-identical (0-ULP) to the two
+    """The fused q/k l2norm must be bit-identical (0-ULP) to the two
     separate ``fla.l2norm.l2norm_fwd`` calls it replaces, including token counts
     that are not multiples of the BT=16 row block."""
-    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd  # unmodified ref
-    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import l2norm_fwd_qk
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd  # reference
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 
     num_k_heads, head_k_dim, dtype = 4, 128, torch.bfloat16
     q = torch.randn(
@@ -324,11 +330,11 @@ def test_l2norm_qk_fusion_bitexact(total_tokens: int):
 
 
 def test_l2norm_qk_fusion_launch_count():
-    """P2: the fusion must actually collapse 2 kernel launches into 1."""
+    """The fusion must actually collapse 2 kernel launches into 1."""
     from torch.profiler import ProfilerActivity, profile
 
     from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import l2norm_fwd_qk
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 
     q = torch.randn(4096, 4, 128, device="cuda", dtype=torch.bfloat16).reshape(-1, 128)
     k = torch.randn_like(q)
@@ -349,7 +355,7 @@ def test_l2norm_qk_fusion_launch_count():
 @pytest.mark.parametrize("num_seqs", [1, 5, 257])
 @pytest.mark.parametrize("pad_last", [False, True])
 def test_cutedsl_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
-    """P2c: precomputed (hoisted) prep passed via extend(prep=...) must yield
+    """Precomputed (hoisted) prep passed via extend(prep=...) must yield
     bit-identical core-attn output AND ssm-state writeback vs the per-layer
     recompute path (prep=None), for single & multi-request, incl. -1 padding
     (remapped to sentinel slot N-1)."""
@@ -384,32 +390,15 @@ def test_cutedsl_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
     ).to(torch.long)
     assert torch.equal(ssm_cache_indices, expected)
 
-    def run(prep_arg):
-        ssm = inp["ssm_states"].clone()
-        o, s1, s2 = kernel.extend(
-            q=inp["q"],
-            k=inp["k"],
-            v=inp["v"],
-            g=inp["g"],
-            beta=inp["beta"],
-            ssm_states=ssm,
-            cache_indices=inp["cache_indices"],
-            query_start_loc=inp["query_start_loc"],
-            prep=prep_arg,
-        )
-        torch.cuda.synchronize()
-        assert s1 is None and s2 is None
-        return o, ssm
-
-    o_ref, ssm_ref = run(None)  # today's per-layer recompute
-    o_hoist, ssm_hoist = run(prep)  # hoisted reuse
+    o_ref, ssm_ref = _run(kernel, inp)  # per-layer recompute path
+    o_hoist, ssm_hoist = _run(kernel, inp, prep=prep)  # hoisted reuse
 
     assert (o_hoist.float() - o_ref.float()).abs().max().item() == 0
     assert (ssm_hoist - ssm_ref).abs().max().item() == 0
 
 
 def test_cutedsl_extend_prep_hoist_launch_count():
-    """P2c: reusing hoisted prep across N layers collapses the
+    """Reusing hoisted prep across N layers collapses the
     prepare_metadata_cutedsl (PrepMetaKernel) call from N -> 1."""
     from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
         CuteDSLGDNKernel,

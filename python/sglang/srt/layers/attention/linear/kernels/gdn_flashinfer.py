@@ -14,8 +14,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
+    unwrap_direct_write_out,
 )
 from sglang.srt.utils import is_cuda
 
@@ -92,13 +94,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     Requires flashinfer >= 0.6.7.
     """
 
-    supports_extend_prep = True
-    # extend() consumes the multiplicative decay alpha = exp(g); the caller
-    # computes it in-kernel via fused_gdn_gating(exp_gate=True), so no separate
-    # exp launch runs per layer.
-    extend_gate_form = "exp"
-    # extend_prenormed() is implemented: q/k arrive pre-normalized from the
-    # gdn_prefill_glue kernel and the internal l2norm is skipped.
+    # extend() consumes alpha = exp(g), produced by fused_gdn_gating(exp_gate=True).
+    extend_expects_exp_gate = True
     supports_prenormed_extend = True
 
     def __init__(self):
@@ -240,11 +237,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         """Compute the layer-invariant extend metadata once per forward.
 
-        The pool-gather indices depend only on per-request cache slot indices,
-        which are identical across all GDN layers of a forward, so the caller
-        (forward_extend) builds this once and reuses it across the per-layer
-        extend() calls. Bit-identical to the recompute in extend()'s prep=None
-        fallback. Same keyword signature as the CuteDSL kernel's method.
+        The pool-gather indices depend only on per-request cache slots,
+        identical across all GDN layers of a forward, so forward_extend builds
+        this once and reuses it for every per-layer extend() call. Must stay
+        bit-identical to extend()'s prep=None recompute.
         """
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
@@ -252,7 +248,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
         else:
-            # SM90: preserve original negative-index handling (remap to last slot).
+            # SM90: negative (pad) indices remap to the last slot, the reserved
+            # sentinel.
             ssm_cache_indices = torch.where(
                 cache_indices >= 0,
                 cache_indices,
@@ -276,14 +273,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
-
-        # Fused single-launch q/k L2 norm (was two separate l2norm_fwd calls).
         q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
 
-        # `g` arrives as alpha = exp(g) already (extend_gate_form == "exp": the
-        # caller runs fused_gdn_gating(exp_gate=True)), so no exp launch here.
-        # Both are fp32 from the gating kernel; the .to() calls are no-op guards.
+        # g is already alpha = exp(g) (see extend_expects_exp_gate); the
+        # .to(float32) calls are normally no-op guards.
         return self._extend_core(
             q_fi=q_fi,
             k_fi=k_fi,
@@ -359,9 +352,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         head_v_dim = v_fi.shape[2]
 
         if prep is None:
-            # Fallback for direct extend() callers (e.g. unit tests). On the
-            # per-layer hot path, forward_extend passes prep= once per forward
-            # so this layer-invariant metadata is not recomputed per layer.
+            # Fallback for direct extend() callers (e.g. unit tests); the hot
+            # path passes prep built once per forward.
             prep = self.build_extend_prep(
                 head_k_dim=q_fi.shape[-1],
                 query_start_loc=query_start_loc,
@@ -371,68 +363,53 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
         (ssm_cache_indices,) = prep
 
-        # Direct-write epilogue: when the caller supplies its final output slice
-        # (shape [1, T, Hv, V]), the kernel writes [T, Hv, V] straight into it,
-        # eliminating the caller's device-to-device copy.
-        output_buf = None
-        if out is not None:
-            assert out.shape == (1, total_seq_len, num_v_heads, head_v_dim), (
-                f"direct-write out buffer {tuple(out.shape)} != expected "
-                f"{(1, total_seq_len, num_v_heads, head_v_dim)}"
-            )
-            output_buf = out.squeeze(0)
+        output_buf = unwrap_direct_write_out(
+            out, expected_shape=(1, total_seq_len, num_v_heads, head_v_dim)
+        )
 
-        # When no request in the batch has a prefix (fresh prefills — always the
-        # case with the radix cache disabled), skip the pool gather entirely and
+        # When no request in the batch has a prefix, skip the pool gather and
         # let the kernel zero-seed via initial_state=None. Bit-identical: freed
         # pool slots are cleared, so the gather would materialize zeros anyway
         # (and this also insulates fresh prefills from any stale slot content).
-        num_seqs = query_start_loc.numel() - 1
-        if self.use_state_pool:
-            if no_prefix:
-                initial_state_fi = None
-                output_state_fi = ssm_states.new_empty(
-                    (num_seqs,) + ssm_states.shape[1:]
-                )
-            else:
-                initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-                # Pre-allocate bf16 output_state so the kernel compiles and writes
-                # the bf16 state path directly, avoiding a fp32 allocation and a
-                # subsequent fp32->bf16 conversion in the scatter step.
-                output_state_fi = torch.empty_like(initial_state_fi)
-            output_fi, output_state_fi = self._prefill_fn(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=alpha_fi,
-                beta=beta_fi,
-                scale=None,
-                initial_state=initial_state_fi,
-                output_final_state=True,
-                cu_seqlens=query_start_loc,  # already int32
-                use_qk_l2norm_in_kernel=False,
-                output=output_buf,
-                output_state=output_state_fi,
-            )
+        if no_prefix:
+            initial_state_fi = None
         else:
-            # State must be float32; kernel requires int64 cu_seqlens.
-            if no_prefix:
-                initial_state_fi = None
-            else:
-                initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-            output_fi, output_state_fi = self._prefill_fn(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=alpha_fi,
-                beta=beta_fi,
-                scale=None,
-                initial_state=initial_state_fi,
-                output_final_state=True,
-                cu_seqlens=query_start_loc.to(torch.int64),
-                use_qk_l2norm_in_kernel=False,
-                output=output_buf,
+            gathered = ssm_states[ssm_cache_indices]
+            # SM90 state must be float32; SM100 keeps the pool's bf16.
+            initial_state_fi = (
+                gathered.contiguous()
+                if self.use_state_pool
+                else gathered.to(torch.float32)
             )
+
+        extra = {}
+        if self.use_state_pool:
+            # Pre-allocate bf16 output_state so the kernel compiles and writes
+            # the bf16 state path directly, avoiding a fp32 allocation and a
+            # subsequent fp32->bf16 conversion in the scatter step.
+            num_seqs = query_start_loc.numel() - 1
+            extra["output_state"] = ssm_states.new_empty(
+                (num_seqs,) + ssm_states.shape[1:]
+            )
+
+        output_fi, output_state_fi = self._prefill_fn(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha_fi,
+            beta=beta_fi,
+            scale=None,
+            initial_state=initial_state_fi,
+            output_final_state=True,
+            cu_seqlens=(
+                query_start_loc  # already int32
+                if self.use_state_pool
+                else query_start_loc.to(torch.int64)
+            ),
+            use_qk_l2norm_in_kernel=False,
+            output=output_buf,
+            **extra,
+        )
 
         # Write back state to pool
         ssm_states.index_copy_(

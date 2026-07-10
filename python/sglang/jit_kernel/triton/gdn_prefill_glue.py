@@ -1,13 +1,11 @@
 """Axis-stacked GDN prefill prologue glue: split + gating + q/k L2 norm in ONE launch.
 
-Replaces the per-layer three-kernel chain
-``fused_qkv_split_gdn_prefill`` -> ``fused_gdn_gating`` -> ``l2norm_fwd_qk``
-on GDN extend with a single kernel whose 1D grid is range-partitioned by
-program id into four roles (q-norm rows, k-norm rows, v-copy, gating). Each
-role body is a clone of the kernel it subsumes, at a tile shape proven
-bit-identical, with the q/k loads addressed directly into the packed
-``mixed_qkv`` — the raw (un-normalized) q/k intermediates never reach global
-memory.
+Fuses the GDN extend prologue chain ``fused_qkv_split_gdn_prefill`` ->
+``fused_gdn_gating`` -> ``l2norm_fwd_qk`` into a single kernel whose 1D grid is
+range-partitioned by program id into four roles (q-norm rows, k-norm rows,
+v-copy, gating). Each role body is a clone of the corresponding standalone
+kernel, with q/k loads addressed directly into the packed ``mixed_qkv`` — the
+raw (un-normalized) q/k intermediates never reach global memory.
 
 Clone discipline (do NOT "clean up" without re-proving the 0-ULP matrix in
 test_gdn_prefill_flashinfer_opts.py):
@@ -18,7 +16,7 @@ test_gdn_prefill_flashinfer_opts.py):
 2. The norm role's 0-ULP equality under manual-pointer loads (vs the original
    block-ptr loads) is a Triton lowering property pinned by CI, not a language
    contract; a Triton upgrade that breaks it must fail the 0-ULP matrix test.
-3. If the causal conv1d is ever fused in (BCG-fold era), q/k MUST be rounded to
+3. If the causal conv1d is ever fused in, q/k MUST be rounded to
    bf16 in-register before the L2 reduction: today the norm reads the conv's
    already-rounded bf16 output, and norming pre-round fp32 values diverges on
    ~26% of elements.
@@ -172,13 +170,31 @@ def gdn_prefill_glue_kernel(
     V_DIM: tl.constexpr = NUM_V_HEADS * HEAD_V_DIM
     if pid < nbn:
         _norm_body_packed(
-            mixed_qkv, q_norm, eps, pid, 0, stride_t, t_rows,
-            NUM_QK_HEADS, HEAD_QK_DIM, BT, BD,
+            mixed_qkv,
+            q_norm,
+            eps,
+            pid,
+            0,
+            stride_t,
+            t_rows,
+            NUM_QK_HEADS,
+            HEAD_QK_DIM,
+            BT,
+            BD,
         )
     elif pid < 2 * nbn:
         _norm_body_packed(
-            mixed_qkv, k_norm, eps, pid - nbn, Q_DIM, stride_t, t_rows,
-            NUM_QK_HEADS, HEAD_QK_DIM, BT, BD,
+            mixed_qkv,
+            k_norm,
+            eps,
+            pid - nbn,
+            Q_DIM,
+            stride_t,
+            t_rows,
+            NUM_QK_HEADS,
+            HEAD_QK_DIM,
+            BT,
+            BD,
         )
     elif pid < 2 * nbn + seq_len:
         _vcopy_body(
@@ -186,9 +202,21 @@ def gdn_prefill_glue_kernel(
         )
     else:
         _gating_body_matched(
-            g, beta_out, A_log, a, b, dt_bias,
-            pid - 2 * nbn - seq_len, seq_len, stride_a, stride_b,
-            NUM_V_HEADS, beta, threshold, BT_G, EXP_GATE,
+            g,
+            beta_out,
+            A_log,
+            a,
+            b,
+            dt_bias,
+            pid - 2 * nbn - seq_len,
+            seq_len,
+            stride_a,
+            stride_b,
+            NUM_V_HEADS,
+            beta,
+            threshold,
+            BT_G,
+            EXP_GATE,
         )
 
 
@@ -225,26 +253,49 @@ def gdn_prefill_glue(
     assert qkv_dim == 2 * num_qk_heads * head_qk_dim + num_v_heads * head_v_dim
     assert mixed_qkv.stride(1) == 1, "glue requires a row-contiguous mixed_qkv"
     assert head_qk_dim == 128, "norm body is the verified BD=128 clone shape"
+    assert (
+        num_v_heads & (num_v_heads - 1) == 0
+    ), "matched gating tile requires power-of-two num_v_heads (tl.arange)"
+    assert A_log.shape == dt_bias.shape == (num_v_heads,)
     assert a.shape == b.shape == (seq_len, num_v_heads)
     assert a.stride(1) == 1 and b.stride(1) == 1
 
     dtype = mixed_qkv.dtype
     device = mixed_qkv.device
-    q_norm = torch.empty((1, seq_len, num_qk_heads, head_qk_dim), dtype=dtype, device=device)
-    k_norm = torch.empty((1, seq_len, num_qk_heads, head_qk_dim), dtype=dtype, device=device)
+    q_norm = torch.empty(
+        (1, seq_len, num_qk_heads, head_qk_dim), dtype=dtype, device=device
+    )
+    k_norm = torch.empty(
+        (1, seq_len, num_qk_heads, head_qk_dim), dtype=dtype, device=device
+    )
     v = torch.empty((1, seq_len, num_v_heads, head_v_dim), dtype=dtype, device=device)
     g = torch.empty((1, seq_len, num_v_heads), dtype=torch.float32, device=device)
-    beta_out = torch.empty((1, seq_len, num_v_heads), dtype=torch.float32, device=device)
+    beta_out = torch.empty(
+        (1, seq_len, num_v_heads), dtype=torch.float32, device=device
+    )
 
     BT = 16  # l2norm's native row-block; also the matched gating token tile
     t_rows = seq_len * num_qk_heads
     nbn = triton.cdiv(t_rows, BT)
     grid = (2 * nbn + seq_len + triton.cdiv(seq_len, BT),)
     gdn_prefill_glue_kernel[grid](
-        mixed_qkv, a, b, A_log, dt_bias,
-        q_norm, k_norm, v, g, beta_out,
-        eps, seq_len, t_rows, nbn,
-        mixed_qkv.stride(0), a.stride(0), b.stride(0),
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        q_norm,
+        k_norm,
+        v,
+        g,
+        beta_out,
+        eps,
+        seq_len,
+        t_rows,
+        nbn,
+        mixed_qkv.stride(0),
+        a.stride(0),
+        b.stride(0),
         NUM_QK_HEADS=num_qk_heads,
         NUM_V_HEADS=num_v_heads,
         HEAD_QK_DIM=head_qk_dim,

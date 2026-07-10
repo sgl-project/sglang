@@ -16,6 +16,7 @@ from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rul
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
+    unwrap_direct_write_out,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,6 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
     unsupported; callers should query :attr:`supports_prefill` and fall back
     to another backend (e.g. Triton).
     """
-
-    supports_extend_prep = True
 
     def __init__(self):
         # The Blackwell extend kernel uses tcgen05/TMA-bulk-swizzle features
@@ -118,11 +117,11 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         """Compute the layer-invariant extend metadata once per forward.
 
-        These three quantities depend only on per-request data (query start
-        locations, cache slot indices, sequence structure), which is identical
-        across all GDN layers in a forward, so the caller (forward_extend) builds
-        this once and reuses it across the 45 per-layer extend() calls (P2c).
-        Bit-identical to the recompute in extend()'s prep=None fallback.
+        All three quantities depend only on per-request data (query start
+        locations, cache slots, sequence structure), identical across all GDN
+        layers of a forward, so forward_extend builds this once and reuses it
+        for every per-layer extend() call. Must stay bit-identical to extend()'s
+        prep=None recompute.
         """
         self._ensure_extend_loaded(head_k_dim)
         cu_seqlens = query_start_loc.to(torch.int32)
@@ -159,8 +158,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        # L2 norm Q/K outside the kernel (same as flashinfer path), fused into a
-        # single launch (was two separate l2norm_fwd calls).
+        # L2 norm Q/K outside the kernel (same as flashinfer path).
         q_norm, k_norm = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
         q_norm = q_norm.unsqueeze(0)
         k_norm = k_norm.unsqueeze(0)
@@ -170,9 +168,8 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         beta_in = beta[0].to(torch.float32).unsqueeze(0)
 
         if prep is None:
-            # Fallback for direct extend() callers (e.g. unit tests). On the
-            # per-layer hot path, forward_extend passes prep= once per forward
-            # (P2c) so this layer-invariant metadata is not recomputed 45x.
+            # Fallback for direct extend() callers (e.g. unit tests); the hot
+            # path passes prep built once per forward.
             prep = self.build_extend_prep(
                 head_k_dim=head_k_dim,
                 query_start_loc=query_start_loc,
@@ -182,19 +179,13 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
             )
         cu_seqlens, ssm_cache_indices, chunk_indices, chunk_offsets = prep
 
-        # Pool gather: remap padding (-1) to the last (sentinel) slot.
+        # Pool gather (prep's ssm_cache_indices already remap -1 padding to the
+        # sentinel slot).
         initial_state = ssm_states[ssm_cache_indices].contiguous()
 
-        # Direct-write epilogue: when the caller supplies its final output slice
-        # (shape [1, T, Hv, V]), the o-kernel writes [T, Hv, V] straight into it,
-        # eliminating the caller's device-to-device copy.
-        core_attn_out = None
-        if out is not None:
-            assert out.shape == (1, total_seq_len, num_v_heads, head_v_dim), (
-                f"direct-write out buffer {tuple(out.shape)} != expected "
-                f"{(1, total_seq_len, num_v_heads, head_v_dim)}"
-            )
-            core_attn_out = out.squeeze(0)
+        core_attn_out = unwrap_direct_write_out(
+            out, expected_shape=(1, total_seq_len, num_v_heads, head_v_dim)
+        )
 
         output, final_state = self._extend_fn(
             q=q_norm,

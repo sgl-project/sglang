@@ -8,9 +8,8 @@ from triton.language.extra import libdevice
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
-# With EXP_GATE, g is stored as exp(g) (the multiplicative decay "alpha" that
-# the FlashInfer GDN prefill kernel consumes), fusing away the separate
-# torch.exp launch and its extra round trip over g.
+# With EXP_GATE, g is stored as exp(g) — the multiplicative decay alpha the
+# FlashInfer GDN prefill kernel consumes.
 @triton.jit
 def fused_gdn_gating_kernel(
     g,
