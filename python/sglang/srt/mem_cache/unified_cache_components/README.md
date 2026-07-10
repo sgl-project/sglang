@@ -208,16 +208,16 @@ Cache a completed request's KV data into the tree.
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
 | **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
 | **Output** | `CacheFinishedReqResult(unhandled_kv_start=...)` — page-aligned position after which the caller frees the request's remaining allocated KV indices |
-| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
+| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees only duplicates already present in the tree; everything past `unhandled_kv_start` (truncated range, unaligned tail, non-inserted suffix when `is_insert=False`) is left for the caller to free. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
 1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: sets `swa_evicted_seqlen`; Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen` as truncation hint)
-2. Truncates if `effective_cache_len < len(token_ids)`: frees excess pool indices
+2. Truncates the token/KV views if `effective_cache_len < len(token_ids)`
 3. Converts token IDs (bigram if EAGLE), page-aligns keys, then calls `insert()`
-4. Frees unaligned tail KV indices beyond page boundary
-5. Calls `dec_lock_ref()` on the previous `req.last_node`
-6. `cleanup_after_caching_req()` per component (Mamba: frees forked mamba_value based on `mamba_exist`, handles ping-pong buffer cleanup)
+4. Calls `dec_lock_ref()` on the previous `req.last_node`
+5. `cleanup_after_caching_req()` per component (Mamba: frees forked mamba_value based on `mamba_exist`, handles ping-pong buffer cleanup)
+6. Returns `unhandled_kv_start` (`max(page_aligned_len, cache_protected_len)` on insert, `cache_protected_len` otherwise); the caller frees `[unhandled_kv_start, kv_allocated_len)`
 
 ---
 

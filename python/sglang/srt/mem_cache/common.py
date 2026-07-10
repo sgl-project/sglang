@@ -155,8 +155,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None and req.kv is None:
         return
 
-    start_p, end_p = result.unhandled_kv_start, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    _release_overallocated_kv_indices(
+        req,
+        start_p=result.unhandled_kv_start,
+        end_p=req.kv.kv_allocated_len,
+        tree_cache=tree_cache,
+        effective_kv_committed_len=effective_kv_committed_len,
+    )
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
@@ -173,7 +178,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 
 def _release_overallocated_kv_indices(
-    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+    req: Req,
+    start_p: int,
+    end_p: int,
+    tree_cache: BasePrefixCache,
+    effective_kv_committed_len: int,
 ) -> None:
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
@@ -183,15 +192,15 @@ def _release_overallocated_kv_indices(
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
-            req.effective_kv_committed_len() == req.kv.kv_allocated_len
+            effective_kv_committed_len == req.kv.kv_allocated_len
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
     assert (
         start_p % page_size == 0
     ), f"unhandled_kv_start must be page aligned, {start_p=}, {page_size=}"
     assert (
-        req.cache_protected_len <= start_p
-    ), f"unhandled_kv_start below protected prefix, {start_p=}, {req.cache_protected_len=}"
+        req.cache_protected_len <= start_p <= effective_kv_committed_len
+    ), f"unhandled_kv_start out of range, {start_p=}, {req.cache_protected_len=}, {effective_kv_committed_len=}"
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
