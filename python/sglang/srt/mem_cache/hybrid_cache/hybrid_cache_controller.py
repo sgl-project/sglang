@@ -394,9 +394,19 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
+        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            host_indices = op.host_indices
+            device_indices = op.device_indices
+            resolved_pool_transfers = op.pool_transfers
+        else:
+            host_indices, device_indices, resolved_pool_transfers = (
+                self.move_hybrid_indices(op)
+            )
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -575,13 +585,9 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        last_hash = operation.last_hash
-        hash_value = []
-        for start in range(0, len(operation.token_ids), self.page_size):
-            last_hash = self.get_hash_str(
-                operation.token_ids[start : start + self.page_size], last_hash
-            )
-            hash_value.append(last_hash)
+        hash_value = self.get_hash_str(
+            operation.token_ids, operation.last_hash, page_size=self.page_size
+        )
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None

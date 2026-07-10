@@ -9,11 +9,28 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES = 128 * 1024
+
+
+@functools.lru_cache(maxsize=None)
+def _get_cuda_shared_memory_per_block_optin() -> Optional[int]:
+    if _is_hip or not torch.cuda.is_available():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    except (AssertionError, RuntimeError):
+        return None
+    return getattr(props, "shared_memory_per_block_optin", None)
+
+
+def _use_low_smem_fp8_default() -> bool:
+    smem_limit = _get_cuda_shared_memory_per_block_optin()
+    return smem_limit is not None and smem_limit < _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES
 
 
 def get_config_file_name(
@@ -52,7 +69,7 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
@@ -153,7 +170,7 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
@@ -163,23 +180,42 @@ def get_default_config(
         return config
     if dtype == "fp8_w8a8":
         if block_shape is None:
-            config = {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 32,
-                "num_warps": 8,
-                "num_stages": 2 if _is_hip else 4,
-            }
-            if M <= E:
+            if _use_low_smem_fp8_default():
                 config = {
-                    "BLOCK_SIZE_M": 64,
-                    "BLOCK_SIZE_N": 128,
-                    "BLOCK_SIZE_K": 128,
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 256,
                     "GROUP_SIZE_M": 1,
                     "num_warps": 4,
+                    "num_stages": 4,
+                }
+                if M > E:
+                    config = {
+                        "BLOCK_SIZE_M": 64,
+                        "BLOCK_SIZE_N": 128,
+                        "BLOCK_SIZE_K": 256,
+                        "GROUP_SIZE_M": 64,
+                        "num_warps": 4,
+                        "num_stages": 2,
+                    }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 128,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 32,
+                    "num_warps": 8,
                     "num_stages": 2 if _is_hip else 4,
                 }
+                if M <= E:
+                    config = {
+                        "BLOCK_SIZE_M": 64,
+                        "BLOCK_SIZE_N": 128,
+                        "BLOCK_SIZE_K": 128,
+                        "GROUP_SIZE_M": 1,
+                        "num_warps": 4,
+                        "num_stages": 2 if _is_hip else 4,
+                    }
         else:
             # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]
             config = {

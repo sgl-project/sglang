@@ -39,6 +39,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     KimiVLConfig,
     LagunaConfig,
+    LocateAnythingConfig,
     LongcatFlashConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
@@ -84,6 +85,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
         Step3VLConfig,
@@ -181,6 +183,33 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     return hf_hub_download(
         model_name_or_path, filename, revision=revision, local_files_only=True
     )
+
+
+def _cached_file_exists(model_name_or_path, filename, revision=None) -> bool:
+    """Whether *filename* is available locally or in the HF cache (no network)."""
+    try:
+        _resolve_local_or_cached_file(model_name_or_path, filename, revision)
+        return True
+    except Exception:
+        return False
+
+
+def _remote_file_exists(repo_id, filename, revision=None) -> bool:
+    """Whether *filename* exists on the HF hub (HEAD request only, no download).
+
+    Returns False on any error (offline, gated, network, invalid id) so callers
+    fall back to their default path instead of crashing.
+    """
+    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+    if HF_HUB_OFFLINE:
+        return False
+    try:
+        from huggingface_hub import HfApi
+
+        return HfApi().file_exists(repo_id, filename, revision=revision)
+    except Exception:
+        return False
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
