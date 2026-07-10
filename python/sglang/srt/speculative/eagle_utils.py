@@ -729,10 +729,32 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        # coins for rejection sampling
-        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-        # coins for final sampling
-        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        sampling_seed = sampling_info.sampling_seed
+        if sampling_seed is not None:
+            from sglang.srt.layers.utils.hash import murmur_hash32
+
+            cols = torch.arange(
+                verify_input.draft_token_num + 1, device=device, dtype=torch.int64
+            )
+            hashed = murmur_hash32(
+                sampling_seed.to(torch.uint64), batch.seq_lens.to(torch.uint64), cols
+            )
+            uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+            coins = (
+                uniforms[:, : verify_input.draft_token_num]
+                .to(torch.float32)
+                .contiguous()
+            )
+            coins_for_final_sampling = (
+                uniforms[:, verify_input.draft_token_num].to(torch.float32).contiguous()
+            )
+        else:
+            # coins for rejection sampling
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+            # coins for final sampling
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
 
         sampling_fn = (
             chain_speculative_sampling_triton
