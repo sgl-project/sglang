@@ -15,9 +15,16 @@
 
 This module provides:
 - StackedParamsDispatch: reusable stacked-parameter routing (qkv_proj, gate_up_proj).
+- ExpertParamsDispatch: MoE expert_id + w1/w2/w3 shard routing.
 - filter_pp_weights: generator that drops out-of-range PP layers.
-- WeightRemapRegistry: architecture-specific name remap registration.
+- RemapRegistry: architecture-specific name remap registration.
 - Re-exports of AutoWeightsLoader and WeightsMapper from models/utils.py.
+
+Load / post-load split (PR1 protocol, see design.md):
+  load_weights(..., run_post_load=True)  -> WeightLoadResult
+  post_load_weights(loaded=result)       -> optional GPU derivations (MLA w_kc/w_vc, etc.)
+
+Migration plan: design.md in this directory.
 """
 
 from __future__ import annotations
