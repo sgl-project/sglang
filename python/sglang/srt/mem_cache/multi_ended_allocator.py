@@ -772,6 +772,38 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- paged alloc surface --
 
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Allocate ``num_pages`` virtual PAGE ids (id-owner only): consume the
+        head of ``free_virtual_ids`` and bind each consumed virtual page to a
+        physical page on THIS sub-allocator. Returns virtual page ids, or None
+        on shortfall.
+        """
+        with record_function("MultiEndedAlloc.alloc_pages"):
+            assert self.is_id_owner, (
+                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_pages called "
+                "on a non-id-owner allocator; use alloc_with_virtual instead"
+            )
+            if num_pages <= 0:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
+            if num_pages > len(self.free_virtual_ids):
+                return None
+            # Lazy: physical-capacity pre-check; on shortfall flush the PEER
+            # (own compaction is internal -- see `alloc`).
+            need_tokens = num_pages * self.page_size
+            if need_tokens > self.available_size():
+                if not self._flush_peer_for_alloc(need_tokens):
+                    return None
+            if self.need_sort and num_pages > len(self.free_virtual_ids):
+                self.merge_and_sort_free()
+
+            v_pages = self.free_virtual_ids[:num_pages]
+            self.free_virtual_ids = self.free_virtual_ids[num_pages:]
+            phys_pages = self._alloc_bind_fast_or_slow(v_pages, num_pages)
+            if phys_pages is None:
+                self.free_virtual_ids = torch.cat([v_pages, self.free_virtual_ids])
+                return None
+            return v_pages
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -1820,6 +1852,12 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         with record_function("UnifiedMambaAlloc.alloc"):
             return self.full_attn_allocator.alloc(need_size)
 
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Paged page-granular alloc. Mamba state is per-request (doesn't
+        advance per-token), so forward only to the full sub-allocator."""
+        with record_function("UnifiedMambaAlloc.alloc_pages"):
+            return self.full_attn_allocator.alloc_pages(num_pages)
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -2267,6 +2305,28 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
             return v_tokens
+
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Page-granular composite alloc: the full side mints the virtual
+        pages, then the swa side binds the SAME virtual pages via
+        ``alloc_with_virtual`` (cross-sub-pool virtual-id identity).
+        """
+        with record_function("UnifiedSWAAlloc.alloc_pages"):
+            need_tokens = num_pages * self.page_size
+            if need_tokens > self.available_size():
+                if not self._flush_both_for_alloc(need_tokens):
+                    return None
+
+            v_pages = self.full_attn_allocator.alloc_pages(num_pages)
+            assert v_pages is not None, (
+                "UnifiedSWA.alloc_pages: full.alloc_pages returned None after "
+                "joint pre-check passed — internal-state inconsistency"
+            )
+
+            if v_pages.numel() > 0:
+                self.swa_attn_allocator.alloc_with_virtual(v_pages)
+
+            return v_pages
 
     def alloc_extend(
         self,

@@ -1289,54 +1289,24 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             min(fa.available_size(), sa.available_size()),
         )
 
-    # 9. REGRESSION: alloc_extend must bind v2p / p2v on
-    # this allocator. Without binding, `virtual_to_physical[virt_page]`
-    # stays -1 and `translate_kv_loc(virt_token)` returns negative token
-    # ids → CUDA OOB in the Triton attention kernel.
-    def test_paged_alloc_extend_binds_v2p_p2v(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
-
+    # 9. REGRESSION (migrated to alloc_pages, op6): the extend-shaped page
+    # allocation must bind v2p / p2v on this allocator. Without binding,
+    # `virtual_to_physical[virt_page]` stays -1 and
+    # `translate_kv_loc(virt_token)` returns negative token ids → CUDA OOB
+    # in the Triton attention kernel.
+    def test_paged_alloc_pages_binds_v2p_p2v(self):
+        """alloc_pages(n) binds v2p/p2v for every consumed virtual page."""
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
         free_before = full_alloc.free_virtual_ids.clone()
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
 
-        # Stub the kernel — we only need to verify the BINDING contract.
-        # (Driving the real Triton kernel needs a GPU; the contract we're
-        # checking is that the v2p/p2v tables get updated regardless of
-        # what the kernel writes into out_indices.)
-        original_kernel = mea_mod.alloc_extend_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_extend_kernel = _NoOpKernelGrid()
-        try:
-            # bs=1, prefix=0, seq=2 pages worth, so num_new_pages=2.
-            prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEV)
-            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-            seq_lens = torch.tensor([2 * PS], dtype=torch.int64, device=_DEV)
-            seq_lens_cpu = torch.tensor([2 * PS], dtype=torch.int64)
-            last_loc = torch.tensor([-1], dtype=torch.int64, device=_DEV)
-
-            out = full_alloc.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                2 * PS,
-                num_new_pages=2,
-            )
-        finally:
-            mea_mod.alloc_extend_kernel = original_kernel
+        # An extend that spans 2 fresh pages allocates exactly 2 pages.
+        out = full_alloc.alloc_pages(2)
 
         self.assertIsNotNone(out)
+        self.assertTrue(torch.equal(out, free_before[:2]))
         # The two virtual pages consumed from the front of free_virtual_ids
         # must now be BOUND in v2p_page (not -1).
         consumed_pages = free_before[:2]
@@ -1372,51 +1342,27 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             int(free_before.numel()) - 2,
         )
 
-    # 10. REGRESSION: alloc_decode must bind v2p / p2v on
-    # this allocator when num_new_pages > 0. Most decode steps reuse the
-    # prefix's tail page (num_new_pages == 0), but the page-wrapping case
-    # must update tables.
-    def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
-
+    # 10. REGRESSION (migrated to alloc_pages, op6): the decode page-wrap
+    # allocation (one fresh page for a request crossing a page boundary)
+    # must bind v2p / p2v on this allocator. Most decode steps reuse the
+    # prefix's tail page (they never reach the allocator on the alloc_pages
+    # path), but the page-wrapping case must update tables.
+    def test_paged_alloc_pages_binds_v2p_p2v_on_page_wrap(self):
+        """alloc_pages(1) for a page-crossing decode binds v2p/p2v."""
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
-        # Pre-allocate ~1 page so an arbitrary `seq_len % page_size == 1`
-        # decode step triggers a new-page consumption.
+        # Pre-allocate ~1 page so the decode step below is the page-wrapping
+        # one (seq_len % page_size == 0 → one fresh page).
         v = full_alloc.alloc(PS)
         self.assertIsNotNone(v)
         free_before = full_alloc.free_virtual_ids.clone()
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
 
-        # Build a decode that wraps to a new page: seq_len % page_size == 1
-        # (one req that just stepped past a page boundary). The kernel will
-        # consume 1 new page from `free_virtual_ids[0]`.
-        seq_lens = torch.tensor([PS + 1], dtype=torch.int64, device=_DEV)
-        seq_lens_cpu = torch.tensor([PS + 1], dtype=torch.int64)
-        last_loc = torch.tensor(
-            # last token of page-N at offset page_size-1.
-            [int(v[-1].item())],
-            dtype=torch.int64,
-            device=_DEV,
-        )
-
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        out = full_alloc.alloc_pages(1)
 
         self.assertIsNotNone(out)
+        self.assertTrue(torch.equal(out, free_before[:1]))
         # 1 virtual page consumed from the head of free_virtual_ids.
         consumed_page = int(free_before[0].item())
         # v2p_page must now map to a valid physical page (not -1).
@@ -1452,53 +1398,35 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             int(free_before.numel()) - 1,
         )
 
-    # 11. REGRESSION: alloc_decode with num_new_pages == 0
-    # (the common case — the decode token reuses the prefix's tail page)
-    # must NOT advance the watermark and NOT touch v2p / p2v.
-    def test_paged_alloc_decode_no_op_when_no_new_page(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
-
+    # 11. REGRESSION (migrated to alloc_pages, op6): a decode step whose token
+    # reuses the prefix's tail page (the common case) allocates zero pages;
+    # alloc_pages(0) must return an empty tensor and NOT advance the
+    # watermark, NOT touch v2p / p2v, and NOT consume free virtual ids.
+    def test_paged_alloc_pages_zero_is_no_op(self):
+        """alloc_pages(0) returns an empty tensor and leaves all state untouched."""
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
-        # Pre-allocate 2 pages worth. We'll simulate a decode where seq_len
-        # advances WITHIN the existing tail page (no new page consumed).
+        # Pre-allocate 1 page worth, matching a request mid-page during decode.
         v = full_alloc.alloc(PS)
+        self.assertIsNotNone(v)
         free_before = full_alloc.free_virtual_ids.clone()
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
+        v2p_before = full_alloc.virtual_to_physical.clone()
 
-        # seq_len = PS - 1 (just inside the prefix page), pre-prefix-len = PS - 2.
-        # `(seq_lens % page_size == 1)` is FALSE here, so num_new_pages == 0.
-        seq_lens = torch.tensor([PS - 1], dtype=torch.int64, device=_DEV)
-        seq_lens_cpu = torch.tensor([PS - 1], dtype=torch.int64)
-        last_loc = torch.tensor(
-            [int(v[PS - 2].item())],
-            dtype=torch.int64,
-            device=_DEV,
-        )
-
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        out = full_alloc.alloc_pages(0)
 
         self.assertIsNotNone(out)
+        self.assertEqual(int(out.numel()), 0)
         # Nothing should have moved — no new page consumed.
         self.assertEqual(full_alloc.watermark_physical, watermark_before)
         self.assertEqual(full_alloc.allocated_count(), allocated_count_before)
         self.assertEqual(
             int(full_alloc.free_virtual_ids.numel()),
             int(free_before.numel()),
+        )
+        self.assertTrue(
+            torch.equal(full_alloc.virtual_to_physical, v2p_before)
         )
 
     # 12. translate_kv_loc preserves token-level identity end-to-end.
