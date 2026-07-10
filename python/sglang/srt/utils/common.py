@@ -97,6 +97,7 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -1890,7 +1891,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.12")
+        min_version: Minimum version required (e.g., "0.6.14")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2058,11 +2059,10 @@ def set_ulimit(target_soft_limit=65535):
 
 def rank0_log(msg: str):
     from sglang.srt.distributed import (
-        get_tensor_model_parallel_rank,
         model_parallel_is_initialized,
     )
 
-    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
         logger.info(msg)
 
 
@@ -3364,10 +3364,9 @@ class BumpAllocator:
 
 
 def log_info_on_rank0(logger, msg):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     try:
-        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3382,10 +3381,9 @@ def log_debug_on_rank0(logger, msg):
     Log a debug message only on tensor model parallel rank 0.
     Falls back to logging if distributed is not initialized or error occurs.
     """
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     try:
-        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.debug(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3417,6 +3415,11 @@ def dispose_tensor(x: torch.Tensor):
     )
 
     if is_in_tc_piecewise_cuda_graph():
+        return
+
+    from sglang.srt.runtime_context import get_flags
+
+    if get_flags().capture.disable_dispose_tensor:
         return
 
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
@@ -3459,6 +3462,16 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         elif not server_args.enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
+            return True
+        elif get_moe_a2a_backend().is_flashinfer():
+            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
+            # cuda-graph bucket must be identical across EP ranks, otherwise ranks
+            # replay different-sized graphs -> geometry mismatch -> illegal memory
+            # access (issue #30242). No literal MLP TP-gather happens here -- the
+            # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
+            # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
+            # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
         else:
             return (
