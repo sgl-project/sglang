@@ -235,6 +235,12 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
 
+        # MossVL always runs the mm processor, so it can't take the text-only
+        # input_ids fast path in _multimodal_prompt_kwargs.
+        self._forces_mm_processor = "MossVLForConditionalGeneration" in (
+            self.tokenizer_manager.model_config.hf_config.architectures or []
+        )
+
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -532,7 +538,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
         raw_request: Request = None,
@@ -565,7 +571,8 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = await self._process_messages(request, is_multimodal)
+
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -573,10 +580,11 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
+            prompt_kwargs = self._multimodal_prompt_kwargs(processed_messages)
         else:
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}
@@ -637,7 +645,31 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _process_messages(
+    def _multimodal_prompt_kwargs(
+        self, processed_messages: MessageProcessingResult
+    ) -> Dict[str, Any]:
+        """Prompt kwargs for a multimodal model.
+
+        With mm data: pass text (the mm processor consumes it). Text-only:
+        pass prompt_ids to skip the re-encode in _tokenize_one_request.
+        """
+        has_mm_data = bool(
+            processed_messages.image_data
+            or processed_messages.video_data
+            or processed_messages.audio_data
+        )
+        prompt_ids = processed_messages.prompt_ids
+        can_skip_reencode = (
+            not has_mm_data
+            and not self._forces_mm_processor
+            and isinstance(prompt_ids, list)
+            and prompt_ids
+        )
+        if can_skip_reencode:
+            return {"input_ids": prompt_ids}
+        return {"text": processed_messages.prompt}
+
+    async def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
@@ -714,14 +746,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
+            result = await self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
         return result
 
-    def _apply_jinja_template(
+    async def _encode_text(self, text: str, encode_kwargs: Dict[str, Any]) -> List[int]:
+        dynamic_batch_tokenizer = self.tokenizer_manager.async_dynamic_batch_tokenizer
+        if dynamic_batch_tokenizer is not None:
+            result = await dynamic_batch_tokenizer.encode(text, **encode_kwargs)
+            return result["input_ids"]
+        return self.tokenizer_manager.tokenizer.encode(text, **encode_kwargs)
+
+    async def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
@@ -875,7 +914,8 @@ class OpenAIServingChat(OpenAIServingBase):
             # can skip add_special_tokens=False on tokenizers that don't auto-add
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
             # templates already include role/special tokens, so the encode must
-            # avoid double BOS on tokenizers that would add it.
+            # avoid double BOS on tokenizers that would add it. Encoding via
+            # _encode_text lets it use the dynamic batch tokenizer when enabled.
             encode_kwargs = (
                 {"add_special_tokens": False}
                 if self._tokenizer_auto_adds_specials
@@ -890,9 +930,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
+                prompt_ids = await self._encode_text(rendered_prompt, encode_kwargs)
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -912,9 +950,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
-                    )
+                    prompt_ids = await self._encode_text(rendered_prompt, encode_kwargs)
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
@@ -927,7 +963,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
 
-            if is_multimodal:
+            if is_multimodal and (
+                image_data or video_data or audio_data or self._forces_mm_processor
+            ):
+                # The mm processor consumes text; text-only requests skip this
+                # and pass prompt_ids straight through (see
+                # _multimodal_prompt_kwargs).
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop

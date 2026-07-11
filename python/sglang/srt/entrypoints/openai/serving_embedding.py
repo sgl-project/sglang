@@ -74,7 +74,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         return f"Token ID at index {i} must be non-negative"
         return None
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: EmbeddingRequest,
         raw_request: Request = None,

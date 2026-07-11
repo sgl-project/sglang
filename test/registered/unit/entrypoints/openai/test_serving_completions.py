@@ -62,7 +62,9 @@ class ServingCompletionTestCase(unittest.TestCase):
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
-        internal, _ = self.sc._convert_to_internal_request(req)
+        internal, _ = get_or_create_event_loop().run_until_complete(
+            self.sc._convert_to_internal_request(req)
+        )
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
     # ---------- echo-handling ----------
@@ -225,7 +227,9 @@ class ServingCompletionTestCase(unittest.TestCase):
             stream=True,
         )
 
-        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        adapted_request, _ = get_or_create_event_loop().run_until_complete(
+            self.sc._convert_to_internal_request(req)
+        )
 
         async def run_stream():
             chunks = []
@@ -336,7 +340,9 @@ class ServingCompletionTestCase(unittest.TestCase):
             return_cached_tokens_details=True,
         )
 
-        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        adapted_request, _ = get_or_create_event_loop().run_until_complete(
+            self.sc._convert_to_internal_request(req)
+        )
 
         async def run_stream():
             chunks = []

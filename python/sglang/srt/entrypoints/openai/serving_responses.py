@@ -481,11 +481,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self._process_messages(chat_request, is_multimodal)
+        processed_messages = await self._process_messages(chat_request, is_multimodal)
 
         if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
+            # Text-only requests get input_ids to skip a re-encode; see
+            # _multimodal_prompt_kwargs. Downstream: str -> text, list -> ids.
+            prompt_kwargs = self._multimodal_prompt_kwargs(processed_messages)
+            engine_prompt = (
+                prompt_kwargs["input_ids"]
+                if "input_ids" in prompt_kwargs
+                else prompt_kwargs["text"]
+            )
+            request_prompts = [engine_prompt]
+            engine_prompts = [engine_prompt]
         else:
             request_prompts = [processed_messages.prompt_ids]
             engine_prompts = [processed_messages.prompt_ids]

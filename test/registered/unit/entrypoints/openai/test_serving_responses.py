@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -165,7 +165,7 @@ class ChatToolForwardingTestCase(unittest.TestCase):
                 tool_call_constraint=("json_schema", {"type": "object"}),
             )
 
-        serving._process_messages = Mock(side_effect=fake_process)
+        serving._process_messages = AsyncMock(side_effect=fake_process)
         request = ResponsesRequest(
             model="x",
             input="call the tool",
@@ -307,7 +307,7 @@ class MultimodalRequestTestCase(unittest.TestCase):
         serving = make_serving(is_multimodal=True)
         captured = {}
 
-        serving._process_messages = Mock(
+        serving._process_messages = AsyncMock(
             return_value=MessageProcessingResult(
                 prompt="rendered multimodal prompt",
                 prompt_ids=[9, 9, 9],
