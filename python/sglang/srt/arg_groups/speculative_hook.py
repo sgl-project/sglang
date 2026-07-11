@@ -400,6 +400,11 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         ) = _auto_choose_speculative_params(server_args, model_arch)
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
+        # Target verify remains chain-only for trtllm_mha. Draft-only
+        # trtllm_mha with topk>1 (e.g. Frozen-KV MTP expanding B*topk) is
+        # allowed when the target backend is not trtllm_mha.
+        # Gemma4 headDim=512 target verify with num_draft_tokens in [5, 16]
+        # requires flashinfer >= 0.6.14 (flashinfer-ai/flashinfer#3393).
         if server_args.speculative_eagle_topk > 1:
             raise ValueError(
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
