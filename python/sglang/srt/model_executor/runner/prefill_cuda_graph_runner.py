@@ -109,6 +109,33 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Find the module that owns decoder layers behind language/model wrappers."""
+    layer_model = getattr(model, "language_model", model)
+    seen = set()
+    while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+        obj_id = id(layer_model)
+        if obj_id in seen:
+            break
+        seen.add(obj_id)
+        layer_model = layer_model.model
+
+    if not hasattr(layer_model, "layers"):
+        raise RuntimeError(
+            f"could not resolve inner layer_model on {type(model).__name__}; "
+            f"resolved to {type(layer_model).__name__} without layers."
+        )
+    return layer_model
+
+
+def _prefill_input_embeds_slot(
+    registry: CudaGraphBufferRegistry, bs: int, num_tokens: int
+) -> Optional[torch.Tensor]:
+    if not registry.has_slot("input_embeds"):
+        return None
+    return registry.get_slot("input_embeds").slice_for(bs, num_tokens)
+
+
 def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
     numbered suggestion list. The runner is only constructed for BREAKABLE
@@ -328,21 +355,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
         if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
-            language_model = getattr(
-                self.model_runner.model, "language_model", self.model_runner.model
-            )
-            if hasattr(language_model, "model") and hasattr(
-                language_model.model, "layers"
-            ):
-                self.layer_model = language_model.model
-            elif hasattr(language_model, "layers"):
-                self.layer_model = language_model
-            else:
-                raise RuntimeError(
-                    f"{type(self.backend).__name__} could not resolve inner "
-                    f"layer_model on {type(language_model).__name__}; "
-                    f"this backend is unsupported for this model architecture."
+            try:
+                self.layer_model = _resolve_transformer_layer_model(
+                    self.model_runner.model
                 )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{type(self.backend).__name__} {exc} This backend is "
+                    f"unsupported for this model architecture."
+                ) from exc
             params = list(inspect.signature(self.layer_model.forward).parameters)
             self._input_embeds_arg_idx = (
                 params.index("input_embeds") if "input_embeds" in params else None
@@ -688,18 +709,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                # BCG's graph is text-only, so it forces input_embeds=None;
-                # tc_piecewise keeps the slot so multimodal prefill keeps its
-                # image embeds (else NaN logits).
-                input_embeds=(
-                    None
-                    if self.prefill_backend_name == Backend.BREAKABLE
-                    else (
-                        _slot("input_embeds")
-                        if registry.has_slot("input_embeds")
-                        else None
-                    )
-                ),
+                # Multimodal BCG must capture the input_embeds path so replay
+                # can feed live text+vision/audio embeds through the stable slot.
+                input_embeds=_prefill_input_embeds_slot(registry, bs, num_tokens),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=self._next_token_logits_buffer(bs),
@@ -867,14 +879,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
-        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
-        # logits).
-        input_embeds = (
-            None
-            if self.prefill_backend_name == Backend.BREAKABLE
-            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
-        )
+        # Multimodal BCG captures the input_embeds branch, so replay must expose
+        # the same stable slot for general_mm_embed_routine to populate.
+        input_embeds = _prefill_input_embeds_slot(registry, bs, static_num_tokens)
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
         mrope_positions = (

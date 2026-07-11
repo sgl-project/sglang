@@ -308,6 +308,14 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     return model.model
 
 
+def _has_resolvable_language_model(model: nn.Module) -> bool:
+    return (
+        hasattr(model, "model")
+        or hasattr(model, "language_model")
+        or model.__class__.__name__ == "Qwen3OmniMoeForConditionalGeneration"
+    )
+
+
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
 
@@ -940,11 +948,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # batch.
         self.eager_runner = EagerRunner(self)
 
-        # cuda-graph capture: prefill before decode, so both coalesce onto the
-        # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
-        # to the eager runner when the prefill graph is disabled.)
-        self.init_prefill_cuda_graph()
-
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
 
@@ -958,6 +961,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.init_decode_cuda_graph()
         else:
             self.decode_cuda_graph_runner = self.eager_runner
+
+        # Capture prefill after decode. Both still coalesce onto the eager
+        # buffer allocated above, while decode-side graph initialization cannot
+        # invalidate already-captured prefill BCG state.
+        self.init_prefill_cuda_graph()
 
         # Register forward hooks AFTER cuda-graph capture so their tensor ops are
         # not traced into any captured graph — capture stays hook-free and hooks
@@ -2700,8 +2708,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
-        # Disable prefill CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
+        # Disable prefill CUDA graph for non-language models. Some multimodal
+        # wrappers (e.g. Qwen3-ASR) expose the text model as ``language_model``
+        # and only get ``.model`` normalized below.
+        if not _has_resolvable_language_model(self.model):
             logger.warning(
                 "Disable prefill CUDA graph because the model is not a language model"
             )
