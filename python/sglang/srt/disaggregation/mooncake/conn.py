@@ -1117,6 +1117,41 @@ class MooncakeKVManager(CommonKVManager):
                 )
         return rc
 
+    def _send_last_chunk_extras(
+        self,
+        req: TransferInfo,
+        kv_chunk: TransferKVChunk,
+        skip_state: bool,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+    ) -> int:
+        """Transfer trailing state then aux metadata for the final chunk.
+
+        Returns 0 only when every required state component and the aux
+        transfer succeed. A nonzero state status short-circuits the aux
+        transfer so that a successful aux transfer cannot report overall
+        success while state pages are stale or partially written.
+        """
+        state_ret = 0
+        if kv_chunk.state_indices and not skip_state:
+            state_ret = self.maybe_send_extra(
+                req,
+                kv_chunk.state_indices,
+                executor,
+                target_rank_registration_info,
+            )
+        if state_ret != 0:
+            logger.error(
+                f"State transfer failed for bootstrap_room {kv_chunk.room} "
+                f"with status {state_ret}; skipping aux transfer."
+            )
+            return state_ret
+        return self.send_aux(
+            req,
+            kv_chunk.prefill_aux_index,
+            target_rank_registration_info.dst_aux_ptrs,
+        )
+
     def _send_mamba_state(
         self,
         req: TransferInfo,
@@ -1406,19 +1441,14 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
-                                self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
-
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
+                            # Success requires both state and aux transfers so
+                            # a good aux cannot mask a failed state transfer.
+                            ret = self._send_last_chunk_extras(
                                 req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
+                                kv_chunk,
+                                skip_state,
+                                executor,
+                                target_rank_registration_info,
                             )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
