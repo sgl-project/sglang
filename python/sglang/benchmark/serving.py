@@ -136,7 +136,12 @@ def get_request_headers() -> Dict[str, str]:
 
 
 def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
-    return (message.get("reasoning_content") or "") + (message.get("content") or "")
+    # Most OpenAI-compatible servers use ``reasoning_content``. vLLM's Kimi
+    # parser instead streams its reasoning in ``reasoning``. Prefer the
+    # standard field when both are present to avoid counting the same tokens
+    # twice on servers that expose aliases.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    return reasoning + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
