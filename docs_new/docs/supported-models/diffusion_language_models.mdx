@@ -5,7 +5,7 @@ Diffusion language models have shown promise for non-autoregressive text generat
 
 ## Example Launch Command
 
-SGLang supports different DLLM algorithms such as `LowConfidence` and `JointThreshold`.
+SGLang supports different DLLM algorithms such as `LowConfidence`, `JointThreshold`, and `EBSampling`.
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -50,6 +50,21 @@ max_post_edit_steps: 16
 # 2-gram repetition penalty (default 0).
 # An empirical value of 3 is often sufficient to mitigate most repetitions.
 penalty_lambda: 0
+```
+
+EBSampling Config:
+
+```yaml Config
+# Entropy budget for revealing masked tokens within a block each step.
+# The single lowest-entropy token is always revealed. Additional tokens are
+# revealed while the running (cumulative) entropy prefix stays within gamma.
+# - Higher values: reveal more tokens per step, faster but potentially lower quality
+# - Lower values: reveal fewer tokens per step, slower but higher quality
+# Range: >= 0.0
+gamma: 0.15
+
+# Default: 32, for LLaDA2MoeModelLM
+block_size: 32
 ```
 
 ## Example Client Code Snippet
@@ -133,6 +148,11 @@ Below the supported models are summarized in a table.
       <td><strong>DiffusionGemma</strong></td>
       <td><code>google/diffusiongemma-26B-A4B-it</code></td>
       <td>Uniform-state (renoising) block-diffusion multimodal (text + image) MoE, 25.2B total / 3.8B active, served with the <code>Gemma4Renoise</code> sampler.</td>
+    </tr>
+    <tr>
+      <td><strong>GFusion</strong></td>
+      <td><code>ai-sage/GFusion-10B-A1.8B</code></td>
+      <td>MLA-based (DeepSeek-V3-style) MoE diffusion language model, 10B total / 1.8B active. Requires the <code>fa3</code> or <code>triton</code> attention backend.
     </tr>
   </tbody>
 </table>
