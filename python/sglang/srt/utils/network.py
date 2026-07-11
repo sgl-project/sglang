@@ -185,6 +185,27 @@ def get_free_port():
     return port
 
 
+def get_free_port_block(num_ports: int, max_attempts: int = 20) -> int:
+    """Return a base port P such that ports P..P+num_ports-1 are all free.
+
+    The base is seeded from an OS-assigned ephemeral port so concurrent
+    callers (e.g. sibling launch_server.py processes sharing a launch
+    cmdline) get distinct blocks instead of colliding on a deterministically
+    derived port.
+    """
+    if num_ports < 1:
+        raise ValueError(f"num_ports must be >= 1, got {num_ports}")
+    for _ in range(max_attempts):
+        base = get_free_port()
+        if base + num_ports - 1 > MAX_VALID_PORT:
+            continue
+        if all(is_port_available(base + offset) for offset in range(1, num_ports)):
+            return base
+    raise OSError(
+        f"Could not find {num_ports} consecutive free ports in {max_attempts} attempts"
+    )
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     return try_bind_socket(port=port, listen=True)

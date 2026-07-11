@@ -7,6 +7,7 @@ from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
+    get_free_port_block,
     get_open_port,
     is_port_available,
     try_bind_socket,
@@ -152,6 +153,49 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+
+class TestGetFreePortBlock(CustomTestCase):
+    def test_returns_consecutive_free_block(self):
+        """get_free_port_block should return a base whose whole span is free."""
+        num_ports = 7
+        base = get_free_port_block(num_ports)
+        self.assertGreater(base, 0)
+        self.assertLessEqual(base + num_ports - 1, 65535)
+        for offset in range(num_ports):
+            self.assertTrue(is_port_available(base + offset))
+
+    def test_block_avoids_held_ports(self):
+        """A held block is skipped, so concurrent callers get distinct blocks."""
+        base1 = get_free_port_block(7)
+        held = [bind_port(base1 + offset) for offset in range(7)]
+        try:
+            base2 = get_free_port_block(7)
+            block1 = set(range(base1, base1 + 7))
+            block2 = set(range(base2, base2 + 7))
+            self.assertEqual(block1 & block2, set())
+        finally:
+            for sock in held:
+                sock.close()
+
+    def test_block_of_one(self):
+        """A block of size 1 should behave like get_free_port."""
+        base = get_free_port_block(1)
+        self.assertTrue(is_port_available(base))
+
+    def test_invalid_count_raises(self):
+        """get_free_port_block should reject counts below 1."""
+        with self.assertRaises(ValueError):
+            get_free_port_block(0)
+
+    def test_exhausted_attempts_raise(self):
+        """get_free_port_block should raise if no block is ever free."""
+        with patch(
+            "sglang.srt.utils.network.is_port_available",
+            return_value=False,
+        ):
+            with self.assertRaises(OSError):
+                get_free_port_block(2, max_attempts=3)
 
 
 class TestReservePort(CustomTestCase):
