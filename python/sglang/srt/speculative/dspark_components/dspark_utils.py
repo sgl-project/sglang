@@ -10,33 +10,6 @@ DEFAULT_DSPARK_GAMMA = 7
 SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 
 
-class DSparkLengthContract(msgspec.Struct, frozen=True):
-
-    gamma: int
-
-    @property
-    def num_draft_positions(self) -> int:
-        return int(self.gamma)
-
-    @property
-    def verify_num_draft_tokens(self) -> int:
-        return int(self.gamma) + 1
-
-    @property
-    def speculative_num_draft_tokens(self) -> int:
-        return self.verify_num_draft_tokens
-
-    def validate(self) -> None:
-        if int(self.gamma) < 1:
-            raise ValueError(f"DSpark gamma must be >= 1, got {self.gamma}.")
-
-
-def make_dspark_length_contract(*, gamma: int) -> DSparkLengthContract:
-    contract = DSparkLengthContract(gamma=int(gamma))
-    contract.validate()
-    return contract
-
-
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     gamma = int(num_draft_tokens) - 1
     if gamma < 1:
