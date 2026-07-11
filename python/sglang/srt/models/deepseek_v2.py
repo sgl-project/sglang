@@ -74,7 +74,6 @@ from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
-from sglang.srt.layers.dcp import dcp_enabled, get_attention_dcp_world_size
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -182,7 +181,12 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
@@ -292,8 +296,6 @@ class DeepseekV2MLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
@@ -321,10 +323,7 @@ class DeepseekV2MLP(nn.Module):
                 self.down_proj.input_scale_inv,
                 enable_pdl=True,
             )
-            out, _ = self.down_proj(
-                (out_fp4, out_scale),
-                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-            )
+            out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
         if (
@@ -426,10 +425,7 @@ class DeepseekV2MLP(nn.Module):
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -857,8 +853,6 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
@@ -880,8 +874,6 @@ class DeepseekV2MoE(nn.Module):
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
                 )
             elif (
                 self.alt_stream is not None
@@ -897,8 +889,6 @@ class DeepseekV2MoE(nn.Module):
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
@@ -906,8 +896,6 @@ class DeepseekV2MoE(nn.Module):
             else:
                 return self.forward_normal(
                     hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
@@ -921,31 +909,27 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
-        *,
-        use_flashinfer_trtllm_bypass: bool = False,
     ) -> torch.Tensor:
-        # Note(kpham-sgl): launch the shared expert BEFORE the routed call.
-        # The routed deep_gemm pre-permute calls `dispose_tensor` which
-        # `set_()`s `hidden_states` to empty (host-side); any later kernel
-        # launch consuming `hidden_states` then captures `data_ptr() == 0`
-        # into the decode CUDA graph and replays from null.
+        # Note(kpham-sgl): issue order satisfies 3 constraints:
+        # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
+        # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
+        # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
+        #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
+        use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        has_shared_output = (
+            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
+        )
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb
+            if server_args.enable_eplb and not self.is_nextn
             else None
         )
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         if use_flashinfer_trtllm_bypass:
@@ -967,7 +951,7 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         deferred_finalize = (
-            shared_output is not None
+            has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
@@ -987,6 +971,12 @@ class DeepseekV2MoE(nn.Module):
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
+
+        # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -1009,8 +999,6 @@ class DeepseekV2MoE(nn.Module):
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
@@ -1022,8 +1010,6 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
@@ -1032,11 +1018,11 @@ class DeepseekV2MoE(nn.Module):
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, should_allreduce_fusion)
+            return self.forward_cpu(hidden_states)
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb
+            if server_args.enable_eplb and not self.is_nextn
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
@@ -1135,8 +1121,6 @@ class DeepseekV2MoE(nn.Module):
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
@@ -1148,7 +1132,6 @@ class DeepseekV2MoE(nn.Module):
     def forward_cpu(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -1197,7 +1180,7 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not should_allreduce_fusion:
+        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1237,8 +1220,12 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    )
+                    if not self.is_nextn
+                    else None
                 ),
                 **topk_kwargs,
             )
@@ -1471,8 +1458,12 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
+                    expert_location_dispatch_info=(
+                        ExpertLocationDispatchInfo.init_new(
+                            layer_id=self.layer_id,
+                        )
+                        if not self.is_nextn
+                        else None
                     ),
                     **topk_kwargs,
                 )
@@ -1732,9 +1723,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if dcp_enabled():
+        if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_attention_dcp_world_size(),
+                self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
@@ -2246,14 +2237,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
@@ -2271,22 +2262,24 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with _mlp_ctx:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-                gemm_output_zero_allocator,
-            )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            with _mlp_ctx:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    gemm_output_zero_allocator,
+                )
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
-            and should_allreduce_fusion
+            and fuse_mlp_allreduce
         ):
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_allreduce_fusion:
+        if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -2983,8 +2976,6 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 def dsv2_flashinfer_moe_dual_stream_graph(
     hidden_states: torch.Tensor,
     layer_id: int,
-    should_allreduce_fusion: bool,
-    use_reduce_scatter: bool,
 ) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
     assert forward_context is not None
@@ -2992,12 +2983,8 @@ def dsv2_flashinfer_moe_dual_stream_graph(
 
     moe_fusion = forward_context.moe_fusions[layer_id]
     assert moe_fusion is not None
-    return moe_fusion.forward_normal_dual_stream(
-        hidden_states,
-        should_allreduce_fusion=should_allreduce_fusion,
-        use_reduce_scatter=use_reduce_scatter,
-        use_flashinfer_trtllm_bypass=True,
-    )
+    with get_forward().scoped(flashinfer_trtllm_bypass=True):
+        return moe_fusion.forward_normal_dual_stream(hidden_states)
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

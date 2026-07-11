@@ -292,6 +292,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -736,6 +737,19 @@ class ServerArgs:
         int,
         "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
     ] = 10
+    retraction_policy: A[
+        str,
+        Arg(
+            help=(
+                "The decode retraction policy to use when the KV cache is full. "
+                "'length' preserves the existing behavior and retracts short-output, "
+                "long-input requests first. 'priority' retracts lower-priority "
+                "requests first, using the same priority direction as priority "
+                "scheduling."
+            ),
+            choices=RETRACTION_POLICY_CHOICES,
+        ),
+    ] = "length"
     schedule_conservativeness: A[
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
@@ -2011,7 +2025,7 @@ class ServerArgs:
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend.",
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
@@ -2335,6 +2349,13 @@ class ServerArgs:
         Optional[str],
         "The diffusion LLM algorithm configurations. Must be a YAML file.",
     ] = None
+    dllm_fdfo: A[
+        bool,
+        Arg(
+            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM inference. Enabled by default; use --no-dllm-fdfo to fall back to synchronous block scheduling.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -5653,26 +5674,6 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: HiCache is not yet supported with the DeepSeek-V4 hip unified_kv
-        # layout, so fall back to the default tilelang FlashMLA backend.
-        self._resolve_unified_kv_hicache_compatibility()
-
-    def _resolve_unified_kv_hicache_compatibility(self):
-        # The DeepSeek-V4 unified_kv layout (SGLANG_HACK_FLASHMLA_BACKEND=
-        # unified_kv_triton) keeps swa/c4/c128 in a single per-layer buffer and
-        # has no HiCache host-pool support yet, so reset the backend to the
-        # default (tilelang) so the server still starts.
-        if not self.enable_hierarchical_cache:
-            return
-
-        if envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton":
-            envs.SGLANG_HACK_FLASHMLA_BACKEND.set("tilelang")
-            logger.warning(
-                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton is not yet "
-                "compatible with --enable-hierarchical-cache; falling back to "
-                "SGLANG_HACK_FLASHMLA_BACKEND=tilelang."
-            )
-
     def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -6690,6 +6691,11 @@ class ServerArgs:
         ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
+    def get_tokenizer_worker_class(self):
+        from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+
+        return TokenizerWorker
+
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
@@ -7019,6 +7025,10 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
+        if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
+            raise ValueError(
+                "--retraction-policy priority requires --enable-priority-scheduling"
+            )
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:

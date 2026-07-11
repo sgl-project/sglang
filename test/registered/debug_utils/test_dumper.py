@@ -1127,6 +1127,96 @@ class TestDumpModel:
         assert all("grad" in f for f in filenames)
 
 
+class TestDumpModelGradInjection:
+    def test_get_grad_overrides_param_grad(self, tmp_path):
+        """dump_model dumps the tensor returned by get_grad instead of param.grad."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        y = model(torch.ones(1, 4)).sum()
+        y.backward()
+        injected = torch.full_like(model.weight, 7.0)
+
+        d.dump_model(model, name_prefix="p", get_grad=lambda param: injected)
+
+        path = _find_dump_file(tmp_path, name="grad__p__weight")
+        assert torch.equal(_load_dump(path)["value"], injected)
+
+    def test_get_grad_reads_custom_grad_storage(self, tmp_path):
+        """get_grad lets callers surface grads living outside param.grad (e.g. main_grad)."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        assert model.weight.grad is None
+        model.weight.main_grad = torch.full_like(model.weight, 3.0)
+
+        d.dump_model(
+            model,
+            name_prefix="p",
+            get_grad=lambda param: getattr(param, "main_grad", None),
+        )
+
+        path = _find_dump_file(tmp_path, name="grad__p__weight")
+        assert torch.equal(_load_dump(path)["value"], model.weight.main_grad)
+
+    def test_get_grad_returning_none_skips_grad_dump(self, tmp_path):
+        """A get_grad returning None suppresses the grad dump for that param."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        y = model(torch.ones(1, 4)).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="p", get_grad=lambda param: None)
+
+        assert len(_get_filenames(tmp_path)) == 0
+
+    def test_default_uses_param_grad_without_main_grad_fallback(self, tmp_path):
+        """Without get_grad, only param.grad is dumped; a main_grad attribute is ignored."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        assert model.weight.grad is None
+        model.weight.main_grad = torch.full_like(model.weight, 3.0)
+
+        d.dump_model(model, name_prefix="p")
+
+        assert len(_get_filenames(tmp_path)) == 0
+
+
+class TestDumpModelStepOverride:
+    def test_step_override_in_filenames(self, tmp_path):
+        """An explicit step overrides the dumper's ambient step for value and grad files."""
+        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=True)
+        d._state.step = 3
+        model = torch.nn.Linear(4, 2, bias=False)
+        y = model(torch.ones(1, 4)).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="p", step=7)
+
+        filenames = _get_filenames(tmp_path)
+        assert len(filenames) == 2
+        assert all("step=7" in f for f in filenames)
+
+    def test_step_none_uses_ambient_step(self, tmp_path):
+        """Without an explicit step, dump_model records the dumper's current step."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
+        d._state.step = 3
+        model = torch.nn.Linear(4, 2, bias=False)
+
+        d.dump_model(model, name_prefix="p")
+
+        filenames = _get_filenames(tmp_path)
+        assert filenames and all("step=3" in f for f in filenames)
+
+
 class TestParallelRankInFilename:
     def test_config_default_false(self):
         """include_parallel_rank_in_filename defaults to False."""

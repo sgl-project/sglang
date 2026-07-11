@@ -97,10 +97,6 @@ sgl-eval run aime25 \\
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
-    // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
-    "b200|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "b300|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "gb300|nvfp4": "lmsysorg/sglang:dev-glm52-nvfp4",
   },
 
   github: {
@@ -668,7 +664,6 @@ sgl-eval run aime25 \\
     // high-throughput add DP-Attention (dp8). low-latency uses MTP 5-1-6, balanced MTP 2-1-3.
     // GB300: 4-GPU single node, TP4 (the node fits the ~381 GB build); GB300 adds dp4 on
     // balanced & high-throughput; low-latency uses MTP 5-1-6.
-    // Blackwell NVFP4 measured on the dev-glm52-nvfp4 preview image.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -743,6 +738,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -805,6 +805,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
