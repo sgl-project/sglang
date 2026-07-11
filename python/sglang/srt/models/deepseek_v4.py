@@ -122,7 +122,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -134,7 +134,6 @@ if _is_xpu:
 else:
     from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
 
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -1640,7 +1639,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
         # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
-        # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
+        # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
         _use_reduce_scatterv = (
             _use_tp_moe_gather
@@ -1664,6 +1663,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
+        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
@@ -1703,17 +1703,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-            # Skip the MoE-internal post-experts all_reduce when we will do the
-            # reduce via reduce_scatterv/reduce_scatter at the combine below
-            # (else double-reduce).
-            use_reduce_scatter=_use_cp or _use_reduce_scatterv or _use_reduce_scatter,
-            skip_shared_experts=_do_shared_local,
-        )
+        # Skip the MoE-internal post-experts all_reduce when we will do the
+        # reduce via reduce_scatterv/reduce_scatter at the combine below
+        # (else double-reduce).
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=_do_shared_local,
+            )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -1724,7 +1724,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
-                # MoE-internal all_reduce was skipped (use_reduce_scatter above).
+                # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
                 # This is the symmetric inverse of the all_gatherv gather.
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
@@ -1736,7 +1736,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # expert outputs AND scatter each rank its own (MAX_LEN-padded)
                 # token chunk in one op (symmetric inverse of the MAX_LEN
                 # all_gather). Correct because the MoE-internal all_reduce was
-                # skipped (use_reduce_scatter above). dp_reduce_scatter_tensor
+                # skipped (mlp_reduce_scatter above). dp_reduce_scatter_tensor
                 # routes to the equal-chunk reduce_scatter_tensor here (its
                 # variable-length reduce_scatterv branch is gated by
                 # is_dp_gatherv_active(), which is False under MAX_LEN), which in
@@ -1921,19 +1921,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.pop("gather_keepalive")
 
     def op_moe(self, state):
-        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. use_reduce_scatter
+        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. mlp_reduce_scatter
         # skips the MoE-internal all_reduce (we reduce_scatterv in op_combine).
         fb = state.forward_batch
         global_hidden = state.pop("global_hidden")
         global_ids = fb._tbo_global_input_ids
-        state.global_expert_out = self.mlp(
-            global_hidden,
-            fb,
-            use_reduce_scatter=True,
-            input_ids=global_ids,
-            input_ids_global=global_ids,
-            skip_shared_experts=state.do_shared_local,
-        )
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            state.global_expert_out = self.mlp(
+                global_hidden,
+                fb,
+                input_ids=global_ids,
+                input_ids_global=global_ids,
+                skip_shared_experts=state.do_shared_local,
+            )
 
     def op_combine_a(self, state):
         # Launch reduce_scatterv (global partial expert sums -> per-rank local) on

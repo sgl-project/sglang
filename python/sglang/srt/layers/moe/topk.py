@@ -174,10 +174,10 @@ if _is_cuda:
         fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import topk_softmax
+    from sglang.kernels.ops.moe import topk_softmax
 
     try:
-        from sgl_kernel import topk_sigmoid
+        from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
     except ImportError:
         pass
 if _use_aiter:
@@ -757,6 +757,9 @@ def fused_topk(
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
     scoring_func: str = "softmax",
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_fused_shared_experts: int = 0,
     packed_out: Optional[torch.Tensor] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
@@ -834,6 +837,10 @@ def fused_topk(
                 topk_group=1,
                 need_renorm=renormalize,
             )
+            if apply_routed_scaling_factor_on_output:
+                topk_weights *= (
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                )
         elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
             # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
             from sglang.jit_kernel.moe_fused_gate import (
@@ -855,14 +862,30 @@ def fused_topk(
                 topk,
                 scoring_func="sigmoid",
                 renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
+            if num_fused_shared_experts > 1:
+                raise ValueError(
+                    "sigmoid topk supports at most one fused shared expert"
+                )
+            scale = (
+                routed_scaling_factor
+                if (
+                    apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor is not None
+                )
+                else 1.0
+            )
             topk_sigmoid(
                 topk_weights,
                 topk_ids,
                 gating_output,
                 renormalize,
                 correction_bias,
+                scale,
+                num_fused_shared_experts,
             )
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
@@ -882,10 +905,17 @@ def grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    scoring_func: str = "softmax",
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = torch.softmax(gating_output, dim=-1)
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     group_scores = (
@@ -2010,6 +2040,7 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                scoring_func=scoring_func,
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -2039,14 +2070,16 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        if scoring_func != "sqrtsoftplus":
+        if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        if scoring_func == "sqrtsoftplus":
+        # Keep sigmoid flag-off byte-identical: only use the JIT gate when the flag is on.
+        use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+        if scoring_func == "sqrtsoftplus" or (
+            scoring_func == "sigmoid" and use_jit_fused_gate
+        ):
             _biased_topk = (
-                biased_topk_jit_kernel_impl
-                if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
-                else biased_topk_impl
+                biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
             )
 
             topk_weights, topk_ids = _biased_topk(
@@ -2119,13 +2152,15 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                num_fused_shared_experts=num_fused_shared_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 **_fused_topk_kwargs,
             )
     else:
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in custom_routing_function"
-        assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,

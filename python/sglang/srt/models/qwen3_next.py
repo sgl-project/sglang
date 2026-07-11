@@ -47,7 +47,12 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -472,30 +477,28 @@ def _apply_qwen3_next_mlp(
     hidden_states, residual = layer.layer_communicator.prepare_mlp(
         hidden_states, residual, forward_batch
     )
-    use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+    mlp_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
         forward_batch
     )
-    should_allreduce_fusion = (
+    fuse_mlp_allreduce = (
         layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
             forward_batch
         )
     )
 
-    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-        hidden_states = layer.mlp(
-            hidden_states,
-            forward_batch=forward_batch,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        )
-    else:
-        hidden_states = layer.mlp(
-            hidden_states,
-            should_allreduce_fusion=should_allreduce_fusion,
-            use_reduce_scatter=use_reduce_scatter,
-        )
+    with get_forward().scoped(
+        fuse_mlp_allreduce=fuse_mlp_allreduce,
+        mlp_reduce_scatter=mlp_reduce_scatter,
+    ):
+        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+            hidden_states = layer.mlp(
+                hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            hidden_states = layer.mlp(hidden_states)
 
-    if should_allreduce_fusion:
+    if fuse_mlp_allreduce:
         hidden_states._sglang_needs_allreduce_fusion = True
     else:
         hidden_states, residual = layer.layer_communicator.postprocess_layer(
