@@ -30,6 +30,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    PI05_ACTION_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
@@ -100,6 +101,16 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "pi05_action_http",
+        DiffusionServerArgs(
+            model_path="lerobot/pi05_base",
+        ),
+        PI05_ACTION_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
@@ -947,9 +958,13 @@ PARAMETRIZED_CASE_GROUPS = {
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
     ],
+    "bcg-diffusion": [],
 }
 
 STANDALONE_FILES = {
+    "bcg-diffusion": [
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
+    ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_update_weights_from_disk.py",
@@ -964,6 +979,9 @@ STANDALONE_FILES = {
 # CI will use a fallback estimate for sharding, run the test, then print a
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 STANDALONE_FILE_EST_TIMES = {
+    "bcg-diffusion": {
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 300.0,
+    },
     "1-gpu": {
         "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
@@ -985,7 +1003,7 @@ SUITES = {
     },
 }
 
-STRICT_SUITES = {"unit"}
+STRICT_SUITES = {"unit", "bcg-diffusion"}
 COMPONENT_ACCURACY_SUITES = {
     "component-accuracy",
     "component-accuracy-1-gpu",

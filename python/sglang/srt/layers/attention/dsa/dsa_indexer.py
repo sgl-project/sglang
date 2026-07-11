@@ -8,12 +8,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
-from sglang.jit_kernel.dsa import (
-    aiter_paged_mqa_logits,
-    cutedsl_paged_mqa_logits,
-    deepgemm_paged_mqa_logits_native,
-    deepgemm_paged_mqa_logits_split,
-)
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -64,11 +58,25 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-if not _is_hip:
-    # Preserve the original eager import behavior on non-ROCm platforms.
+
+if not _is_npu:
+    from sglang.jit_kernel.dsa import (
+        aiter_paged_mqa_logits,
+        cutedsl_paged_mqa_logits,
+        deepgemm_paged_mqa_logits_native,
+        deepgemm_paged_mqa_logits_split,
+    )
+else:
+    aiter_paged_mqa_logits = None
+    cutedsl_paged_mqa_logits = None
+    deepgemm_paged_mqa_logits_native = None
+    deepgemm_paged_mqa_logits_split = None
+
+if _is_cuda:
     from sglang.jit_kernel.dsa import pick_dsl_expand
 else:
     pick_dsl_expand = None
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -921,7 +929,7 @@ class Indexer(MultiPlatformOp):
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
         ):
-            assert pick_dsl_expand is not None, "Not supported on AMD/ROCm. "
+            assert pick_dsl_expand is not None, "CuTe DSL paged MQA is CUDA-only."
             dsl_expand_factor, dsl_atom = pick_dsl_expand(
                 next_n,
                 batch_size=B,
