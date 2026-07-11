@@ -2414,6 +2414,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
+            is_last_prefill_chunk = req.extend_range.end == len(
+                req.full_untruncated_fill_ids
+            )
+            if (
+                is_last_prefill_chunk
+                and req.extend_range.length % mamba_cache_chunk_size == 0
+                and req.extend_range.length > mamba_cache_chunk_size
+            ):
+                # Prefix matching looks up at most page_aligned(input_len - 1),
+                # so a final snapshot at the exact end position can never be
+                # matched by a later request; track one chunk earlier instead.
+                mamba_track_seqlen_aligned -= mamba_cache_chunk_size
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
