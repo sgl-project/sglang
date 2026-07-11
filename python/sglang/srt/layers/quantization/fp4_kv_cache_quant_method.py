@@ -16,6 +16,20 @@ KV cache quantization strategy pattern.
 
 Three-player design:
   quant_method (pure compute)  ►  Pool (buffer + batch dequant)  ►  Backend (view adaptation)
+
+Why do we need attention access rules?
+- Problem: torch.float4_e2m1fn_x2 only describes packed FP4 storage. It does
+  not say whether the recipe is NVFP4 or fp4_mx_block16, nor how scales are
+  interpreted.
+- Problem: prefill and decode may use different KV views for the same recipe.
+  For example, NVFP4 uses a FlashInfer dequant workspace for prefill, but TRTLLM
+  MHA consumes native packed FP4 plus scales for decode.
+- Problem: putting these recipe/backend combinations directly into each backend
+  as dtype checks makes unsupported paths hard to spot and future recipes hard
+  to add safely.
+- Approach: each KV cache quant method declares KVCacheAttentionAccess entries.
+  A backend resolves one entry by (phase, backend_name, tags), then either uses
+  the declared access pattern or fails fast if that combination is unsupported.
 """
 
 from abc import ABC, abstractmethod
@@ -38,7 +52,8 @@ class KVCacheAttentionPhase(str, Enum):
 class KVCacheAttentionAccessKind(str, Enum):
     # KV cache is already in the dtype/layout expected by the attention backend.
     PLAIN = "plain"
-    # KV cache is stored quantized, then dequantized into a temporary workspace.
+    # KV cache is stored quantized, then dequantized and decompressed into a
+    # temporary workspace before attention.
     DEQUANT_WORKSPACE = "dequant_workspace"
     # Attention backend directly consumes FP4 KV cache storage and scales.
     NATIVE_FP4 = "native_fp4"
@@ -61,6 +76,22 @@ class KVCacheBackendMatcher:
 
 @dataclass(frozen=True)
 class KVCacheAttentionAccess:
+    """Describes how one attention backend reads KV cache for one phase.
+
+    Fields:
+    - phase: prefill or decode stage where this rule applies.
+    - kind: access mode, such as plain KV, dequant workspace, or native FP4.
+    - backend_matcher: backend names/tags that select this rule, e.g.
+      exact={"trtllm_mha"} or a FlashInfer dequant-workspace tag.
+    - storage_dtype: dtype stored in the KV pool, e.g. torch.float4_e2m1fn_x2.
+    - attention_kv_dtype: dtype consumed by attention after any conversion, e.g.
+      FP8 workspace for FlashInfer prefill or packed FP4 for TRTLLM decode.
+    - scale_recipe: scale semantics for this FP4 recipe, e.g. "nvfp4" or
+      "fp4_mx_block16".
+    - workspace_dtype: temporary workspace dtype for dequant/decompress paths;
+      None means no temporary workspace is needed.
+    """
+
     phase: KVCacheAttentionPhase
     kind: KVCacheAttentionAccessKind
     backend_matcher: KVCacheBackendMatcher
