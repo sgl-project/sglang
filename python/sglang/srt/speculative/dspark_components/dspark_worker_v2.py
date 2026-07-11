@@ -49,6 +49,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
+    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
@@ -710,54 +711,27 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        if folded_accept:
-            accept = epilogue.read_accept(bs)
-            correct_len = accept.correct_len
-            bonus = accept.bonus
-            cap_trim_lens = accept.cap_trim_lens
-            commit_lens = accept.commit_lens
-            new_seq_lens = accept.new_seq_lens
-            out_tokens = accept.out_tokens
-        else:
-            correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-                candidates=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                draft_block=draft_block,
-                sampling_info=sampling_info,
-                draft_input=draft_input,
-                gamma=self.gamma,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                cutoff_layout=layout,
-            )
-            if self._simulate_acc_len > 0:
-                correct_len = self._simulated_correct_len(
-                    bs=bs, dtype=correct_len.dtype, device=correct_len.device
-                )
-
-            finalized = FinalizeAcceptLens.execute(
-                correct_len=correct_len,
-                cap_trim_lens=cap_trim_lens,
-                prefix_lens=prefix_lens,
-            )
-            commit_lens = finalized.commit_lens
-            new_seq_lens = finalized.new_seq_lens
-            cap_trim_lens = finalized.cap_trim_lens
-            out_tokens = BuildOutTokens.execute(
-                draft_tokens=draft_tokens,
-                correct_len=correct_len,
-                bonus=bonus,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                gamma=self.gamma,
-            )
+        accept = self._accept_and_finalize(
+            folded_accept=folded_accept,
+            bs=bs,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=logits_output.next_token_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            layout=layout,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+        )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(
-                    new_seq_lens,
+                    accept.new_seq_lens,
                     confidence=confidence,
                     confidence_seq_lens=prefix_lens,
                 )
             else:
-                on_publish(new_seq_lens)
+                on_publish(accept.new_seq_lens)
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
@@ -767,7 +741,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided=hidden_strided,
                 verify_window=verify_window,
                 logits_output=logits_output,
-                commit_lens=commit_lens,
+                commit_lens=accept.commit_lens,
                 bs=bs,
                 run_compact=run_compact,
             )
@@ -786,10 +760,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             draft_block=draft_block,
             sampling_info=sampling_info,
-            correct_len=correct_len,
-            cap_trim_lens=cap_trim_lens,
-            bonus=bonus,
-            commit_lens=commit_lens,
+            correct_len=accept.correct_len,
+            cap_trim_lens=accept.cap_trim_lens,
+            bonus=accept.bonus,
+            commit_lens=accept.commit_lens,
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
@@ -797,21 +771,81 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         next_draft_input = make_next_draft_input(
-            bonus_tokens=bonus,
-            new_seq_lens=new_seq_lens,
+            bonus_tokens=accept.bonus,
+            new_seq_lens=accept.new_seq_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=out_tokens.reshape(-1),
-            accept_lens=commit_lens,
-            block_accept_lens=commit_lens + cap_trim_lens,
+            next_token_ids=accept.out_tokens.reshape(-1),
+            accept_lens=accept.commit_lens,
+            block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
             ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
-            new_seq_lens=new_seq_lens,
+            new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _accept_and_finalize(
+        self,
+        *,
+        folded_accept: bool,
+        bs: int,
+        verify_ids_2d: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
+        draft_block,
+        sampling_info,
+        draft_input: DFlashDraftInputV2,
+        layout,
+        prefix_lens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ) -> AcceptOuts:
+        """Produce the per-request accept outcome after target verify.
+
+        Folded path: the accept/finalize/out-token kernels already ran inside
+        the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
+        Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
+        override.
+        """
+        if folded_accept:
+            return self._verify_executor.verify_epilogue.read_accept(bs)
+
+        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+            candidates=verify_ids_2d,
+            target_logits=target_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            cutoff_layout=layout,
+        )
+        if self._simulate_acc_len > 0:
+            correct_len = self._simulated_correct_len(
+                bs=bs, dtype=correct_len.dtype, device=correct_len.device
+            )
+
+        finalized = FinalizeAcceptLens.execute(
+            correct_len=correct_len,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=prefix_lens,
+        )
+        out_tokens = BuildOutTokens.execute(
+            draft_tokens=draft_tokens,
+            correct_len=correct_len,
+            bonus=bonus,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            gamma=self.gamma,
+        )
+        return AcceptOuts(
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=finalized.cap_trim_lens,
+            commit_lens=finalized.commit_lens,
+            new_seq_lens=finalized.new_seq_lens,
+            out_tokens=out_tokens,
         )
 
     def _simulated_correct_len(
