@@ -569,6 +569,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if forward_batch.capture_dsa_topk_indices:
+            return False
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
         if forward_batch.input_embeds is not None:

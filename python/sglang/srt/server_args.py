@@ -5118,9 +5118,11 @@ class ServerArgs:
             return
 
         mode = strategy_to_legacy_mode[self.cp_strategy]
-        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
-        ) in ("dsa", "dsv4")
+        use_dsa_legacy_aliases = (
+            self.enable_dsa_prefill_context_parallel
+            or getattr(self._resolved(), "attention_backend", None)
+            in ("dsa", "dsv4")
+        )
         if use_dsa_legacy_aliases:
             self.enable_dsa_prefill_context_parallel = True
             self.enable_prefill_context_parallel = False

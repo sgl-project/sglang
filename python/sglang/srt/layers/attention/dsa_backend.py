@@ -3041,6 +3041,29 @@ class DeepseekSparseAttnMultiStepBackend:
                     precomputed.seqlens_expanded_size,
                 )
 
+                for backend, metadata in (
+                    (self.attn_backends[0], metadata0),
+                    (self.attn_backends[1], metadata1),
+                    (self.attn_backends[2], metadata2),
+                ):
+                    if is_cuda():
+                        seqlens_32_2d = _to_2d_context_lens(
+                            metadata.cache_seqlens_int32, bs
+                        )
+                        backend._refresh_paged_mqa_schedule_metadata(
+                            metadata, seqlens_32_2d
+                        )
+                        backend._refresh_topk_v2_plan(metadata)
+                        if metadata.paged_mqa_ctx_lens_2d is None:
+                            object.__setattr__(
+                                metadata,
+                                "paged_mqa_ctx_lens_2d",
+                                seqlens_32_2d,
+                            )
+                        else:
+                            metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+                    backend.forward_metadata = metadata
+
                 # Copy remaining backends one by one (if > 3 backends)
                 for i in range(3, self.speculative_num_steps - 1):
                     self.attn_backends[

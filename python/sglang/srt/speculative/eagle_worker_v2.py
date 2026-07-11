@@ -517,6 +517,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            can_cuda_graph
+            and not forward_batch.forward_mode.is_idle()
+            and self.index_share_for_mtp_iteration
+            and draft_input.dsa_topk_indices is None
+        ):
+            can_cuda_graph = False
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -646,7 +653,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_dsa_topk_indices = True
-            forward_batch.topk_indices = spec_info.dsa_topk_indices
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -834,7 +840,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         prefill_dsa_topk = None
         if seed_from_extend:
-            prefill_dsa_topk = self.extract_draft_seed_dsa_topk_indices(forward_batch)
+            prefill_dsa_topk = self.extract_draft_seed_dsa_topk_indices(
+                forward_batch,
+                getattr(logits_output, "dsa_topk_indices", None),
+            )
             if prefill_dsa_topk is not None:
                 prefill_dsa_topk = prefill_dsa_topk.clone()
 
@@ -874,9 +883,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if dsa_topk_indices is None or forward_batch.extend_seq_lens is None:
             return None
 
-        last_token_indices = torch.cumsum(
-            forward_batch.extend_seq_lens.to(torch.int64), dim=0
-        ) - 1
+        extend_seq_lens = forward_batch.extend_seq_lens[: forward_batch.batch_size]
+        last_token_indices = torch.cumsum(extend_seq_lens.to(torch.int64), dim=0) - 1
         return dsa_topk_indices.index_select(0, last_token_indices)
 
     def _draft_extend_for_decode(
@@ -967,12 +975,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # seed (select_index already picks the last accepted position per req).
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
-            if can_cuda_graph:
-                dsa_extend_topk_capture = getattr(
-                    draft_logits_output, "dsa_topk_indices", None
-                )
-            else:
-                dsa_extend_topk_capture = forward_batch.topk_indices
+            dsa_extend_topk_capture = getattr(
+                draft_logits_output, "dsa_topk_indices", None
+            )
             if dsa_extend_topk_capture is not None:
                 dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 

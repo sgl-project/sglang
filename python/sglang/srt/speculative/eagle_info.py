@@ -178,6 +178,7 @@ class EagleDraftInput(SpecInput):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -254,6 +255,10 @@ class EagleDraftInput(SpecInput):
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
+            )
+            self.future_dsa_topk_indices_available = (
+                self.future_dsa_topk_indices_available
+                and spec_info.future_dsa_topk_indices_available
             )
             return
 
