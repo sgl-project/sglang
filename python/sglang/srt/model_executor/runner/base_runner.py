@@ -264,9 +264,19 @@ class BaseRunner(ABC):
         Supplied by warmup() (the decode runner's captured buffers when a graph
         runner exists; a freshly-allocated dummy set in the eager path).
         """
+        mr = self.model_runner
+        canary_run_ctx = (
+            c.with_active_single_forward_manager(0)
+            if (c := mr.canary_manager) is not None
+            else empty_context()
+        )
 
         def forward_fn():
-            self._dummy_run(batch_size=batch_size, buffers=buffers)
+            self._dummy_run(
+                batch_size=batch_size,
+                buffers=buffers,
+                run_ctx=canary_run_ctx,
+            )
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 

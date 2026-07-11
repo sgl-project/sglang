@@ -5,6 +5,11 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dflash import (
+    _compute_dflash_accept_bonus_triton_unchecked,
+    _prepare_dflash_draft_block_unchecked,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -38,11 +43,6 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     draft_tp_context,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.speculative.triton_ops.dflash import (
-    _compute_dflash_accept_bonus_triton_unchecked,
-    _prepare_dflash_draft_block_unchecked,
-)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import empty_context
 
@@ -57,7 +57,7 @@ _FusedKVMaterializeHelper = None
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
-        from sglang.srt.speculative.triton_ops.fused_kv_materialize import (
+        from sglang.kernels.ops.speculative.fused_kv_materialize import (
             FusedKVMaterializeHelper,
         )
 
