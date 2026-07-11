@@ -48,17 +48,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
-    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    accept_draft_tokens,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
-    FinalizeAcceptLens,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
-    BuildOutTokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
@@ -227,18 +219,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
 
-        self._verify_executor = TargetVerifyExecutor(
-            target_worker=self.target_worker,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            kv_injector=self._kv_injector,
-            verify_epilogue=self._verify_epilogue,
-        )
-
-        self._forced_budget_frac: Optional[float] = None
-
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
-        self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
@@ -256,6 +237,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._verify_planner.mode_value!r}, simulate_acc_len="
                 f"{self._simulate_acc_len}."
             )
+
+        self._verify_executor = TargetVerifyExecutor(
+            target_worker=self.target_worker,
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            kv_injector=self._kv_injector,
+            verify_epilogue=self._verify_epilogue,
+            simulate_acc_len=self._simulate_acc_len,
+        )
+
+        self._forced_budget_frac: Optional[float] = None
 
         self._observers = DsparkStepObservers(
             planner=self._verify_planner,
@@ -678,7 +671,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        accept = self._accept_and_finalize(
+        accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
             verify_ids_2d=verify_ids_2d,
@@ -754,80 +747,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
-
-    def _accept_and_finalize(
-        self,
-        *,
-        folded_accept: bool,
-        bs: int,
-        verify_ids_2d: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
-        draft_block,
-        sampling_info,
-        draft_input: DFlashDraftInputV2,
-        layout,
-        prefix_lens: torch.Tensor,
-        draft_tokens: torch.Tensor,
-    ) -> AcceptOuts:
-        """Produce the per-request accept outcome after target verify.
-
-        Folded path: the accept/finalize/out-token kernels already ran inside
-        the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
-        Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
-        override.
-        """
-        if folded_accept:
-            return self._verify_executor.verify_epilogue.read_accept(bs)
-
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
-            target_logits=target_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
-        )
-        if self._simulate_acc_len > 0:
-            correct_len = self._simulated_correct_len(
-                bs=bs, dtype=correct_len.dtype, device=correct_len.device
-            )
-
-        finalized = FinalizeAcceptLens.execute(
-            correct_len=correct_len,
-            cap_trim_lens=cap_trim_lens,
-            prefix_lens=prefix_lens,
-        )
-        out_tokens = BuildOutTokens.execute(
-            draft_tokens=draft_tokens,
-            correct_len=correct_len,
-            bonus=bonus,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            gamma=self.gamma,
-        )
-        return AcceptOuts(
-            correct_len=correct_len,
-            bonus=bonus,
-            cap_trim_lens=finalized.cap_trim_lens,
-            commit_lens=finalized.commit_lens,
-            new_seq_lens=finalized.new_seq_lens,
-            out_tokens=out_tokens,
-        )
-
-    def _simulated_correct_len(
-        self, *, bs: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        buf = self._simulated_correct_drafts_buf
-        if buf is None or buf.numel() < bs or buf.dtype != dtype:
-            correct_target = int(
-                round(min(max(self._simulate_acc_len - 1.0, 0.0), float(self.gamma)))
-            )
-            buf = torch.full(
-                (max(bs, 512),), correct_target, dtype=dtype, device=device
-            )
-            self._simulated_correct_drafts_buf = buf
-        return buf[:bs]
 
     def _resolve_verify_token_budget(
         self,

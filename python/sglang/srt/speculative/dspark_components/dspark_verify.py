@@ -22,6 +22,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
+    FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
     accept_greedy_triton,
@@ -48,17 +49,96 @@ class TargetVerifyExecutor:
         self,
         *,
         target_worker,
+        gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
         verify_epilogue=None,
+        simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
+        self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
+        self._simulate_acc_len = float(simulate_acc_len)
+        self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+
+    def accept_and_finalize(
+        self,
+        *,
+        folded_accept: bool,
+        bs: int,
+        verify_ids_2d: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
+        draft_block: DraftBlockResult,
+        sampling_info,
+        draft_input: DFlashDraftInputV2,
+        layout: Optional[RaggedVerifyLayout],
+        prefix_lens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ) -> AcceptOuts:
+        """Produce the per-request accept outcome after target verify.
+
+        Folded path: the accept/finalize/out-token kernels already ran inside
+        the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
+        Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
+        override.
+        """
+        if folded_accept:
+            return self.verify_epilogue.read_accept(bs)
+
+        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+            candidates=verify_ids_2d,
+            target_logits=target_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            cutoff_layout=layout,
+        )
+        if self._simulate_acc_len > 0:
+            correct_len = self._simulated_correct_len(
+                bs=bs, dtype=correct_len.dtype, device=correct_len.device
+            )
+
+        finalized = FinalizeAcceptLens.execute(
+            correct_len=correct_len,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=prefix_lens,
+        )
+        out_tokens = BuildOutTokens.execute(
+            draft_tokens=draft_tokens,
+            correct_len=correct_len,
+            bonus=bonus,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            gamma=self.gamma,
+        )
+        return AcceptOuts(
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=finalized.cap_trim_lens,
+            commit_lens=finalized.commit_lens,
+            new_seq_lens=finalized.new_seq_lens,
+            out_tokens=out_tokens,
+        )
+
+    def _simulated_correct_len(
+        self, *, bs: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        buf = self._simulated_correct_drafts_buf
+        if buf is None or buf.numel() < bs or buf.dtype != dtype:
+            correct_target = int(
+                round(min(max(self._simulate_acc_len - 1.0, 0.0), float(self.gamma)))
+            )
+            buf = torch.full(
+                (max(bs, 512),), correct_target, dtype=dtype, device=device
+            )
+            self._simulated_correct_drafts_buf = buf
+        return buf[:bs]
 
     def run_non_compact(
         self,
