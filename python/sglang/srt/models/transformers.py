@@ -1516,6 +1516,19 @@ class MultiModalMixin:
         ):
             mm_inputs = forward_batch.mm_inputs
             target_device = next(self.model.parameters()).device
+            # 5D features (num_images, num_patches, C, H, W) are collected
+            # separately per feature_key and merged after the loop: anyres
+            # models (e.g. LLaVA-OneVision) pad num_patches to the max tile
+            # count *within a single HF processor call*, so a multi-image
+            # request's item can already contain per-image padding. HF's own
+            # get_image_features strips that padding using each image's real
+            # patch count re-derived from image_sizes, but only if the tensor
+            # keeps its (num_images, num_patches, ...) shape -- so instead of
+            # flattening here (which would keep stray padding rows whenever
+            # two images in the same item need a different tile count), pad
+            # every item's tensor to the batch-wide max num_patches and let
+            # the model do its own per-image slicing.
+            pending_5d_features: dict = {}
 
             for batch_idx in range(len(mm_inputs or [])):
                 mm_input = mm_inputs[batch_idx]
@@ -1539,10 +1552,10 @@ class MultiModalMixin:
                         if isinstance(feature, torch.Tensor):
                             feature = feature.to(device=target_device)
                             if feature.dim() == 5:
-                                # Flatten the size-1 "images per call" dim so anyres
-                                # models (e.g. LLaVA-OneVision) with a varying tile
-                                # count per image can still be concatenated below.
-                                feature = feature.reshape(-1, *feature.shape[2:])
+                                pending_5d_features.setdefault(
+                                    feature_key, []
+                                ).append(feature)
+                                continue
                         if feature_key not in kwargs:
                             kwargs[feature_key] = feature
                         elif isinstance(feature, torch.Tensor) and isinstance(
@@ -1551,6 +1564,24 @@ class MultiModalMixin:
                             kwargs[feature_key] = torch.cat(
                                 [kwargs[feature_key], feature], dim=0
                             )
+
+            for feature_key, tensors in pending_5d_features.items():
+                max_patches = max(t.shape[1] for t in tensors)
+                padded = []
+                for t in tensors:
+                    if t.shape[1] < max_patches:
+                        pad = t.new_zeros(
+                            (t.shape[0], max_patches - t.shape[1], *t.shape[2:])
+                        )
+                        t = torch.cat([t, pad], dim=1)
+                    padded.append(t)
+                combined = torch.cat(padded, dim=0)
+                if feature_key in kwargs:
+                    kwargs[feature_key] = torch.cat(
+                        [kwargs[feature_key], combined], dim=0
+                    )
+                else:
+                    kwargs[feature_key] = combined
 
         return kwargs
 
