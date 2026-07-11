@@ -57,6 +57,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    speculators_convention: bool
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -268,6 +269,21 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     else:
         target_layer_ids = base.target_layer_ids
 
+    # speculators (github.com/vllm-project/speculators)-trained DSpark
+    # checkpoints use a different block-slot convention than the
+    # DeepSpec-trained ones this file was written against: DeepSpec trains
+    # block slot k to predict anchor+k+1 (every slot trained), while
+    # speculators trains slot j to predict anchor+j with slot 0 loss-masked
+    # (its first slot is never trained to predict anything useful). Every
+    # `run_markov_block` slot is therefore read one position early for a
+    # speculators checkpoint, degrading accept length to ~1 regardless of
+    # the underlying model's real speculative quality. Detected here, not
+    # silently corrected, until the shift is implemented and validated
+    # end-to-end (it isn't yet) -- see sgl-project/sglang#30261 (comment by
+    # jessiewei7, 2026-07-09) for the confirmed diagnosis and reproduction.
+    speculators_model_type = _cfg_get(draft_hf_config, "speculators_model_type", None)
+    speculators_convention = speculators_model_type == "dspark"
+
     return DSparkDraftConfig(
         num_hidden_layers=base.num_hidden_layers,
         num_target_layers=base.num_target_layers,
@@ -277,4 +293,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        speculators_convention=speculators_convention,
     )
