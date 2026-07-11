@@ -101,6 +101,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -688,7 +689,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
+                    "Initial expert_location_metadata:\n%s",
+                    format_expert_location_layout(
+                        get_global_expert_location_metadata()
+                    ),
                 )
 
             set_global_expert_distribution_recorder(

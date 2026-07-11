@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:

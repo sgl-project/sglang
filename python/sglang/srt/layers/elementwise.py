@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
+from sglang.kernels.ops.activation.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 

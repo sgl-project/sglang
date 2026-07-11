@@ -9,6 +9,33 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_target_cache_loc as get_target_cache_loc,
+)
+from sglang.kernels.ops.speculative.eagle import (
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
@@ -16,33 +43,6 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
-)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,

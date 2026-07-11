@@ -407,17 +407,28 @@ class ForwardFlags:
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
+        # Per-layer MLP collective control (set by decoder via scoped()
+        # around the MLP / MoE / hybrid mixer call).
+        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
+        # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
+        # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
+        "fuse_mlp_allreduce": False,
+        "mlp_reduce_scatter": False,
+        "flashinfer_trtllm_bypass": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
-    # EP dispatch, DP gather/scatter): plain-slot backed. Before moving a
-    # flag out of this set, prove no read/write site sits under
-    # torch.compile.
+    # EP dispatch, DP gather/scatter, MLP/MoE skip-AR): plain-slot backed.
+    # Before moving a flag out of this set, prove no read/write site sits
+    # under torch.compile.
     _GRAPH_VISIBLE = frozenset(
         {
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
+            "fuse_mlp_allreduce",
+            "mlp_reduce_scatter",
+            "flashinfer_trtllm_bypass",
         }
     )
 

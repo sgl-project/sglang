@@ -5,6 +5,9 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+)
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -22,9 +25,6 @@ from sglang.srt.speculative.spec_utils import (
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
