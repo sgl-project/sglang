@@ -70,6 +70,7 @@ def build_eagle_disagg_draft_input(
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
     if batch.enable_overlap:
+        spec_info.future_dsa_topk_indices_available = dsa_topk_indices is not None
         spec_info.future_indices = batch.req_pool_indices
         # Seed the relay buf with the known seq_lens; publish's chained record
         # keeps the in-flight forward's fence intact (see FutureMap.publish).

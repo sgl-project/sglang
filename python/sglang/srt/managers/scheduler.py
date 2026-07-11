@@ -3350,6 +3350,12 @@ class Scheduler(
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
+                    if hasattr(
+                        batch.spec_info, "future_dsa_topk_indices_available"
+                    ):
+                        batch.spec_info.future_dsa_topk_indices_available = (
+                            batch.spec_info.dsa_topk_indices is not None
+                        )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
