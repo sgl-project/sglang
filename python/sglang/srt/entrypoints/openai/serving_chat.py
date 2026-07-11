@@ -1791,6 +1791,13 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.reasoning_parser == "minimax-m3":
+            # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
+            # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
+            return (request.chat_template_kwargs or {}).get(
+                "thinking_mode"
+            ) == "enabled"
+
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
