@@ -1192,6 +1192,7 @@ class ReasoningParser:
             and isinstance(request, ChatCompletionRequest)
             and request.continue_final_message
             and request.messages[-1].role == "assistant"
+            and isinstance(request.messages[-1].content, str)
         ):
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content

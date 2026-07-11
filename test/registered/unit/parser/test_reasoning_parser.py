@@ -922,6 +922,38 @@ class TestReasoningParserAdvanced(CustomTestCase):
         parser = ReasoningParser("qwen3", request=request)
         self.assertTrue(parser.detector.continue_final_message)
 
+    def test_continue_final_message_non_string_content(self):
+        """Assistant content may be None (a tool-only turn) or a multimodal list.
+        With continue_final_message such a request used to pass that value straight
+        to BaseReasoningFormatDetector, which called len() on it and raised
+        TypeError on None. The parser must ignore non-string content and fall back
+        to no continuation, mirroring serving_chat._apply_continue_final_message."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageContentTextPart,
+            ChatCompletionMessageGenericParam,
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        for content in (
+            None,
+            [ChatCompletionMessageContentTextPart(type="text", text="partial")],
+        ):
+            with self.subTest(content=content):
+                request = ChatCompletionRequest(
+                    model="test",
+                    messages=[
+                        ChatCompletionMessageUserParam(role="user", content="Hi"),
+                        ChatCompletionMessageGenericParam(
+                            role="assistant", content=content
+                        ),
+                    ],
+                    continue_final_message=True,
+                )
+                parser = ReasoningParser("qwen3", request=request)
+                self.assertFalse(parser.detector.continue_final_message)
+                self.assertEqual(parser.detector.previous_content, "")
+
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """Test that force_nonempty_content is passed via chat_template_kwargs."""
         from sglang.srt.entrypoints.openai.protocol import (
