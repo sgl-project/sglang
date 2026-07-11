@@ -777,9 +777,11 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
         elif forward_batch.forward_mode.is_dllm_extend():
-            # The page table below is built at token granularity (no // page_size),
-            # which is only correct at page_size=1 (enforced in _handle_dllm_inference).
-            assert self.page_size == 1, "fa3 dLLM extend requires page_size=1."
+            # dLLM decodes a fixed-size block of masked tokens per request with
+            # bidirectional attention over the whole cached sequence. The page
+            # table is built at token granularity here and strided to page indices
+            # by the shared `page_size > 1` conversion below (same as every other
+            # mode), so page_size == block_size (block-aligned radix cache) works.
             dllm_block_size = self._get_dllm_block_size(
                 batch_size=batch_size, num_tokens=forward_batch.input_ids.shape[0]
             )

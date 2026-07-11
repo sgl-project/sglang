@@ -6379,23 +6379,6 @@ class ServerArgs:
                 )
                 self.attention_backend = "flashinfer"
 
-        # FlashAttention3 (fa3) supports dLLM only with page_size=1 and does not
-        # use the block-aligned dLLM radix cache; force page_size=1 and disable
-        # radix cache before the radix-cache handling below.
-        if self.attention_backend == "fa3":
-            if self.page_size != 1:
-                logger.warning(
-                    "FlashAttention3 only supports page_size=1 for diffusion LLM "
-                    f"inference currently. Changing page_size from {self.page_size} to 1."
-                )
-                self.page_size = 1
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Radix cache is disabled for diffusion LLM inference on the fa3 "
-                    "attention backend (fa3 requires page_size=1)."
-                )
-                self.disable_radix_cache = True
-
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"
