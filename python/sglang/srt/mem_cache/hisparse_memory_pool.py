@@ -6,6 +6,9 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.base_hisparse_memory_pool import (
+    HiSparseDevicePoolMappingMixin,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -25,7 +28,7 @@ else:
         )
 
 
-class HiSparseDSATokenToKVPool(DSATokenToKVPool):
+class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -58,20 +61,6 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             index_buf_size=size * host_to_device_ratio,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
-
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
-
-    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(full_indices)
 
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         return full_indices
