@@ -56,8 +56,45 @@ class TestPagedAllocatorCapacity(CustomTestCase):
         kernel.__getitem__.assert_not_called()
         self.assertTrue(torch.equal(allocator.free_pages, free_pages))
 
+    def test_alloc_extend_does_not_merge_released_pages_on_oom(self):
+        allocator = make_allocator(free_pages=[7], release_pages=[3], need_sort=True)
+        free_pages = allocator.free_pages.clone()
+        release_pages = allocator.release_pages.clone()
+
+        with patch.object(paged, "alloc_extend_kernel") as kernel:
+            result = allocator.alloc_extend(
+                prefix_lens=torch.tensor([8, 8, 8]),
+                prefix_lens_cpu=torch.tensor([8, 8, 8]),
+                seq_lens=torch.tensor([9, 9, 9]),
+                seq_lens_cpu=torch.tensor([9, 9, 9]),
+                last_loc=torch.tensor([7, 7, 7]),
+                extend_num_tokens=3,
+            )
+
+        self.assertIsNone(result)
+        kernel.__getitem__.assert_not_called()
+        self.assertTrue(torch.equal(allocator.free_pages, free_pages))
+        self.assertTrue(torch.equal(allocator.release_pages, release_pages))
+
+    def test_alloc_decode_does_not_merge_released_pages_on_oom(self):
+        allocator = make_allocator(free_pages=[7], release_pages=[3], need_sort=True)
+        free_pages = allocator.free_pages.clone()
+        release_pages = allocator.release_pages.clone()
+
+        with patch.object(paged, "alloc_decode_kernel") as kernel:
+            result = allocator.alloc_decode(
+                seq_lens=torch.tensor([9, 9, 9]),
+                seq_lens_cpu=torch.tensor([9, 9, 9]),
+                last_loc=torch.tensor([7, 7, 7]),
+            )
+
+        self.assertIsNone(result)
+        kernel.__getitem__.assert_not_called()
+        self.assertTrue(torch.equal(allocator.free_pages, free_pages))
+        self.assertTrue(torch.equal(allocator.release_pages, release_pages))
+
     def test_alloc_extend_launches_at_exact_capacity(self):
-        allocator = make_allocator(free_pages=[3, 7])
+        allocator = make_allocator(free_pages=[9, 3, 7])
 
         with patch.object(paged, "alloc_extend_kernel") as kernel:
             result = allocator.alloc_extend(
@@ -71,6 +108,24 @@ class TestPagedAllocatorCapacity(CustomTestCase):
 
         self.assertIsNotNone(result)
         kernel.__getitem__.assert_called_once_with((2,))
+        launched_free_pages = kernel.__getitem__.return_value.call_args.args[3]
+        self.assertTrue(torch.equal(launched_free_pages, torch.tensor([9, 3, 7])))
+        self.assertTrue(torch.equal(allocator.free_pages, torch.tensor([7])))
+
+    def test_alloc_decode_launches_at_exact_capacity(self):
+        allocator = make_allocator(free_pages=[9, 3])
+
+        with patch.object(paged, "alloc_decode_kernel") as kernel:
+            result = allocator.alloc_decode(
+                seq_lens=torch.tensor([9, 9]),
+                seq_lens_cpu=torch.tensor([9, 9]),
+                last_loc=torch.tensor([7, 7]),
+            )
+
+        self.assertIsNotNone(result)
+        kernel.__getitem__.assert_called_once_with((2,))
+        launched_free_pages = kernel.__getitem__.return_value.call_args.args[2]
+        self.assertTrue(torch.equal(launched_free_pages, torch.tensor([9, 3])))
         self.assertEqual(len(allocator.free_pages), 0)
 
     def test_allocations_launch_when_no_new_page_is_required(self):
