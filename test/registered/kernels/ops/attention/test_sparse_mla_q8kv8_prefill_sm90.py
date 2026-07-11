@@ -192,6 +192,85 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     _run_and_check(d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv)
 
 
+# topk_length WITHOUT attn_sink (the production early-exit path for
+# SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH): rows with a trailing -1 pad run must
+# be BITWISE identical to the full-topk dispatch that masks those pads, and
+# must match the fp32 reference on the truncated index range.
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+@pytest.mark.parametrize(
+    "d_qk,s_q,topk,s_kv",
+    [
+        (576, 8, TOPK, S_KV),
+        (576, 65, 256, 592),
+        (512, 8, TOPK, S_KV),
+    ],
+)
+def test_sparse_mla_q8kv8_prefill_topk_length_only(
+    d_qk: int, s_q: int, topk: int, s_kv: int
+):
+    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, _, _ = _make_case(
+        d_qk, False, s_q=s_q, topk=topk, s_kv=s_kv
+    )
+    # Trailing pad runs of varying size, including a 1-valid-entry row (the
+    # production clamp(min=1) floor) and full rows.
+    lengths = [
+        topk if i % 3 == 0 else (1 if i % 3 == 1 else max(topk - 32, topk // 2))
+        for i in range(s_q)
+    ]
+    topk_length = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    for q_idx, valid_topk in enumerate(lengths):
+        if valid_topk < topk:
+            indices[q_idx, 0, valid_topk:] = -1
+
+    out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=D_V,
+        attn_sink=None,
+        topk_length=topk_length,
+    )
+    out_full, max_logits_full, lse_full = sparse_mla_q8kv8_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=D_V,
+        attn_sink=None,
+        topk_length=None,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(out, out_full)
+    assert torch.equal(max_logits, max_logits_full)
+    assert torch.equal(lse, lse_full)
+
+    ref, ref_max_logits, ref_lse = _torch_sparse_attention_ref(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        attn_sink=None,
+        topk_length=topk_length,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=8e-2, rtol=8e-2)
+    torch.testing.assert_close(max_logits.float(), ref_max_logits, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse.float(), ref_lse, atol=2e-3, rtol=2e-3)
+
+
 # Precision / accuracy: no-sink only because these metrics are intended to
 # approximate the current DeepSeek NSA E2E path. Sink behavior is still covered
 # above as kernel feature coverage, but sink-enabled precision numbers should
