@@ -48,7 +48,6 @@ class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
     verify_num_draft_tokens: int
     mask_token_id: int
-    draft_config: DSparkDraftConfig
 
 
 def resolve_runtime_config(
@@ -101,7 +100,6 @@ def resolve_runtime_config(
         gamma=gamma,
         verify_num_draft_tokens=gamma + 1,
         mask_token_id=mask_token_id,
-        draft_config=draft_config,
     )
 
 
