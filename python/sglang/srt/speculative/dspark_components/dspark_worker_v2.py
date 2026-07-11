@@ -30,9 +30,6 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
-from sglang.srt.speculative.dspark_components.dspark_accept import (
-    accept_draft_tokens,
-)
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     BlockAcceptEstimateRecorder,
     create_block_accept_estimate_recorder,
@@ -60,16 +57,15 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     StsDataRecorder,
 )
-from sglang.srt.speculative.dspark_components.dspark_target_verify import (
-    TargetVerifyExecutor,
-)
 from sglang.srt.speculative.dspark_components.dspark_utils import (
     dspark_gamma_from_num_draft_tokens,
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.dspark_components.dspark_verify_epilogue import (
+from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
+    TargetVerifyExecutor,
+    accept_draft_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
