@@ -1359,14 +1359,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     logger.debug(
                         "DSpark PD hidden receive buffer pool is busy; "
-                        "delaying preallocation: rid=%s, hidden_len=%s, "
+                        "delaying current preallocation and continuing scan: "
+                        "rid=%s, hidden_len=%s, "
                         "limit=%s, transfer_queue=%s",
                         decode_req.req.rid,
                         dspark_hidden_len,
                         envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get(),
                         len(self.transfer_queue.queue),
                     )
-                    break
+                    continue
                 if dspark_hidden_dst_indices_by_pp is None:
                     continue
                 dspark_hidden_pp_slices = pp_slices
