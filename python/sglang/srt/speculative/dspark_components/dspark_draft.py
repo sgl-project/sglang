@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from typing import Optional
 
@@ -22,6 +23,8 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import 
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
+
+logger = logging.getLogger(__name__)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -92,6 +95,43 @@ class DsparkDraftSampler:
                 confidence_tap=confidence_tap,
             )
             self.confidence_out[:bs].copy_(confidence)
+
+
+def maybe_build_draft_sampler(
+    *,
+    draft_model,
+    gamma: int,
+    max_bs: int,
+    device,
+    tp_rank: int,
+    confidence_fn=None,
+    out=None,
+) -> Optional[DsparkDraftSampler]:
+    """Build the graph-folded greedy draft sampler, or return None (with the
+    reason logged) when the draft model cannot support folding and the
+    proposal must stay eager."""
+
+    def _eager(reason):
+        if tp_rank == 0:
+            logger.info("DSpark draft greedy proposal kept eager (reason=%s).", reason)
+        return None
+
+    if gamma <= 0:
+        return _eager("gamma<=0")
+    if not hasattr(draft_model, "compute_base_logits"):
+        return _eager("no compute_base_logits")
+    if getattr(draft_model, "markov_head", None) is None:
+        return _eager("no markov head")
+    if tp_rank == 0:
+        logger.info("DSpark draft greedy proposal folded into the draft cuda graph.")
+    return DsparkDraftSampler(
+        model=draft_model,
+        gamma=gamma,
+        max_bs=max_bs,
+        device=device,
+        confidence_fn=confidence_fn,
+        out=out,
+    )
 
 
 def make_next_draft_input(

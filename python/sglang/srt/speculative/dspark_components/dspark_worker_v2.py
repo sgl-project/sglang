@@ -29,8 +29,8 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
-    DsparkDraftSampler,
     make_next_draft_input,
+    maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -331,28 +331,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _maybe_build_draft_sampler(self):
-        def _eager(reason):
-            if self.tp_rank == 0:
-                logger.info(
-                    "DSpark draft greedy proposal kept eager (reason=%s).", reason
-                )
-            return None
-
-        if self.gamma <= 0:
-            return _eager("gamma<=0")
-        if not hasattr(self.draft_model, "compute_base_logits"):
-            return _eager("no compute_base_logits")
-        if getattr(self.draft_model, "markov_head", None) is None:
-            return _eager("no markov head")
-        if self.tp_rank == 0:
-            logger.info(
-                "DSpark draft greedy proposal folded into the draft cuda graph."
-            )
-        return DsparkDraftSampler(
-            model=self.draft_model,
+        return maybe_build_draft_sampler(
+            draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
             device=self.device,
+            tp_rank=self.tp_rank,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
