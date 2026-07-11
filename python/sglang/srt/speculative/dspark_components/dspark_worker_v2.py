@@ -19,11 +19,12 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
-    draft_is_deepseek_v4,
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    DSV4_DRAFT_ATTENTION_BACKEND,
+    draft_is_deepseek_v4,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -107,6 +108,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
+                attention_backend_override=(
+                    DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
+                ),
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner

@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 from copy import deepcopy
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -16,60 +14,21 @@ from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.utils.hf_transformers_utils import get_config
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_DRAFT_BACKENDS = ("flashinfer", "fa3", "fa4", "triton", "ascend")
 
-_DEEPSEEK_V4_DRAFT_BACKEND = "dsv4"
-
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_worker: TpModelWorker
-    draft_model_runner: Any
-    draft_model: Any
+    draft_model_runner: ModelRunner
+    draft_model: torch.nn.Module
     resolved_attention_backend: str
-
-
-def _resolve_draft_attention_backend(
-    *, draft_server_args: ServerArgs, algo_label: str
-) -> str:
-    draft_hf_config = _load_draft_hf_config(draft_server_args=draft_server_args)
-    return _select_draft_attention_backend(
-        draft_hf_config=draft_hf_config,
-        draft_server_args=draft_server_args,
-        algo_label=algo_label,
-    )
-
-
-def _load_draft_hf_config(*, draft_server_args: ServerArgs) -> Optional[Any]:
-    draft_model_path = draft_server_args.speculative_draft_model_path
-    if not draft_model_path:
-        return None
-    model_override_args = json.loads(draft_server_args.json_model_override_args)
-    return get_config(
-        draft_model_path,
-        trust_remote_code=draft_server_args.trust_remote_code,
-        revision=draft_server_args.speculative_draft_model_revision,
-        model_override_args=model_override_args,
-        model_config_parser=draft_server_args.model_config_parser,
-    )
-
-
-def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
-    draft_hf_config = _load_draft_hf_config(draft_server_args=server_args)
-    return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
-
-
-def _select_draft_attention_backend(
-    *, draft_hf_config: Optional[Any], draft_server_args: ServerArgs, algo_label: str
-) -> str:
-    if draft_hf_config is not None and is_deepseek_v4(draft_hf_config):
-        return _DEEPSEEK_V4_DRAFT_BACKEND
-    return _resolve_draft_attention_backend_fallback(
-        draft_server_args=draft_server_args, algo_label=algo_label
-    )
 
 
 def _resolve_draft_attention_backend_fallback(
@@ -104,12 +63,18 @@ def build_draft_tp_worker(
     attn_cp_rank: int,
     moe_dp_rank: int,
     nccl_port: int,
-    target_model_config: Any,
+    target_model_config: ModelConfig,
     algo_label: str,
+    attention_backend_override: Optional[str] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
-    draft_backend = _resolve_draft_attention_backend(
-        draft_server_args=draft_server_args, algo_label=algo_label
+    # An override names a draft-specific backend the caller has already
+    # validated (e.g. a self-drafting architecture); it skips the generic
+    # supported-backend fallback below.
+    draft_backend = attention_backend_override or (
+        _resolve_draft_attention_backend_fallback(
+            draft_server_args=draft_server_args, algo_label=algo_label
+        )
     )
     # Post-resolution ServerArgs rejects bare assignment; route the draft-copy
     # adjustments through the audited mutation point. The backend fields make

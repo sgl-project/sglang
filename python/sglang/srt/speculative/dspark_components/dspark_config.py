@@ -16,6 +16,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_DSPARK_GAMMA = 7
 SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 
+# The dsv4 self-drafting checkpoint runs its draft attention on the dedicated
+# DeepSeek-V4 backend instead of the generic draft-backend fallback.
+DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
+
+
+def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_model_path = server_args.speculative_draft_model_path
+    if not draft_model_path:
+        return False
+    draft_hf_config = get_config(
+        draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=json.loads(server_args.json_model_override_args),
+        model_config_parser=server_args.model_config_parser,
+    )
+    return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     gamma = int(num_draft_tokens) - 1
