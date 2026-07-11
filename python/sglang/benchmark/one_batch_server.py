@@ -785,9 +785,15 @@ def run_one_case(
         response.raise_for_status()
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
-        internal_state = internal_states[0] if internal_states else {}
-        last_gen_throughput = internal_state.get("last_gen_throughput", None) or -1
-        acc_length = internal_state.get("avg_spec_accept_length", None) or -1
+        acc_length = -1
+        last_gen_throughput = -1
+        for internal_state in internal_states:
+            acc_length = (
+                internal_state.get("avg_spec_accept_length", None) or acc_length
+            )
+            last_gen_throughput = (
+                internal_state.get("last_gen_throughput", None) or last_gen_throughput
+            )
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
