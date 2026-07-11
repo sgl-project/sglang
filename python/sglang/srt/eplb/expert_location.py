@@ -19,7 +19,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional
 
 import torch
 import torch.distributed
@@ -305,17 +305,121 @@ class ExpertLocationMetadata:
         ]
 
 
-_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
+def format_expert_location_layout(
+    metadata: Optional[ExpertLocationMetadata],
+    layer_ids: Optional[Iterable[int]] = None,
+) -> str:
+    if metadata is None:
+        return "<none>"
+
+    return format_physical_to_logical_map(
+        metadata.physical_to_logical_map_cpu,
+        ep_size=metadata.ep_size,
+        layer_ids=layer_ids,
+    )
+
+
+def format_expert_location_layout_diff(
+    old_metadata: Optional[ExpertLocationMetadata],
+    new_metadata: Optional[ExpertLocationMetadata],
+    layer_ids: Optional[Iterable[int]] = None,
+) -> str:
+    if old_metadata is None or new_metadata is None:
+        return "<none>"
+
+    old_map = old_metadata.physical_to_logical_map_cpu
+    new_map = new_metadata.physical_to_logical_map_cpu
+    if old_map.shape != new_map.shape:
+        return f"shape_changed old_shape={tuple(old_map.shape)} new_shape={tuple(new_map.shape)}"
+
+    layer_ids = _normalize_layer_ids(layer_ids, num_layers=old_map.shape[0])
+    num_physical_experts = old_map.shape[1]
+
+    changed_by_layer = []
+    for layer_id in layer_ids:
+        num_changed = torch.count_nonzero(old_map[layer_id] != new_map[layer_id]).item()
+        if num_changed > 0:
+            changed_by_layer.append((layer_id, num_changed))
+
+    total_changed = sum(num_changed for _, num_changed in changed_by_layer)
+    total_slots = len(layer_ids) * num_physical_experts
+    lines = [f"changed_physical_slots={total_changed}/{total_slots}"]
+    if not changed_by_layer:
+        lines.append("changed_layers=[]")
+        return "\n".join(lines)
+
+    for layer_id, num_changed in changed_by_layer:
+        lines.append(f"layer={layer_id}: changed={num_changed}/{num_physical_experts}")
+    return "\n".join(lines)
+
+
+def format_physical_to_logical_map(
+    physical_to_logical_map: torch.Tensor,
+    ep_size: int,
+    layer_ids: Optional[Iterable[int]] = None,
+) -> str:
+    physical_to_logical_map = physical_to_logical_map.cpu()
+    if physical_to_logical_map.numel() == 0:
+        return "<empty>"
+
+    layer_ids = _normalize_layer_ids(
+        layer_ids, num_layers=physical_to_logical_map.shape[0]
+    )
+    num_physical_experts = physical_to_logical_map.shape[1]
+    num_local_physical_experts, remainder = divmod(num_physical_experts, ep_size)
+
+    lines = [
+        "physical_to_logical_map "
+        f"num_layers={physical_to_logical_map.shape[0]} "
+        f"num_physical_experts={num_physical_experts} "
+        f"ep_size={ep_size}"
+    ]
+    for layer_id in layer_ids:
+        row = physical_to_logical_map[layer_id].tolist()
+        if remainder != 0:
+            lines.append(
+                f"layer={layer_id}: "
+                f"physical={json.dumps(row, separators=(',', ':'))}"
+            )
+            continue
+
+        rank_chunks = []
+        for ep_rank in range(ep_size):
+            start = ep_rank * num_local_physical_experts
+            end = start + num_local_physical_experts
+            rank_chunks.append(
+                f"ep{ep_rank}={json.dumps(row[start:end], separators=(',', ':'))}"
+            )
+        lines.append(f"layer={layer_id}: " + " ".join(rank_chunks))
+
+    return "\n".join(lines)
+
+
+def _normalize_layer_ids(
+    layer_ids: Optional[Iterable[int]],
+    num_layers: int,
+) -> List[int]:
+    if layer_ids is None:
+        return list(range(num_layers))
+
+    normalized_layer_ids = [int(layer_id) for layer_id in layer_ids]
+    for layer_id in normalized_layer_ids:
+        assert 0 <= layer_id < num_layers, f"{layer_id=} {num_layers=}"
+    return normalized_layer_ids
 
 
 def get_global_expert_location_metadata():
-    return _global_expert_location_metadata
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value):
-    global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
-    _global_expert_location_metadata = value
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    assert resources.expert_location_metadata is None
+    resources.expert_location_metadata = value
 
 
 def broadcast_global_expert_location_metadata(

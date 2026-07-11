@@ -87,8 +87,7 @@ from sglang.srt.models.nemotron_h_utils import (
     pad_to_original_num_tokens,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
@@ -133,14 +132,10 @@ class NemotronHMLP(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         x, _ = self.up_proj(x)
         x = self.act_fn(x)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -191,7 +186,7 @@ class NemotronHMoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -307,8 +302,6 @@ class NemotronHMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         # routed_scaling_factor is fused into the experts call (applied by the
@@ -323,8 +316,6 @@ class NemotronHMoE(nn.Module):
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -345,20 +336,20 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
                 forward_batch
             )
-            should_allreduce_fusion = (
+            fuse_mlp_allreduce = (
                 self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                     forward_batch
                 )
             )
-            hidden_states = self.mixer.forward(
-                hidden_states,
-                should_allreduce_fusion=should_allreduce_fusion,
-                use_reduce_scatter=use_reduce_scatter,
-            )
-            if should_allreduce_fusion:
+            with get_forward().scoped(
+                fuse_mlp_allreduce=fuse_mlp_allreduce,
+                mlp_reduce_scatter=mlp_reduce_scatter,
+            ):
+                hidden_states = self.mixer.forward(hidden_states)
+            if fuse_mlp_allreduce:
                 hidden_states._sglang_needs_allreduce_fusion = True
             else:
                 hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -370,15 +361,14 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
             self.norm, hidden_states, residual
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        hidden_states = self.mixer.forward(
-            hidden_states, should_allreduce_fusion=should_allreduce_fusion
-        )
-        if should_allreduce_fusion:
+        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+            hidden_states = self.mixer.forward(hidden_states)
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states, residual
 
@@ -495,11 +485,17 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(
+            self.norm,
+            for_attn=True,
+            is_last_layer=layer_idx == len(config.hybrid_override_pattern) - 1,
+        )
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def _forward_mamba(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Core Mamba forward logic, called directly or via split op."""
         original_num_tokens = hidden_states.shape[0]
@@ -544,18 +540,27 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             self.norm, hidden_states, residual
         )
 
-        if is_in_breakable_cuda_graph():
-            output = torch.empty_like(hidden_states)
-            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
-            return output, residual
+        fuse_mlp_allreduce = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
 
-        if is_in_tc_piecewise_cuda_graph():
-            output = torch.empty_like(hidden_states)
-            nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
-            return output, residual
-        else:
-            output = self._forward_mamba(hidden_states, forward_batch)
-            return output, residual
+        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+            if is_in_breakable_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                breakable_nemotron_mamba2_with_output(
+                    hidden_states, output, self.layer_id
+                )
+            elif is_in_tc_piecewise_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            else:
+                output = self._forward_mamba(hidden_states, forward_batch)
+
+        if fuse_mlp_allreduce:
+            output._sglang_needs_allreduce_fusion = True
+        return output, residual
 
 
 class NemotronHAttention(nn.Module):
@@ -625,7 +630,9 @@ class NemotronHAttention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not is_dp_attention_enabled():
             qkv, _ = self.qkv_proj(hidden_states)
@@ -682,7 +689,11 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(
+            self.norm,
+            for_attn=True,
+            is_last_layer=layer_idx == len(config.hybrid_override_pattern) - 1,
+        )
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def forward(
@@ -705,9 +716,19 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
             self.norm, hidden_states, residual
         )
 
-        hidden_states = self.mixer.forward(
-            hidden_states=hidden_states, forward_batch=forward_batch
+        fuse_mlp_allreduce = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
+
+        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+            hidden_states = self.mixer.forward(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        if fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states, residual
 
 
@@ -880,7 +901,7 @@ class NemotronHForCausalLM(nn.Module):
                         else lora_config.lora_vocab_padding_size
                     ),
                     quant_config=quant_config,
-                    use_attn_tp_group=get_flags().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
