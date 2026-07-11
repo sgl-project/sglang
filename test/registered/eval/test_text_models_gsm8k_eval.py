@@ -64,6 +64,8 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             cls.models.append(ModelLaunchSettings(model_path, tp_size=2))
 
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.env = None
+        cls.api = "generate"
 
     def test_gsm8k_all_models(self):
         warnings.filterwarnings(
@@ -85,6 +87,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         other_args=other_args,
                         base_url=self.base_url,
                         timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
+                        env=self.env,
                     )
 
                     args = SimpleNamespace(
@@ -94,6 +97,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         api="sgl_eval",
                         num_examples=None,
                         num_threads=1024,
+                        api=self.api,
                     )
 
                     metrics = run_eval(args)
@@ -133,6 +137,14 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             model_accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
             model_count=len(self.models),
         )
+
+
+class TestNightlyGsm8KEvalWithRustServer(TestNightlyGsm8KEval):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.env = {"SGLANG_RUST_SERVER": "1"}
+        cls.api = "generate"
 
 
 if __name__ == "__main__":

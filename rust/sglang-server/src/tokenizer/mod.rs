@@ -26,9 +26,9 @@ pub trait TextTokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<i32>, Error>;
 }
 
-/// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
-/// `None` under `skip_tokenizer_init`, else required (missing/failed load → `Err`).
-/// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
+/// Load the dynamo tokenizer used by the detok shards for the incremental decode
+/// stream. `None` under `skip_tokenizer_init`, else required (missing/failed load →
+/// `Err`). `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
 /// (resolved from the local cache — no network).
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
@@ -48,6 +48,32 @@ pub fn load_tokenizer(
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file(&file)
         .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded tokenizer");
+    Ok(Some(tokenizer))
+}
+
+/// Load the HuggingFace `tokenizers` tokenizer used by the encode pool. Separate
+/// from [`load_tokenizer`] (dynamo) because the two libraries differ on special
+/// tokens: dynamo hard-codes `add_special_tokens=false`, so it drops the BOS the
+/// prompt's post-processor would add, whereas [`HfEncoder`] passes `true` to match
+/// the Python server's `tokenizer.encode(text)`. Loads the same `tokenizer.json`;
+/// `None` under `skip_tokenizer_init`.
+pub fn load_encoder(
+    tokenizer_path: Option<&str>,
+    revision: Option<&str>,
+    skip_tokenizer_init: bool,
+) -> Result<Option<tokenizers::Tokenizer>, String> {
+    if skip_tokenizer_init {
+        return Ok(None);
+    }
+    let path = tokenizer_path.ok_or_else(|| {
+        "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
+    })?;
+
+    let file = resolve_model_file(path, revision, "tokenizer.json")
+        .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&file)
+        .map_err(|e| format!("encoder load failed ({file}): {e}"))?;
+    tracing::info!(%path, "loaded encoder (add_special_tokens=true)");
     Ok(Some(tokenizer))
 }
 
@@ -84,18 +110,23 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
-pub struct DynamoTokenizer {
-    inner: dynamo_tokenizers::Tokenizer,
+/// Real encoder over the HuggingFace `tokenizers` library. Encodes with
+/// `add_special_tokens=true` so the prompt gets its BOS / post-processor special
+/// tokens — matching the Python server's `tokenizer.encode(text)`. dynamo's encoder
+/// passes `false`, dropping BOS; on models that prepend one (Llama, gemma, …) that
+/// silently changed the prompt and measurably cut accuracy (GSM8K gemma-2: 0.44 →
+/// 0.29). Decode still runs through dynamo's `DecodeStream` (see the detok shard).
+pub struct HfEncoder {
+    inner: tokenizers::Tokenizer,
 }
 
-impl DynamoTokenizer {
-    pub fn new(inner: dynamo_tokenizers::Tokenizer) -> Self {
+impl HfEncoder {
+    pub fn new(inner: tokenizers::Tokenizer) -> Self {
         Self { inner }
     }
 }
 
-impl TextTokenizer for DynamoTokenizer {
+impl TextTokenizer for HfEncoder {
     fn encode(&self, text: &str) -> Result<Vec<i32>, Error> {
         if text.is_empty() {
             // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
@@ -104,10 +135,10 @@ impl TextTokenizer for DynamoTokenizer {
         }
         let encoding = self
             .inner
-            .encode(text)
+            .encode(text, true) // add_special_tokens=true → BOS etc., as Python does
             .map_err(|e| Error::Tokenize(e.to_string()))?;
         // Vocab ids are non-negative and fit in i32.
-        Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
+        Ok(encoding.get_ids().iter().map(|&id| id as i32).collect())
     }
 }
 
