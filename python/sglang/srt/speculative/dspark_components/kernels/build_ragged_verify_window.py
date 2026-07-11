@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -7,7 +8,6 @@ import triton.language as tl
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.speculative.dspark_components.dspark_info import RaggedVerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.compact_layout import (
     compact_row_index,
     compact_row_index_triton,
@@ -15,6 +15,13 @@ from sglang.srt.speculative.dspark_components.kernels.compact_layout import (
     compact_verify_ids_triton,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
+class RaggedVerifyWindow(msgspec.Struct, frozen=True):
+    positions: torch.Tensor
+    verify_cache_loc: torch.Tensor
+    verify_ids: torch.Tensor
+
 
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_RAGGED_WINDOW.get()
 

@@ -353,7 +353,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         gamma = int(server_args.speculative_dspark_block_size)
 
     if gamma is None and server_args.speculative_num_draft_tokens is None:
-        from sglang.srt.speculative.dspark_components.dspark_utils import (
+        from sglang.srt.speculative.dspark_components.dspark_config import (
             DEFAULT_DSPARK_GAMMA,
             parse_dspark_draft_config,
         )
@@ -386,7 +386,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     elif gamma is None and server_args.speculative_num_draft_tokens is not None:
-        from sglang.srt.speculative.dspark_components.dspark_utils import (
+        from sglang.srt.speculative.dspark_components.dspark_config import (
             parse_dspark_draft_config,
         )
 

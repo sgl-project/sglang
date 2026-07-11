@@ -19,7 +19,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -48,6 +47,12 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
+
+
+class VerifyWindow(msgspec.Struct, frozen=True):
+    positions_2d: torch.Tensor
+    verify_cache_loc: torch.Tensor
+    verify_cache_loc_2d: torch.Tensor
 
 
 class DSparkVerifyPlanner:

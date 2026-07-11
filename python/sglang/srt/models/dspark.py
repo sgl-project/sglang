@@ -9,7 +9,7 @@ from torch import nn
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.speculative.dspark_components.dspark_utils import (
+from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (

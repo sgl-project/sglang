@@ -34,6 +34,10 @@ from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator impo
     BlockAcceptEstimateRecorder,
     create_block_accept_estimate_recorder,
 )
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    dspark_gamma_from_num_draft_tokens,
+    parse_dspark_draft_config,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     DsparkDraftSampler,
@@ -49,24 +53,20 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     InfoSegment,
     resolve_enabled_components,
 )
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyPlanner,
+    alloc_verify_window,
+    dp_global_verify_tier_num_tokens,
+    idle_ragged_layout,
+)
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     StsDataRecorder,
-)
-from sglang.srt.speculative.dspark_components.dspark_utils import (
-    dspark_gamma_from_num_draft_tokens,
-    parse_dspark_draft_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     accept_draft_tokens,
-)
-from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
-    DSparkVerifyPlanner,
-    alloc_verify_window,
-    dp_global_verify_tier_num_tokens,
-    idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
     BuildOutTokens,

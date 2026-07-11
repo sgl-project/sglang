@@ -11,16 +11,12 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_info import (
-    DraftBlockResult,
-    RaggedVerifyWindow,
-    TargetVerifyResult,
-    VerifyWindow,
-)
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    VerifyWindow,
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.dspark_components.kernels.accept_greedy import (
@@ -35,6 +31,7 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
 )
 from sglang.srt.speculative.dspark_components.kernels.build_ragged_verify_window import (
     BuildRaggedVerifyWindow,
+    RaggedVerifyWindow,
 )
 from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
     BuildCommitInjectLayout,
@@ -51,6 +48,11 @@ from sglang.srt.speculative.dspark_components.kernels.scatter_compact_to_strided
 )
 from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
+class TargetVerifyResult(msgspec.Struct, frozen=True):
+    logits_output: object
+    can_run_cuda_graph: bool
 
 
 class TargetVerifyExecutor:

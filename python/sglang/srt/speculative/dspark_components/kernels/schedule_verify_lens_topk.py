@@ -9,7 +9,7 @@ import triton.language as tl
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
+    from sglang.srt.speculative.dspark_components.dspark_planner import (
         DSparkScheduleConfig,
     )
 

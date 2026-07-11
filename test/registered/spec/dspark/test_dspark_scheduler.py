@@ -9,16 +9,16 @@ os.environ.setdefault("SGLANG_DSPARK_KERNEL_QO_INDPTR", "torch")
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_sps import (
-    SpsAdditiveCostTable,
-    SpsCostTable,
-)
-from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
+from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
+)
+from sglang.srt.speculative.dspark_components.dspark_sps import (
+    SpsAdditiveCostTable,
+    SpsCostTable,
 )
 from sglang.srt.speculative.dspark_components.kernels.schedule_verify_lens_topk import (
     schedule_verify_lens_topk_from_survival,

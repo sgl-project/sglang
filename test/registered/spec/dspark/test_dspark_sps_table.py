@@ -157,7 +157,7 @@ class TestProfileSpsTable(CustomTestCase):
 
 
 def _build_sps_cost_table_for(*, sps_table_path):
-    from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
+    from sglang.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 

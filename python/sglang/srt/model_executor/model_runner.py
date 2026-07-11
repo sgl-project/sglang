@@ -507,7 +507,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             if self.spec_algorithm.is_dspark():
-                from sglang.srt.speculative.dspark_components.dspark_utils import (
+                from sglang.srt.speculative.dspark_components.dspark_config import (
                     parse_dspark_draft_config,
                 )
 
