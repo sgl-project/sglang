@@ -4,6 +4,11 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dflash import (
+    _compute_dflash_accept_bonus_triton_unchecked,
+    _prepare_dflash_draft_block_unchecked,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -29,11 +34,6 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.speculative.triton_ops.dflash import (
-    _compute_dflash_accept_bonus_triton_unchecked,
-    _prepare_dflash_draft_block_unchecked,
-)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -47,7 +47,7 @@ _FusedKVMaterializeHelper = None
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
-        from sglang.srt.speculative.triton_ops.fused_kv_materialize import (
+        from sglang.kernels.ops.speculative.fused_kv_materialize import (
             FusedKVMaterializeHelper,
         )
 
@@ -118,12 +118,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self._need_mamba_verify_commit = (
-            self.model_runner.mambaish_config is not None
-            and hasattr(
-                self.model_runner.attn_backend, "update_mamba_state_after_mtp_verify"
-            )
-        )
+        self._need_mamba_verify_commit = False
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -286,6 +281,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        self._need_mamba_verify_commit = (
+            self.model_runner.mambaish_config is not None
+            and hasattr(
+                self.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+        )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (

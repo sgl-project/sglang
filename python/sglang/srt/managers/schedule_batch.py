@@ -40,6 +40,7 @@ import copy
 import dataclasses
 import logging
 import re
+import sys
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -57,6 +58,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import numpy as np
 import torch
 
@@ -66,7 +68,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -107,9 +108,10 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
@@ -1035,7 +1037,7 @@ class Req(ReqDllmMixin):
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        spec_alg = get_global_server_args().speculative_algorithm
+        spec_alg = get_server_args().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
@@ -1056,7 +1058,7 @@ class Req(ReqDllmMixin):
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
-        if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
+        if get_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
 
@@ -1163,6 +1165,16 @@ class Req(ReqDllmMixin):
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
+        # SWA lives in a per-request ring that's not content-stable and is never
+        # stored in the radix tree, so a reused prefix carries stale SWA. Cap the
+        # match by the trailing sliding window so it gets re-prefilled, rewriting
+        # this request's SWA ring. No-op for other layouts.
+        if tree_cache is not None:
+            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+            if reprefill_tail:
+                capped = max(0, input_len - reprefill_tail)
+                key_limit = capped if key_limit is None else min(key_limit, capped)
+
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
@@ -1172,6 +1184,14 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
+            # unified_kv SWA lives in a per-request ring that is not content-stable
+            # and never cached in the radix tree, so a reused prefix carries stale
+            # SWA. Cap the match by the trailing sliding window so it is re-prefilled
+            # into this request's ring. No-op for other layouts (returns 0).
+            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+            if reprefill_tail:
+                capped = max(0, input_len - reprefill_tail)
+                key_limit = capped if key_limit is None else min(key_limit, capped)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1577,7 +1597,7 @@ class Req(ReqDllmMixin):
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):
-        if get_tensor_model_parallel_rank() == 0:
+        if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
@@ -2072,6 +2092,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+        server_args = get_server_args()
 
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
@@ -2205,7 +2226,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if get_global_server_args().enable_mamba_extra_buffer():
+            if server_args.enable_mamba_extra_buffer():
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
@@ -2310,7 +2331,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if get_global_server_args().enable_mamba_extra_buffer():
+        if server_args.enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2344,7 +2365,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        server_args = get_server_args()
+        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
             assert i % mamba_cache_chunk_size == 0
@@ -2395,7 +2417,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
-            if not get_global_server_args().enable_mamba_extra_buffer_lazy():
+            if not server_args.enable_mamba_extra_buffer_lazy():
                 req.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
@@ -2534,21 +2556,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = list(range(len(self.reqs)))
-
-        # TODO(lsyin): improve retraction policy for radix cache
-        # For spec decoding, filter_batch API can only filter
-        # requests from the back, so we can only retract from the back.
-        # TODO(sang): Clean up finish path and support better retract
-        # policy.
-        if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+        sorted_indices = self._get_decode_retraction_order(
+            self.reqs,
+            server_args,
+            allow_policy_sort=(
+                self.spec_algorithm is None or self.spec_algorithm.is_none()
+            ),
+        )
 
         retracted_reqs = []
         first_iter = True
@@ -2593,6 +2607,52 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
+
+    @staticmethod
+    def _get_decode_retraction_order(
+        reqs: List[Req], server_args: ServerArgs, *, allow_policy_sort: bool
+    ) -> List[int]:
+        """Return indices ordered from most-preferred to least-preferred to keep.
+
+        The retraction loop pops from the end of this list, so the least-preferred
+        request is retracted first.
+        """
+        sorted_indices = list(range(len(reqs)))
+
+        # TODO(lsyin): improve retraction policy for radix cache
+        # For spec decoding, filter_batch API can only filter requests from the
+        # back, so we can only retract from the back.
+        # TODO(sang): Clean up finish path and support better retract policy.
+        if not allow_policy_sort:
+            return sorted_indices
+
+        def length_key(req: Req) -> Tuple[int, int]:
+            return (len(req.output_ids), -len(req.origin_input_ids))
+
+        if server_args.retraction_policy == "priority":
+            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+
+            def retraction_key(req: Req) -> Tuple[int, int, int]:
+                priority = req.priority
+                if priority is None:
+                    priority = (
+                        sys.maxsize
+                        if server_args.schedule_low_priority_values_first
+                        else -sys.maxsize - 1
+                    )
+                return (priority * (-priority_sign), *length_key(req))
+
+            sorted_indices.sort(
+                key=lambda i: retraction_key(reqs[i]),
+                reverse=True,
+            )
+            return sorted_indices
+
+        sorted_indices.sort(
+            key=lambda i: length_key(reqs[i]),
+            reverse=True,
+        )
+        return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         release_req(
@@ -2680,6 +2740,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        server_args = get_server_args()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2736,15 +2797,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if get_global_server_args().enable_mamba_extra_buffer():
-            mamba_track_interval = get_global_server_args().mamba_track_interval
+        if server_args.enable_mamba_extra_buffer():
+            mamba_track_interval = server_args.mamba_track_interval
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                if get_global_server_args().enable_mamba_extra_buffer_lazy():
+                if server_args.enable_mamba_extra_buffer_lazy():
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
@@ -2932,7 +2993,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
-            server_args = get_global_server_args()
+            server_args = get_server_args()
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
@@ -3001,3 +3062,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
+
+
+class NextBatchPlan(msgspec.Struct):
+    batch_to_run: Optional[ScheduleBatch]
+    running_batch: ScheduleBatch
