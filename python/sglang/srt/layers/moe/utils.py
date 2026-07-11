@@ -12,7 +12,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -20,7 +25,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +244,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     """
 
     # 0. Parse server argument.
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
         return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
@@ -512,20 +517,27 @@ def should_use_dp_reduce_scatterv():
     )
 
 
-def should_skip_post_experts_all_reduce(
-    *,
-    is_tp_path: bool,
-    use_reduce_scatter: bool = False,
-    should_allreduce_fusion: bool = False,
-) -> bool:
+def should_skip_mlp_all_reduce() -> bool:
+    """Whether dense MLP / row-parallel projections should skip their all-reduce.
+
+    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
+    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
+    on ``get_forward()``.
+    """
+    f = get_forward()
+    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+
+
+def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """Whether to skip the post-experts all-reduce (EP or TP) because a
     downstream component will fuse, replace, or absorb it.
 
     Skip reasons, in order:
-      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
-        with the next layer's residual all-reduce.
-      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
-        do reduce-scatter, which would double-reduce on top of an all-reduce.
+      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
+        all-reduce with the next layer's residual all-reduce.
+      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
+        scatter will do reduce-scatter, which would double-reduce on top of
+        an all-reduce.
       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
         path replaces the all-reduce with a reduce-scatterv.
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
@@ -538,11 +550,11 @@ def should_skip_post_experts_all_reduce(
         ``not enable_alltoall`` gate
         (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
 
-    The first two args are layer-context flags from ``LayerCommunicator`` and
-    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+    The first two reasons come from per-layer ``ForwardFlags`` published by
+    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
-    if should_allreduce_fusion or use_reduce_scatter:
+    if should_skip_mlp_all_reduce():
         return True
     if should_use_dp_reduce_scatterv():
         return True

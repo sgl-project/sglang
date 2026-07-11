@@ -4,7 +4,9 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
+import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -30,7 +32,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
@@ -712,7 +714,7 @@ def _adjust_embedding_length(
             f"tokens from multimodal embeddings."
         )
         if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_global_server_args().chunked_prefill_size
+            chunked_prefill_size = get_server_args().chunked_prefill_size
             if chunked_prefill_size != -1:
                 logger.warning(
                     "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
@@ -1071,7 +1073,7 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            server_args = get_global_server_args()
+            server_args = get_server_args()
             if server_args and server_args.enable_adaptive_dispatch_to_encoder:
                 # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                 input_embeds, other_info = _embed_mm_inputs_with_split(
@@ -1117,7 +1119,7 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_global_server_args().language_only:
+                            if get_server_args().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
                                 )
@@ -1249,8 +1251,12 @@ def tensor_hash(tensor_list) -> int:
 
 def hash_feature(f):
     if isinstance(f, list):
-        if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
-            return tensor_hash([x.tensor for x in f])
+        # A list may mix ShmPointerMMData and plain tensors, since wrapping
+        # falls back to inline transport per element when shm allocation fails.
+        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
+            return tensor_hash(
+                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
+            )
         if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
@@ -1688,6 +1694,12 @@ class ShmPointerMMData:
             create=True, size=nbytes, name=make_shm_name("mm")
         )
         try:
+            if sys.platform == "linux":
+                # SharedMemory only ftruncates the segment, so tmpfs pages are
+                # allocated lazily at write time; if /dev/shm fills up mid-copy
+                # the process is killed with SIGBUS. Reserving the pages up
+                # front turns exhaustion into a catchable OSError (ENOSPC).
+                os.posix_fallocate(shm._fd, 0, nbytes)
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
@@ -1744,9 +1756,24 @@ def _get_is_default_transport():
         )
 
         _is_default_tensor_transport = (
-            _determine_tensor_transport_mode(get_global_server_args()) == "default"
+            _determine_tensor_transport_mode(get_server_args()) == "default"
         )
     return _is_default_tensor_transport
+
+
+def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
+    transport when shared memory cannot be allocated, e.g. /dev/shm is full
+    under a burst of multimodal requests."""
+    try:
+        return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+    except OSError as e:
+        print_warning_once(
+            f"Failed to allocate shared memory for multimodal feature transport "
+            f"({e}); falling back to inline transport. "
+            f"Consider increasing /dev/shm size."
+        )
+        return tensor
 
 
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
@@ -1757,10 +1784,10 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     so per-element hashes are not applicable.
     """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return ShmPointerMMData(value, precomputed_hash=precomputed_hash)
+        return _wrap_shm_or_inline(value, precomputed_hash=precomputed_hash)
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            (_wrap_shm_or_inline(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
@@ -1771,7 +1798,7 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
         return obj
 
     if obj.mm_inputs:
@@ -1832,7 +1859,7 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
         return obj
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):
