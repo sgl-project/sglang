@@ -88,8 +88,9 @@ class TestHTTPServerLiveness(CustomTestCase):
                         },
                     )
                 )
-                await asyncio.sleep(0)
-                ping_response = await client.get("/ping")
+                # Queue liveness before chat conversion gets its first event-loop turn.
+                ping_task = asyncio.create_task(client.get("/ping"))
+                ping_response = await ping_task
                 ping_completed.set()
                 chat_response = await chat_task
                 return ping_response, chat_response
