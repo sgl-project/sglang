@@ -16,7 +16,7 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     compute_verify_token_budget,
     schedule_verify_lens_topk_from_survival,
 )
-from sglang.srt.speculative.dspark_components.dspark_sps_table import (
+from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
 )

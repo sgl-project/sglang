@@ -23,7 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     VerifyBudgetDecision,
     build_sps_cost_table,
 )
-from sglang.srt.speculative.dspark_components.dspark_sps_table import (
+from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsCostTable,
     is_uninitialized_sps_table,
 )

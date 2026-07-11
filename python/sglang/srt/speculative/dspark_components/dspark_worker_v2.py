@@ -56,7 +56,7 @@ from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.dspark_components.dspark_sps_recorder import (
+from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsDataRecorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_sts import (

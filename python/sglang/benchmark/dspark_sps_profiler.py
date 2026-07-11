@@ -37,7 +37,7 @@ try:
         should_skip_due_to_token_capacity,
     )
     from sglang.benchmark.utils import get_tokenizer
-    from sglang.srt.speculative.dspark_components.dspark_sps_table import (
+    from sglang.srt.speculative.dspark_components.dspark_sps import (
         SpsAdditiveCostTable,
         load_sps_table_from_path,
         profile_sps_table,
@@ -50,8 +50,8 @@ except ImportError as exc:
     )
     _benchmark_dir = Path(__file__).resolve().parent
     _table_module = _load_module_by_path(
-        "dspark_sps_table",
-        _benchmark_dir.parent / "srt/speculative/dspark_components/dspark_sps_table.py",
+        "dspark_sps",
+        _benchmark_dir.parent / "srt/speculative/dspark_components/dspark_sps.py",
     )
     SpsAdditiveCostTable = _table_module.SpsAdditiveCostTable
     load_sps_table_from_path = _table_module.load_sps_table_from_path
@@ -61,7 +61,7 @@ except ImportError as exc:
     should_skip_due_to_max_running_requests = None
     should_skip_due_to_token_capacity = None
 
-DEFAULT_OUT = "dspark_sps_table.json"
+DEFAULT_OUT = "dspark_sps.json"
 DEFAULT_MAX_BATCH_SIZE = 256
 DEFAULT_INPUT_LEN = 16
 DEFAULT_TEMPERATURE = 1.0

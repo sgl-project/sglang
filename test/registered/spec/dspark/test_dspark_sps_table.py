@@ -3,10 +3,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.speculative.dspark_components.dspark_sps_table import (
+from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
-    build_batch_size_sweep,
     build_uninitialized_sps_table,
     is_uninitialized_sps_table,
     load_sps_table_from_path,
@@ -186,25 +185,6 @@ class TestBuildSpsCostTableContract(CustomTestCase):
         self.assertEqual(loaded.sample_batch_tokens, table.sample_batch_tokens)
         self.assertEqual(loaded.sample_steps_per_sec, table.sample_steps_per_sec)
         self.assertEqual(loaded.max_batch_tokens, table.max_batch_tokens)
-
-
-class TestBuildBatchSizeSweep(CustomTestCase):
-    def _sweep(self, max_num_tokens):
-        return build_batch_size_sweep(max_num_tokens)
-
-    def test_sweep_is_strictly_increasing_deduped_and_ends_at_max(self):
-        for max_num_tokens in (8, 100, 1024, 4096, 8192):
-            sweep = self._sweep(max_num_tokens)
-            self.assertEqual(sweep, sorted(set(sweep)))
-            self.assertTrue(all(1 <= value <= max_num_tokens for value in sweep))
-            self.assertEqual(sweep[-1], max_num_tokens)
-
-    def test_tiny_max_truncates_the_taper(self):
-        self.assertEqual(self._sweep(8), [1, 2, 4, 8])
-
-    def test_non_positive_max_raises(self):
-        with self.assertRaises(ValueError):
-            self._sweep(0)
 
 
 class TestIsUninitializedSpsTable(CustomTestCase):

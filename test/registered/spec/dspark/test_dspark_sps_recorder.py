@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.speculative.dspark_components.dspark_sps_recorder import (
+from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsDataRecorder,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
