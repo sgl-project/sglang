@@ -2491,6 +2491,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         return swa.sliding_window_size if swa else None
 
+    def swa_reprefill_tail_tokens(self) -> int:
+        """
+        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never offloaded to host, so a
+        reused prefix's trailing sliding window would read another request's
+        stale ring slots. Re-prefilling that window rewrites this request's ring
+        (what plain radix reuse does via its SWA match gate). 0 for every other
+        layout.
+        """
+        swa = self.components.get(ComponentType.SWA)
+        unified_compress_only_hicache = (
+            self.cache_controller is not None
+            and swa is not None
+            and swa._swa_kv_pool_host is None
+        )
+        return swa.sliding_window_size if unified_compress_only_hicache else 0
+
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components
 
