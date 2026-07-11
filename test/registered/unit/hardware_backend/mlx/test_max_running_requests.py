@@ -14,6 +14,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -34,7 +35,7 @@ def _stub(max_running_requests, max_total_num_tokens, dp_size=1):
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
-class TestMlxMaxRunningRequests(unittest.TestCase):
+class TestMlxMaxRunningRequests(CustomTestCase):
     def test_flag_unset_uses_capacity_default(self):
         # No flag -> min(pool // 2, 4096), the previous default.
         self.assertEqual(_stub(None, 1000)._resolve_max_running_requests(), 500)
