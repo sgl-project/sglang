@@ -1,12 +1,5 @@
-import os
 import types
 import unittest
-
-# This suite runs on CPU-only CI; pin the layout kernels to their torch
-# implementations (the triton defaults require CUDA tensors). Must be set
-# before the kernel modules are imported.
-os.environ.setdefault("SGLANG_DSPARK_KERNEL_QO_INDPTR", "torch")
-os.environ.setdefault("SGLANG_DSPARK_KERNEL_PADDED_TO_BUCKET", "torch")
 
 import torch
 

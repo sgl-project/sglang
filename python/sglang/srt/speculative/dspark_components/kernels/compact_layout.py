@@ -4,10 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+    inputs_on_cuda,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_COMPACT_LAYOUT.get()
 
 _SEARCH_NBITS = 11
 
@@ -17,9 +17,9 @@ class CompactRowIndex:
     def execute(
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(
@@ -53,9 +53,9 @@ class CompactRowIndex:
 class CompactVerifyIds:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(

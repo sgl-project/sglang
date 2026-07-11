@@ -5,19 +5,20 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
-
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_COMMIT_KV_PROJ.get()
-
 _STACKED_WEIGHT_CACHE: dict[int, _StackedWkvWeight] = {}
 
 
 class CommitKvProj:
     @classmethod
-    def execute(cls, *args, **kwargs) -> list[torch.Tensor]:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+    def execute(
+        cls,
+        *,
+        main_x: torch.Tensor,
+        wkv_linears: list[torch.nn.Module],
+    ) -> list[torch.Tensor]:
+        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
+            return cls.triton(main_x=main_x, wkv_linears=wkv_linears)
+        return cls.torch(main_x=main_x, wkv_linears=wkv_linears)
 
     @classmethod
     def torch(
@@ -88,43 +89,69 @@ def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWei
     return cached
 
 
+def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
+    quant_method = wkv_linears[0].quant_method
+    block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
+    if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
+        return False
+    block_out = quant_method.quant_config.weight_block_size[0]
+    return all(
+        linear.weight.dtype == torch.float8_e4m3fn
+        and linear.weight.shape[0] % block_out == 0
+        for linear in wkv_linears
+    )
+
+
+def _dequant_supported(linear: torch.nn.Module) -> bool:
+    """Mirrors the preconditions asserted in _dequant_linear_weight."""
+    weight = linear.weight
+    if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return True
+    if weight.dtype != torch.float8_e4m3fn:
+        return False
+    block = 128
+    out_dim, in_dim = weight.shape
+    expected_scale_shape = (
+        (out_dim + block - 1) // block,
+        (in_dim + block - 1) // block,
+    )
+    return tuple(linear.weight_scale_inv.shape) == expected_scale_shape
+
+
+def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
+    """Whether _build_stacked_wkv_weight can handle these weights; unsupported
+    quant schemes fall back to the per-linear torch path in execute()."""
+    if _block_quant_stack_applies(wkv_linears=wkv_linears):
+        return True
+    return all(_dequant_supported(linear) for linear in wkv_linears)
+
+
 def _build_stacked_wkv_weight(
     *, wkv_linears: list[torch.nn.Module]
 ) -> _StackedWkvWeight:
-    first = wkv_linears[0]
-    quant_method = first.quant_method
-    block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
-    if block_quant and hasattr(quant_method, "w8a8_block_fp8_linear"):
-        block_out = quant_method.quant_config.weight_block_size[0]
-        if all(
-            linear.weight.dtype == torch.float8_e4m3fn
-            and linear.weight.shape[0] % block_out == 0
-            for linear in wkv_linears
-        ):
-            weight = torch.cat([linear.weight for linear in wkv_linears], dim=0)
-            if wkv_linears[0].weight_scale_inv.dtype == torch.int32:
-                from sglang.srt.layers.quantization.fp8_utils import (
-                    inverse_transform_scale_ue8m0,
-                    transform_scale_ue8m0,
-                )
-
-                sf_fp32 = torch.cat(
-                    [
-                        inverse_transform_scale_ue8m0(
-                            linear.weight_scale_inv, mn=linear.weight.shape[0]
-                        )
-                        for linear in wkv_linears
-                    ],
-                    dim=0,
-                )
-                scale = transform_scale_ue8m0(sf_fp32, mn=weight.shape[0])
-                return _StackedWkvWeight(weight=weight, fp8_scale=scale)
-            scale = torch.cat(
-                [linear.weight_scale_inv for linear in wkv_linears], dim=0
+    if _block_quant_stack_applies(wkv_linears=wkv_linears):
+        weight = torch.cat([linear.weight for linear in wkv_linears], dim=0)
+        if wkv_linears[0].weight_scale_inv.dtype == torch.int32:
+            from sglang.srt.layers.quantization.fp8_utils import (
+                inverse_transform_scale_ue8m0,
+                transform_scale_ue8m0,
             )
-            if scale.dim() >= 2 and scale.stride(-2) != 1:
-                scale = scale.transpose(-2, -1).contiguous().transpose(-2, -1)
+
+            sf_fp32 = torch.cat(
+                [
+                    inverse_transform_scale_ue8m0(
+                        linear.weight_scale_inv, mn=linear.weight.shape[0]
+                    )
+                    for linear in wkv_linears
+                ],
+                dim=0,
+            )
+            scale = transform_scale_ue8m0(sf_fp32, mn=weight.shape[0])
             return _StackedWkvWeight(weight=weight, fp8_scale=scale)
+        scale = torch.cat([linear.weight_scale_inv for linear in wkv_linears], dim=0)
+        if scale.dim() >= 2 and scale.stride(-2) != 1:
+            scale = scale.transpose(-2, -1).contiguous().transpose(-2, -1)
+        return _StackedWkvWeight(weight=weight, fp8_scale=scale)
     weight = torch.cat(
         [_dequant_linear_weight(linear) for linear in wkv_linears], dim=0
     )
@@ -137,7 +164,8 @@ def _dequant_linear_weight(linear: torch.nn.Module) -> torch.Tensor:
         return weight.to(torch.bfloat16)
     assert weight.dtype == torch.float8_e4m3fn, (
         f"unsupported wkv weight dtype {weight.dtype} for the fused commit kv proj; "
-        f"set SGLANG_DSPARK_KERNEL_COMMIT_KV_PROJ=torch"
+        f"execute() should have routed this to the torch path "
+        f"(_fused_commit_kv_proj_supported)"
     )
     block = 128
     scale = linear.weight_scale_inv
@@ -149,7 +177,8 @@ def _dequant_linear_weight(linear: torch.nn.Module) -> torch.Tensor:
     assert tuple(scale.shape) == expected_scale_shape, (
         f"wkv weight_scale_inv shape {tuple(scale.shape)} does not match the "
         f"128x128 block grid {expected_scale_shape} for weight {tuple(weight.shape)}; "
-        f"set SGLANG_DSPARK_KERNEL_COMMIT_KV_PROJ=torch"
+        f"execute() should have routed this to the torch path "
+        f"(_fused_commit_kv_proj_supported)"
     )
     scale_full = scale.repeat_interleave(block, dim=0)[:out_dim]
     scale_full = scale_full.repeat_interleave(block, dim=1)[:, :in_dim]

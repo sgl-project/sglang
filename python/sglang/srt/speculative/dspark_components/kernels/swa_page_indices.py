@@ -7,10 +7,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+    inputs_on_cuda,
+)
 from sglang.srt.utils import ceil_align
-
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_SWA_PAGE_INDICES.get()
 
 
 class DsparkWindowGather(msgspec.Struct, frozen=True):
@@ -25,9 +25,9 @@ class DsparkWindowGather(msgspec.Struct, frozen=True):
 class ComputeDsparkWindowGather:
     @classmethod
     def execute(cls, *args, **kwargs) -> DsparkWindowGather:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(
@@ -65,9 +65,9 @@ class ComputeDsparkWindowGather:
 class BuildDsparkSwaPageIndices:
     @classmethod
     def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(

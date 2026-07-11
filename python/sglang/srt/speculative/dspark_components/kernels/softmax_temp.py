@@ -4,22 +4,22 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+    inputs_on_cuda,
+)
 
 try:
     from flashinfer.sampling import softmax as _flashinfer_softmax
 except ImportError:
     _flashinfer_softmax = None
 
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP.get()
-
 
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if _KERNEL_IMPL == "torch":
+        if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        if _KERNEL_IMPL == "flashinfer":
+        if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
@@ -160,7 +160,7 @@ def softmax_temp_flashinfer(
 ) -> torch.Tensor:
     if _flashinfer_softmax is None:
         raise RuntimeError(
-            "SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP=flashinfer requires flashinfer.sampling.softmax, "
+            "softmax_temp_flashinfer requires flashinfer.sampling.softmax, "
             "which is unavailable in this environment"
         )
     num_rows, vocab = logits.shape[0], logits.shape[-1]

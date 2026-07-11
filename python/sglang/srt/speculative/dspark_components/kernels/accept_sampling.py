@@ -6,7 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -15,10 +14,11 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.dspark_components.kernels.cap_correct_len import (
     CapCorrectLen,
 )
+from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+    inputs_on_cuda,
+)
 from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
 from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
-
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_ACCEPT_SAMPLING.get()
 
 
 class AcceptSampling:
@@ -26,9 +26,9 @@ class AcceptSampling:
     def execute(
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(

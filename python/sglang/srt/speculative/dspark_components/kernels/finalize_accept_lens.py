@@ -5,9 +5,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_FINALIZE_ACCEPT.get()
+from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+    inputs_on_cuda,
+)
 
 
 class FinalizeAcceptLensResult(msgspec.Struct):
@@ -19,9 +19,9 @@ class FinalizeAcceptLensResult(msgspec.Struct):
 class FinalizeAcceptLens:
     @classmethod
     def execute(cls, *args, **kwargs) -> FinalizeAcceptLensResult:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
 
     @classmethod
     def torch(

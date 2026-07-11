@@ -4,10 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
-_KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_SAMPLE_STEP_TOKENS.get()
-
 _BLOCK_V = 1024
 _IDX_SENTINEL = tl.constexpr(2147483647)
 
@@ -22,14 +18,14 @@ class SampleStepTokens:
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
     ) -> torch.Tensor:
-        if _KERNEL_IMPL == "torch":
-            return cls.torch(
+        if step_logits.is_cuda:
+            return cls.triton(
                 step_logits=step_logits,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
                 exp_noise=exp_noise,
             )
-        return cls.triton(
+        return cls.torch(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
