@@ -533,10 +533,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         input_ids = getattr(req, "origin_input_ids", None)
         if not input_ids:
             return None
-        prefix_len = min(len(input_ids), 2048)
-        if prefix_len <= 0:
-            return None
-        return prefix_len, tuple(int(x) for x in input_ids[:prefix_len])
+        # Only serialize exact same full prompts. Shared-prefix workloads often
+        # differ in the question tail and prefill can trim their hidden transfer
+        # after its own prefix-cache hit; treating the first 2K tokens as the key
+        # serializes those independent tail transfers and keeps prealloc high.
+        return len(input_ids), tuple(int(x) for x in input_ids)
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
