@@ -17,6 +17,7 @@ from unittest import mock
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -47,7 +48,7 @@ def _patch_use_mlx(value):
     )
 
 
-class TestMlxLogprobGuard(unittest.TestCase):
+class TestMlxLogprobGuard(CustomTestCase):
     def test_return_logprob_rejected_under_mlx(self):
         """THE REGRESSION: logprobs + MLX -> clean ValueError, not a crash."""
         tm, obj = _make_tm(), _make_req(return_logprob=True)
