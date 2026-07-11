@@ -2349,6 +2349,13 @@ class ServerArgs:
         Optional[str],
         "The diffusion LLM algorithm configurations. Must be a YAML file.",
     ] = None
+    dllm_fdfo: A[
+        bool,
+        Arg(
+            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM inference. Enabled by default; use --no-dllm-fdfo to fall back to synchronous block scheduling.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
 
     # -------------------------------------------------------------------------
     # PD disaggregation
