@@ -1538,6 +1538,11 @@ class MultiModalMixin:
                         feature = item.feature
                         if isinstance(feature, torch.Tensor):
                             feature = feature.to(device=target_device)
+                            if feature.dim() == 5:
+                                # Flatten the size-1 "images per call" dim so anyres
+                                # models (e.g. LLaVA-OneVision) with a varying tile
+                                # count per image can still be concatenated below.
+                                feature = feature.reshape(-1, *feature.shape[2:])
                         if feature_key not in kwargs:
                             kwargs[feature_key] = feature
                         elif isinstance(feature, torch.Tensor) and isinstance(
