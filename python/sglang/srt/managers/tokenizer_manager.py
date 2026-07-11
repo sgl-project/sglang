@@ -761,6 +761,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if obj.contains_mm_input() and not self.model_config.is_multimodal:
+            if self.model_config.is_lm_only:
+                raise ValueError(
+                    "Multimodal inputs are not supported in language-model-only "
+                    "mode because the encoder is not loaded."
+                )
+            if not self.model_config.enable_multimodal:
+                raise ValueError(
+                    "Multimodal inputs are disabled. Restart with "
+                    "--enable-multimodal to process images, video, or audio."
+                )
+            raise ValueError("The served model does not support multimodal inputs.")
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -1024,11 +1036,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
-        if contains_mm_input and self.server_args.language_model_only:
-            raise ValueError(
-                "Multimodal inputs are not supported when --language-model-only "
-                "is set; the encoder is not loaded. Restart without the flag."
-            )
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
