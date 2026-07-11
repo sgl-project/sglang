@@ -37,6 +37,7 @@ from sglang.srt.speculative.draft_worker_common import (
     build_draft_tp_worker,
     make_draft_block_spec_info,
     make_draft_input_v2,
+    make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -80,7 +81,7 @@ class _DflashDraftSampler:
             device=weight.device,
         )
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
@@ -304,7 +305,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if capture_decode_cuda_graph:
             # Must run before capture so the draft graph folds the head in.
             self._draft_sampler = self._maybe_build_draft_sampler()
-            self.draft_model_runner.dflash_draft_sampler = self._draft_sampler
+            if self._draft_sampler is not None:
+                self.draft_model_runner.capture_tail_hooks.append(
+                    make_draft_sampler_capture_hook(self._draft_sampler)
+                )
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
