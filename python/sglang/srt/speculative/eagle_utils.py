@@ -25,6 +25,7 @@ from sglang.srt.speculative.triton_ops.spec_tree import (
     verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -46,6 +47,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,11 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+elif _is_cpu:
+    from sgl_kernel import (
+        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
+    )
+    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
 ALLOC_EXTEND_FUNCS = defaultdict(
@@ -137,6 +144,12 @@ class TreeMaskMode(IntEnum):
     FULL_MASK = 0
     QLEN_ONLY = 1
     QLEN_ONLY_BITPACKING = 2
+
+
+def default_tree_mask_mode() -> TreeMaskMode:
+    # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+    # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+    return TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
 
 
 def build_tree_kernel_efficient(
@@ -230,6 +243,21 @@ def build_tree_kernel_efficient(
         )
     elif _is_xpu:
         sgl_build_tree_kernel_triton(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    elif _is_cpu:
+        sgl_build_tree_kernel_efficient_cpu(
             parent_list,
             top_scores_index,
             seq_lens,
@@ -370,6 +398,20 @@ def verify_tree_greedy_func(
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
             # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+
+    elif _is_cpu:
+        sgl_verify_tree_greedy_cpu(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match the CUDA op schema, so
+            # the CPU/CUDA call sites stay grep-symmetric.
             retrive_index=retrieve_index,
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,
@@ -617,7 +659,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(

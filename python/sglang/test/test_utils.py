@@ -8,6 +8,10 @@ import inspect
 import json
 import logging
 import os
+
+# Registered tests run with the strict config-mutation guard: bare
+# server_args assignments after resolution raise (use ServerArgs.override).
+os.environ.setdefault("SGLANG_STRICT_CONFIG_MUTATION", "1")
 import random
 import re
 import shlex

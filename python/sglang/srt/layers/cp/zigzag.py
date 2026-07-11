@@ -17,10 +17,10 @@
 For ``cp_size = 4``, each sequence is split into ``2 * cp_size`` blocks. Each
 rank owns one early block and one late block:
 
-    dp_attn_tp0: block0, block7
-    dp_attn_tp1: block1, block6
-    dp_attn_tp2: block2, block5
-    dp_attn_tp3: block3, block4
+    cp0: block0, block7
+    cp1: block1, block6
+    cp2: block2, block5
+    cp3: block3, block4
 
 After all-gather, the blocks are reranged back to their original order:
 

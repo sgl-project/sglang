@@ -38,7 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -1197,8 +1197,8 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # XPU/NPU: even ranks send first, odd ranks recv first.
+        send_first = (not (is_xpu() or is_npu())) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1483,11 +1483,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
-            """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

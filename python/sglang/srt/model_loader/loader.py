@@ -247,6 +247,7 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:
@@ -574,6 +575,34 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 server_args.weight_loader_drop_cache_after_load
             )
+
+            # Prefetch and multi-threaded loading both read the same shards,
+            # competing for I/O on shared/network storage. When prefetch is
+            # active (mmap path, not FASTSAFETENSORS) and the user didn't
+            # explicitly request multi-threaded loading, fall back to the
+            # single-threaded loader and let prefetch feed the page cache.
+            # Setting enable_multithread_load or num_threads in
+            # --model-loader-extra-config opts out (the latter is consumed
+            # only by the multi-threaded iterator, so it signals intent);
+            # e.g. local NVMe, where prefetch is a no-op and multi-threading
+            # helps.
+            if (
+                weight_loader_prefetch
+                and not weight_loader_disable_mmap
+                and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
+                and use_multithread
+                and not (
+                    {"enable_multithread_load", "num_threads"} & extra_config.keys()
+                )
+            ):
+                logger.warning(
+                    "--weight-loader-prefetch-checkpoints is enabled; falling "
+                    "back to single-threaded weight loading to avoid I/O "
+                    "oversubscription with the prefetch threads. Set "
+                    "enable_multithread_load=true in --model-loader-extra-config "
+                    "to keep multi-threaded loading."
+                )
+                use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(

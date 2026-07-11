@@ -675,7 +675,14 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        # Kernel write-back keeps host indices on CPU only for page_first AND only
+        # when the staged JIT write-back kernel is available (it stages through
+        # device memory and accepts CPU destination indices). Otherwise we fall back
+        # to the plain transfer kernel, whose CUDA/HIP implementation requires
+        # device-resident destination indices -- so the indices must be moved to the
+        # device first. Without the can_use_write_back_jit check this crashes on
+        # backends where the JIT kernel is unavailable, with
+        # "Destination indices must be a CUDA tensor".
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
