@@ -127,6 +127,10 @@ DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
 DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
 
+# Standalone with DP-Attention models
+DEFAULT_TARGET_MODEL_STANDALONE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DRAFT_MODEL_STANDALONE_DP_ATTN = "Qwen/Qwen3-0.6B"
+
 # N-gram speculative decoding models
 DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
