@@ -77,7 +77,7 @@ def build_commit_inject_layout(
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
-    from sglang.srt.speculative.triton_ops.cache_locs import (
+    from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_func,
     )
 

@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -11,7 +12,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
-from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 
 
 def local_verify_tier_num_tokens(
