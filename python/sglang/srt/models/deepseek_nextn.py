@@ -242,9 +242,7 @@ class DeepseekModelNextN(nn.Module):
                     residual,
                     zero_allocator,
                     prev_topk_indices=(
-                        getattr(
-                            forward_batch.spec_info, "dsa_topk_indices", None
-                        )
+                        getattr(forward_batch.spec_info, "dsa_topk_indices", None)
                         if forward_batch.reuse_dsa_topk_indices
                         else None
                     ),

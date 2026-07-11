@@ -340,10 +340,7 @@ class FutureMap:
             )
 
     def _maybe_init_dsa_topk_indices_buf(self, payload: RelayPayload) -> None:
-        if (
-            self.dsa_topk_indices_buf is not None
-            or payload.dsa_topk_indices is None
-        ):
+        if self.dsa_topk_indices_buf is not None or payload.dsa_topk_indices is None:
             return
         seed0 = payload.dsa_topk_indices[0]
         self.dsa_topk_indices_buf = torch.empty(
