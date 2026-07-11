@@ -18,7 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.kernels import (
     accept_greedy,
     accept_sampling,
-    build_block_seq_lens_casual,
+    build_block_seq_lens_causal,
     build_out_tokens,
     build_ragged_verify_window,
     build_step_local,
@@ -27,8 +27,7 @@ from sglang.srt.speculative.dspark_components.kernels import (
     commit_inject_layout,
     commit_kv_proj,
     compact_layout,
-    dspark_swa_page_indices,
-    expand_prefill_casually,
+    expand_prefill_causally,
     finalize_accept_lens,
     mixed_accept_select,
     padded_to_bucket,
@@ -38,6 +37,7 @@ from sglang.srt.speculative.dspark_components.kernels import (
     scatter_compact_to_strided,
     schedule_verify_lens_topk,
     softmax_temp,
+    swa_page_indices,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -103,12 +103,12 @@ def _case_accept_sampling(tc):
     tc._eq(got, ref)
 
 
-def _case_build_block_seq_lens_casual(tc):
+def _case_build_block_seq_lens_causal(tc):
     torch.manual_seed(2)
     seq_lens = _ri(1, 100000, (128,))
     for block_size in (1, 5, 7):
         tc._parity(
-            build_block_seq_lens_casual.BuildBlockSeqLensCasual,
+            build_block_seq_lens_causal.BuildBlockSeqLensCausal,
             seq_lens=seq_lens,
             block_size=block_size,
             device=DEVICE,
@@ -289,18 +289,18 @@ def _case_compact_layout(tc):
         )
 
 
-def _case_dspark_swa_page_indices(tc):
+def _case_swa_page_indices(tc):
     torch.manual_seed(11)
     block_size, num_q, max_reqs, n_full = 5, 320, 300, 50000
     _, gather = tc._parity(
-        dspark_swa_page_indices.ComputeDsparkWindowGather,
+        swa_page_indices.ComputeDsparkWindowGather,
         seq_lens_casual=_ri(1, 300, (num_q,), torch.int32),
         req_pool_indices_repeated=_ri(0, max_reqs, (num_q,)),
         block_size=block_size,
         swa_window=128,
     )
     tc._parity(
-        dspark_swa_page_indices.BuildDsparkSwaPageIndices,
+        swa_page_indices.BuildDsparkSwaPageIndices,
         req_to_token=_ri(0, n_full, (max_reqs, 400), torch.int32),
         full_to_swa_mapping=_ri(0, 20000, (n_full,), torch.int32),
         req_pool_indices_per_request=gather.req_pool_indices_per_request,
@@ -314,7 +314,7 @@ def _case_dspark_swa_page_indices(tc):
     )
 
 
-def _case_expand_prefill_casually(tc):
+def _case_expand_prefill_causally(tc):
     torch.manual_seed(12)
     # Vectorized branch: ragged extends with padded token count.
     bs = 64
@@ -323,7 +323,7 @@ def _case_expand_prefill_casually(tc):
     req_pool_indices = torch.randperm(512, device=DEVICE)[:bs]
     seq_lens = _ri(8, 500, (bs,))
     tc._parity(
-        expand_prefill_casually.ExpandPrefillCasually,
+        expand_prefill_causally.ExpandPrefillCausally,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         extend_seq_lens=extend,
@@ -336,7 +336,7 @@ def _case_expand_prefill_casually(tc):
     # Loop branch: uniform extend with CPU lens and no padding.
     bs2, block = 8, 6
     tc._parity(
-        expand_prefill_casually.ExpandPrefillCasually,
+        expand_prefill_causally.ExpandPrefillCausally,
         req_pool_indices=req_pool_indices[:bs2],
         seq_lens=seq_lens[:bs2],
         extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
@@ -524,7 +524,7 @@ def _case_softmax_temp(tc):
 _CASES = [
     ("accept_greedy", _case_accept_greedy),
     ("accept_sampling", _case_accept_sampling),
-    ("build_block_seq_lens_casual", _case_build_block_seq_lens_casual),
+    ("build_block_seq_lens_causal", _case_build_block_seq_lens_causal),
     ("build_out_tokens", _case_build_out_tokens),
     ("build_ragged_verify_window", _case_build_ragged_verify_window),
     ("build_step_local", _case_build_step_local),
@@ -533,8 +533,8 @@ _CASES = [
     ("commit_inject_layout", _case_commit_inject_layout),
     ("commit_kv_proj", _case_commit_kv_proj),
     ("compact_layout", _case_compact_layout),
-    ("dspark_swa_page_indices", _case_dspark_swa_page_indices),
-    ("expand_prefill_casually", _case_expand_prefill_casually),
+    ("swa_page_indices", _case_swa_page_indices),
+    ("expand_prefill_causally", _case_expand_prefill_causally),
     ("finalize_accept_lens", _case_finalize_accept_lens),
     ("mixed_accept_select", _case_mixed_accept_select),
     ("padded_to_bucket", _case_padded_to_bucket),

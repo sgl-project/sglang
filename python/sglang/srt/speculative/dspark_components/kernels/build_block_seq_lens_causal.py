@@ -9,7 +9,7 @@ from sglang.srt.environ import envs
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_BLOCK_SEQ_LENS_CASUAL.get()
 
 
-class BuildBlockSeqLensCasual:
+class BuildBlockSeqLensCausal:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if _KERNEL_IMPL == "torch":
@@ -24,7 +24,7 @@ class BuildBlockSeqLensCasual:
         block_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        return build_block_seq_lens_casual(
+        return build_block_seq_lens_causal(
             seq_lens=seq_lens,
             block_size=block_size,
             device=device,
@@ -38,14 +38,14 @@ class BuildBlockSeqLensCasual:
         block_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        return build_block_seq_lens_casual_triton(
+        return build_block_seq_lens_causal_triton(
             seq_lens=seq_lens,
             block_size=block_size,
             device=device,
         )
 
 
-def build_block_seq_lens_casual(
+def build_block_seq_lens_causal(
     *,
     seq_lens: torch.Tensor,
     block_size: int,
@@ -73,7 +73,7 @@ def _block_seq_lens_casual_kernel(
     tl.store(out_ptr + offs, (prefix + col + 1).to(tl.int32), mask=mask)
 
 
-def build_block_seq_lens_casual_triton(
+def build_block_seq_lens_causal_triton(
     *,
     seq_lens: torch.Tensor,
     block_size: int,

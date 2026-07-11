@@ -12,14 +12,14 @@ from sglang.srt.environ import envs
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_EXPAND_PREFILL.get()
 
 
-class ExpandPrefillCasuallyResult(msgspec.Struct):
+class ExpandPrefillCausallyResult(msgspec.Struct):
     seq_lens_casual: torch.Tensor
     req_pool_indices_repeated: torch.Tensor
 
 
-class ExpandPrefillCasually:
+class ExpandPrefillCausally:
     @classmethod
-    def execute(cls, *args, **kwargs) -> ExpandPrefillCasuallyResult:
+    def execute(cls, *args, **kwargs) -> ExpandPrefillCausallyResult:
         if _KERNEL_IMPL == "torch":
             return cls.torch(*args, **kwargs)
         return cls.triton(*args, **kwargs)
@@ -36,8 +36,8 @@ class ExpandPrefillCasually:
         extend_seq_lens_cpu: Optional[list[int]],
         num_tokens: int,
         padded_num_tokens: Optional[int],
-    ) -> ExpandPrefillCasuallyResult:
-        return expand_prefill_casually(
+    ) -> ExpandPrefillCausallyResult:
+        return expand_prefill_causally(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens,
@@ -60,8 +60,8 @@ class ExpandPrefillCasually:
         extend_seq_lens_cpu: Optional[list[int]],
         num_tokens: int,
         padded_num_tokens: Optional[int],
-    ) -> ExpandPrefillCasuallyResult:
-        return expand_prefill_casually_triton(
+    ) -> ExpandPrefillCausallyResult:
+        return expand_prefill_causally_triton(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens,
@@ -70,7 +70,7 @@ class ExpandPrefillCasually:
         )
 
 
-def expand_prefill_casually(
+def expand_prefill_causally(
     *,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -80,7 +80,7 @@ def expand_prefill_casually(
     extend_seq_lens_cpu: Optional[list[int]],
     num_tokens: int,
     padded_num_tokens: Optional[int],
-) -> ExpandPrefillCasuallyResult:
+) -> ExpandPrefillCausallyResult:
     device = req_pool_indices.device
     cuda_int32_kwargs = {"dtype": torch.int32, "device": device}
 
@@ -112,7 +112,7 @@ def expand_prefill_casually(
                     req_pool_indices_repeated[-1:].expand(pad_size),
                 )
             )
-        return ExpandPrefillCasuallyResult(
+        return ExpandPrefillCausallyResult(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
         )
@@ -140,14 +140,14 @@ def expand_prefill_casually(
             (0, pad_size),
             value=req_pool_indices_repeated[-1].item(),
         )
-    return ExpandPrefillCasuallyResult(
+    return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
         req_pool_indices_repeated=req_pool_indices_repeated,
     )
 
 
 @triton.jit
-def _expand_prefill_casually_kernel(
+def _expand_prefill_causally_kernel(
     req_pool_ptr,
     seq_lens_ptr,
     extend_seq_lens_ptr,
@@ -176,22 +176,22 @@ def _expand_prefill_casually_kernel(
     seq_len = tl.load(seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
     ext = tl.load(extend_seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
     start_loc = tl.sum(tl.where(started, extend[None, :], 0).to(tl.int32), axis=1) - ext
-    casual = (seq_len - ext + 1) + (t - start_loc)
-    casual = tl.where(is_real, casual, 1)
+    causal = (seq_len - ext + 1) + (t - start_loc)
+    causal = tl.where(is_real, causal, 1)
 
     rp = tl.load(req_pool_ptr + r, mask=mask, other=0)
-    tl.store(seq_lens_casual_ptr + offs, casual, mask=mask)
+    tl.store(seq_lens_casual_ptr + offs, causal, mask=mask)
     tl.store(req_pool_repeated_ptr + offs, rp, mask=mask)
 
 
-def expand_prefill_casually_triton(
+def expand_prefill_causally_triton(
     *,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     num_tokens: int,
     padded_num_tokens: Optional[int],
-) -> ExpandPrefillCasuallyResult:
+) -> ExpandPrefillCausallyResult:
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
     total_tokens = (
@@ -205,7 +205,7 @@ def expand_prefill_casually_triton(
         total_tokens, dtype=req_pool_indices.dtype, device=device
     )
     BLOCK = 256
-    _expand_prefill_casually_kernel[(triton.cdiv(total_tokens, BLOCK),)](
+    _expand_prefill_causally_kernel[(triton.cdiv(total_tokens, BLOCK),)](
         req_pool_indices,
         seq_lens,
         extend_seq_lens,
@@ -217,7 +217,7 @@ def expand_prefill_casually_triton(
         BLOCK=BLOCK,
         BS_P2=triton.next_power_of_2(max(bs, 1)),
     )
-    return ExpandPrefillCasuallyResult(
+    return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
         req_pool_indices_repeated=req_pool_indices_repeated,
     )
