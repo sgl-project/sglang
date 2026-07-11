@@ -14,7 +14,16 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.speculative.dflash_utils import (
+    compute_dflash_correct_drafts_and_bonus,
+    verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
+    create_block_accept_estimate_recorder,
+)
+from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -710,3 +719,243 @@ class ConfidenceMetricsProbe:
         self._step_ct += 1
         if self._step_ct % self.print_every == 0:
             logger.info("%s", self._metrics.format_table())
+
+
+_STS_COLLECT_FLUSH_EVERY: int = 256
+
+
+class DsparkStepObservers:
+    """Facade over the per-step observability sinks (info dumper, confidence
+    probe, STS collection, block-accept estimator). The worker's decode path
+    makes one call per step; all sink gating and field derivation live here
+    so the hot path stays free of observer plumbing."""
+
+    def __init__(
+        self,
+        *,
+        planner,
+        gamma: int,
+        verify_num_draft_tokens: int,
+        tp_rank: int,
+        device,
+        simulate_acc_len: float,
+    ) -> None:
+        self._planner = planner
+        self._gamma = int(gamma)
+        self._verify_num_draft_tokens = int(verify_num_draft_tokens)
+        self._simulate_acc_len = float(simulate_acc_len)
+
+        self._confidence_probe = ConfidenceMetricsProbe(
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            tp_rank=tp_rank,
+        )
+        self._info_dumper = DsparkInfoDumper(
+            components=resolve_enabled_components(),
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            device=device,
+            mode_value=planner.mode_value,
+            sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
+        )
+        self._block_accept_recorder = create_block_accept_estimate_recorder(
+            gamma=gamma, device=device, tp_rank=tp_rank
+        )
+        if self._simulate_acc_len > 0 and self._block_accept_recorder is not None:
+            raise ValueError(
+                "SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH cannot be combined with "
+                "SGLANG_SIMULATE_ACC_LEN (simulated correct_len breaks the "
+                "accept-probability bookkeeping of the estimator)."
+            )
+        self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        self._sts_recorder: Optional[StsDataRecorder] = None
+
+    # --- step lifecycle -------------------------------------------------
+
+    def begin_step(self) -> None:
+        self._info_dumper.begin_step()
+
+    def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
+        return self._info_dumper.segment(name)
+
+    def note_prefill_step(self) -> None:
+        self._info_dumper.note_non_decode_step()
+        if self._block_accept_recorder is not None:
+            self._block_accept_recorder.flush()
+
+    def note_idle_decode_step(self) -> None:
+        self._info_dumper.note_non_decode_step()
+
+    # --- scheduler-facing hooks ------------------------------------------
+
+    def dump_info_records(self) -> Optional[dict]:
+        dumped = self._info_dumper.dump()
+        if dumped is None:
+            return None
+        dumped["simulate_acc_len"] = (
+            self._simulate_acc_len if self._simulate_acc_len > 0 else None
+        )
+        return dumped
+
+    def clear_info_records(self) -> None:
+        self._info_dumper.clear()
+
+    def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if self._block_accept_recorder is None:
+            return None
+        return self._block_accept_recorder.estimate_log_suffix()
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        if self._block_accept_recorder is None:
+            return
+        self._block_accept_recorder.note_request_finished(
+            rid=rid, natural_stop=natural_stop
+        )
+
+    # --- per-step observation --------------------------------------------
+
+    def observe_verify_step(
+        self,
+        *,
+        forward_ct: int,
+        reqs,
+        bs: int,
+        proposal_folded: bool,
+        verify_ids_2d: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
+        layout,
+        confidence: Optional[torch.Tensor],
+        prefix_lens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_block,
+        sampling_info,
+        correct_len: torch.Tensor,
+        cap_trim_lens: torch.Tensor,
+        bonus: torch.Tensor,
+        commit_lens: torch.Tensor,
+        verify_token_budget: Optional[int],
+        req_pool_indices: torch.Tensor,
+        verify_tier_num_tokens: int,
+        dp_tier_num_tokens: Optional[int],
+    ) -> None:
+        planner = self._planner
+        if not proposal_folded:
+            self._maybe_record_sts_collect(
+                verify_ids_2d=verify_ids_2d,
+                target_logits=target_logits,
+                bs=bs,
+            )
+            self._confidence_probe.maybe_observe(
+                carries_confidence=planner.carries_confidence,
+                is_compact_mode=planner.is_compact_mode,
+                confidence_raw=planner.last_confidence_raw,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=target_logits,
+                bs=bs,
+            )
+        if self._block_accept_recorder is not None and not proposal_folded:
+            self._block_accept_recorder.observe_verify_step(
+                forward_ct=forward_ct,
+                rids=[req.rid for req in reqs],
+                draft_tokens=draft_tokens,
+                corrected_logits=draft_block.corrected_logits,
+                draft_temperatures=draft_block.temperatures,
+                greedy_mask=draft_block.greedy_mask,
+                target_logits=target_logits,
+                target_temperatures=(
+                    sampling_info.temperatures
+                    if sampling_info is not None
+                    else draft_block.temperatures
+                ),
+                truncated_sampling_mask=(
+                    (sampling_info.top_ks != TOP_K_ALL)
+                    | (sampling_info.top_ps != 1.0)
+                    | (sampling_info.min_ps > 0)
+                    if sampling_info is not None
+                    else None
+                ),
+                logits_adjustments_are_noop=verify_logits_adjustments_are_noop(
+                    sampling_info
+                ),
+                correct_len=correct_len,
+                cap_trim_lens=cap_trim_lens,
+                bonus=bonus,
+                prefix_lens=prefix_lens,
+                layout=layout,
+            )
+        if self._info_dumper.enabled:
+            budget_decision = planner.take_budget_decision()
+            predicted_step_ms = (
+                None
+                if budget_decision is None
+                or budget_decision.predicted_step_seconds is None
+                else budget_decision.predicted_step_seconds * 1e3
+            )
+            predicted_theta = (
+                None if budget_decision is None else budget_decision.predicted_theta
+            )
+            num_verify_tokens = (
+                layout.graph_num_tokens
+                if layout is not None
+                else int(verify_ids_2d.numel())
+            )
+            self._info_dumper.observe_decode_step(
+                DecodeStepObservation(
+                    forward_ct=forward_ct,
+                    bs=bs,
+                    mode=planner.mode_value,
+                    budget=verify_token_budget,
+                    lag_steps=planner.lag_steps,
+                    num_verify_tokens=num_verify_tokens,
+                    verify_tokens_local=verify_tier_num_tokens,
+                    verify_tokens_dp_synced=(
+                        -1 if dp_tier_num_tokens is None else int(dp_tier_num_tokens)
+                    ),
+                    verify_tokens_graph_key=num_verify_tokens,
+                    predicted_step_ms=predicted_step_ms,
+                    predicted_theta=predicted_theta,
+                    verify_lens=layout.verify_lens if layout is not None else None,
+                    confidence=confidence,
+                    req_pool_indices=req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    draft_tokens=draft_tokens,
+                    bonus_tokens=bonus,
+                    correct_len=correct_len,
+                    cap_trim_lens=cap_trim_lens,
+                    commit_lens=commit_lens,
+                    rids=[req.rid for req in reqs],
+                )
+            )
+
+    def _maybe_record_sts_collect(
+        self,
+        *,
+        verify_ids_2d: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
+        bs: int,
+    ) -> None:
+        if not self._sts_collect_path:
+            return
+        if not self._planner.carries_confidence:
+            return
+        confidence_raw = self._planner.last_confidence_raw
+        if confidence_raw is None:
+            return
+        if self._sts_recorder is None:
+            self._sts_recorder = StsDataRecorder(
+                path_stem=self._sts_collect_path,
+                gamma=self._gamma,
+                flush_every=_STS_COLLECT_FLUSH_EVERY,
+            )
+        target_predict = torch.argmax(target_logits, dim=-1).view(
+            bs, self._verify_num_draft_tokens
+        )
+        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+            candidates=verify_ids_2d,
+            target_predict=target_predict,
+        )
+        self._sts_recorder.record(
+            confidence_raw=confidence_raw,
+            num_correct_drafts=num_correct_drafts,
+        )

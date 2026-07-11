@@ -14,25 +14,17 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    compute_dflash_correct_drafts_and_bonus,
-    verify_logits_adjustments_are_noop,
-)
+from sglang.srt.speculative.dflash_utils import verify_logits_adjustments_are_noop
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
     draft_is_deepseek_v4,
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
-)
-from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
-    BlockAcceptEstimateRecorder,
-    create_block_accept_estimate_recorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     dspark_gamma_from_num_draft_tokens,
@@ -47,20 +39,14 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
-    ConfidenceMetricsProbe,
-    DecodeStepObservation,
-    DsparkInfoDumper,
+    DsparkStepObservers,
     InfoSegment,
-    resolve_enabled_components,
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
-)
-from sglang.srt.speculative.dspark_components.dspark_sts import (
-    StsDataRecorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -78,8 +64,6 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
-
-_STS_COLLECT_FLUSH_EVERY: int = 256
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -283,14 +267,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_epilogue=self._verify_epilogue,
         )
 
-        self._sts_recorder: Optional[StsDataRecorder] = None
-
-        self._block_accept_recorder: Optional[BlockAcceptEstimateRecorder] = (
-            create_block_accept_estimate_recorder(
-                gamma=self.gamma, device=self.device, tp_rank=self.tp_rank
-            )
-        )
-
         self._forced_budget_frac: Optional[float] = None
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
@@ -312,27 +288,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._verify_planner.mode_value!r}, simulate_acc_len="
                 f"{self._simulate_acc_len}."
             )
-        if self._simulate_acc_len > 0 and self._block_accept_recorder is not None:
-            raise ValueError(
-                "SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH cannot be combined with "
-                "SGLANG_SIMULATE_ACC_LEN (simulated correct_len breaks the "
-                "accept-probability bookkeeping of the estimator)."
-            )
 
-        self._confidence_probe = ConfidenceMetricsProbe(
+        self._observers = DsparkStepObservers(
+            planner=self._verify_planner,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_rank=self.tp_rank,
-        )
-
-        self._info_dumper = DsparkInfoDumper(
-            components=resolve_enabled_components(),
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            attn_tp_rank=get_parallel().attn_tp_rank,
             device=self.device,
-            mode_value=self._verify_planner.mode_value,
-            sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
+            simulate_acc_len=self._simulate_acc_len,
         )
 
     def _resolve_target_embed_tokens(self, target_model):
@@ -451,28 +414,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
-        dumped = self._info_dumper.dump()
-        if dumped is None:
-            return None
-        dumped["simulate_acc_len"] = (
-            self._simulate_acc_len if self._simulate_acc_len > 0 else None
-        )
-        return dumped
+        return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
-        self._info_dumper.clear()
+        self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
-        if self._block_accept_recorder is None:
-            return None
-        return self._block_accept_recorder.estimate_log_suffix()
+        return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        if self._block_accept_recorder is None:
-            return
-        self._block_accept_recorder.note_request_finished(
-            rid=rid, natural_stop=natural_stop
-        )
+        self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
         self,
@@ -486,9 +437,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
-            self._info_dumper.note_non_decode_step()
-            if self._block_accept_recorder is not None:
-                self._block_accept_recorder.flush()
+            self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish)
 
         return self._forward_decode(batch, on_publish)
@@ -649,7 +598,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
-            self._info_dumper.note_non_decode_step()
+            self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
@@ -663,7 +612,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         device = self.device
         prefix_lens = batch.seq_lens
 
-        self._info_dumper.begin_step()
+        self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
 
@@ -677,7 +626,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._info_dumper.segment(InfoSegment.DRAFT):
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -735,7 +684,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
         )
-        with self._info_dumper.segment(InfoSegment.TARGET_VERIFY):
+        with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
@@ -824,97 +773,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
-        if not proposal.folded:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                bs=bs,
-            )
-            self._confidence_probe.maybe_observe(
-                carries_confidence=self._verify_planner.carries_confidence,
-                is_compact_mode=self._verify_planner.is_compact_mode,
-                confidence_raw=self._verify_planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                bs=bs,
-            )
-        if self._block_accept_recorder is not None and not proposal.folded:
-            self._block_accept_recorder.observe_verify_step(
-                forward_ct=int(batch.forward_iter),
-                rids=[req.rid for req in batch.reqs],
-                draft_tokens=draft_tokens,
-                corrected_logits=draft_block.corrected_logits,
-                draft_temperatures=draft_block.temperatures,
-                greedy_mask=draft_block.greedy_mask,
-                target_logits=logits_output.next_token_logits,
-                target_temperatures=(
-                    sampling_info.temperatures
-                    if sampling_info is not None
-                    else draft_block.temperatures
-                ),
-                truncated_sampling_mask=(
-                    (sampling_info.top_ks != TOP_K_ALL)
-                    | (sampling_info.top_ps != 1.0)
-                    | (sampling_info.min_ps > 0)
-                    if sampling_info is not None
-                    else None
-                ),
-                logits_adjustments_are_noop=verify_logits_adjustments_are_noop(
-                    sampling_info
-                ),
-                correct_len=correct_len,
-                cap_trim_lens=cap_trim_lens,
-                bonus=bonus,
-                prefix_lens=prefix_lens,
-                layout=layout,
-            )
-        if self._info_dumper.enabled:
-            info_dp_tier = self._dp_verify_tier_num_tokens(batch)
-            budget_decision = self._verify_planner.take_budget_decision()
-            predicted_step_ms = (
-                None
-                if budget_decision is None
-                or budget_decision.predicted_step_seconds is None
-                else budget_decision.predicted_step_seconds * 1e3
-            )
-            predicted_theta = (
-                None if budget_decision is None else budget_decision.predicted_theta
-            )
-            self._info_dumper.observe_decode_step(
-                DecodeStepObservation(
-                    forward_ct=int(batch.forward_iter),
-                    bs=bs,
-                    mode=self._verify_planner.mode_value,
-                    budget=verify_token_budget,
-                    lag_steps=self._verify_planner.lag_steps,
-                    num_verify_tokens=(
-                        layout.graph_num_tokens
-                        if layout is not None
-                        else int(verify_ids_2d.numel())
-                    ),
-                    verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
-                    verify_tokens_dp_synced=(
-                        -1 if info_dp_tier is None else int(info_dp_tier)
-                    ),
-                    verify_tokens_graph_key=(
-                        layout.graph_num_tokens
-                        if layout is not None
-                        else int(verify_ids_2d.numel())
-                    ),
-                    predicted_step_ms=predicted_step_ms,
-                    predicted_theta=predicted_theta,
-                    verify_lens=layout.verify_lens if layout is not None else None,
-                    confidence=confidence,
-                    req_pool_indices=batch.req_pool_indices,
-                    prefix_lens=prefix_lens,
-                    draft_tokens=draft_tokens,
-                    bonus_tokens=bonus,
-                    correct_len=correct_len,
-                    cap_trim_lens=cap_trim_lens,
-                    commit_lens=commit_lens,
-                    rids=[req.rid for req in batch.reqs],
-                )
-            )
+        self._observers.observe_verify_step(
+            forward_ct=int(batch.forward_iter),
+            reqs=batch.reqs,
+            bs=bs,
+            proposal_folded=proposal.folded,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=logits_output.next_token_logits,
+            layout=layout,
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            correct_len=correct_len,
+            cap_trim_lens=cap_trim_lens,
+            bonus=bonus,
+            commit_lens=commit_lens,
+            verify_token_budget=verify_token_budget,
+            req_pool_indices=batch.req_pool_indices,
+            verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
+            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+        )
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=bonus,
@@ -947,39 +827,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             self._simulated_correct_drafts_buf = buf
         return buf[:bs]
-
-    def _maybe_record_sts_collect(
-        self,
-        *,
-        verify_ids_2d: torch.Tensor,
-        target_logits: torch.Tensor,
-        bs: int,
-    ) -> None:
-        collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
-        if not collect_path:
-            return
-        if not self._verify_planner.carries_confidence:
-            return
-        confidence_raw = self._verify_planner.last_confidence_raw
-        if confidence_raw is None:
-            return
-        if self._sts_recorder is None:
-            self._sts_recorder = StsDataRecorder(
-                path_stem=collect_path,
-                gamma=self.gamma,
-                flush_every=_STS_COLLECT_FLUSH_EVERY,
-            )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self.verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
-        self._sts_recorder.record(
-            confidence_raw=confidence_raw,
-            num_correct_drafts=num_correct_drafts,
-        )
 
     def _resolve_verify_token_budget(
         self,
