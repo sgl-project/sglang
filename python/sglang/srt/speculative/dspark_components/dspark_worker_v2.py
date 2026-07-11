@@ -551,11 +551,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 confidence_tap=proposal.confidence_tap,
             )
 
-        verify_token_budget = self._resolve_verify_token_budget(
-            batch=batch,
+        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
             confidence=confidence,
             prefix_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
         )
 
         global_num_reqs = (
@@ -689,25 +689,5 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
 
-    def _resolve_verify_token_budget(
-        self,
-        *,
-        batch: ScheduleBatch,
-        draft_input: DFlashDraftInputV2,
-        confidence: Optional[torch.Tensor],
-        prefix_lens: torch.Tensor,
-    ) -> Optional[int]:
-        if not self._verify_planner.schedules_verify_budget or confidence is None:
-            return None
-        if not self.server_args.disable_overlap_schedule:
-            return draft_input.verify_token_budget
-        return self._verify_planner.compute_budget_sync(
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=batch.req_pool_indices,
-        )
-
     def get_confidence_budget_prepare(self):
-        if not self._verify_planner.schedules_verify_budget:
-            return None
-        return self._verify_planner.prepare_verify_budget
+        return self._verify_planner.confidence_budget_prepare()

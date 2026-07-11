@@ -18,6 +18,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -356,6 +357,31 @@ class DSparkVerifyPlanner:
         return self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
         )
+
+    def resolve_verify_token_budget(
+        self,
+        *,
+        draft_input: DFlashDraftInputV2,
+        confidence: Optional[torch.Tensor],
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> Optional[int]:
+        """Per-step verify-token budget: under overlap it was precomputed into
+        the draft input by prepare_verify_budget; otherwise compute it now."""
+        if not self.schedules_verify_budget or confidence is None:
+            return None
+        if not self.server_args.disable_overlap_schedule:
+            return draft_input.verify_token_budget
+        return self.compute_budget_sync(
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            req_pool_indices=req_pool_indices,
+        )
+
+    def confidence_budget_prepare(self):
+        if not self.schedules_verify_budget:
+            return None
+        return self.prepare_verify_budget
 
     def _budget_from_resolved(
         self,
