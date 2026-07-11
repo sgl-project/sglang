@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    q8kv8_topk_length_from_indices,
     seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
@@ -494,11 +495,10 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_kv_buf: Optional[torch.Tensor] = None
         # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
         # rows whose topk indices end in a -1 pad run skip whole topk blocks
-        # in-kernel.  [1, topk] position ramp cached for the amax derivation.
+        # in-kernel.
         self._q8kv8_topk_length_enabled: bool = (
             envs.SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH.get()
         )
-        self._q8kv8_topk_arange: Optional[torch.Tensor] = None
 
         # Born-fp8 q handshake (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): when the
         # model's q-prep decides (via q8kv8_born_fp8_q_eligible) that this
@@ -2648,17 +2648,12 @@ class DeepseekSparseAttnBackend(
         # Per-row valid-topk count = last non-pad position + 1.  Bit-exact
         # vs topk_length=None: the skipped tail blocks contain only -1 pads
         # (masked to zero contribution today), and -1 entries inside the
-        # consumed range still take the kernel's clamp+mask path.  clamp(min=1)
-        # keeps all-pad rows on the well-tested >=1-block path.
+        # consumed range still take the kernel's clamp+mask path.  The
+        # backscan's cost is proportional to the trailing pad run, so rows
+        # with a full topk (all rows at long context) pay ~one block read.
         topk_length = None
         if self._q8kv8_topk_length_enabled:
-            arange = self._q8kv8_topk_arange
-            if arange is None or arange.shape[0] != topk:
-                arange = torch.arange(1, topk + 1, dtype=torch.int32, device=dev)
-                self._q8kv8_topk_arange = arange
-            topk_length = (
-                (page_table_1 >= 0).int().mul_(arange).amax(dim=-1).clamp_(min=1)
-            )
+            topk_length = q8kv8_topk_length_from_indices(page_table_1)
 
         o, _, _ = sparse_mla_q8kv8_prefill_fwd(
             q=q_fp8,
