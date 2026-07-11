@@ -49,3 +49,11 @@ def test_down_moe_reuses_tuned_up_config_when_separate_config_is_absent(
         ) == {128: {"BLOCK_SIZE_M": 64}}
     finally:
         fused_moe_triton_config.get_moe_configs.cache_clear()
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
