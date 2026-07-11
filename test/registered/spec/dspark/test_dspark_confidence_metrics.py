@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_confidence_metrics import (
+from sglang.srt.speculative.dspark_components.dspark_observability import (
     ConfidenceMetricsProbe,
     PerPositionConfidenceMetrics,
 )

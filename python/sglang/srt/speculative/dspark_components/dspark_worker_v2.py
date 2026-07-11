@@ -34,22 +34,20 @@ from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator impo
     BlockAcceptEstimateRecorder,
     create_block_accept_estimate_recorder,
 )
-from sglang.srt.speculative.dspark_components.dspark_confidence_metrics import (
-    ConfidenceMetricsProbe,
-)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     DsparkDraftSampler,
     make_next_draft_input,
 )
-from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
+from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+    TargetHiddenKvInjector,
+)
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    ConfidenceMetricsProbe,
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoSegment,
     resolve_enabled_components,
-)
-from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
-    TargetHiddenKvInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     StsDataRecorder,

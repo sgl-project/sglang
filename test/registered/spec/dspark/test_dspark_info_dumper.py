@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
+from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoComponent,
