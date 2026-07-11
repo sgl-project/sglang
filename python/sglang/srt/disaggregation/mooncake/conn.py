@@ -584,6 +584,48 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    def _transfer_data_batched_by_bytes(
+        self, mooncake_session_id, transfer_blocks, max_batch_bytes: int
+    ):
+        if not transfer_blocks:
+            return 0
+        if max_batch_bytes <= 0:
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+        pending = []
+        pending_bytes = 0
+
+        def flush_pending():
+            nonlocal pending, pending_bytes
+            if not pending:
+                return 0
+            ret = self._transfer_data(mooncake_session_id, pending)
+            pending = []
+            pending_bytes = 0
+            return ret
+
+        for src_addr, dst_addr, length in transfer_blocks:
+            src_addr = int(src_addr)
+            dst_addr = int(dst_addr)
+            remaining = int(length)
+            offset = 0
+            while remaining > 0:
+                chunk_len = min(remaining, int(max_batch_bytes))
+                if pending and pending_bytes + chunk_len > max_batch_bytes:
+                    ret = flush_pending()
+                    if ret != 0:
+                        return ret
+                pending.append((src_addr + offset, dst_addr + offset, chunk_len))
+                pending_bytes += chunk_len
+                offset += chunk_len
+                remaining -= chunk_len
+                if pending_bytes >= max_batch_bytes:
+                    ret = flush_pending()
+                    if ret != 0:
+                        return ret
+
+        return flush_pending()
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -667,6 +709,12 @@ class MooncakeKVManager(CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+            if state_type == StateType.DSPARK_HIDDEN:
+                return self._transfer_data_batched_by_bytes(
+                    mooncake_session_id,
+                    transfer_blocks,
+                    envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get(),
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
@@ -674,6 +722,12 @@ class MooncakeKVManager(CommonKVManager):
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+            if state_type == StateType.DSPARK_HIDDEN:
+                return self._transfer_data_batched_by_bytes(
+                    mooncake_session_id,
+                    transfer_blocks,
+                    envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get(),
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
