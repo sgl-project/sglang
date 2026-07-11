@@ -27,9 +27,10 @@ Why do we need attention access rules?
 - Problem: putting these recipe/backend combinations directly into each backend
   as dtype checks makes unsupported paths hard to spot and future recipes hard
   to add safely.
-- Approach: each KV cache quant method declares KVCacheAttentionAccess entries.
-  A backend resolves one entry by (phase, backend_name, tags), then either uses
-  the declared access pattern or fails fast if that combination is unsupported.
+- Approach: the bottom registry declares KVCacheAttentionAccess entries for
+  each recipe. A backend resolves one entry by (phase, backend_name, tags),
+  then either uses the declared access pattern or fails fast if that
+  combination is unsupported.
 """
 
 from abc import ABC, abstractmethod
@@ -121,7 +122,7 @@ class KVCacheQuantMethodBase(ABC):
     SCALE_BLOCK_SIZE: int = 1
 
     def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
-        return ()
+        return KV_CACHE_ATTENTION_ACCESS_REGISTRY.get(self.name, ())
 
     def resolve_attention_access(
         self, phase, backend_name: str, backend_tags: Iterable[str] = ()
@@ -225,21 +226,6 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
     name = "unquantized"
     SCALE_BLOCK_SIZE = 1
 
-    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
-        any_backend = KVCacheBackendMatcher(any_backend=True)
-        return (
-            KVCacheAttentionAccess(
-                KVCacheAttentionPhase.PREFILL,
-                KVCacheAttentionAccessKind.PLAIN,
-                any_backend,
-            ),
-            KVCacheAttentionAccess(
-                KVCacheAttentionPhase.DECODE,
-                KVCacheAttentionAccessKind.PLAIN,
-                any_backend,
-            ),
-        )
-
     def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
         pass
 
@@ -291,28 +277,6 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.k_scales_float = [1.0] * num_layers
         self.v_scales_float = [1.0] * num_layers
-
-    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
-        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        return (
-            KVCacheAttentionAccess(
-                KVCacheAttentionPhase.PREFILL,
-                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-                KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
-                storage_dtype=torch.uint8,
-                attention_kv_dtype=torch.float8_e4m3fn,
-                scale_recipe="nvfp4",
-                workspace_dtype=torch.float8_e4m3fn,
-            ),
-            KVCacheAttentionAccess(
-                KVCacheAttentionPhase.DECODE,
-                KVCacheAttentionAccessKind.NATIVE_FP4,
-                KVCacheBackendMatcher(exact=frozenset({"trtllm_mha"})),
-                storage_dtype=torch.uint8,
-                attention_kv_dtype=fp4_dtype,
-                scale_recipe="nvfp4",
-            ),
-        )
 
     def needs_global_scale(self) -> bool:
         return True
@@ -519,30 +483,6 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     ):
         pass
 
-    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
-        return (
-            KVCacheAttentionAccess(
-                KVCacheAttentionPhase.PREFILL,
-                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-                KVCacheBackendMatcher(
-                    tags=frozenset({BACKEND_TAG_FP4_DEQUANT_PREFILL})
-                ),
-                storage_dtype=torch.uint8,
-                attention_kv_dtype=torch.float8_e4m3fn,
-                scale_recipe="fp4_mx_block16",
-                workspace_dtype=torch.float8_e4m3fn,
-            ),
-            KVCacheAttentionAccess(
-                KVCacheAttentionPhase.DECODE,
-                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-                KVCacheBackendMatcher(tags=frozenset({BACKEND_TAG_FP4_DEQUANT_DECODE})),
-                storage_dtype=torch.uint8,
-                attention_kv_dtype=torch.float8_e4m3fn,
-                scale_recipe="fp4_mx_block16",
-                workspace_dtype=torch.float8_e4m3fn,
-            ),
-        )
-
     def create_buffers(
         self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
     ) -> dict:
@@ -641,6 +581,72 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         )
         dq_size = head_num * head_dim * 2 * kv_size
         return fp4_size + scale_size + dq_size
+
+
+# Registry: method name -> attention access rules.
+# Keep this table near the method-class registry so reviewers can see every
+# supported recipe/backend/phase combination in one place.
+_ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
+_FP4_DEQUANT_PREFILL_BACKENDS = KVCacheBackendMatcher(
+    tags=frozenset({BACKEND_TAG_FP4_DEQUANT_PREFILL})
+)
+_FP4_DEQUANT_DECODE_BACKENDS = KVCacheBackendMatcher(
+    tags=frozenset({BACKEND_TAG_FP4_DEQUANT_DECODE})
+)
+
+KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
+    UnquantizedKVCacheMethod.name: (
+        KVCacheAttentionAccess(
+            KVCacheAttentionPhase.PREFILL,
+            KVCacheAttentionAccessKind.PLAIN,
+            _ANY_BACKEND,
+        ),
+        KVCacheAttentionAccess(
+            KVCacheAttentionPhase.DECODE,
+            KVCacheAttentionAccessKind.PLAIN,
+            _ANY_BACKEND,
+        ),
+    ),
+    NVFP4KVCacheMethod.name: (
+        KVCacheAttentionAccess(
+            KVCacheAttentionPhase.PREFILL,
+            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+            KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
+            storage_dtype=torch.uint8,
+            attention_kv_dtype=torch.float8_e4m3fn,
+            scale_recipe="nvfp4",
+            workspace_dtype=torch.float8_e4m3fn,
+        ),
+        KVCacheAttentionAccess(
+            KVCacheAttentionPhase.DECODE,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+            KVCacheBackendMatcher(exact=frozenset({"trtllm_mha"})),
+            storage_dtype=torch.uint8,
+            attention_kv_dtype=getattr(torch, "float4_e2m1fn_x2", None),
+            scale_recipe="nvfp4",
+        ),
+    ),
+    FP4MXBlock16KVCacheMethod.name: (
+        KVCacheAttentionAccess(
+            KVCacheAttentionPhase.PREFILL,
+            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+            _FP4_DEQUANT_PREFILL_BACKENDS,
+            storage_dtype=torch.uint8,
+            attention_kv_dtype=torch.float8_e4m3fn,
+            scale_recipe="fp4_mx_block16",
+            workspace_dtype=torch.float8_e4m3fn,
+        ),
+        KVCacheAttentionAccess(
+            KVCacheAttentionPhase.DECODE,
+            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+            _FP4_DEQUANT_DECODE_BACKENDS,
+            storage_dtype=torch.uint8,
+            attention_kv_dtype=torch.float8_e4m3fn,
+            scale_recipe="fp4_mx_block16",
+            workspace_dtype=torch.float8_e4m3fn,
+        ),
+    ),
+}
 
 
 # Registry: explicit --kv-cache-dtype value -> method class.

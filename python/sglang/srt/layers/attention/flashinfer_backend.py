@@ -342,9 +342,9 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         if self.__class__ is FlashInferAttnBackend:
             if prefill_backend == "flashinfer":
-                self._require_kv_attention_access("prefill", self.prefill_kv_access)
+                self._check_kv_attention_access("prefill", self.prefill_kv_access)
             if decode_backend == "flashinfer":
-                self._require_kv_attention_access("decode", self.decode_kv_access)
+                self._check_kv_attention_access("decode", self.decode_kv_access)
 
         self.prefill_uses_dequant_workspace = (
             self.prefill_kv_access is not None
@@ -543,7 +543,7 @@ class FlashInferAttnBackend(AttentionBackend):
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
 
-    def _require_kv_attention_access(self, phase: str, access) -> None:
+    def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
             return
         method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
