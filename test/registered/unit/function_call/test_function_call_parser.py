@@ -2610,6 +2610,26 @@ class TestGlm4MoeDetector(unittest.TestCase):
             [str(w.message) for w in caught],
         )
 
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """PEP 515 makes ast.literal_eval strip underscores ("123_456"->123456);
+        a string-typed arg must keep the raw value. See #30644."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -2891,6 +2911,25 @@ class TestGlm47MoeDetector(unittest.TestCase):
             any(isinstance(w.message, SyntaxWarning) for w in caught),
             [str(w.message) for w in caught],
         )
+
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """Same PEP 515 guard as the GLM-4 detector, on the GLM-4.7 parser."""
+        from sglang.srt.function_call.glm47_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
 
     def test_get_model_structural_tag(self):
         """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
