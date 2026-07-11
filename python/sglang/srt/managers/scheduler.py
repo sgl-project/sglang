@@ -3782,12 +3782,19 @@ class Scheduler(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
             "token_capacity": int(self.max_total_num_tokens),
-            "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
+            # Decode graphs plus prefill (breakable) graphs.
+            "graph": round(
+                self.tp_worker.model_runner.graph_mem_usage
+                + self.tp_worker.model_runner.prefill_graph_mem_usage,
+                2,
+            ),
         }
         # NGRAM draft workers have no draft model, hence no draft graphs.
         if isinstance(self.draft_worker, BaseSpecWorker):
+            draft_runner = self.draft_worker.draft_worker.draft_runner
             ret["memory_usage"]["draft_graph"] = round(
-                self.draft_worker.draft_worker.draft_runner.graph_mem_usage, 2
+                draft_runner.graph_mem_usage + draft_runner.prefill_graph_mem_usage,
+                2,
             )
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 

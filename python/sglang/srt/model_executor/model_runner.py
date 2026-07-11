@@ -892,6 +892,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
+        self.prefill_graph_mem_usage = 0
         self.graph_shared_output = None
 
     def init_attention_backends(self):
@@ -2661,6 +2662,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
+        self.prefill_graph_mem_usage = 0
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
@@ -2820,11 +2822,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        mem_usage = before_mem - after_mem
+        self.prefill_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture {capture_name} CUDA graph end. "
             f"elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
+            f"mem usage={self.prefill_graph_mem_usage:.2f} GB, "
+            f"avail mem={after_mem:.2f} GB."
         )
 
     def init_threads_binding(self):
