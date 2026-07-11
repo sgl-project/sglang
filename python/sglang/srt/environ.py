@@ -526,6 +526,14 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
+    # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
+    # halves the gathered hidden-state bytes over NCCL; the combine
+    # (reduce_scatterv) leg stays bf16 (NCCL SUM cannot run on fp8).  Lossy on
+    # the wire — same group quantization the MoE expert GEMMs apply to their
+    # input anyway, but router/shared-expert reads see rounded values, so this
+    # stays accuracy-gated and default OFF.
+    SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated

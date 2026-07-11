@@ -505,6 +505,88 @@ def _dp_gather_via_all_gather(
 # tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
 _USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
 
+_DP_GATHER_FP8_GROUP = 128
+# Grow-only gathered fp8 payload / scales buffers, keyed by device.
+_dp_gather_fp8_bufs: dict = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _use_dp_gather_fp8() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
+
+
+def _get_dp_gather_fp8_bufs(rows: int, hidden: int, device: torch.device):
+    key = str(device)
+    bufs = _dp_gather_fp8_bufs.get(key)
+    if bufs is None or bufs[0].shape[0] < rows:
+        bufs = (
+            torch.empty((rows, hidden), dtype=torch.uint8, device=device),
+            torch.empty(
+                (rows, hidden // _DP_GATHER_FP8_GROUP),
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        _dp_gather_fp8_bufs[key] = bufs
+    return bufs[0][:rows], bufs[1][:rows]
+
+
+@triton.jit
+def _dequant_per_token_group_fp8_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    HIDDEN: tl.constexpr,
+    NGROUPS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    for start in tl.static_range(0, HIDDEN, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        qv = tl.load(q_ptr + row * HIDDEN + offs).to(tl.float32)
+        sv = tl.load(s_ptr + row * NGROUPS + offs // GROUP)
+        tl.store(out_ptr + row * HIDDEN + offs, (qv * sv).to(tl.bfloat16))
+
+
+def _dp_gather_via_all_gatherv_fp8(
+    global_tokens: torch.Tensor,
+    local_real: torch.Tensor,
+    sizes: List[int],
+):
+    """fp8 wire format for the variable-length DP gather: quantize the local
+    rows per-token-group (the SAME group-128 quantization the MoE expert GEMMs
+    apply to their input downstream), gather payload (as uint8 — NCCL has no
+    fp8 dtype; the gatherv leg is broadcast-only so a byte view is safe) and
+    scales in two output-buffered gatherv calls, then dequantize into the
+    bf16 global buffer.  Zero pad rows quantize to (q=0, s=eps) and so
+    dequantize back to exact zeros — the MoE-tail invariant is preserved.
+    The combine leg (reduce_scatterv) stays bf16: NCCL SUM cannot run on fp8."""
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    rows = global_tokens.shape[0]
+    hidden = global_tokens.shape[-1]
+    q, s = sglang_per_token_group_quant_fp8(
+        local_real.contiguous(), _DP_GATHER_FP8_GROUP
+    )
+    gq, gs = _get_dp_gather_fp8_bufs(rows, hidden, global_tokens.device)
+    tp_group = get_tp_group()
+    tp_group.all_gatherv(q.view(torch.uint8), sizes=sizes, output=gq)
+    tp_group.all_gatherv(s, sizes=sizes, output=gs)
+    _dequant_per_token_group_fp8_kernel[(rows,)](
+        gq.view(torch.float8_e4m3fn),
+        gs,
+        global_tokens,
+        HIDDEN=hidden,
+        NGROUPS=hidden // _DP_GATHER_FP8_GROUP,
+        GROUP=_DP_GATHER_FP8_GROUP,
+        BLOCK=2048,
+    )
+
 
 def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
@@ -568,6 +650,14 @@ def _dp_gather_via_all_gatherv(
     # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
     # the gather writes directly into it -- avoids the previous extra full-buffer
     # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    if (
+        _use_dp_gather_fp8()
+        and forward_batch.forward_mode.is_extend()
+        and global_tokens.dtype == torch.bfloat16
+        and global_tokens.shape[-1] % _DP_GATHER_FP8_GROUP == 0
+    ):
+        _dp_gather_via_all_gatherv_fp8(global_tokens, local_real, sizes)
+        return
     get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
