@@ -351,8 +351,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"got {server_args.speculative_dspark_block_size}."
             )
         gamma = int(server_args.speculative_dspark_block_size)
-
-    if gamma is None and server_args.speculative_num_draft_tokens is None:
+    else:
         from sglang.srt.speculative.dspark_components.dspark_config import (
             DEFAULT_DSPARK_GAMMA,
             read_draft_checkpoint_gamma,
@@ -362,43 +361,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             gamma = read_draft_checkpoint_gamma(server_args=server_args)
         except Exception as e:
             logger.warning(
-                "Failed to infer DSpark gamma from draft model config; "
-                "defaulting to %d. Error: %s",
-                DEFAULT_DSPARK_GAMMA,
+                "Failed to read DSpark gamma from draft model config; "
+                "cannot cross-check --speculative-num-draft-tokens. Error: %s",
                 e,
             )
-        if gamma is None:
+        if gamma is None and server_args.speculative_num_draft_tokens is None:
             gamma = DEFAULT_DSPARK_GAMMA
             logger.warning(
                 "DSpark gamma is not set; defaulting to %d.",
                 gamma,
             )
-
-    elif gamma is None and server_args.speculative_num_draft_tokens is not None:
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            read_draft_checkpoint_gamma,
-        )
-
-        config_gamma: Optional[int] = None
-        try:
-            config_gamma = read_draft_checkpoint_gamma(server_args=server_args)
-        except Exception as e:
-            logger.warning(
-                "Failed to read DSpark gamma from draft model config; "
-                "skipping speculative_num_draft_tokens consistency check. Error: %s",
-                e,
-            )
-
-        if config_gamma is not None:
-            config_verify_window = int(config_gamma) + 1
-            if int(server_args.speculative_num_draft_tokens) != config_verify_window:
-                raise ValueError(
-                    "DSpark speculative_num_draft_tokens must equal the draft "
-                    "checkpoint block_size + 1 "
-                    f"(= {config_verify_window} for block_size={config_gamma}), "
-                    "but got speculative_num_draft_tokens="
-                    f"{server_args.speculative_num_draft_tokens}."
-                )
 
     if gamma is not None:
         verify_window = int(gamma) + 1
