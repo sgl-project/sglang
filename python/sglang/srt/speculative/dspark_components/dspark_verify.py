@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -139,6 +139,56 @@ class TargetVerifyExecutor:
             )
             self._simulated_correct_drafts_buf = buf
         return buf[:bs]
+
+    def run_idle_participation(
+        self,
+        *,
+        batch: ScheduleBatch,
+        idle_layout: Optional[RaggedVerifyLayout],
+    ) -> None:
+        """Run a dummy target-verify forward so an idle DP rank joins the
+        token-keyed collective ops of the busy ranks' verify step."""
+        device = self.model_runner.device
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.begin_step(None, armed=False)
+        num_dummy_tokens = (
+            idle_layout.graph_num_tokens if idle_layout is not None else 0
+        )
+        verify_input = DFlashVerifyInput(
+            draft_token=torch.zeros(
+                (num_dummy_tokens,), dtype=torch.int64, device=device
+            ),
+            positions=torch.zeros(
+                (num_dummy_tokens,), dtype=torch.int64, device=device
+            ),
+            draft_token_num=self.verify_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=idle_layout,
+        )
+        batch.out_cache_loc = torch.zeros(
+            (num_dummy_tokens,), dtype=torch.int64, device=device
+        )
+        if idle_layout is not None:
+            num_dummy_slots = int(idle_layout.verify_lens.numel())
+            batch.seq_lens = torch.ones(
+                (num_dummy_slots,), dtype=torch.int64, device=device
+            )
+            batch.req_pool_indices = torch.zeros(
+                (num_dummy_slots,), dtype=torch.int64, device=device
+            )
+            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
+            batch.seq_lens_sum = num_dummy_slots
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
+            batch, self.target_worker
+        )
+        self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
 
     def run_non_compact(
         self,

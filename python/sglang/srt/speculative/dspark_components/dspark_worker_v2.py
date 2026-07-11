@@ -10,13 +10,11 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardMode,
     compute_position,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import verify_logits_adjustments_are_noop
 from sglang.srt.speculative.draft_worker_common import (
@@ -456,49 +454,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return batch_output
 
-    def _run_idle_verify_participation(self, batch: ScheduleBatch) -> None:
-        if self._verify_epilogue is not None:
-            self._verify_epilogue.begin_step(None, armed=False)
-        idle_layout = self._idle_verify_ragged_layout(batch)
-        num_dummy_tokens = (
-            idle_layout.graph_num_tokens if idle_layout is not None else 0
-        )
-        verify_input = DFlashVerifyInput(
-            draft_token=torch.zeros(
-                (num_dummy_tokens,), dtype=torch.int64, device=self.device
-            ),
-            positions=torch.zeros(
-                (num_dummy_tokens,), dtype=torch.int64, device=self.device
-            ),
-            draft_token_num=self.verify_num_draft_tokens,
-            custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            ragged_verify_layout=idle_layout,
-        )
-        batch.out_cache_loc = torch.zeros(
-            (num_dummy_tokens,), dtype=torch.int64, device=self.device
-        )
-        if idle_layout is not None:
-            num_dummy_slots = int(idle_layout.verify_lens.numel())
-            batch.seq_lens = torch.ones(
-                (num_dummy_slots,), dtype=torch.int64, device=self.device
-            )
-            batch.req_pool_indices = torch.zeros(
-                (num_dummy_slots,), dtype=torch.int64, device=self.device
-            )
-            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
-            batch.seq_lens_sum = num_dummy_slots
-            batch.forward_mode = ForwardMode.TARGET_VERIFY
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
-
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
@@ -563,7 +518,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
-                self._run_idle_verify_participation(batch)
+                self._verify_executor.run_idle_participation(
+                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
