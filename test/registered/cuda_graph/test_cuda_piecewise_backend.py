@@ -50,3 +50,7 @@ def test_runtime_recompile_without_capture_stream_falls_back(monkeypatch):
 
     assert backend(4) == "fallback-result"
     fallback.assert_called_once_with(4)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

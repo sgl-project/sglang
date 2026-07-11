@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -71,3 +72,7 @@ def test_forward_batch_marks_token_and_batch_metadata_dynamic():
     assert (id(batch.seq_lens), (0,)) in marked
     assert (id(batch.mrope_positions), (1,)) in marked
     assert all(value_id != id(batch.scalar) for value_id, _ in marked)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
