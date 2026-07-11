@@ -8,7 +8,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.srt.managers import schedule_batch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
@@ -87,8 +88,11 @@ def _make_manager(pool_size: int, page_size: int = 1):
 
 
 class _FinishedEvent:
+    def __init__(self):
+        self.synchronized = False
+
     def synchronize(self):
-        pass
+        self.synchronized = True
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
@@ -301,6 +305,120 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
         self.assertNotIn(req.rid, manager.offload_inflight)
+
+    def test_prepare_retraction_drains_inflight_offload(self):
+        manager, _ = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=6
+        )
+        req.finished.return_value = False
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=4, last_hash="prior_hash"
+        )
+        manager.offload_inflight[req.rid] = 1
+        host_indices = object()
+        incremental_tokens = [10, 11, 12, 13]
+        start_time = 123.0
+        manager.ongoing_offload[10] = (
+            req,
+            host_indices,
+            incremental_tokens,
+            start_time,
+            4,
+            8,
+        )
+        finish_event = _FinishedEvent()
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.ack_write_queue = [(None, finish_event, [10])]
+        manager.cache_controller.ack_backup_queue.qsize.return_value = 0
+        manager._trigger_backup = MagicMock(return_value="next_hash")
+
+        manager.prepare_retraction(req)
+
+        self.assertTrue(finish_event.synchronized)
+        self.assertNotIn(req.rid, manager.offload_inflight)
+        self.assertNotIn(10, manager.ongoing_offload)
+        manager._trigger_backup.assert_called_once_with(
+            req,
+            host_indices,
+            incremental_tokens,
+            start_time,
+            "prior_hash",
+        )
+        self.assertEqual(manager.offloaded_state[req.rid].last_hash, "next_hash")
+
+    def test_prepare_retraction_fails_closed_when_only_peer_is_inflight(self):
+        manager, _ = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=7
+        )
+        manager.tp_world_size = 2
+        manager.tp_group = object()
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.ack_write_queue = []
+        manager.cache_controller.ack_backup_queue.qsize.return_value = 0
+        collectives = []
+
+        def simulate_peer_inflight(tensor, op, group):
+            self.assertIs(group, manager.tp_group)
+            collectives.append((tensor.numel(), op))
+            if op == torch.distributed.ReduceOp.MAX:
+                tensor.fill_(1)
+
+        with (
+            patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=simulate_peer_inflight,
+            ),
+            self.assertRaisesRegex(RuntimeError, "inflight decode KV offload"),
+        ):
+            manager.prepare_retraction(req)
+
+        self.assertEqual(
+            collectives,
+            [
+                (1, torch.distributed.ReduceOp.MAX),
+                (2, torch.distributed.ReduceOp.MIN),
+                (1, torch.distributed.ReduceOp.MAX),
+            ],
+        )
+
+    def test_release_req_prepares_kv_before_offload_and_release(self):
+        events = []
+        req = object.__new__(schedule_batch.Req)
+        req.finished_reason = None
+        req.reset_for_retract = lambda: None
+
+        def prepare_kv_release(released_req):
+            self.assertIs(released_req, req)
+            events.append("prepare")
+
+        with (
+            patch.object(
+                req,
+                "offload_kv_cache",
+                side_effect=lambda *args, **kwargs: events.append("offload"),
+            ),
+            patch.object(
+                schedule_batch,
+                "release_kv_cache",
+                side_effect=lambda *args, **kwargs: events.append("release"),
+            ),
+            patch.object(schedule_batch, "evict_from_tree_cache"),
+        ):
+            schedule_batch.release_req(
+                req=req,
+                remaing_req_count=0,
+                server_args=MagicMock(disaggregation_mode="decode"),
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=MagicMock(),
+                tree_cache=MagicMock(),
+                hisparse_coordinator=None,
+                prepare_kv_release=prepare_kv_release,
+            )
+
+        self.assertEqual(events, ["prepare", "offload", "release"])
 
     def test_offload_kv_cache_tracks_inflight_write_until_ack(self):
         manager, freed = _make_manager(pool_size=32, page_size=4)
