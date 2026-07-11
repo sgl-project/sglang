@@ -741,17 +741,12 @@ class _NormScaleShift(CustomOp):
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
+        # On CUDA/XPU this dispatches to the Triton kernel; on CPU/MPS/MUSA/NPU
+        # `fuse_scale_shift_kernel` is rebound to the pure-PyTorch fallback at
+        # import time (see python/sglang/jit_kernel/diffusion/triton/scale_shift.py),
+        # so no tensor-device branch is needed here.
         normalized = self.norm(x)
-        if x.is_cuda or x.is_xpu:
-            modulated = fuse_scale_shift_kernel(normalized, scale, shift)
-        else:
-            # fuse_scale_shift_kernel is the Triton impl on CUDA builds and
-            # asserts CUDA tensors; use the pure-PyTorch fallback for CPU.
-            from sglang.jit_kernel.diffusion.triton.torch_fallback import (
-                fuse_scale_shift_kernel_native,
-            )
-
-            modulated = fuse_scale_shift_kernel_native(normalized, scale, shift)
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
         return modulated.to(x.dtype)
 
     def forward_npu(
