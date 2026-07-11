@@ -49,6 +49,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     NamedTuple,
@@ -1669,6 +1670,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    prepare_kv_release: Optional[Callable[[Req], None]] = None,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -1677,6 +1679,8 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
+    if prepare_kv_release is not None:
+        prepare_kv_release(req)
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
@@ -1697,6 +1701,7 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    prepare_kv_release: Optional[Callable[[Req], None]] = None,
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -1709,6 +1714,7 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
+            prepare_kv_release=prepare_kv_release,
         )
     return retracted_reqs
 
@@ -2539,7 +2545,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def retract_all(self, server_args: ServerArgs, offload_kv: bool = True):
+    def retract_all(
+        self,
+        server_args: ServerArgs,
+        offload_kv: bool = True,
+        prepare_kv_release: Optional[Callable[[Req], None]] = None,
+    ):
         retracted_reqs = retract_all(
             reqs=self.reqs,
             server_args=server_args,
@@ -2548,12 +2559,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
+            prepare_kv_release=prepare_kv_release,
         )
         self.reqs = []
         return retracted_reqs
 
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
+        prepare_kv_release: Optional[Callable[[Req], None]] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(
@@ -2578,7 +2592,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                prepare_kv_release=prepare_kv_release,
+            )
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -2594,7 +2613,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(
+                last_idx,
+                0,
+                server_args,
+                prepare_kv_release=prepare_kv_release,
+            )
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2654,7 +2678,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        prepare_kv_release: Optional[Callable[[Req], None]] = None,
+    ):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -2663,6 +2693,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            prepare_kv_release=prepare_kv_release,
         )
 
     def prepare_encoder_info_decode(self):
