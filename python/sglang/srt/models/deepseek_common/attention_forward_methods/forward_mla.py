@@ -18,6 +18,9 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    absorbed_bmm_concat_cast_q_fp8,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
@@ -51,6 +54,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -74,6 +78,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -257,6 +262,84 @@ class DeepseekMLAForwardMixin:
             attn_output_buf=attn_output_buf,
         )
 
+    def _q8kv8_born_fp8_q_backend(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        llama_4_scaling: Optional[torch.Tensor],
+    ):
+        """Return the DSA backend iff the born-fp8 q fast path can run.
+
+        Gated by SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q (checked by the caller).
+        When this returns a backend, the bf16 absorbed bmm + the standalone
+        concat_and_cast_q_fp8_pad are replaced by one fused kernel that writes
+        the fp8 q directly into the backend's q8kv8 buffer; q_nope_out becomes
+        a NaN sentinel.  Every condition here must therefore guarantee that
+        forward_extend consumes q via _forward_flashmla_sparse_q8kv8 and that
+        nothing else reads q_nope_out's payload.
+        """
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if llama_4_scaling is not None:
+            return None
+        if _is_hip or _is_cpu:
+            return None
+        if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return None
+        if self.use_deep_gemm_bmm:
+            return None
+        w_kc = self.w_kc
+        if w_kc is None or w_kc.dtype != torch.bfloat16:
+            return None
+        if is_kv_b_lora_active(self) or _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            return None
+        # The fused kernel consumes the post-rope q_pe, so the eager rope
+        # apply below must run (mirror of its condition).
+        if self.rotary_emb is None:
+            return None
+        if self._fuse_rope_for_trtllm_mla(forward_batch):
+            return None
+        if self._skip_rope_for_dsa_tilelang_fused():
+            return None
+        if self._skip_rope_for_aiter_fused_mla():
+            return None
+        if _use_aiter and _is_gfx95_supported and not self.use_dsa:
+            return None
+        # Graph/compile surfaces run their own dispatch; the python-side
+        # stash handshake is eager-only.
+        if is_graph_dsa_split_op_surface(forward_batch):
+            return None
+        if get_tc_piecewise_forward_context() is not None:
+            return None
+        if is_in_breakable_cuda_graph():
+            return None
+        if get_is_capture_mode():
+            return None
+        if dcp_enabled():
+            return None
+        # Context-parallel prefill reshuffles the KV side; keep the handshake
+        # out of those paths.
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+            return None
+        # Kernel shape constraints (tl.arange / tl.dot / block tiling).  K
+        # (qk_nope_head_dim) needs only K % 16 == 0 and K <= 256: power-of-2
+        # K (DeepSeek 128) takes the kernel's preload-once path, other K
+        # (GLM-5 192) its split-K loop.
+        k_dim = self.qk_nope_head_dim
+        rope_dim = self.qk_rope_head_dim
+        if k_dim < 16 or k_dim > 256 or k_dim % 16 != 0:
+            return None
+        if rope_dim <= 0 or (rope_dim & (rope_dim - 1)) != 0:
+            return None
+        if self.kv_lora_rank % 128 != 0:
+            return None
+        if tuple(w_kc.shape) != (self.num_local_heads, k_dim, self.kv_lora_rank):
+            return None
+        backend = get_attn_backend()
+        eligible = getattr(backend, "q8kv8_born_fp8_q_eligible", None)
+        if eligible is None or not eligible(forward_batch, self.num_local_heads):
+            return None
+        return backend
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -429,10 +512,24 @@ class DeepseekMLAForwardMixin:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         _kvb_q = None
+        born_q_backend = None
+        if (
+            _ENABLE_DSA_Q8KV8_BORN_FP8_Q
+            and fusion_plan is None
+            and q_nope.dtype == torch.bfloat16
+        ):
+            born_q_backend = self._q8kv8_born_fp8_q_backend(
+                forward_batch, llama_4_scaling
+            )
         if fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
             # this transposed alias directly.
             q_nope_out = fusion_plan.q_nope_out_view
+        elif born_q_backend is not None:
+            # Born-fp8 q: skip the bf16 absorbed bmm entirely; the fused
+            # bmm+concat+cast kernel (launched after rope below) writes the
+            # fp8 q directly into the q8kv8 backend buffer.
+            q_nope_out = None
         else:
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
@@ -559,6 +656,29 @@ class DeepseekMLAForwardMixin:
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        if born_q_backend is not None:
+            # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
+            # kernel replaces bmm -> bf16 q_nope_out ->
+            # concat_and_cast_q_fp8_pad.  q_nope is the pre-absorb bf16 view
+            # (rope only touched the disjoint q_pe columns) and q_pe carries
+            # the post-rope values.  The stash is consumed by
+            # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
+            # NaN-poisoned shape-only sentinel.
+            num_tokens = q_nope.shape[0]
+            q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
+                num_tokens,
+                self.num_local_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                q_nope.device,
+            )
+            absorbed_bmm_concat_cast_q_fp8(
+                q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
+            )
+            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+            q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
+                num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
+            )
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
