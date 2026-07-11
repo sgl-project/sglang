@@ -1139,18 +1139,25 @@ class MooncakeKVManager(CommonKVManager):
                                 f"rid={req.rid}, row_start={row_start}, "
                                 f"row_len={row_len}, row_count={len(src_indices)}"
                             )
+                        if "ptr" in row_chunk:
+                            chunk_dst_data_ptrs = [int(row_chunk["ptr"])]
+                            chunk_dst_indices = list(range(row_len))
+                        else:
+                            chunk_dst_data_ptrs = dst_data_ptrs
+                            chunk_dst_indices = dst_indices_local[
+                                row_start:row_end
+                            ]
                         rc = (
                             self._send_kvcache_generic(
                                 mooncake_session_id=req.mooncake_session_id,
                                 src_data_ptrs=src_data_ptrs,
-                                dst_data_ptrs=dst_data_ptrs,
+                                dst_data_ptrs=chunk_dst_data_ptrs,
                                 item_lens=src_item_lens,
                                 prefill_data_indices=np.array(
                                     src_indices[row_start:row_end], dtype=np.int32
                                 ),
                                 dst_data_indices=np.array(
-                                    dst_indices_local[row_start:row_end],
-                                    dtype=np.int32,
+                                    chunk_dst_indices, dtype=np.int32
                                 ),
                                 executor=executor,
                                 state_type=st,
