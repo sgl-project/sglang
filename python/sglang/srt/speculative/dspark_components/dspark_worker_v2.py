@@ -78,6 +78,47 @@ def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
     }
 
 
+def _dspark_logits_debug_summary(logits: torch.Tensor, bs: int, verify_w: int) -> dict:
+    sample = logits.detach()
+    if sample.numel() == 0:
+        return {
+            "shape": list(sample.shape),
+            "sum": 0.0,
+            "absmax": 0.0,
+            "l2": 0.0,
+            "top1_ids": [],
+            "top1_vals": [],
+        }
+
+    flat = sample.reshape(-1)
+    head = flat[: min(8, flat.numel())].float().cpu().tolist()
+    sample_f = sample.float()
+    top1_vals, top1_ids = torch.max(sample_f, dim=-1)
+    if sample.shape[0] == bs * verify_w:
+        top1_ids_list = top1_ids.reshape(bs, verify_w).detach().cpu().tolist()
+        top1_vals_list = top1_vals.reshape(bs, verify_w).detach().cpu().tolist()
+    else:
+        top1_ids_list = top1_ids.detach().cpu().tolist()
+        top1_vals_list = top1_vals.detach().cpu().tolist()
+    return {
+        "shape": list(sample.shape),
+        "sum": round(float(sample_f.sum().item()), 6),
+        "absmax": round(float(sample_f.abs().max().item()), 6),
+        "l2": round(float(torch.linalg.vector_norm(sample_f).item()), 6),
+        "head": [round(float(x), 6) for x in head],
+        "top1_ids": top1_ids_list,
+        "top1_vals": _round_nested_float_list(top1_vals_list),
+    }
+
+
+def _round_nested_float_list(values):
+    if not values:
+        return values
+    if isinstance(values[0], list):
+        return [[round(float(x), 6) for x in row] for row in values]
+    return [round(float(x), 6) for x in values]
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -665,6 +706,30 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_TARGET_VERIFY_LOGITS_SUMMARY=%s",
+                {
+                    "forward_ct": int(batch.forward_iter),
+                    "rids": [req.rid for req in batch.reqs],
+                    "prefix_lens": [
+                        int(x) for x in prefix_lens.detach().cpu().tolist()
+                    ],
+                    "verify_ids": verify_ids_2d.detach().cpu().tolist(),
+                    "verify_lens": (
+                        None
+                        if layout is None
+                        else [int(x) for x in layout.verify_lens.detach().cpu().tolist()]
+                    ),
+                    "can_run_cuda_graph": bool(can_run_cuda_graph),
+                    "summary": _dspark_logits_debug_summary(
+                        logits_output.next_token_logits,
+                        bs,
+                        self.verify_num_draft_tokens,
+                    ),
+                },
+            )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
