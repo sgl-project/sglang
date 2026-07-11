@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.srt.layers.attention.vision import SingletonCache, resolve_max_seqlen
@@ -18,3 +19,7 @@ def test_resolve_max_seqlen_caches_on_singleton_carrier():
 
     assert resolve_max_seqlen(source, cu_seqlens) == 5
     assert source._max_seqlen == 5
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
