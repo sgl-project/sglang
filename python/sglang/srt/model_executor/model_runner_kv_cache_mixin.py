@@ -564,6 +564,20 @@ class ModelRunnerKVCacheMixin:
                         mamba_size=self.server_args.max_mamba_cache_size,
                         start_layer=self.start_layer,
                     )
+                elif _is_npu and is_deepseek_v4(self.model_config.hf_config):
+                    # Decode-side per-req tables the stock pool lacks.
+                    from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                        DSV4NPUDecodeReqToTokenPool,
+                    )
+
+                    self.req_to_token_pool = DSV4NPUDecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        pre_alloc_size=pre_alloc_size,
+                    )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
                         size=max_num_reqs,
