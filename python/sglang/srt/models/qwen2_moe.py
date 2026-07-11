@@ -125,6 +125,21 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def _zero_moe_padding_tail(
+    hidden_states: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor],
+) -> None:
+    """Keep CUDA-graph-only rows out of residuals and TP collectives."""
+    if num_token_non_padded is None:
+        return
+
+    token_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    hidden_states.masked_fill_(
+        token_indices[:, None] >= num_token_non_padded,
+        0,
+    )
+
+
 def get_num_shared_experts(config: PretrainedConfig) -> int:
     n_shared_experts = getattr(config, "n_shared_experts", None)
     if n_shared_experts is not None:
@@ -485,10 +500,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=(
+                forward_batch.num_token_non_padded
+                if forward_batch is not None
+                else None
+            ),
+        )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -499,6 +526,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -527,7 +555,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(
+                hidden_states,
+                forward_batch,
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -563,13 +594,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states, use_fused_gate=use_fused_gate
+                hidden_states,
+                use_fused_gate=use_fused_gate,
+                forward_batch=forward_batch,
             )
         else:
             shared_output = self._forward_shared_experts(
                 hidden_states, apply_gate=not use_fused_gate
             )
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(
+                hidden_states,
+                forward_batch,
+            )
 
         if shared_output is not None:
             if use_fused_gate:
@@ -581,6 +617,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             else:
                 final_hidden_states += shared_output
+
+        _zero_moe_padding_tail(
+            final_hidden_states,
+            (forward_batch.num_token_non_padded if forward_batch is not None else None),
+        )
         if (
             self.tp_size > 1
             and not should_skip_post_experts_all_reduce(
