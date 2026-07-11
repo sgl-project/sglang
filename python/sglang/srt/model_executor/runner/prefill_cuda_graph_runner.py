@@ -728,11 +728,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens=shape_inputs["extend_seq_lens"],
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
-                extend_prefix_lens_cpu=torch.zeros(
-                    (bs,), dtype=torch.int64, device="cpu"
-                ),
-                extend_seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
+                extend_prefix_lens_cpu=[0] * bs,
+                extend_seq_lens_cpu=list(lens_cpu),
+                extend_logprob_start_lens_cpu=list(lens_cpu),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,

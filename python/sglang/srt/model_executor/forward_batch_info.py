@@ -1267,8 +1267,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_start_loc = torch.arange(
                         bs, dtype=torch.int32, device=self.seq_lens.device
                     )
-                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
-                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
