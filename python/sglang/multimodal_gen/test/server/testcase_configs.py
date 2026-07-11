@@ -311,7 +311,13 @@ class DiffusionTestCase:
             )
 
 
-LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+_REALTIME_MODEL_COMMON_EXTRAS = {
+    "seed": 42,
+    "num_inference_steps": 4,
+    "guidance_scale": 1.0,
+}
+
+REALTIME_MODEL_sampling_params = DiffusionSamplingParams(
     prompt=(
         "A slow aerial orbit around a pastel floating island hotel in the open "
         "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
@@ -332,9 +338,7 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
     },
     realtime_perf_ignore_initial_chunks=2,
     extras={
-        "seed": 42,
-        "num_inference_steps": 4,
-        "guidance_scale": 1.0,
+        **_REALTIME_MODEL_COMMON_EXTRAS,
         "realtime_causal_sink_size": 9,
         "realtime_causal_kv_cache_num_frames": 18,
         "condition_inputs": {
@@ -586,18 +590,26 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 
-LONGLIVE2_T2V_CI_sampling_params = DiffusionSamplingParams(
-    prompt=T2V_PROMPT,
-    output_size="832x480",
+LONGLIVE2_T2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    image_path=None,
     num_frames=61,
-    extras={"num_inference_steps": 4, "seed": 0, "guidance_scale": 1.0},
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
 )
 
-LONGLIVE2_I2V_CI_sampling_params = DiffusionSamplingParams(
-    prompt=TI2V_sampling_params.prompt,
-    image_path=TI2V_sampling_params.image_path,
+LONGLIVE2_I2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    output_size="960x928",
     num_frames=61,
-    extras={"num_inference_steps": 4, "seed": 0, "guidance_scale": 1.0},
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
