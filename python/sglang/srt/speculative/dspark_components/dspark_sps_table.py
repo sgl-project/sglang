@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import bisect
-import logging
 from typing import Optional
 
 import msgspec
-
-logger = logging.getLogger(__name__)
 
 
 def floor_probe_index(edges: list[int], batch_tokens: int) -> int:
@@ -165,23 +162,3 @@ def is_uninitialized_sps_table(table: SpsCostTable | SpsAdditiveCostTable) -> bo
     if isinstance(table, SpsAdditiveCostTable):
         return False
     return len(table.sample_batch_tokens) <= 1
-
-
-def build_batch_size_sweep(max_num_tokens: int) -> list[int]:
-    if max_num_tokens < 1:
-        raise ValueError(f"max_num_tokens must be >= 1, got {max_num_tokens}.")
-    raw = [
-        1,
-        2,
-        4,
-        8,
-        *range(12, 128, 4),
-        *range(128, 256, 16),
-        *range(256, 1024, 32),
-        *range(1024, 2048, 128),
-        *range(2048, max_num_tokens + 1, 256),
-    ]
-    sweep = sorted({value for value in raw if 1 <= value <= max_num_tokens})
-    if sweep[-1] != max_num_tokens:
-        sweep.append(max_num_tokens)
-    return sweep
