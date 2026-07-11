@@ -1655,7 +1655,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        if self.visual is not None:
+            self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1713,6 +1714,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            if not self.enable_multimodal and name.startswith(
+                ("model.visual.", "visual.")
+            ):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1812,7 +1817,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        if self.visual is not None:
+            self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_fused_shared_experts = 0
         if _use_aiter and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
@@ -1964,6 +1970,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            if not self.enable_multimodal and name.startswith(
+                ("model.visual.", "visual.")
+            ):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:

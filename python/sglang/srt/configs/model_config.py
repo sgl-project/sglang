@@ -322,6 +322,9 @@ class ModelConfig:
             else:
                 enable_multimodal = True
 
+        self.enable_multimodal = enable_multimodal
+        self.hf_config.enable_multimodal = enable_multimodal
+
         # Config draft model
         self._config_draft_model()
 
