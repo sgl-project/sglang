@@ -38,7 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -1215,8 +1215,8 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # XPU/NPU: even ranks send first, odd ranks recv first.
+        send_first = (not (is_xpu() or is_npu())) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1238,13 +1238,24 @@ class SchedulerPPMixin:
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
-            with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.schedule_stream)
+            if is_npu():
+                # On NPU, recv_tensor_dict's work.wait() may return when data
+                # is in a host buffer, but the NPU compute stream has not yet
+                # processed the HCCL irecv.  Sync the stream so that the
+                # d2h_event recorded below will actually fire; otherwise
+                # d2h_event.synchronize() blocks indefinitely.
+                self.device_module.current_stream().synchronize()
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
-                d2h_event = self.device_module.Event()
-                d2h_event.record(self.device_module.current_stream())
+            else:
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.schedule_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        target, mb_metadata[next_mb_id], next_pp_outputs
+                    )
+            d2h_event = self.device_module.Event()
+            d2h_event.record(self.device_module.current_stream())
 
         if send_first:
             send_output_work = _do_send()
