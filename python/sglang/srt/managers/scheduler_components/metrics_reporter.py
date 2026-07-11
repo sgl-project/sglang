@@ -140,6 +140,13 @@ class SchedulerMetricsReporter:
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
 
+        # Lifetime prefix-cache token accumulators. The cache_hit_rate gauge is
+        # computed from these so it reflects a cumulative hit rate; otherwise a
+        # single zero-hit prefill batch (health probe, fresh prompt) would reset
+        # the last-batch-wins gauge to 0 and hide otherwise healthy caching.
+        self.total_cache_hit_tokens = 0
+        self.total_cache_input_tokens = 0
+
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
@@ -510,6 +517,14 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
+        # Reset alongside the prefix cache (this runs on flush_cache), so the
+        # cumulative hit rate reflects only post-flush traffic. Clear the
+        # exported stats too, so idle-time logging doesn't keep publishing the
+        # stale pre-flush rate until the next batch is processed.
+        self.total_cache_hit_tokens = 0
+        self.total_cache_input_tokens = 0
+        self.stats.cache_hit_rate = 0.0
+        self.stats.cache_hit_rate_cumulative = 0.0
 
     def report_prefill_stats(
         self,
@@ -619,6 +634,13 @@ class SchedulerMetricsReporter:
             cache_hit_rate = (
                 effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
+            # Also accumulate over the server lifetime for the cumulative gauge
+            # (see _cumulative_cache_hit_rate); the per-batch value above is
+            # still reported as stats.cache_hit_rate for the KV-events stream.
+            # Use the same effective (reprocessed-adjusted) counts as the
+            # per-batch rate so the cumulative ratio stays consistent.
+            self.total_cache_hit_tokens += effective_hit_tokens
+            self.total_cache_input_tokens += total_tokens
 
             # Basics
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
@@ -627,6 +649,7 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.cache_hit_rate_cumulative = self._cumulative_cache_hit_rate()
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -663,6 +686,12 @@ class SchedulerMetricsReporter:
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
+
+    def _cumulative_cache_hit_rate(self) -> float:
+        """Server-lifetime prefix-cache hit rate (cached / total prefill tokens)."""
+        if self.total_cache_input_tokens > 0:
+            return self.total_cache_hit_tokens / self.total_cache_input_tokens
+        return 0.0
 
     def report_decode_stats(
         self,
@@ -756,6 +785,7 @@ class SchedulerMetricsReporter:
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
+        # Decode batches do no prefix matching, so the per-batch hit rate is 0.
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -817,6 +847,7 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.cache_hit_rate_cumulative = self._cumulative_cache_hit_rate()
             self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts

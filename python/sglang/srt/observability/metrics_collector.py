@@ -68,7 +68,15 @@ class SchedulerStats:
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
     gen_throughput: float = 0.0
+    # Per-batch prefix-cache hit rate (most recent prefill batch; 0 for decode).
+    # Kept per-batch because it is consumed by the KV-events stream
+    # (gpu_prefix_cache_hit_rate), which external KV-aware routers read as an
+    # instantaneous value.
     cache_hit_rate: float = 0.0
+    # Server-lifetime cumulative prefix-cache hit rate, exported as the
+    # sglang:cache_hit_rate Prometheus gauge so it is not clobbered to 0 by
+    # zero-hit prefill batches or decode-only intervals.
+    cache_hit_rate_cumulative: float = 0.0
     decode_sum_seq_lens: int = 0
 
     # Memory pool usage ratios (0.0–1.0).
@@ -1263,7 +1271,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate_cumulative)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
 
         # Memory pool usage ratios
