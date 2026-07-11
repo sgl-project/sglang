@@ -681,5 +681,44 @@ def test_sparse_mla_q8kv8_prefill_large_skv():
     assert cos > 0.99, f"cos {cos:.4f} <= 0.99"
 
 
+# Backend-side topk_length derivation (backscan Triton kernel): must equal the
+# reference "last non-negative position + 1 (min 1)" on every pad pattern the
+# production topk output can produce (trailing runs), plus adversarial ones
+# (interleaved -1s, all-pad, full rows) where the trailing-run semantics still
+# define the correct consumed range.
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+@pytest.mark.parametrize("s_q,topk", [(437, 2048), (7, 128), (65, 256), (4096, 2048)])
+def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
+    from sglang.srt.layers.attention.triton_ops.cache_ops import (
+        q8kv8_topk_length_from_indices,
+    )
+
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(4000 + s_q + topk)
+    indices = torch.randint(
+        0, 1 << 20, (s_q, topk), dtype=torch.int32, device="cuda", generator=generator
+    )
+    # Row patterns: full, trailing pad runs of every length, all-pad,
+    # interleaved -1s inside the valid range.
+    for i in range(s_q):
+        mode = i % 5
+        if mode == 1:
+            indices[i, max(1, i % topk) :] = -1
+        elif mode == 2:
+            indices[i, :] = -1
+        elif mode == 3:
+            indices[i, i % topk :: 7] = -1  # interleaved + trailing mix
+        elif mode == 4:
+            indices[i, topk - 1 :] = -1
+
+    got = q8kv8_topk_length_from_indices(indices)
+
+    ramp = torch.arange(1, topk + 1, dtype=torch.int32, device="cuda")
+    ref = ((indices >= 0).int() * ramp).amax(dim=-1).clamp_(min=1)
+    assert torch.equal(got, ref)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
