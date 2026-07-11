@@ -650,9 +650,14 @@ def _dp_gather_via_all_gatherv(
     # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
     # the gather writes directly into it -- avoids the previous extra full-buffer
     # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    # NOTE: the fp8 branch condition must be identical on EVERY DP rank (all
+    # ranks must issue the same NCCL op sequence) — env/dtype/hidden are
+    # rank-uniform; never gate on per-rank state like forward_mode (ranks can
+    # be extend/idle-mixed within one global forward).  Prefill-only is
+    # already structural: the gatherv path runs only under SUM_LEN padding,
+    # which decode-only steps and CUDA-graph capture never select.
     if (
         _use_dp_gather_fp8()
-        and forward_batch.forward_mode.is_extend()
         and global_tokens.dtype == torch.bfloat16
         and global_tokens.shape[-1] % _DP_GATHER_FP8_GROUP == 0
     ):
