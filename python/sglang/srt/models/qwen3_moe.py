@@ -18,6 +18,7 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
+import re
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
@@ -103,6 +104,9 @@ Qwen3MoeConfig = None
 _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
+
+# Checkpoint-name fragment of a routed-expert weight, e.g. "experts.7.gate_proj."
+_EXPERT_WEIGHT_NAME_RE = re.compile(r"experts\.\d+\.\w+\.")
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -1112,6 +1116,15 @@ class Qwen3MoeForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
+        # Index the expert mapping by its checkpoint-name fragment
+        # ("experts.{E}.{proj}.") so each incoming tensor resolves in O(1).
+        # The previous per-tensor linear scan over the num_experts * 3 entries is
+        # quadratic over a checkpoint and dominates update_weights_from_tensor
+        # time for RL weight sync on MoE models (#30848).
+        expert_params_index = {
+            weight_name: (param_name, expert_id, shard_id)
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping
+        }
 
         # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
         params_dict = dict(self.named_parameters())
@@ -1169,20 +1182,17 @@ class Qwen3MoeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Track if this is an expert weight to enable early skipping
-                is_expert_weight = False
-
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-
-                    # Mark as expert weight regardless of whether we can process it
-                    is_expert_weight = True
-
-                    name = name.replace(weight_name, param_name)
+                expert_match = _EXPERT_WEIGHT_NAME_RE.search(name)
+                expert_entry = (
+                    expert_params_index.get(expert_match.group(0))
+                    if expert_match is not None
+                    else None
+                )
+                if expert_entry is not None:
+                    param_name, expert_id, shard_id = expert_entry
+                    name = name.replace(expert_match.group(0), param_name)
                     if name not in params_dict:
-                        # Expert weight not on this rank, will be skipped below
+                        # Expert weight not on this rank, skip all remaining processing
                         continue
 
                     param = params_dict[name]
@@ -1194,12 +1204,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
-                    break
                 else:
-                    if is_expert_weight:
-                        # This is an expert weight but not mapped to this rank, skip all remaining processing
-                        continue
-
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
