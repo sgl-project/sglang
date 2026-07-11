@@ -1123,16 +1123,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.spec_algorithm.is_dspark()
             and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
         ):
-            hidden_pool_limit = max(
-                1, envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get()
-            )
             configured_prefix_limit = (
                 envs.SGLANG_DSPARK_PD_FULL_HIDDEN_PREFIX_LIMIT.get()
             )
             dspark_full_prefix_limit = (
                 configured_prefix_limit
                 if configured_prefix_limit > 0
-                else max(1, min(4, hidden_pool_limit // 2))
+                else 1
             )
             for active_req in self.transfer_queue.queue:
                 if int(getattr(active_req, "dspark_hidden_start", 0)) != 0:
