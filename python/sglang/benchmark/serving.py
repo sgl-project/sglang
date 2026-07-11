@@ -2281,7 +2281,9 @@ def cli_main():
         default="1080p",
         help=(
             "Resolution of images for image dataset. "
-            "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+            "Supports presets 4k/1080p/720p/360p, custom 'heightxwidth' "
+            "(e.g., 1080x1920), or random 'random:<min_h>x<min_w>-<max_h>x<max_w>' "
+            "bounds (e.g., random:256x256-1024x1024)."
         ),
     )
     parser.add_argument(
