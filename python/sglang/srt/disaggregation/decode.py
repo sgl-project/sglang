@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -1045,11 +1045,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
-        dspark_active_full_prefixes = set()
+        dspark_active_full_prefix_counts = Counter()
+        dspark_full_prefix_limit = 1
         if (
             self.scheduler.spec_algorithm.is_dspark()
             and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
         ):
+            hidden_pool_limit = max(
+                1, envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get()
+            )
+            configured_prefix_limit = (
+                envs.SGLANG_DSPARK_PD_FULL_HIDDEN_PREFIX_LIMIT.get()
+            )
+            dspark_full_prefix_limit = (
+                configured_prefix_limit
+                if configured_prefix_limit > 0
+                else max(1, min(4, hidden_pool_limit // 2))
+            )
             for active_req in self.transfer_queue.queue:
                 if int(getattr(active_req, "dspark_hidden_start", 0)) != 0:
                     continue
@@ -1057,7 +1069,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     continue
                 prefix_key = self._dspark_prefix_fingerprint(active_req.req)
                 if prefix_key is not None:
-                    dspark_active_full_prefixes.add(prefix_key)
+                    dspark_active_full_prefix_counts[prefix_key] += 1
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -1174,16 +1186,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if (
                     total_prefix_len == 0
                     and dspark_prefix_key is not None
-                    and dspark_prefix_key in dspark_active_full_prefixes
+                    and dspark_active_full_prefix_counts[dspark_prefix_key]
+                    >= dspark_full_prefix_limit
                 ):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     logger.debug(
                         "Delay DSpark PD full hidden prealloc behind active "
-                        "same-prefix transfer: rid=%s, hidden_len=%s, "
-                        "transfer_queue=%s",
+                        "same-prefix transfers: rid=%s, hidden_len=%s, "
+                        "active_same_prefix=%s, limit=%s, transfer_queue=%s",
                         decode_req.req.rid,
                         dspark_hidden_len,
+                        dspark_active_full_prefix_counts[dspark_prefix_key],
+                        dspark_full_prefix_limit,
                         len(self.transfer_queue.queue),
                     )
                     continue
@@ -1611,7 +1626,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and dspark_hidden_start == 0
                 and dspark_hidden_dst_indices_by_pp is not None
             ):
-                dspark_active_full_prefixes.add(dspark_prefix_key)
+                dspark_active_full_prefix_counts[dspark_prefix_key] += 1
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
