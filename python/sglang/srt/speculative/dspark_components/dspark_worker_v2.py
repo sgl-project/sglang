@@ -41,11 +41,9 @@ from sglang.srt.speculative.dspark_components.dspark_confidence_metrics import (
     ConfidenceMetricsProbe,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockProposer,
     DsparkDraftSampler,
     make_next_draft_input,
-)
-from sglang.srt.speculative.dspark_components.dspark_draft_proposer import (
-    DraftBlockProposer,
 )
 from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
     DecodeStepObservation,
