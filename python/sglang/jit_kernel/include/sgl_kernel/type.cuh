@@ -43,7 +43,12 @@ struct DTypeTrait {};
   }                                                \
   static_assert(true)
 
+// Also emits a `kHas_<NAME>` flag so reduction dispatch can detect the op via
+// plain member SFINAE (see details::HasMax below) — hipcc mis-evaluates
+// requires-expressions that probe device functions, so detection must only
+// ever look at data members.
 #define SGL_REGISTER_BINARY_FUNCTION(NAME, FN)                      \
+  static constexpr bool kHas_##NAME = true;                         \
   SGL_DEVICE static self_t NAME(const self_t& x, const self_t& y) { \
     return FN(x, y);                                                \
   }                                                                 \
@@ -121,6 +126,8 @@ struct DTypeTrait<fp16x2_t> {
   SGL_REGISTER_BINARY_FUNCTION(min, __hmin2);
 #else
   // HIP only provides __hmax2/__hmin2 for __hip_bfloat162, not __half2.
+  static constexpr bool kHas_max = true;
+  static constexpr bool kHas_min = true;
   SGL_DEVICE static self_t max(const self_t& x, const self_t& y) {
     return self_t{__hmax(x.x, y.x), __hmax(x.y, y.y)};
   }
@@ -237,21 +244,25 @@ struct ReductionTrait {};
 
 namespace details {
 
+// Op detection via the `kHas_*` data members emitted by
+// SGL_REGISTER_BINARY_FUNCTION. Deliberately classic void_t member SFINAE:
+// hipcc mis-evaluates requires-expressions in device instantiation contexts
+// (observed: even `requires { a + b; }` on float came out false), so detection
+// must never probe function-call expressions.
+template <typename T, typename = void>
+struct HasAdd : std::false_type {};
 template <typename T>
-concept IsDefaultAddable = requires(T a, T b) {
-  { a + b } -> std::convertible_to<T>;
-};
+struct HasAdd<T, std::void_t<decltype(DTypeTrait<T>::kHas_add)>> : std::true_type {};
 
+template <typename T, typename = void>
+struct HasMax : std::false_type {};
 template <typename T>
-concept HasAdd = requires(T a, T b) {
-  { DTypeTrait<T>::add(a, b) } -> std::convertible_to<T>;
-};
+struct HasMax<T, std::void_t<decltype(DTypeTrait<T>::kHas_max)>> : std::true_type {};
 
+template <typename T, typename = void>
+struct HasMin : std::false_type {};
 template <typename T>
-concept HasMinMax = requires(T a, T b) {
-  { DTypeTrait<T>::max(a, b) } -> std::convertible_to<T>;
-  { DTypeTrait<T>::min(a, b) } -> std::convertible_to<T>;
-};
+struct HasMin<T, std::void_t<decltype(DTypeTrait<T>::kHas_min)>> : std::true_type {};
 
 template <ReductionOp Op, typename T>
 SGL_DEVICE T reduce_recursive(const T& x, const T& y) {
@@ -272,12 +283,18 @@ SGL_DEVICE T reduce_recursive(const T& x, const T& y) {
 
 }  // namespace details
 
+// Dispatch rules, chosen so correctness never depends on detection:
+// scalars (kVecSize == 1) call the trait member / operator directly — a
+// missing op is a clear compile error at the call line; packed types use the
+// native op when the trait registered one and fall back to lane-wise
+// recursion otherwise (worst case for a mis-detecting compiler is a slightly
+// slower but still correct lane-wise path).
 template <typename T>
 struct ReductionTrait<ReductionOp::SUM, T> {
   SGL_DEVICE static T reduce(const T& x, const T& y) {
-    if constexpr (details::HasAdd<T>) {
+    if constexpr (details::HasAdd<T>::value) {
       return DTypeTrait<T>::add(x, y);
-    } else if constexpr (details::IsDefaultAddable<T>) {
+    } else if constexpr (DTypeTrait<T>::kVecSize == 1) {
       return static_cast<T>(x + y);
     } else {
       return details::reduce_recursive<ReductionOp::SUM>(x, y);
@@ -288,7 +305,9 @@ struct ReductionTrait<ReductionOp::SUM, T> {
 template <typename T>
 struct ReductionTrait<ReductionOp::MAX, T> {
   SGL_DEVICE static T reduce(const T& x, const T& y) {
-    if constexpr (details::HasMinMax<T>) {
+    if constexpr (DTypeTrait<T>::kVecSize == 1) {
+      return DTypeTrait<T>::max(x, y);
+    } else if constexpr (details::HasMax<T>::value) {
       return DTypeTrait<T>::max(x, y);
     } else {
       return details::reduce_recursive<ReductionOp::MAX>(x, y);
@@ -299,7 +318,9 @@ struct ReductionTrait<ReductionOp::MAX, T> {
 template <typename T>
 struct ReductionTrait<ReductionOp::MIN, T> {
   SGL_DEVICE static T reduce(const T& x, const T& y) {
-    if constexpr (details::HasMinMax<T>) {
+    if constexpr (DTypeTrait<T>::kVecSize == 1) {
+      return DTypeTrait<T>::min(x, y);
+    } else if constexpr (details::HasMin<T>::value) {
       return DTypeTrait<T>::min(x, y);
     } else {
       return details::reduce_recursive<ReductionOp::MIN>(x, y);
