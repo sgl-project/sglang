@@ -263,15 +263,6 @@ class SpeculativeAlgorithm(Enum):
                     prefill_tail_start_positions = torch.tensor(
                         tail_start, dtype=torch.int64, device=batch.device
                     )
-                    logger.info(
-                        "Built DSpark PD draft tail hidden: bs=%s, max_len=%s, "
-                        "hidden_size=%s, valid_rows=%s, start_positions=%s",
-                        len(tail_hidden),
-                        max_len,
-                        hidden_size,
-                        int(prefill_tail_valid_mask.sum().item()),
-                        [int(x) for x in tail_start],
-                    )
             else:
                 prefill_tail_hidden_states = None
                 prefill_tail_valid_mask = None

@@ -1182,16 +1182,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
             positions=positions_2d.reshape(-1)[flat_mask],
         )
-        logger.info(
-            "Injected DSpark PD prefill tail hidden: bs=%s, tail_len=%s, "
-            "valid_rows=%s, hidden_size=%s, position_range=(%s, %s)",
-            bs,
-            tail_len,
-            int(flat_mask.sum().item()),
-            int(tail_hidden.shape[-1]),
-            min_pos,
-            max_pos,
-        )
         draft_input.prefill_tail_hidden_states = None
         draft_input.prefill_tail_valid_mask = None
         draft_input.prefill_tail_start_positions = None

@@ -2378,26 +2378,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
                         )[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
-                received_target_layer_ids = []
-                pp_slice_summary = {}
-                for pp_rank, pp_slice in pp_slices.items():
-                    layer_ids = [int(x) for x in pp_slice.get("layer_ids", [])]
-                    received_target_layer_ids.extend(layer_ids)
-                    pp_slice_summary[int(pp_rank)] = {
-                        "layer_ids": layer_ids,
-                        "slice_len": int(pp_slice.get("slice_len", 0)),
-                    }
-                logger.info(
-                    "DSpark PD hidden received on decode: "
-                    f"rid={decode_req.req.rid}, "
-                    f"bootstrap_room={decode_req.req.bootstrap_room}, "
-                    f"hidden_shape={tuple(hidden.shape)}, "
-                    f"hidden_start={received_hidden_start}, "
-                    f"prefill_cached_len={prefill_cached_len}, "
-                    f"target_layer_ids={received_target_layer_ids}, "
-                    f"pp_slices={pp_slice_summary}, "
-                    f"row_count={hidden_len}"
-                )
                 if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
                     logger.info(
                         "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
