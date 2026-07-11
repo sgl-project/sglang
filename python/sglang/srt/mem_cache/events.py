@@ -55,11 +55,11 @@ class KVCacheEventMixin:
             # Get parent's last hash value for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
-                parent_hash_values = (
-                    compute_node_event_hash_values(node.parent, self.page_size)
-                    if node.key.cache_salt is not None
-                    else node.parent.hash_value
-                )
+                if node.key.cache_salt is not None:
+                    parent_hash_values = node.parent.event_hash_value
+                    assert parent_hash_values is not None
+                else:
+                    parent_hash_values = node.parent.hash_value
                 if parent_hash_values:
                     parent_block_hash = hash_str_to_int64(parent_hash_values[-1])
 

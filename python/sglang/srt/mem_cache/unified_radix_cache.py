@@ -700,7 +700,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 token_ids,
                 req.extra_key,
                 is_bigram=self.tree_core.is_eagle,
-                cache_salt=getattr(req, "cache_salt", None),
+                cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -793,7 +793,7 @@ class UnifiedRadixCache(BasePrefixCache):
             token_ids[:effective_cache_len],
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=getattr(req, "cache_salt", None),
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
