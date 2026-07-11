@@ -149,6 +149,14 @@ class KVCacheQuantMethodBase(ABC):
             for access in self.attention_accesses()
         )
 
+    def needs_plain_kv_dequant_read(self) -> bool:
+        """Whether plain attention reads require dequantizing packed KV first."""
+        return any(
+            access.kind == KVCacheAttentionAccessKind.PLAIN
+            and access.storage_dtype is not None
+            for access in self.attention_accesses()
+        )
+
     def dequant_workspace_dtype(self) -> Optional[torch.dtype]:
         """Workspace dtype required by DEQUANT_WORKSPACE access rules."""
         workspace_dtypes = set()
@@ -186,6 +194,24 @@ class KVCacheQuantMethodBase(ABC):
                 f"dtypes: {sorted(str(dtype) for dtype in storage_dtypes)}."
             )
         return next(iter(storage_dtypes))
+
+    def plain_attention_kv_dtype(self) -> Optional[torch.dtype]:
+        """Dtype produced when packed KV is dequantized for PLAIN attention."""
+        attention_dtypes = {
+            access.attention_kv_dtype
+            for access in self.attention_accesses()
+            if access.kind == KVCacheAttentionAccessKind.PLAIN
+            and access.storage_dtype is not None
+            and access.attention_kv_dtype is not None
+        }
+        if not attention_dtypes:
+            return None
+        if len(attention_dtypes) != 1:
+            raise ValueError(
+                f"KV cache method {self.name!r} declares multiple plain attention "
+                f"KV dtypes: {sorted(str(dtype) for dtype in attention_dtypes)}."
+            )
+        return next(iter(attention_dtypes))
 
     def needs_global_scale(self) -> bool:
         """Whether this method uses a per-layer global FP32 scale."""
@@ -238,10 +264,20 @@ class KVCacheQuantMethodBase(ABC):
         """Dequantize stored FP4 KV (selected token indices already applied).
 
         Returns:
-            (k_fp8, v_fp8): Both in torch.float8_e4m3fn dtype with shape
-            matching the input (after unpacking). These are written into the
-            shared dequant workspace buffer for the FlashInfer FP8 prefill kernel.
+            Dequantized K/V tensors with shape matching the input after unpacking.
         """
+
+    def dequantize_kv_tensor(
+        self,
+        fp4_tensor: Tensor,
+        scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        """Dequantize one packed FP4 KV tensor for plain attention reads."""
+        raise NotImplementedError(
+            f"KV cache method {self.name!r} does not support plain KV dequant reads."
+        )
 
     @abstractmethod
     def compute_cell_size(
@@ -611,6 +647,22 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         k_scale_buffer[loc] = cache_k_sf
         v_scale_buffer[loc] = cache_v_sf
 
+    def dequantize_kv_tensor(
+        self,
+        fp4_tensor: Tensor,
+        scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        from sglang.srt.layers.quantization.kvfp4_tensor import (
+            FP4MXBlock16KVQuantizeUtil,
+        )
+
+        target_dtype = dtype or self.plain_attention_kv_dtype() or torch.bfloat16
+        return FP4MXBlock16KVQuantizeUtil.batched_dequantize(
+            fp4_tensor, scales, dtype=target_dtype
+        )
+
     def dequantize_prev_kv(
         self,
         k_fp4: Tensor,
@@ -619,13 +671,10 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        from sglang.srt.layers.quantization.kvfp4_tensor import (
-            FP4MXBlock16KVQuantizeUtil,
+        return (
+            self.dequantize_kv_tensor(k_fp4, k_scales, layer_id),
+            self.dequantize_kv_tensor(v_fp4, v_scales, layer_id),
         )
-
-        k_bf16 = FP4MXBlock16KVQuantizeUtil.batched_dequantize(k_fp4, k_scales)
-        v_bf16 = FP4MXBlock16KVQuantizeUtil.batched_dequantize(v_fp4, v_scales)
-        return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
@@ -649,6 +698,10 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
 
 # Registry: method name -> attention access rules.
 _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
+_FP4_MX_BLOCK16_MHA_BACKENDS = frozenset(
+    {"triton", "torch_native", "flex_attention", "trtllm_mha"}
+)
+_FP4_MX_BLOCK16_MHA_PREFILL_BACKENDS = _FP4_MX_BLOCK16_MHA_BACKENDS | frozenset({"fa4"})
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
     UnquantizedKVCacheMethod.name: (
         KVCacheAttentionAccess(
@@ -684,21 +737,19 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
     FP4MXBlock16KVCacheMethod.name: (
         KVCacheAttentionAccess(
             KVCacheAttentionPhase.PREFILL,
-            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-            KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
+            KVCacheAttentionAccessKind.PLAIN,
+            KVCacheBackendMatcher(exact=_FP4_MX_BLOCK16_MHA_PREFILL_BACKENDS),
             storage_dtype=torch.uint8,
-            attention_kv_dtype=torch.float8_e4m3fn,
+            attention_kv_dtype=torch.bfloat16,
             scale_recipe="fp4_mx_block16",
-            workspace_dtype=torch.float8_e4m3fn,
         ),
         KVCacheAttentionAccess(
             KVCacheAttentionPhase.DECODE,
-            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-            KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
+            KVCacheAttentionAccessKind.PLAIN,
+            KVCacheBackendMatcher(exact=_FP4_MX_BLOCK16_MHA_BACKENDS),
             storage_dtype=torch.uint8,
-            attention_kv_dtype=torch.float8_e4m3fn,
+            attention_kv_dtype=torch.bfloat16,
             scale_recipe="fp4_mx_block16",
-            workspace_dtype=torch.float8_e4m3fn,
         ),
     ),
 }

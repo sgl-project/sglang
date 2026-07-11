@@ -210,12 +210,25 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
     def test_properties(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4MXBlock16KVCacheMethod,
+            KVCacheAttentionAccessKind,
         )
 
         m = FP4MXBlock16KVCacheMethod()
         self.assertEqual(m.name, "fp4_mx_block16")
-        self.assertTrue(m.needs_dequant_workspace())
+        self.assertFalse(m.needs_dequant_workspace())
+        self.assertTrue(m.needs_plain_kv_dequant_read())
         self.assertFalse(m.needs_global_scale())
+        self.assertEqual(m.plain_attention_kv_dtype(), torch.bfloat16)
+        self.assertEqual(
+            m.resolve_attention_access("prefill", "triton").kind,
+            KVCacheAttentionAccessKind.PLAIN,
+        )
+        self.assertEqual(
+            m.resolve_attention_access("decode", "trtllm_mha").kind,
+            KVCacheAttentionAccessKind.PLAIN,
+        )
+        self.assertIsNone(m.resolve_attention_access("prefill", "flashinfer"))
+        self.assertIsNone(m.resolve_attention_access("decode", "flashinfer"))
 
     def test_create_buffers_shapes(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -230,6 +243,8 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
         self.assertEqual(bufs["k_buffer"][0].shape, (size, heads, dim // 2))
         # Block-16 FP4 flattens head dims for scales
         self.assertEqual(bufs["k_scale_buffer"][0].shape, (size, (heads * dim) // 16))
+        self.assertIsNone(bufs["dq_k_buffer"])
+        self.assertIsNone(bufs["dq_v_buffer"])
 
     def test_quantize_dequantize_roundtrip_cpu(self):
         """Test block-16 FP4 quantize->dequantize roundtrip on CPU."""
@@ -264,7 +279,9 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
         k_out, v_out = m.dequantize_prev_kv(k_fp4, k_scales, v_fp4, v_scales, 0)
 
         self.assertEqual(k_out.shape, (4, heads, dim))
-        self.assertEqual(k_out.dtype, torch.float8_e4m3fn)
+        self.assertEqual(v_out.shape, (4, heads, dim))
+        self.assertEqual(k_out.dtype, torch.bfloat16)
+        self.assertEqual(v_out.dtype, torch.bfloat16)
 
 
 class TestFP4MXBlock16KVQuantizeUtil(CustomTestCase):

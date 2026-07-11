@@ -1867,9 +1867,19 @@ class MHATokenToKVPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
+        local_layer_id = layer_id - self.start_layer
+        if (
+            self.is_quantized_kv_cache
+            and self.quant_method.needs_plain_kv_dequant_read()
+        ):
+            return self.quant_method.dequantize_kv_tensor(
+                self.k_buffer[local_layer_id],
+                self.k_scale_buffer[local_layer_id],
+                layer_id,
+            )
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[local_layer_id].view(self.dtype)
+        return self.k_buffer[local_layer_id]
 
     def get_key_buffer(self, layer_id: int):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
@@ -1881,9 +1891,19 @@ class MHATokenToKVPool(KVCache):
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
+        local_layer_id = layer_id - self.start_layer
+        if (
+            self.is_quantized_kv_cache
+            and self.quant_method.needs_plain_kv_dequant_read()
+        ):
+            return self.quant_method.dequantize_kv_tensor(
+                self.v_buffer[local_layer_id],
+                self.v_scale_buffer[local_layer_id],
+                layer_id,
+            )
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[local_layer_id].view(self.dtype)
+        return self.v_buffer[local_layer_id]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
