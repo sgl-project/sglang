@@ -355,10 +355,17 @@ class EagerRunner(BaseRunner):
                     pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
                 )
                 aux_hidden_states = None
-                capture_aux_hidden_states = getattr(
-                    model_runner.model, "capture_aux_hidden_states", False
+                batch_dspark_capture = (
+                    getattr(forward_batch, "dspark_hidden_capture_layer_ids", None)
+                    is not None
                 )
-                if capture_aux_hidden_states:
+                capture_aux_hidden_states = batch_dspark_capture or (
+                    getattr(model_runner.model, "capture_aux_hidden_states", False)
+                    and model_runner.server_args.disaggregation_mode != "prefill"
+                )
+                if capture_aux_hidden_states and not isinstance(
+                    hidden_states, PPProxyTensors
+                ):
                     hidden_states, aux_hidden_states = hidden_states
                 if model_runner.model.pp_group.is_last_rank:
                     hidden_states = cp_gather_after_forward(
@@ -366,6 +373,22 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
+                    if aux_hidden_states is not None:
+                        gathered_len = (
+                            int(hidden_states[0].shape[0])
+                            if isinstance(hidden_states, tuple)
+                            else int(hidden_states.shape[0])
+                        )
+                        aux_hidden_states = [
+                            aux_hidden
+                            if int(aux_hidden.shape[0]) == gathered_len
+                            else cp_gather_after_forward(
+                                aux_hidden,
+                                forward_batch,
+                                torch.cuda.current_stream(),
+                            )
+                            for aux_hidden in aux_hidden_states
+                        ]
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,
                         hidden_states,

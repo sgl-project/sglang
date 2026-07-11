@@ -19,6 +19,7 @@ class StateType(str, enum.Enum):
     SWA = "swa"
     DSA = "dsa"
     MINIMAX_INDEX_K = "minimax_index_k"
+    DSPARK_HIDDEN = "dspark_hidden"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
@@ -183,6 +184,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

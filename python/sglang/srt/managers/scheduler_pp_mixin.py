@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
@@ -44,6 +45,26 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _pp_stable_rid_hash(rid: str) -> int:
+    digest = hashlib.blake2b(str(rid).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+
+
+def _pp_ordered_intersection(prev_rids: List[str], curr_rids: List[str]) -> List[str]:
+    curr_set = set(curr_rids)
+    return [rid for rid in prev_rids if rid in curr_set]
+
+
+def _pp_ordered_union(prev_rids: List[str], curr_rids: List[str]) -> List[str]:
+    output = list(prev_rids)
+    seen = set(output)
+    for rid in curr_rids:
+        if rid not in seen:
+            output.append(rid)
+            seen.add(rid)
+    return output
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -249,6 +270,8 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                if hasattr(self, "_prepare_dspark_hidden_capture_for_batch"):
+                    self._prepare_dspark_hidden_capture_for_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -551,7 +574,9 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
-        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        self.last_rank_comm_queue: deque[Tuple[int, torch.Event, PPProxyTensors]] = (
+            deque()
+        )
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -786,10 +811,22 @@ class SchedulerPPMixin:
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
+                    rids_to_check=good_consensus_bootstrapped_rids,
+                    failed_rids_to_check=bad_consensus_bootstrapped_rids,
                 )
             )
+            # PP stages must admit the same request order. DSpark PD can make
+            # target-layer PP ranks finalize metadata at a different pace than
+            # non-target ranks, so relying on each rank's local queue order can
+            # pair one stage's positions with another stage's proxy hidden.
+            good_order = {
+                rid: i for i, rid in enumerate(good_consensus_bootstrapped_rids)
+            }
+            bad_order = {
+                rid: i for i, rid in enumerate(bad_consensus_bootstrapped_rids)
+            }
+            good_reqs.sort(key=lambda req: good_order.get(req.rid, len(good_order)))
+            failed_reqs.sort(key=lambda req: bad_order.get(req.rid, len(bad_order)))
             self.waiting_queue.extend(good_reqs)
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
@@ -816,12 +853,16 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
+            curr_good_set = set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = [
+                rid for rid in prev_good_bootstrapped_rids if rid in curr_good_set
+            ]
+            bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
+            seen_bad_rids = set(bad_bootstrapped_rids)
+            for rid in curr_bad_bootstrapped_rids:
+                if rid not in seen_bad_rids:
+                    bad_bootstrapped_rids.append(rid)
+                    seen_bad_rids.add(rid)
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
@@ -844,8 +885,8 @@ class SchedulerPPMixin:
                 [KVPoll.Success, KVPoll.Failed],
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            transferred_rids = _pp_ordered_intersection(
+                prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
 
@@ -976,9 +1017,30 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
+        if result.next_token_ids is not None and result.next_token_ids.shape[0] == len(
+            batch.reqs
+        ):
+            output_reqs = batch.reqs
+        else:
+            output_reqs = [
+                req for req in batch.reqs if req.inflight_middle_chunks <= 0
+            ][: result.next_token_ids.shape[0]]
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
+            "pp_output_rid_hashes": torch.tensor(
+                [_pp_stable_rid_hash(req.rid) for req in output_reqs],
+                dtype=torch.int64,
+                device=result.next_token_ids.device,
+            ),
         }
+        if (
+            result.logits_output is not None
+            and result.logits_output.hidden_states is not None
+            and any(getattr(req, "dspark_hidden_meta", None) for req in batch.reqs)
+        ):
+            tensor_dict["dspark_aux_hidden_states_0"] = (
+                result.logits_output.hidden_states
+            )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1076,6 +1138,11 @@ class SchedulerPPMixin:
     ):
         bs = len(batch.reqs)
         placeholder = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        rid_hashes = torch.tensor(
+            [_pp_stable_rid_hash(req.rid) for req in batch.reqs],
+            dtype=torch.int64,
+            device=self.device,
+        )
         # next_pp_outputs = None so non-last ranks skip forwarding
         # (pp_outputs is None gate). Placeholder carried in
         # batch_result.next_token_ids for process_batch_result_prefill.
@@ -1088,6 +1155,7 @@ class SchedulerPPMixin:
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
             skipped_output_comm=True,
+            pp_output_rid_hashes=rid_hashes,
         )
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
@@ -1112,16 +1180,81 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        pp_output_rid_hashes = pp_outputs.tensors.get("pp_output_rid_hashes", None)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
-        )
+        if batch.input_ids.shape[0] == batch.req_pool_indices.shape[0]:
+            stash_indices = batch.req_pool_indices
+            stash_tokens = batch.input_ids
+        elif (
+            pp_output_rid_hashes is not None
+            and pp_output_rid_hashes.shape[0] == batch.input_ids.shape[0]
+        ):
+            local_hash_to_indices = {}
+            for idx, req in enumerate(batch.reqs):
+                local_hash_to_indices.setdefault(_pp_stable_rid_hash(req.rid), []).append(
+                    idx
+                )
+            matched_indices = []
+            missing_hashes = []
+            for rid_hash in pp_output_rid_hashes.detach().cpu().tolist():
+                candidates = local_hash_to_indices.get(int(rid_hash))
+                if candidates:
+                    matched_indices.append(candidates.pop(0))
+                else:
+                    missing_hashes.append(int(rid_hash))
+            if missing_hashes:
+                raise RuntimeError(
+                    "PP disagg prefill output rid hash mismatch before "
+                    "future-map stash: "
+                    f"num_reqs={len(batch.reqs)}, "
+                    f"num_next_token_ids={batch.input_ids.shape[0]}, "
+                    f"local_rids={[req.rid for req in batch.reqs]}, "
+                    f"output_rid_hashes={pp_output_rid_hashes.detach().cpu().tolist()}, "
+                    f"missing_output_hashes={missing_hashes}"
+                )
+            stash_indices = batch.req_pool_indices[
+                torch.tensor(matched_indices, device=batch.req_pool_indices.device)
+            ]
+            stash_tokens = batch.input_ids
+        else:
+            consuming_indices = [
+                i
+                for i, req in enumerate(batch.reqs)
+                if req.inflight_middle_chunks <= 0
+            ]
+            if len(consuming_indices) != batch.input_ids.shape[0]:
+                raise RuntimeError(
+                    "PP disagg prefill compact output token count mismatch before "
+                    "future-map stash: "
+                    f"num_reqs={len(batch.reqs)}, "
+                    f"num_req_pool_indices={batch.req_pool_indices.shape[0]}, "
+                    f"num_next_token_ids={batch.input_ids.shape[0]}, "
+                    f"consuming_indices={consuming_indices}, "
+                    f"rids={[req.rid for req in batch.reqs]}, "
+                    "pp_output_rid_hashes="
+                    f"{pp_output_rid_hashes.detach().cpu().tolist() if pp_output_rid_hashes is not None else None}, "
+                    "inflight_middle_chunks="
+                    f"{[req.inflight_middle_chunks for req in batch.reqs]}"
+                )
+            stash_indices = batch.req_pool_indices[
+                torch.tensor(consuming_indices, device=batch.req_pool_indices.device)
+            ]
+            stash_tokens = batch.input_ids
+        self.future_map.stash(stash_indices, RelayPayload(bonus_tokens=stash_tokens))
         output_result = GenerationBatchResult(
             logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
+            pp_hidden_states_proxy_tensors=(
+                pp_outputs
+                if any(
+                    key.startswith("dspark_aux_hidden_states_")
+                    for key in pp_outputs.tensors
+                )
+                else None
+            ),
             next_token_ids=pp_outputs["next_token_ids"],
+            pp_output_rid_hashes=pp_output_rid_hashes,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1145,7 +1278,25 @@ class SchedulerPPMixin:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
             if target is not None:
-                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                queue_idx = next(
+                    (
+                        i
+                        for i, (queued_mb_id, _, _) in enumerate(
+                            last_rank_comm_queue
+                        )
+                        if queued_mb_id == next_first_rank_mb_id
+                    ),
+                    None,
+                )
+                if queue_idx is None:
+                    raise RuntimeError(
+                        "PP last-rank output queue missing target microbatch: "
+                        f"target_mb_id={next_first_rank_mb_id}, "
+                        "queued_mb_ids="
+                        f"{[item[0] for item in last_rank_comm_queue]}"
+                    )
+                _, q_event, pp_outputs_to_send = last_rank_comm_queue[queue_idx]
+                del last_rank_comm_queue[queue_idx]
                 if (
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
@@ -1268,6 +1419,7 @@ class SchedulerPPMixin:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
                         (
+                            mb_id,
                             event,
                             PPProxyTensors(
                                 self._pp_prepare_tensor_dict(result, self.cur_batch)
@@ -1315,7 +1467,7 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
             prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-            return list(set(prev_retract_rids) & set(curr_retract_rids))
+            return _pp_ordered_intersection(prev_retract_rids, curr_retract_rids)
 
     def _pp_pd_get_prealloc_ids(self: Scheduler):
         # communicate pre-consensus prealloc reqs
@@ -1337,11 +1489,11 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            good_prealloc_rids = list(
-                set(prev_good_prealloc_rids) & set(curr_good_prealloc_rids)
+            good_prealloc_rids = _pp_ordered_intersection(
+                prev_good_prealloc_rids, curr_good_prealloc_rids
             )
-            bad_prealloc_rids = list(
-                set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
+            bad_prealloc_rids = _pp_ordered_union(
+                prev_bad_prealloc_rids, curr_bad_prealloc_rids
             )
         return [good_prealloc_rids, bad_prealloc_rids]
 
@@ -1365,8 +1517,8 @@ class SchedulerPPMixin:
                 [KVPoll.Success, KVPoll.Failed],
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            transferred_rids = _pp_ordered_intersection(
+                prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
 

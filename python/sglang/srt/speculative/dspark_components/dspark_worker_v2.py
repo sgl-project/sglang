@@ -103,6 +103,22 @@ logger = logging.getLogger(__name__)
 _STS_COLLECT_FLUSH_EVERY: int = 256
 
 
+def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
+    sample = hidden.detach()
+    if sample.numel() == 0:
+        return {"shape": list(sample.shape), "sum": 0.0, "absmax": 0.0, "l2": 0.0}
+    flat = sample.reshape(-1)
+    head = flat[: min(8, flat.numel())].float().cpu().tolist()
+    sample_f = sample.float()
+    return {
+        "shape": list(sample.shape),
+        "sum": round(float(sample_f.sum().item()), 6),
+        "absmax": round(float(sample_f.abs().max().item()), 6),
+        "l2": round(float(torch.linalg.vector_norm(sample_f).item()), 6),
+        "head": [round(float(x), 6) for x in head],
+    }
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -593,6 +609,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
+                {
+                    "path": "non_pd_prefill",
+                    "rids": [req.rid for req in batch.reqs],
+                    "positions": [
+                        int(positions[0].item()) if positions.numel() > 0 else -1,
+                        int(positions[-1].item()) if positions.numel() > 0 else -1,
+                    ],
+                    "summary": _dspark_hidden_debug_summary(
+                        logits_output.hidden_states
+                    ),
+                },
+            )
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
@@ -720,6 +751,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._run_idle_verify_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
 
+        prefill_tail_start_positions = getattr(
+            draft_input, "prefill_tail_start_positions", None
+        )
+        prefill_tail_valid_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        prefill_tail_valid_lens = (
+            prefill_tail_valid_mask.to(torch.int64).sum(dim=1)
+            if prefill_tail_valid_mask is not None
+            and prefill_tail_valid_mask.numel() > 0
+            else None
+        )
         self._maybe_inject_pd_prefill_tail(batch, draft_input)
 
         batch.seq_lens.record_stream(
@@ -934,11 +975,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             rids=[req.rid for req in batch.reqs],
             prefix_lens=prefix_lens,
+            anchor_tokens=draft_block_ids[:, 0],
             draft_tokens=draft_tokens,
             bonus_tokens=bonus,
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
             commit_lens=commit_lens,
+            prefill_tail_start_positions=prefill_tail_start_positions,
+            prefill_tail_valid_lens=prefill_tail_valid_lens,
         )
         if self._block_accept_recorder is not None and not proposal.folded:
             self._block_accept_recorder.observe_verify_step(
@@ -1046,33 +1090,111 @@ class DSparkWorkerV2(BaseSpecWorker):
         if tail_hidden is None or tail_mask is None or tail_hidden.numel() == 0:
             return
 
+        if tail_hidden.ndim != 3 or tail_mask.ndim != 2:
+            raise RuntimeError(
+                "DSpark PD prefill hidden injection expects hidden=[bs, len, dim] "
+                f"and mask=[bs, len], got hidden={tuple(tail_hidden.shape)}, "
+                f"mask={tuple(tail_mask.shape)}"
+            )
         tail_hidden = tail_hidden.to(device=self.device, non_blocking=True)
         tail_mask = tail_mask.to(device=self.device, non_blocking=True).bool()
         bs, tail_len = tail_mask.shape
         if bs == 0 or tail_len == 0:
             return
+        if int(tail_hidden.shape[0]) != bs or int(tail_hidden.shape[1]) != tail_len:
+            raise RuntimeError(
+                "DSpark PD prefill hidden/mask shape mismatch before injection: "
+                f"hidden={tuple(tail_hidden.shape)}, mask={tuple(tail_mask.shape)}"
+            )
 
         device = torch.device(self.device)
-        row = torch.arange(tail_len, device=device).view(1, tail_len)
-        valid_counts = tail_mask.sum(dim=1).to(torch.int64)
-        start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
-            -1, 1
+        req_pool_indices = getattr(draft_input, "future_indices", None)
+        if req_pool_indices is None or req_pool_indices.numel() == 0:
+            req_pool_indices = batch.req_pool_indices
+        if int(req_pool_indices.numel()) != bs:
+            raise RuntimeError(
+                "DSpark PD prefill hidden batch size mismatch: "
+                f"hidden_bs={bs}, req_indices={int(req_pool_indices.numel())}, "
+                f"running_bs={int(batch.req_pool_indices.numel())}"
+            )
+        req_pool_indices = req_pool_indices.to(
+            device=device, dtype=torch.long, non_blocking=True
         )
+
+        row = torch.arange(tail_len, device=device).view(1, tail_len)
+        tail_start_positions = getattr(
+            draft_input, "prefill_tail_start_positions", None
+        )
+        if tail_start_positions is None or tail_start_positions.numel() == 0:
+            if int(batch.seq_lens.numel()) != bs:
+                raise RuntimeError(
+                    "DSpark PD hidden injection requires explicit start positions "
+                    "when draft input is not aligned with the running batch: "
+                    f"hidden_bs={bs}, running_bs={int(batch.seq_lens.numel())}"
+                )
+            valid_counts = tail_mask.sum(dim=1).to(torch.int64)
+            start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
+                -1, 1
+            )
+        else:
+            if int(tail_start_positions.numel()) != bs:
+                raise RuntimeError(
+                    "DSpark PD hidden start position size mismatch: "
+                    f"start_positions={int(tail_start_positions.numel())}, "
+                    f"hidden_bs={bs}"
+                )
+            start_pos = tail_start_positions.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            ).view(-1, 1)
         positions_2d = start_pos + row
 
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        cache_loc_2d = req_to_token[batch.req_pool_indices, positions_2d.clamp_min(0)]
-
         flat_mask = tail_mask.reshape(-1)
         if not bool(flat_mask.any()):
             return
+        valid_positions = positions_2d.reshape(-1)[flat_mask]
+        min_pos = int(valid_positions.min().item())
+        max_pos = int(valid_positions.max().item())
+        if min_pos < 0 or max_pos >= int(req_to_token.shape[1]):
+            raise RuntimeError(
+                "DSpark PD prefill hidden positions are out of req_to_token range: "
+                f"position_range=({min_pos}, {max_pos}), "
+                f"req_to_token_width={int(req_to_token.shape[1])}, "
+                f"start_positions={start_pos.view(-1).tolist()}, tail_len={tail_len}"
+            )
+        cache_loc_2d = req_to_token[
+            req_pool_indices.view(-1, 1), positions_2d.clamp_min(0)
+        ]
+        target_hidden = tail_hidden.reshape(bs * tail_len, -1)[flat_mask]
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
+                {
+                    "path": "pd_decode_inject",
+                    "rids": [req.rid for req in batch.reqs],
+                    "position_range": [min_pos, max_pos],
+                    "summary": _dspark_hidden_debug_summary(target_hidden),
+                },
+            )
+
         self._kv_injector.inject_target_hidden(
-            target_hidden=tail_hidden.reshape(bs * tail_len, -1)[flat_mask],
+            target_hidden=target_hidden,
             cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
             positions=positions_2d.reshape(-1)[flat_mask],
         )
+        logger.info(
+            "Injected DSpark PD prefill tail hidden: bs=%s, tail_len=%s, "
+            "valid_rows=%s, hidden_size=%s, position_range=(%s, %s)",
+            bs,
+            tail_len,
+            int(flat_mask.sum().item()),
+            int(tail_hidden.shape[-1]),
+            min_pos,
+            max_pos,
+        )
         draft_input.prefill_tail_hidden_states = None
         draft_input.prefill_tail_valid_mask = None
+        draft_input.prefill_tail_start_positions = None
 
     def _simulated_correct_len(
         self, *, bs: int, dtype: torch.dtype, device: torch.device

@@ -150,6 +150,7 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
+    spec_metadata: Optional[dict] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -181,6 +182,11 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
+            spec_metadata=(
+                json.loads(msg[9].decode("utf-8"))
+                if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
         )
 
 
@@ -2026,6 +2032,7 @@ class NixlKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
+                StateType.DSPARK_HIDDEN,
             ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
@@ -2037,11 +2044,66 @@ class NixlKVManager(CommonKVManager):
                     and len(dst_indices) == 0
                 ):
                     continue
+                dynamic_dst = None
+                dst_mem_kind_for_state = "VRAM"
+                if st == StateType.DSPARK_HIDDEN:
+                    dynamic_dst = (
+                        (req.spec_metadata or {})
+                        .get("pp_slice", {})
+                        .get("dynamic_dst")
+                    )
+                    if dynamic_dst:
+                        row_count = int(dynamic_dst.get("row_count", 0))
+                        dst_ptrs = [int(dynamic_dst["ptr"])]
+                        src_lens = [int(dynamic_dst["item_len"])]
+                        dst_indices = list(range(row_count))
+                        dst_mem_kind_for_state = "DRAM"
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "
                         f"prefill={len(src_indices)}, dst={len(dst_indices)}"
                     )
+                if st == StateType.DSPARK_HIDDEN and dynamic_dst:
+                    row_chunks = dynamic_dst.get("row_chunks") or [
+                        {"row_start": 0, "row_len": len(src_indices)}
+                    ]
+                    for row_chunk in row_chunks:
+                        row_start = int(row_chunk.get("row_start", 0))
+                        row_len = int(row_chunk.get("row_len", 0))
+                        if row_len <= 0:
+                            continue
+                        row_end = row_start + row_len
+                        if row_start < 0 or row_end > len(src_indices):
+                            raise RuntimeError(
+                                "Invalid DSpark hidden row chunk: "
+                                f"rid={req.rid}, row_start={row_start}, "
+                                f"row_len={row_len}, row_count={len(src_indices)}"
+                            )
+                        if "ptr" in row_chunk:
+                            chunk_dst_ptrs = [int(row_chunk["ptr"])]
+                            chunk_dst_indices = list(range(row_len))
+                        else:
+                            chunk_dst_ptrs = dst_ptrs
+                            chunk_dst_indices = dst_indices[row_start:row_end]
+                        h = self._send_kvcache_generic(
+                            peer_name=peer_name,
+                            src_data_ptrs=src_ptrs,
+                            dst_data_ptrs=chunk_dst_ptrs,
+                            item_lens=src_lens,
+                            prefill_data_indices=np.array(
+                                src_indices[row_start:row_end], dtype=np.int32
+                            ),
+                            dst_data_indices=np.array(
+                                chunk_dst_indices, dtype=np.int32
+                            ),
+                            dst_gpu_id=dst_gpu_id,
+                            notif=comp_notif,
+                            state_type=st,
+                            dst_mem_kind=dst_mem_kind_for_state,
+                        )
+                        if h is not None:
+                            handles.append(h)
+                    continue
                 h = self._send_kvcache_generic(
                     peer_name=peer_name,
                     src_data_ptrs=src_ptrs,
@@ -2052,6 +2114,7 @@ class NixlKVManager(CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    dst_mem_kind=dst_mem_kind_for_state,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
@@ -2377,6 +2440,17 @@ class NixlKVManager(CommonKVManager):
                         ),
                         0,
                     )
+                    dspark_meta = next(
+                        (
+                            info.spec_metadata
+                            for info in self.transfer_infos[room].values()
+                            if info.spec_metadata
+                            and info.spec_metadata.get("dspark_hidden")
+                        ),
+                        None,
+                    )
+                    if dspark_meta:
+                        self.req_to_dspark_hidden_meta[room] = dspark_meta
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -2498,6 +2572,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -2525,11 +2600,35 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
+            local_state_indices = state_indices
+            local_spec_metadata = spec_metadata
+            if spec_metadata and spec_metadata.get("pp_slices"):
+                pp_rank = int(
+                    bootstrap_info.get(
+                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
+                    )
+                )
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_spec_metadata = {
+                    **spec_metadata,
+                    "target_pp_rank": int(pp_rank),
+                    "pp_slice": pp_slice,
+                }
+                local_state_indices = list(
+                    state_indices
+                    if state_indices is not None
+                    else [None] * len(self.kv_mgr.kv_args.state_types)
+                )
+                for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
+                    if state_type == StateType.DSPARK_HIDDEN:
+                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        break
             packed_state_indices = (
                 pack_int_lists(
-                    [(idx if idx is not None else []) for idx in state_indices], "i"
+                    [(idx if idx is not None else []) for idx in local_state_indices],
+                    "i",
                 )
-                if not is_dummy and state_indices is not None
+                if not is_dummy and local_state_indices is not None
                 else b""
             )
             with lock:
@@ -2545,6 +2644,11 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            json.dumps(local_spec_metadata).encode("utf-8")
+                            if local_spec_metadata
+                            else b""
+                        ),
                     ]
                 )
 

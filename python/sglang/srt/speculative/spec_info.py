@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+
+logger = logging.getLogger(__name__)
 
 
 class SpeculativeAlgorithm(Enum):
@@ -181,29 +185,104 @@ class SpeculativeAlgorithm(Enum):
             tail_mask = [
                 getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs
             ]
-            if (
-                tail_hidden
-                and all(t is not None for t in tail_hidden)
-                and all(t is not None for t in tail_mask)
-            ):
-                prefill_tail_hidden_states = torch.stack(tail_hidden, dim=0).to(
-                    device=batch.device, non_blocking=True
+            tail_start = [
+                int(getattr(req, "prefill_tail_hidden_start", 0))
+                for req in batch.reqs
+            ]
+            has_tail = [
+                hidden is not None and mask is not None
+                for hidden, mask in zip(tail_hidden, tail_mask)
+            ]
+            if any(has_tail):
+                ref_hidden = next(
+                    hidden for hidden, has_cur in zip(tail_hidden, has_tail) if has_cur
                 )
-                prefill_tail_valid_mask = torch.stack(tail_mask, dim=0).to(
-                    device=batch.device, non_blocking=True
+                if ref_hidden.ndim != 2:
+                    raise RuntimeError(
+                        "DSpark PD prefill tail hidden must be 2D per request: "
+                        f"shape={tuple(ref_hidden.shape)}"
+                    )
+                max_len = max(
+                    int(hidden.shape[0])
+                    for hidden, has_cur in zip(tail_hidden, has_tail)
+                    if has_cur
                 )
+                hidden_size = int(ref_hidden.shape[-1])
+                prefill_tail_hidden_states = torch.zeros(
+                    (len(tail_hidden), max_len, hidden_size),
+                    dtype=ref_hidden.dtype,
+                    device=batch.device,
+                )
+                prefill_tail_valid_mask = torch.zeros(
+                    (len(tail_hidden), max_len),
+                    dtype=torch.bool,
+                    device=batch.device,
+                )
+                for i, (hidden, mask, has_cur) in enumerate(
+                    zip(tail_hidden, tail_mask, has_tail)
+                ):
+                    if not has_cur:
+                        if hidden is not None or mask is not None:
+                            raise RuntimeError(
+                                "DSpark PD prefill tail hidden/mask must be both "
+                                f"present or both absent for batch index {i}."
+                            )
+                        continue
+                    if hidden.ndim != 2 or mask.ndim != 1:
+                        raise RuntimeError(
+                            "DSpark PD prefill tail shape mismatch: "
+                            f"batch_index={i}, hidden={tuple(hidden.shape)}, "
+                            f"mask={tuple(mask.shape)}"
+                        )
+                    if int(hidden.shape[0]) != int(mask.shape[0]):
+                        raise RuntimeError(
+                            "DSpark PD prefill tail length mismatch: "
+                            f"batch_index={i}, hidden_len={int(hidden.shape[0])}, "
+                            f"mask_len={int(mask.shape[0])}"
+                        )
+                    if int(hidden.shape[-1]) != hidden_size:
+                        raise RuntimeError(
+                            "DSpark PD prefill tail hidden size mismatch: "
+                            f"batch_index={i}, hidden_size={int(hidden.shape[-1])}, "
+                            f"expected={hidden_size}"
+                        )
+                    cur_len = int(hidden.shape[0])
+                    if cur_len == 0:
+                        continue
+                    prefill_tail_hidden_states[i, :cur_len].copy_(
+                        hidden.to(device=batch.device, non_blocking=True)
+                    )
+                    prefill_tail_valid_mask[i, :cur_len].copy_(
+                        mask.to(device=batch.device, non_blocking=True).bool()
+                    )
                 if not bool(prefill_tail_valid_mask.any()):
                     prefill_tail_hidden_states = None
                     prefill_tail_valid_mask = None
+                    prefill_tail_start_positions = None
+                else:
+                    prefill_tail_start_positions = torch.tensor(
+                        tail_start, dtype=torch.int64, device=batch.device
+                    )
+                    logger.info(
+                        "Built DSpark PD draft tail hidden: bs=%s, max_len=%s, "
+                        "hidden_size=%s, valid_rows=%s, start_positions=%s",
+                        len(tail_hidden),
+                        max_len,
+                        hidden_size,
+                        int(prefill_tail_valid_mask.sum().item()),
+                        [int(x) for x in tail_start],
+                    )
             else:
                 prefill_tail_hidden_states = None
                 prefill_tail_valid_mask = None
+                prefill_tail_start_positions = None
 
             spec_info = make_next_draft_input(
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=batch.seq_lens,
                 prefill_tail_hidden_states=prefill_tail_hidden_states,
                 prefill_tail_valid_mask=prefill_tail_valid_mask,
+                prefill_tail_start_positions=prefill_tail_start_positions,
                 prefill_tail_hidden_projected=False,
             )
             spec_info.future_indices = batch.req_pool_indices

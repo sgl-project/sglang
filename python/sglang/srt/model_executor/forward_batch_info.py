@@ -437,6 +437,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
     capture_hidden_mode: CaptureHiddenMode = None
+    dspark_hidden_capture_layer_ids: Optional[List[int]] = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -635,6 +636,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch.capture_hidden_mode = None
         seq_lens_cpu_cache = batch.seq_lens_cpu_cache
         batch.seq_lens_cpu_cache = None
+        dspark_hidden_capture_layer_ids = batch.dspark_hidden_capture_layer_ids
+        batch.dspark_hidden_capture_layer_ids = None
         return_hidden_states_before_norm = batch.return_hidden_states_before_norm
         batch.return_hidden_states_before_norm = False
 
@@ -719,6 +722,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
+            dspark_hidden_capture_layer_ids=dspark_hidden_capture_layer_ids,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
