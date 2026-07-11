@@ -84,6 +84,11 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def _pp_stable_rid_hash(rid: str) -> int:
+    digest = hashlib.blake2b(str(rid).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+
+
 def maybe_release_metadata_buffer(
     req: Req,
     allocator: ReqToMetadataIdxAllocator,
@@ -924,6 +929,13 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
+        pp_output_rid_hashes = getattr(result, "pp_output_rid_hashes", None)
+        pp_output_hash_set = None
+        if pp_output_rid_hashes is not None:
+            pp_output_hash_set = {
+                int(x) for x in pp_output_rid_hashes.detach().cpu().tolist()
+            }
+
         full_batch_next_tokens = len(next_token_ids) == len(batch.reqs)
         compact_next_token_pt = 0
         for i, req in enumerate(batch.reqs):
@@ -931,13 +943,62 @@ class SchedulerDisaggregationPrefillMixin:
                 if full_batch_next_tokens:
                     next_token_id = next_token_ids[i]
                 else:
+                    if (
+                        pp_output_hash_set is not None
+                        and _pp_stable_rid_hash(req.rid) not in pp_output_hash_set
+                    ):
+                        output_matched_rids = [
+                            x.rid
+                            for x in batch.reqs
+                            if _pp_stable_rid_hash(x.rid) in pp_output_hash_set
+                        ]
+                        missing_output_rids = [
+                            x.rid
+                            for x in batch.reqs
+                            if (
+                                x.inflight_middle_chunks <= 0
+                                and _pp_stable_rid_hash(x.rid)
+                                not in pp_output_hash_set
+                            )
+                        ]
+                        raise RuntimeError(
+                            "Disagg prefill PP output rid mismatch: "
+                            f"num_reqs={len(batch.reqs)}, "
+                            f"num_next_token_ids={len(next_token_ids)}, "
+                            f"rids={[x.rid for x in batch.reqs]}, "
+                            f"output_matched_rids={output_matched_rids}, "
+                            f"missing_output_rids={missing_output_rids}, "
+                            "pp_output_rid_hashes="
+                            f"{pp_output_rid_hashes.detach().cpu().tolist()}"
+                        )
                     if compact_next_token_pt >= len(next_token_ids):
+                        output_matched_rids = None
+                        missing_output_rids = None
+                        if pp_output_hash_set is not None:
+                            output_matched_rids = [
+                                x.rid
+                                for x in batch.reqs
+                                if _pp_stable_rid_hash(x.rid) in pp_output_hash_set
+                            ]
+                            missing_output_rids = [
+                                x.rid
+                                for x in batch.reqs
+                                if (
+                                    x.inflight_middle_chunks <= 0
+                                    and _pp_stable_rid_hash(x.rid)
+                                    not in pp_output_hash_set
+                                )
+                            ]
                         raise RuntimeError(
                             "Disagg prefill PP output token count mismatch: "
                             f"num_reqs={len(batch.reqs)}, "
                             f"num_next_token_ids={len(next_token_ids)}, "
                             f"consumed_next_token_ids={compact_next_token_pt}, "
                             f"rids={[req.rid for req in batch.reqs]}, "
+                            f"output_matched_rids={output_matched_rids}, "
+                            f"missing_output_rids={missing_output_rids}, "
+                            "pp_output_rid_hashes="
+                            f"{pp_output_rid_hashes.detach().cpu().tolist() if pp_output_rid_hashes is not None else None}, "
                             "inflight_middle_chunks="
                             f"{[req.inflight_middle_chunks for req in batch.reqs]}"
                         )

@@ -50,6 +50,7 @@ class GenerationBatchResult:
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
     # to validate that skipped output is never consumed.
     skipped_output_comm: bool = False
+    pp_output_rid_hashes: Optional[torch.Tensor] = None
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
