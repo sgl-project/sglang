@@ -18,6 +18,9 @@ from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.mem_cache.base_hisparse_memory_pool import (
+    HiSparseDevicePoolMappingMixin,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -166,8 +169,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         raise NotImplementedError("Use get_key_buffer instead.")
 
 
-class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
+class HiSparseC4DevicePool(HiSparseDevicePoolMappingMixin, DeepSeekV4SingleKVPool):
     def __init__(
         self,
         size: int,
@@ -201,27 +203,14 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         )
         self.compress_ratio = 4
 
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
-
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         mask = (full_indices + 1) % self.compress_ratio == 0
         compressed_indices = full_indices[mask] // self.compress_ratio
         return compressed_indices
 
     def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
-            torch.int32
-        )
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(
-            self.translate_loc_from_full_to_compressed(full_indices)
+        return (
+            super().translate_loc_to_hisparse_device(compressed_indices).to(torch.int32)
         )
 
     def set_key_buffer(
@@ -453,7 +442,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
