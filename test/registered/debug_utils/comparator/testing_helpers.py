@@ -63,7 +63,6 @@ def make_diff(
     max_abs_diff: float = 0.0005,
     mean_abs_diff: float = 0.0002,
     abs_diff_percentiles: Optional[dict[int, float]] = None,
-    diff_threshold: float = 1e-3,
     passed: bool = True,
 ) -> DiffInfo:
     return DiffInfo(
@@ -78,7 +77,6 @@ def make_diff(
         max_diff_coord=[2, 3],
         baseline_at_max=1.0,
         target_at_max=1.0005,
-        diff_threshold=diff_threshold,
         passed=passed,
     )
 

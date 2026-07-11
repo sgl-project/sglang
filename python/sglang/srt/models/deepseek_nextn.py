@@ -59,7 +59,6 @@ from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_t
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
@@ -120,7 +119,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.rot_weight = None
         if _is_npu:
-            rot_weight_path = get_global_server_args().model_path + "/rot.safetensors"
+            rot_weight_path = get_server_args().model_path + "/rot.safetensors"
             if os.path.isfile(rot_weight_path):
                 self.rot_weight = load_file(rot_weight_path)
                 self.rot_weight = self.rot_weight["rot.weight"].npu()
@@ -133,8 +132,8 @@ class DeepseekModelNextN(nn.Module):
 
         layer_name = "decoder"
         if _is_npu and (
-            get_global_server_args().speculative_draft_model_path
-            == get_global_server_args().model_path
+            get_server_args().speculative_draft_model_path
+            == get_server_args().model_path
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
 
@@ -303,6 +302,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -326,17 +337,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
-        nextn_quant_config = quant_config
-        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
-        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
-
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
-                nextn_quant_config = None
+        nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)

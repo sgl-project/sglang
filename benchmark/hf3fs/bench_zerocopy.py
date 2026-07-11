@@ -16,7 +16,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 init_distributed_environment(
     world_size=1,
