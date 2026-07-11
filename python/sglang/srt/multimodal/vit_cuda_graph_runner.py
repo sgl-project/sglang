@@ -116,6 +116,18 @@ class ViTCudaGraphRunner:
         # x_3d: [S, B, H], B=1, S as graph_key
         return x_3d.shape[0]
 
+    def _capture_context(self):
+        # A DP-sharded encoder intentionally lets each rank capture only the
+        # images it owns (and some ranks can own none). Entering the TP
+        # communication capture in that case requires every TP peer to enter
+        # the same collective capture sequence, which deadlocks on an uneven
+        # image assignment. The encoder's output all-gather is outside this
+        # graph, and all layers are local in DP mode, so capture locally.
+        if getattr(self.vit, "use_data_parallel", False):
+            return nullcontext()
+        ca_comm = get_tp_group().ca_comm
+        return ca_comm.capture() if ca_comm is not None else nullcontext()
+
     def _create_graph(
         self,
         graph_key: int,
@@ -125,7 +137,6 @@ class ViTCudaGraphRunner:
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
     ):
-
         graph = torch.cuda.CUDAGraph()
         vit = self.vit
 
@@ -141,11 +152,7 @@ class ViTCudaGraphRunner:
 
         override_backend = get_server_args().mm_attention_backend
 
-        tp_group = get_tp_group()
-        ca_comm = tp_group.ca_comm
-        capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
-
-        with capture_ctx, torch.cuda.graph(graph):
+        with self._capture_context(), torch.cuda.graph(graph):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -322,7 +329,6 @@ class ViTCudaGraphRunner:
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if position_embeddings is not None:
             # update rotary workspace content
             head_dim = position_embeddings[0].shape[1]

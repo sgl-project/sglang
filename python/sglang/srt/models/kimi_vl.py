@@ -43,6 +43,7 @@
 
 import copy
 import logging
+import math
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -50,7 +51,6 @@ import torch
 from torch import nn
 from transformers.activations import GELUActivation
 
-from sglang.srt.configs import KimiVLConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
@@ -73,6 +73,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,6 @@ class MaxImageTokenMeta:
 
 
 class KimiVLMultiModalProjector(nn.Module):
-
     def __init__(self, config: KimiVLConfig):
         super().__init__()
 
@@ -124,7 +125,13 @@ class KimiVLForConditionalGeneration(nn.Module):
         self.config = config
         assert isinstance(config.vision_config, MoonViTConfig)
 
-        self.vision_tower = MoonVitPretrainedModel(config.vision_config)
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.vision_tower = MoonVitPretrainedModel(
+            config.vision_config,
+            prefix=add_prefix("vision_tower", prefix),
+            use_data_parallel=self.use_data_parallel,
+            use_tensor_parallel=not self.use_data_parallel,
+        )
 
         self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
         self.quant_config = quant_config
@@ -152,13 +159,26 @@ class KimiVLForConditionalGeneration(nn.Module):
         ):
             return pixel_values
 
-        image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
-            self.vision_tower.device
-        )
-        image_features = self.vision_tower(pixel_values, image_grid_hws)
-        assert isinstance(image_features, list)
-        # lengths = [x.shape[0] for x in image_features]
-        res = self.multi_modal_projector(torch.cat(image_features))  # .split(lengths)
+        image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0)
+        image_grid_hws_list = image_grid_hws.tolist()
+        if self.use_data_parallel:
+            image_features = run_dp_sharded_mrope_vision_model(
+                self.vision_tower,
+                pixel_values,
+                image_grid_hws_list,
+                rope_type="rope_2d",
+            )
+        else:
+            image_grid_hws = image_grid_hws.to(self.vision_tower.device)
+            image_features = self.vision_tower(
+                pixel_values,
+                image_grid_hws,
+                max_seqlen=max(math.prod(grid) for grid in image_grid_hws_list),
+            )
+            assert isinstance(image_features, list)
+            image_features = torch.cat(image_features)
+
+        res = self.multi_modal_projector(image_features)
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -242,8 +262,6 @@ class KimiVLForConditionalGeneration(nn.Module):
             use_default_weight_loading = False
             if "vision" in name:
                 if self.vision_tower is not None:
-                    # We only do sharding for language model and
-                    # not vision model for now.
                     use_default_weight_loading = True
             else:
                 for param_name, weight_name, shard_id in stacked_params_mapping:

@@ -497,6 +497,71 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
 
+    def run_dummy_multimodal_deepstack_forward(
+        self, language_model: torch.nn.Module, num_tokens: int
+    ) -> bool:
+        """Warm the tensor-valued deepstack branch before serving requests.
+
+        The regular PCG dummy is text-only. Qwen3-VL only provides
+        ``input_deepstack_embeds`` after visual encoding, so leaving this
+        branch cold makes the first image request synchronously recompile the
+        language model. The model/signature checks keep this a no-op for
+        non-deepstack architectures.
+        """
+        if (
+            "input_deepstack_embeds"
+            not in inspect.signature(language_model.forward).parameters
+        ):
+            return False
+
+        num_deepstack = getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
+        if num_deepstack <= 0:
+            return False
+
+        hidden_size = (
+            getattr(getattr(language_model, "config", None), "hidden_size", None)
+            or self.model_runner.model_config.hidden_size
+        )
+        fb, attn_backend = self.capture_prepare(num_tokens)
+        attn_backend.init_forward_metadata(fb)
+        deepstack_embeds = torch.zeros(
+            (num_tokens, hidden_size * num_deepstack),
+            dtype=self.model_runner.dtype,
+            device=self.device,
+        )
+        torch._dynamo.maybe_mark_dynamic(deepstack_embeds, 0)
+
+        fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            fb.global_dp_buffer_len,
+            num_tokens,
+            fb.dp_padding_mode.is_max_len(),
+            fb.global_num_tokens_cpu,
+        )
+        set_is_extend_in_batch(False)
+
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_tc_piecewise_forward_context(
+                fb,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+            ),
+        ):
+            language_model.forward(
+                fb.input_ids,
+                self._get_layer_model_positions(fb),
+                fb,
+                input_embeds=fb.input_embeds,
+                input_deepstack_embeds=deepstack_embeds,
+            )
+        return True
+
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
@@ -631,7 +696,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        buffers = self.buffers
         bs = self._capture_req_slots
         # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
         lens_cpu = [num_tokens] + [0] * (bs - 1)
@@ -831,7 +895,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
         """
-        buffers = self.buffers
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         self.raw_num_tokens = num_tokens
