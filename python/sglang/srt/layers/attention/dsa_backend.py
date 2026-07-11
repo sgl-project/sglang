@@ -485,6 +485,35 @@ class DeepseekSparseAttnBackend(
         # Q8KV8 dispatch (no-ops for other backends).
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
         self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
+        # Persistent (grow-only) fp8 KV destination for the Q8KV8 prefill
+        # gather: [capacity_rows, 576].  Avoids a fresh torch.zeros
+        # (alloc + full-buffer FillFunctor) per layer per call; only the
+        # `topk` -1-sentinel landing-pad rows need zeroing each call, and
+        # the gather kernel fuses that in.  Same single-stream reuse
+        # argument as `_q8kv8_qpad_buf`.
+        self._q8kv8_kv_buf: Optional[torch.Tensor] = None
+        # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
+        # rows whose topk indices end in a -1 pad run skip whole topk blocks
+        # in-kernel.  [1, topk] position ramp cached for the amax derivation.
+        self._q8kv8_topk_length_enabled: bool = (
+            envs.SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH.get()
+        )
+        self._q8kv8_topk_arange: Optional[torch.Tensor] = None
+
+        # Born-fp8 q handshake (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): when the
+        # model's q-prep decides (via q8kv8_born_fp8_q_eligible) that this
+        # batch's forward_extend is guaranteed to hit
+        # _forward_flashmla_sparse_q8kv8, it writes the padded fp8 q directly
+        # (fused absorbed-bmm + concat + cast) into _q8kv8_born_q_buf and
+        # stashes (num_tokens, layer_id); the helper consumes the stash
+        # instead of rebuilding q_fp8.  Same single-stream reuse argument as
+        # _q8kv8_qpad_buf.  The bf16 q that flows through the attention API in
+        # that mode is a NaN-poisoned sentinel: any code path that reads it by
+        # mistake fails loudly instead of producing silently wrong output.
+        self._q8kv8_born_q_buf: Optional[torch.Tensor] = None
+        self._q8kv8_born_q_stash: Optional[Tuple[int, int]] = None
+        self._q8kv8_born_q_sentinel: Optional[torch.Tensor] = None
+        self._q8kv8_born_q_tbo = model_runner.server_args.enable_two_batch_overlap
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
@@ -2044,6 +2073,7 @@ class DeepseekSparseAttnBackend(
                             page_table_1=page_table_1,
                             sm_scale=layer.scaling,
                             v_head_dim=layer.v_head_dim,
+                            layer_id=layer.layer_id,
                         )
                     kv_cache = _cat([k, k_rope], dim=-1)
                     return self._forward_flashmla_sparse_q8kv8(
@@ -2055,6 +2085,7 @@ class DeepseekSparseAttnBackend(
                         page_table_1=page_table_1,
                         sm_scale=layer.scaling,
                         v_head_dim=layer.v_head_dim,
+                        layer_id=layer.layer_id,
                     )
 
                 # bf16 path (dsa_impl == "flashmla_sparse").
@@ -2365,6 +2396,97 @@ class DeepseekSparseAttnBackend(
 
         return o
 
+    def q8kv8_born_fp8_q_eligible(
+        self, forward_batch: ForwardBatch, num_heads: int
+    ) -> bool:
+        """True iff this batch's forward_extend is guaranteed to consume q via
+        ``_forward_flashmla_sparse_q8kv8`` (born-fp8 q handshake precondition).
+
+        Must stay in lockstep with the forward_extend dispatch: a True here
+        while dispatch takes any other branch would leak the NaN sentinel into
+        a real attention kernel (loud NaNs, not silent corruption, but still a
+        failed forward).
+        """
+        if self.dsa_prefill_impl != "flashmla_sparse_q8":
+            return False
+        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
+        # target-verify and draft-extend, which use dsa_decode_impl anyway).
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return False
+        # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
+        if self.use_mha:
+            return False
+        if self.hisparse_coordinator is not None:
+            return False
+        # TBO interleaves two micro-batches through one backend instance; the
+        # single-slot stash handshake is not safe there.
+        if self._q8kv8_born_q_tbo:
+            return False
+        if is_dsa_enable_prefill_cp():
+            return False
+        if (
+            self.get_topk_transform_method(forward_batch.forward_mode)
+            != TopkTransformMethod.RAGGED
+        ):
+            return False
+        # Mirror the helper's head-padding compatibility check.
+        if num_heads % 64 != 0 and 64 % num_heads != 0:
+            return False
+        return True
+
+    def q8kv8_acquire_born_q_buffer(
+        self, num_tokens: int, num_heads: int, head_dim: int, device: torch.device
+    ) -> torch.Tensor:
+        """Padded fp8 q destination for the born-fp8 kernel (grow-only).
+
+        Pad rows [num_heads:pad_heads] are zeroed at allocation and never
+        written afterwards (the fused kernel only writes the active heads),
+        matching the _q8kv8_qpad_buf invariant the SM90 kernel relies on.
+        """
+        pad = 64
+        padded_heads = num_heads if num_heads % pad == 0 else pad
+        buf = self._q8kv8_born_q_buf
+        if (
+            buf is None
+            or buf.shape[0] < num_tokens
+            or buf.shape[1] != padded_heads
+            or buf.shape[2] != head_dim
+        ):
+            buf = torch.zeros(
+                (num_tokens, padded_heads, head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            self._q8kv8_born_q_buf = buf
+        return buf[:num_tokens]
+
+    def q8kv8_stash_born_q(self, num_tokens: int, layer_id: int) -> None:
+        if self._q8kv8_born_q_stash is not None:
+            raise RuntimeError(
+                "q8kv8 born-fp8 q stash was never consumed (previous stash "
+                f"{self._q8kv8_born_q_stash}, new ({num_tokens}, {layer_id})): "
+                "the eligibility predicate fired but forward_extend dispatched "
+                "away from _forward_flashmla_sparse_q8kv8."
+            )
+        self._q8kv8_born_q_stash = (num_tokens, layer_id)
+
+    def q8kv8_born_q_sentinel(
+        self, num_tokens: int, num_heads: int, v_head_dim: int, device: torch.device
+    ) -> torch.Tensor:
+        """NaN-poisoned bf16 stand-in for q_nope_out in born-fp8 mode.
+
+        Only its shape/dtype/device are ever legitimately used downstream; a
+        NaN payload turns any accidental read into loud NaN output.
+        """
+        numel = num_tokens * num_heads * v_head_dim
+        buf = self._q8kv8_born_q_sentinel
+        if buf is None or buf.numel() < numel:
+            buf = torch.full(
+                (numel,), float("nan"), dtype=torch.bfloat16, device=device
+            )
+            self._q8kv8_born_q_sentinel = buf
+        return buf[:numel].view(num_tokens, num_heads, v_head_dim)
+
     def _forward_flashmla_sparse_q8kv8(
         self,
         q_nope: torch.Tensor,
@@ -2375,6 +2497,7 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         paged_kv_cache: Optional[torch.Tensor] = None,
         page_table_1_flattened: Optional[torch.Tensor] = None,
+        layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         """Native FP8 (q8 x kv8) sparse-prefill attention (SM90 JIT kernel).
 
@@ -2409,12 +2532,37 @@ class DeepseekSparseAttnBackend(
         required_padding = 64
         need_padding = num_heads % required_padding != 0
 
+        # Born-fp8 fast path (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): the model's
+        # q-prep already wrote the padded fp8 q (fused absorbed-bmm + concat +
+        # cast); consume the stash instead of rebuilding it.  q_nope here is
+        # the NaN sentinel (shape-only); q_rope's bf16 content is valid but
+        # unused.
+        born = self._q8kv8_born_q_stash
+        if born is not None:
+            self._q8kv8_born_q_stash = None
+            born_tokens, born_layer_id = born
+            if born_tokens != num_tokens or (
+                layer_id is not None and born_layer_id != layer_id
+            ):
+                raise RuntimeError(
+                    "q8kv8 born-fp8 q stash mismatch: stashed "
+                    f"(num_tokens={born_tokens}, layer_id={born_layer_id}) but "
+                    f"consuming (num_tokens={num_tokens}, layer_id={layer_id})."
+                )
+            q_fp8 = self._q8kv8_born_q_buf[:num_tokens]
+            expected_heads = required_padding if need_padding else num_heads
+            if q_fp8.shape[1] != expected_heads or q_fp8.shape[2] != head_dim:
+                raise RuntimeError(
+                    "q8kv8 born-fp8 q buffer shape mismatch: got "
+                    f"{tuple(q_fp8.shape)}, expected (*, {expected_heads}, "
+                    f"{head_dim})."
+                )
         # Build the fp8 q.  concat_and_cast_q_fp8_pad fuses the nope/rope
         # concat with the bf16->fp8 cast in one Triton kernel (bit-exact vs
         # concat + .to(fp8)); it requires power-of-two head/dim counts (a
         # tl.arange constraint), so non-power-of-two head counts fall back to
         # the generic concat + cast.
-        if need_padding:
+        elif need_padding:
             if required_padding % num_heads != 0:
                 raise ValueError(
                     f"num_heads={num_heads} cannot be padded to {required_padding}; "
@@ -2458,20 +2606,59 @@ class DeepseekSparseAttnBackend(
         # Mapping many slots onto one shared row would serialize the kernel's
         # KV gather; distinct zero rows are value-identical (zero KV
         # contributes nothing to the softmax-weighted sum) at full speed.
+        #
+        # The destination is a persistent grow-only buffer instead of a fresh
+        # torch.zeros: rows [0, num_kv_tokens) are fully overwritten every
+        # call (gather kernel / cast-copy), so only the pad rows
+        # [num_kv_tokens, num_kv_tokens + topk) - exactly the rows the SM90
+        # kernel's -1 clamp (pad_base + slot) can read - need zeroing, and
+        # they need it EVERY call because a previous, larger call may have
+        # left real KV data there.  The gather kernel fuses the pad-row
+        # zeroing; the bf16 path zeroes the tail explicitly.
         topk = page_table_1.shape[-1]
+        num_kv_tokens = (
+            page_table_1_flattened.shape[0]
+            if paged_kv_cache is not None
+            else kv_bf16.shape[0]
+        )
+        total_kv_rows = num_kv_tokens + topk
+        kv_buf = self._q8kv8_kv_buf
+        if kv_buf is None or kv_buf.shape[0] < total_kv_rows:
+            kv_buf = torch.empty(
+                (total_kv_rows, head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=dev,
+            )
+            self._q8kv8_kv_buf = kv_buf
         if paged_kv_cache is not None:
             kv_padded = gather_dequant_requant_fp8_paged(
                 paged_kv_cache,
                 page_table_1_flattened,
                 extra_rows=topk,
+                out=kv_buf[:total_kv_rows],
             ).view(-1, 1, head_dim)
         else:
-            kv_padded = kv_bf16.new_zeros(
-                (kv_bf16.shape[0] + topk, *kv_bf16.shape[1:]),
-                dtype=torch.float8_e4m3fn,
-            )
-            kv_padded[: kv_bf16.shape[0]].copy_(kv_bf16)
+            kv_padded = kv_buf[:total_kv_rows]
+            # bf16 -> fp8 cast copy, same op as the previous fresh-buffer
+            # path (bit-identical bytes).
+            kv_padded[:num_kv_tokens].copy_(kv_bf16.view(num_kv_tokens, head_dim))
+            kv_padded[num_kv_tokens:].zero_()
             kv_padded = kv_padded.view(-1, 1, head_dim)
+
+        # Per-row valid-topk count = last non-pad position + 1.  Bit-exact
+        # vs topk_length=None: the skipped tail blocks contain only -1 pads
+        # (masked to zero contribution today), and -1 entries inside the
+        # consumed range still take the kernel's clamp+mask path.  clamp(min=1)
+        # keeps all-pad rows on the well-tested >=1-block path.
+        topk_length = None
+        if self._q8kv8_topk_length_enabled:
+            arange = self._q8kv8_topk_arange
+            if arange is None or arange.shape[0] != topk:
+                arange = torch.arange(1, topk + 1, dtype=torch.int32, device=dev)
+                self._q8kv8_topk_arange = arange
+            topk_length = (
+                (page_table_1 >= 0).int().mul_(arange).amax(dim=-1).clamp_(min=1)
+            )
 
         o, _, _ = sparse_mla_q8kv8_prefill_fwd(
             q=q_fp8,
@@ -2482,7 +2669,7 @@ class DeepseekSparseAttnBackend(
             kv_scale=identity_scale,
             d_v=v_head_dim,
             attn_sink=None,
-            topk_length=None,
+            topk_length=topk_length,
         )
 
         # Trim the output back to the original head count if we padded.

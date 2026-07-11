@@ -696,6 +696,20 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
+    # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
+    # directly in fp8 ("born fp8") and the standalone concat-cast kernel
+    # disappears.  Not bit-exact vs the default path (same rounding stages,
+    # different GEMM accumulation order), hence default OFF until accuracy-
+    # gated (oracle + full-set gsm8k).
+    SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: pass a
+    # per-row valid-topk count (derived from the trailing -1 pad run of the
+    # topk indices) so the kernel skips whole pad-only topk blocks instead of
+    # computing masked zero contributions.  Bit-exact by construction: skipped
+    # blocks contain only -1 pads, and -1 entries inside the consumed range
+    # still take the in-kernel clamp+mask path.
+    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
