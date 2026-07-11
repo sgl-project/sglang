@@ -406,7 +406,6 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4HipRadixBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
-    supports_ragged_verify_graph: bool = True
     # DSV4 TBO runs ONLY in eager prefill (prefill cuda-graph is disabled);
     # decode/target-verify graphs are non-TBO (primary backend only). So the TBO
     # child backends must not be driven through cuda-graph capture/replay — doing
@@ -655,10 +654,7 @@ class DeepseekV4HipRadixBackend(
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
-                bs=bs,
-                qo_len=num_draft_tokens,
-                seq_lens=seq_lens,
-                req_pool_indices=req_pool_indices,
+                bs, num_draft_tokens, seq_lens, req_pool_indices
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -1574,7 +1570,6 @@ class DeepseekV4HipRadixBackend(
 
     def expand_extend_with_same_length(
         self,
-        *,
         bs: int,
         qo_len: int,
         seq_lens: torch.Tensor,
