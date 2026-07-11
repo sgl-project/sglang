@@ -12,7 +12,7 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_scheduler import (
+from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkScheduleConfig,
 )
 from sglang.srt.speculative.dspark_components.kernels import (
