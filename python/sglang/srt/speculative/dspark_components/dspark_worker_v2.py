@@ -16,7 +16,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import verify_logits_adjustments_are_noop
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -49,6 +48,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda

@@ -39,6 +39,23 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
+def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+    if sampling_info is None:
+        return True
+    if sampling_info.has_custom_logit_processor:
+        return False
+    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+        return False
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    if penalizer is not None and penalizer.is_required:
+        return False
+    if getattr(sampling_info, "vocab_mask", None) is not None:
+        return False
+    if getattr(sampling_info, "logit_bias", None) is not None:
+        return False
+    return True
+
+
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
