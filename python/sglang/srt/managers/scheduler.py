@@ -3335,9 +3335,7 @@ class Scheduler(
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
-                    if hasattr(
-                        batch.spec_info, "future_dsa_topk_indices_available"
-                    ):
+                    if hasattr(batch.spec_info, "future_dsa_topk_indices_available"):
                         batch.spec_info.future_dsa_topk_indices_available = (
                             batch.spec_info.dsa_topk_indices is not None
                         )
