@@ -571,7 +571,9 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
-        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        self.last_rank_comm_queue: deque[Tuple[int, torch.Event, PPProxyTensors]] = (
+            deque()
+        )
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1219,7 +1221,25 @@ class SchedulerPPMixin:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
             if target is not None:
-                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                queue_idx = next(
+                    (
+                        i
+                        for i, (queued_mb_id, _, _) in enumerate(
+                            last_rank_comm_queue
+                        )
+                        if queued_mb_id == next_first_rank_mb_id
+                    ),
+                    None,
+                )
+                if queue_idx is None:
+                    raise RuntimeError(
+                        "PP last-rank output queue missing target microbatch: "
+                        f"target_mb_id={next_first_rank_mb_id}, "
+                        "queued_mb_ids="
+                        f"{[item[0] for item in last_rank_comm_queue]}"
+                    )
+                _, q_event, pp_outputs_to_send = last_rank_comm_queue[queue_idx]
+                del last_rank_comm_queue[queue_idx]
                 if (
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
@@ -1343,6 +1363,7 @@ class SchedulerPPMixin:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
                         (
+                            mb_id,
                             event,
                             PPProxyTensors(
                                 self._pp_prepare_tensor_dict(result, cur_batch)
