@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -285,11 +287,19 @@ def _dequantize_k_cache_paged_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
+# Tokens handled by one program of the vectorized gather kernel.  4 tokens
+# x 512 fp8 nope elements = 2048 elements per program: with num_warps=4
+# (128 threads) that is 16 fp8 elements per thread, which Triton emits as
+# a single 16-byte vectorized load/store per thread.
+_GATHER_TOKENS_PER_PROG = 4
+
+
 def gather_dequant_requant_fp8_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
     extra_rows: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Gather paged fp8 KV tokens and re-pack into flat [576] fp8 layout.
 
@@ -300,6 +310,13 @@ def gather_dequant_requant_fp8_paged(
     Rope is cast bf16->fp8.  The whole operation is fused into a single
     Triton kernel to avoid allocating an intermediate bf16 buffer.
 
+    The kernel writes EVERY byte of rows [0, num_tokens) and zero-fills
+    rows [num_tokens, num_tokens + extra_rows) (the -1-sentinel landing
+    pad required by the SM90 sparse MLA Q8KV8 kernel, which clamps each
+    -1 topk slot ``offs`` to distinct row ``num_tokens + offs``).  The
+    destination therefore needs no pre-zeroing, which allows passing a
+    persistent (dirty) buffer via ``out``.
+
     Args:
         quant_k_cache: [total_num_tokens, 1, 656] fp8_e4m3fn
         page_table_1_flattened: [num_tokens] int32
@@ -308,6 +325,9 @@ def gather_dequant_requant_fp8_paged(
             the end of the output (used by the SM90 sparse MLA Q8KV8
             kernel which over-reads past end-of-buffer for masked
             indices)
+        out: optional pre-allocated destination of shape
+            [num_tokens + extra_rows, 1, 576] (or [.., 576]) fp8_e4m3fn,
+            contiguous.  Contents may be arbitrary (fully overwritten).
     Returns:
         output: [num_tokens + extra_rows, 1, 576] fp8_e4m3fn
     """
@@ -324,10 +344,161 @@ def gather_dequant_requant_fp8_paged(
     assert num_tiles * group_size == dim_nope
 
     total_rows = num_tokens + extra_rows
+    if out is None:
+        # No zero-fill needed: the kernel overwrites every byte of the
+        # data rows and zero-fills the pad rows itself.
+        output = torch.empty(
+            (total_rows, 1, out_dim),
+            dtype=torch.float8_e4m3fn,
+            device=quant_k_cache.device,
+        )
+    else:
+        assert out.dtype == torch.float8_e4m3fn
+        assert out.device == quant_k_cache.device
+        assert out.is_contiguous()
+        assert out.numel() == total_rows * out_dim, (
+            f"out buffer has {out.numel()} elements, expected "
+            f"{total_rows} x {out_dim} = {total_rows * out_dim}"
+        )
+        output = out.view(total_rows, 1, out_dim)
+
+    if total_rows == 0:
+        return output
+
+    input_nope_q = quant_k_cache[:, :dim_nope]
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+        torch.float32
+    )
+    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+
+    grid = (triton.cdiv(total_rows, _GATHER_TOKENS_PER_PROG),)
+    _gather_dequant_requant_fp8_paged_vec_kernel[grid](
+        output,
+        input_nope_q,
+        input_nope_s,
+        input_rope,
+        page_table_1_flattened,
+        num_tokens,
+        total_rows,
+        output.stride(0),
+        input_nope_q.stride(0),
+        input_nope_s.stride(0),
+        input_rope.stride(0),
+        NUM_NOPE_BLOCKS=num_tiles,
+        GROUP_SIZE=group_size,
+        DIM_NOPE=dim_nope,
+        DIM_ROPE=dim_rope,
+        TOKENS_PER_PROG=_GATHER_TOKENS_PER_PROG,
+        num_warps=4,
+    )
+
+    return output
+
+
+@triton.jit
+def _gather_dequant_requant_fp8_paged_vec_kernel(
+    output_ptr,
+    input_nope_q_ptr,
+    input_nope_s_ptr,
+    input_rope_ptr,
+    page_table_1_ptr,
+    num_tokens: int,
+    total_rows: int,
+    output_stride_0: int,
+    input_nope_q_stride_0: int,
+    input_nope_s_stride_0: int,
+    input_rope_stride_0: int,
+    NUM_NOPE_BLOCKS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TOKENS_PER_PROG: tl.constexpr,
+):
+    """Vectorized fused gather + dequant(per-group) + requant(per-tensor).
+
+    One program handles TOKENS_PER_PROG consecutive output rows (full
+    576-byte rows each), instead of the legacy one-program-per-(token,
+    128-elem-slice) layout, so each thread moves 16 contiguous fp8 bytes
+    per load/store.  Rows >= num_tokens (the -1-sentinel landing pad) are
+    zero-filled without touching the KV cache.  Per-element math is
+    bit-identical to the legacy kernel: fp8 -> f32, * f32 group scale,
+    -> fp8 (nope); bf16 -> fp8 (rope).
+    """
+    pid = tl.program_id(0)
+    offs_t = pid * TOKENS_PER_PROG + tl.arange(0, TOKENS_PER_PROG)  # [T]
+    row_in_range = offs_t < total_rows
+    is_real = offs_t < num_tokens
+    # Masked lanes (pad rows) never touch memory; `other=0` keeps the
+    # address arithmetic in-bounds-irrelevant.
+    paged = tl.load(page_table_1_ptr + offs_t, mask=is_real, other=0).to(tl.int64)
+    # 64-bit output row offsets: total_rows * 576 can exceed int32 for
+    # very large gathered buffers.
+    offs_t64 = offs_t.to(tl.int64)
+
+    offs_g = tl.arange(0, NUM_NOPE_BLOCKS)  # [G] dequant groups
+    offs_i = tl.arange(0, GROUP_SIZE)  # [I] elems within a group
+
+    # a. nope: [T, G, I] fp8 block; the (G, I) plane spans the contiguous
+    #    DIM_NOPE bytes of one cache row.
+    ptr_q = (
+        input_nope_q_ptr
+        + paged[:, None, None] * input_nope_q_stride_0
+        + offs_g[None, :, None] * GROUP_SIZE
+        + offs_i[None, None, :]
+    )
+    y_q = tl.load(ptr_q, mask=is_real[:, None, None], other=0.0).to(tl.float32)
+    ptr_s = input_nope_s_ptr + paged[:, None] * input_nope_s_stride_0 + offs_g[None, :]
+    y_s = tl.load(ptr_s, mask=is_real[:, None], other=0.0)
+    # dequant -> f32 -> requant to fp8; pad rows: (0 * 0) -> +0 -> byte 0x00
+    y = (y_q * y_s[:, :, None]).to(tl.float8e4nv)
+    dst_q = (
+        output_ptr
+        + offs_t64[:, None, None] * output_stride_0
+        + offs_g[None, :, None] * GROUP_SIZE
+        + offs_i[None, None, :]
+    )
+    tl.store(dst_q, y, mask=row_in_range[:, None, None])
+
+    # b. rope: [T, R] bf16 -> fp8; pad rows: 0.0 -> byte 0x00
+    offs_r = tl.arange(0, DIM_ROPE)
+    src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
+    data = tl.load(src_r, mask=is_real[:, None], other=0.0).to(tl.float8e4nv)
+    dst_r = (
+        output_ptr + offs_t64[:, None] * output_stride_0 + DIM_NOPE + offs_r[None, :]
+    )
+    tl.store(dst_r, data, mask=row_in_range[:, None])
+
+
+def gather_dequant_requant_fp8_paged_legacy(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    group_size: int = 128,
+    extra_rows: int = 0,
+) -> torch.Tensor:
+    """Legacy (pre-vectorization) gather + dequant + requant.
+
+    Kept as the bit-exactness / performance reference for
+    ``gather_dequant_requant_fp8_paged`` (see
+    ``scripts/pr3_gather_microbench.py``).  Allocates and zero-fills the
+    full destination each call, then launches one program per
+    (token, 128-elem slice).
+    """
+    dim_quant = quant_k_cache.shape[-1]
+    assert dim_quant == 656
+    quant_k_cache = quant_k_cache.view((-1, dim_quant))
+
+    num_tokens = page_table_1_flattened.shape[0]
+    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    dim_nope = 512
+    dim_rope = 64
+    num_tiles = dim_nope // group_size  # 4
+    out_dim = dim_nope + dim_rope  # 576
+    assert num_tiles * group_size == dim_nope
+
+    total_rows = num_tokens + extra_rows
     # Allocate a fresh zero-filled buffer.  The extra landing-pad rows at
     # the tail must read as zeros (the kernel may over-read past
-    # num_tokens for masked indices).  A future optimization could cache
-    # this buffer but baseline allocates fresh.
+    # num_tokens for masked indices).
     output = torch.zeros(
         (total_rows, 1, out_dim),
         dtype=torch.float8_e4m3fn,
