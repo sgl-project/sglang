@@ -8001,11 +8001,6 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        if self.speculative_algorithm is not None:
-            raise ValueError(
-                "Diffusion LLM inference does not support speculative decoding. "
-                "--dllm-algorithm cannot be used together with --speculative-algorithm."
-            )
         # On AMD/HIP, disable cuda graph for DLLM (the attention backend
         # resolution moved to the pipeline in arg_groups/overrides.py).
         if is_hip():
