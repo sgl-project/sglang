@@ -91,7 +91,12 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 
 # Utils
 from sglang.srt.utils import (
@@ -133,7 +138,7 @@ cached_get_processor = lru_cache(get_processor)
 def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
-    return get_flags().disable_shared_experts_fusion
+    return get_server_args().disable_shared_experts_fusion
 
 
 if _is_cuda:
@@ -682,27 +687,27 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if should_allreduce_fusion:
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1067,27 +1072,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if should_allreduce_fusion:
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1177,7 +1182,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # so the model still gets the #25885 multi-streaming path. ROCm-only.
         if (
             config.model_type == "qwen3_5_moe_text"
-            and not get_flags().disable_shared_experts_fusion
+            and not get_server_args().disable_shared_experts_fusion
             and not can_fuse_shared_expert(config, quant_config)
         ):
             from sglang.srt.arg_groups.overrides import declare_load_time_override
@@ -1206,7 +1211,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
-        alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
+        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
         if self.pp_group.is_first_rank:
