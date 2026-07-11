@@ -951,6 +951,22 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        pp_output_rid_hashes = getattr(result, "pp_output_rid_hashes", None)
+        pp_output_hash_set = None
+        if pp_output_rid_hashes is not None:
+            pp_output_hash_set = {
+                int(x) for x in pp_output_rid_hashes.detach().cpu().tolist()
+            }
+
+        full_batch_next_tokens = len(next_token_ids) == len(batch.reqs)
+
+        def has_final_pp_output(req: Req) -> bool:
+            if full_batch_next_tokens:
+                return True
+            if pp_output_hash_set is not None:
+                return _pp_stable_rid_hash(req.rid) in pp_output_hash_set
+            return req.inflight_middle_chunks <= 0
+
         # Poll optimistic prefill requests in this batch.
         # Note: In overlap scheduling, a chunked request that was still pending
         # during process_prefill_chunk is not checked again here.
@@ -960,7 +976,7 @@ class SchedulerDisaggregationPrefillMixin:
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
-            if req.pending_bootstrap and req.inflight_middle_chunks <= 0
+            if req.pending_bootstrap and has_final_pp_output(req)
         ]
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -972,48 +988,12 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
-        pp_output_rid_hashes = getattr(result, "pp_output_rid_hashes", None)
-        pp_output_hash_set = None
-        if pp_output_rid_hashes is not None:
-            pp_output_hash_set = {
-                int(x) for x in pp_output_rid_hashes.detach().cpu().tolist()
-            }
-
-        full_batch_next_tokens = len(next_token_ids) == len(batch.reqs)
         compact_next_token_pt = 0
         for i, req in enumerate(batch.reqs):
-            if req.inflight_middle_chunks <= 0:
+            if has_final_pp_output(req):
                 if full_batch_next_tokens:
                     next_token_id = next_token_ids[i]
                 else:
-                    if (
-                        pp_output_hash_set is not None
-                        and _pp_stable_rid_hash(req.rid) not in pp_output_hash_set
-                    ):
-                        output_matched_rids = [
-                            x.rid
-                            for x in batch.reqs
-                            if _pp_stable_rid_hash(x.rid) in pp_output_hash_set
-                        ]
-                        missing_output_rids = [
-                            x.rid
-                            for x in batch.reqs
-                            if (
-                                x.inflight_middle_chunks <= 0
-                                and _pp_stable_rid_hash(x.rid)
-                                not in pp_output_hash_set
-                            )
-                        ]
-                        raise RuntimeError(
-                            "Disagg prefill PP output rid mismatch: "
-                            f"num_reqs={len(batch.reqs)}, "
-                            f"num_next_token_ids={len(next_token_ids)}, "
-                            f"rids={[x.rid for x in batch.reqs]}, "
-                            f"output_matched_rids={output_matched_rids}, "
-                            f"missing_output_rids={missing_output_rids}, "
-                            "pp_output_rid_hashes="
-                            f"{pp_output_rid_hashes.detach().cpu().tolist()}"
-                        )
                     if compact_next_token_pt >= len(next_token_ids):
                         output_matched_rids = None
                         missing_output_rids = None
@@ -1027,7 +1007,7 @@ class SchedulerDisaggregationPrefillMixin:
                                 x.rid
                                 for x in batch.reqs
                                 if (
-                                    x.inflight_middle_chunks <= 0
+                                    has_final_pp_output(x)
                                     and _pp_stable_rid_hash(x.rid)
                                     not in pp_output_hash_set
                                 )
@@ -1107,7 +1087,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                elif pp_output_hash_set is not None:
+                    logger.debug(
+                        "Treat PP disagg prefill req as compact middle chunk "
+                        "from output rid hashes despite local non-positive "
+                        "inflight_middle_chunks: rid=%s",
+                        req.rid,
+                    )
 
                 # Still chunking iff its next chunk was launched: either it is
                 # still self.chunked_req, or its final chunk (extend_range
