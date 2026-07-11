@@ -22,7 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 def _load_custom_rms_norm() -> Optional[Callable]:
-    """Return the AOT Metal ``rms_norm`` entry point, or None if unavailable."""
+    """Return the raw AOT Metal ``rms_norm`` entry point, or None if unavailable.
+
+    This is the nanobind ``_metal.rms_norm``, NOT the validating ``metal.rms_norm``
+    wrapper: ``MLXRMSNormWrapper._supported`` already guarantees the shape/dtype
+    contract, so the wrapper's duplicate validation and its two per-call
+    ``mx.contiguous`` graph nodes are skipped. In exchange, contiguity of both
+    arguments is this module's responsibility (the raw entry reads flat
+    row-major buffers with no checks).
+    """
     try:
         from sgl_kernel import metal
     except ImportError:
@@ -31,7 +39,7 @@ def _load_custom_rms_norm() -> Optional[Callable]:
         return None
     if getattr(metal, "_IMPORT_ERROR", None) is not None:
         return None
-    return metal.rms_norm
+    return metal._metal.rms_norm
 
 
 def is_plain_rms_norm(module: Any) -> bool:
@@ -60,23 +68,37 @@ class MLXRMSNormWrapper(nn.Module):
         # re-registered submodules/params (mirrors MLXAttentionWrapper).
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_kernel", kernel)
+        object.__setattr__(self, "_eps", float(inner.eps))
+        self._refresh_weight_cache(inner.weight)
+    
+    def _refresh_weight_cache(self, w):
+        object.__setattr__(self, "_w_is_1D", w.ndim == 1)
+        object.__setattr__(self, "_w_dtype", w.dtype)
+        object.__setattr__(self, "_w_shape_0", w.shape[0])
+        object.__setattr__(self, "_w_contig", mx.contiguous(w))
+        object.__setattr__(self, "_w_ref", w)
 
     def _supported(self, x: mx.array) -> bool:
         """Whether the custom kernel can handle this call; else we fall back."""
-        w = self._inner.weight
         return (
             x.dtype in (mx.float16, mx.bfloat16, mx.float32)
-            and w.dtype == x.dtype
-            and w.ndim == 1
-            and x.shape[-1] == w.shape[0]
+            and self._w_dtype == x.dtype
+            and self._w_is_1D
+            and x.shape[-1] == self._w_shape_0
         )
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self._inner.weight is not self._w_ref:
+            self._refresh_weight_cache(self._inner.weight)
         if not self._supported(x):
             return self._inner(x)
-        rows = x.reshape(-1, x.shape[-1])
-        y = self._kernel(rows, self._inner.weight, eps=float(self._inner.eps))
-        return y.reshape(x.shape)
+        w = self._w_contig
+        if x.ndim == 2:
+            return self._kernel(mx.contiguous(x), w, self._eps)
+        else:
+            rows = mx.contiguous(x.reshape(-1, x.shape[-1]))
+            y = self._kernel(rows, w, self._eps)
+            return y.reshape(x.shape)
 
 
 def _patch_norms(module: nn.Module, wrap: Callable[[nn.Module], nn.Module]) -> int:
