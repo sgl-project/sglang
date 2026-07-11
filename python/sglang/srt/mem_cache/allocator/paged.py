@@ -184,18 +184,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
-        bs = len(prefix_lens)
-        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-            self.free_pages
-        ):
-            self.merge_and_sort_free()
-
         if num_new_pages is None:
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
                 prefix_lens=prefix_lens_cpu,
             )
+        if num_new_pages > len(self.free_pages) + len(self.release_pages):
+            return None
+
+        bs = len(prefix_lens)
+        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
+            self.free_pages
+        ):
+            self.merge_and_sort_free()
+
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -230,15 +233,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
-        bs = len(seq_lens)
-        if self.need_sort and bs > len(self.free_pages):
-            self.merge_and_sort_free()
-
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
             decode=True,
         )
+        if num_new_pages > len(self.free_pages) + len(self.release_pages):
+            return None
+
+        bs = len(seq_lens)
+        if self.need_sort and bs > len(self.free_pages):
+            self.merge_and_sort_free()
+
         if num_new_pages > len(self.free_pages):
             return None
 
