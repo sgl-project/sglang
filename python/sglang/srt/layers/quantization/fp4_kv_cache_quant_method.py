@@ -107,10 +107,6 @@ class KVCacheAttentionAccess:
         ) and self.backend_matcher.matches(backend_name, backend_tags)
 
 
-BACKEND_TAG_FP4_DEQUANT_PREFILL = "fp4_dequant_workspace_prefill"
-BACKEND_TAG_FP4_DEQUANT_DECODE = "fp4_dequant_workspace_decode"
-
-
 class KVCacheQuantMethodBase(ABC):
     """Abstract base for KV cache quantization strategies.
 
@@ -652,16 +648,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
 
 
 # Registry: method name -> attention access rules.
-# Keep this table near the method-class registry so reviewers can see every
-# supported recipe/backend/phase combination in one place.
 _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
-_FP4_DEQUANT_PREFILL_BACKENDS = KVCacheBackendMatcher(
-    tags=frozenset({BACKEND_TAG_FP4_DEQUANT_PREFILL})
-)
-_FP4_DEQUANT_DECODE_BACKENDS = KVCacheBackendMatcher(
-    tags=frozenset({BACKEND_TAG_FP4_DEQUANT_DECODE})
-)
-
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
     UnquantizedKVCacheMethod.name: (
         KVCacheAttentionAccess(
@@ -698,7 +685,7 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         KVCacheAttentionAccess(
             KVCacheAttentionPhase.PREFILL,
             KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-            _FP4_DEQUANT_PREFILL_BACKENDS,
+            KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
             storage_dtype=torch.uint8,
             attention_kv_dtype=torch.float8_e4m3fn,
             scale_recipe="fp4_mx_block16",
@@ -707,7 +694,7 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         KVCacheAttentionAccess(
             KVCacheAttentionPhase.DECODE,
             KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-            _FP4_DEQUANT_DECODE_BACKENDS,
+            KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
             storage_dtype=torch.uint8,
             attention_kv_dtype=torch.float8_e4m3fn,
             scale_recipe="fp4_mx_block16",

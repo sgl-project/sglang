@@ -27,8 +27,6 @@ from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-    BACKEND_TAG_FP4_DEQUANT_DECODE,
-    BACKEND_TAG_FP4_DEQUANT_PREFILL,
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -328,14 +326,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
-            "prefill",
-            "flashinfer",
-            backend_tags={BACKEND_TAG_FP4_DEQUANT_PREFILL},
+            "prefill", "flashinfer"
         )
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
-            "decode",
-            "flashinfer",
-            backend_tags={BACKEND_TAG_FP4_DEQUANT_DECODE},
+            "decode", "flashinfer"
         )
         prefill_backend, decode_backend = (
             model_runner.server_args.get_attention_backends()
