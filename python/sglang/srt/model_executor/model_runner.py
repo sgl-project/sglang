@@ -2822,12 +2822,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.prefill_graph_mem_usage = before_mem - after_mem
+        mem_usage = before_mem - after_mem
+        self.prefill_graph_mem_usage = mem_usage
         logger.info(
             f"Capture {capture_name} CUDA graph end. "
             f"elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={self.prefill_graph_mem_usage:.2f} GB, "
-            f"avail mem={after_mem:.2f} GB."
+            f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
 
     def init_threads_binding(self):
