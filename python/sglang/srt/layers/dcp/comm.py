@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import warnings
 from typing import Optional
 
 import torch
@@ -28,36 +29,39 @@ from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_at
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    get_dcp_group,
-    get_dcp_group_no_assert,
-)
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda
+
+
+def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
+    warnings.warn(
+        f"{name} is deprecated; use {replacement} instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
 
 def dcp_enabled() -> bool:
-    """
-    only checks whether dcp enabled for cuda platform
-    """
-    if get_dcp_group_no_assert() is None:
-        return False
-    if not is_cuda():
-        return False
-    return get_parallel().dcp_size > 1
+    """Deprecated: use ``get_parallel().dcp_enabled``."""
+    _warn_deprecated_dcp_accessor("dcp_enabled()", "get_parallel().dcp_enabled")
+    return get_parallel().dcp_enabled
 
 
 def get_attention_dcp_world_size() -> int:
-    if not dcp_enabled():
-        return 1
-    return get_parallel().dcp_size
+    """Deprecated: use ``get_parallel().attn_dcp_size``."""
+    _warn_deprecated_dcp_accessor(
+        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
+    )
+    return get_parallel().attn_dcp_size
 
 
 def get_attention_dcp_rank() -> int:
-    if not dcp_enabled():
-        return 0
-    return get_parallel().dcp_rank
+    """Deprecated: use ``get_parallel().attn_dcp_rank``."""
+    _warn_deprecated_dcp_accessor(
+        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
+    )
+    return get_parallel().attn_dcp_rank
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -132,12 +136,13 @@ def cp_lse_ag_out_rs_mla(
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
-    dcp_world_size = get_parallel().dcp_size
+    parallel = get_parallel()
+    dcp_world_size = parallel.dcp_size
     # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
     gathered_kv_a = kv_a.new_empty(
         (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
     )
-    get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
+    parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
     gathered_kv_a = (
         gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
         .transpose(0, 1)
@@ -152,7 +157,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
-    if dcp_enabled():
+    if get_parallel().dcp_enabled:
         kv_a = kv_a.unsqueeze(1)
         gathered_kv = all_gather_kv_cache_for_dcp(
             kv_a,
@@ -218,10 +223,11 @@ def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
 ):
-    with use_symmetric_memory(get_dcp_group()):
+    group = get_parallel().dcp_group
+    with use_symmetric_memory(group):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
         combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = get_dcp_group().all_gather(combined, dim=0)
+    gathered = group.all_gather(combined, dim=0)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
@@ -278,11 +284,12 @@ def all_gather_kv_cache_for_dcp(
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
     """
-    if not dcp_enabled():
+    parallel = get_parallel()
+    if not parallel.dcp_enabled:
         return torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     # 1. compute max kv_lens for each seq
-    dcp_world_size = get_parallel().dcp_size
-    dcp_rank = get_parallel().dcp_rank
+    dcp_world_size = parallel.dcp_size
+    dcp_rank = parallel.dcp_rank
 
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)

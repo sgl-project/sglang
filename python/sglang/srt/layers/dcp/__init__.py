@@ -23,7 +23,11 @@ Only the symbols imported by code OUTSIDE this subpackage are re-exported here.
 Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
 ``correct_attn_out``, ``create_dcp_kv_indices``, ``update_kv_lens_and_indices``,
 ``_all_gather_dcp_kv_cache``) stay private to their submodules — import them from
-``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally."""
+``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally.
+
+``dcp_enabled`` / ``get_attention_dcp_*`` remain compatibility exports for
+out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
+``get_parallel().attn_dcp_*``."""
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,

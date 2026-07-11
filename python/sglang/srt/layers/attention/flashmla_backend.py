@@ -17,11 +17,6 @@ from sglang.kernels.ops.attention.utils import (
     get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.dcp import (
-    dcp_enabled,
-    get_attention_dcp_rank,
-    get_attention_dcp_world_size,
-)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -96,8 +91,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
 
         # get dcp info
-        self.dcp_world_size = get_attention_dcp_world_size()
-        self.dcp_rank = get_attention_dcp_rank()
+        self.dcp_world_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
 
     def init_forward_metadata_out_graph(
         self,
@@ -390,7 +385,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # TODO uniform output for forward_decode and forward_extend to
             # return tuple instead of single output
             # decode context parallel needs lse to correct attn_output via online softmax
-            if dcp_enabled():
+            if get_parallel().dcp_enabled:
                 return o, lse
             return o
 
