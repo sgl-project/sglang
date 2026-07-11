@@ -590,15 +590,15 @@ class Glm4vForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in GLM-V, last dim is the same. Some items' feature may have been
-        # dropped to None by the DP-encoder pre-H2D sharding helper; in that
-        # case we only concat the locally-owned shard.
+        # in GLM-V, last dim is the same. Non-local items' feature may have been
+        # dropped to None by the DP-encoder pre-H2D sharding; concat only the
+        # locally-owned shard.
         from sglang.srt.managers.mm_utils import (
             build_local_pixel_values_for_dp_encoder,
         )
 
         fallback_device = next(self.visual.parameters()).device
-        pixel_values, shard_indices = build_local_pixel_values_for_dp_encoder(
+        pixel_values, dp_encoder_owner_ranks = build_local_pixel_values_for_dp_encoder(
             items, dtype=self.visual.dtype, fallback_device=fallback_device
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
@@ -610,7 +610,7 @@ class Glm4vForConditionalGeneration(nn.Module):
                 pixel_values,
                 image_grid_thw.tolist(),
                 rope_type="rope_3d",
-                local_item_indices=shard_indices,
+                owner_ranks=dp_encoder_owner_ranks,
             )
         else:
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)

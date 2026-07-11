@@ -153,9 +153,6 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
-from sglang.srt.managers.mm_utils import (
-    maybe_shard_items_for_dp_encoder,
-)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -1981,10 +1978,14 @@ class Scheduler(
         else:
             image_inputs = MultimodalInputs.from_processor_output(mm_inputs_dict)
 
-        # DP-encoder CPU-side sharding: drop ``item.feature`` for items not
-        # owned by this rank so the subsequent H2D only ships local data.
-        if image_inputs is not None and image_inputs.mm_items:
-            maybe_shard_items_for_dp_encoder(image_inputs.mm_items)
+        # Decide DP-encoder ownership once, over the request's full image set,
+        # and store it as a persistent per-item tag. This is deterministic on
+        # every rank, survives retraction, and is the single source of truth for
+        # both the encode-path feature drop and the vision-model runner.
+        if image_inputs is not None:
+            from sglang.srt.managers.mm_utils import assign_dp_encoder_owners
+
+            assign_dp_encoder_owners(image_inputs.mm_items)
 
         return image_inputs
 

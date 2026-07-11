@@ -2061,6 +2061,14 @@ class ServerArgs:
         bool,
         "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
     ] = False
+    mm_dp_encoder_shard_by_owner: A[
+        bool,
+        "(Experimental) When mm_enable_dp_encoder is on, decide each image's owning "
+        "rank once in the scheduler and shard encoder features by owner before H2D "
+        "(saves host->device copy and is safe under chunked prefill / retraction). "
+        "When off, the DP encoder replicates inputs and the runner recomputes the "
+        "load-balancing assignment (legacy behavior).",
+    ] = False
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(

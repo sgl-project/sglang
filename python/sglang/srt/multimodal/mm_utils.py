@@ -33,7 +33,7 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import numpy as np
 import pybase64
@@ -367,6 +367,138 @@ def process_images(images, image_processor, model_cfg):
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
+def dp_encoder_num_patches(grid_thw) -> int:
+    """Canonical per-image load metric for DP-encoder load balancing.
+
+    The scheduler-side owner assignment (:func:`assign_dp_encoder_owner_ranks`)
+    and the vision-model runner (:func:`run_dp_sharded_mrope_vision_model`) MUST
+    both derive the per-image load from this single definition. If they diverged,
+    the ranks could disagree on ownership and the pre-sharded ``pixel_values``
+    would no longer line up with the runner's reassembly order.
+    """
+    return int(math.prod(grid_thw))
+
+
+def assign_dp_encoder_owner_ranks(sizes: List[int], tp_size: int) -> List[int]:
+    """Return the owning attention-TP rank for each item.
+
+    This is the single, authoritative DP-encoder ownership decision. It is
+    computed ONCE per request in the scheduler (over the request's full image
+    set) and then stored on each item as a persistent tag
+    (``dp_encoder_owner_rank``). Because ownership is an intrinsic per-item
+    property that never changes, every later consumer -- the pre-H2D feature
+    drop and the vision-model runner -- simply reads the tag instead of
+    recomputing a load-balancing assignment. This is what makes the scheme
+    correct under chunked prefill, per-image caching, and retraction: the exact
+    subset of items encoded in any given ViT call may vary, but the owner of
+    each item is fixed, so the drop side and the runner can never disagree.
+
+    ``sizes[i]`` is the per-item load metric (:func:`dp_encoder_num_patches`).
+    The result is fully deterministic given ``(sizes, tp_size)`` so every rank
+    agrees without communication.
+    """
+    shuffle_indices, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(sizes, tp_size)
+    owner_ranks = [0] * len(sizes)
+    pos = 0
+    for rank in range(tp_size):
+        for _ in range(gpu_sample_counts[rank]):
+            owner_ranks[shuffle_indices[pos]] = rank
+            pos += 1
+    return owner_ranks
+
+
+def _dp_encoder_owner_groups(
+    owner_ranks: List[int], patches_per_image: List[int], tp_size: int
+):
+    """Group encoded items by their persistent owner tag (no load balancing).
+
+    Returns the same ``(rank_image_order, gpu_sample_counts,
+    grouped_pixel_values_len)`` triple that the legacy load-balancing path
+    produces, but derived purely from the fixed owner tags of the *current*
+    encoded subset. Item indices within each rank stay ascending (iteration
+    order), which is exactly the order in which the locally-owned features are
+    concatenated into ``pixel_values``.
+    """
+    rank_image_order: List[List[int]] = [[] for _ in range(tp_size)]
+    for i, rank in enumerate(owner_ranks):
+        rank_image_order[rank].append(i)
+    gpu_sample_counts = [len(idxs) for idxs in rank_image_order]
+    grouped_pixel_values_len = [
+        sum(patches_per_image[i] for i in idxs) for idxs in rank_image_order
+    ]
+    return rank_image_order, gpu_sample_counts, grouped_pixel_values_len
+
+
+class DpEncoderDispatch:
+    """Process-wide selector for the DP-encoder sharding strategy.
+
+    A single global instance (:func:`get_dp_encoder_dispatch`) is the one place
+    that decides *which* DP-encoder path is active, so the scheduler tagging, the
+    encode-path feature drop, and the vision-model runner all consult the same
+    switch instead of each re-reading ``server_args`` and re-deriving the TP
+    topology. All lookups are read-through (never cached): ``server_args`` and
+    the attention-TP getters are resolved lazily on each call, matching
+    :mod:`sglang.srt.runtime_context`, and every accessor degrades to the safe
+    legacy behavior (disabled / tp_size 1) if the runtime state is not ready.
+
+    Two strategies exist, both under ``mm_enable_dp_encoder``:
+
+    * owner-tag sharding (``shard_by_owner`` on): ownership decided once in the
+      scheduler, features dropped by owner pre-H2D, runner reuses the tags.
+    * legacy replication (``shard_by_owner`` off): inputs replicated, runner
+      recomputes the load-balancing assignment over the full ``pixel_values``.
+    """
+
+    @staticmethod
+    def _server_args():
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            return get_server_args()
+        except Exception:
+            return None
+
+    def tp_size(self) -> int:
+        try:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            return get_attention_tp_size()
+        except Exception:
+            return 1
+
+    def tp_rank(self) -> int:
+        try:
+            from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+            return get_attention_tp_rank()
+        except Exception:
+            return 0
+
+    def shard_by_owner_enabled(self) -> bool:
+        """True when the experimental owner-tag sharding path should be used.
+
+        Requires ``mm_enable_dp_encoder`` AND ``mm_dp_encoder_shard_by_owner``
+        AND an attention-TP world size > 1. When False, the DP encoder (if
+        enabled at all) falls back to the legacy runner-side load balancing.
+        """
+        sa = self._server_args()
+        if sa is None:
+            return False
+        if not getattr(sa, "mm_enable_dp_encoder", False):
+            return False
+        if not getattr(sa, "mm_dp_encoder_shard_by_owner", False):
+            return False
+        return self.tp_size() > 1
+
+
+_dp_encoder_dispatch = DpEncoderDispatch()
+
+
+def get_dp_encoder_dispatch() -> DpEncoderDispatch:
+    """Return the process-wide :class:`DpEncoderDispatch` singleton."""
+    return _dp_encoder_dispatch
+
+
 def get_dp_encoder_lb_assignment(
     sizes: list[int],
     num_gpus: int = 2,
@@ -477,7 +609,7 @@ def run_dp_sharded_mrope_vision_model(
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d"],
-    local_item_indices: Optional[list[int]] = None,
+    owner_ranks: Optional[List[int]] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -487,21 +619,26 @@ def run_dp_sharded_mrope_vision_model(
     Args:
         vision_model (torch.nn.Module): Vision model.
         pixel_values (torch.Tensor): Image/Video input tensor. When
-            ``local_item_indices`` is ``None`` this must be the *full* concat
-            of all items' patches; when ``local_item_indices`` is provided it
-            must already contain only the local-rank items concatenated in
-            ``local_item_indices`` order (which must equal
-            ``sorted(image_idxs_local)`` under the same LB assignment).
-        grid_thw_list: List of grid dimensions for *all* images (one row per
-            item) -- used for the LB decision and for output reassembly.
+            ``owner_ranks`` is ``None`` this must be the *full* concat of all
+            items' patches (the runner slices out this rank's shard). When
+            ``owner_ranks`` is provided, the caller has already dropped
+            non-local items' features pre-H2D, so ``pixel_values`` contains only
+            this rank's owned items, concatenated in ascending item-index order.
+        grid_thw_list: List of grid dimensions for *all* images in the encoded
+            subset (one row per item) -- used for output reassembly. When
+            ``owner_ranks`` is provided it must describe exactly these items
+            (``len(owner_ranks) == len(grid_thw_list)``).
         rope_type: Type of rope used in the vision model.
                    Different rope types have different dimension to do ViT.
                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
                    "rope_2d" for 2D rope (e.g., Kimi-VL)
-        local_item_indices: Optional. If provided, ``pixel_values`` is treated
-            as already containing only the local rank's items, in this exact
-            order. This avoids materializing the full concat on every rank
-            (the whole point of pre-H2D item sharding).
+        owner_ranks: Optional per-item owner attention-TP rank (the persistent
+            ``dp_encoder_owner_rank`` tag assigned once in the scheduler). When
+            provided, the runner does NOT recompute any load-balancing
+            assignment; it groups the encoded subset purely by these fixed
+            tags and treats ``pixel_values`` as this rank's already-sharded
+            shard. Because the tags are intrinsic to each item, the drop side
+            and the runner can never disagree, even across chunks/retraction.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -529,29 +666,52 @@ def run_dp_sharded_mrope_vision_model(
     # GPU_1 tp_rank_local = 1
     tp_rank_local = get_attention_tp_rank()
 
-    # patches_per_image = [1000, 100, 200, 50]
-    patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
+    patches_per_image = [dp_encoder_num_patches(g) for g in grid_thw_list]
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
 
-    # Always compute the deterministic LB assignment from the full
-    # grid_thw_list so every rank agrees on per-rank metadata (needed for
-    # all-gather padding and output reassembly).
-    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
-        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
-    )
-    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
-
-    rank_image_order: list[list[int]] = []
-    for rank in range(tp_size):
-        idxs = image_to_tp_rank[
-            cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+    # Ownership is decided exactly once, in the scheduler, and stored as a
+    # persistent per-item tag. When the encode path forwarded those tags
+    # (``owner_ranks``) we simply group the encoded subset by them -- the runner
+    # is NOT allowed to recompute a load-balancing assignment, so ownership can
+    # never diverge from the pre-H2D drop (this is what makes it safe under
+    # chunked prefill / per-image caching / retraction). Otherwise (legacy /
+    # video path with a full ``pixel_values``) we fall back to computing the
+    # assignment here over ``patches_per_image``.
+    pixel_values_is_sharded = owner_ranks is not None
+    if owner_ranks is not None:
+        assert len(owner_ranks) == len(grid_thw_list), (
+            f"owner_ranks has {len(owner_ranks)} entries but grid_thw_list has "
+            f"{len(grid_thw_list)}; the tags and the encoded item list disagree."
+        )
+        rank_image_order, gpu_sample_counts, grouped_pixel_values_len = (
+            _dp_encoder_owner_groups(owner_ranks, patches_per_image, tp_size)
+        )
+    else:
+        image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
+            get_dp_encoder_lb_assignment(patches_per_image, tp_size)
+        )
+        cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+        rank_image_order = [
+            sorted(
+                image_to_tp_rank[
+                    cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+                ]
+            )
+            for rank in range(tp_size)
         ]
-        rank_image_order.append(sorted(idxs))
 
     image_idxs_local = rank_image_order[tp_rank_local]
 
-    if local_item_indices is not None:
+    if pixel_values_is_sharded:
+        # pixel_values is exactly this rank's shard (features for non-owned
+        # items were dropped to None before H2D). Assert it lines up with the
+        # owner-tag grouping.
+        expected_local_patches = grouped_pixel_values_len[tp_rank_local]
+        assert pixel_values.shape[0] == expected_local_patches, (
+            f"pre-sharded pixel_values has {pixel_values.shape[0]} patches but the "
+            f"DP-encoder owner tags expect {expected_local_patches} for this rank."
+        )
         pixel_values_local = pixel_values
     elif len(image_idxs_local) > 0:
         pixel_values_local = torch.cat(

@@ -4,7 +4,6 @@ Multi-modality utils
 
 import copy
 import hashlib
-import math
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -507,11 +506,10 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-def _item_patches_for_dp_encoder(item: MultimodalDataItem) -> Optional[int]:
-    """Compute the per-item patch count (load metric) for image items.
+def _item_grid_thw_for_dp_encoder(item: MultimodalDataItem) -> Optional[List[int]]:
+    """Return the single ``image_grid_thw`` row (as ints) for an image item.
 
-    Returns the product of the item's ``image_grid_thw`` values when available,
-    or ``None`` when the item does not expose grid metadata suitable for
+    Returns ``None`` when the item does not expose grid metadata suitable for
     per-item DP-encoder sharding.
 
     The item MUST have exactly one grid_thw row (shape (1, 3)) to be eligible
@@ -527,98 +525,115 @@ def _item_patches_for_dp_encoder(item: MultimodalDataItem) -> Optional[int]:
             return None
         if grid.dim() == 2 and grid.shape[0] != 1:
             return None
-        return int(grid.prod().item())
+        return [int(v) for v in grid.flatten().tolist()]
     if isinstance(grid, (list, tuple)):
         if len(grid) == 1 and isinstance(grid[0], (list, tuple)):
-            return int(math.prod(int(v) for v in grid[0]))
+            return [int(v) for v in grid[0]]
         elif all(isinstance(v, (int, float)) for v in grid):
-            return int(math.prod(int(v) for v in grid))
+            return [int(v) for v in grid]
     return None
 
 
-def maybe_shard_items_for_dp_encoder(
-    items: List[MultimodalDataItem],
-) -> Optional[List[int]]:
-    """Drop non-local item features before H2D when DP encoder sharding is on.
+def _dp_encoder_owner_rank(item: MultimodalDataItem) -> Optional[int]:
+    """Read the persistent DP-encoder owner tag from an item (``None`` if unset)."""
+    return getattr(item, "dp_encoder_owner_rank", None)
 
-    When ``mm_enable_dp_encoder`` is enabled and the attention TP world size is
-    greater than one, partition the given items across attention-TP ranks using
-    the same load-balancing algorithm as
-    :func:`sglang.srt.multimodal.mm_utils.get_dp_encoder_lb_assignment` (load =
-    patches per image). On each rank, set ``item.feature = None`` for items that
-    do not belong to this rank, so the subsequent ``_move_items_to_device`` only
-    ships the local shard to GPU.
 
-    The decision is fully deterministic given the (CPU-resident) ``image_grid_thw``
-    metadata, so every rank computes the same ownership and the downstream
-    all-gather inside ``run_dp_sharded_mrope_vision_model`` stays collective-safe.
+def assign_dp_encoder_owners(items: List[MultimodalDataItem]) -> bool:
+    """Assign each image item its DP-encoder owner rank (scheduler side, once).
 
-    Stage 1 scope: only image items (single-image granularity). Returns ``None``
-    when no sharding was performed; otherwise returns the sorted list of local
-    item indices (the indices of items whose ``feature`` is preserved on this
-    rank).
+    This is the single ownership decision for the whole request. It runs when
+    the request is admitted (before any prefill chunking), over the request's
+    *full* image-item set, and stores the result as a persistent per-item tag
+    (``dp_encoder_owner_rank``). The tag is intrinsic to the item and is never
+    recomputed, so:
+
+    * it survives retraction (``reset_for_retract`` does not touch ``mm_items``),
+      and
+    * every later ViT call -- which under chunked prefill / per-image caching
+      may encode only a *subset* of these items -- groups its subset by these
+      fixed tags. The pre-H2D feature drop and the vision-model runner therefore
+      read the same ownership and can never diverge.
+
+    Ownership is deterministic given ``(sizes, tp_size)``, so every rank computes
+    identical tags without communication.
+
+    Returns ``True`` if tags were assigned. Returns ``False`` (no tags; request
+    falls back to legacy full-replication, which is always safe) when owner-tag
+    sharding is disabled, TP size is 1, there are fewer than 2 image items, or
+    any image item lacks single-grid metadata.
     """
-    if not items or len(items) < 2:
-        return None
+    if not items:
+        return False
 
-    try:
-        from sglang.srt.runtime_context import get_server_args
-
-        server_args = get_server_args()
-    except Exception:
-        return None
-    if server_args is None or not getattr(server_args, "mm_enable_dp_encoder", False):
-        return None
-
-    # Defer import to avoid a top-level circular dependency with dp_attention.
-    try:
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-        )
-
-        tp_size = get_attention_tp_size()
-        tp_rank = get_attention_tp_rank()
-    except Exception:
-        return None
-
-    if tp_size <= 1:
-        return None
-
-    # Stage 1: only shard when every item is an image with image_grid_thw.
-    # Video items, audio items, and items lacking grid metadata fall back to
-    # the legacy full-replication path (handled by the model's get_*_feature).
-    patches_per_item: List[int] = []
-    for item in items:
-        if getattr(item, "modality", None) != Modality.IMAGE:
-            return None
-        p = _item_patches_for_dp_encoder(item)
-        if p is None or p <= 0:
-            return None
-        patches_per_item.append(p)
-
-    from sglang.srt.multimodal.mm_utils import get_dp_encoder_lb_assignment
-
-    image_to_tp_rank, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(
-        patches_per_item, tp_size
+    from sglang.srt.multimodal.mm_utils import (
+        assign_dp_encoder_owner_ranks,
+        dp_encoder_num_patches,
+        get_dp_encoder_dispatch,
     )
-    # Convert flat assignment into per-rank sets.
-    cursor = 0
-    rank_to_items: List[set] = []
-    for count in gpu_sample_counts:
-        rank_to_items.append(set(image_to_tp_rank[cursor : cursor + count]))
-        cursor += count
 
-    local_set = rank_to_items[tp_rank]
-    # Drop features for items this rank does not own. Metadata (hashes,
-    # image_grid_thw, offsets, pad_value, ...) is intentionally preserved so
-    # downstream code can still compute the global grid_thw_list and assemble
-    # outputs in the original per-item order.
-    for i, item in enumerate(items):
-        if i not in local_set and item.feature is not None:
+    dispatch = get_dp_encoder_dispatch()
+    if not dispatch.shard_by_owner_enabled():
+        return False
+    tp_size = dispatch.tp_size()
+
+    # Stage 1: only shard image items with single-grid metadata. If any image
+    # item is unsuitable (video/audio/precomputed/multi-grid) we skip tagging
+    # entirely; the request then uses the legacy full-replication path.
+    image_items = [
+        it for it in items if getattr(it, "modality", None) == Modality.IMAGE
+    ]
+    if len(image_items) < 2:
+        return False
+
+    sizes: List[int] = []
+    for item in image_items:
+        grid = _item_grid_thw_for_dp_encoder(item)
+        if grid is None or dp_encoder_num_patches(grid) <= 0:
+            return False
+        sizes.append(dp_encoder_num_patches(grid))
+
+    owner_ranks = assign_dp_encoder_owner_ranks(sizes, tp_size)
+    for item, owner in zip(image_items, owner_ranks):
+        item.set("dp_encoder_owner_rank", int(owner))
+    return True
+
+
+def drop_nonlocal_features_for_dp_encoder(items: List[MultimodalDataItem]) -> bool:
+    """Drop features for items this rank does not own (encode side, pre-H2D).
+
+    Runs in the model-forward encode path right before H2D, over the *exact*
+    set of items about to be encoded together. It reads the persistent owner
+    tags assigned once by :func:`assign_dp_encoder_owners` (never recomputes an
+    assignment), and sets ``item.feature = None`` for items owned by other
+    ranks so the subsequent ``_move_items_to_device`` only ships this rank's
+    shard to GPU.
+
+    This is safe under chunked prefill / per-image caching / retraction: a rank
+    only ever drops items it does not own, and ownership is fixed, so it never
+    drops a feature it will later need to encode. Metadata (hashes,
+    image_grid_thw, offsets, owner tag, ...) is preserved so the runner can
+    still group and reassemble in the original per-item order.
+
+    Returns ``True`` if sharding is active for this item list (all items tagged),
+    else ``False`` (features untouched; runner takes its legacy full-slice path).
+    Presence of owner tags already implies owner-tag sharding was enabled when
+    the request was admitted, so no re-check of the dispatch flag is needed.
+    """
+    if not items:
+        return False
+
+    owner_ranks = [_dp_encoder_owner_rank(it) for it in items]
+    if any(o is None for o in owner_ranks):
+        return False
+
+    from sglang.srt.multimodal.mm_utils import get_dp_encoder_dispatch
+
+    tp_rank = get_dp_encoder_dispatch().tp_rank()
+    for item, owner in zip(items, owner_ranks):
+        if owner != tp_rank and item.feature is not None:
             item.feature = None
-
-    return sorted(local_set)
+    return True
 
 
 def build_local_pixel_values_for_dp_encoder(
@@ -630,21 +645,23 @@ def build_local_pixel_values_for_dp_encoder(
 ) -> Tuple[torch.Tensor, Optional[List[int]]]:
     """Concat the locally-owned item features into ``pixel_values``.
 
-    After :func:`maybe_shard_items_for_dp_encoder` has dropped non-local items'
-    ``feature`` to ``None`` on this rank, this helper produces the
-    ``(pixel_values, shard_indices)`` pair expected by
-    :func:`sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model`'s
-    ``local_item_indices`` parameter.
+    After :func:`drop_nonlocal_features_for_dp_encoder` has dropped non-local
+    items' ``feature`` to ``None`` on this rank, this helper concats only the
+    surviving (locally-owned) features, in ascending item order, into the
+    ``pixel_values`` consumed by
+    :func:`sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model`.
 
-    The second return is ``None`` when no sharding occurred (every item still
-    has a feature locally) so callers can pass it straight through to the DP
-    helper, which will then take its legacy slice path. When sharding did
-    happen, the second return is the sorted list of locally-owned item indices.
+    Returns ``(pixel_values, owner_ranks)``. ``owner_ranks`` is the per-item
+    owner-rank list (one entry per item in ``items``) when DP-encoder sharding
+    is active for this exact item list -- the runner then groups by these tags
+    and treats ``pixel_values`` as this rank's shard. It is ``None`` when no
+    sharding applies (every item still carries its feature, so the runner takes
+    its legacy full-slice path over the complete ``pixel_values``).
 
-    When no items are owned locally (the LB assigned this rank an empty shard),
-    returns a typed ``(0, 0)`` empty tensor on ``fallback_device``. In that case
-    only ``shape[0]`` is read downstream, so the trailing dim and device only
-    matter for type propagation through the DP helper's empty branch.
+    When this rank owns no features, returns a typed ``(0, 0)`` empty tensor on
+    ``fallback_device``. In that case only ``shape[0]`` is read downstream, so
+    the trailing dim and device only matter for type propagation through the
+    runner's empty branch.
 
     Args:
         items: Per-modality item list as passed to ``get_image_feature``.
@@ -654,23 +671,34 @@ def build_local_pixel_values_for_dp_encoder(
         to_device: Optional explicit device for the concatenated tensor. When
             ``None`` the tensor stays on its current device (post-H2D).
     """
-    local_item_indices = [i for i, it in enumerate(items) if it.feature is not None]
-    sharded = len(local_item_indices) < len(items)
-    shard_indices = local_item_indices if sharded else None
-    local_features = [items[i].feature for i in local_item_indices]
+    owner_tags = [_dp_encoder_owner_rank(it) for it in items]
+    sharded = bool(items) and all(o is not None for o in owner_tags)
+
+    if sharded:
+        from sglang.srt.multimodal.mm_utils import get_dp_encoder_dispatch
+
+        my_rank = get_dp_encoder_dispatch().tp_rank()
+        owner_ranks: Optional[List[int]] = [int(o) for o in owner_tags]
+        local_features = [
+            it.feature for it, o in zip(items, owner_ranks) if o == my_rank
+        ]
+    else:
+        owner_ranks = None
+        local_features = [it.feature for it in items if it.feature is not None]
+
     if local_features:
         pixel = torch.cat(local_features, dim=0)
         if to_device is not None:
             pixel = pixel.to(device=to_device, dtype=dtype)
         else:
             pixel = pixel.to(dtype)
-        return pixel, shard_indices
+        return pixel, owner_ranks
     return (
-        # (0, 0) is intentional: the DP helper only reads ``shape[0]`` on the
-        # pre-shard path; the trailing dim is irrelevant because the per-rank
-        # ViT call is skipped entirely (it branches on ``shape[0] > 0``).
+        # (0, 0) is intentional: the runner only reads ``shape[0]`` on this
+        # (empty local shard) path; the trailing dim is irrelevant because the
+        # per-rank ViT call is skipped entirely (it branches on ``shape[0] > 0``).
         torch.empty((0, 0), dtype=dtype, device=fallback_device),
-        shard_indices,
+        owner_ranks,
     )
 
 
@@ -692,6 +720,11 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
+        # DP-encoder pre-H2D drop: over THIS exact item list, drop features for
+        # items owned by other ranks (using the persistent owner tags assigned
+        # once in the scheduler). No assignment is recomputed here, so the drop
+        # can never diverge from the runner's owner-tag grouping.
+        drop_nonlocal_features_for_dp_encoder(embedding_items_per_req)
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
@@ -766,6 +799,11 @@ def _get_chunked_embedding_by_item(
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
+        # DP-encoder pre-H2D drop over the exact cache-miss subset actually
+        # encoded in this chunk. Uses the persistent per-item owner tags (no
+        # recomputed assignment), so the drop matches the runner's owner-tag
+        # grouping even though this is only a subset of the request's images.
+        drop_nonlocal_features_for_dp_encoder(miss_item_list)
         _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
