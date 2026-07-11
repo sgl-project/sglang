@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
+logger = init_logger(__name__)
 LONG_LIVE2_DEFAULT_SCENE_CUT_PREFIX = "The scene transitions. "
 
 
@@ -216,6 +219,16 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
     @staticmethod
     def _guidance_scale(batch: Req) -> float:
         return float(getattr(batch, "guidance_scale", 1.0))
+
+    @staticmethod
+    def _denoise_step_profiler(batch: Req, start_frame: int, step_index: int):
+        return StageProfiler(
+            f"denoising_step_{start_frame}_{step_index}",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
+            record_as_step=True,
+        )
 
     @staticmethod
     def _get_negative_prompt_embeds(batch: Req):
@@ -593,55 +606,58 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
-            if clamp_latent is not None:
-                current_latents[:, :, :context_frames] = clamp_latent
-            latent_model_input = prepare_model_input(current_latents).to(target_dtype)
-            attn_metadata = self._build_causal_attn_metadata(
-                batch,
-                server_args,
-                current_timestep=current_timestep,
-                raw_latent_shape=attn_raw_latent_shape,
-                device=device,
-            )
-            batch_size = latent_model_input.shape[0]
-            timestep_2d = (
-                timestep.reshape(1)
-                .to(device=latent_model_input.device, dtype=torch.float32)
-                .expand(batch_size, latent_model_input.shape[2])
-            )
-            if clamp_latent is not None:
-                timestep_2d = timestep_2d.clone()
-                timestep_2d[:, :context_frames] = 0
-            flow_pred = self._forward_causal_transformer(
-                batch,
-                latent_model_input=latent_model_input,
-                prompt_embeds=prompt_embeds,
-                timestep=timestep_2d,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-                current_start_tokens=current_start_tokens,
-                start_frame=start_frame,
-                image_kwargs=image_kwargs,
-                pos_cond_kwargs=pos_cond_kwargs,
-                current_timestep=current_timestep,
-                attn_metadata=attn_metadata,
-                target_dtype=target_dtype,
-                autocast_enabled=autocast_enabled,
-            )
+            with self._denoise_step_profiler(batch, start_frame, current_timestep):
+                if clamp_latent is not None:
+                    current_latents[:, :, :context_frames] = clamp_latent
+                latent_model_input = prepare_model_input(current_latents).to(
+                    target_dtype
+                )
+                attn_metadata = self._build_causal_attn_metadata(
+                    batch,
+                    server_args,
+                    current_timestep=current_timestep,
+                    raw_latent_shape=attn_raw_latent_shape,
+                    device=device,
+                )
+                batch_size = latent_model_input.shape[0]
+                timestep_2d = (
+                    timestep.reshape(1)
+                    .to(device=latent_model_input.device, dtype=torch.float32)
+                    .expand(batch_size, latent_model_input.shape[2])
+                )
+                if clamp_latent is not None:
+                    timestep_2d = timestep_2d.clone()
+                    timestep_2d[:, :context_frames] = 0
+                flow_pred = self._forward_causal_transformer(
+                    batch,
+                    latent_model_input=latent_model_input,
+                    prompt_embeds=prompt_embeds,
+                    timestep=timestep_2d,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start_tokens=current_start_tokens,
+                    start_frame=start_frame,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=pos_cond_kwargs,
+                    current_timestep=current_timestep,
+                    attn_metadata=attn_metadata,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
+                )
 
-            next_latents = scheduler.step(
-                flow_pred,
-                timestep,
-                current_latents,
-                return_dict=False,
-            )[0]
+                next_latents = scheduler.step(
+                    flow_pred,
+                    timestep,
+                    current_latents,
+                    return_dict=False,
+                )[0]
 
-            current_latents = next_latents
-            if clamp_latent is not None:
-                current_latents[:, :, :context_frames] = clamp_latent
+                current_latents = next_latents
+                if clamp_latent is not None:
+                    current_latents[:, :, :context_frames] = clamp_latent
 
-            if progress_bar is not None:
-                progress_bar.update()
+                if progress_bar is not None:
+                    progress_bar.update()
 
         return current_latents, attn_metadata
 
@@ -687,73 +703,76 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
-            if clamp_latent is not None:
-                current_latents[:, :, :context_frames] = clamp_latent
-            latent_model_input = prepare_model_input(current_latents).to(target_dtype)
-            attn_metadata = self._build_causal_attn_metadata(
-                batch,
-                server_args,
-                current_timestep=current_timestep,
-                raw_latent_shape=attn_raw_latent_shape,
-                device=device,
-            )
-            batch_size = latent_model_input.shape[0]
-            timestep_2d = (
-                timestep.reshape(1)
-                .to(device=latent_model_input.device, dtype=torch.float32)
-                .expand(batch_size, latent_model_input.shape[2])
-            )
-            if clamp_latent is not None:
-                timestep_2d = timestep_2d.clone()
-                timestep_2d[:, :context_frames] = 0
-            flow_pred_cond = self._forward_causal_transformer(
-                batch,
-                latent_model_input=latent_model_input,
-                prompt_embeds=prompt_embeds,
-                timestep=timestep_2d,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-                current_start_tokens=current_start_tokens,
-                start_frame=start_frame,
-                image_kwargs=image_kwargs,
-                pos_cond_kwargs=pos_cond_kwargs,
-                current_timestep=current_timestep,
-                attn_metadata=attn_metadata,
-                target_dtype=target_dtype,
-                autocast_enabled=autocast_enabled,
-            )
-            flow_pred_uncond = self._forward_causal_transformer(
-                batch,
-                latent_model_input=latent_model_input,
-                prompt_embeds=negative_prompt_embeds,
-                timestep=timestep_2d,
-                kv_cache=kv_cache_neg,
-                crossattn_cache=crossattn_cache_neg,
-                current_start_tokens=current_start_tokens,
-                start_frame=start_frame,
-                image_kwargs=image_kwargs,
-                pos_cond_kwargs=neg_cond_kwargs,
-                current_timestep=current_timestep,
-                attn_metadata=attn_metadata,
-                target_dtype=target_dtype,
-                autocast_enabled=autocast_enabled,
-            )
-            flow_pred = flow_pred_uncond + guidance_scale * (
-                flow_pred_cond - flow_pred_uncond
-            )
+            with self._denoise_step_profiler(batch, start_frame, current_timestep):
+                if clamp_latent is not None:
+                    current_latents[:, :, :context_frames] = clamp_latent
+                latent_model_input = prepare_model_input(current_latents).to(
+                    target_dtype
+                )
+                attn_metadata = self._build_causal_attn_metadata(
+                    batch,
+                    server_args,
+                    current_timestep=current_timestep,
+                    raw_latent_shape=attn_raw_latent_shape,
+                    device=device,
+                )
+                batch_size = latent_model_input.shape[0]
+                timestep_2d = (
+                    timestep.reshape(1)
+                    .to(device=latent_model_input.device, dtype=torch.float32)
+                    .expand(batch_size, latent_model_input.shape[2])
+                )
+                if clamp_latent is not None:
+                    timestep_2d = timestep_2d.clone()
+                    timestep_2d[:, :context_frames] = 0
+                flow_pred_cond = self._forward_causal_transformer(
+                    batch,
+                    latent_model_input=latent_model_input,
+                    prompt_embeds=prompt_embeds,
+                    timestep=timestep_2d,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start_tokens=current_start_tokens,
+                    start_frame=start_frame,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=pos_cond_kwargs,
+                    current_timestep=current_timestep,
+                    attn_metadata=attn_metadata,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
+                )
+                flow_pred_uncond = self._forward_causal_transformer(
+                    batch,
+                    latent_model_input=latent_model_input,
+                    prompt_embeds=negative_prompt_embeds,
+                    timestep=timestep_2d,
+                    kv_cache=kv_cache_neg,
+                    crossattn_cache=crossattn_cache_neg,
+                    current_start_tokens=current_start_tokens,
+                    start_frame=start_frame,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=neg_cond_kwargs,
+                    current_timestep=current_timestep,
+                    attn_metadata=attn_metadata,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
+                )
+                flow_pred = flow_pred_uncond + guidance_scale * (
+                    flow_pred_cond - flow_pred_uncond
+                )
 
-            next_latents = scheduler.step(
-                flow_pred,
-                timestep,
-                current_latents,
-                return_dict=False,
-            )[0]
-            current_latents = next_latents
-            if clamp_latent is not None:
-                current_latents[:, :, :context_frames] = clamp_latent
+                next_latents = scheduler.step(
+                    flow_pred,
+                    timestep,
+                    current_latents,
+                    return_dict=False,
+                )[0]
+                current_latents = next_latents
+                if clamp_latent is not None:
+                    current_latents[:, :, :context_frames] = clamp_latent
 
-            if progress_bar is not None:
-                progress_bar.update()
+                if progress_bar is not None:
+                    progress_bar.update()
 
         return current_latents, attn_metadata
 
