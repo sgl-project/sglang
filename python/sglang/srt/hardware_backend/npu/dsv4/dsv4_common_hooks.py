@@ -119,7 +119,9 @@ def maybe_write_dsv4_extend(
         )
 
 
-def dsv4_state_payloads(req_to_token_pool, req_pool_idx, seq_len, page_size, window_size):
+def dsv4_state_payloads(
+    req_to_token_pool, req_pool_idx, seq_len, page_size, window_size
+):
     """Per-StateType PD-payload builders for DSV4-on-NPU, keyed by ``StateType``.
 
     Returns ``{}`` for non-DSV4 pools so PD code can ``dict.update`` it
@@ -209,8 +211,12 @@ def write_dsv4_prealloc_tables(
     pl = torch.tensor([prefix_len])
     sl = torch.tensor([fill_len])
 
-    _write_per_req_slice(req_to_token_pool.write_swa, rp, pl, sl, bundle.out_swa_loc, ratio=1)
-    _write_per_req_slice(req_to_token_pool.write_c4, rp, pl, sl, bundle.out_c4_loc, ratio=4)
+    _write_per_req_slice(
+        req_to_token_pool.write_swa, rp, pl, sl, bundle.out_swa_loc, ratio=1
+    )
+    _write_per_req_slice(
+        req_to_token_pool.write_c4, rp, pl, sl, bundle.out_c4_loc, ratio=4
+    )
     _write_per_req_slice(
         req_to_token_pool.write_c128, rp, pl, sl, bundle.out_c128_loc, ratio=128
     )

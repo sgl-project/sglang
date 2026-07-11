@@ -1186,9 +1186,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
             }
-            if _is_npu and isinstance(
-                self.token_to_kv_pool, DeepSeekV4TokenToKVPool
-            ):
+            if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
                 )

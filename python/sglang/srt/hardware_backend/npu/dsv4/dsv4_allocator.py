@@ -674,7 +674,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         req_to_token_pool=None,
     ) -> Optional[DSV4OutCacheLoc]:
         """Disagg-decode prealloc variant of :meth:`alloc_extend`: super() does
-        full+swa-tail, then _alloc_c_and_state adds c4/c128(+state) → DSV4OutCacheLoc."""
+        full+swa-tail, then _alloc_c_and_state adds c4/c128(+state) → DSV4OutCacheLoc.
+        """
         self._cur_req_to_token_pool = req_to_token_pool
         out_full_loc = super().alloc_extend_swa_tail(
             prefix_lens,

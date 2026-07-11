@@ -924,7 +924,7 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
-    def _is_generic_kvcache_state_type(self, st: "StateType") -> bool:
+    def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
         """State types sent via the page-indexed ``_send_kvcache_generic`` path
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
