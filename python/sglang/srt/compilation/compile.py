@@ -86,6 +86,22 @@ def _mark_dynamic_on_value(val, dims):
         # else: ignore (None or non-tensor)
 
 
+_MROPE_TOKEN_AXIS_ARGUMENTS = frozenset(
+    {"positions", "position_ids", "mrope_positions"}
+)
+
+
+def _runtime_dynamic_dim_for_argument(name: str) -> int:
+    """Return the runtime-sized tensor dimension for a compiled argument.
+
+    Most compiler-facing tensors are batch/token-major and vary on dim 0.
+    mRoPE positions instead have shape ``[rope_axis, token]``; their runtime
+    token length is therefore the final dimension. ``maybe_mark_dynamic``
+    accepts ``-1`` for that final dimension irrespective of tensor rank.
+    """
+    return -1 if name in _MROPE_TOKEN_AXIS_ARGUMENTS else 0
+
+
 def _infer_dynamic_arg_dims_from_annotations(forward_fn):
     sig = inspect.signature(forward_fn)
     dyn = {}
@@ -96,12 +112,7 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             ann is torch.Tensor
             or getattr(getattr(ann, "__args__", [None])[0], "__name__", "") == "Tensor"
         ):
-            # Token positions are normally [T], but mRoPE models pass them
-            # as [rope_axis, T]. The token dimension is consequently the
-            # last dimension in both cases. Marking dim 0 (the old default)
-            # leaves T static for Qwen-VL and makes Dynamo recompile on every
-            # unseen prefill length.
-            dyn[name] = -1 if name in ("positions", "position_ids") else 0
+            dyn[name] = _runtime_dynamic_dim_for_argument(name)
         elif getattr(ann, "__name__", "") in ("IntermediateTensors",) or any(
             getattr(a, "__name__", "") == "IntermediateTensors"
             for a in getattr(ann, "__args__", [])
@@ -109,7 +120,7 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             dyn[name] = 0
         elif ann == "torch.Tensor" or ann == "Optional[torch.Tensor]":
             # For future import annotations (e.g. from __future__ import annotations), the annotation is a string
-            dyn[name] = -1 if name in ("positions", "position_ids") else 0
+            dyn[name] = _runtime_dynamic_dim_for_argument(name)
     if not dyn:
         raise ValueError("No dynamic dims inferred; pass dynamic_arg_dims explicitly.")
     return dyn
@@ -132,7 +143,7 @@ def _mark_dynamic_forward_batch(forward_batch) -> None:
     for name, value in vars(forward_batch).items():
         if not isinstance(value, torch.Tensor) or value.ndim == 0:
             continue
-        dims = -1 if name in ("positions", "mrope_positions") else 0
+        dims = _runtime_dynamic_dim_for_argument(name)
         _mark_dynamic_on_value(value, dims)
 
 
@@ -204,14 +215,9 @@ def install_torch_compiled(
 
         bound = types.MethodType(unbound_fwd, self)
         compiled_callable = torch.compile(
-            # A multimodal-only argument may first appear after the text
-            # dummy trace (e.g. Qwen3-VL deepstack embeds). Keep that
-            # replacement trace shape-polymorphic instead of baking its first
-            # image length into every subsequent VLM prefill request.
             bound,
             fullgraph=fullgraph,
             backend=backend_factory,
-            dynamic=True,
         )
 
         # Trigger Dynamo so bytecode hook can capture

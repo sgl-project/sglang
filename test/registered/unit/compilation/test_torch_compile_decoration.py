@@ -10,6 +10,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 from sglang.srt.compilation.compile import (
     _infer_dynamic_arg_dims_from_annotations,
     _mark_dynamic_forward_batch,
+    _runtime_dynamic_dim_for_argument,
 )
 
 
@@ -42,6 +43,13 @@ def test_positions_marks_the_token_axis_dynamic_for_mrope_and_1d_rope():
     assert dynamic_dims["input_ids"] == 0
     assert dynamic_dims["positions"] == -1
     assert string_dynamic_dims["positions"] == -1
+
+
+def test_runtime_dynamic_dim_uses_the_token_axis_for_mrope_metadata():
+    assert _runtime_dynamic_dim_for_argument("positions") == -1
+    assert _runtime_dynamic_dim_for_argument("position_ids") == -1
+    assert _runtime_dynamic_dim_for_argument("mrope_positions") == -1
+    assert _runtime_dynamic_dim_for_argument("input_ids") == 0
 
 
 def test_forward_batch_marks_token_and_batch_metadata_dynamic():
