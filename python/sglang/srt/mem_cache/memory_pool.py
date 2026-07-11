@@ -1565,6 +1565,41 @@ class MHATokenToKVPool(KVCache):
         self.dq_k_buffer = buf.get("dq_k_buffer")
         self.dq_v_buffer = buf.get("dq_v_buffer")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
+        self._check_quantized_buffer_access_requirements()
+
+    def _check_quantized_buffer_access_requirements(self):
+        expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
+        has_k_workspace = self.dq_k_buffer is not None
+        has_v_workspace = self.dq_v_buffer is not None
+        if has_k_workspace != has_v_workspace:
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} created only one "
+                "dequant workspace buffer."
+            )
+
+        if expected_workspace_dtype is None:
+            if has_k_workspace:
+                raise RuntimeError(
+                    f"KV cache method {self.quant_method.name!r} does not declare "
+                    "DEQUANT_WORKSPACE access but created dequant buffers."
+                )
+            return
+
+        if not has_k_workspace:
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} declares "
+                "DEQUANT_WORKSPACE access but did not create dequant buffers."
+            )
+
+        if (
+            self.dq_k_buffer.dtype != expected_workspace_dtype
+            or self.dq_v_buffer.dtype != expected_workspace_dtype
+        ):
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} declares dequant "
+                f"workspace dtype {expected_workspace_dtype}, but created "
+                f"{self.dq_k_buffer.dtype}/{self.dq_v_buffer.dtype}."
+            )
 
     def _slot_move_pointer_buffers(self):
         """Buffers whose pointers/strides are used when KV slots are remapped.

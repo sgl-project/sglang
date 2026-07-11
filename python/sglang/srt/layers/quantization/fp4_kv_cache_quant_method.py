@@ -153,6 +153,44 @@ class KVCacheQuantMethodBase(ABC):
             for access in self.attention_accesses()
         )
 
+    def dequant_workspace_dtype(self) -> Optional[torch.dtype]:
+        """Workspace dtype required by DEQUANT_WORKSPACE access rules."""
+        workspace_dtypes = set()
+        for access in self.attention_accesses():
+            if access.kind != KVCacheAttentionAccessKind.DEQUANT_WORKSPACE:
+                continue
+            if access.workspace_dtype is None:
+                raise ValueError(
+                    f"KV cache method {self.name!r} declares DEQUANT_WORKSPACE "
+                    "without workspace_dtype."
+                )
+            workspace_dtypes.add(access.workspace_dtype)
+
+        if not workspace_dtypes:
+            return None
+        if len(workspace_dtypes) != 1:
+            raise ValueError(
+                f"KV cache method {self.name!r} declares multiple dequant "
+                f"workspace dtypes: {sorted(str(dtype) for dtype in workspace_dtypes)}."
+            )
+        return next(iter(workspace_dtypes))
+
+    def kv_storage_dtype(self) -> torch.dtype:
+        """Packed KV storage dtype declared by attention access rules."""
+        storage_dtypes = {
+            access.storage_dtype
+            for access in self.attention_accesses()
+            if access.storage_dtype is not None
+        }
+        if not storage_dtypes:
+            return torch.uint8
+        if len(storage_dtypes) != 1:
+            raise ValueError(
+                f"KV cache method {self.name!r} declares multiple storage "
+                f"dtypes: {sorted(str(dtype) for dtype in storage_dtypes)}."
+            )
+        return next(iter(storage_dtypes))
+
     def needs_global_scale(self) -> bool:
         """Whether this method uses a per-layer global FP32 scale."""
         return False
@@ -363,8 +401,8 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         m = size
         n = head_num
         k = head_dim
-        store_dtype = torch.uint8
-        dq_dtype = torch.float8_e4m3fn
+        store_dtype = self.kv_storage_dtype()
+        dq_dtype = self.dequant_workspace_dtype()
 
         k_buffer = [
             torch.zeros((m, n, k // 2), dtype=store_dtype, device=device)
@@ -386,9 +424,17 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             )
             for _ in range(layer_num)
         ]
-        # Shared dequant workspace — one copy, reused per layer during prefill
-        dq_k_buffer = torch.zeros((m, n, k), dtype=dq_dtype, device=device)
-        dq_v_buffer = torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+        # Shared dequant workspace: one copy, reused per layer during prefill.
+        dq_k_buffer = (
+            torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+        dq_v_buffer = (
+            torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
 
         return {
             "k_buffer": k_buffer,
@@ -461,8 +507,17 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         scale_size = (
             head_num * (head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
         )
-        # Dequant workspace: shared across layers (not multiplied by num_layers), FP8
-        dq_size = head_num * head_dim * 2 * kv_size
+        # Dequant workspace is shared across layers, not multiplied by num_layers.
+        dq_dtype = self.dequant_workspace_dtype()
+        dq_size = (
+            head_num
+            * head_dim
+            * 2
+            * kv_size
+            * torch.empty((), dtype=dq_dtype).element_size()
+            if dq_dtype is not None
+            else 0
+        )
         return fp4_size + scale_size + dq_size
 
 
@@ -487,8 +542,8 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
     ) -> dict:
         m = size
-        store_dtype = torch.uint8
-        dq_dtype = torch.float8_e4m3fn
+        store_dtype = self.kv_storage_dtype()
+        dq_dtype = self.dequant_workspace_dtype()
 
         k_buffer = [
             torch.zeros((m, head_num, head_dim // 2), dtype=store_dtype, device=device)
@@ -515,11 +570,15 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
             )
             for _ in range(layer_num)
         ]
-        dq_k_buffer = torch.zeros(
-            (m, head_num, head_dim), dtype=dq_dtype, device=device
+        dq_k_buffer = (
+            torch.zeros((m, head_num, head_dim), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
         )
-        dq_v_buffer = torch.zeros(
-            (m, head_num, head_dim), dtype=dq_dtype, device=device
+        dq_v_buffer = (
+            torch.zeros((m, head_num, head_dim), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
         )
 
         return {
@@ -579,7 +638,16 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         scale_size = (
             (head_num * head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
         )
-        dq_size = head_num * head_dim * 2 * kv_size
+        dq_dtype = self.dequant_workspace_dtype()
+        dq_size = (
+            head_num
+            * head_dim
+            * 2
+            * kv_size
+            * torch.empty((), dtype=dq_dtype).element_size()
+            if dq_dtype is not None
+            else 0
+        )
         return fp4_size + scale_size + dq_size
 
 
