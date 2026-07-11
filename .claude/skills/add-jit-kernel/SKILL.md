@@ -90,18 +90,18 @@ const size_t n = N.unwrap();
 const DLDevice dev = device.unwrap();
 ```
 
-### `type.cuh` — `dtype_trait<T>` and `packed_t<T>`
+### `type.cuh` — `DTypeTrait<T>` and `packed_t<T>`
 
 ```cpp
 #include <sgl_kernel/type.cuh>
 ```
 
-- **`dtype_trait<T>`** — Static trait struct for each scalar type. Provides:
-  - `dtype_trait<T>::from(value)` — convert from another type (e.g. `fp32_t` → `fp16_t`)
-  - `dtype_trait<T>::abs/sqrt/rsqrt/exp/sin/cos(x)` — type-dispatched unary math (primarily for `fp32_t`)
-  - `dtype_trait<T>::max/min(x, y)` — type-dispatched binary math (primarily for `fp32_t`)
+- **`DTypeTrait<T>`** — Static trait struct for each scalar type. Provides:
+  - `DTypeTrait<T>::from(value)` — convert from another type (e.g. `fp32_t` → `fp16_t`)
+  - `DTypeTrait<T>::abs/sqrt/rsqrt/exp/sin/cos(x)` — type-dispatched unary math (primarily for `fp32_t`)
+  - `DTypeTrait<T>::max/min(x, y)` — type-dispatched binary math (primarily for `fp32_t`)
 - **`packed_t<T>`** — Two-element packed alias: `packed_t<fp16_t>` = `fp16x2_t`, `packed_t<bf16_t>` = `bf16x2_t`, `packed_t<fp32_t>` = `fp32x2_t`. Use for vectorized loads/stores.
-- **`device::cast<To, From>(value)`** — Type-safe cast using `dtype_trait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
+- **`device::cast<To, From>(value)`** — Type-safe cast using `DTypeTrait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
 
 ### `vec.cuh` — Vectorized memory access (`AlignedVector`)
 
@@ -135,8 +135,8 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 #include <sgl_kernel/math.cuh>
 ```
 
-- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `dtype_trait`
-- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `dtype_trait`
+- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `DTypeTrait`
+- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `DTypeTrait`
 
 ### `warp.cuh` — Warp-level primitives
 
@@ -203,7 +203,7 @@ The implementation fully uses the project abstractions described above:
 // NOTE: Comments for headers are not common in practice.
 // It is only shown here for tutorial purposes to highlight the key abstractions.
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/type.cuh>   // For dtype_trait, fp16_t, bf16_t, fp32_t
+#include <sgl_kernel/type.cuh>   // For DTypeTrait, fp16_t, bf16_t, fp32_t
 #include <sgl_kernel/utils.h>    // For RuntimeCheck, div_ceil
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
@@ -319,7 +319,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - Use `RuntimeCheck` for runtime assertions with useful error messages
 - Prefer passing runtime scalars like `factor` directly unless compile-time specialisation is genuinely required
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
-- `device::cast<To, From>` or `dtype_trait<T>::from(val)` for cross-type conversions
+- `device::cast<To, From>` or `DTypeTrait<T>::from(val)` for cross-type conversions
 - `device::math::` functions for device math instead of bare `__` intrinsics if possible.
 - Try to use `PDL` feature. In some cases, this will benefit the performance.
 
@@ -626,7 +626,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/jit_kernel/include/sgl_kernel/vec.cuh` — `AlignedVector`
 - `python/sglang/jit_kernel/include/sgl_kernel/tile.cuh` — `tile::Memory`
-- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `dtype_trait`, `packed_t`, `device::cast`
+- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `DTypeTrait`, `packed_t`, `device::cast`
 - `python/sglang/jit_kernel/include/sgl_kernel/math.cuh` — `device::math::`
 - `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh` — `warp::reduce_sum/max`
 - `python/sglang/jit_kernel/include/sgl_kernel/cta.cuh` — `cta::reduce_max`

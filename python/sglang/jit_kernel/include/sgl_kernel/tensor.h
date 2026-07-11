@@ -52,10 +52,10 @@ struct DTypeRef;
 struct DeviceRef;
 
 template <typename T>
-struct _dtype_trait {};
+struct _DTypeTrait {};
 
 template <std::integral T>
-struct _dtype_trait<T> {
+struct _DTypeTrait<T> {
   inline static constexpr DLDataType value = {
       .code = std::is_signed_v<T> ? DLDataTypeCode::kDLInt : DLDataTypeCode::kDLUInt,
       .bits = static_cast<std::uint8_t>(sizeof(T) * 8),
@@ -63,31 +63,31 @@ struct _dtype_trait<T> {
 };
 
 template <std::floating_point T>
-struct _dtype_trait<T> {
+struct _DTypeTrait<T> {
   inline static constexpr DLDataType value = {
       .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
 
 #ifdef __CUDACC__
 template <>
-struct _dtype_trait<fp16_t> {
+struct _DTypeTrait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct _dtype_trait<bf16_t> {
+struct _DTypeTrait<bf16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct _dtype_trait<fp8_e4m3_t> {
+struct _DTypeTrait<fp8_e4m3_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 #elif defined(__HIPCC__)
 template <>
-struct _dtype_trait<fp16_t> {
+struct _DTypeTrait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct _dtype_trait<bf16_t> {
+struct _DTypeTrait<bf16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
 #endif
@@ -98,7 +98,7 @@ struct _device_trait {
 };
 
 template <typename... Ts>
-inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{_dtype_trait<Ts>::value...};
+inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{_DTypeTrait<Ts>::value...};
 
 template <DLDeviceType... Codes>
 inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{_device_trait<Codes>::value...};
@@ -176,7 +176,7 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 /// \brief Check whether `dtype` matches the DLDataType for C++ type `T`.
 template <typename T>
 inline bool is_type(DLDataType dtype) {
-  return dtype == details::_dtype_trait<T>::value;
+  return dtype == details::_DTypeTrait<T>::value;
 }
 
 /**

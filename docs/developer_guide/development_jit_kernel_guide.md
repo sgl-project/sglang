@@ -291,7 +291,7 @@ and its key APIs.
 | Header | Namespace | Purpose |
 |--------|-----------|---------|
 | `math.cuh` | `device::math` | `max`, `min`, `abs`, `sqrt`, `rsqrt`, `exp`, `sin`, `cos`, constants |
-| `type.cuh` | (global) / `device` | `dtype_trait<T>`, `packed_t<T>`, `device::cast<To>(from)` |
+| `type.cuh` | (global) / `device` | `DTypeTrait<T>`, `packed_t<T>`, `device::cast<To>(from)` |
 
 ### Memory Access
 

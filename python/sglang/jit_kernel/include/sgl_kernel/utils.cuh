@@ -61,6 +61,8 @@ using fp16x2_t = __half2;
 using bf16x2_t = __nv_bfloat162;
 using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
+using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -74,6 +76,8 @@ using fp16x2_t = half2;
 using bf16x2_t = __hip_bfloat162;
 using fp8x2_e4m3_t = uint16_t;
 using fp8x2_e5m2_t = uint16_t;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
 using fp32x4_t = float4;
 #endif
 
