@@ -2079,16 +2079,22 @@ class NixlKVManager(CommonKVManager):
                                 f"rid={req.rid}, row_start={row_start}, "
                                 f"row_len={row_len}, row_count={len(src_indices)}"
                             )
+                        if "ptr" in row_chunk:
+                            chunk_dst_ptrs = [int(row_chunk["ptr"])]
+                            chunk_dst_indices = list(range(row_len))
+                        else:
+                            chunk_dst_ptrs = dst_ptrs
+                            chunk_dst_indices = dst_indices[row_start:row_end]
                         h = self._send_kvcache_generic(
                             peer_name=peer_name,
                             src_data_ptrs=src_ptrs,
-                            dst_data_ptrs=dst_ptrs,
+                            dst_data_ptrs=chunk_dst_ptrs,
                             item_lens=src_lens,
                             prefill_data_indices=np.array(
                                 src_indices[row_start:row_end], dtype=np.int32
                             ),
                             dst_data_indices=np.array(
-                                dst_indices[row_start:row_end], dtype=np.int32
+                                chunk_dst_indices, dtype=np.int32
                             ),
                             dst_gpu_id=dst_gpu_id,
                             notif=comp_notif,

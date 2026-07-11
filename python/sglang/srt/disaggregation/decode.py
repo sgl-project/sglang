@@ -281,8 +281,8 @@ class DecodeRequest:
     dspark_hidden_dst_indices: Optional[List[int]] = None
     dspark_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
     dspark_hidden_pp_slices: Optional[Dict[int, dict]] = None
-    dspark_hidden_dynamic_buffers_by_pp: Optional[Dict[int, torch.Tensor]] = None
-    dspark_hidden_dynamic_cache_entries_by_pp: Optional[Dict[int, Any]] = None
+    dspark_hidden_dynamic_buffers_by_pp: Optional[Dict[int, List[torch.Tensor]]] = None
+    dspark_hidden_dynamic_cache_entries_by_pp: Optional[Dict[int, List[Any]]] = None
     dspark_hidden_dynamic_register_handles: Optional[List[Any]] = None
     dspark_hidden_dynamic_kv_manager: Optional[CommonKVManager] = None
     dspark_hidden_start: int = 0
@@ -1436,18 +1436,46 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 dspark_dynamic_pool_busy = False
                 for pp_rank, pp_slice in pp_slices.items():
                     cur_indices = [int(x) for x in range(dspark_hidden_len)]
+                    slice_len = int(pp_slice.get("slice_len", 0))
+                    item_len = int(slice_len * dtype_itemsize)
+                    row_chunks = self._dspark_hidden_row_chunks(
+                        dspark_hidden_len, item_len
+                    )
+                    chunk_buffers = []
+                    chunk_entries = []
                     try:
-                        entry, reused = _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.acquire(
-                            self.kv_manager,
-                            int(pp_rank),
-                            int(dspark_hidden_len),
-                            int(dspark_pool.hidden_size),
-                            dspark_pool.dtype,
-                        )
+                        for row_chunk in row_chunks:
+                            entry, reused = _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.acquire(
+                                self.kv_manager,
+                                int(pp_rank),
+                                int(row_chunk["row_len"]),
+                                int(slice_len),
+                                dspark_pool.dtype,
+                            )
+                            if entry is None:
+                                dspark_dynamic_pool_busy = True
+                                break
+                            chunk_entries.append(entry)
+                            chunk_buffers.append(entry.tensor)
+                            row_chunk["ptr"] = int(entry.tensor.data_ptr())
+                            row_chunk["nbytes"] = int(row_chunk["row_len"] * item_len)
+                            if reused:
+                                dspark_dynamic_reused += 1
+                            else:
+                                dspark_dynamic_allocated += 1
+                            if entry.handle is not None:
+                                dspark_hidden_dynamic_register_handles.append(
+                                    entry.handle
+                                )
                     except Exception as e:
-                        for acquired_entry in (
+                        for acquired_entries in (
                             dspark_hidden_dynamic_cache_entries_by_pp or {}
                         ).values():
+                            for acquired_entry in acquired_entries:
+                                _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
+                                    self.kv_manager, acquired_entry
+                                )
+                        for acquired_entry in chunk_entries:
                             _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
                                 self.kv_manager, acquired_entry
                             )
@@ -1470,38 +1498,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         indices_to_remove.add(i)
                         dspark_hidden_dst_indices_by_pp = None
                         break
-                    if entry is None:
-                        for acquired_entry in (
+                    if dspark_dynamic_pool_busy:
+                        for acquired_entries in (
                             dspark_hidden_dynamic_cache_entries_by_pp or {}
                         ).values():
+                            for acquired_entry in acquired_entries:
+                                _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
+                                    self.kv_manager, acquired_entry
+                                )
+                        for acquired_entry in chunk_entries:
                             _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
                                 self.kv_manager, acquired_entry
                             )
                         dspark_dynamic_pool_busy = True
                         dspark_hidden_dst_indices_by_pp = None
                         break
-                    dynamic_buffer = entry.tensor
-                    dspark_hidden_dynamic_cache_entries_by_pp[pp_rank] = entry
-                    if reused:
-                        dspark_dynamic_reused += 1
-                    else:
-                        dspark_dynamic_allocated += 1
-                    dspark_hidden_dynamic_buffers_by_pp[pp_rank] = dynamic_buffer
-                    if entry.handle is not None:
-                        dspark_hidden_dynamic_register_handles.append(entry.handle)
+                    dspark_hidden_dynamic_cache_entries_by_pp[pp_rank] = chunk_entries
+                    dspark_hidden_dynamic_buffers_by_pp[pp_rank] = chunk_buffers
                     dspark_hidden_dst_indices_by_pp[pp_rank] = cur_indices
                     pp_slice["dst_indices"] = [int(x) for x in cur_indices]
-                    item_len = int(
-                        dynamic_buffer.shape[1] * dynamic_buffer.element_size()
-                    )
                     pp_slice["dynamic_dst"] = {
-                        "ptr": int(dynamic_buffer.data_ptr()),
+                        "ptr": int(row_chunks[0]["ptr"]) if row_chunks else 0,
                         "nbytes": int(dspark_hidden_len * item_len),
                         "item_len": item_len,
                         "row_count": int(dspark_hidden_len),
-                        "row_chunks": self._dspark_hidden_row_chunks(
-                            dspark_hidden_len, item_len
-                        ),
+                        "row_chunks": row_chunks,
                     }
                 if dspark_dynamic_pool_busy:
                     if prefix_len > 0:
@@ -2214,8 +2235,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if decode_req.dspark_hidden_dynamic_cache_entries_by_pp is not None:
             kv_manager = decode_req.dspark_hidden_dynamic_kv_manager
             if kv_manager is not None:
-                for entry in decode_req.dspark_hidden_dynamic_cache_entries_by_pp.values():
-                    _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(kv_manager, entry)
+                for entries in decode_req.dspark_hidden_dynamic_cache_entries_by_pp.values():
+                    if isinstance(entries, list):
+                        for entry in entries:
+                            _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
+                                kv_manager, entry
+                            )
+                    else:
+                        _DSPARK_DYNAMIC_HIDDEN_BUFFER_CACHE.release(
+                            kv_manager, entries
+                        )
         elif decode_req.dspark_hidden_dynamic_kv_manager is not None:
             _deregister_dspark_dynamic_buffers(
                 decode_req.dspark_hidden_dynamic_kv_manager,
@@ -2397,14 +2426,46 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     dynamic_buffers = (
                         decode_req.dspark_hidden_dynamic_buffers_by_pp or {}
                     )
-                    dynamic_buffer = dynamic_buffers.get(
+                    dynamic_buffer_or_chunks = dynamic_buffers.get(
                         pp_rank, dynamic_buffers.get(int(pp_rank))
                     )
-                    if dynamic_buffer is not None:
-                        slice_hidden = dynamic_buffer[
-                            hidden_offset : hidden_offset + hidden_len,
-                            :slice_len,
-                        ]
+                    if dynamic_buffer_or_chunks is not None:
+                        if isinstance(dynamic_buffer_or_chunks, list):
+                            slice_hidden = torch.empty(
+                                (hidden_len, slice_len),
+                                dtype=dspark_pool.dtype,
+                                device="cpu",
+                            )
+                            row_chunks = (
+                                (pp_slice.get("dynamic_dst") or {}).get("row_chunks")
+                                or []
+                            )
+                            for row_chunk, chunk_buffer in zip(
+                                row_chunks, dynamic_buffer_or_chunks, strict=True
+                            ):
+                                chunk_start = int(row_chunk.get("row_start", 0))
+                                chunk_len = int(row_chunk.get("row_len", 0))
+                                chunk_end = chunk_start + chunk_len
+                                overlap_start = max(chunk_start, hidden_offset)
+                                overlap_end = min(
+                                    chunk_end, hidden_offset + hidden_len
+                                )
+                                if overlap_end <= overlap_start:
+                                    continue
+                                dst_start = overlap_start - hidden_offset
+                                dst_end = overlap_end - hidden_offset
+                                chunk_src_start = overlap_start - chunk_start
+                                chunk_src_end = overlap_end - chunk_start
+                                slice_hidden[dst_start:dst_end].copy_(
+                                    chunk_buffer[
+                                        chunk_src_start:chunk_src_end, :slice_len
+                                    ]
+                                )
+                        else:
+                            slice_hidden = dynamic_buffer_or_chunks[
+                                hidden_offset : hidden_offset + hidden_len,
+                                :slice_len,
+                            ]
                     else:
                         slice_hidden = dspark_pool.read(
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
