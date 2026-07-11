@@ -421,7 +421,7 @@ class FlexKVRadixCache(RadixCache):
                 key=RadixKey(
                     token_ids,
                     req.extra_key,
-                    cache_salt=getattr(req, "cache_salt", None),
+                    cache_salt=req.cache_salt,
                 )
             )
         )

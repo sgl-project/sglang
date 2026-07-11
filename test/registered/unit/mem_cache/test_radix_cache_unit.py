@@ -608,6 +608,36 @@ class TestRadixCache(unittest.TestCase):
             unsalted_hashes, [event.block_hashes[0] for event in stored]
         )
 
+    def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
+        cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
+        original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")
+        cache.insert(
+            InsertParams(
+                key=original,
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+            )
+        )
+        original_node = cache.match_prefix(
+            MatchPrefixParams(key=original)
+        ).last_device_node
+        original_hashes = list(original_node.event_hash_value)
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 9, 10]), cache_salt="tenant-a"),
+                value=torch.tensor([10, 20, 90, 100], dtype=torch.int64),
+            )
+        )
+        split_child = cache.match_prefix(
+            MatchPrefixParams(key=original)
+        ).last_device_node
+        split_parent = split_child.parent
+
+        self.assertEqual(
+            split_parent.event_hash_value + split_child.event_hash_value,
+            original_hashes,
+        )
+
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
         cache = RadixCache.create_simulated()

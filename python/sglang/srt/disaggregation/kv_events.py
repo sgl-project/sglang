@@ -140,6 +140,10 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
+    # BlockStoredWithMetadata deliberately stays out of this tagged union.
+    # Existing typed consumers decode its shared "BlockStored" tag as the base
+    # type and ignore the trailing metadata; adding both types would give
+    # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 

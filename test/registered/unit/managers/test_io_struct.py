@@ -474,6 +474,22 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "batch size"):
             req.normalize_batch_and_arguments()
 
+    def test_cache_key_normalization_rejects_invalid_types(self):
+        for field_name in ("extra_key", "cache_salt"):
+            with self.subTest(field_name=field_name, mode="single"):
+                req = GenerateReqInput(text="Hello", **{field_name: ["value"]})
+                with self.assertRaisesRegex(ValueError, "single request"):
+                    req.normalize_batch_and_arguments()
+
+            with self.subTest(field_name=field_name, mode="batch"):
+                req = GenerateReqInput(
+                    text=["Hello", "World"],
+                    sampling_params=[{}, {}],
+                    **{field_name: ["value", 1]},
+                )
+                with self.assertRaisesRegex(ValueError, "should be a string"):
+                    req.normalize_batch_and_arguments()
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example

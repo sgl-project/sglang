@@ -47,6 +47,7 @@ def _make_req(
     req.logprob_start_len = -1
     req.positional_embed_overrides = None
     req.extra_key = None
+    req.cache_salt = None
     req.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req

@@ -77,6 +77,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
 
+    def test_single_request_rejects_batched_cache_salt(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=1,
+            cache_salt=["tenant-a"],
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        with self.assertRaisesRegex(ValueError, "single request"):
+            internal.normalize_batch_and_arguments()
+
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(

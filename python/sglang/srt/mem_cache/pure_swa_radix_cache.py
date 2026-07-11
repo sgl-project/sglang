@@ -92,7 +92,7 @@ class PureSWARadixCache(RadixCache):
             token_ids,
             req.extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=getattr(req, "cache_salt", None),
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         keys_len = len(radix_key)
 

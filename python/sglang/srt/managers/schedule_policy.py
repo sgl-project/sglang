@@ -113,7 +113,7 @@ def match_prefix_for_req(
                 token_ids=token_ids,
                 extra_key=req.extra_key,
                 limit=key_limit,
-                cache_salt=getattr(req, "cache_salt", None),
+                cache_salt=req.cache_salt,
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
@@ -276,7 +276,7 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            cache_salt = getattr(r, "cache_salt", None)
+            cache_salt = r.cache_salt
             match_result = match_prefix_for_req(
                 self.tree_cache, r, prefix_ids, include_req=True
             )

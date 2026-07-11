@@ -92,6 +92,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -768,7 +770,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 token_ids,
                 req.extra_key,
                 is_bigram=self.is_eagle,
-                cache_salt=getattr(req, "cache_salt", None),
+                cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -848,7 +850,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             token_ids[:effective_cache_len],
             req.extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=getattr(req, "cache_salt", None),
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -1047,6 +1049,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         child.key = child.key[split_len:]
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
 
         for component in self._components_tuple:

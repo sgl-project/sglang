@@ -1136,6 +1136,9 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         child.last_access_time = get_last_access_time()
         if child.mamba_value is not None:
