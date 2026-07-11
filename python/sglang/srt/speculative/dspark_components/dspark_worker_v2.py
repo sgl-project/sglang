@@ -398,10 +398,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
         device = self.model_runner.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
+        pin_memory = is_cuda()
+        ctx_lens_cpu = torch.empty(
+            (len(batch.extend_lens),), dtype=torch.int32, pin_memory=pin_memory
         )
+        draft_seq_lens_cpu = torch.empty(
+            (len(batch.prefix_lens),), dtype=torch.int32, pin_memory=pin_memory
+        )
+        ctx_lens_cpu.copy_(torch.tensor(batch.extend_lens, dtype=torch.int32))
+        draft_seq_lens_cpu.copy_(torch.tensor(batch.prefix_lens, dtype=torch.int32))
+        ctx_lens = ctx_lens_cpu.to(device, non_blocking=True)
+        draft_seq_lens = draft_seq_lens_cpu.to(device, non_blocking=True)
         positions, _ = compute_position(
             self.model_runner.server_args.attention_backend,
             draft_seq_lens,
