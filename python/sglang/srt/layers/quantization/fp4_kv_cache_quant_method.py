@@ -722,32 +722,20 @@ def _backend_matcher(backends) -> KVCacheBackendMatcher:
     return KVCacheBackendMatcher(exact=backends)
 
 
-def _access(
-    phase: KVCacheAttentionPhase,
-    kind: KVCacheAttentionAccessKind,
-    backends,
-    scale: Optional[str] = None,
-    attention_dtype: Optional[torch.dtype] = None,
-    workspace_dtype: Optional[torch.dtype] = None,
-) -> KVCacheAttentionAccess:
-    return KVCacheAttentionAccess(
-        phase,
-        kind,
-        _backend_matcher(backends),
-        storage_dtype=torch.uint8 if scale is not None else None,
-        attention_kv_dtype=attention_dtype,
-        scale_recipe=scale,
-        workspace_dtype=workspace_dtype,
-    )
-
-
 def _plain(
     phase: KVCacheAttentionPhase,
     backends,
     scale: Optional[str] = None,
     attention_dtype: Optional[torch.dtype] = None,
 ) -> KVCacheAttentionAccess:
-    return _access(phase, _PLAIN_KIND, backends, scale, attention_dtype)
+    return KVCacheAttentionAccess(
+        phase,
+        _PLAIN_KIND,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8 if scale is not None else None,
+        attention_kv_dtype=attention_dtype,
+        scale_recipe=scale,
+    )
 
 
 def _dq_workspace(
@@ -756,12 +744,13 @@ def _dq_workspace(
     scale: str,
     attention_dtype: torch.dtype,
 ) -> KVCacheAttentionAccess:
-    return _access(
+    return KVCacheAttentionAccess(
         phase,
         _DQ_WORKSPACE_KIND,
-        backends,
-        scale,
-        attention_dtype,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8,
+        attention_kv_dtype=attention_dtype,
+        scale_recipe=scale,
         workspace_dtype=attention_dtype,
     )
 
@@ -772,7 +761,14 @@ def _native_fp4(
     scale: str,
     attention_dtype: Optional[torch.dtype],
 ) -> KVCacheAttentionAccess:
-    return _access(phase, _NATIVE_FP4_KIND, backends, scale, attention_dtype)
+    return KVCacheAttentionAccess(
+        phase,
+        _NATIVE_FP4_KIND,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8,
+        attention_kv_dtype=attention_dtype,
+        scale_recipe=scale,
+    )
 
 
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
