@@ -1,7 +1,7 @@
 import random
 import unittest
 
-from sglang.srt.speculative.dspark_components.dspark_verify import (
+from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
 )

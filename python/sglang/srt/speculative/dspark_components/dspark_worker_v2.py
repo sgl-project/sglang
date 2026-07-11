@@ -67,17 +67,15 @@ from sglang.srt.speculative.dspark_components.dspark_utils import (
     dspark_gamma_from_num_draft_tokens,
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.dspark_components.dspark_verify import (
-    alloc_verify_window,
-    dp_global_verify_tier_num_tokens,
-    idle_ragged_layout,
-)
 from sglang.srt.speculative.dspark_components.dspark_verify_epilogue import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
+    alloc_verify_window,
+    dp_global_verify_tier_num_tokens,
+    idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
     BuildOutTokens,

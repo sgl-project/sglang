@@ -17,7 +17,7 @@ from sglang.srt.speculative.dspark_components.dspark_info import (
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.dspark_components.dspark_verify import (
+from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_ragged_verify_window import (

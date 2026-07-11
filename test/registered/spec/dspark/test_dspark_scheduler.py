@@ -20,7 +20,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
 )
-from sglang.srt.speculative.dspark_components.dspark_verify import (
+from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     graph_tier_fill_budget,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout

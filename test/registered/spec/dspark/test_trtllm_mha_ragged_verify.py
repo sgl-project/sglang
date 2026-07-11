@@ -197,7 +197,7 @@ def _fake_model_runner(capture_num_tokens, max_bs):
 
 class TestBudgetTierSelection(CustomTestCase):
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
-        from sglang.srt.speculative.dspark_components.dspark_verify import (
+        from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
             verify_layout_graph_num_tokens_floor,
         )
         from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
@@ -228,7 +228,7 @@ class TestBudgetTierSelection(CustomTestCase):
         self.assertEqual(pinned, 800)
 
     def test_exceeds_gate_checks_slots_and_tier(self):
-        from sglang.srt.speculative.dspark_components.dspark_verify import (
+        from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
             ragged_layout_exceeds_captured_grid,
         )
 
