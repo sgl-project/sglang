@@ -86,7 +86,9 @@ class EBSampling(DllmAlgorithm):
                 # while the running entropy budget stays within gamma.
                 reveal_mask = torch.zeros_like(sorted_entropies, dtype=torch.bool)
                 reveal_mask[0] = True
-                reveal_mask[1:] = torch.cumsum(sorted_entropies[:-1], dim=0) <= self.gamma
+                reveal_mask[1:] = (
+                    torch.cumsum(sorted_entropies[:-1], dim=0) <= self.gamma
+                )
                 transfer_positions = sorted_positions[reveal_mask]
                 transfer_index = torch.zeros_like(block_mask_index)
                 transfer_index[transfer_positions] = True
