@@ -829,8 +829,8 @@ class SchedulerPPMixin:
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
+                    rids_to_check=good_consensus_bootstrapped_rids,
+                    failed_rids_to_check=bad_consensus_bootstrapped_rids,
                 )
             )
             # PP stages must admit the same request order. DSpark PD can make

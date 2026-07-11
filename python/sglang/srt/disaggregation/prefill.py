@@ -507,12 +507,16 @@ class PrefillBootstrapQueue:
         self,
         return_failed_reqs: bool = False,
         rids_to_check: Optional[List[str]] = None,
+        failed_rids_to_check: Optional[List[str]] = None,
     ) -> List[Req]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        failed_rids_to_check: For PP, rids that any stage already marked as
+            failed. These must be drained on every stage instead of being
+            finalized locally if this stage still observes WaitingForInput.
         """
 
         bootstrapped_reqs = []
@@ -531,10 +535,16 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_tp_cpu_group,
         )
 
+        failed_rids_to_check = set(failed_rids_to_check or [])
+        rids_to_check_set = (
+            set(rids_to_check) | failed_rids_to_check
+            if rids_to_check is not None
+            else None
+        )
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
+                rids_to_check_set is not None
+                and req.rid not in rids_to_check_set
                 and poll != KVPoll.Failed
             ):
                 # In PP mode, successful bootstrap still requires cross-rank
@@ -542,7 +552,9 @@ class PrefillBootstrapQueue:
                 # even if an earlier PP rank has already removed the request.
                 continue
 
-            if poll == KVPoll.Failed:
+            if poll == KVPoll.Failed or req.rid in failed_rids_to_check:
+                if poll != KVPoll.Failed and hasattr(req.disagg_kv_sender, "abort"):
+                    req.disagg_kv_sender.abort()
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
