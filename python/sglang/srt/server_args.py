@@ -5225,10 +5225,31 @@ class ServerArgs:
         if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
+            original_chunked_prefill_size = self.chunked_prefill_size
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                f"DP attention is enabled. chunked prefill size is adjusted "
+                f"from {original_chunked_prefill_size} to {self.chunked_prefill_size}."
             )
+
+            # The prefill CUDA graph max_bs was derived from the pre-DP-division
+            # chunked_prefill_size in _handle_gpu_memory_settings (which runs
+            # before this handler). Re-clamp it (and the captured shape list) to
+            # the per-DP-rank chunked_prefill_size so breakable CUDA graph
+            # capture never exceeds the MoE all-to-all's max_num_tokens budget,
+            # which is also sized from the DP-adjusted chunked_prefill_size.
+            prefill_cfg = self.cuda_graph_config.prefill
+            if (
+                prefill_cfg.backend != Backend.DISABLED
+                and prefill_cfg.max_bs is not None
+                and prefill_cfg.max_bs > self.chunked_prefill_size
+                and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
+            ):
+                prefill_cfg.max_bs = self.chunked_prefill_size
+                if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
+                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
+                        prefill_cfg.max_bs
+                    )
 
         # The dp-lm-head validation moved to the resolution pipeline
         # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
