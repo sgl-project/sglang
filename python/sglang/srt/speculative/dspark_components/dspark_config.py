@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+import json
+import logging
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
 SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
@@ -35,6 +42,83 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
 
     def require_markov(self) -> bool:
         return int(self.markov_rank) > 0
+
+
+class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
+    gamma: int
+    verify_num_draft_tokens: int
+    mask_token_id: int
+    draft_config: DSparkDraftConfig
+
+
+def resolve_runtime_config(
+    *,
+    draft_hf_config: Any,
+    speculative_num_draft_tokens: Optional[int],
+    target_vocab_size: int,
+) -> DSparkRuntimeConfig:
+    """Resolve and validate the worker-facing DSpark runtime knobs (gamma,
+    verify window, mask token) from the draft checkpoint config, with
+    server_args.speculative_num_draft_tokens taking precedence for gamma."""
+    draft_config = parse_dspark_draft_config(draft_hf_config=draft_hf_config)
+    if not draft_config.require_markov():
+        raise ValueError(
+            "DSpark draft requires markov_rank > 0; got "
+            f"markov_rank={draft_config.markov_rank}."
+        )
+
+    if speculative_num_draft_tokens is None:
+        gamma = int(draft_config.resolve_gamma(default=None) or 0)
+        if gamma < 1:
+            raise ValueError(
+                "DSpark could not resolve gamma from the draft config and "
+                "speculative_num_draft_tokens is unset."
+            )
+    else:
+        gamma = dspark_gamma_from_num_draft_tokens(int(speculative_num_draft_tokens))
+        config_gamma = draft_config.resolve_gamma(default=None)
+        if config_gamma is not None and int(config_gamma) != gamma:
+            logger.warning(
+                "DSpark gamma mismatch: using gamma=%s (from "
+                "speculative_num_draft_tokens=%s) but draft config block_size=%s.",
+                gamma,
+                speculative_num_draft_tokens,
+                config_gamma,
+            )
+
+    if draft_config.mask_token_id is None:
+        raise ValueError(
+            "DSpark requires mask_token_id to be set in the draft model config."
+        )
+    mask_token_id = int(draft_config.mask_token_id)
+    if mask_token_id >= target_vocab_size:
+        raise ValueError(
+            f"DSpark mask_token_id={mask_token_id} is outside the target "
+            f"vocab size {target_vocab_size}."
+        )
+
+    return DSparkRuntimeConfig(
+        gamma=gamma,
+        verify_num_draft_tokens=gamma + 1,
+        mask_token_id=mask_token_id,
+        draft_config=draft_config,
+    )
+
+
+def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
+    """Load the draft checkpoint's hf config and read its DSpark gamma
+    (block_size). Raises on config-load failure; callers pick the fallback."""
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=json.loads(server_args.json_model_override_args),
+    )
+    return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
+        default=None
+    )
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:

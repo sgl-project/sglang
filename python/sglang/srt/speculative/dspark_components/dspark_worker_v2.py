@@ -27,8 +27,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
-    dspark_gamma_from_num_draft_tokens,
-    parse_dspark_draft_config,
+    resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
@@ -124,49 +123,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
 
-        dspark_config = parse_dspark_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        runtime_config = resolve_runtime_config(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config,
+            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            target_vocab_size=int(
+                self.target_worker.model_runner.model_config.vocab_size
+            ),
         )
-        if not dspark_config.require_markov():
-            raise ValueError(
-                "DSpark draft requires markov_rank > 0; got "
-                f"markov_rank={dspark_config.markov_rank}."
-            )
-        if server_args.speculative_num_draft_tokens is None:
-            gamma = int(dspark_config.resolve_gamma(default=None) or 0)
-            if gamma < 1:
-                raise ValueError(
-                    "DSpark could not resolve gamma from the draft config and "
-                    "speculative_num_draft_tokens is unset."
-                )
-            self.gamma = gamma
-        else:
-            self.gamma = dspark_gamma_from_num_draft_tokens(
-                int(server_args.speculative_num_draft_tokens)
-            )
-            config_gamma = dspark_config.resolve_gamma(default=None)
-            if config_gamma is not None and int(config_gamma) != self.gamma:
-                logger.warning(
-                    "DSpark gamma mismatch: using gamma=%s (from "
-                    "speculative_num_draft_tokens=%s) but draft config block_size=%s.",
-                    self.gamma,
-                    server_args.speculative_num_draft_tokens,
-                    config_gamma,
-                )
-        self.verify_num_draft_tokens = self.gamma + 1
+        self.gamma = runtime_config.gamma
+        self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
-
-        if dspark_config.mask_token_id is None:
-            raise ValueError(
-                "DSpark requires mask_token_id to be set in the draft model config."
-            )
-        self._mask_token_id = int(dspark_config.mask_token_id)
-        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
-        if self._mask_token_id >= vocab_size:
-            raise ValueError(
-                f"DSpark mask_token_id={self._mask_token_id} is outside the target "
-                f"vocab size {vocab_size}."
-            )
+        self._mask_token_id = runtime_config.mask_token_id
 
         if self.tp_rank == 0:
             logger.info(

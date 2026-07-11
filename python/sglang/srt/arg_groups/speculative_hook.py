@@ -355,22 +355,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if gamma is None and server_args.speculative_num_draft_tokens is None:
         from sglang.srt.speculative.dspark_components.dspark_config import (
             DEFAULT_DSPARK_GAMMA,
-            parse_dspark_draft_config,
+            read_draft_checkpoint_gamma,
         )
 
-        model_override_args = json.loads(server_args.json_model_override_args)
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                server_args.speculative_draft_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            gamma = parse_dspark_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_gamma(default=None)
+            gamma = read_draft_checkpoint_gamma(server_args=server_args)
         except Exception as e:
             logger.warning(
                 "Failed to infer DSpark gamma from draft model config; "
@@ -387,23 +376,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
     elif gamma is None and server_args.speculative_num_draft_tokens is not None:
         from sglang.srt.speculative.dspark_components.dspark_config import (
-            parse_dspark_draft_config,
+            read_draft_checkpoint_gamma,
         )
 
-        model_override_args = json.loads(server_args.json_model_override_args)
         config_gamma: Optional[int] = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                server_args.speculative_draft_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            config_gamma = parse_dspark_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_gamma(default=None)
+            config_gamma = read_draft_checkpoint_gamma(server_args=server_args)
         except Exception as e:
             logger.warning(
                 "Failed to read DSpark gamma from draft model config; "
