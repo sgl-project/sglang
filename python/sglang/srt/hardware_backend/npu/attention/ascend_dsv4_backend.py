@@ -1413,6 +1413,33 @@ class DeepseekV4AscendAttnBackend(
             from sglang.srt.server_args import get_global_server_args
 
             max_seqlen_q = get_global_server_args().speculative_num_draft_tokens or 1
+        elif forward_batch.forward_mode.is_extend():
+            from sglang.srt.server_args import get_global_server_args
+
+            spec_algorithm = str(
+                getattr(get_global_server_args(), "speculative_algorithm", "")
+            ).lower()
+            if spec_algorithm and spec_algorithm != "none":
+                max_seqlen_q = 1
+            else:
+                extend_seq_lens_cpu = getattr(
+                    forward_batch, "extend_seq_lens_cpu", None
+                )
+                if isinstance(extend_seq_lens_cpu, list):
+                    max_seqlen_q = max(extend_seq_lens_cpu, default=1)
+                elif extend_seq_lens_cpu is not None:
+                    max_seqlen_q = int(extend_seq_lens_cpu.max().item())
+                elif fm.actual_seq_lengths_q_pa is not None:
+                    max_seqlen_q = int(
+                        (
+                            fm.actual_seq_lengths_q_pa[1:]
+                            - fm.actual_seq_lengths_q_pa[:-1]
+                        )
+                        .max()
+                        .item()
+                    )
+                else:
+                    max_seqlen_q = 1
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(

@@ -349,6 +349,18 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        if (
+            _is_npu
+            and server_args.disaggregation_mode == "prefill"
+            and self.enable_overlap
+        ):
+            logger.warning(
+                "Disabling overlap schedule for NPU disaggregation prefill. "
+                "DSV4 PD prefill uses the non-overlap path; decode overlap remains "
+                "controlled by --disable-overlap-schedule."
+            )
+            self.enable_overlap = False
+            self.enable_overlap_mlx = False
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
