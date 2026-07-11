@@ -151,7 +151,7 @@ class DsparkInfoDumper:
         components: set[Union[InfoComponent, str]],
         gamma: int,
         verify_num_draft_tokens: int,
-        tp_rank: int,
+        attn_tp_rank: int,
         device: torch.device,
         mode_value: str,
         sps_report_interval: int = 0,
@@ -161,7 +161,7 @@ class DsparkInfoDumper:
     ) -> None:
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = int(verify_num_draft_tokens)
-        self.tp_rank = int(tp_rank)
+        self.attn_tp_rank = int(attn_tp_rank)
         self.device = device
         self.mode_value = mode_value
         self._clock = clock
@@ -173,7 +173,10 @@ class DsparkInfoDumper:
         self._sps_report_interval = int(sps_report_interval)
         if self._sps_report_interval > 0:
             self._components.add(InfoComponent.STEP_GPU_TIME)
-        self.enabled = bool(self._components) and self.tp_rank == 0
+        # Dedup within an attention-TP group only: records describe the
+        # DP-rank-local batch, so under dp-attention every DP rank must keep
+        # dumping (the SPS profiler reads one payload per DP rank).
+        self.enabled = bool(self._components) and self.attn_tp_rank == 0
         self._sps_window: list[tuple[float, float]] = []
         self._sps_mismatched = 0
 

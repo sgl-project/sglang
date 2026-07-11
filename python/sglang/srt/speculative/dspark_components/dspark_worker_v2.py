@@ -329,7 +329,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             components=resolve_enabled_components(),
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.tp_rank,
+            attn_tp_rank=get_parallel().attn_tp_rank,
             device=self.device,
             mode_value=self._verify_planner.mode_value,
             sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
