@@ -28,6 +28,9 @@ from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KVCacheAttentionAccessKind,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -99,8 +102,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
+        self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "decode", "trtllm_mha"
+        )
+        self.decode_uses_native_fp4 = (
+            self.decode_kv_access is not None
+            and self.decode_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+        )
         self.is_nvfp4_kvcache = (
-            getattr(self.kv_cache_quant_method, "name", None) == "nvfp4"
+            self.decode_uses_native_fp4
+            and self.decode_kv_access.scale_layout == "nvfp4"
         )
 
         config = model_runner.model_config
@@ -177,12 +188,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if (
             hasattr(torch, "float4_e2m1fn_x2")
             and self.data_type == torch.float4_e2m1fn_x2
-            and not self.is_nvfp4_kvcache
+            and not self.decode_uses_native_fp4
         ):
+            method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+            available = self.kv_cache_quant_method.describe_attention_accesses("decode")
             raise ValueError(
-                "trtllm_mha FP4 KV cache decode supports nvfp4 only. "
-                "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
-                "for fp4_mx_block16."
+                f"KV cache method {method_name!r} does not support decode with "
+                f"trtllm_mha. Available decode accesses: {available}."
             )
 
     @staticmethod
@@ -899,9 +911,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        if self.is_nvfp4_kvcache:
+        if self.decode_uses_native_fp4:
             raise RuntimeError(
-                "TRTLLM MHA with NVFP4 KV cache supports decode only; "
+                "TRTLLM MHA with native FP4 KV cache supports decode only; "
                 "use a separate prefill backend such as flashinfer or triton."
             )
 

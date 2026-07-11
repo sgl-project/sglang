@@ -2034,11 +2034,17 @@ class MHATokenToKVPool(KVCache):
         local_layer_id = layer_id - self.start_layer
         if self.k_scale_buffer is None or self.v_scale_buffer is None:
             raise RuntimeError("Raw FP4 KV cache requested from a non-FP4 KV pool.")
+        k_scale = self.k_scale_buffer[local_layer_id]
+        v_scale = self.v_scale_buffer[local_layer_id]
+        scale_view_dtype = self.quant_method.scale_buffer_view_dtype()
+        if scale_view_dtype is not None:
+            k_scale = k_scale.view(scale_view_dtype)
+            v_scale = v_scale.view(scale_view_dtype)
         return (
             self.k_buffer[local_layer_id],
             self.v_buffer[local_layer_id],
-            self.k_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
-            self.v_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
+            k_scale,
+            v_scale,
         )
 
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2048,7 +2054,7 @@ class MHATokenToKVPool(KVCache):
             )
         return self.dq_k_buffer, self.dq_v_buffer
 
-    def get_flashinfer_quantized_kv_buffer(
+    def get_flashinfer_dequant_workspace_kv_buffer(
         self,
         layer: RadixAttention,
         req_to_token: torch.Tensor,
@@ -2103,6 +2109,41 @@ class MHATokenToKVPool(KVCache):
             k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
             v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
         )
+
+    def get_flashinfer_decode_dequant_workspace_kv_buffer(
+        self,
+        layer: RadixAttention,
+        req_to_token: torch.Tensor,
+        req_pool_indices,
+        seq_lens,
+        *,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError(
+                "FlashInfer dequant workspace requested from a non-quantized KV pool."
+            )
+
+        self._prepare_dequant_decode_workspace(
+            layer.layer_id if layer_id_override is None else layer_id_override,
+            layer.layer_id,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+        )
+        k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
+        return (
+            k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+        )
+
+    @staticmethod
+    def _to_cpu_int_list(values) -> list[int]:
+        if isinstance(values, list):
+            return [int(value) for value in values]
+        if isinstance(values, torch.Tensor):
+            return [int(value) for value in values.cpu().tolist()]
+        return [int(value) for value in values]
 
     def _prepare_dequant_extend_workspace(
         self,
@@ -2160,6 +2201,36 @@ class MHATokenToKVPool(KVCache):
                 // page_size
                 * page_size
             )
+
+        return dq_k, dq_v
+
+    def _prepare_dequant_decode_workspace(
+        self,
+        layer_id: int,
+        global_layer_id: int,
+        req_to_token: torch.Tensor,
+        req_pool_indices,
+        seq_lens,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(layer_id)
+        dq_k, dq_v = self.get_dequant_workspace()
+
+        req_pool_indices_cpu = self._to_cpu_int_list(req_pool_indices)
+        seq_lens_cpu = self._to_cpu_int_list(seq_lens)
+
+        for req_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
+            if seq_len <= 0:
+                continue
+            kv_indices = req_to_token[req_idx, :seq_len]
+            k_prev_fp8, v_prev_fp8 = self.quant_method.dequantize_prev_kv(
+                k_fp4[kv_indices],
+                k_scales[kv_indices],
+                v_fp4[kv_indices],
+                v_scales[kv_indices],
+                global_layer_id,
+            )
+            dq_k[kv_indices] = k_prev_fp8
+            dq_v[kv_indices] = v_prev_fp8
 
         return dq_k, dq_v
 
@@ -2942,10 +3013,17 @@ class HybridLinearKVPool(KVCache):
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_dequant_workspace()
 
-    def get_flashinfer_quantized_kv_buffer(self, layer, *args, **kwargs):
+    def get_flashinfer_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
         self._wait_for_layer(layer.layer_id)
         local_layer_id = self._transfer_full_attention_id(layer.layer_id)
-        return self.full_kv_pool.get_flashinfer_quantized_kv_buffer(
+        return self.full_kv_pool.get_flashinfer_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=local_layer_id, **kwargs
+        )
+
+    def get_flashinfer_decode_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
+        self._wait_for_layer(layer.layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer.layer_id)
+        return self.full_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
             layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 

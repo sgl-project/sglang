@@ -19,13 +19,61 @@ Three-player design:
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from dataclasses import dataclass
+from enum import Enum
+from typing import Iterable, Optional
 
 import torch
 from torch import Tensor
 
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
 from sglang.srt.utils.common import is_sm100_supported
+
+
+class KVCacheAttentionPhase(str, Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+
+
+class KVCacheAttentionAccessKind(str, Enum):
+    PLAIN = "plain"
+    DEQUANT_WORKSPACE = "dequant_workspace"
+    NATIVE_FP4 = "native_fp4"
+
+
+@dataclass(frozen=True)
+class KVCacheBackendMatcher:
+    exact: frozenset[str] = frozenset()
+    tags: frozenset[str] = frozenset()
+    any_backend: bool = False
+
+    def matches(self, backend_name: str, backend_tags: Iterable[str]) -> bool:
+        backend_tags = frozenset(backend_tags)
+        return (
+            self.any_backend
+            or backend_name in self.exact
+            or (bool(self.tags) and self.tags.issubset(backend_tags))
+        )
+
+
+@dataclass(frozen=True)
+class KVCacheAttentionAccess:
+    phase: KVCacheAttentionPhase
+    kind: KVCacheAttentionAccessKind
+    backend_matcher: KVCacheBackendMatcher
+    storage_dtype: Optional[torch.dtype] = None
+    attention_kv_dtype: Optional[torch.dtype] = None
+    scale_layout: Optional[str] = None
+    workspace_dtype: Optional[torch.dtype] = None
+
+    def matches(self, phase, backend_name: str, backend_tags: Iterable[str]) -> bool:
+        return self.phase == KVCacheAttentionPhase(
+            phase
+        ) and self.backend_matcher.matches(backend_name, backend_tags)
+
+
+BACKEND_TAG_FP4_DEQUANT_PREFILL = "fp4_dequant_workspace_prefill"
+BACKEND_TAG_FP4_DEQUANT_DECODE = "fp4_dequant_workspace_decode"
 
 
 class KVCacheQuantMethodBase(ABC):
@@ -38,13 +86,45 @@ class KVCacheQuantMethodBase(ABC):
     name: str
     SCALE_BLOCK_SIZE: int = 1
 
+    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        return ()
+
+    def resolve_attention_access(
+        self, phase, backend_name: str, backend_tags: Iterable[str] = ()
+    ) -> Optional[KVCacheAttentionAccess]:
+        for access in self.attention_accesses():
+            if access.matches(phase, backend_name, backend_tags):
+                return access
+        return None
+
+    def describe_attention_accesses(self, phase=None) -> str:
+        accesses = self.attention_accesses()
+        if phase is not None:
+            phase = KVCacheAttentionPhase(phase)
+            accesses = tuple(access for access in accesses if access.phase == phase)
+        if not accesses:
+            return "none"
+        return "; ".join(
+            f"{access.phase.value}:{access.kind.value}:"
+            f"exact={sorted(access.backend_matcher.exact)}:"
+            f"tags={sorted(access.backend_matcher.tags)}"
+            for access in accesses
+        )
+
     def needs_dequant_workspace(self) -> bool:
-        """Whether the pool should allocate dq_k_buffer / dq_v_buffer for prefill."""
-        return False
+        """Whether the pool should allocate dq_k_buffer / dq_v_buffer."""
+        return any(
+            access.kind == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+            for access in self.attention_accesses()
+        )
 
     def needs_global_scale(self) -> bool:
         """Whether this method uses a per-layer global FP32 scale."""
         return False
+
+    def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
+        """Optional dtype view for stored per-block scales."""
+        return None
 
     @abstractmethod
     def create_buffers(
@@ -111,6 +191,21 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
     name = "unquantized"
     SCALE_BLOCK_SIZE = 1
 
+    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        any_backend = KVCacheBackendMatcher(any_backend=True)
+        return (
+            KVCacheAttentionAccess(
+                KVCacheAttentionPhase.PREFILL,
+                KVCacheAttentionAccessKind.PLAIN,
+                any_backend,
+            ),
+            KVCacheAttentionAccess(
+                KVCacheAttentionPhase.DECODE,
+                KVCacheAttentionAccessKind.PLAIN,
+                any_backend,
+            ),
+        )
+
     def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
         pass
 
@@ -163,13 +258,33 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         self.k_scales_float = [1.0] * num_layers
         self.v_scales_float = [1.0] * num_layers
 
-    def needs_dequant_workspace(self) -> bool:
+    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
         return (
-            True  # prefill uses FP8 dequant workspace; future native FP4 kernel → False
+            KVCacheAttentionAccess(
+                KVCacheAttentionPhase.PREFILL,
+                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+                KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
+                storage_dtype=torch.uint8,
+                attention_kv_dtype=torch.float8_e4m3fn,
+                scale_layout="nvfp4",
+                workspace_dtype=torch.float8_e4m3fn,
+            ),
+            KVCacheAttentionAccess(
+                KVCacheAttentionPhase.DECODE,
+                KVCacheAttentionAccessKind.NATIVE_FP4,
+                KVCacheBackendMatcher(exact=frozenset({"trtllm_mha"})),
+                storage_dtype=torch.uint8,
+                attention_kv_dtype=fp4_dtype,
+                scale_layout="nvfp4",
+            ),
         )
 
     def needs_global_scale(self) -> bool:
         return True
+
+    def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
+        return torch.float8_e4m3fn
 
     def load_scales_from_model(self, model_runner) -> None:
         from sglang.srt.model_executor.model_runner import resolve_language_model
@@ -370,8 +485,29 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     ):
         pass
 
-    def needs_dequant_workspace(self) -> bool:
-        return True
+    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        return (
+            KVCacheAttentionAccess(
+                KVCacheAttentionPhase.PREFILL,
+                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+                KVCacheBackendMatcher(
+                    tags=frozenset({BACKEND_TAG_FP4_DEQUANT_PREFILL})
+                ),
+                storage_dtype=torch.uint8,
+                attention_kv_dtype=torch.float8_e4m3fn,
+                scale_layout="fp4_mx_block16",
+                workspace_dtype=torch.float8_e4m3fn,
+            ),
+            KVCacheAttentionAccess(
+                KVCacheAttentionPhase.DECODE,
+                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+                KVCacheBackendMatcher(tags=frozenset({BACKEND_TAG_FP4_DEQUANT_DECODE})),
+                storage_dtype=torch.uint8,
+                attention_kv_dtype=torch.float8_e4m3fn,
+                scale_layout="fp4_mx_block16",
+                workspace_dtype=torch.float8_e4m3fn,
+            ),
+        )
 
     def create_buffers(
         self, size: int, head_num: int, head_dim: int, layer_num: int, device: str

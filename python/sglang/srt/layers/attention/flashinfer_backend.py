@@ -26,6 +26,11 @@ from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    BACKEND_TAG_FP4_DEQUANT_DECODE,
+    BACKEND_TAG_FP4_DEQUANT_PREFILL,
+    KVCacheAttentionAccessKind,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -322,27 +327,49 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_dllm_model = self.dllm_config is not None
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
-        kv_cache_quant_method_name = getattr(self.kv_cache_quant_method, "name", None)
-        unsupported_fp4_recipe = kv_cache_quant_method_name not in (
-            None,
-            "unquantized",
-            "nvfp4",
+        self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "prefill",
+            "flashinfer",
+            backend_tags={BACKEND_TAG_FP4_DEQUANT_PREFILL},
         )
-        if unsupported_fp4_recipe and self.__class__ is FlashInferAttnBackend:
-            raise ValueError(
-                "flashinfer MHA FP4 KV cache path supports nvfp4 only. "
-                "Use --kv-cache-dtype=nvfp4 or choose another attention backend "
-                "for fp4_mx_block16."
-            )
-        self.is_nvfp4_kvcache = kv_cache_quant_method_name == "nvfp4"
+        self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "decode",
+            "flashinfer",
+            backend_tags={BACKEND_TAG_FP4_DEQUANT_DECODE},
+        )
+        prefill_backend, decode_backend = (
+            model_runner.server_args.get_attention_backends()
+        )
+        if self.__class__ is FlashInferAttnBackend:
+            if prefill_backend == "flashinfer":
+                self._require_kv_attention_access("prefill", self.prefill_kv_access)
+            if decode_backend == "flashinfer":
+                self._require_kv_attention_access("decode", self.decode_kv_access)
+
+        self.prefill_uses_dequant_workspace = (
+            self.prefill_kv_access is not None
+            and self.prefill_kv_access.kind
+            == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+        )
+        self.decode_uses_dequant_workspace = (
+            self.decode_kv_access is not None
+            and self.decode_kv_access.kind
+            == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+        )
+        self.is_nvfp4_kvcache = any(
+            access is not None and access.scale_layout == "nvfp4"
+            for access in (self.prefill_kv_access, self.decode_kv_access)
+        )
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
-        # NVFP4 cache storage is packed FP4, but FlashInfer prefill metadata and
-        # wrapper selection operate on the dequantized FP8 workspace.
+        # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
             torch.float8_e4m3fn
-            if self.is_nvfp4_kvcache
+            if (
+                self.prefill_uses_dequant_workspace
+                or self.decode_uses_dequant_workspace
+            )
             else model_runner.kv_cache_dtype
         )
 
@@ -515,6 +542,16 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def _require_kv_attention_access(self, phase: str, access) -> None:
+        if access is not None:
+            return
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses(phase)
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support {phase} with "
+            f"flashinfer attention backend. Available {phase} accesses: {available}."
+        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
@@ -792,21 +829,21 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.cuda_graph_swa_out_cache_loc[:n]
                 )
 
-    def _prepare_nvfp4_metadata_for_extend_base(
+    def _prepare_dequant_workspace_metadata_for_extend(
         self, forward_batch: ForwardBatch, use_ragged: bool = False
     ):
-        """Prepare FlashInfer prefill metadata for NVFP4 dequant workspace.
+        """Prepare FlashInfer metadata for an FP4 dequant workspace.
 
-        NVFP4 is stored as packed FP4, while FlashInfer prefill currently reads
-        FP8 KV from a temporary workspace. This builds the workspace page table,
-        exact paged lengths, and CPU request ids needed to populate that
-        workspace before the prefill kernel runs.
+        Some FP4 recipes store packed KV but expose an FP8 workspace to
+        FlashInfer prefill. This builds the workspace page table, exact paged
+        lengths, and CPU request ids needed to populate that workspace before
+        the prefill kernel runs.
         """
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
         if not (
-            self.is_nvfp4_kvcache
+            self.prefill_uses_dequant_workspace
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             return
@@ -868,7 +905,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def _kv_write_scales(self, layer: RadixAttention):
-        if self.is_nvfp4_kvcache:
+        if self.kv_cache_quant_method.needs_global_scale():
             return None, None
         return layer.k_scale, layer.v_scale
 
@@ -940,7 +977,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
-            self._prepare_nvfp4_metadata_for_extend_base(forward_batch, use_ragged)
+            self._prepare_dequant_workspace_metadata_for_extend(
+                forward_batch, use_ragged
+            )
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -1229,13 +1268,13 @@ class FlashInferAttnBackend(AttentionBackend):
         q = q.contiguous()
 
         assert not (
-            self.is_nvfp4_kvcache and layer.is_cross_attention
-        ), "NVFP4 dequant KV cache is not supported for cross-attention"
+            self.prefill_uses_dequant_workspace and layer.is_cross_attention
+        ), "FP4 dequant KV cache is not supported for cross-attention"
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
-        if self.is_nvfp4_kvcache:
-            kv_cache = pool.get_flashinfer_quantized_kv_buffer(
+        if self.prefill_uses_dequant_workspace:
+            kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
                 self.cpu_req_pool_indices,
@@ -1297,8 +1336,8 @@ class FlashInferAttnBackend(AttentionBackend):
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
                 assert (
-                    not self.is_nvfp4_kvcache
-                ), "KV cache must be provided for ragged attention when using NVFP4 kv cache"
+                    not self.prefill_uses_dequant_workspace
+                ), "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
@@ -1393,10 +1432,26 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
+        if self.decode_uses_dequant_workspace:
+            kv_cache = (
+                self.token_to_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    (
+                        forward_batch.seq_lens_cpu
+                        if forward_batch.seq_lens_cpu is not None
+                        else forward_batch.seq_lens
+                    ),
+                )
+            )
+        else:
+            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            kv_cache,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
