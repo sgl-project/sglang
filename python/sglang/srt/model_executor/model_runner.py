@@ -78,6 +78,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_active,
     is_mla_cp_enabled,
+    prepare_cp_forward,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
@@ -96,6 +97,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -1593,21 +1595,36 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == 0 or reinit_attn_backend:
-            self.attn_backend.init_forward_metadata(forward_batch)
-        next_split_index = min(
-            forward_batch.split_index + forward_count,
-            self.model_config.num_hidden_layers,
-        )
-        with device_timer_ctx(self.device_timer, "split_prefill"):
-            ret = self.model.forward_split_prefill(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                (forward_batch.split_index, next_split_index),
+        original_mode = forward_batch.forward_mode
+        if (
+            getattr(self.model, "supports_split_prefill_cp", False)
+            and get_cp_strategy() is not None
+        ):
+            # Only adapted split models enter the ordinary CP prefill boundary.
+            # Other models keep SPLIT_PREFILL and their existing non-CP behavior.
+            forward_batch.forward_mode = ForwardMode.EXTEND
+        try:
+            if is_cp_active(forward_batch):
+                # Eager preparation resets DP buffer sizing on every interval.
+                # Reuse CP metadata but restore its padded size before collectives.
+                prepare_cp_forward(forward_batch)
+            if forward_batch.split_index == 0 or reinit_attn_backend:
+                self.attn_backend.init_forward_metadata(forward_batch)
+            next_split_index = min(
+                forward_batch.split_index + forward_count,
+                self.model_config.num_hidden_layers,
             )
-        forward_batch.split_index = next_split_index
-        return ret
+            with device_timer_ctx(self.device_timer, "split_prefill"):
+                ret = self.model.forward_split_prefill(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    (forward_batch.split_index, next_split_index),
+                )
+            forward_batch.split_index = next_split_index
+            return ret
+        finally:
+            forward_batch.forward_mode = original_mode
 
     def forward(
         self,

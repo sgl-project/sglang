@@ -490,7 +490,8 @@ struct TopKKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const bool enable_cluster) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -564,7 +565,7 @@ struct TopKKernel {
     };
 
 #ifndef USE_ROCM
-    const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+    const bool use_cluster = enable_cluster && (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
 #endif
     constexpr bool kUsePDL = true;
     const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
