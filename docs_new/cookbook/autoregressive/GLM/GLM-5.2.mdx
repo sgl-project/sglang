@@ -1,6 +1,6 @@
 ---
 title: GLM-5.2
-description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, and GB300."
+description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X."
 tag: NEW
 ---
 
@@ -52,6 +52,10 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 2-1-3 = 2); high-throughput has no spec.
+</Note>
+
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
@@ -62,7 +66,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup.
+**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -83,22 +87,36 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · BF16</td>
       <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/GLM-5.2-NVFP4">GLM-5.2-NVFP4</a></strong></td>
+      <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · NVFP4</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
+    </tr>
   </tbody>
 </table>
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95` (the checkpoint's `generation_config.json` defaults; informational — do not hardcode in client code).
 
-**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2).
+**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2) · [GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
 
 ## 2. Configuration Tips
 
 - **DeepSeek Sparse Attention (DSA).** GLM-5.2 uses the `glm_moe_dsa` architecture; SGLang auto-selects the DSA attention backends (`flashmla_sparse` prefill, `fa3` decode, `sgl-kernel` indexer topk). No attention-backend flag is needed on the supported hardware. SGLang also auto-selects the KV-cache dtype for DSA models — `fp8_e4m3` on Blackwell (B200/GB300/B300, which then routes DSA through the TensorRT-LLM backend) and `bf16` on Hopper (H200) — so no `--kv-cache-dtype` flag is required.
 - **MTP / speculative decoding.** The checkpoint ships one nextn layer. Enable EAGLE MTP for lower latency (`--speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6` for low-latency; `1-1-2` for balanced). The config's `index_share_for_mtp_iteration` reuses the DSA indexer's topk across draft steps (effective only at `--speculative-eagle-topk 1`). **Tune the draft length to the accept length.** GLM-5.2's MTP head is strong — accept length runs high (4+ in many workloads, near-saturating at 5–6 in low-latency runs). Watch the server's reported **accept length** and adjust `--speculative-num-steps` / `--speculative-num-draft-tokens` accordingly: while accept length stays close to the draft-token count there is headroom to push them higher (more accepted tokens per step); if it falls well below, lower them — every rejected draft token is wasted verification compute.
-- **Context Parallelism (CP) for long prefill.** DSA prefill CP splits the long-prefill attention across `--attn-cp-size` ranks. On **Hopper (H200)** this gives a large prefill-latency win at long context — e.g. round-robin CP (`--tp 8 --attn-cp-size 8 --enable-dsa-prefill-context-parallel --dsa-prefill-cp-mode round-robin-split`) cut 64K-token prefill TTFT roughly **2.5–2.8×** vs. plain TP8 in our testing. Trade-offs: CP partitions the KV pool (lower max context at the same `--mem-fraction-static`) and adds some decode-side overhead, so it pays off only for long sequences. **CP is currently verified on Hopper only** — the Blackwell (sm100) DSA-CP FP8 rope kernel is not yet adapted, so leave CP off on B200/B300/GB300.
+- **Context Parallelism (CP) for long prefill.** DSA prefill CP splits the long-prefill attention across `--attn-cp-size` ranks. This gives a large prefill-latency win at long context — e.g. interleaved CP (`--tp 8 --attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave`) cut 64K-token prefill TTFT roughly **2.5–2.8×** vs. plain TP8 in our testing. Trade-offs: CP partitions the KV pool (lower max context at the same `--mem-fraction-static`) and adds some decode-side overhead, so it pays off only for long sequences.
 - **Memory.** The FP8 weights are large (MoE total, not active params). Start around `--mem-fraction-static 0.8` on H200 (TP8) and tune up; raise it for the 4-GPU GB300 single-node layout (TP4).
 - **DP-Attention + DeepEP** for the balanced/high-throughput strategies spreads attention across data-parallel ranks and routes MoE through DeepEP.
 - **BF16 weights need more GPUs.** The full-precision build (`zai-org/GLM-5.2`, ~1.5 TB) does not fit a single 8×H200 / 8×B200 / 4×GB300 node. It fits single-node on **8×B300** (TP8, ~2.1 TB HBM) — **verified**; on the smaller GPUs it needs a **multi-node** layout (e.g. 2×8×H200 or 2×8×B200 at TP16, 2×4×GB300 at TP8), and those **multi-node BF16 recipes are still proposed/inferred** (`verified: false`). FP8 is the recommended deployment. Use the same DSA / MTP / chunked-prefill guidance as FP8. On B300, BF16 low-latency matches FP8 (the sm103 FP8 path is not yet optimized), but FP8 wins at the balanced/high-throughput points.
+- **PD Disaggregation (prefill/decode).** GLM-5.2 is a DSA model and runs under prefill/decode disaggregation — toggle the **PD Disagg** card in the [Playground above](#playground) (pick a Prefill/Decode role + transfer backend, then front the roles with `sglang_router.launch_router --pd-disaggregation`). The Mooncake backend **auto-detects the InfiniBand HCA**, so no device flag is needed by default; only add `--disaggregation-ib-device mlx5_0` (your NIC) if auto-detection picks the wrong device or KV transfer fails to connect. On H200 Docker, expose the IB HCAs to the container (`--privileged --ulimit memlock=-1`, or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) — without IB exposure Mooncake silently falls back to TCP.
 - **Chunked-prefill size is regime-dependent.** At long input (8K+) the default `--chunked-prefill-size 2048` is too small and leaves the balanced point prefill-bound (queueing dominates TTFT). Raising it to `--chunked-prefill-size 32768` on the balanced recipe gave roughly **+34–78% output throughput and −39–59% TTFT** on 8×H200 and 8×B200 (8K-in / 1K-out) in our testing. It is **neutral for high-throughput** (decode-bound there) — keep the default. `--max-running-requests` tracks KV capacity, not a tuning free-for-all: ~60–90 concurrent 8K+1K FP8 requests fit on a single 8-GPU node, so pin balanced near `--max-running-requests 80` and let high-throughput run wider.
+
+- **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.2-FP8`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.2`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there (or a multi-node BF16 layout once validated). Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). FP8 uses about half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). GLM-5.2 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
+
+<Note>
+**gfx950 block-FP8 accuracy: fixed as of the pinned MI355X image (`v0.5.13.post1-rocm720-mi35x-20260618`).** Earlier SGLang ROCm images miscompiled AMD aiter's `gemm_a8w8_blockscale_bpreshuffle` GEMM on gfx950 (ROCm 7.2): the error was small per layer but compounded across all 78 layers and silently corrupted output — in-context reasoning broke (GSM8K ≈ 0) while short factual prompts still looked fine. The root cause was a gfx950/ROCm-7.2 miscompile of the CK kernel (a packed illegal-type FMA that relied on an LLVM coercion pass removed in ROCm 7.2; non-deterministic wrong rows near tile boundaries). This is resolved in the pinned image and newer: GLM-5.2-FP8 on MI350X/MI355X (gfx950) was re-validated at TP4 and TP8 — **GSM8K ≈ 0.96 (0% invalid)** and **15/15 needle-in-haystack retrieval to ~118K tokens**. **MI300X / MI325X (gfx942) were never affected.** If you must run an older image, treat gfx950 FP8 output as unverified. Background: [sgl-project/sglang#28685](https://github.com/sgl-project/sglang/issues/28685) (analysis) and the upstream CK fix [ROCm/rocm-libraries#8639](https://github.com/ROCm/rocm-libraries/pull/8639) (scalar FMA + accumulator anchor; restores correctness and determinism at -O3).
+</Note>
+
+- **MTP / EAGLE speculative decoding** is disabled for AMD in the Deploy panel. The block-FP8 accuracy bug that previously degraded it is now fixed (see note above), but MTP on gfx950 still depends on the spec-decode draft kernel, which is not yet validated on this hardware (and at `--speculative-num-steps > 3` hits a separate build issue). Until MTP is validated on gfx950, omit the `--speculative-*` flags and serve without MTP.
 
 ## 3. Advanced Usage
 
@@ -201,3 +219,27 @@ Tool calls: [
 ### 3.3 HiCache (Hierarchical KV Caching)
 
 For long-context, prefix-heavy workloads, enable hierarchical KV caching to spill cold KV blocks to host memory (toggle the **Hierarchical KV Cache** card in the [Playground above](#playground)). Useful given GLM-5.2's 1M-token window; pair `--hicache-ratio` with a write policy that matches your reuse pattern.
+
+### 3.4 Claude Code Integration
+
+GLM-5.2's strong reasoning + tool-calling makes it a good backend for [Claude Code](https://code.claude.com/docs/en/overview), Anthropic's agentic CLI. SGLang exposes the Anthropic-compatible `/v1/messages` endpoint on every server, so Claude Code can talk to a GLM-5.2 server with only environment variables — no code change. Launch the server with `--reasoning-parser glm45 --tool-call-parser glm47` (any recipe from the Deployment panel above works), then:
+
+```bash Command
+export ANTHROPIC_BASE_URL="http://127.0.0.1:30000"
+export ANTHROPIC_AUTH_TOKEN="dummy"
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="1000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-5.2[1m]"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="glm-5.2[1m]"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.2[1m]"
+claude
+```
+
+Two of these matter specifically for GLM-5.2:
+
+- **`CLAUDE_CODE_ATTRIBUTION_HEADER=0`** — Claude Code prepends a per-request attribution block to the system prompt. GLM-5.2's chat template renders `tools` **before** `system`, so that per-request hash is the first token to diverge between turns and the radix prefix cache re-prefills the whole system + history every turn. This env removes the block and restores prefix-cache reuse.
+- **`glm-5.2[1m]`** as the model name — the `[1m]` suffix is the client-side hint that enables Claude Code's 1M-context beta, matching GLM-5.2's 1,048,576-token window. Without it, context is capped well below 1M. SGLang does not validate the `model` field, so any name is accepted server-side.
+
+For the full setup (streaming, tool-use, count_tokens, persisting env in `~/.claude/settings.json`, troubleshooting), see [Anthropic-Compatible API](../../../docs/basic_usage/anthropic_api).

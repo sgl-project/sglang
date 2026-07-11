@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -104,10 +104,10 @@ class MmItemMemoryChunk:
 
     def try_to_recycle(self) -> bool:
         try:
-            tp_num = get_global_server_args().tp_size
+            tp_num = get_server_args().tp_size
         except Exception:
             logger.info(
-                "get_global_server_args has not been inited , skip this turn 's recycle"
+                "server_args has not been published yet, skip this turn's recycle"
             )
             return False
 
@@ -122,9 +122,9 @@ class MmItemMemoryChunk:
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval):
+    def __init__(self, memory_size, recycle_interval, base_gpu_id):
         self.memory_pool = torch.empty(
-            memory_size, dtype=torch.int8, device="cuda"
+            memory_size, dtype=torch.int8, device=f"cuda:{base_gpu_id}"
         ).contiguous()
         storage = self.memory_pool.untyped_storage()
         self._pool_ipc_handle = storage._share_cuda_()
@@ -364,7 +364,7 @@ class CudaIpcTensorTransportProxy:
                 "recons_dtype": info_data.dtype,
             }
             state["tensor_data"] = None
-        except Exception as e:
+        except Exception:
             # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
             state["ipc_extra"] = None
             state["tensor_data"] = data

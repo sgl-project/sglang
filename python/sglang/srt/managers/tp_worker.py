@@ -71,6 +71,13 @@ class BaseTpWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # For a plain worker that's its own runner.
+        return self.model_runner
+
+    @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size
 
@@ -234,6 +241,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        context_length: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -254,6 +262,9 @@ class TpModelWorker(BaseTpWorker):
         self.moe_dp_rank = moe_dp_rank
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
+        # Draft worker: target's effective context length; the draft runs at
+        # absolute target positions. None keeps server_args.context_length.
+        self.context_length = context_length
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -266,7 +277,9 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if server_args.skip_tokenizer_init:
+        if server_args.skip_tokenizer_init or self.is_draft_worker:
+            # A draft worker's tokenizer would only duplicate the target's:
+            # tokenizer_path always points at the target model.
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
@@ -333,11 +346,19 @@ class TpModelWorker(BaseTpWorker):
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
-    def init_backends(self, disable_cuda_graph: bool = False):
-        """Initialize attention backends and capture cuda graphs."""
-        self.model_runner.init_backends(disable_cuda_graph=disable_cuda_graph)
+    def init_attention_backends(self):
+        """Initialize attention backends for all model runners."""
+        self.model_runner.init_attention_backends()
         for mr in self.model_runner_list[1:]:
-            mr.init_backends(disable_cuda_graph=disable_cuda_graph)
+            mr.init_attention_backends()
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Capture cuda graphs for all model runners."""
+        self.model_runner.init_cuda_graphs(
+            capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+        for mr in self.model_runner_list[1:]:
+            mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -355,6 +376,7 @@ class TpModelWorker(BaseTpWorker):
                 else self.server_args.speculative_draft_model_revision
             ),
             is_draft_model=self.is_draft_worker,
+            context_length=self.context_length,
         )
 
     def _init_model_runner(self):
@@ -453,14 +475,27 @@ class TpModelWorker(BaseTpWorker):
         return self.dllm_algorithm is not None
 
     def _forward_batch_generation_dllm(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
-        logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
-            self.model_runner, forward_batch
-        )
+        algo_states = None
+        if self.dllm_algorithm.fdfo and batch is not None:
+            algo_states = [req.dllm_algo_state for req in batch.reqs]
+
+        (
+            logits_output,
+            next_token_ids,
+            accept_length_per_req_cpu,
+            dllm_algo_state,
+            can_run_cuda_graph,
+        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
@@ -486,7 +521,7 @@ class TpModelWorker(BaseTpWorker):
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch)
+            return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
