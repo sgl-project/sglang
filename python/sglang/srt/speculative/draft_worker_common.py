@@ -77,13 +77,16 @@ def build_draft_tp_worker(
         )
     )
     # Post-resolution ServerArgs rejects bare assignment; route the draft-copy
-    # adjustments through the audited mutation point. The backend fields make
-    # the draft worker explicit and self-contained (no further overrides);
-    # context_length keeps the draft aligned with the target.
+    # adjustments through the audited mutation point. Keep the resolved value
+    # on speculative_draft_attention_backend: downstream draft-worker logic
+    # keys on that field (backend selection in _get_attention_backend and the
+    # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
+    # would silently skip those paths. context_length keeps the draft aligned
+    # with the target.
     draft_server_args.override(
         "draft_worker.build",
         skip_tokenizer_init=True,
-        speculative_draft_attention_backend=None,
+        speculative_draft_attention_backend=draft_backend,
         prefill_attention_backend=None,
         decode_attention_backend=None,
         attention_backend=draft_backend,
