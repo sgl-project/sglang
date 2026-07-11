@@ -77,6 +77,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
@@ -1278,7 +1279,18 @@ class VisionAttention(nn.Module):
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            # `apply_rotary_pos_emb` is torch.compile-decorated. Its first
+            # specialization may otherwise be compiled while a ViT CUDA graph
+            # is being captured, which makes Inductor attempt an illegal
+            # CPU-to-CUDA copy. The eager version is captured as part of the
+            # graph, so its pointwise work is still replayed without launch
+            # overhead.
+            rotary_fn = (
+                apply_rotary_pos_emb_native_eager
+                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                else apply_rotary_pos_emb
+            )
+            q, k = rotary_fn(q, k, cos, sin)
             q = q.view(original_q_shape)
             k = k.view(original_k_shape)
 
