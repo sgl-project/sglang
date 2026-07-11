@@ -184,6 +184,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    @staticmethod
+    def _get_post_warmup_hook(attn_backend):
+        return getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -988,11 +992,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                 )
-                post_warmup_hook = getattr(
-                    self.model_runner.attn_backend,
-                    "on_after_cuda_graph_warmup",
-                    None,
-                )
+                # PDMux captures one graph per Green Context stream with a
+                # dedicated decode backend. Reset the backend being captured;
+                # resetting the prefill backend leaves DSV4 decode metadata in
+                # its post-warmup state and makes later graph replay unsafe.
+                post_warmup_hook = self._get_post_warmup_hook(attn_backend)
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,

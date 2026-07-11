@@ -879,6 +879,19 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.pdmux_max_prefill_plan_tokens = (
+            model_runner.attn_backend.max_prefill_plan_tokens
+            if self.enable_pdmux
+            else None
+        )
+        if self.pdmux_max_prefill_plan_tokens is not None:
+            logger.info(
+                "PDMux prefill planner hard limit: %s tokens",
+                self.pdmux_max_prefill_plan_tokens,
+            )
+        # Keep accepted requests within any hard PDMux backend limit. PDMux
+        # cannot fall back to chunked prefill for an oversized first request.
+        self.max_req_input_len = self._get_max_req_input_len(self.max_req_input_len)
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2907,19 +2920,28 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        # DeepSeek V4 compressor plans encode ragged token ids as uint16. PDMux
+        # cannot use chunked prefill, so admission must keep the complete batch
+        # within that hard planner limit instead of treating max_prefill_tokens
+        # as a soft budget for the first request.
+        max_prefill_tokens, enforce_max_prefill_tokens = (
+            self._get_prefill_admission_config(self.max_prefill_tokens)
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            enforce_max_prefill_tokens=enforce_max_prefill_tokens,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),

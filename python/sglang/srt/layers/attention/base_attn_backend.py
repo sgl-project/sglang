@@ -38,6 +38,11 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    # Optional hard limit for the aggregate number of prefill tokens accepted
+    # by one backend plan. None means the backend has no stricter limit than
+    # the scheduler's normal soft max_prefill_tokens budget.
+    max_prefill_plan_tokens: Optional[int] = None
+
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None

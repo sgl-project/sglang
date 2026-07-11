@@ -30,14 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
-
     def init_pdmux(self: Scheduler):
         # The current split prefill batch
         self.split_prefill_batch: Optional[ScheduleBatch] = None
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
-        initialize_stream_groups(self.gpu_id, self.pdmux_config)
+        initialize_stream_groups(self.ps.gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
@@ -93,6 +92,79 @@ class SchedulerMultiplexMixin:
             self.split_prefill_batch = batch
             return True
         return False
+
+    def _get_split_forward_count(self: Scheduler) -> int:
+        remaining_layers = (
+            self.model_config.num_hidden_layers - self.split_prefill_batch.split_index
+        )
+
+        # Splitting only benefits decode work that can run between prefill
+        # intervals. Without decode work, finish prefill in one model call to
+        # avoid repeating the full scheduler/model-runner setup per layer.
+        if self.running_batch is None or self.running_batch.is_empty():
+            return remaining_layers
+
+        if self.split_prefill_batch.extend_num_tokens <= 0:
+            return remaining_layers
+
+        forward_count = max(
+            1,
+            self.pdmux_config.split_forward_token_budget
+            // self.split_prefill_batch.extend_num_tokens,
+        )
+        return min(forward_count, remaining_layers)
+
+    def _get_pdmux_prefill_token_limit(
+        self: Scheduler, max_prefill_tokens: int
+    ) -> Optional[int]:
+        hard_limit = self.pdmux_max_prefill_plan_tokens
+        if not (self.enable_pdmux and hard_limit is not None):
+            return None
+
+        # PrefillAdder accounts input tokens in page-aligned units. Align the
+        # backend's raw-token limit down so every accepted request can consume
+        # the admission budget instead of remaining in the waiting queue.
+        limit = min(max_prefill_tokens, hard_limit)
+        return limit - limit % self.page_size
+
+    def _get_prefill_admission_config(
+        self: Scheduler, max_prefill_tokens: int
+    ) -> tuple[int, bool]:
+        effective_limit = SchedulerMultiplexMixin._get_pdmux_prefill_token_limit(
+            self, max_prefill_tokens
+        )
+        if effective_limit is None:
+            return max_prefill_tokens, False
+        return effective_limit, True
+
+    def _get_max_req_input_len(self: Scheduler, max_req_input_len: int) -> int:
+        effective_limit = SchedulerMultiplexMixin._get_pdmux_prefill_token_limit(
+            self, self.max_prefill_tokens
+        )
+        if effective_limit is None:
+            return max_req_input_len
+        # Request validation rejects lengths >= max_req_input_len.
+        return min(max_req_input_len, effective_limit + 1)
+
+    def _merge_finished_prefill_batch(
+        self: Scheduler,
+        prefill_result,
+        prefill_stream,
+        decode_stream,
+    ) -> None:
+        self.process_batch_result(self.split_prefill_batch, prefill_result)
+        if self.running_batch and not self.running_batch.is_empty():
+            self.running_batch.merge_batch(self.split_prefill_batch)
+        else:
+            self.running_batch = self.split_prefill_batch
+
+        self.split_prefill_batch = None
+
+        # merge_batch enqueues tensor concatenations on the prefill stream.
+        # The next loop prepares decode before the stream-group synchronization,
+        # so publish an explicit dependency before decode indexes those tensors.
+        merge_done = prefill_stream.record_event()
+        decode_stream.wait_event(merge_done)
 
     @torch.inference_mode()
     def event_loop_pdmux(self: Scheduler):
@@ -159,15 +231,7 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = (
-                        max(
-                            1,
-                            self.pdmux_config.split_forward_token_budget
-                            // self.split_prefill_batch.extend_num_tokens,
-                        )
-                        if self.split_prefill_batch.extend_num_tokens > 0
-                        else self.model_config.num_hidden_layers
-                    )
+                    forward_count = self._get_split_forward_count()
                     next_split_index = min(
                         self.split_prefill_batch.split_index + forward_count,
                         self.model_config.num_hidden_layers,
@@ -206,15 +270,11 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    if flags.item() == self.tp_size:
-                        self.process_batch_result(
-                            self.split_prefill_batch, prefill_result
+                    if flags.item() == self.ps.tp_size:
+                        self._merge_finished_prefill_batch(
+                            prefill_result,
+                            prefill_stream,
+                            decode_stream,
                         )
-                        if self.running_batch and not self.running_batch.is_empty():
-                            self.running_batch.merge_batch(self.split_prefill_batch)
-                        else:
-                            self.running_batch = self.split_prefill_batch
-
-                        self.split_prefill_batch = None
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True

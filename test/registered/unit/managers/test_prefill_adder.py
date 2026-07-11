@@ -447,6 +447,41 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def test_ignore_eos_respects_prefill_budget_after_first_request(self):
+        self.mock_token_allocator.available_size.return_value = 1000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=100,
+        )
+
+        first = self.create_mock_req("first", priority=0, max_new_tokens=1)
+        first.sampling_params.ignore_eos = True
+        first.origin_input_ids = list(range(60))
+        first.full_untruncated_fill_ids = list(range(60))
+        first.extend_range = Range(0, 60)
+        second = self.create_mock_req("second", priority=0, max_new_tokens=1)
+        second.sampling_params.ignore_eos = True
+        second.origin_input_ids = list(range(60))
+        second.full_untruncated_fill_ids = list(range(60))
+
+        self.assertEqual(adder.add_one_req_ignore_eos(first), AddReqResult.CONTINUE)
+        self.assertEqual(adder.add_one_req_ignore_eos(second), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [first])
+
+    def test_strict_prefill_budget_rejects_oversized_first_request(self):
+        self.mock_token_allocator.available_size.return_value = 1000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=100,
+            enforce_max_prefill_tokens=True,
+        )
+        req = self.create_mock_req("oversized", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        req.full_untruncated_fill_ids = list(range(101))
+
+        self.assertEqual(adder.add_one_req_ignore_eos(req), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [])
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

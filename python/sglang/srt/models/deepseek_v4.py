@@ -2306,6 +2306,109 @@ class DeepseekV4Model(nn.Module):
 
         return hidden_states, pre_hc_head
 
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        start, end = split_interval
+
+        if start == 0:
+            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+
+            if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+                input_ids_global = torch.empty(
+                    (get_global_dp_buffer_len(), 1),
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+                dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+                input_ids_global = input_ids_global.squeeze(-1)
+            else:
+                input_ids_global = input_ids
+
+            if dsa_use_prefill_cp(forward_batch):
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
+                input_ids = cp_round_robin_input_ids(input_ids)
+                input_ids_global = input_ids
+
+            for attr in ("freqs_cis_c4", "freqs_cis_c128"):
+                if hasattr(forward_batch, attr):
+                    delattr(forward_batch, attr)
+
+            # Cross-layer mHC fusion defers hc_post until the next layer, so the
+            # pending tensors must survive scheduler yields between split calls.
+            forward_batch.hidden_states = hidden_states
+            forward_batch.model_specific_states = {
+                "positions": positions,
+                "input_ids": input_ids,
+                "input_ids_global": input_ids_global,
+                "prev_residual": None,
+                "prev_post": None,
+                "prev_comb": None,
+            }
+
+        states = forward_batch.model_specific_states
+        hidden_states = forward_batch.hidden_states
+        prev_residual = states["prev_residual"]
+        prev_post = states["prev_post"]
+        prev_comb = states["prev_comb"]
+        last_layer = None
+
+        for i in range(start, end):
+            layer = self.layers[i]
+            last_layer = layer
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                hidden_states, prev_residual, prev_post, prev_comb = layer(
+                    positions=states["positions"],
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=states["input_ids"],
+                    input_ids_global=states["input_ids_global"],
+                    prev_residual=prev_residual,
+                    prev_post=prev_post,
+                    prev_comb=prev_comb,
+                )
+
+        forward_batch.hidden_states = hidden_states
+        states["prev_residual"] = prev_residual
+        states["prev_post"] = prev_post
+        states["prev_comb"] = prev_comb
+
+        if end != self.end_layer:
+            return None
+
+        if self.use_fused_mhc_post_pre and last_layer is not None:
+            hidden_states = last_layer.hc_post(
+                hidden_states, prev_residual, prev_post, prev_comb
+            )
+
+        if dsa_use_prefill_cp(forward_batch):
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states,
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
+        pre_hc_head = hidden_states.flatten(1)
+        hidden_states = self.hc_head(
+            hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+        )
+        hidden_states = self.norm(hidden_states)
+        forward_batch.hidden_states = hidden_states
+        return hidden_states, pre_hc_head
+
 
 class DeepseekV4ForCausalLM(nn.Module):
     def __init__(
@@ -2421,14 +2524,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    def _prepare_dsa_prefill_cp(self, input_ids, forward_batch):
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
@@ -2448,6 +2544,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        self._prepare_dsa_prefill_cp(input_ids, forward_batch)
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
@@ -2470,6 +2577,40 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states_before_norm=(
                 None if aux_hidden_states is not None else pre_hc_head
             ),
+        )
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        start, _ = split_interval
+        if start == 0:
+            self._prepare_dsa_prefill_cp(input_ids, forward_batch)
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model.forward_split_prefill(
+                input_ids,
+                positions,
+                forward_batch,
+                split_interval,
+                input_embeds,
+            )
+
+        if hidden_states is None:
+            return None
+
+        hidden_states, pre_hc_head = hidden_states
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            hidden_states_before_norm=pre_hc_head,
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

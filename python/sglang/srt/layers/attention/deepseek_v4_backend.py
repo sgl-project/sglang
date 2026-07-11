@@ -482,6 +482,9 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    # Compressor plans encode ragged token ids as uint16.
+    max_prefill_plan_tokens = (1 << 16) - 1
+
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
