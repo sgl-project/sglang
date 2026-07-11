@@ -1885,6 +1885,61 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _pad_nvfp4_gated_moe_weights_for_swizzle(
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    *,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad each logical w13 half and the matching w2 input channels.
+
+    ``swizzle_blockscale`` aligns the fused w13 row dimension to 128. Gated
+    activations split those rows into two equal projections, so each half must
+    be aligned to 64 before swizzling to keep the gate/up boundary intact.
+    """
+    total_rows = w13_weight.shape[1]
+    if total_rows % 2 != 0:
+        raise ValueError(f"Expected an even gated w13 row count, got {total_rows}.")
+    if w13_weight_scale.shape[1] != total_rows:
+        raise ValueError(
+            "w13 weight and block-scale rows must match before NVFP4 padding, "
+            f"got {total_rows} and {w13_weight_scale.shape[1]}."
+        )
+
+    intermediate_size = total_rows // 2
+    if w2_weight.shape[-1] * 2 != intermediate_size:
+        raise ValueError(
+            "w2 packed-weight width does not match the w13 intermediate size: "
+            f"{w2_weight.shape[-1]} * 2 != {intermediate_size}."
+        )
+    if w2_weight_scale.shape[-1] * group_size != intermediate_size:
+        raise ValueError(
+            "w2 block-scale width does not match the w13 intermediate size: "
+            f"{w2_weight_scale.shape[-1]} * {group_size} != {intermediate_size}."
+        )
+
+    padded_intermediate_size = round_up(intermediate_size, 64)
+    pad_size = padded_intermediate_size - intermediate_size
+    if pad_size == 0:
+        return w13_weight, w13_weight_scale, w2_weight, w2_weight_scale
+
+    def _pad_w13_halves(tensor: torch.Tensor) -> torch.Tensor:
+        halves = tensor.split(intermediate_size, dim=1)
+        return torch.cat(
+            [torch.nn.functional.pad(half, (0, 0, 0, pad_size)) for half in halves],
+            dim=1,
+        )
+
+    return (
+        _pad_w13_halves(w13_weight),
+        _pad_w13_halves(w13_weight_scale),
+        torch.nn.functional.pad(w2_weight, (0, pad_size // 2)),
+        torch.nn.functional.pad(w2_weight_scale, (0, pad_size // group_size)),
+    )
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2245,6 +2300,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+
+        if layer.moe_runner_config.is_gated and not self.enable_flashinfer_trtllm_moe:
+            padded_weights = _pad_nvfp4_gated_moe_weights_for_swizzle(
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                group_size=self.quant_config.group_size,
+            )
+            for name, padded_weight in zip(
+                (
+                    "w13_weight",
+                    "w13_weight_scale",
+                    "w2_weight",
+                    "w2_weight_scale",
+                ),
+                padded_weights,
+            ):
+                if padded_weight is not getattr(layer, name):
+                    copy_or_rebind_param(layer, name, padded_weight)
+
         block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
@@ -2327,11 +2403,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_weight = layer.w13_weight
             intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
             if intermediate_size_pad:
-                # padding gated activations will require to split w1 and w3
-                # and pad them individually
                 assert not layer.moe_runner_config.is_gated, (
-                    "The intermediate size required padding, "
-                    "but padding is also implemented for gated activations"
+                    "Unexpected NVFP4 gated MoE padding remained after aligning "
+                    "the gate and up projections independently."
                 )
 
                 copy_or_rebind_param(
