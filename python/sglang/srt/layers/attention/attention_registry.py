@@ -258,6 +258,19 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         runner.hybrid_gdn_config is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
+    from sglang.srt.configs.model_config import is_minimax_sparse
+
+    if is_minimax_sparse(runner.model_config.hf_config):
+        from sglang.srt.layers.attention.minimax_sparse_backend import (
+            MiniMaxHybridAttnBackend,
+            MiniMaxSparseAttnBackend,
+        )
+
+        sparse_backend = MiniMaxSparseAttnBackend(runner)
+        return MiniMaxHybridAttnBackend(
+            full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
+        )
+
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
@@ -278,7 +291,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 HybridLinearAttnBackend,
                 Mamba2AttnBackend,
             )
-            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                GDNAttnBackend,
+                maybe_set_default_flashinfer_gdn_prefill,
+            )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -291,6 +307,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
+        if runner.hybrid_gdn_config is not None and not is_npu():
+            maybe_set_default_flashinfer_gdn_prefill(runner)
         initialize_linear_attn_config(runner.server_args)
         hybrid_backend_cls = HybridLinearAttnBackend
         if runner.hybrid_gdn_config is not None:
