@@ -116,8 +116,18 @@ struct DTypeTrait<fp16x2_t> {
   SGL_REGISTER_FROM_DEFAULT();
   SGL_REGISTER_FROM_FUNCTION(fp32x2_t, __float22half2_rn);
   SGL_REGISTER_UNARY_FUNCTION(abs, __habs2);
+#ifndef USE_ROCM
   SGL_REGISTER_BINARY_FUNCTION(max, __hmax2);
   SGL_REGISTER_BINARY_FUNCTION(min, __hmin2);
+#else
+  // HIP only provides __hmax2/__hmin2 for __hip_bfloat162, not __half2.
+  SGL_DEVICE static self_t max(const self_t& x, const self_t& y) {
+    return self_t{__hmax(x.x, y.x), __hmax(x.y, y.y)};
+  }
+  SGL_DEVICE static self_t min(const self_t& x, const self_t& y) {
+    return self_t{__hmin(x.x, y.x), __hmin(x.y, y.y)};
+  }
+#endif
 };
 
 template <>
@@ -125,7 +135,12 @@ struct DTypeTrait<bf16_t> {
   SGL_REGISTER_PACKED(bf16_t, bf16x2_t);
   SGL_REGISTER_UNPACK(bf16_t, 1);
   SGL_REGISTER_FROM_DEFAULT();
+#ifndef USE_ROCM
   SGL_REGISTER_FROM_FUNCTION(fp32_t, __float2bfloat16_rn);
+#else
+  // HIP has no _rn-suffixed variant; __float2bfloat16 rounds to nearest.
+  SGL_REGISTER_FROM_FUNCTION(fp32_t, __float2bfloat16);
+#endif
   SGL_REGISTER_UNARY_FUNCTION(abs, __habs);
   SGL_REGISTER_BINARY_FUNCTION(max, __hmax);
   SGL_REGISTER_BINARY_FUNCTION(min, __hmin);
