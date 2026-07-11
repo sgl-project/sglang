@@ -16,9 +16,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_confidence import (
-    compute_confidence,
-)
 from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     DSparkScheduleConfig,
@@ -43,7 +40,10 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     round_up_grid,
 )
-from sglang.srt.utils.async_probe import maybe_assert_async
+from sglang.srt.utils.async_probe import (
+    maybe_assert_async,
+    maybe_detect_in_closed_range,
+)
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
@@ -823,3 +823,41 @@ def apply_logits_adjustments_strided(
         sampling_info=sampling_info,
         draft_token_num=verify_num_draft_tokens,
     )
+
+
+def build_markov_embed_stack(
+    *,
+    anchor_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    markov_head,
+    gamma: int,
+) -> torch.Tensor:
+    prev_seq = torch.cat(
+        [anchor_tokens.view(-1, 1), draft_tokens[:, : gamma - 1]], dim=1
+    )
+    return markov_head.get_prev_embeddings(prev_seq)
+
+
+def compute_confidence(
+    *,
+    draft_hidden: torch.Tensor,
+    anchor_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    confidence_head,
+    markov_head,
+    gamma: int,
+) -> torch.Tensor:
+    assert confidence_head is not None
+    if confidence_head.with_markov:
+        markov_embed_stack = build_markov_embed_stack(
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=markov_head,
+            gamma=gamma,
+        )
+    else:
+        markov_embed_stack = None
+    confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
+    confidence = confidence_head.apply_sts(confidence_raw)
+    maybe_detect_in_closed_range(confidence, 0.0, 1.0, "DSpark confidence")
+    return confidence
