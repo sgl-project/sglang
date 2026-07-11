@@ -39,10 +39,10 @@ Then run the **Python** output of the command panel below in that environment. T
 docker pull lmsysorg/sglang:dev-cu13-minimax-m3
 ```
 
-The command panel below fills in the right tag per platform: `dev-cu13-minimax-m3` (CUDA 13 — B300, GB200, GB300), `dev-cu12-minimax-m3` (CUDA 12 — Hopper H200), or `dev-minimax-m3` (default). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `…-rocm700-mi30x`, MI350X/MI355X → `…-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
+The command panel below fills in the right tag per platform: `dev-cu13-minimax-m3` (CUDA 13 — B300, GB200, GB300), `dev-cu12-minimax-m3` (CUDA 12 — Hopper H200), or `dev-minimax-m3` (default). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
 
 <Note>
-These images do not yet bundle MiniMax's MSA sparse-attention kernel (bundling it by default is in progress). Blackwell users who want the recommended fast path install MSA manually after pulling — see **§2.1**. Without it, the same recipe still serves on the built-in Triton sparse path.
+These M3 dev images now **bundle MiniMax's MSA sparse-attention kernel** (`fmha_sm100`), so Blackwell users get the recommended fast path automatically — no manual install needed (see **§2.1**). On a custom image without it, the same recipe still serves on the built-in Triton sparse path.
 </Note>
 
 </Tab>
@@ -79,7 +79,7 @@ Key characteristics as served by SGLang:
 - **Sparse attention**: most layers use M3's "lightning indexer" block-sparse attention (top-k 128-token blocks), which keeps decode cost roughly flat in context length. On Blackwell, MiniMax's open-source [MSA kernel](https://github.com/MiniMax-AI/MSA) accelerates this path further (§2.1).
 - **MXFP8 quantization across vendors**: the MXFP8 MoE weights run natively on NVIDIA Blackwell (B200 / B300 / GB200 / GB300) and on AMD Instinct MI350X/MI355X (gfx950 / CDNA4), both of which have hardware MX-scaled matmul. On AMD MI300X/MI325X (gfx942 / CDNA3) — no hardware MX — SGLang converts the weights to block-fp8 `[128,128]` at load and serves them on the tuned ROCm kernels (§2.3). The vision tower stays unquantized.
 
-**Recommended generation** (from the model card): `temperature` 1.0, `top_p` 0.95, `top_k` 40 — SGLang applies these automatically from the model's `generation_config.json`.
+**Recommended generation**: the model's `generation_config.json` sets `temperature` 1.0 / `top_p` 0.95, which SGLang applies automatically (the default `--sampling-defaults model`). The model card additionally suggests `top_k` 40, but that value is **not** in `generation_config.json`, so SGLang does not apply it by default. `top_k` is a per-request sampling parameter (not a launch flag) — set it per call if you want it, e.g. `extra_body={"top_k": 40}` with the OpenAI client.
 
 **Resources:** [HuggingFace](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) · [MSA kernel](https://github.com/MiniMax-AI/MSA)
 
@@ -87,7 +87,7 @@ Key characteristics as served by SGLang:
 
 ### 2.1 MSA sparse-attention fast path (recommended for Blackwell users)
 
-[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. It is purely additive — install it and the recipe above engages it automatically; without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
+[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. **It ships pre-installed in the M3 dev image** (`lmsysorg/sglang:dev-minimax-m3`, also published under the `dev-cu13-minimax-m3` tag), so the Blackwell recipe above engages it automatically with no extra setup — `import fmha_sm100` works out of the box and the kernels JIT-compile on first use. It is otherwise purely additive: on a custom image, install it (below) and the recipe engages it automatically; without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
 
 **Requirements** (from the [MSA README](https://github.com/MiniMax-AI/MSA#requirements)):
 
@@ -95,10 +95,12 @@ Key characteristics as served by SGLang:
 - **Toolchain**: CUDA Toolkit with `nvcc` ≥ 12.x on `PATH` (or `CUDA_HOME` set) — the kernels are JIT-compiled at first import.
 - **Python**: ≥ 3.10; **OS**: Linux — works on both **x86_64 and aarch64 (Grace, e.g. GB200 / GB300)**; the aarch64 build needs no source edits.
 
-<Accordion title="Install MSA & verify the gate (Python)">
+<Accordion title="Install MSA (only on a custom image) & verify the gate (Python)">
+
+The M3 Blackwell dev images above already bundle MSA, so you can skip straight to the gate check. The `git clone` / `pip install` steps are only needed on a custom image that doesn't have `fmha_sm100`.
 
 ```bash Command
-# --recursive pulls the CUTLASS submodule required for JIT compilation
+# Only on a custom image: --recursive pulls the CUTLASS submodule required for JIT compilation
 git clone --recursive https://github.com/MiniMax-AI/MSA.git msa
 cd msa && pip install .
 # Verify the SGLang gate (True -> MSA engaged on this device; False -> Triton fallback):
@@ -115,19 +117,19 @@ The first import JIT-compiles the kernels, which can take 30 s to a few minutes 
 **Warm the JIT cache before a multi-GPU launch.** On a *cold* cache, several tensor-parallel ranks racing to JIT-compile MSA's plan kernel can leave one rank loading a half-linked module (`AttributeError: Module has no function 'plan'` at CUDA-graph capture). Run the gate-check `python -c "..."` (or any single-process `fmha_sm100_plan` call) once before launching the server — that compiles the kernel single-process, and every rank then hits the warm cache.
 </Warning>
 
-The gate requires `--attention-backend fa4 --page-size 128` (already part of the Blackwell recipe above; on current `main` these are also the auto-selected M3 defaults on SM100 GPUs). Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
+The gate requires `--attention-backend fa4` (MSA's sparse blocks are 128 tokens, so the page size must be 128). SGLang auto-forces `page_size` to 128 for the `fa4` backend — including the combined `--attention-backend fa4` the M3 recipe uses (#28976) — so `--page-size 128` is omitted from the Blackwell cells below. Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
 
 <Note>
-For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4 --page-size 128` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
+For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
 </Note>
 
 ### 2.2 Memory and workload tuning
 
-The NVIDIA Blackwell recipe is the validated single-node **4-GPU (`--tp 4`)** config, which is also the GB200 / GB300 single-node ceiling. It runs identically on B200 (sm_100), B300 (sm_103), and GB300 (sm_103, aarch64); GB200 (sm_100, aarch64) is inferred-supported — both of its axes are validated above — but not directly benchmarked. The AMD recipes use **8-GPU (`--tp 8`)**.
+The NVIDIA Blackwell recipes are validated single-node: **B200 at `--tp 8`** and **B300 / GB300 at `--tp 4`** (4-GPU is also the GB200 / GB300 single-node ceiling). GB200 (sm_100, aarch64) is inferred-supported — both of its axes are validated above (B200 is sm_100; GB300 is sm_103 aarch64) — but not directly benchmarked. The AMD recipes use **8-GPU (`--tp 8`)**.
 
-- **Memory**: `--mem-fraction-static` trades KV-pool capacity against prefill **activation headroom** — `0.75` is the safe default on NVIDIA (`0.80` on AMD). A higher value is fine at low concurrency but OOMs under high concurrency or long context, so raise it only for interactive single-stream serving.
+- **Memory**: `--mem-fraction-static` reserves GPU memory for weights + KV pool; the rest is prefill **activation headroom**. The value scales with *free* memory per GPU (card capacity minus per-GPU weight), so it tracks the card more than the TP degree: **`0.65` on B200** (180 GB — less headroom once weights are resident) and **`0.75` on the larger-memory B300 / GB300** (`0.80` on AMD). Lower TP packs more weight per GPU, so a tighter config needs a *lower* value — B200 needs `0.65` even at `--tp 4`. Raising it past the validated value is fine only for low-concurrency single-stream serving; it OOMs under high concurrency or long context.
 - **Long context (32K+)**: keep `--mem-fraction-static` at the platform default and raise `--chunked-prefill-size` to `16384`. Decode TPOT stays roughly flat in context length thanks to sparse attention; 1K–128K prompts are validated.
-- **8-GPU nodes**: B200 / B300 hosts with 8 GPUs can use `--tp 8` for more throughput / KV headroom; tp4 is documented as the NVIDIA cross-family common denominator.
+- **Scaling TP**: B200 is documented at `--tp 8`; B300 / GB200 / GB300 at `--tp 4` (the single-node cross-family common denominator). On an 8-GPU B300 host you can also raise to `--tp 8` for more throughput / KV headroom.
 - **Expert parallelism**: to trade latency for throughput add `--ep` (see [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism)). On AMD, set `--ep` equal to `--tp`. Shared-experts fusion is automatically disabled when EP > 1; on AMD standard EP the server also disables `--enable-aiter-allreduce-fusion` automatically to preserve accuracy.
 - `--trust-remote-code` is required to load the MiniMax config / processor classes.
 
@@ -151,6 +153,8 @@ The MXFP8 kernels are Blackwell-only, so Hopper (H200) serves the full-precision
 - **MoE runner**: Triton, auto-selected for bf16 weights.
 - **Attention**: FlashAttention-3 with page size 1. MSA (§2.1) is a Blackwell kernel, so M3's sparse step runs on the built-in Triton path here.
 - **CUDA graph**: on, with full decode-graph capture.
+
+**High-concurrency throughput (optional).** On Hopper the sparse prefill runs on the Triton path as a separate eager forward, which briefly stalls the in-flight decode batch under heavy concurrent load. Adding `--enable-mixed-chunk --chunked-prefill-size 2048` merges the running decodes into the prefill step instead of preempting them, which recovers roughly **+10% output throughput** and **~10% lower median TPOT** at high concurrency on 8×H200, with no change in accuracy. Leave it off for latency-sensitive low-concurrency serving.
 
 Validated on 8×H200 — reasoning and tool-call auto-detection plus long-context generation. For prefill/decode disaggregation on Hopper, see §3.4.
 

@@ -38,7 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -195,7 +195,7 @@ class LlamaModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
                 last_indices = (
@@ -258,7 +258,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         # Cache draft SWA size from server args once; consumed both by the post-init
         # attention patch below and by `get_attention_sliding_window_size` later.
         self._draft_window_size: Optional[int] = (
-            get_global_server_args().speculative_draft_window_size
+            get_server_args().speculative_draft_window_size
         )
 
         self.model = LlamaModel(

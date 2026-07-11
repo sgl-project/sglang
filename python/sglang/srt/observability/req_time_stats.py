@@ -26,6 +26,7 @@ from typing_extensions import Self
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
+    EncoderMetricsCollector,
     SchedulerMetricsCollector,
     TokenizerMetricsCollector,
 )
@@ -210,11 +211,6 @@ class RequestStage:
         level=2,
     )
 
-    SPEC_DRAFT_EXTEND = RequestStageConfig(
-        "spec_draft_extend",
-        level=3,
-    )
-
     # CPU-side run batch
     RUN_BATCH_CPU = RequestStageConfig(
         "run_batch_cpu",
@@ -229,7 +225,11 @@ class RequestStage:
 class ReqTimeStatsBase:
     enable_metrics: bool = False
     metrics_collector: Optional[
-        Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ]
     ] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
         default_factory=TraceNullContext
@@ -263,7 +263,12 @@ class ReqTimeStatsBase:
             return "unknown"
 
     def set_metrics_collector(
-        self, collector: Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        self,
+        collector: Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ],
     ):
         if collector:
             self.enable_metrics = True
@@ -613,7 +618,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # speculative decoding
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
-    spec_draft_extend_start_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -678,17 +682,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     "accepted_tokens": num_correct_drafts,
                 },
             )
-
-    def set_spec_draft_extend_start_time(self, ts=None):
-        ts = ts or time.perf_counter()
-        self.spec_draft_extend_start_time = ts
-
-    def set_spec_draft_extend_end_time(self, ts=None):
-        ts = ts or time.perf_counter()
-
-        if self.trace_ctx.tracing_enable:
-            stage = RequestStage.SPEC_DRAFT_EXTEND
-            self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
 
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
@@ -1189,6 +1182,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 class EncoderReqTimeStats(ReqTimeStatsBase):
     mm_encode_start_time: float = 0.0
     mm_encode_end_time: float = 0.0
+    modality: str = "image"
 
     def set_mm_encode_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1210,6 +1204,10 @@ class EncoderReqTimeStats(ReqTimeStatsBase):
                 RequestStage.MM_ENCODE.level,
                 convert_time_to_realtime_ns(ts),
                 thread_finish_flag=True,
+            )
+        if self.enable_metrics:
+            self.metrics_collector.observe_request_e2e_latency(
+                ts - self.mm_encode_start_time, modality=self.modality
             )
 
 

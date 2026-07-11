@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """BreakableCudaGraphBackend — segment-captured graphs with eager break
 markers (eager_on_graph decorators on attention / mamba layers).
 No torch.compile.
@@ -14,9 +27,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
+    DedupedCudaGraphMixin,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
@@ -24,7 +39,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -32,9 +50,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-class BreakableCudaGraphBackend(BaseCudaGraphBackend):
+class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """
@@ -46,8 +65,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
-        if is_hip():
-            raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
+        self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -71,15 +89,19 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
+            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
                 yield
         finally:
-            self._capture_stream = None
+            try:
+                self.end_cuda_graph_capture()
+            finally:
+                self._capture_stream = None
 
     def capture_one(
         self,
@@ -191,6 +213,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self.close()
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None

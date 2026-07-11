@@ -18,10 +18,7 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
+from sglang.srt.runtime_context import get_server_args
 
 
 @dataclass
@@ -37,7 +34,7 @@ class ExpertLocationDispatchInfo:
 
     @classmethod
     def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
+        ep_dispatch_algorithm = get_server_args().ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
@@ -77,7 +74,9 @@ def transform_select_experts_inputs(
 
 
 def topk_ids_logical_to_physical(
-    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    log2phy_prob: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
@@ -86,6 +85,13 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "lp":
+        if log2phy_prob is None:
+            raise RuntimeError(
+                "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
+                f"time (topk_ids.shape={tuple(topk_ids.shape)})."
+            )
+        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -93,7 +99,7 @@ def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     physical_topk_ids = info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
-    if _is_hip:
+    if physical_topk_ids.dtype != topk_ids.dtype:
         physical_topk_ids = physical_topk_ids.to(topk_ids.dtype)
     return physical_topk_ids
 
@@ -102,6 +108,7 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     topk_ids_original_shape = topk_ids.shape
+    original_dtype = topk_ids.dtype
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
 
@@ -110,8 +117,29 @@ def _topk_ids_logical_to_physical_dynamic(
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
-    if _is_hip:
-        topk_ids = topk_ids.to(topk_ids.dtype)
+    if topk_ids.dtype != original_dtype:
+        topk_ids = topk_ids.to(original_dtype)
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
+
+
+def _topk_ids_logical_to_physical_probability(
+    topk_ids: torch.Tensor,
+    info: ExpertLocationDispatchInfo,
+    log2phy_prob: torch.Tensor,
+) -> torch.Tensor:
+    """Select physical experts via the JIT-compiled CUDA dispatch kernel.
+
+    Raises if ``topk_ids`` isn't on CUDA — the LP path requires the fused
+    kernel and there is no torch reference fallback at runtime.
+    """
+    if not topk_ids.is_cuda:
+        raise RuntimeError(
+            "LP dispatch requires CUDA tensors; got topk_ids on " f"{topk_ids.device}."
+        )
+    from sglang.jit_kernel.lplb import cuda_solver
+
+    return cuda_solver.dispatch_probability(
+        topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+    )

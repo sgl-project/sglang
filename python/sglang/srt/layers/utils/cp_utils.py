@@ -10,15 +10,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
-    get_attention_cp_group,
-    get_attention_cp_rank,
-    get_attention_cp_size,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 
 @dataclass
@@ -61,13 +58,13 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    return get_global_server_args().enable_prefill_context_parallel
+    return get_server_args().enable_prefill_context_parallel
 
 
 def is_prefill_cp_in_seq_split():
     return (
         is_prefill_context_parallel_enabled()
-        and get_global_server_args().prefill_cp_mode == "in-seq-split"
+        and get_server_args().prefill_cp_mode == "in-seq-split"
     )
 
 
@@ -80,15 +77,15 @@ def get_cp_padding_align_size() -> int:
     """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_parallel().attn_cp_size
     if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
         return attn_cp_size * 2
     return attn_cp_size
 
 
 def is_mla_prefill_cp_enabled() -> bool:
-    sa = get_global_server_args()
-    return sa.enable_prefill_context_parallel and sa.use_mla_backend
+    sa = get_server_args()
+    return sa.enable_prefill_context_parallel and sa.use_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
@@ -150,7 +147,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
+        cp_size = get_parallel().attn_cp_size
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
@@ -172,7 +169,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
+        cp_size = get_parallel().attn_cp_size
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
@@ -204,8 +201,8 @@ def cp_round_robin_input_ids(input_ids):
     rank2: 2,10,18,...
     ...
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
     if get_moe_a2a_backend().is_none():
         input_ids = input_ids.reshape(-1, cp_size).T.flatten()
     else:
@@ -228,7 +225,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
         )
     with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
     ):
         input_tensor_full = torch.empty(
             max_len * cp_size,
@@ -237,7 +234,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             dtype=input_tensor.dtype,
         )
 
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
+    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
     )
 
@@ -277,7 +274,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
 
     # Create output tensor with proper shape for all dimensions
     with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
     ):
         input_tensor_full = torch.empty(
             max_len * cp_size,
@@ -286,7 +283,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
             dtype=input_tensor.dtype,
         )
 
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
+    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
     )
 
@@ -341,7 +338,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
     if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
-            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),

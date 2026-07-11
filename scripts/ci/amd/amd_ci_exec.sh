@@ -13,7 +13,7 @@ else
   echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
-WORKDIR="/sglang-checkout/test/srt"
+WORKDIR="/sglang-checkout/test"
 declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1

@@ -4,7 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
+from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.ops.activation.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -528,3 +529,174 @@ def silu_and_mul_triton(
         return out_hidden_states, out_scales
     else:
         return out_hidden_states, None
+
+
+@triton.jit
+def _fused_sigmoid_mul_kernel(
+    output_ptr,
+    attn_output_ptr,
+    gate_ptr,
+    gate_stride_row,
+    gate_stride_head,
+    hidden_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fuse sigmoid(gate) * attn_output into a single kernel."""
+    pid_row = tl.program_id(0).to(tl.int64)
+    pid_block = tl.program_id(1)
+
+    offsets = pid_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offsets < hidden_dim
+    head = offsets // HEAD_DIM
+    d = offsets - head * HEAD_DIM
+
+    attn_off = pid_row * hidden_dim + offsets
+    attn = tl.load(attn_output_ptr + attn_off, mask=mask, other=0.0).to(tl.float32)
+
+    gate_off = pid_row * gate_stride_row + head * gate_stride_head + d
+    g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
+
+    result = attn * tl.sigmoid(g)
+    tl.store(output_ptr + attn_off, result, mask=mask)
+
+
+def fused_sigmoid_mul(
+    attn_output: torch.Tensor,
+    gate: torch.Tensor,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """
+    Fused sigmoid-mul for attention output gating.
+
+    Equivalent to: attn_output * sigmoid(gate)
+
+    The production Qwen3.5 path passes a 3D strided gate. A single hidden-block
+    Triton kernel handles both that path and flat contiguous inputs.
+
+    When inplace=True, writes result back to attn_output and returns it.
+
+    Supports strided gate: if gate is 3D (num_tokens, num_heads, head_dim)
+    and attn_output is 2D (num_tokens, hidden_dim), the kernel reads gate
+    via explicit strides without requiring a contiguous copy.
+    """
+    if gate.ndim == 3 and attn_output.ndim == 2:
+        # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
+        num_tokens, num_heads, head_dim = gate.shape
+        hidden_dim = num_heads * head_dim
+        assert attn_output.shape == (num_tokens, hidden_dim)
+        gate_stride_row = gate.stride(0)
+        gate_stride_head = gate.stride(1)
+    else:
+        # Flat path: both tensors have the same shape
+        assert (
+            attn_output.shape == gate.shape
+        ), "attn_output and gate must have the same shape"
+        hidden_dim = attn_output.shape[-1]
+        num_tokens = attn_output.numel() // hidden_dim
+        head_dim = hidden_dim
+        gate_stride_row = hidden_dim
+        gate_stride_head = hidden_dim
+
+    out = attn_output if inplace else torch.empty_like(attn_output)
+    block_h = 1024 if num_tokens < 1024 else 2048
+    grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
+    _fused_sigmoid_mul_kernel[grid](
+        out,
+        attn_output,
+        gate,
+        gate_stride_row,
+        gate_stride_head,
+        hidden_dim,
+        HEAD_DIM=head_dim,
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _fused_gate_sigmoid_mul_add_kernel(
+    hidden_states_ptr,  # [num_tokens, hidden_dim]
+    gate_weight_ptr,  # [hidden_dim]
+    shared_output_ptr,  # [num_tokens, hidden_dim]
+    final_hidden_states_ptr,  # [num_tokens, hidden_dim]
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    row_offset = pid * hidden_dim
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+
+    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    f = tl.load(
+        final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
+    result = f + gate_val * s
+
+    tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
+
+
+def fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> None:
+    """
+    Fused gate-sigmoid-mul-add for MoE shared expert gating.
+
+    Equivalent to:
+        gate = hidden_states @ gate_weight
+        final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output
+    """
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
+    assert shared_output.is_contiguous(), "shared_output must be contiguous"
+    assert final_hidden_states.is_contiguous(), "final_hidden_states must be contiguous"
+
+    num_tokens, hidden_dim = hidden_states.shape
+    assert gate_weight.shape == (hidden_dim,)
+    assert shared_output.shape == (num_tokens, hidden_dim)
+    assert final_hidden_states.shape == (num_tokens, hidden_dim)
+
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+        ),
+    }
+
+    if num_tokens >= 1024:
+        config["num_warps"] = min(config["num_warps"], 8)
+
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
+    _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
+        hidden_states,
+        gate_weight,
+        shared_output,
+        final_hidden_states,
+        hidden_dim=hidden_dim,
+        **config,
+        **pdl_kwargs,
+    )

@@ -3,53 +3,64 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_target_cache_loc as get_target_cache_loc,
+)
+from sglang.kernels.ops.speculative.eagle import (
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    next_power_of_2,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
-)
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -67,13 +78,51 @@ elif _is_hip:
 else:
     from sglang.srt.utils.common import fast_topk
 
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu
+
 
 logger = logging.getLogger(__name__)
+
+
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    sample_p = probs.gather(1, sample_index)
+    return sample_p, sample_index
+
+
+def renorm_draft_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    use_rejection_sampling: bool,
+) -> torch.Tensor:
+    """Draft-side next-token distribution.
+
+    Plain softmax, except under rejection sampling where logits are
+    temperature-scaled so the draft proposal q tracks the target sampling
+    temperature (higher acceptance; correctness holds for any q).
+    """
+    if not use_rejection_sampling or not next_token_logits.size(0):
+        return torch.softmax(next_token_logits, dim=-1)
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+
+def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+
+    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
+    only if q is exactly the distribution X was drawn from, so callers must hand
+    the returned q (not a recomputed one) to the verify.
+    """
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    return probs, topk_p, topk_index
 
 
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -120,7 +169,7 @@ def record_stream_each(tensors, stream):
 def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
 
-    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    Spec V2 mutates SB mid-forward (`prepare_for_verify` rebinds
     `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
     replaces `batch.input_ids` again). Each rebind drops the only SB Python
     ref to the old tensor while the verify forward kernel may still be
@@ -155,7 +204,7 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
@@ -165,7 +214,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     return not server_args.enable_multi_layer_eagle
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -199,7 +248,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
@@ -293,11 +342,16 @@ def generate_simulated_accept_index(
     accept_index,
     predict,
     num_correct_drafts,
+    candidates,
+    target_predict,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+
     assert simulate_acc_len > 0.0
     simulate_acc_len = _sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
@@ -305,13 +359,27 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
+    if simulate_acc_len > 1:
+        draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
+        predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
+            dtype=predict.dtype
+        )
+    bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
+    predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
+        dtype=predict.dtype
+    )
     return sim_accept_index
 
 
@@ -477,9 +545,7 @@ def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
     """
-    if torch.autograd._profiler_enabled():
-        return torch.profiler.record_function(name)
-    return nullcontext()
+    return profile_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
@@ -517,20 +583,30 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+    fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
+        size,
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
@@ -546,7 +622,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
     """
-    if not get_global_server_args().enable_mamba_extra_buffer():
+    if not get_server_args().enable_mamba_extra_buffer():
         return
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None
@@ -601,7 +677,7 @@ def commit_mamba_states_after_verify(
             # we need to update the mamba state for the request at the crossing point.
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_global_server_args().mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
@@ -629,3 +705,15 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+
+
+def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+    """eagle/ngram share a stateless free function; dflash keeps stateful
+    prep on its draft input -- the dispatcher routes.
+    """
+    if batch.spec_algorithm.is_dflash():
+        batch.spec_info.prepare_for_decode(batch)
+    else:
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(batch)

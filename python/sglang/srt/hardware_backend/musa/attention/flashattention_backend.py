@@ -23,7 +23,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 
 # Global workspace buffer for MLA
 _MATE_MLA_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
-_MATE_MLA_WORKSPACE_BUFFER: torch.Tensor | None = None
 
 # Cache for non-MLA scheduler metadata by prefix
 _MATE_NO_MLA_SCHEDULER_METADATA_DICT: dict = {}
@@ -54,7 +53,7 @@ def _compute_scheduler_metadata(
     num_splits: int,
 ) -> Tuple[torch.Tensor, bool] | torch.Tensor:
     """Compute scheduler metadata based on backend's current state."""
-    global _MATE_MLA_WORKSPACE_BUFFER, _MATE_NO_MLA_SCHEDULER_METADATA_DICT
+    global _MATE_NO_MLA_SCHEDULER_METADATA_DICT
 
     layer = backend._current_layer
     current_layer_id = layer.layer_id
@@ -84,11 +83,15 @@ def _compute_scheduler_metadata(
         should_update = True
 
     if backend.use_mla:
-        if _MATE_MLA_WORKSPACE_BUFFER is None:
-            _MATE_MLA_WORKSPACE_BUFFER = torch.empty(
+        from sglang.srt.runtime_context import get_buffer
+
+        workspace = get_buffer(
+            "musa_mate_mla_workspace",
+            lambda: torch.empty(
                 _MATE_MLA_WORKSPACE_SIZE_BYTES, device=backend.device, dtype=torch.uint8
-            )
-        return (_MATE_MLA_WORKSPACE_BUFFER, not should_update)
+            ),
+        )
+        return (workspace, not should_update)
     else:
         with _MATE_NO_MLA_SCHEDULER_METADATA_LOCK:
             if (
@@ -423,13 +426,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     _fa_cp_attn,
                 )
             elif (
-                (
-                    forward_batch.extend_prefix_lens_cpu is not None
-                    and any(forward_batch.extend_prefix_lens_cpu)
-                )
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_target_verify():
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -513,10 +512,10 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_global_server_args().disable_chunked_prefix_cache
+                    assert not get_server_args().disable_chunked_prefix_cache
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
                     assert forward_batch.prefix_chunk_max_seq_lens is not None

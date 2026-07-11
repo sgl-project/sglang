@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
 
 if TYPE_CHECKING:
@@ -95,10 +95,10 @@ class WaveAttnBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            get_parallel().attn_tp_size
         )
 
         self.static_kv_splits = get_bool_env_var(
@@ -281,23 +281,6 @@ class WaveAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
-        elif forward_batch.forward_mode.is_draft_extend():
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    None,
-                    self.req_to_token,
-                )
-            )
-            mask_indptr = None
-            # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accept_tokens_cpu)`.
-            # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
             num_kv_splits = None
             attn_logits = None
             attn_lse = None

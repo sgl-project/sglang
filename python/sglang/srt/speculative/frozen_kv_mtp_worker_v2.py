@@ -32,10 +32,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    cuda_graph_fully_disabled,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -44,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker
+from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -80,7 +77,7 @@ from sglang.srt.utils.async_probe import (
 logger = logging.getLogger(__name__)
 
 
-class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
+class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     """Frozen-KV MTP draft worker.
 
     The assistant reads target KV only. It reuses EAGLE's verify input/output
@@ -117,27 +114,18 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
             f"{self.speculative_algorithm.name}."
         )
 
-        # Defer cuda graph capture; we do it ourselves below.
-        backup_decode_mode = server_args.cuda_graph_config.decode.backend
-        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
-
-        # Draft attention uses target req_to_token + KV allocator (read-only).
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        target_cfg = target_worker.model_runner.memory_pool_config
-        draft_pool_config = MemoryPoolConfig(
-            max_total_num_tokens=64,  # Dummy value
-            max_running_requests=target_cfg.max_running_requests,
-        )
+        # Target pools (read-only) are bound in alloc_memory_pool(), not here, so
+        # the worker can be built before the target pool exists (see #29021).
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = None
+        self.draft_pool_config: Optional[MemoryPoolConfig] = None
 
         self.hot_token_id = None
 
         with (
             empty_context()
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            # NOTE: call TpModelWorker.__init__ explicitly -- BaseDraftWorker is
+            # NOTE: call TpModelWorker.__init__ explicitly -- EagleDraftWorkerBase is
             # an ABC with no __init__, so cooperative super() would be ambiguous.
             TpModelWorker.__init__(
                 self,
@@ -151,9 +139,6 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=draft_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -167,31 +152,62 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
             )
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
-        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
-            self._bind_kv_context()
-
-        self.draft_model_runner.server_args.cuda_graph_config.decode.backend = (
-            backup_decode_mode
-        )
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.draft_attn_backend = self._init_draft_attn_backend()
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_attn_backend = None
         self.cuda_graph_runner = None
         # Frozen draft has no draft-extend forward (seed-select only); keep these
         # None so inherited probes (spec_v2_attn_backends, adaptive) stay typed.
         self.draft_extend_attn_backend = None
         self.cuda_graph_runner_for_draft_extend = None
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+        self.draft_pool_config = MemoryPoolConfig(
+            max_total_num_tokens=64,  # Dummy value
+            max_running_requests=memory_pool_config.max_running_requests,
+        )
+
+        # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
+        # the MRO and its alloc_memory_pool is a no-op stub.
+        TpModelWorker.alloc_memory_pool(
+            self,
+            memory_pool_config=self.draft_pool_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
+            self._bind_kv_context()
+
+    def init_attention_backends(self):
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
-            self.init_cuda_graphs()
+            TpModelWorker.init_attention_backends(self)
+            self.draft_attn_backend = self._init_draft_attn_backend()
+            self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+
+    def init_cuda_graphs(self):
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            TpModelWorker.init_cuda_graphs(self, capture_decode_cuda_graph=False)
+            self._capture_cuda_graphs()
 
     @property
     def draft_model_runner(self):
@@ -327,7 +343,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-    def init_cuda_graphs(self) -> None:
+    def _capture_cuda_graphs(self) -> None:
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
@@ -401,8 +417,8 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
         # NOTE: per-iter bookkeeping (penalty cumulation, maybe_evict_swa,
-        # decode_batch_idx tick) is done by the inherited
-        # EagleDraftInputV2Mixin.prepare_for_decode (scheduler-driven, see
+        # decode_batch_idx tick) is done by the scheduler-driven
+        # eagle_utils.eagle_prepare_for_decode (see
         # ScheduleBatch.prepare_for_decode), not here -- matching EAGLE v2.
         # Repeating evict/tick here would double-run them: the idx clock
         # gates SWA eviction timing and the SWA prefix-lock release.
@@ -419,12 +435,16 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
-        can_run_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
+        # Frozen draft never writes KV; None signals fill_from to skip the slot.
+        forward_batch.out_cache_loc = None
+
+        can_run_cuda_graph = (
+            self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run_graph(forward_batch)
         )
         if can_run_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens = (
+                self.cuda_graph_runner.execute(forward_batch)
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
@@ -568,7 +588,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         )
 
     def draft_extend(self):
-        # BaseDraftWorker contract. Frozen has no draft-KV extend forward; the
+        # EagleDraftWorkerBase contract. Frozen has no draft-KV extend forward; the
         # orchestrator calls `_draft_extend_for_{prefill,decode}` directly.
         pass
 
@@ -656,7 +676,10 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             target_worker.get_memory_pool()
         )
         # Match the draft context length to the target (assistant reads target KV).
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,

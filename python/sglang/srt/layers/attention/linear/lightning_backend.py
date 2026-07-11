@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -133,13 +134,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         slopes = torch.tensor(
             get_slopes(n_attention_heads), dtype=torch.float32
         ).reshape(n_attention_heads, 1, 1)
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-        )
 
-        tp_heads = n_attention_heads // get_attention_tp_size()
-        tp_rank = get_attention_tp_rank()
+        tp_heads = n_attention_heads // get_parallel().attn_tp_size
+        tp_rank = get_parallel().attn_tp_rank
         if num_hidden_layers <= 1:
             slope_rate_list = [slopes * (1 + 1e-5)]
         else:
