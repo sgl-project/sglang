@@ -72,6 +72,8 @@ from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_device
 
+_MAX_INFERENCE_POS_EMB_CACHE_ENTRIES = 256
+
 
 @debug_kernel_api
 def multihead_attention(
@@ -252,6 +254,13 @@ class Learnable2DInterpPosEmb(nn.Module):
                         .flatten(end_dim=1)
                     )
                     if not self.training:
+                        if (
+                            len(self._interpolated_pos_emb_cache)
+                            >= _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES
+                        ):
+                            self._interpolated_pos_emb_cache.pop(
+                                next(iter(self._interpolated_pos_emb_cache))
+                            )
                         self._interpolated_pos_emb_cache[cache_key] = pos_emb
                 pos_embs.append(pos_emb)
         out = x + torch.cat(pos_embs)
