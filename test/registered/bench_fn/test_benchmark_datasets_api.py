@@ -426,6 +426,25 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
 
+    def test_image_sampler_vllm_chat(self):
+        rows = sample_image_requests(
+            num_requests=2,
+            image_count=1,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=self.processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="vllm-chat",
+            random_image_count=False,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+        self.assertTrue(all(row.image_data for row in rows))
+        self.assertTrue(all("[IMAGE]" not in row.prompt for row in rows))
+
     def test_image_sampler_random_resolution(self):
         state = np.random.get_state()
         np.random.seed(20260711)
