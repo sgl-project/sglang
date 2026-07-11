@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
+    maybe_cache_unfinished_req,
     page_align_floor,
     release_kv_cache,
 )
@@ -2375,7 +2376,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 decode_req.req.prefill_tail_hidden_start = 0
 
-        if decode_req.req.return_logprob and not replayed_boundary:
+        if (
+            self.spec_algorithm.is_dspark()
+            and decode_req.dspark_hidden_dst_indices_by_pp is not None
+        ):
+            maybe_cache_unfinished_req(decode_req.req, self.tree_cache)
+            logger.debug(
+                "Cached DSpark PD transferred prefix on decode commit: "
+                "rid=%s, cache_protected_len=%s, prefix_indices_len=%s",
+                decode_req.req.rid,
+                decode_req.req.cache_protected_len,
+                len(decode_req.req.prefix_indices),
+            )
+
+        if decode_req.req.return_logprob:
             decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
