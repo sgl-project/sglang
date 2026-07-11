@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_sm100_supported, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -18,6 +18,14 @@ register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
+
+# trtllm_mha prefill requires SM100 (Blackwell); use the Hopper-native pair elsewhere.
+if is_sm100_supported():
+    ATTENTION_BACKEND = "trtllm_mha"
+    DRAFT_ATTENTION_BACKEND = "fa4"
+else:
+    ATTENTION_BACKEND = "fa3"
+    DRAFT_ATTENTION_BACKEND = "fa3"
 
 
 class TestBasicSanityDSpark(
@@ -39,8 +47,8 @@ class TestBasicSanityDSpark(
     gsm8k_accuracy_thres = 0.80
     gsm8k_accept_length_thres = 2.0
 
-    attention_backend = "trtllm_mha"
-    draft_attention_backend = "fa4"
+    attention_backend = ATTENTION_BACKEND
+    draft_attention_backend = DRAFT_ATTENTION_BACKEND
 
     process = None
 
