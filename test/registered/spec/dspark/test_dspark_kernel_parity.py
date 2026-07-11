@@ -16,28 +16,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
 from sglang.srt.speculative.dspark_components.kernels import (
-    accept_greedy,
-    accept_sampling,
-    build_block_seq_lens_causal,
-    build_out_tokens,
-    build_ragged_verify_window,
-    build_step_local,
-    cap_correct_len,
-    causal_swa_page_indices,
-    commit_inject_layout,
-    commit_kv_proj,
-    compact_layout,
-    expand_prefill_causally,
-    finalize_accept_lens,
-    mixed_accept_select,
-    padded_to_bucket,
-    page_table_positions,
-    qo_indptr,
-    sample_step_tokens,
-    scatter_compact_to_strided,
-    schedule_verify_lens_topk,
-    softmax_temp,
-    swa_page_indices,
+    dspark_accept,
+    dspark_attn_metadata,
+    dspark_draft_model,
+    dspark_ragged,
+    dspark_schedule,
+    dspark_verify_window,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -77,7 +61,7 @@ def _case_accept_greedy(tc):
     target_logits = torch.randn(bs * t, 200, device=DEVICE)
     for cutoff in (None, _ri(1, t + 1, (bs,), torch.int32)):
         tc._parity(
-            accept_greedy.AcceptGreedy,
+            dspark_accept.AcceptGreedy,
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=t,
@@ -86,7 +70,7 @@ def _case_accept_greedy(tc):
     # gather_row_bonus: bonus token at a per-row column index.
     table, idx = _ri(0, VOCAB, (64, t)), _ri(0, t, (64,), torch.int32)
     ref = table[torch.arange(64, device=DEVICE), idx.long()]
-    tc._eq(accept_greedy.gather_row_bonus_triton(table=table, idx=idx), ref)
+    tc._eq(dspark_accept.gather_row_bonus_triton(table=table, idx=idx), ref)
 
 
 def _case_accept_sampling(tc):
@@ -97,7 +81,7 @@ def _case_accept_sampling(tc):
     correct_len = _ri(0, t, (bs,), torch.int32)
     rows = torch.arange(bs, device=DEVICE)
     ref = predicts[accept_index[rows, correct_len.long()].long()]
-    got = accept_sampling.gather_two_level_bonus_triton(
+    got = dspark_accept.gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len
     )
     tc._eq(got, ref)
@@ -108,7 +92,7 @@ def _case_build_block_seq_lens_causal(tc):
     seq_lens = _ri(1, 100000, (128,))
     for block_size in (1, 5, 7):
         tc._parity(
-            build_block_seq_lens_causal.BuildBlockSeqLensCausal,
+            dspark_attn_metadata.BuildBlockSeqLensCausal,
             seq_lens=seq_lens,
             block_size=block_size,
             device=DEVICE,
@@ -122,7 +106,7 @@ def _case_build_out_tokens(tc):
         # Bonus insertion swept through every position 0..gamma.
         cl = (torch.arange(bs, device=DEVICE) % (gamma + 1)).to(cl_dtype)
         tc._parity(
-            build_out_tokens.BuildOutTokens,
+            dspark_verify_window.BuildOutTokens,
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             correct_len=cl,
             bonus=_ri(0, VOCAB, (bs,)),
@@ -146,7 +130,7 @@ def _case_build_ragged_verify_window(tc):
     )
     for graph_num_tokens in (bs * t, (bs + 3) * t):  # tight and bucket padding
         tc._parity(
-            build_ragged_verify_window.BuildRaggedVerifyWindow,
+            dspark_verify_window.BuildRaggedVerifyWindow,
             batch=batch,
             layout=_layout(verify_lens, graph_num_tokens),
             draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
@@ -166,7 +150,9 @@ def _case_build_step_local(tc):
     ):
         bias = (torch.randn(3, org_width, device=DEVICE) * 3.0).to(bias_dtype)
         base = torch.randn(3, per_partition, device=DEVICE)
-        got, _ = tc._parity(build_step_local.BuildStepLocal, bias=bias, base_local=base)
+        got, _ = tc._parity(
+            dspark_draft_model.BuildStepLocal, bias=bias, base_local=base
+        )
         # Padding columns beyond org_width must stay pure base.
         tc.assertTrue(torch.equal(got[:, org_width:], base[:, org_width:]))
 
@@ -177,9 +163,7 @@ def _case_cap_correct_len(tc):
     verify_lens = _ri(1, nd + 1, (bs,), torch.int32)
     for cl_dtype in (torch.int32, torch.int64):
         cl = (torch.arange(bs, device=DEVICE) % (nd + 1)).to(cl_dtype)
-        tc._parity(
-            cap_correct_len.CapCorrectLen, correct_len=cl, verify_lens=verify_lens
-        )
+        tc._parity(dspark_accept.CapCorrectLen, correct_len=cl, verify_lens=verify_lens)
 
 
 def _case_causal_swa_page_indices(tc):
@@ -195,7 +179,7 @@ def _case_causal_swa_page_indices(tc):
     # Lens short of / straddling / beyond the SWA window boundary.
     for lo, hi in ((1, swa), (swa - 4, swa + 4), (swa + 1, pool_len)):
         lens = _ri(lo, hi, (num_q,), torch.int32, g)
-        cls = causal_swa_page_indices.BuildCausalSwaPageIndices
+        cls = dspark_attn_metadata.BuildCausalSwaPageIndices
         ref = cls.torch(seq_lens_casual=lens, **kw)
         got = cls.triton(seq_lens_casual=lens, **kw)
         tc.assertEqual(got.shape, ref.shape)
@@ -220,14 +204,14 @@ def _case_commit_inject_layout(tc):
         commit_lens=_ri(0, stride + 1, (bs,), torch.int32, g),
         stride=stride,
     )
-    tc._parity(commit_inject_layout.BuildCommitInjectLayout, **kw)
+    tc._parity(dspark_verify_window.BuildCommitInjectLayout, **kw)
     # commit_len edges: 0 masks the whole row to -1, stride keeps it all.
     kw.update(
         req_pool_indices=kw["req_pool_indices"][:2],
         prefix_lens=kw["prefix_lens"][:2],
         commit_lens=torch.tensor([0, stride], device=DEVICE, dtype=torch.int32),
     )
-    edge = commit_inject_layout.BuildCommitInjectLayout.triton(**kw)
+    edge = dspark_verify_window.BuildCommitInjectLayout.triton(**kw)
     swa_2d = edge.swa_loc.view(2, stride)
     tc.assertTrue(bool((swa_2d[0] == -1).all()))
     tc.assertTrue(bool((swa_2d[1] >= 0).all()))
@@ -247,7 +231,7 @@ def _case_commit_kv_proj(tc):
     main_x = (torch.randn(56, hidden, device=DEVICE, generator=g) * 0.5).to(
         torch.bfloat16
     )
-    cls = commit_kv_proj.CommitKvProj
+    cls = dspark_draft_model.CommitKvProj
     ref = cls.torch(main_x=main_x, wkv_linears=linears)
     got = cls.triton(main_x=main_x, wkv_linears=linears)
     tc.assertEqual(len(got), num_stages)
@@ -265,7 +249,7 @@ def _case_commit_kv_proj(tc):
     sf = sf.repeat_interleave(block, 1)[:, :in_dim]
     expected = (w8.to(torch.float32) * sf).to(torch.bfloat16)
     stub = types.SimpleNamespace(weight=w8, weight_scale_inv=scale)
-    tc._eq(commit_kv_proj._dequant_linear_weight(stub), expected)
+    tc._eq(dspark_draft_model._dequant_linear_weight(stub), expected)
 
 
 def _case_compact_layout(tc):
@@ -275,13 +259,13 @@ def _case_compact_layout(tc):
     total = int(verify_lens.sum().item())
     for padded_total in (total, bs * t):  # exact and bucket padding
         tc._parity(
-            compact_layout.CompactRowIndex,
+            dspark_verify_window.CompactRowIndex,
             verify_lens=verify_lens,
             padded_total=padded_total,
             device=DEVICE,
         )
         tc._parity(
-            compact_layout.CompactVerifyIds,
+            dspark_verify_window.CompactVerifyIds,
             draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             layout=_layout(verify_lens, padded_total),
@@ -293,14 +277,14 @@ def _case_swa_page_indices(tc):
     torch.manual_seed(11)
     block_size, num_q, max_reqs, n_full = 5, 320, 300, 50000
     _, gather = tc._parity(
-        swa_page_indices.ComputeDsparkWindowGather,
+        dspark_attn_metadata.ComputeDsparkWindowGather,
         seq_lens_casual=_ri(1, 300, (num_q,), torch.int32),
         req_pool_indices_repeated=_ri(0, max_reqs, (num_q,)),
         block_size=block_size,
         swa_window=128,
     )
     tc._parity(
-        swa_page_indices.BuildDsparkSwaPageIndices,
+        dspark_attn_metadata.BuildDsparkSwaPageIndices,
         req_to_token=_ri(0, n_full, (max_reqs, 400), torch.int32),
         full_to_swa_mapping=_ri(0, 20000, (n_full,), torch.int32),
         req_pool_indices_per_request=gather.req_pool_indices_per_request,
@@ -323,7 +307,7 @@ def _case_expand_prefill_causally(tc):
     req_pool_indices = torch.randperm(512, device=DEVICE)[:bs]
     seq_lens = _ri(8, 500, (bs,))
     tc._parity(
-        expand_prefill_causally.ExpandPrefillCausally,
+        dspark_attn_metadata.ExpandPrefillCausally,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         extend_seq_lens=extend,
@@ -336,7 +320,7 @@ def _case_expand_prefill_causally(tc):
     # Loop branch: uniform extend with CPU lens and no padding.
     bs2, block = 8, 6
     tc._parity(
-        expand_prefill_causally.ExpandPrefillCausally,
+        dspark_attn_metadata.ExpandPrefillCausally,
         req_pool_indices=req_pool_indices[:bs2],
         seq_lens=seq_lens[:bs2],
         extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
@@ -353,7 +337,7 @@ def _case_finalize_accept_lens(tc):
     bs = 64
     for prefix_dtype in (torch.int32, torch.int64):
         tc._parity(
-            finalize_accept_lens.FinalizeAcceptLens,
+            dspark_accept.FinalizeAcceptLens,
             correct_len=_ri(0, 7, (bs,), torch.int32),
             cap_trim_lens=_ri(0, 4, (bs,)),
             prefix_lens=_ri(1, 4000, (bs,), prefix_dtype),
@@ -365,7 +349,7 @@ def _case_mixed_accept_select(tc):
     bs = 64
     # Mixed dtypes between the greedy and sampling lanes.
     tc._parity(
-        mixed_accept_select.SelectMixedAccept,
+        dspark_accept.SelectMixedAccept,
         greedy_mask=torch.rand(bs, device=DEVICE) < 0.5,
         greedy_len=_ri(0, 7, (bs,)),
         greedy_bonus=_ri(0, 100000, (bs,)),
@@ -383,7 +367,7 @@ def _case_padded_to_bucket(tc):
         if int(verify_lens.sum()) > graph_num_tokens:
             verify_lens = torch.ones(bs, dtype=torch.int32, device=DEVICE)
         got, _ = tc._parity(
-            padded_to_bucket.PaddedToBucket,
+            dspark_ragged.PaddedToBucket,
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             bs=bs,
@@ -402,7 +386,7 @@ def _case_page_table_positions(tc):
     # Large page + non-pool-aligned max_seq_len, then page_size 1.
     for num_q, page_size, max_seq_len in ((300, 64, 4000), (56, 1, 4096)):
         tc._parity(
-            page_table_positions.BuildPageTablePositions,
+            dspark_attn_metadata.BuildPageTablePositions,
             req_to_token=req_to_token,
             req_pool_indices_repeated=_ri(0, num_pool, (num_q,), torch.int32, g),
             seq_lens_casual=_ri(1, pool_len, (num_q,), torch.int64, g),
@@ -414,7 +398,7 @@ def _case_page_table_positions(tc):
 
 def _case_qo_indptr(tc):
     torch.manual_seed(17)
-    cls = qo_indptr.BuildQoIndptr
+    cls = dspark_ragged.BuildQoIndptr
     for dtype in (torch.int32, torch.int64):
         verify_lens = _ri(1, 8, (129,), dtype)  # straddles the 128 block
         ref = cls.torch(verify_lens=verify_lens)
@@ -429,7 +413,7 @@ def _case_qo_indptr(tc):
 
 def _case_sample_step_tokens(tc):
     torch.manual_seed(18)
-    cls = sample_step_tokens.SampleStepTokens
+    cls = dspark_draft_model.SampleStepTokens
     # Injected noise makes stochastic sampling exactly comparable.
     for vocab, dtype in ((130000, torch.bfloat16), (5003, torch.float32)):
         bs = 3
@@ -474,7 +458,7 @@ def _case_scatter_compact_to_strided(tc):
             graph_num_tokens, dim, dtype=torch.bfloat16, device=DEVICE
         )
         tc._parity(
-            scatter_compact_to_strided.ScatterCompactToStrided,
+            dspark_verify_window.ScatterCompactToStrided,
             compact=compact,
             layout=_layout(verify_lens, graph_num_tokens),
             fill_value=0.0,
@@ -486,7 +470,7 @@ def _case_schedule_verify_lens_topk(tc):
     torch.manual_seed(20)
     gamma, bs = 5, 64
     cfg = DSparkScheduleConfig(gamma=gamma)
-    cls = schedule_verify_lens_topk.ScheduleVerifyLensTopk
+    cls = dspark_schedule.ScheduleVerifyLensTopk
     base = torch.rand(bs, gamma, device=DEVICE)
     confidences = (
         torch.full((bs, gamma), 0.5, device=DEVICE),  # all-ties
@@ -500,7 +484,7 @@ def _case_schedule_verify_lens_topk(tc):
 
 def _case_softmax_temp(tc):
     g = torch.Generator(device=DEVICE).manual_seed(21)
-    cls = softmax_temp.SoftmaxTemp
+    cls = dspark_accept.SoftmaxTemp
     # bf16 logits, non-power-of-two rows_per_request, full vocab.
     logits = (torch.randn(56, VOCAB, device=DEVICE, generator=g) * 8.0).to(
         torch.bfloat16

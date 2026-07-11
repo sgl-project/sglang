@@ -40,10 +40,8 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.dspark_components.kernels.build_step_local import (
+from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     BuildStepLocal,
-)
-from sglang.srt.speculative.dspark_components.kernels.commit_kv_proj import (
     CommitKvProj,
 )
 from sglang.srt.speculative.ragged_verify import (

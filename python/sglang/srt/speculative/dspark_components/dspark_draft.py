@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
-from sglang.srt.speculative.dspark_components.kernels.sample_step_tokens import (
+from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

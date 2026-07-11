@@ -30,7 +30,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
 )
-from sglang.srt.speculative.dspark_components.kernels.schedule_verify_lens_topk import (
+from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
 )

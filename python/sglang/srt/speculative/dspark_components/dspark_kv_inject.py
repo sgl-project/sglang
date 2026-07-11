@@ -4,7 +4,7 @@ import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
+from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout

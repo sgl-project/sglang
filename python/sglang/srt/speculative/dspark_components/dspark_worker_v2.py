@@ -68,11 +68,11 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     accept_draft_tokens,
 )
-from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
-    BuildOutTokens,
-)
-from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
+from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     FinalizeAcceptLens,
+)
+from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
+    BuildOutTokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda

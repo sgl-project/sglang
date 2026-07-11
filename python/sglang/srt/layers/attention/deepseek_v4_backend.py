@@ -50,24 +50,16 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dspark_components.kernels.build_block_seq_lens_causal import (
+from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
-)
-from sglang.srt.speculative.dspark_components.kernels.build_block_seq_lens_causal import (
-    build_block_seq_lens_causal as build_block_seq_lens_causal,
-)
-from sglang.srt.speculative.dspark_components.kernels.causal_swa_page_indices import (
     BuildCausalSwaPageIndices,
-)
-from sglang.srt.speculative.dspark_components.kernels.expand_prefill_causally import (
+    BuildDsparkSwaPageIndices,
+    BuildPageTablePositions,
+    ComputeDsparkWindowGather,
     ExpandPrefillCausally,
 )
-from sglang.srt.speculative.dspark_components.kernels.page_table_positions import (
-    BuildPageTablePositions,
-)
-from sglang.srt.speculative.dspark_components.kernels.swa_page_indices import (
-    BuildDsparkSwaPageIndices,
-    ComputeDsparkWindowGather,
+from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
+    build_block_seq_lens_causal as build_block_seq_lens_causal,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
