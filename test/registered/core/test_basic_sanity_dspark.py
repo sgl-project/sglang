@@ -58,7 +58,9 @@ class TestBasicSanityDSpark(
         cls.process = popen_launch_server(
             TARGET_MODEL,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # A cold runner downloads the draft checkpoint from HF (several
+            # GB, not on the CI mirror); the 600s default is too tight.
+            timeout=max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1800),
             other_args=[
                 "--trust-remote-code",
                 "--attention-backend",
