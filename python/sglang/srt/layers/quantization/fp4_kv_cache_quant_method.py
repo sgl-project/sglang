@@ -697,60 +697,96 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
 
 
 # Registry: method name -> attention access rules.
+_PREFILL = KVCacheAttentionPhase.PREFILL
+_DECODE = KVCacheAttentionPhase.DECODE
+_PLAIN_KIND = KVCacheAttentionAccessKind.PLAIN
+_DQ_WORKSPACE_KIND = KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+_NATIVE_FP4_KIND = KVCacheAttentionAccessKind.NATIVE_FP4
 _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
-_FP4_MX_BLOCK16_MHA_BACKENDS = frozenset(
+_NVFP4_SCALE = "nvfp4"
+_FP4_MX_SCALE = "fp4_mx_block16"
+_FP8_E4M3 = torch.float8_e4m3fn
+_TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
+_BF16 = torch.bfloat16
+_NVFP4_PREFILL_BACKENDS = frozenset({"flashinfer"})
+_NVFP4_DECODE_BACKENDS = frozenset({"trtllm_mha"})
+_FP4_MX_MHA_BACKENDS = frozenset(
     {"triton", "torch_native", "flex_attention", "trtllm_mha"}
 )
-_FP4_MX_BLOCK16_MHA_PREFILL_BACKENDS = _FP4_MX_BLOCK16_MHA_BACKENDS | frozenset({"fa4"})
+_FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
+
+
+def _backend_matcher(backends) -> KVCacheBackendMatcher:
+    if isinstance(backends, KVCacheBackendMatcher):
+        return backends
+    return KVCacheBackendMatcher(exact=backends)
+
+
+def _access(
+    phase: KVCacheAttentionPhase,
+    kind: KVCacheAttentionAccessKind,
+    backends,
+    scale: Optional[str] = None,
+    attention_dtype: Optional[torch.dtype] = None,
+    workspace_dtype: Optional[torch.dtype] = None,
+) -> KVCacheAttentionAccess:
+    return KVCacheAttentionAccess(
+        phase,
+        kind,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8 if scale is not None else None,
+        attention_kv_dtype=attention_dtype,
+        scale_recipe=scale,
+        workspace_dtype=workspace_dtype,
+    )
+
+
+def _plain(
+    phase: KVCacheAttentionPhase,
+    backends,
+    scale: Optional[str] = None,
+    attention_dtype: Optional[torch.dtype] = None,
+) -> KVCacheAttentionAccess:
+    return _access(phase, _PLAIN_KIND, backends, scale, attention_dtype)
+
+
+def _dq_workspace(
+    phase: KVCacheAttentionPhase,
+    backends,
+    scale: str,
+    attention_dtype: torch.dtype,
+) -> KVCacheAttentionAccess:
+    return _access(
+        phase,
+        _DQ_WORKSPACE_KIND,
+        backends,
+        scale,
+        attention_dtype,
+        workspace_dtype=attention_dtype,
+    )
+
+
+def _native_fp4(
+    phase: KVCacheAttentionPhase,
+    backends,
+    scale: str,
+    attention_dtype: Optional[torch.dtype],
+) -> KVCacheAttentionAccess:
+    return _access(phase, _NATIVE_FP4_KIND, backends, scale, attention_dtype)
+
+
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
     UnquantizedKVCacheMethod.name: (
-        KVCacheAttentionAccess(
-            KVCacheAttentionPhase.PREFILL,
-            KVCacheAttentionAccessKind.PLAIN,
-            _ANY_BACKEND,
-        ),
-        KVCacheAttentionAccess(
-            KVCacheAttentionPhase.DECODE,
-            KVCacheAttentionAccessKind.PLAIN,
-            _ANY_BACKEND,
-        ),
+        _plain(_PREFILL, _ANY_BACKEND),
+        _plain(_DECODE, _ANY_BACKEND),
     ),
     NVFP4KVCacheMethod.name: (
-        KVCacheAttentionAccess(
-            KVCacheAttentionPhase.PREFILL,
-            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
-            KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
-            storage_dtype=torch.uint8,
-            attention_kv_dtype=torch.float8_e4m3fn,
-            scale_recipe="nvfp4",
-            workspace_dtype=torch.float8_e4m3fn,
-        ),
-        KVCacheAttentionAccess(
-            KVCacheAttentionPhase.DECODE,
-            KVCacheAttentionAccessKind.NATIVE_FP4,
-            KVCacheBackendMatcher(exact=frozenset({"trtllm_mha"})),
-            storage_dtype=torch.uint8,
-            attention_kv_dtype=getattr(torch, "float4_e2m1fn_x2", None),
-            scale_recipe="nvfp4",
-        ),
+        _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),
     FP4MXBlock16KVCacheMethod.name: (
-        KVCacheAttentionAccess(
-            KVCacheAttentionPhase.PREFILL,
-            KVCacheAttentionAccessKind.PLAIN,
-            KVCacheBackendMatcher(exact=_FP4_MX_BLOCK16_MHA_PREFILL_BACKENDS),
-            storage_dtype=torch.uint8,
-            attention_kv_dtype=torch.bfloat16,
-            scale_recipe="fp4_mx_block16",
-        ),
-        KVCacheAttentionAccess(
-            KVCacheAttentionPhase.DECODE,
-            KVCacheAttentionAccessKind.PLAIN,
-            KVCacheBackendMatcher(exact=_FP4_MX_BLOCK16_MHA_BACKENDS),
-            storage_dtype=torch.uint8,
-            attention_kv_dtype=torch.bfloat16,
-            scale_recipe="fp4_mx_block16",
-        ),
+        _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
+        _plain(_DECODE, _FP4_MX_MHA_BACKENDS, _FP4_MX_SCALE, _BF16),
     ),
 }
 

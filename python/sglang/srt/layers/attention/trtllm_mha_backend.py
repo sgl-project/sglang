@@ -105,7 +105,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "trtllm_mha"
         )
-        self._require_decode_kv_access()
+        self._check_decode_kv_access()
         self.decode_uses_native_fp4 = (
             self.decode_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
         )
@@ -186,7 +186,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-    def _require_decode_kv_access(self) -> None:
+    def _check_decode_kv_access(self) -> None:
         supported_kinds = {
             KVCacheAttentionAccessKind.PLAIN,
             KVCacheAttentionAccessKind.NATIVE_FP4,
