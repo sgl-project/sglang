@@ -831,6 +831,26 @@ class SchedulerDisaggregationPrefillMixin:
                     dynamic_dst["ptr"] = int(dynamic_dst["ptr"]) + offset * item_len
                     dynamic_dst["row_count"] = int(new_hidden_len)
                     dynamic_dst["nbytes"] = int(new_hidden_len * item_len)
+                    target_bytes = int(
+                        envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get()
+                    )
+                    if target_bytes > 0 and item_len > 0:
+                        rows_per_chunk = max(1, target_bytes // item_len)
+                        dynamic_dst["row_chunks"] = [
+                            {
+                                "row_start": int(row_start),
+                                "row_len": int(
+                                    min(rows_per_chunk, new_hidden_len - row_start)
+                                ),
+                            }
+                            for row_start in range(
+                                0, new_hidden_len, rows_per_chunk
+                            )
+                        ]
+                    else:
+                        dynamic_dst["row_chunks"] = [
+                            {"row_start": 0, "row_len": int(new_hidden_len)}
+                        ]
                     pp_slice["dynamic_dst"] = dynamic_dst
                 new_meta["pp_slice"] = pp_slice
                 pp_rank = str(pp_slice.get("pp_rank", self.ps.pp_rank))

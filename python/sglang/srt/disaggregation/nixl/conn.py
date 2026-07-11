@@ -2063,6 +2063,41 @@ class NixlKVManager(CommonKVManager):
                         f"State index length mismatch at component {i}: "
                         f"prefill={len(src_indices)}, dst={len(dst_indices)}"
                     )
+                if st == StateType.DSPARK_HIDDEN and dynamic_dst:
+                    row_chunks = dynamic_dst.get("row_chunks") or [
+                        {"row_start": 0, "row_len": len(src_indices)}
+                    ]
+                    for row_chunk in row_chunks:
+                        row_start = int(row_chunk.get("row_start", 0))
+                        row_len = int(row_chunk.get("row_len", 0))
+                        if row_len <= 0:
+                            continue
+                        row_end = row_start + row_len
+                        if row_start < 0 or row_end > len(src_indices):
+                            raise RuntimeError(
+                                "Invalid DSpark hidden row chunk: "
+                                f"rid={req.rid}, row_start={row_start}, "
+                                f"row_len={row_len}, row_count={len(src_indices)}"
+                            )
+                        h = self._send_kvcache_generic(
+                            peer_name=peer_name,
+                            src_data_ptrs=src_ptrs,
+                            dst_data_ptrs=dst_ptrs,
+                            item_lens=src_lens,
+                            prefill_data_indices=np.array(
+                                src_indices[row_start:row_end], dtype=np.int32
+                            ),
+                            dst_data_indices=np.array(
+                                dst_indices[row_start:row_end], dtype=np.int32
+                            ),
+                            dst_gpu_id=dst_gpu_id,
+                            notif=comp_notif,
+                            state_type=st,
+                            dst_mem_kind=dst_mem_kind_for_state,
+                        )
+                        if h is not None:
+                            handles.append(h)
+                    continue
                 h = self._send_kvcache_generic(
                     peer_name=peer_name,
                     src_data_ptrs=src_ptrs,

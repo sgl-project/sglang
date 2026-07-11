@@ -539,6 +539,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # serializes those independent tail transfers and keeps prealloc high.
         return len(input_ids), tuple(int(x) for x in input_ids)
 
+    @staticmethod
+    def _dspark_hidden_row_chunks(row_count: int, row_bytes: int) -> List[dict]:
+        row_count = int(row_count)
+        row_bytes = int(row_bytes)
+        if row_count <= 0:
+            return []
+        target_bytes = int(envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get())
+        if target_bytes <= 0 or row_bytes <= 0:
+            return [{"row_start": 0, "row_len": row_count}]
+        rows_per_chunk = max(1, target_bytes // row_bytes)
+        return [
+            {
+                "row_start": int(row_start),
+                "row_len": int(min(rows_per_chunk, row_count - row_start)),
+            }
+            for row_start in range(0, row_count, rows_per_chunk)
+        ]
+
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
@@ -1481,6 +1499,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "nbytes": int(dspark_hidden_len * item_len),
                         "item_len": item_len,
                         "row_count": int(dspark_hidden_len),
+                        "row_chunks": self._dspark_hidden_row_chunks(
+                            dspark_hidden_len, item_len
+                        ),
                     }
                 if dspark_dynamic_pool_busy:
                     if prefix_len > 0:
