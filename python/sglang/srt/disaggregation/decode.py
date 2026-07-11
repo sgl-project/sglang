@@ -1049,6 +1049,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         dspark_active_full_prefix_counts = Counter()
         dspark_full_prefix_limit = 1
+        dspark_active_hidden_transfer_reqs = 0
+        dspark_active_hidden_transfer_bytes = 0
+        dspark_hidden_transfer_queue_limit = 0
+        dspark_hidden_transfer_queue_bytes = 0
         if (
             self.scheduler.spec_algorithm.is_dspark()
             and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
@@ -1061,14 +1065,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if configured_prefix_limit > 0
                 else 1
             )
+            dspark_hidden_transfer_queue_limit = (
+                envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_LIMIT.get()
+            )
+            dspark_hidden_transfer_queue_bytes = (
+                envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_BYTES.get()
+            )
             for active_req in self.transfer_queue.queue:
-                if int(getattr(active_req, "dspark_hidden_start", 0)) != 0:
-                    continue
                 if not getattr(active_req, "dspark_hidden_dst_indices_by_pp", None):
                     continue
-                prefix_key = self._dspark_prefix_fingerprint(active_req.req)
-                if prefix_key is not None:
-                    dspark_active_full_prefix_counts[prefix_key] += 1
+                dspark_active_hidden_transfer_reqs += 1
+                for pp_slice in (
+                    getattr(active_req, "dspark_hidden_pp_slices", None) or {}
+                ).values():
+                    dynamic_dst = pp_slice.get("dynamic_dst", {})
+                    dspark_active_hidden_transfer_bytes += int(
+                        dynamic_dst.get("nbytes", 0)
+                    )
+                if int(getattr(active_req, "dspark_hidden_start", 0)) == 0:
+                    prefix_key = self._dspark_prefix_fingerprint(active_req.req)
+                    if prefix_key is not None:
+                        dspark_active_full_prefix_counts[prefix_key] += 1
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -1279,6 +1296,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
+                    continue
+
+                dtype_itemsize = torch.empty((), dtype=dspark_pool.dtype).element_size()
+                dspark_hidden_transfer_bytes = int(
+                    dspark_hidden_len
+                    * sum(int(x.get("slice_len", 0)) for x in pp_slices.values())
+                    * dtype_itemsize
+                )
+                if (
+                    dspark_hidden_transfer_queue_limit > 0
+                    and dspark_active_hidden_transfer_reqs
+                    >= dspark_hidden_transfer_queue_limit
+                ) or (
+                    dspark_hidden_transfer_queue_bytes > 0
+                    and dspark_active_hidden_transfer_reqs > 0
+                    and dspark_active_hidden_transfer_bytes
+                    + dspark_hidden_transfer_bytes
+                    > dspark_hidden_transfer_queue_bytes
+                ):
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    logger.debug(
+                        "Delay DSpark PD hidden prealloc behind active hidden "
+                        "transfers: rid=%s, hidden_len=%s, active_reqs=%s, "
+                        "req_limit=%s, active_bytes=%s, next_bytes=%s, "
+                        "bytes_limit=%s, transfer_queue=%s",
+                        decode_req.req.rid,
+                        dspark_hidden_len,
+                        dspark_active_hidden_transfer_reqs,
+                        dspark_hidden_transfer_queue_limit,
+                        dspark_active_hidden_transfer_bytes,
+                        dspark_hidden_transfer_bytes,
+                        dspark_hidden_transfer_queue_bytes,
+                        len(self.transfer_queue.queue),
+                    )
                     continue
 
                 dspark_hidden_dst_indices_by_pp = {}
@@ -1627,6 +1679,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and dspark_hidden_dst_indices_by_pp is not None
             ):
                 dspark_active_full_prefix_counts[dspark_prefix_key] += 1
+            if dspark_hidden_dst_indices_by_pp is not None:
+                dspark_active_hidden_transfer_reqs += 1
+                dspark_active_hidden_transfer_bytes += sum(
+                    int((pp_slice.get("dynamic_dst", {}) or {}).get("nbytes", 0))
+                    for pp_slice in (dspark_hidden_pp_slices or {}).values()
+                )
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
