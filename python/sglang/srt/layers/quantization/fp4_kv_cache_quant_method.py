@@ -36,8 +36,11 @@ class KVCacheAttentionPhase(str, Enum):
 
 
 class KVCacheAttentionAccessKind(str, Enum):
+    # KV cache is already in the dtype/layout expected by the attention backend.
     PLAIN = "plain"
+    # KV cache is stored quantized, then dequantized into a temporary workspace.
     DEQUANT_WORKSPACE = "dequant_workspace"
+    # Attention backend directly consumes FP4 KV cache storage and scales.
     NATIVE_FP4 = "native_fp4"
 
 
@@ -63,7 +66,7 @@ class KVCacheAttentionAccess:
     backend_matcher: KVCacheBackendMatcher
     storage_dtype: Optional[torch.dtype] = None
     attention_kv_dtype: Optional[torch.dtype] = None
-    scale_layout: Optional[str] = None
+    scale_recipe: Optional[str] = None
     workspace_dtype: Optional[torch.dtype] = None
 
     def matches(self, phase, backend_name: str, backend_tags: Iterable[str]) -> bool:
@@ -267,7 +270,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
                 KVCacheBackendMatcher(exact=frozenset({"flashinfer"})),
                 storage_dtype=torch.uint8,
                 attention_kv_dtype=torch.float8_e4m3fn,
-                scale_layout="nvfp4",
+                scale_recipe="nvfp4",
                 workspace_dtype=torch.float8_e4m3fn,
             ),
             KVCacheAttentionAccess(
@@ -276,7 +279,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
                 KVCacheBackendMatcher(exact=frozenset({"trtllm_mha"})),
                 storage_dtype=torch.uint8,
                 attention_kv_dtype=fp4_dtype,
-                scale_layout="nvfp4",
+                scale_recipe="nvfp4",
             ),
         )
 
@@ -495,7 +498,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
                 ),
                 storage_dtype=torch.uint8,
                 attention_kv_dtype=torch.float8_e4m3fn,
-                scale_layout="fp4_mx_block16",
+                scale_recipe="fp4_mx_block16",
                 workspace_dtype=torch.float8_e4m3fn,
             ),
             KVCacheAttentionAccess(
@@ -504,7 +507,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
                 KVCacheBackendMatcher(tags=frozenset({BACKEND_TAG_FP4_DEQUANT_DECODE})),
                 storage_dtype=torch.uint8,
                 attention_kv_dtype=torch.float8_e4m3fn,
-                scale_layout="fp4_mx_block16",
+                scale_recipe="fp4_mx_block16",
                 workspace_dtype=torch.float8_e4m3fn,
             ),
         )

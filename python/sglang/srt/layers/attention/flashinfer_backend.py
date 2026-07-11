@@ -357,7 +357,7 @@ class FlashInferAttnBackend(AttentionBackend):
             == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
         )
         self.is_nvfp4_kvcache = any(
-            access is not None and access.scale_layout == "nvfp4"
+            access is not None and access.scale_recipe == "nvfp4"
             for access in (self.prefill_kv_access, self.decode_kv_access)
         )
         self.dq_page_table = None

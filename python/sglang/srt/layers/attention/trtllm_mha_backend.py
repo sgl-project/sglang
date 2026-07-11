@@ -105,13 +105,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "trtllm_mha"
         )
+        self._require_decode_kv_access()
         self.decode_uses_native_fp4 = (
-            self.decode_kv_access is not None
-            and self.decode_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+            self.decode_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
         )
         self.is_nvfp4_kvcache = (
             self.decode_uses_native_fp4
-            and self.decode_kv_access.scale_layout == "nvfp4"
+            and self.decode_kv_access.scale_recipe == "nvfp4"
         )
 
         config = model_runner.model_config
@@ -185,17 +185,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+    def _require_decode_kv_access(self) -> None:
+        supported_kinds = {
+            KVCacheAttentionAccessKind.PLAIN,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        }
         if (
-            hasattr(torch, "float4_e2m1fn_x2")
-            and self.data_type == torch.float4_e2m1fn_x2
-            and not self.decode_uses_native_fp4
+            self.decode_kv_access is not None
+            and self.decode_kv_access.kind in supported_kinds
         ):
-            method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
-            available = self.kv_cache_quant_method.describe_attention_accesses("decode")
-            raise ValueError(
-                f"KV cache method {method_name!r} does not support decode with "
-                f"trtllm_mha. Available decode accesses: {available}."
-            )
+            return
+
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses("decode")
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support decode with "
+            f"trtllm_mha. Available decode accesses: {available}."
+        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:

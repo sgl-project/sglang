@@ -2430,11 +2430,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"{self.server_args.kv_cache_dtype.upper()} KV Cache might lead to an accuracy drop!"
                 )
             else:
-                logger.warning(
-                    "--kv-cache-dtype falls back to 'auto' because this torch "
-                    "version does not support torch.float4_e2m1fn_x2"
+                raise ValueError(
+                    f"--kv-cache-dtype={self.server_args.kv_cache_dtype} requires "
+                    "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
+                    "with CUDA 12.8+."
                 )
-                self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
