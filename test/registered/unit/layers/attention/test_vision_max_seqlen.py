@@ -20,7 +20,11 @@ def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):
         return q
 
     monkeypatch.setattr(vision, "_is_cuda", True)
-    monkeypatch.setattr(vision, "flash_attn_varlen_func", fake_flash_attn)
+    # This symbol is imported only on CUDA/MUSA hosts; inject the stub on the
+    # CPU CI path too so the backend-selection behavior stays unit-testable.
+    monkeypatch.setattr(
+        vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
+    )
 
     attention = vision.VisionFlash3Attention(use_data_parallel=True)
     q = torch.zeros(3, 1, 8)
