@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -1546,7 +1547,15 @@ class RowParallelLinear(LinearBase):
         with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+        # skip_all_reduce: explicit call-site override. Also honor
+        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
+        # the decoder — callers should not thread those flags into modules.
+        if (
+            self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
+        ):
             if self.use_dp_attention_reduce:
                 output = get_parallel().attn_tp_group.all_reduce(output_parallel)
             else:

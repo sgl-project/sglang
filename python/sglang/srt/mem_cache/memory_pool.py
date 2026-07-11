@@ -36,6 +36,11 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.cache_move import (
+    copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_tiled,
+    store_cache_4d,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -45,11 +50,6 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp import (
-    dcp_enabled,
-    get_attention_dcp_rank,
-    get_attention_dcp_world_size,
-)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
@@ -60,11 +60,6 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
-from sglang.srt.mem_cache.triton_ops.cache_move import (
-    copy_all_layer_kv_cache_func,
-    set_kv_buffer_prefix_valid_tiled,
-    store_cache_4d,
-)
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -73,6 +68,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -2834,10 +2830,9 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
-        if dcp_enabled():
-            valid_mask = (
-                loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
-            )
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
