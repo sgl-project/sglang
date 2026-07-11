@@ -8,6 +8,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -85,6 +86,16 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.offload_inflight = {}
 
     return manager, freed_indices
+
+
+def _make_release_batch(reqs):
+    batch = object.__new__(schedule_batch.ScheduleBatch)
+    batch.reqs = reqs
+    batch.req_to_token_pool = MagicMock()
+    batch.token_to_kv_pool_allocator = MagicMock()
+    batch.tree_cache = MagicMock()
+    batch.hisparse_coordinator = None
+    return batch
 
 
 class _FinishedEvent:
@@ -419,6 +430,71 @@ class TestReleaseFinishedReq(unittest.TestCase):
             )
 
         self.assertEqual(events, ["prepare", "offload", "release"])
+
+    def test_retract_decode_propagates_prepare_callback_to_release(self):
+        events = []
+        keep_req = _make_mock_req(0, 20, 20, rid=8)
+        retract_req = _make_mock_req(0, 20, 20, rid=9)
+        retract_req.offload_kv_cache.side_effect = lambda *args: events.append(
+            "offload"
+        )
+        batch = _make_release_batch([keep_req, retract_req])
+        batch.spec_algorithm = MagicMock()
+        batch.spec_algorithm.is_none.return_value = True
+        batch._get_decode_retraction_order = MagicMock(return_value=[0, 1])
+        batch.check_decode_mem = MagicMock(return_value=True)
+        batch.filter_batch = MagicMock()
+        for req in batch.reqs:
+            req.output_ids = []
+            req.sampling_params.max_new_tokens = 10
+
+        def prepare_kv_release(req):
+            self.assertIs(req, retract_req)
+            events.append("prepare")
+
+        with (
+            patch.object(
+                schedule_batch,
+                "release_kv_cache",
+                side_effect=lambda *args, **kwargs: events.append("release"),
+            ),
+            patch.object(schedule_batch, "evict_from_tree_cache"),
+        ):
+            retracted, _, aborted = batch.retract_decode(
+                SimpleNamespace(disaggregation_mode="decode"),
+                prepare_kv_release=prepare_kv_release,
+            )
+
+        self.assertEqual(retracted, [retract_req])
+        self.assertEqual(aborted, [])
+        self.assertEqual(events, ["prepare", "offload", "release"])
+
+    def test_retract_all_propagates_prepare_callback_to_release(self):
+        events = []
+        req = _make_mock_req(0, 20, 20, rid=10)
+        batch = _make_release_batch([req])
+
+        def prepare_kv_release(released_req):
+            self.assertIs(released_req, req)
+            events.append("prepare")
+
+        with (
+            patch.object(
+                schedule_batch,
+                "release_kv_cache",
+                side_effect=lambda *args, **kwargs: events.append("release"),
+            ),
+            patch.object(schedule_batch, "evict_from_tree_cache"),
+        ):
+            retracted = batch.retract_all(
+                SimpleNamespace(disaggregation_mode="decode"),
+                offload_kv=False,
+                prepare_kv_release=prepare_kv_release,
+            )
+
+        self.assertEqual(retracted, [req])
+        self.assertEqual(batch.reqs, [])
+        self.assertEqual(events, ["prepare", "release"])
 
     def test_offload_kv_cache_tracks_inflight_write_until_ack(self):
         manager, freed = _make_manager(pool_size=32, page_size=4)

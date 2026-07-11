@@ -1,7 +1,8 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from sglang.srt.managers import schedule_batch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -133,6 +134,51 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
         running_batch.release_req.assert_called_once()
+
+    def test_preemption_propagates_prepare_callback_to_release(self):
+        events = []
+        running_req = self.create_mock_req("run", 0, 50)
+        running_req.offload_kv_cache.side_effect = lambda *args: events.append(
+            "offload"
+        )
+        running_batch = object.__new__(schedule_batch.ScheduleBatch)
+        running_batch.reqs = [running_req]
+        running_batch.req_to_token_pool = MagicMock()
+        running_batch.token_to_kv_pool_allocator = self.mock_token_allocator
+        running_batch.tree_cache = self.mock_tree_cache
+        running_batch.hisparse_coordinator = None
+        running_batch.filter_batch = MagicMock()
+
+        def prepare_kv_release(req):
+            self.assertIs(req, running_req)
+            events.append("prepare")
+
+        adder = self.create_adder(
+            running_batch,
+            prepare_kv_release=prepare_kv_release,
+        )
+        self.mock_token_allocator.full_available_size.return_value = 50
+        self.mock_token_allocator.available_size.return_value = 50
+        new_req = self.create_mock_req("new", priority=1, max_new_tokens=49)
+
+        with (
+            patch.object(
+                schedule_batch,
+                "release_kv_cache",
+                side_effect=lambda *args, **kwargs: events.append("release"),
+            ),
+            patch.object(schedule_batch, "evict_from_tree_cache"),
+        ):
+            success = adder.preempt_to_schedule(
+                new_req,
+                SimpleNamespace(
+                    schedule_low_priority_values_first=False,
+                    disaggregation_mode="decode",
+                ),
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(events, ["prepare", "offload", "release"])
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
