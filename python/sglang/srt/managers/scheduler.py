@@ -42,7 +42,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -1139,8 +1139,11 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
+        ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            buffer_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -2624,7 +2627,12 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+                if self.dllm_config.first_done_first_out_mode:
+                    if not req.dllm_incomplete_ids:
+                        self.stash_chunked_request(req)
+                    self.req_to_token_pool.free(req)
+                else:
+                    self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
