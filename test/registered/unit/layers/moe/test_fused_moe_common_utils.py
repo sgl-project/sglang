@@ -51,3 +51,11 @@ def test_get_model_config_supports_kimi_vl():
         "block_shape": None,
         "architecture": "KimiVLForConditionalGeneration",
     }
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
