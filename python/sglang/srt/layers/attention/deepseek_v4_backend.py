@@ -619,6 +619,21 @@ class DeepseekV4AttnBackend(
         self.speculative_num_draft_tokens: int = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if self.speculative_num_draft_tokens is not None:
+            # Persistent target-verify metadata buffers. Allocated here (not
+            # lazily) so they are ordinary tensors: the first touch of a lazy
+            # buffer would inherit the caller's context, and a creation inside
+            # an inference_mode forward would forbid the in-place updates the
+            # graph-capture path performs outside inference mode.
+            num_reqs = self.req_to_token.shape[0]
+            self.extend_seq_lens_buffer = torch.full(
+                (num_reqs,),
+                self.speculative_num_draft_tokens,
+                **self.cuda_int32_kwargs,
+            )
+            self.extend_start_loc_buffer = torch.zeros(
+                num_reqs, **self.cuda_int32_kwargs
+            )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -863,23 +878,6 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=c128_compress_metadata,
         )
 
-    def _ensure_verify_bs_buffers(self) -> None:
-        if hasattr(self, "extend_seq_lens_buffer"):
-            return
-        num_reqs = self.req_to_token.shape[0]
-        # The first call may land inside an inference_mode forward (profile /
-        # warmup); escape it so graph capture can still write these buffers
-        # in-place outside inference mode.
-        with torch.inference_mode(False):
-            self.extend_seq_lens_buffer = torch.full(
-                (num_reqs,),
-                self.speculative_num_draft_tokens,
-                **self.cuda_int32_kwargs,
-            )
-            self.extend_start_loc_buffer = torch.zeros(
-                num_reqs, **self.cuda_int32_kwargs
-            )
-
     def init_forward_metadata_target_verify(
         self,
         max_seq_len: int,
@@ -897,7 +895,6 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu_list = (
                 seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
             )
-            self._ensure_verify_bs_buffers()
             if ragged_layout is None:
                 self.extend_seq_lens_buffer[:bs].fill_(
                     self.speculative_num_draft_tokens
