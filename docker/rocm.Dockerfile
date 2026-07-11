@@ -145,12 +145,12 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # Version pins — override with --build-arg to update
-ARG ROCM_VERSION="7.14.0rc1"
-ARG INDEX_URL="https://rocm.prereleases.amd.com/whl-multi-arch/"
+ARG ROCM_VERSION="7.15.0a20260710"
+ARG INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
 ARG PIP_EXTRA_INDEX_URL="https://rocm.prereleases.amd.com/whl-multi-arch/"
 ARG TORCH_VERSION="2.11.0"
 ARG TORCHVISION_VERSION="0.26.0"
-ARG TRITON_VERSION="3.7.1+git110cd8e2"
+ARG TRITON_VERSION="3.7.1+git0263a6a6"
 
 # ROCm SDK + PyTorch stack — single pip install, single index.
 RUN python3 -m pip install --no-cache-dir --pre \
@@ -187,7 +187,7 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 # Workaround: Pull latest (up to 0630) for gfx1250 support
 ENV AITER_COMMIT_DEFAULT="8815f4b56dbaf416a3370659b777839c70ff3bf9"
-ENV TRITON_COMMIT_DEFAULT="24cefad68d271d594d7d66d86a37e8ab5fe6dcbc"
+ENV TRITON_COMMIT_DEFAULT="c57bbbd8c1d83a8388baa508cf1286bfdad1695d"
 ENV MORI_COMMIT_DEFAULT="e31d426a13e96e1cbff96a1c904d291aefe8c46a"
 
 # ===============================
