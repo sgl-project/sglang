@@ -58,9 +58,6 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata impor
     ComputeDsparkWindowGather,
     ExpandPrefillCausally,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
-    build_block_seq_lens_causal as build_block_seq_lens_causal,
-)
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -1349,9 +1346,8 @@ class DeepseekV4AttnBackend(
             assert num_tokens_v >= len(out_cache_loc), (
                 f"ragged verify token-keyed graph requires the decode cuda-graph "
                 f"runner to supply out_cache_loc sized to graph_num_tokens "
-                f"({num_tokens_v}), got {len(out_cache_loc)}; the token-keyed "
-                "runner path is not yet wired (see ragged-cuda-graph-runner-routing "
-                "decision B / infra section 12.F)."
+                f"({num_tokens_v}), got {len(out_cache_loc)}; the decode graph "
+                "runner does not yet route token-keyed ragged captures."
             )
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,

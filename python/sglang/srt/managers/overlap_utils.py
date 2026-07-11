@@ -467,13 +467,11 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
-        confidence_seq_lens: Optional[torch.Tensor] = None,
     ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        del confidence_seq_lens
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)

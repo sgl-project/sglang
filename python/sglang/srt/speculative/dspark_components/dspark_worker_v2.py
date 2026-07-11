@@ -626,11 +626,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if on_publish is not None:
             if confidence is not None:
-                on_publish(
-                    accept.new_seq_lens,
-                    confidence=confidence,
-                    confidence_seq_lens=prefix_lens,
-                )
+                on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
 
