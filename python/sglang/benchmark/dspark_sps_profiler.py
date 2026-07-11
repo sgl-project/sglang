@@ -102,25 +102,13 @@ class SpsRow(msgspec.Struct, frozen=True):
     step_time: float
 
 
-class RecordSource(msgspec.Struct, frozen=True):
-    name: str
-    payload_key: str
-    enable_hint: str
-    step_time_ms: bool
-
-
-INFO_RECORD_SOURCE = RecordSource(
-    name="info",
-    payload_key="dspark_info_record",
-    enable_hint=(
-        "SGLANG_DSPARK_ENABLE_SPS_RECORD=1 (or SGLANG_DSPARK_DEBUG_DUMP="
-        "core,step_cpu_time) and SGLANG_RAGGED_VERIFY_MODE=static"
-    ),
-    step_time_ms=True,
+# Server-side per-step record feed: the DsparkInfoDumper 'core' +
+# 'step_cpu_time' components exported on /server_info.
+INFO_RECORD_PAYLOAD_KEY = "dspark_info_record"
+INFO_RECORD_ENABLE_HINT = (
+    "SGLANG_DSPARK_ENABLE_SPS_RECORD=1 (or SGLANG_DSPARK_DEBUG_DUMP="
+    "core,step_cpu_time) and SGLANG_RAGGED_VERIFY_MODE=static"
 )
-RECORD_SOURCES = {
-    INFO_RECORD_SOURCE.name: INFO_RECORD_SOURCE,
-}
 
 
 class ServerContext(msgspec.Struct, frozen=True):
@@ -133,7 +121,6 @@ class ServerContext(msgspec.Struct, frozen=True):
     cuda_graph_max_bs: Optional[int]
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
-    record_source: RecordSource
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -184,7 +171,6 @@ def run_profile(
     out: str,
     repeats: int,
     local_tokenizer_path: Optional[str],
-    recorder_source: str,
     fracs: Optional[list[float]],
 ) -> None:
     if get_tokenizer is None:
@@ -219,7 +205,6 @@ def run_profile(
     context = fetch_server_context(
         base_url=base_url,
         local_tokenizer_path=local_tokenizer_path,
-        record_source=RECORD_SOURCES[recorder_source],
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
@@ -362,7 +347,6 @@ def profile_all(
     repeats: int,
     self_check: bool,
     local_tokenizer_path: Optional[str],
-    recorder_source: str,
     fracs: Optional[list[float]],
     plot: bool,
 ) -> None:
@@ -373,7 +357,6 @@ def profile_all(
         out=out,
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
-        recorder_source=recorder_source,
         fracs=fracs,
     )
     fit_profile(
@@ -428,7 +411,6 @@ def fetch_server_context(
     *,
     base_url: str,
     local_tokenizer_path: Optional[str],
-    record_source: RecordSource,
     allowed_modes: tuple[str, ...] = ("static",),
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
@@ -453,27 +435,26 @@ def fetch_server_context(
     internal_states = info.get("internal_states") or []
     if not internal_states:
         raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
-    sps_payloads = [state.get(record_source.payload_key) for state in internal_states]
+    sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
     for rank_index, payload in enumerate(sps_payloads):
         if payload is None:
             raise ValueError(
-                f"DP rank {rank_index} reports no {record_source.payload_key}; "
-                f"launch the server with {record_source.enable_hint}."
+                f"DP rank {rank_index} reports no {INFO_RECORD_PAYLOAD_KEY}; "
+                f"launch the server with {INFO_RECORD_ENABLE_HINT}."
             )
         if payload.get("mode") not in allowed_modes:
             raise ValueError(
-                f"{record_source.payload_key}.mode must be one of {allowed_modes}, "
+                f"{INFO_RECORD_PAYLOAD_KEY}.mode must be one of {allowed_modes}, "
                 f"got {payload.get('mode')!r} on DP rank {rank_index}."
             )
-        if record_source is INFO_RECORD_SOURCE:
-            components = payload.get("components") or []
-            missing = {"core", "step_cpu_time"} - set(components)
-            if missing:
-                raise ValueError(
-                    f"DP rank {rank_index} {record_source.payload_key} is missing "
-                    f"component(s) {sorted(missing)}; launch with "
-                    f"{record_source.enable_hint}."
-                )
+        components = payload.get("components") or []
+        missing = {"core", "step_cpu_time"} - set(components)
+        if missing:
+            raise ValueError(
+                f"DP rank {rank_index} {INFO_RECORD_PAYLOAD_KEY} is missing "
+                f"component(s) {sorted(missing)}; launch with "
+                f"{INFO_RECORD_ENABLE_HINT}."
+            )
         if payload.get("simulate_acc_len") != REQUIRED_SIMULATE_ACC_LEN:
             raise ValueError(
                 f"DP rank {rank_index} reports simulate_acc_len="
@@ -487,11 +468,6 @@ def fetch_server_context(
     verify_num_draft_tokens = {
         int(payload["verify_num_draft_tokens"]) for payload in sps_payloads
     }
-    simulate_acc_lens = {float(payload["simulate_acc_len"]) for payload in sps_payloads}
-    if len(simulate_acc_lens) != 1:
-        raise RuntimeError(
-            f"DP ranks disagree on simulate_acc_len: {sorted(simulate_acc_lens)}."
-        )
     if len(verify_num_draft_tokens) != 1:
         raise RuntimeError(
             "DP ranks disagree on verify_num_draft_tokens: "
@@ -531,11 +507,10 @@ def fetch_server_context(
         tp_size=int(info.get("tp_size", 1) or 1),
         dp_size=dp_size,
         verify_num_draft_tokens=verify_num_draft_tokens.pop(),
-        simulate_acc_len=simulate_acc_lens.pop(),
+        simulate_acc_len=REQUIRED_SIMULATE_ACC_LEN,
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
-        record_source=record_source,
     )
 
 
@@ -598,16 +573,11 @@ def build_request_count_sweep(max_num_reqs: int) -> list[int]:
     return sweep
 
 
-def round_max_new_tokens(*, settings: RoundSettings, context: ServerContext) -> int:
-    commit_tokens_per_step = (
-        max(
-            0,
-            min(
-                round(context.simulate_acc_len - 1), context.verify_num_draft_tokens - 1
-            ),
-        )
-        + 1
-    )
+def round_max_new_tokens(*, settings: RoundSettings) -> int:
+    # simulate_acc_len is pinned to exactly 1.0 (enforced in
+    # fetch_server_context), so every step commits exactly the bonus token
+    # per request.
+    commit_tokens_per_step = 1
     steady_steps_budget = max(
         settings.min_steady_steps,
         math.ceil(settings.min_steady_seconds / STEP_TIME_FLOOR_SECONDS),
@@ -656,7 +626,7 @@ def run_one_round(
     frac: Optional[float] = None,
 ) -> Optional[RoundOutcome]:
     batch_size = batch_size_per_rank * context.dp_size
-    max_new_tokens = round_max_new_tokens(settings=settings, context=context)
+    max_new_tokens = round_max_new_tokens(settings=settings)
     if should_skip_due_to_max_running_requests(
         batch_size, context.skip_max_running_requests_threshold
     ) or should_skip_due_to_token_capacity(
@@ -673,9 +643,7 @@ def run_one_round(
     flush_cache(base_url=context.base_url)
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
-        for rows in fetch_rank_rows(
-            base_url=context.base_url, record_source=context.record_source
-        )
+        for rows in fetch_rank_rows(base_url=context.base_url)
     ]
 
     start_time = time.monotonic()
@@ -716,9 +684,7 @@ def run_one_round(
             settings.min_steady_seconds,
         )
 
-    rank_rows = fetch_rank_rows(
-        base_url=context.base_url, record_source=context.record_source
-    )
+    rank_rows = fetch_rank_rows(base_url=context.base_url)
     if len(rank_rows) != len(watermarks):
         raise RuntimeError(
             f"DP rank count changed mid-profile: {len(watermarks)} -> "
@@ -800,9 +766,7 @@ def wait_for_aligned_steps(
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL_SECONDS)
         try:
-            rank_rows = fetch_rank_rows(
-                base_url=context.base_url, record_source=context.record_source
-            )
+            rank_rows = fetch_rank_rows(base_url=context.base_url)
         except Exception:
             logger.warning("Polling /server_info failed; retrying.", exc_info=True)
             continue
@@ -886,37 +850,28 @@ def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
         )
 
 
-def fetch_rank_rows(
-    *, base_url: str, record_source: RecordSource
-) -> list[list[SpsRow]]:
+def fetch_rank_rows(*, base_url: str) -> list[list[SpsRow]]:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     internal_states = response.json().get("internal_states") or []
     rank_rows: list[list[SpsRow]] = []
     for state in internal_states:
-        payload = state.get(record_source.payload_key) or {}
+        payload = state.get(INFO_RECORD_PAYLOAD_KEY) or {}
         rows: list[SpsRow] = []
         for record in payload.get("records", []):
-            step_time = _row_step_time(record=record, record_source=record_source)
-            if step_time is None:
+            step_cpu_ms = record.get("step_cpu_ms")
+            if step_cpu_ms is None:
                 continue
             rows.append(
                 SpsRow(
                     forward_ct=int(record["forward_ct"]),
                     num_running_reqs=int(record["num_running_reqs"]),
                     num_verify_tokens=int(record["num_verify_tokens"]),
-                    step_time=step_time,
+                    step_time=float(step_cpu_ms) / 1000.0,
                 )
             )
         rank_rows.append(rows)
     return rank_rows
-
-
-def _row_step_time(*, record: dict, record_source: RecordSource) -> Optional[float]:
-    if not record_source.step_time_ms:
-        return float(record["step_time"])
-    value = record.get("step_cpu_ms")
-    return None if value is None else float(value) / 1000.0
 
 
 def postprocess_round(
@@ -1512,15 +1467,6 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Override the tokenizer path (defaults to the one reported by "
         "/server_info).",
     )
-    parser.add_argument(
-        "--recorder-source",
-        type=str,
-        choices=sorted(RECORD_SOURCES),
-        default=INFO_RECORD_SOURCE.name,
-        help="Server-side per-step record feed to read: 'info' (the "
-        "DsparkInfoDumper 'core'+'step_cpu_time' components via "
-        "SGLANG_DSPARK_DEBUG_DUMP).",
-    )
 
 
 def add_fit_args(parser: argparse.ArgumentParser) -> None:
@@ -1603,7 +1549,6 @@ def cli_main() -> None:
             out=args.out,
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
-            recorder_source=args.recorder_source,
             fracs=args.fracs,
         )
     elif args.command == "fit":
@@ -1623,7 +1568,6 @@ def cli_main() -> None:
             repeats=args.repeats,
             self_check=args.self_check,
             local_tokenizer_path=args.local_tokenizer_path,
-            recorder_source=args.recorder_source,
             fracs=args.fracs,
             plot=args.plot,
         )
