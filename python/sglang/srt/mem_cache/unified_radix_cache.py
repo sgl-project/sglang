@@ -778,6 +778,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
+        if is_insert:
+            self._backup_finished_prefix(req.last_node)
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1815,6 +1818,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and node.hit_count >= self.write_through_threshold
         ):
             self.write_backup(node)
+
+    def _backup_finished_prefix(self, last_node: UnifiedTreeNode) -> None:
+        if self.cache_controller is None:
+            return
+        chain = []
+        node = last_node
+        while node is not self.root_node and not node.backuped:
+            chain.append(node)
+            node = node.parent
+        for node in reversed(chain):
+            self._inc_hit_count(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         if (
