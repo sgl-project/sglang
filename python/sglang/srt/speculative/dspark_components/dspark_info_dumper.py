@@ -11,6 +11,7 @@ from typing import Callable, ContextManager, Iterator, Optional, Union
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,16 @@ class InfoSegment(str, Enum):
 
 INFO_DUMP_MAX_RECORDS = 200_000
 INFO_DUMP_MAX_STEP_CPU_SECONDS = 1.0
+
+
+def resolve_enabled_components() -> set[InfoComponent]:
+    """Components enabled via env: SGLANG_DSPARK_DEBUG_DUMP tokens, plus the
+    published SPS-profiling switch SGLANG_DSPARK_ENABLE_SPS_RECORD=1, which is
+    an alias for the core,step_cpu_time components the SPS table fit needs."""
+    components = resolve_components(envs.SGLANG_DSPARK_DEBUG_DUMP.get())
+    if envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get():
+        components |= {InfoComponent.CORE, InfoComponent.STEP_CPU_TIME}
+    return components
 
 
 def resolve_components(raw: tuple[str, ...]) -> set[InfoComponent]:

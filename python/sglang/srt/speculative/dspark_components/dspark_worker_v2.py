@@ -46,13 +46,10 @@ from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoSegment,
-    resolve_components,
+    resolve_enabled_components,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
-)
-from sglang.srt.speculative.dspark_components.dspark_sps import (
-    SpsDataRecorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     StsDataRecorder,
@@ -79,7 +76,6 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
     FinalizeAcceptLens,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -299,10 +295,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._forced_budget_frac: Optional[float] = None
 
-        self._sps_recorder: Optional[SpsDataRecorder] = None
-        if envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get():
-            self._sps_recorder = SpsDataRecorder()
-
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
         if (
@@ -336,7 +328,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._info_dumper = DsparkInfoDumper(
-            components=resolve_components(envs.SGLANG_DSPARK_DEBUG_DUMP.get()),
+            components=resolve_enabled_components(),
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_rank=self.tp_rank,
@@ -460,29 +452,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
-    def _recorder_verify_tokens(self, *, bs: int, verify_ids_2d) -> int:
-        forced_frac = self._forced_budget_frac
-        if (
-            forced_frac is None
-            or self._verify_planner.mode_value == RaggedVerifyMode.STATIC.value
-        ):
-            return int(verify_ids_2d.numel())
-        max_len = int(verify_ids_2d.shape[1])
-        budget = int(float(forced_frac) * bs * max_len)
-        return bs + min(budget, bs * (max_len - 1))
-
-    def dump_sps_records(self) -> Optional[dict]:
-        if self._sps_recorder is None:
-            return None
-        return {
-            "mode": self._verify_planner.mode_value,
-            "verify_num_draft_tokens": int(self.verify_num_draft_tokens),
-            "simulate_acc_len": (
-                self._simulate_acc_len if self._simulate_acc_len > 0 else None
-            ),
-            "records": self._sps_recorder.dump_records(),
-        }
-
     def dump_info_records(self) -> Optional[dict]:
         dumped = self._info_dumper.dump()
         if dumped is None:
@@ -519,8 +488,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
-            if self._sps_recorder is not None:
-                self._sps_recorder.note_non_decode_step()
             self._info_dumper.note_non_decode_step()
             if self._block_accept_recorder is not None:
                 self._block_accept_recorder.flush()
@@ -684,8 +651,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
-            if self._sps_recorder is not None:
-                self._sps_recorder.note_non_decode_step()
             self._info_dumper.note_non_decode_step()
             if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
@@ -765,25 +730,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
-
-        if self._sps_recorder is not None:
-            sps_dp_tier = self._dp_verify_tier_num_tokens(batch)
-            self._sps_recorder.observe_decode_step(
-                forward_ct=int(batch.forward_iter),
-                num_running_reqs=bs,
-                num_verify_tokens=self._recorder_verify_tokens(
-                    bs=bs, verify_ids_2d=verify_ids_2d
-                ),
-                verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
-                verify_tokens_dp_synced=(
-                    -1 if sps_dp_tier is None else int(sps_dp_tier)
-                ),
-                verify_tokens_graph_key=(
-                    layout.graph_num_tokens
-                    if layout is not None
-                    else int(verify_ids_2d.numel())
-                ),
-            )
 
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None

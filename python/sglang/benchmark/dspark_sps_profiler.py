@@ -109,23 +109,16 @@ class RecordSource(msgspec.Struct, frozen=True):
     step_time_ms: bool
 
 
-SPS_RECORD_SOURCE = RecordSource(
-    name="sps",
-    payload_key="dspark_sps_record",
-    enable_hint="SGLANG_DSPARK_ENABLE_SPS_RECORD=1 (and SGLANG_RAGGED_VERIFY_MODE=static)",
-    step_time_ms=False,
-)
 INFO_RECORD_SOURCE = RecordSource(
     name="info",
     payload_key="dspark_info_record",
     enable_hint=(
-        "SGLANG_DSPARK_DEBUG_DUMP=core,step_cpu_time "
-        "(and SGLANG_RAGGED_VERIFY_MODE=static)"
+        "SGLANG_DSPARK_ENABLE_SPS_RECORD=1 (or SGLANG_DSPARK_DEBUG_DUMP="
+        "core,step_cpu_time) and SGLANG_RAGGED_VERIFY_MODE=static"
     ),
     step_time_ms=True,
 )
 RECORD_SOURCES = {
-    SPS_RECORD_SOURCE.name: SPS_RECORD_SOURCE,
     INFO_RECORD_SOURCE.name: INFO_RECORD_SOURCE,
 }
 
@@ -1523,11 +1516,10 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "--recorder-source",
         type=str,
         choices=sorted(RECORD_SOURCES),
-        default=SPS_RECORD_SOURCE.name,
-        help="Which server-side per-step record feed to read: 'sps' (legacy "
-        "SpsDataRecorder via SGLANG_DSPARK_ENABLE_SPS_RECORD) or 'info' (the "
+        default=INFO_RECORD_SOURCE.name,
+        help="Server-side per-step record feed to read: 'info' (the "
         "DsparkInfoDumper 'core'+'step_cpu_time' components via "
-        "SGLANG_DSPARK_DEBUG_DUMP). Both yield the same steps_per_sec table.",
+        "SGLANG_DSPARK_DEBUG_DUMP).",
     )
 
 

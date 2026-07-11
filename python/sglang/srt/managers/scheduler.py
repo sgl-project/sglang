@@ -3813,9 +3813,6 @@ class Scheduler(
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
         if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
-            sps_record = self.draft_worker.dump_sps_records()
-            if sps_record is not None:
-                ret["dspark_sps_record"] = sps_record
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 ret["dspark_info_record"] = info_record

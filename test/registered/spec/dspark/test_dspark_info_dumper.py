@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
     DecodeStepObservation,
     DsparkInfoDumper,
@@ -9,6 +10,7 @@ from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
     _PendingStep,
     logger,
     resolve_components,
+    resolve_enabled_components,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -91,6 +93,27 @@ class TestResolveComponents(CustomTestCase):
     def test_unknown_component_raises(self):
         with self.assertRaises(ValueError):
             resolve_components(("core", "bogus"))
+
+    def test_sps_record_env_enables_core_and_cpu_timing(self):
+        """SGLANG_DSPARK_ENABLE_SPS_RECORD=1 is the published SPS-profiling
+        switch; it must keep enabling the components the table fit reads."""
+        with envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.override(True):
+            self.assertEqual(
+                resolve_enabled_components(),
+                {InfoComponent.CORE, InfoComponent.STEP_CPU_TIME},
+            )
+
+    def test_sps_record_env_unions_with_debug_dump(self):
+        with envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.override(True):
+            with envs.SGLANG_DSPARK_DEBUG_DUMP.override("reqs"):
+                self.assertEqual(
+                    resolve_enabled_components(),
+                    {
+                        InfoComponent.CORE,
+                        InfoComponent.STEP_CPU_TIME,
+                        InfoComponent.REQS,
+                    },
+                )
 
 
 class TestCoreAndCpuTiming(CustomTestCase):
