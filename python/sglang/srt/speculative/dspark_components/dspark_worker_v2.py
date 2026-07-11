@@ -160,6 +160,51 @@ def _round_nested_float_list(values):
     return [round(float(x), 6) for x in values]
 
 
+def _dspark_verify_window_debug_summary(
+    batch: ScheduleBatch,
+    verify_window,
+    model_runner,
+) -> dict:
+    req_to_token = model_runner.req_to_token_pool.req_to_token
+    req_pool_indices = batch.req_pool_indices.detach()
+    prefix_lens = batch.seq_lens.detach()
+    prefix_tail_cache_locs = []
+    prefix_tail_positions = []
+    req_pool_indices_cpu = req_pool_indices.cpu().tolist()
+    prefix_lens_cpu = prefix_lens.cpu().tolist()
+    req_to_token_width = int(req_to_token.shape[1])
+
+    for req_idx, prefix_len in zip(req_pool_indices_cpu, prefix_lens_cpu):
+        prefix_len = int(prefix_len)
+        tail_start = max(0, prefix_len - 8)
+        tail_end = min(prefix_len, req_to_token_width)
+        if tail_end <= tail_start:
+            prefix_tail_positions.append([])
+            prefix_tail_cache_locs.append([])
+            continue
+        positions = torch.arange(
+            tail_start,
+            tail_end,
+            device=req_to_token.device,
+            dtype=torch.long,
+        )
+        cache_locs = req_to_token[int(req_idx), positions]
+        prefix_tail_positions.append([int(x) for x in positions.cpu().tolist()])
+        prefix_tail_cache_locs.append(
+            [int(x) for x in cache_locs.detach().cpu().tolist()]
+        )
+
+    return {
+        "req_pool_indices": [int(x) for x in req_pool_indices_cpu],
+        "prefix_tail_positions": prefix_tail_positions,
+        "prefix_tail_cache_locs": prefix_tail_cache_locs,
+        "verify_positions": verify_window.positions_2d.detach().cpu().tolist(),
+        "verify_cache_locs": verify_window.verify_cache_loc_2d.detach()
+        .cpu()
+        .tolist(),
+    }
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -823,6 +868,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_VERIFY_WINDOW_SUMMARY=%s",
+                {
+                    "forward_ct": int(batch.forward_iter),
+                    "rids": [req.rid for req in batch.reqs],
+                    "prefix_lens": [
+                        int(x) for x in prefix_lens.detach().cpu().tolist()
+                    ],
+                    "summary": _dspark_verify_window_debug_summary(
+                        batch,
+                        verify_window,
+                        self.model_runner,
+                    ),
+                },
+            )
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._info_dumper.segment(InfoSegment.DRAFT):
@@ -1230,6 +1291,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         cache_loc_2d = req_to_token[
             req_pool_indices.view(-1, 1), positions_2d.clamp_min(0)
         ]
+        valid_cache_locs = cache_loc_2d.reshape(-1)[flat_mask]
         target_hidden = tail_hidden.reshape(bs * tail_len, -1)[flat_mask]
         if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
             logger.info(
@@ -1237,14 +1299,28 @@ class DSparkWorkerV2(BaseSpecWorker):
                 {
                     "path": "pd_decode_inject",
                     "rids": [req.rid for req in batch.reqs],
+                    "start_positions": [
+                        int(x) for x in start_pos.view(-1).detach().cpu().tolist()
+                    ],
                     "position_range": [min_pos, max_pos],
+                    "cache_loc_range": [
+                        int(valid_cache_locs.min().item()),
+                        int(valid_cache_locs.max().item()),
+                    ],
+                    "cache_loc_head": [
+                        int(x)
+                        for x in valid_cache_locs[: min(8, valid_cache_locs.numel())]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
                     "summary": _dspark_hidden_debug_summary(target_hidden),
                 },
             )
 
         self._kv_injector.inject_target_hidden(
             target_hidden=target_hidden,
-            cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
+            cache_loc=valid_cache_locs,
             positions=positions_2d.reshape(-1)[flat_mask],
         )
         draft_input.prefill_tail_hidden_states = None
