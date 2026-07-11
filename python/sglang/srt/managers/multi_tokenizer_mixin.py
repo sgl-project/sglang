@@ -599,6 +599,9 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+        import torch
+
+        torch.set_num_threads(1)
         super().__init__(
             server_args,
             port_args,
@@ -703,9 +706,7 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """
-    Get the main process ID.
-    """
+    """Get the main process ID."""
     return multiprocessing.current_process()._parent_pid
 
 

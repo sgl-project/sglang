@@ -20,7 +20,9 @@ from sglang.test.test_utils import (
 )
 
 
-class TestLLaDA2Mini(CustomTestCase):
+class TestBatchingFDFO(CustomTestCase):
+    """End-to-end dLLM coverage on the default First-Done-First-Out scheduler."""
+
     @classmethod
     def setUpClass(cls):
         cls.model = "inclusionAI/LLaDA2.0-mini"
@@ -38,6 +40,7 @@ class TestLLaDA2Mini(CustomTestCase):
             "flashinfer",
             "--dllm-algorithm",
             "LowConfidence",
+            "--dllm-fdfo",
             "--cuda-graph-bs",
             "1",
             "2",
@@ -73,7 +76,7 @@ class TestLLaDA2Mini(CustomTestCase):
         if is_in_amd_ci():
             self.assertGreater(metrics["output_throughput"], 80)
         else:
-            self.assertGreater(metrics["output_throughput"], 350)
+            self.assertGreater(metrics["output_throughput"], 450)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -83,7 +86,7 @@ class TestLLaDA2Mini(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (llada2-mini) with tp1\n"
+                f"### test_bs_1_speed (llada2-mini FDFO) with tp1\n"
                 f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():

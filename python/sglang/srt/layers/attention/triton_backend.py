@@ -14,7 +14,6 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import (
@@ -166,8 +165,8 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = getattr(model_runner, "dcp_size", 1)
-        self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         ) * self.dcp_size
@@ -1387,7 +1386,7 @@ class TritonAttnBackend(AttentionBackend):
                 "DCP Triton extend does not support sliding window"
             )
 
-        group = get_dcp_group()
+        group = get_parallel().dcp_group
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         total_tokens, local_heads, _ = q_local.shape
 
@@ -1712,7 +1711,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = self.forward_metadata.swa_attn_logits
 
         if self.dcp_size > 1:
-            group = get_dcp_group()
+            group = get_parallel().dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
