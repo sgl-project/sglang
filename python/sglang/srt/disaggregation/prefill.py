@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
+    DSparkHiddenTransferPlan,
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
@@ -784,63 +785,14 @@ class SchedulerDisaggregationPrefillMixin:
                 pp_slice["dst_indices"] = [int(x) for x in range(new_hidden_len)]
                 dynamic_dst = dict(pp_slice.get("dynamic_dst") or {})
                 if dynamic_dst:
-                    item_len = int(dynamic_dst.get("item_len", 0))
-                    old_chunks = list(dynamic_dst.get("row_chunks") or [])
-                    dynamic_dst["row_count"] = int(new_hidden_len)
-                    dynamic_dst["nbytes"] = int(new_hidden_len * item_len)
-                    if old_chunks and "ptr" in old_chunks[0]:
-                        new_chunks = []
-                        old_hidden_end = int(hidden_len)
-                        for old_chunk in old_chunks:
-                            chunk_start = int(old_chunk.get("row_start", 0))
-                            chunk_len = int(old_chunk.get("row_len", 0))
-                            chunk_end = chunk_start + chunk_len
-                            overlap_start = max(chunk_start, offset)
-                            overlap_end = min(chunk_end, old_hidden_end)
-                            if overlap_end <= overlap_start:
-                                continue
-                            new_chunks.append(
-                                {
-                                    "row_start": int(overlap_start - offset),
-                                    "row_len": int(overlap_end - overlap_start),
-                                    "ptr": int(old_chunk["ptr"])
-                                    + int(overlap_start - chunk_start) * item_len,
-                                    "nbytes": int(
-                                        (overlap_end - overlap_start) * item_len
-                                    ),
-                                }
-                            )
-                        dynamic_dst["row_chunks"] = new_chunks
-                        dynamic_dst["ptr"] = (
-                            int(new_chunks[0]["ptr"]) if new_chunks else 0
+                    pp_slice["dynamic_dst"] = (
+                        DSparkHiddenTransferPlan.trim_dynamic_dst(
+                            dynamic_dst,
+                            offset=offset,
+                            new_row_count=new_hidden_len,
+                            old_row_count=hidden_len,
                         )
-                    elif item_len > 0:
-                        dynamic_dst["ptr"] = int(dynamic_dst["ptr"]) + offset * item_len
-                        target_bytes = int(
-                            envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get()
-                        )
-                        if target_bytes > 0:
-                            rows_per_chunk = max(1, target_bytes // item_len)
-                            dynamic_dst["row_chunks"] = [
-                                {
-                                    "row_start": int(row_start),
-                                    "row_len": int(
-                                        min(rows_per_chunk, new_hidden_len - row_start)
-                                    ),
-                                }
-                                for row_start in range(
-                                    0, new_hidden_len, rows_per_chunk
-                                )
-                            ]
-                        else:
-                            dynamic_dst["row_chunks"] = [
-                                {"row_start": 0, "row_len": int(new_hidden_len)}
-                            ]
-                    else:
-                        dynamic_dst["row_chunks"] = [
-                            {"row_start": 0, "row_len": int(new_hidden_len)}
-                        ]
-                    pp_slice["dynamic_dst"] = dynamic_dst
+                    )
                 new_meta["pp_slice"] = pp_slice
                 pp_rank = str(pp_slice.get("pp_rank", self.ps.pp_rank))
                 pp_slices = dict(new_meta.get("pp_slices") or {})

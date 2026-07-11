@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import (
+    DSparkHiddenTransferPlan,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -621,24 +622,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # after its own prefix-cache hit; treating the first 2K tokens as the key
         # serializes those independent tail transfers and keeps prealloc high.
         return len(input_ids), tuple(int(x) for x in input_ids)
-
-    @staticmethod
-    def _dspark_hidden_row_chunks(row_count: int, row_bytes: int) -> List[dict]:
-        row_count = int(row_count)
-        row_bytes = int(row_bytes)
-        if row_count <= 0:
-            return []
-        target_bytes = int(envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get())
-        if target_bytes <= 0 or row_bytes <= 0:
-            return [{"row_start": 0, "row_len": row_count}]
-        rows_per_chunk = max(1, target_bytes // row_bytes)
-        return [
-            {
-                "row_start": int(row_start),
-                "row_len": int(min(rows_per_chunk, row_count - row_start)),
-            }
-            for row_start in range(0, row_count, rows_per_chunk)
-        ]
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -1456,9 +1439,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     cur_indices = [int(x) for x in range(dspark_hidden_len)]
                     slice_len = int(pp_slice.get("slice_len", 0))
                     item_len = int(slice_len * dtype_itemsize)
-                    row_chunks = self._dspark_hidden_row_chunks(
+                    transfer_plan = DSparkHiddenTransferPlan.build(
                         dspark_hidden_len, item_len
                     )
+                    row_chunks = transfer_plan.row_chunks
                     try:
                         (
                             chunk_buffers,
@@ -1513,13 +1497,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     dspark_hidden_dynamic_buffers_by_pp[pp_rank] = chunk_buffers
                     dspark_hidden_dst_indices_by_pp[pp_rank] = cur_indices
                     pp_slice["dst_indices"] = [int(x) for x in cur_indices]
-                    pp_slice["dynamic_dst"] = {
-                        "ptr": int(row_chunks[0]["ptr"]) if row_chunks else 0,
-                        "nbytes": int(dspark_hidden_len * item_len),
-                        "item_len": item_len,
-                        "row_count": int(dspark_hidden_len),
-                        "row_chunks": row_chunks,
-                    }
+                    pp_slice["dynamic_dst"] = transfer_plan.to_dynamic_dst(
+                        ptr=int(row_chunks[0]["ptr"]) if row_chunks else 0
+                    )
                 if dspark_dynamic_pool_busy:
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)

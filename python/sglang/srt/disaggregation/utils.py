@@ -4,8 +4,9 @@ import os
 import random
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type, overload
 
 import numpy as np
 import torch
@@ -287,6 +288,106 @@ class DSparkHiddenRowPool:
         if self.size <= 0:
             return [], [], []
         return [self.buffer.data_ptr()], [self.buffer.nbytes], [self.buffer[0].nbytes]
+
+
+@dataclass
+class DSparkHiddenTransferPlan:
+    """JSON-serializable row-chunk transfer plan for DSpark hidden state.
+
+    DSpark hidden is row-addressed by token position. The transfer plan groups
+    consecutive rows into registered receive pages/chunks, which is the unit
+    consumed by Mooncake/NIXL transfer blocks.
+    """
+
+    row_count: int
+    item_len: int
+    row_chunks: List[Dict[str, Any]]
+
+    @classmethod
+    def build(cls, row_count: int, item_len: int) -> "DSparkHiddenTransferPlan":
+        row_count = int(row_count)
+        item_len = int(item_len)
+        if row_count <= 0:
+            return cls(row_count=0, item_len=item_len, row_chunks=[])
+
+        target_bytes = int(envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get())
+        if target_bytes <= 0 or item_len <= 0:
+            return cls(
+                row_count=row_count,
+                item_len=item_len,
+                row_chunks=[{"row_start": 0, "row_len": row_count}],
+            )
+
+        rows_per_chunk = max(1, target_bytes // item_len)
+        return cls(
+            row_count=row_count,
+            item_len=item_len,
+            row_chunks=[
+                {
+                    "row_start": int(row_start),
+                    "row_len": int(min(rows_per_chunk, row_count - row_start)),
+                }
+                for row_start in range(0, row_count, rows_per_chunk)
+            ],
+        )
+
+    def to_dynamic_dst(self, ptr: int = 0) -> Dict[str, Any]:
+        return {
+            "ptr": int(ptr),
+            "nbytes": int(self.row_count * self.item_len),
+            "item_len": int(self.item_len),
+            "row_count": int(self.row_count),
+            "row_chunks": [dict(chunk) for chunk in self.row_chunks],
+        }
+
+    @staticmethod
+    def trim_dynamic_dst(
+        dynamic_dst: Dict[str, Any],
+        *,
+        offset: int,
+        new_row_count: int,
+        old_row_count: int,
+    ) -> Dict[str, Any]:
+        """Trim a dynamic dst plan when prefill cache removes leading rows."""
+
+        new_dynamic_dst = dict(dynamic_dst)
+        item_len = int(new_dynamic_dst.get("item_len", 0))
+        offset = int(offset)
+        new_row_count = int(new_row_count)
+        old_row_count = int(old_row_count)
+        old_chunks = [dict(chunk) for chunk in new_dynamic_dst.get("row_chunks") or []]
+
+        new_dynamic_dst["row_count"] = new_row_count
+        new_dynamic_dst["nbytes"] = int(new_row_count * item_len)
+
+        if old_chunks and "ptr" in old_chunks[0]:
+            new_chunks = []
+            for old_chunk in old_chunks:
+                chunk_start = int(old_chunk.get("row_start", 0))
+                chunk_len = int(old_chunk.get("row_len", 0))
+                chunk_end = chunk_start + chunk_len
+                overlap_start = max(chunk_start, offset)
+                overlap_end = min(chunk_end, old_row_count)
+                if overlap_end <= overlap_start:
+                    continue
+                new_chunks.append(
+                    {
+                        "row_start": int(overlap_start - offset),
+                        "row_len": int(overlap_end - overlap_start),
+                        "ptr": int(old_chunk["ptr"])
+                        + int(overlap_start - chunk_start) * item_len,
+                        "nbytes": int((overlap_end - overlap_start) * item_len),
+                    }
+                )
+            new_dynamic_dst["row_chunks"] = new_chunks
+            new_dynamic_dst["ptr"] = int(new_chunks[0]["ptr"]) if new_chunks else 0
+            return new_dynamic_dst
+
+        if item_len > 0:
+            new_dynamic_dst["ptr"] = int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+        plan = DSparkHiddenTransferPlan.build(new_row_count, item_len)
+        new_dynamic_dst["row_chunks"] = plan.row_chunks
+        return new_dynamic_dst
 
 
 class MetadataBuffers:
