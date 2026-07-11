@@ -168,10 +168,6 @@ class CUDAPiecewiseBackend:
                     "subgraph."
                 )
                 return entry.runnable(*args)
-            assert (
-                stream is not None
-            ), "PCG capture stream is not set, please check if runtime recompilation happened"
-
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)

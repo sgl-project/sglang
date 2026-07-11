@@ -160,11 +160,15 @@ def resolve_seqlens(
     return resolved_seqlens
 
 
-def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
-    """Return max segment length, caching it on a stable carrier so the
-    device->host sync (.item()) happens once per forward instead of once per layer.
+def resolve_max_seqlen(
+    source: torch.Tensor | SingletonCache | None, cu_seqlens: torch.Tensor
+) -> int:
+    """Return the maximum segment length, caching only on ``SingletonCache``.
+
+    Raw tensors have no mutable instance dictionary, so caching on them would
+    raise ``AttributeError``. They use the same calculation without a cache.
     """
-    if isinstance(source, SingletonCache) or isinstance(source, torch.Tensor):
+    if isinstance(source, SingletonCache):
         cached = getattr(source, "_max_seqlen", None)
         if cached is None:
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
