@@ -260,20 +260,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
 
     def _init_trtllm_mha_draft_attn_backend(self):
-        # Draft topk>1 expands the batch (B*topk decode with q_len=1), so this
-        # path does not need tree-shaped trtllm_mha metadata.
-        #
-        # Remaining gaps (orthogonal to enabling the draft backend):
-        #   1. target=triton + draft=trtllm_mha: page_size must be in
-        #      {16,32,64} (auto-promoted when draft backend is trtllm_mha).
-        #   2. target=trtllm_mha + topk>1: still rejected in speculative_hook
-        #      (target verify remains chain-only for trtllm_mha).
-        #   3. topk>1 + page_size>1 + SWA: eagle verify `move_kv_cache` without
-        #      enable_kv_cache_copy (orthogonal SWA issue).
-        #
-        # Note: target=trtllm_mha + num_draft_tokens in [5, 16] for Gemma4
-        # headDim=512 previously failed (flashinfer-ai/flashinfer#3343 /
-        # #3511); fixed in flashinfer >= 0.6.14 (#3393).
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
         return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=True)
