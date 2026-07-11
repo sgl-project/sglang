@@ -128,6 +128,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        # speculators-trained checkpoints use a gamma+1-wide draft block
+        # (anchor is a separate bonus/conditioning token) instead of
+        # DeepSpec's gamma-wide anchor-first block -- see the docstring on
+        # DSparkDraftConfig.speculators_convention (dspark_config.py) and on
+        # DraftBlockProposer (dspark_draft.py). Threaded through to both the
+        # eager (DraftBlockProposer) and CUDA-graph-folded (DsparkDraftSampler)
+        # draft-sampling paths below.
+        self._bonus_anchor = runtime_config.speculators_convention
+        if self.tp_rank == 0 and self._bonus_anchor:
+            logger.info(
+                "DSpark draft checkpoint uses the speculators bonus-anchor "
+                "convention (gamma+1-wide draft block, anchor excluded from "
+                "sampling)."
+            )
 
         if self.tp_rank == 0:
             logger.info(
@@ -197,6 +211,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            bonus_anchor=self._bonus_anchor,
         )
         self._verify_epilogue = None
         if (
@@ -351,6 +366,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            bonus_anchor=self._bonus_anchor,
         )
 
     def clear_cache_pool(self):

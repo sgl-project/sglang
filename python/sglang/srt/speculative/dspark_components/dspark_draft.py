@@ -56,11 +56,33 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 
 class DsparkDraftSampler:
+    """CUDA-graph-folded fast path for the all-greedy case.
 
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
+    ``bonus_anchor`` mirrors DraftBlockProposer's flag (see its docstring):
+    when set, the draft forward pass this sampler consumes was run over
+    ``gamma + 1`` query positions (anchor + gamma real draft slots, the
+    speculators convention) rather than ``gamma`` (DeepSpec's anchor-first
+    convention), and slot 0's hidden state/logits must be excluded from the
+    sampled draft tokens the same way DraftBlockProposer.propose excludes it
+    on the non-graph path.
+    """
+
+    def __init__(
+        self,
+        *,
+        model,
+        gamma,
+        max_bs,
+        device,
+        confidence_fn=None,
+        out=None,
+        bonus_anchor: bool = False,
+    ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.bonus_anchor = bool(bonus_anchor)
+        self.draft_width = self.gamma + 1 if self.bonus_anchor else self.gamma
         if out is not None:
             assert out.shape == (int(max_bs) * self.gamma,) and out.dtype == torch.int64
             self.out = out
@@ -76,20 +98,37 @@ class DsparkDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        bs = hidden_states.shape[0] // self.draft_width
+        hidden_3d = hidden_states.view(bs, self.draft_width, -1)
+        ids_2d = input_ids.view(bs, self.draft_width)
+        anchor = ids_2d[:, 0]
+        # Slot 0 is the anchor. Under bonus_anchor it's a conditioning-only
+        # token (untrained as a draft prediction); slots 1..gamma are the
+        # real draft positions. Under DeepSpec's anchor-first convention,
+        # slot 0 IS itself a trained draft prediction, so draft_width ==
+        # gamma and no slicing is needed -- the branch below is a no-op then.
+        # .contiguous(): the [:, 1:, :] slice breaks the (bs*draft_width, H)
+        # contiguous layout .view() below needs -- reshape() would silently
+        # copy anyway in that case, but .view() is used deliberately
+        # elsewhere in this class to catch accidental copies; stay consistent.
+        draft_hidden = (
+            hidden_3d[:, 1:, :].contiguous() if self.bonus_anchor else hidden_3d
+        )
+
+        base_logits, confidence_tap = self.model.compute_base_logits(
+            draft_hidden.reshape(bs * self.gamma, -1)
+        )
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
         draft_tokens, _ = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
+            hidden_states=draft_hidden,
             sampler=greedy_step_sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
+                draft_hidden=draft_hidden,
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
@@ -215,6 +254,31 @@ def sample_draft_block(
 
 
 class DraftBlockProposer:
+    """Runs the DSpark draft model's forward pass and samples its block.
+
+    ``bonus_anchor`` (from DSparkDraftConfig.speculators_convention, threaded
+    in by dspark_worker_v2.py) selects between two block layouts:
+
+    - False (DeepSpec, the original convention this class was written for):
+      the draft block is exactly ``gamma`` slots wide, anchor-first -- slot 0
+      IS the anchor token and is itself a real, trained draft prediction.
+      ``self.gamma`` (the real draft-token count used everywhere else in the
+      codebase -- verify window sizing, KV commit, accept-length accounting)
+      already equals the forward-pass width; no adjustment needed.
+    - True (speculators): the draft block is ``gamma + 1`` slots wide --
+      slot 0 is still the anchor token (the draft transformer must see it to
+      attend to), but it's an untrained conditioning token, not a draft
+      prediction, so its hidden state/logits are excluded before sampling.
+      Only this class's own internal forward-pass sizing changes
+      (``draft_width``); ``self.gamma`` itself, and everything downstream
+      that reads it, is unaffected.
+
+    Mirrors vLLM's validated `dspark_bonus_anchor`/`sample_from_anchor` fix
+    (vllm-project/vllm#47093) rather than unconditionally widening every
+    DSpark block the way an earlier draft of this fix did -- see the
+    docstring on ``speculators_convention`` in dspark_config.py.
+    """
+
     def __init__(
         self,
         *,
@@ -224,6 +288,7 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
+        bonus_anchor: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -232,6 +297,8 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self.bonus_anchor = bool(bonus_anchor)
+        self.draft_width = self.gamma + 1 if self.bonus_anchor else self.gamma
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -290,8 +357,14 @@ class DraftBlockProposer:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
             with self._base_logits_context():
+                # fwd.draft_hidden_3d is always exactly gamma slots wide
+                # (DraftBlockProposer._run_forward already excludes the
+                # anchor's own hidden state when bonus_anchor is set) --
+                # base_logits must come from the same gamma real draft
+                # slots, never from the wider raw_hidden that includes the
+                # anchor under bonus_anchor.
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
-                    fwd.raw_hidden
+                    fwd.draft_hidden_3d.reshape(bs * self.gamma, -1)
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
             draft_block = sample_draft_block(
@@ -344,17 +417,22 @@ class DraftBlockProposer:
         device: str,
         embed_module,
     ) -> DraftForwardResult:
-        gamma = self.gamma
+        draft_width = self.draft_width
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
+        # draft_width == gamma (DeepSpec, anchor-first) or gamma + 1
+        # (speculators, anchor is a separate bonus/conditioning token) -- see
+        # this class's docstring. positions_2d/verify_cache_loc_2d are always
+        # allocated verify_num_draft_tokens (= gamma + 1) wide, so slicing to
+        # draft_width is in-bounds either way.
         draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
+            (bs, draft_width), int(self._mask_token_id), dtype=torch.long, device=device
         )
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :gamma].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+        draft_positions = positions_2d[:, :draft_width].reshape(-1)
+        draft_cache_loc = verify_cache_loc_2d[:, :draft_width].reshape(-1)
 
         draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
@@ -363,9 +441,15 @@ class DraftBlockProposer:
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
+            draft_seq_lens_cpu = batch.seq_lens_cpu + draft_width
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:
+            # TODO(bonus_anchor): reserved_seq_lens_cpu/reserved_seq_lens_sum
+            # come pre-computed from elsewhere (CUDA-graph-padded reservation
+            # sizing) and are used as-is here, unlike the branch above. Not
+            # verified against bonus_anchor=True -- if this path is ever hit
+            # for a speculators checkpoint, confirm the reservation already
+            # accounts for draft_width (gamma + 1), not just gamma.
             draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
         else:
@@ -393,7 +477,20 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        # draft_hidden_3d is always exactly gamma slots wide -- the real
+        # draft-hidden states callers (propose(), base_logits computation)
+        # consume, regardless of which convention produced them. Under
+        # bonus_anchor, slot 0 of the draft_width-wide forward output is the
+        # anchor's own hidden state and is excluded here, not downstream.
+        raw_hidden_3d = raw_hidden.view(bs, draft_width, -1)
+        # .contiguous(): downstream consumers of DraftForwardResult.draft_hidden_3d
+        # (propose()'s base_logits reshape, DraftProposal.draft_hidden feeding
+        # confidence/KV-inject code) are not all guaranteed to use .reshape()
+        # over .view() -- keep this slice's output actually contiguous rather
+        # than relying on every consumer tolerating a non-contiguous view.
+        draft_hidden_3d = (
+            raw_hidden_3d[:, 1:, :].contiguous() if self.bonus_anchor else raw_hidden_3d
+        )
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,
