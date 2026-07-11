@@ -91,7 +91,11 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=not isinstance(req.finished_reason, FINISH_ABORT),
+                )
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -236,7 +240,11 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not isinstance(req.finished_reason, FINISH_ABORT),
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -320,7 +328,11 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not isinstance(req.finished_reason, FINISH_ABORT),
+                        )
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -850,6 +862,9 @@ class SchedulerBatchResultProcessor:
                     req.mamba_lazy_is_insert
                     if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
+                )
+                is_insert = is_insert and not isinstance(
+                    req.finished_reason, FINISH_ABORT
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
