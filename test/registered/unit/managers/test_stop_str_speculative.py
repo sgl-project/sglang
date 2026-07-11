@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -158,7 +159,7 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertIsNone(req.finished_len)
 
 
-class TestFinishLengthVsStopSpeculative(unittest.TestCase):
+class TestFinishLengthVsStopSpeculative(CustomTestCase):
     """A stop token/string inside a multi-token accepted run that crosses
     max_new_tokens must be honored (correct finish_reason + trim at the stop),
     not masked by the length limit. Guards the ordering/clamping between the
