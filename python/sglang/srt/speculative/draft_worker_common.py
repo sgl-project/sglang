@@ -91,19 +91,21 @@ def build_draft_tp_worker(
     )
 
     saved_server_args = get_server_args()
-    draft_worker = TpModelWorker(
-        server_args=draft_server_args,
-        gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        moe_ep_rank=moe_ep_rank,
-        pp_rank=0,
-        attn_cp_rank=attn_cp_rank,
-        moe_dp_rank=moe_dp_rank,
-        dp_rank=dp_rank,
-        nccl_port=nccl_port,
-        is_draft_worker=True,
-    )
-    get_context().set_server_args(saved_server_args)
+    try:
+        draft_worker = TpModelWorker(
+            server_args=draft_server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=0,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+        )
+    finally:
+        get_context().set_server_args(saved_server_args)
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
