@@ -788,12 +788,12 @@ def run_one_case(
         acc_length = -1
         last_gen_throughput = -1
         for internal_state in internal_states:
-            acc_length = (
-                internal_state.get("avg_spec_accept_length", None) or acc_length
-            )
-            last_gen_throughput = (
-                internal_state.get("last_gen_throughput", None) or last_gen_throughput
-            )
+            val_acc = internal_state.get("avg_spec_accept_length")
+            if val_acc is not None:
+                acc_length = val_acc
+            val_thr = internal_state.get("last_gen_throughput")
+            if val_thr is not None:
+                last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)

@@ -77,13 +77,16 @@ def build_draft_tp_worker(
         )
     )
     # Post-resolution ServerArgs rejects bare assignment; route the draft-copy
-    # adjustments through the audited mutation point. The backend fields make
-    # the draft worker explicit and self-contained (no further overrides);
-    # context_length keeps the draft aligned with the target.
+    # adjustments through the audited mutation point. Keep the resolved value
+    # on speculative_draft_attention_backend: downstream draft-worker logic
+    # keys on that field (backend selection in _get_attention_backend and the
+    # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
+    # would silently skip those paths. context_length keeps the draft aligned
+    # with the target.
     draft_server_args.override(
         "draft_worker.build",
         skip_tokenizer_init=True,
-        speculative_draft_attention_backend=None,
+        speculative_draft_attention_backend=draft_backend,
         prefill_attention_backend=None,
         decode_attention_backend=None,
         attention_backend=draft_backend,
@@ -91,19 +94,21 @@ def build_draft_tp_worker(
     )
 
     saved_server_args = get_server_args()
-    draft_worker = TpModelWorker(
-        server_args=draft_server_args,
-        gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        moe_ep_rank=moe_ep_rank,
-        pp_rank=0,
-        attn_cp_rank=attn_cp_rank,
-        moe_dp_rank=moe_dp_rank,
-        dp_rank=dp_rank,
-        nccl_port=nccl_port,
-        is_draft_worker=True,
-    )
-    get_context().set_server_args(saved_server_args)
+    try:
+        draft_worker = TpModelWorker(
+            server_args=draft_server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=0,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+        )
+    finally:
+        get_context().set_server_args(saved_server_args)
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner

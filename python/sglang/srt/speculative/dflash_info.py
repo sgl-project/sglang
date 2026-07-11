@@ -39,6 +39,7 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None

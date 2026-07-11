@@ -321,6 +321,12 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     }
   }
 
+  // A negative out_loc marks a slot with no KV write target (e.g. the -1
+  // sentinel from the full->SWA translation for out-of-window tokens or
+  // padded rows); skip the row instead of writing out of bounds. Checked
+  // here, not at the load, so the out_loc prefetch overlaps the norm above.
+  if (out_loc < 0) return;
+
   const int32_t page = out_loc >> kPageBits;
   const int32_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
