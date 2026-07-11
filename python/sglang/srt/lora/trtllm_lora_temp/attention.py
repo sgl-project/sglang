@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.lora.trtllm_lora_temp import (
     get_lora_side_stream,
     get_original_column_forward,
@@ -125,6 +126,7 @@ def row_parallel_lora_forward(
         self.base_layer.reduce_results
         and self.base_layer.tp_size > 1
         and not skip_all_reduce
+        and not should_skip_mlp_all_reduce()
     )
 
     if should_reduce:

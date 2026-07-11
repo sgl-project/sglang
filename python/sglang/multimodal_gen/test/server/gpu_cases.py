@@ -31,6 +31,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    PI05_ACTION_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
@@ -102,6 +103,16 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "pi05_action_http",
+        DiffusionServerArgs(
+            model_path="lerobot/pi05_base",
+        ),
+        PI05_ACTION_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
