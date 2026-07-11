@@ -57,19 +57,24 @@ void test() {
 
 #### Runtime Checking
 
-`RuntimeCheck` validates conditions at runtime. It accepts optional arguments for error reporting.
-If the check fails, these arguments are output to aid debugging.
-`RuntimeDeviceCheck` verifies the status of the last kernel launch.
+`CHECK_HOST` is the preferred runtime check: stream-style, and zero overhead when the
+check passes — the message expressions are only evaluated on failure.
+`RuntimeCheck` is the function-style alternative; note its message arguments are always
+evaluated, even when the check passes.
+`RuntimeDeviceCheck` verifies the status of the last kernel launch, and `CHECK_CUDA`
+is its stream-style equivalent for checking a `cudaError_t` with extra context.
 
 ```C++
 #include <sgl_kernel/utils.h>
 #include <sgl_kernel/utils.cuh>
 
 void test() {
+  CHECK_HOST(1 + 1 == 2) << 1 + 1 << " != " << 2;  // preferred
   host::RuntimeCheck(1 + 1 == 2, 1 + 1, " != ", 2);
   host::RuntimeDeviceCheck();
   // check the provided `cudaError_t`
   host::RuntimeDeviceCheck(cudaGetLastError());
+  CHECK_CUDA(cudaGetLastError()) << "after my_kernel launch";
 }
 
 ```
@@ -157,7 +162,7 @@ Write your CUDA kernel in [jit_kernel/csrc/add_constant.cuh](../../python/sglang
 ```cpp
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
-#include <sgl_kernel/utils.h>    // For div_ceil, RuntimeCheck
+#include <sgl_kernel/utils.h>    // For div_ceil, CHECK_HOST
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -195,8 +200,8 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   const size_t num_elements = N.unwrap();
   const size_t grid_size = div_ceil(num_elements, kBlockSize);
   const DLDevice device = device_.unwrap();
-  // some extra runtime checks using host::RuntimeCheck
-  RuntimeCheck(num_elements > 0, "We only support non-empty tensors, got num_elements = ", num_elements);
+  // some extra runtime checks using CHECK_HOST
+  CHECK_HOST(num_elements > 0) << "We only support non-empty tensors, got num_elements = " << num_elements;
 
   // 3. Launch the kernel. Error code will be automatically checked.
   LaunchKernel(grid_size, kBlockSize, device /*, dynamic_smem*/)(
@@ -275,8 +280,8 @@ and its key APIs.
 
 | Header | Namespace | Purpose |
 |--------|-----------|---------|
-| `utils.h` | `host` | Host-side essentials: `RuntimeCheck`, `Panic`, `div_ceil`, `irange` |
-| `utils.cuh` | `device` / `host` | Type aliases (`fp16_t`, `bf16_t`, ...), `SGL_DEVICE` macro, PDL helpers, `LaunchKernel`, `RuntimeDeviceCheck` |
+| `utils.h` | `host` | Host-side essentials: `RuntimeCheck`, `CHECK_HOST(cond) << ...`, `Panic`, `div_ceil`, `irange` |
+| `utils.cuh` | `device` / `host` | Type aliases (`fp16_t`, `bf16_t`, ...), `SGL_DEVICE` macro, PDL helpers, `LaunchKernel`, `RuntimeDeviceCheck`, `CHECK_CUDA(expr) << ...` |
 | `source_location.h` | (global) | Portable `std::source_location` wrapper for error reporting |
 | `runtime.cuh` | `host::runtime` | CUDA runtime queries: `get_blocks_per_sm`, `get_sm_count`, `get_cc_major`, `get_runtime_version`, `get_available_dynamic_smem_per_block` |
 
@@ -304,7 +309,7 @@ and its key APIs.
 
 | Header | Namespace | Purpose |
 |--------|-----------|---------|
-| `warp.cuh` | `device::warp` | `reduce_sum`, `reduce_max` via `__shfl_xor_sync` |
+| `warp.cuh` | `device::warp` | `reduce<Op, kNumThreads, kInner>` (SUM/MAX/MIN, grouped or inter-group) and `reduce_sum` / `reduce_max` / `reduce_min` wrappers via `__shfl_xor_sync` |
 | `cta.cuh` | `device::cta` | `reduce_max` across warps via shared memory |
 | `atomic.cuh` | `device::atomic` | `max` - atomic float max (CUDA + ROCm fallback) |
 

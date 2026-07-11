@@ -214,9 +214,7 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
-/// PTX pragma that lets the compiler spill registers into otherwise-unused
-/// shared memory instead of local memory. The radix kernels run at occupancy 2
-/// (32 regs/thread) and rely on this to avoid local-memory traffic.
+/// PTX pragma that lets the compiler spill registers into shared memory
 SGL_DEVICE void enable_smem_spilling() {
 #if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
   asm(".pragma \"enable_smem_spilling\";");
@@ -369,5 +367,12 @@ struct LaunchKernel {
   const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
 };
+
+// The empty-true-branch if/else form keeps a trailing `else` in user code
+// bound to the user's `if`, not to the macro's.
+#define CHECK_CUDA(COND)                                              \
+  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
+  } else                                                              \
+    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
