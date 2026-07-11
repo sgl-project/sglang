@@ -86,7 +86,7 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
-    from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
+    from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
     # When num_heads is large (e.g. with DP attention where attention_tp_size=1), the
