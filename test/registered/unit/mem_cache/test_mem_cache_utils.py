@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.evict_policy import (
@@ -304,6 +305,7 @@ class TestComputeNodeHashValues(unittest.TestCase):
         node = MagicMock()
         node.key = key
         node.parent = parent
+        node.event_hash_value = None
         if parent is not None:
             parent.hash_value = parent_hash_values
         return node
@@ -341,6 +343,42 @@ class TestComputeNodeHashValues(unittest.TestCase):
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             compute_node_event_hash_values(self._make_node(other), page_size=8),
         )
+
+    def test_cache_salt_event_hashes_are_memoized(self):
+        node = self._make_node(
+            _HashKey(array("q", range(1, 17)), cache_salt="tenant-a")
+        )
+        with patch(
+            "sglang.srt.mem_cache.utils.get_hash_str", wraps=get_hash_str
+        ) as mock_get_hash_str:
+            first = compute_node_event_hash_values(node, page_size=8)
+            second = compute_node_event_hash_values(node, page_size=8)
+
+        self.assertIs(first, second)
+        mock_get_hash_str.assert_called_once()
+
+    def test_cache_salt_event_hash_walk_is_iterative(self):
+        root = SimpleNamespace(
+            key=_HashKey(array("q")),
+            parent=None,
+            hash_value=[],
+            event_hash_value=None,
+        )
+        node = root
+        path = []
+        for token_id in range(1, 1102):
+            node = SimpleNamespace(
+                key=_HashKey(array("q", [token_id]), cache_salt="tenant-a"),
+                parent=node,
+                hash_value=None,
+                event_hash_value=None,
+            )
+            path.append(node)
+
+        result = compute_node_event_hash_values(node, page_size=1)
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(all(item.event_hash_value is not None for item in path))
 
     def test_parent_hash_is_used_only_when_parent_has_nonempty_key_and_hash(self):
         parent = MagicMock()

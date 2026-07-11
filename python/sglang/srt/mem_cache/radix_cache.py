@@ -74,6 +74,9 @@ class RadixKey:
         # Extra key for caller-defined cache classification.
         self.extra_key = extra_key
         # Cache salt is kept distinct so it cannot collide with extra_key.
+        # It namespaces the in-process radix tree and external KV events;
+        # external L3/remote storage keys remain token-only and are outside
+        # this contract.
         self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
@@ -254,6 +257,8 @@ class TreeNode:
         self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
 
@@ -477,7 +482,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             token_ids,
             req.extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=getattr(req, "cache_salt", None),
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
@@ -521,7 +526,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             token_ids,
             req.extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=getattr(req, "cache_salt", None),
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
@@ -716,6 +721,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
 
         return new_node
