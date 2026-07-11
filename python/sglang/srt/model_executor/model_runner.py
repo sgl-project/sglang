@@ -468,6 +468,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.spec_algorithm.is_dflash_or_dspark() and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
+            # Select target layers to capture for building draft context features.
             draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
