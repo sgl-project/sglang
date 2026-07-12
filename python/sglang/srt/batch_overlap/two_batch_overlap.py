@@ -23,6 +23,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_tbo_token_distribution_threshold,
+    is_decode_tbo_enabled,
     is_tbo_enabled,
 )
 from sglang.srt.layers.moe.token_dispatcher import (
@@ -430,13 +431,23 @@ class TboDPAttentionPreparer:
                 token_num_per_seq=token_num_per_seq,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
-            local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
-                (
-                    local_batch.forward_mode.is_extend()
-                    and not local_batch.forward_mode.is_target_verify()
+            local_can_run_tbo = (
+                (self.local_tbo_split_seq_index is not None)
+                and not (
+                    (
+                        local_batch.forward_mode.is_extend()
+                        and not local_batch.forward_mode.is_target_verify()
+                    )
+                    and enable_a2a_moe
+                    and (resolved_deepep_mode.is_low_latency())
                 )
-                and enable_a2a_moe
-                and (resolved_deepep_mode.is_low_latency())
+                and not (
+                    not is_decode_tbo_enabled()
+                    and (
+                        local_batch.forward_mode.is_decode()
+                        or local_batch.forward_mode.is_target_verify()
+                    )
+                )
             )
         else:
             self.local_tbo_split_seq_index = 0

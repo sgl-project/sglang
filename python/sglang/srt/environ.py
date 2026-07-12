@@ -607,6 +607,7 @@ class Envs:
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
+    SGLANG_DISABLE_TBO_FOR_DECODE = EnvBool(False)
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
