@@ -123,6 +123,12 @@ class LoRARegistry:
 
         return lora_ref.lora_id
 
+    async def get_lora_id(self, lora_name: str) -> Optional[str]:
+        """Return the ``lora_id`` of a registered adapter, or ``None``."""
+        async with self._registry_lock.reader_lock:
+            lora_ref = self._registry.get(lora_name, None)
+            return lora_ref.lora_id if lora_ref is not None else None
+
     async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
         """
         Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters

@@ -756,6 +756,22 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.upsert:
+                    # Refresh an already-registered adapter in place; if not
+                    # registered, fall through to the normal register path.
+                    existing_id = await self.lora_registry.get_lora_id(obj.lora_name)
+                    if existing_id is not None:
+                        obj.lora_id = existing_id
+                        result = (await self.update_lora_adapter_communicator(obj))[0]
+                        if result.success:
+                            self.lora_ref_cache[obj.lora_name] = LoRARef(
+                                lora_id=existing_id,
+                                lora_name=obj.lora_name,
+                                lora_path="__distributed__",
+                                pinned=obj.pinned,
+                            )
+                        return result
+
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__distributed__",
