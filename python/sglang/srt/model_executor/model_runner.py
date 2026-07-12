@@ -118,7 +118,7 @@ from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGra
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
@@ -132,7 +132,6 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
@@ -2845,7 +2844,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def apply_torch_tp(self):
-        apply_torch_tp(model=self.model, device=self.device, tp_size=self.tp_size)
+        model_parallel.apply_torch_tp(
+            model=self.model, device=self.device, tp_size=self.tp_size
+        )
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
