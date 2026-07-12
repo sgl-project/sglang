@@ -1739,7 +1739,8 @@ class SetInternalStateReqOutput(BaseReq):
 class PDFlipMigrationSourceStartReq(BaseReq):
     session_id: Optional[str] = None
     target_url: Optional[str] = None
-    max_reqs: Optional[int] = None
+    rids: Optional[List[str]] = None
+    include_waiting: bool = False
 
 
 @dataclass

@@ -278,42 +278,40 @@ class TestPDFlipMigrationAccounting(unittest.TestCase):
         output = Scheduler.start_pd_flip_migration_source(
             scheduler,
             PDFlipMigrationSourceStartReq(
-                session_id="session-1", target_url="http://target"
+                session_id="session-1",
+                target_url="http://target",
+                include_waiting=True,
             ),
         )
 
         self.assertFalse(output.success)
-        self.assertIn("refusing partial migration", output.message)
+        self.assertIn("remaining waiting requests are not migratable", output.message)
         self.assertIn("no-pool", output.message)
         self.assertFalse(hasattr(scheduler, "pd_flip_migration_session"))
 
-    def test_source_start_refuses_max_reqs_that_would_omit_eligible_requests(self):
+    def test_source_start_refuses_non_prefix_running_rids(self):
         scheduler = Scheduler.__new__(Scheduler)
         running_reqs = [self._waiting_req("running-1"), self._waiting_req("running-2")]
-        waiting_reqs = [
-            self._waiting_req("waiting-1"),
-            self._waiting_req("waiting-2"),
-            self._waiting_req("waiting-3"),
-        ]
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.running_batch = types.SimpleNamespace(reqs=running_reqs)
-        scheduler.waiting_queue = waiting_reqs
+        scheduler.waiting_queue = []
         scheduler.server_args = types.SimpleNamespace(disaggregation_bootstrap_port=8998)
         scheduler.ps = types.SimpleNamespace(attn_dp_rank=0, dp_rank=0)
         scheduler._pd_flip_start_source_entries = (
-            lambda reqs, manifests: self.fail("bounded partial migration should not start")
+            lambda reqs, manifests: self.fail("non-prefix migration should not start")
         )
 
         output = Scheduler.start_pd_flip_migration_source(
             scheduler,
             PDFlipMigrationSourceStartReq(
-                session_id="session-1", target_url="http://target", max_reqs=4
+                session_id="session-1",
+                target_url="http://target",
+                rids=["running-2"],
             ),
         )
 
         self.assertFalse(output.success)
-        self.assertIn("max_reqs=4", output.message)
-        self.assertIn("would omit 1 eligible requests", output.message)
+        self.assertIn("running-batch prefix", output.message)
         self.assertFalse(hasattr(scheduler, "pd_flip_migration_session"))
 
     def test_source_start_includes_eligible_waiting_reqs_in_manifest(self):
@@ -347,7 +345,9 @@ class TestPDFlipMigrationAccounting(unittest.TestCase):
         output = Scheduler.start_pd_flip_migration_source(
             scheduler,
             PDFlipMigrationSourceStartReq(
-                session_id="session-1", target_url="http://target"
+                session_id="session-1",
+                target_url="http://target",
+                include_waiting=True,
             ),
         )
 

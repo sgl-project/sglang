@@ -45,12 +45,18 @@ except ModuleNotFoundError:
     TraceSLOMonitor = _TRACE_SLO_MODULE.TraceSLOMonitor
 
 
-def _migration_source_start_payload(session_id: str, target_url: str) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"session_id": session_id, "target_url": target_url}
-    max_reqs = os.environ.get("PD_FLIP_MIGRATION_MAX_REQS")
-    if max_reqs:
-        payload["max_reqs"] = int(max_reqs)
-    return payload
+def _migration_source_start_payload(
+    session_id: str,
+    target_url: str,
+    rids: Optional[List[str]],
+    include_waiting: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "target_url": target_url,
+        "rids": None if rids is None else list(rids),
+        "include_waiting": include_waiting,
+    }
 
 
 JsonDict = Dict[str, Any]
@@ -595,7 +601,9 @@ class PDFlipController:
             "start_decode_migration_source",
             source,
             "/pd_flip/migration/source/start",
-            _migration_source_start_payload(session_id, target.worker_url),
+            _migration_source_start_payload(
+                session_id, target.worker_url, None, include_waiting=True
+            ),
         )
         manifests = _response_manifests(source_start)
         self._post_worker(
@@ -757,7 +765,9 @@ class PDFlipController:
                 "start_decode_migration_source",
                 source,
                 "/pd_flip/migration/source/start",
-                _migration_source_start_payload(session_id, target.worker_url),
+                _migration_source_start_payload(
+                    session_id, target.worker_url, None, include_waiting=True
+                ),
             )
             manifests = _response_manifests(source_start)
             self._post_worker(
@@ -1811,7 +1821,9 @@ class PDFlipController:
                 source,
                 "POST",
                 "/pd_flip/migration/source/start",
-                {"session_id": session_id, "target_url": target.worker_url},
+                _migration_source_start_payload(
+                    session_id, target.worker_url, None, include_waiting=True
+                ),
             ),
             self._worker_action(
                 "prepare_decode_migration_target",
