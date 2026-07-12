@@ -35,6 +35,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
+    get_mm_feature_pool_size_per_worker,
 )
 
 _is_cpu = is_cpu()
@@ -272,16 +273,19 @@ class BaseMultimodalProcessor(ABC):
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
             worker_num = self.server_args.tokenizer_worker_num
-            per_worker_pool_size = max(
-                MM_FEATURE_CACHE_SIZE // worker_num,
-                128 * 1024 * 1024,
+            per_worker_pool_size = get_mm_feature_pool_size_per_worker(
+                MM_FEATURE_CACHE_SIZE, worker_num
             )
+            total_pool_size = per_worker_pool_size * worker_num
             logger.info(
-                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
-                "(budget %.0f MiB / %d worker(s))",
+                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
+                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
+                "budget %.0f MiB).",
+                total_pool_size / (1024 * 1024),
+                self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
                 worker_num,
+                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,

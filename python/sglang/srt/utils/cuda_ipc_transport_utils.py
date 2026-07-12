@@ -23,6 +23,25 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
 
 
+def get_mm_feature_pool_size_per_worker(
+    total_pool_size: int, tokenizer_worker_num: int
+) -> int:
+    """Split the CUDA IPC feature-pool budget without exceeding it.
+
+    Each tokenizer worker owns a distinct CUDA allocation, even though all pools
+    are created on ``base_gpu_id``.  Therefore a minimum per-worker allocation
+    would make the aggregate HBM reservation larger than the configured budget.
+    Keep the configured value as a hard per-node cap and leave at most
+    ``tokenizer_worker_num - 1`` bytes unused when it is not evenly divisible.
+    """
+    if total_pool_size <= 0:
+        raise ValueError("total_pool_size must be positive")
+    if tokenizer_worker_num <= 0:
+        raise ValueError("tokenizer_worker_num must be positive")
+
+    return total_pool_size // tokenizer_worker_num
+
+
 # Cache for pool-level IPC handles on the consumer side.
 # Key: the pool CUDA IPC handle tuple. Value: opened UntypedStorage.
 _pool_storage_cache: dict = {}
