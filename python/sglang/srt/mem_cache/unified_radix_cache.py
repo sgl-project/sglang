@@ -871,10 +871,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if full_data.value is None:
                     break
                 matched = child.key.match(remaining_key, page_size=self.page_size)
-                value = full_data.value
                 if matched < len(child.key):
-                    value = value[:matched]
-                full_values.append(value)
+                    # Partial match: the divergence is inside this node, so we
+                    # cannot descend into its children (they extend past this
+                    # node's full key). Take the matched span and stop, mirroring
+                    # _match_prefix_helper.
+                    full_values.append(full_data.value[:matched])
+                    full_last_node = child
+                    break
+                full_values.append(full_data.value)
                 full_last_node = child
                 walk_node = child
                 remaining_key = remaining_key[matched:]
