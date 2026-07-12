@@ -120,6 +120,7 @@ def start_profile(
         try:
             torch.cuda.cudart().cudaProfilerStart()
             rank_print("CUDA Profiler started (nsys will begin capturing)")
+            return "cuda"
         except Exception as e:
             rank_print(f"Failed to start CUDA profiler: {e}")
         return None
@@ -177,7 +178,9 @@ def stop_profile(
         profiler.stop()
 
     if save_trace:
-        if profiler is not None:
+        if "CUDA_PROFILER" in profile_activities:
+            rank_print(f"CUDA profiler trace for {stage} completed")
+        elif profiler is not None:
             if trace_filename:
                 _save_profile_trace_results(
                     profiler, profile_activities, trace_filename
@@ -186,8 +189,6 @@ def stop_profile(
                 rank_print(
                     f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
                 )
-        if "CUDA_PROFILER" in profile_activities:
-            rank_print(f"CUDA profiler trace for {stage} completed")
 
 
 @dataclasses.dataclass
