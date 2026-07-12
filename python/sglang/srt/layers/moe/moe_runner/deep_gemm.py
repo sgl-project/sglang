@@ -933,49 +933,32 @@ def _varlen_deep_gemm_silu_mul_quant(
     del D_2
     G = D // group_size
 
-    # oai-swiglu (gemm1_alpha) stays on the Triton kernels until v3 grows an
-    # activation-kind axis. Fused UE8M0 pack needs 4 groups per packed int32
-    # (the G%4 and D guards).
+    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until v3 grows an
+    # activation-kind axis. The output_scale dtype picks the schedule: packed
+    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
+    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
     if gemm1_alpha is not None:
         assert (
             swiglu_limit is None
         ), "swiglu_limit and gemm1_alpha are mutually exclusive"
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
-        down_input = torch.empty(
-            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
-        )
-        if (
-            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and num_real_tokens is not None
-            and G % 4 == 0
-            and D % (group_size * 4) == 0
-        ):
-            from sglang.kernels.ops.moe.ep_moe_kernels import (
-                silu_and_mul_masked_post_quant_packed_fwd,
-            )
-
-            down_input_scale_packed = torch.empty(
-                (E, G // 4, N), device=hidden_states_device, dtype=torch.int32
-            )
-            silu_and_mul_masked_post_quant_packed_fwd(
-                gateup_output,
-                down_input,
-                down_input_scale_packed,
-                group_size,
-                masked_m,
-                num_real_tokens=num_real_tokens,
-                topk=topk,
-                gemm1_alpha=gemm1_alpha,
-                gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
-            )
-            return down_input, down_input_scale_packed.transpose(-1, -2)
-
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
 
+        use_packed = (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and num_real_tokens is not None
+            and G % 4 == 0
+            and D % (group_size * 4) == 0
+        )
+        down_input = torch.empty(
+            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+        )
         down_input_scale = torch.empty(
-            (E, N, G), device=hidden_states_device, dtype=torch.float32
+            (E, G // 4, N) if use_packed else (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.int32 if use_packed else torch.float32,
         )
         silu_and_mul_masked_post_quant_fwd(
             gateup_output,
@@ -986,7 +969,11 @@ def _varlen_deep_gemm_silu_mul_quant(
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+            num_real_tokens=num_real_tokens,
+            topk=topk,
         )
+        if use_packed:
+            down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
     # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
