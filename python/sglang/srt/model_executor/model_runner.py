@@ -127,6 +127,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    check_quantized_moe_compatibility,
     init_lplb_solvers,
     prepare_moe_topk,
 )
@@ -184,9 +185,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_bool_env_var,
     init_cublas,
-    is_hip,
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
@@ -211,7 +210,6 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -224,51 +222,6 @@ elif current_platform.is_out_of_tree():
 
 
 logger = logging.getLogger(__name__)
-
-
-def check_quantized_moe_compatibility(
-    *,
-    model_config: ModelConfig,
-    tp_size: int,
-    moe_ep_size: int,
-    moe_dp_size: int,
-) -> None:
-    if (
-        quantization_config := getattr(
-            model_config.hf_config, "quantization_config", None
-        )
-    ) is not None and (
-        weight_block_size := quantization_config.get("weight_block_size", None)
-    ) is not None:
-        weight_block_size_n = weight_block_size[0]
-
-        if tp_size % moe_ep_size != 0:
-            raise ValueError(
-                f"tp_size {tp_size} must be divisible by ep_size {moe_ep_size}"
-            )
-        moe_tp_size = tp_size // moe_ep_size // moe_dp_size
-
-        moe_intermediate_size = getattr(
-            model_config.hf_text_config, "moe_intermediate_size", None
-        )
-        if moe_intermediate_size is None:
-            return
-
-        if moe_intermediate_size % moe_tp_size != 0:
-            raise ValueError(
-                f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size})."
-            )
-
-        if (
-            not envs.SGLANG_SHARED_EXPERT_TP1.get()
-            and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
-            and not _use_aiter
-        ):
-            raise ValueError(
-                f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                f"where moe_tp_size is equal to tp_size ({tp_size}) divided by ep_size ({moe_ep_size}). "
-                f"You can fix this by setting arguments `--tp` and `--ep` correctly."
-            )
 
 
 @dataclass
