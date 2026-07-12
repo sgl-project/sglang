@@ -30,10 +30,8 @@ def _moe_align_small_numel_kernel(
     num_experts,  # E + 1 (the +1 offset convention's bucket count)
     block_size,
     numel,
-    max_num_tokens_padded,
     NP: tl.constexpr,  # power-of-2 >= numel
-    NE: tl.constexpr,  # power-of-2 >= num_experts
-    NB: tl.constexpr,  # power-of-2 >= max blocks (= cdiv(max_num_tokens_padded, block_size))
+    NB: tl.constexpr,  # power-of-2 >= max blocks used
     USE_GDC: tl.constexpr = False,
 ):
     """Single-CTA moe_align for tiny batches with MANY experts.
@@ -41,16 +39,24 @@ def _moe_align_small_numel_kernel(
     The CUDA small-batch kernel is gated to num_experts <= 64 (its shared
     memory grows as O(threads x experts)), so bs=1 decode on wide-expert MoEs
     (e.g. 513 experts, 45 pairs) always paid the generic two-kernel path.
-    This variant replaces both launches for numel <= NP with one program,
-    reproducing the reference semantics exactly:
+    This variant replaces both launches for numel <= NP with one program.
 
+    Everything works on the PAIR axis ([NP, NP] pairwise comparisons plus a
+    rank-0 representative per bucket) -- an expert-axis formulation (histogram
+    / cumsum over ~1k buckets) is ~3x more single-SM work and measured slower
+    than the two-kernel path it replaces.
+
+    Reference semantics reproduced:
     - "+1 offset" convention: expert -1 (EP-filtered) maps to bucket 0 and its
       blocks get expert_ids = -1 (skipped by fused_moe's filter_expert);
-    - every bucket is padded to a block_size multiple, cumsum over buckets;
-    - sorted_token_ids is pre-filled with `numel` over the whole buffer;
+    - every bucket is padded to a block_size multiple, offsets in bucket order;
+    - pad slots inside [0, num_tokens_post_pad) hold `numel`.
+    Intended deviations, both invisible to fused_moe:
     - intra-bucket order is stable in pair index (the reference's atomicAdd
-      order is scheduling-dependent; fused_moe's output is invariant to it
-      since every pair writes its own row).
+      order is scheduling-dependent; every pair writes its own output row);
+    - sorted_token_ids beyond num_tokens_post_pad is left unwritten (the
+      reference pre-fills the whole buffer; consumers only read below the
+      published total).
     """
     if USE_GDC:
         # Consumer side of the PDL'd router top-k; trigger immediately so the
@@ -60,56 +66,55 @@ def _moe_align_small_numel_kernel(
 
     offs_p = tl.arange(0, NP)
     mask_p = offs_p < numel
-    # Out-of-range bucket for padded lanes: never counted, never scattered.
     ids = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=-2)
-    bucket = tl.where(mask_p, ids + 1, num_experts)
+    # Padded lanes get an out-of-range bucket and are masked out everywhere.
+    bucket = tl.where(mask_p, (ids + 1).to(tl.int32), num_experts)
 
-    # Per-bucket counts (histogram over NE bins; lanes >= num_experts unused).
-    counts = tl.histogram(bucket, NE)  # [NE] int32
-    offs_e = tl.arange(0, NE)
-    mask_e = offs_e < num_experts
-    counts = tl.where(mask_e, counts, 0)
+    # Pairwise stats: stable rank within the bucket and bucket population.
+    same = (
+        (bucket[None, :] == bucket[:, None]) & mask_p[None, :] & mask_p[:, None]
+    )
+    earlier = offs_p[None, :] < offs_p[:, None]
+    rank = tl.sum((same & earlier).to(tl.int32), axis=1)  # [NP]
+    cnt = tl.sum(same.to(tl.int32), axis=1)  # [NP], own-bucket population
+    padded_cnt = ((cnt + block_size - 1) // block_size) * block_size
+    is_rep = (rank == 0) & mask_p  # one representative pair per bucket
 
-    # Pad each bucket to a block_size multiple; inclusive cumsum -> offsets.
-    padded = ((counts + block_size - 1) // block_size) * block_size
-    cum_incl = tl.cumsum(padded, axis=0)  # [NE]
-    excl = cum_incl - padded
-    total = tl.max(tl.where(mask_e, cum_incl, 0), axis=0)
+    # Bucket-ordered exclusive offsets: sum the padded counts of every
+    # representative with a strictly smaller bucket id.
+    smaller_rep = (bucket[None, :] < bucket[:, None]) & is_rep[None, :]
+    excl = tl.sum(smaller_rep.to(tl.int32) * padded_cnt[None, :], axis=1)  # [NP]
+
+    total = tl.sum(tl.where(is_rep, padded_cnt, 0), axis=0)
     tl.store(num_tokens_post_pad_ptr, total.to(tl.int32))
 
-    # Pre-fill the whole sorted buffer with `numel` (reference behavior).
-    n_fill_iters = (max_num_tokens_padded + NP - 1) // NP
-    for it in range(n_fill_iters):
+    # expert_ids per used block: representative r owns blocks
+    # [excl[r], excl[r] + padded_cnt[r]); the written id is bucket - 1
+    # (bucket 0 = filtered -> -1).
+    offs_b = tl.arange(0, NB)
+    block_start = offs_b * block_size
+    in_range = (
+        (block_start[:, None] >= excl[None, :])
+        & (block_start[:, None] < (excl + padded_cnt)[None, :])
+        & is_rep[None, :]
+    )
+    eid = tl.sum(in_range.to(tl.int32) * (bucket[None, :] - 1), axis=1)
+    tl.store(expert_ids_ptr + offs_b, eid.to(tl.int32), mask=block_start < total)
+
+    # Fill the used region's pad slots with `numel`, then scatter the real
+    # pair indices over them. The barrier is required: fill and scatter run on
+    # different warps of this CTA, and a scatter store must not be overtaken
+    # by a later-warp fill store to the same address.
+    n_fill = (total + NP - 1) // NP
+    for it in range(n_fill):
         f_offs = it * NP + offs_p
         tl.store(
             sorted_token_ids_ptr + f_offs,
             tl.full([NP], 0, tl.int32) + numel,
-            mask=f_offs < max_num_tokens_padded,
+            mask=f_offs < total,
         )
-
-    # expert_ids per used block: bucket j owns blocks [excl[j], cum_incl[j]);
-    # written id is j - 1 (bucket 0 = filtered -> -1).
-    offs_b = tl.arange(0, NB)
-    block_start = offs_b * block_size
-    # For each block, its bucket = #buckets with cum_incl <= block_start.
-    j = tl.sum(
-        (cum_incl[None, :] <= block_start[:, None]) & mask_e[None, :], axis=1
-    )
-    tl.store(
-        expert_ids_ptr + offs_b,
-        (j - 1).to(tl.int32),
-        mask=block_start < total,
-    )
-
-    # Scatter: stable rank of each pair within its bucket.
-    same_bucket_before = (bucket[None, :] == bucket[:, None]) & (
-        offs_p[None, :] < offs_p[:, None]
-    )
-    rank = tl.sum(same_bucket_before.to(tl.int32), axis=1)
-    excl_of_pair = tl.sum(
-        tl.where(offs_e[None, :] == bucket[:, None], excl[None, :], 0), axis=1
-    )
-    pos = excl_of_pair + rank
+    tl.debug_barrier()
+    pos = excl + rank
     tl.store(sorted_token_ids_ptr + pos, offs_p.to(tl.int32), mask=mask_p)
 
 
@@ -187,14 +192,18 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
-    # Tiny-batch, many-experts fast path (bs=1 decode on wide-expert MoEs):
-    # one single-CTA triton launch replaces the generic align + count_and_sort
-    # pair. The CUDA small-batch kernel only covers num_experts <= 64 (its
-    # smem grows as O(threads x experts)), so e.g. 513-expert decode always
-    # paid two launches here. PDL-chained on sm90+ (consumer of the router
-    # top-k, early trigger for the fused_moe up-GEMM).
+    # Tiny-batch fast path (bs=1 decode): one single-CTA triton launch
+    # replaces the generic align + count_and_sort pair. The CUDA small-batch
+    # kernel only covers num_experts <= 64 (its smem grows as
+    # O(threads x experts)), so e.g. 513-expert decode always paid two
+    # launches here. The pair-axis kernel has no expert-count limit, but its
+    # [NP, NP] pairwise tensors grow quadratically: NP=64 fits in registers
+    # (~4 us, on par with the CUDA pair), while NP=256 spills to local memory
+    # and measured ~230 us/launch -- hence the hard numel <= 64 gate.
+    # PDL-chained on sm90+ (consumer of the router top-k, early trigger for
+    # the fused_moe up-GEMM).
     num_buckets = num_experts + 1
-    if _is_cuda and topk_ids.numel() <= 256 and num_buckets + 1 <= 1024:
+    if _is_cuda and topk_ids.numel() <= 64:
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
         )
@@ -206,11 +215,9 @@ def moe_align_block_size(
             num_buckets,
             block_size,
             topk_ids.numel(),
-            max_num_tokens_padded,
             NP=triton.next_power_of_2(max(topk_ids.numel(), 2)),
-            NE=triton.next_power_of_2(num_buckets + 1),
             NB=triton.next_power_of_2(max(max_num_m_blocks, 2)),
-            num_warps=8,
+            num_warps=4,
             **pdl_kwargs,
         )
         return sorted_ids, expert_ids, num_tokens_post_pad
