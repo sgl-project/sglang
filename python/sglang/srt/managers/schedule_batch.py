@@ -1019,6 +1019,8 @@ class Req(ReqDllmMixin):
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
+        # Number of optimistic prefill forward passes started. preserved across retracts.
+        self.prefill_attempt_count = 0
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
@@ -1497,6 +1499,8 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
+        self.temp_input_token_ids_logprobs_val = None
+        self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -1605,6 +1609,7 @@ class Req(ReqDllmMixin):
             f"input_len={len(self.origin_input_ids)}, "
             f"cached_input_len={self.cached_tokens}, "
             f"output_len={len(self.output_ids)}, "
+            f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
         )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")

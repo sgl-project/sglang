@@ -2441,9 +2441,9 @@ class ServerArgs:
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
     ] = 1
-    optimistic_prefill_retries: A[
+    optimistic_prefill_attempts: A[
         int,
-        "Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        "Number of optimistic prefill forward passes that skip the bootstrap wait.",
     ] = 0
 
     # -------------------------------------------------------------------------
@@ -6382,21 +6382,21 @@ class ServerArgs:
 
         # Handle optimistic prefill validation
         if (
-            self.optimistic_prefill_retries > 0
+            self.optimistic_prefill_attempts > 0
             and self.disaggregation_mode == "prefill"
         ):
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
             elif self.enable_hierarchical_cache:
                 logger.warning("Optimistic prefill does not support hierarchical cache")
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
             elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
                     "Optimistic prefill does not support models that use "
                     "mamba radix cache."
                 )
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
 
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
