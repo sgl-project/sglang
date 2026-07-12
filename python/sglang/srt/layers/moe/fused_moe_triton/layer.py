@@ -306,7 +306,13 @@ class FusedMoE(torch.nn.Module):
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
-            and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and (
+                isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+                # The FP8 block-scale kernel also supports do_finalize=False;
+                # deferring finalize folds it into the shared-expert add and
+                # skips the symmetric-output workaround copy (flashinfer#2703).
+                or type(self.quant_method).__name__ == "Fp8MoEMethod"
+            )
         )
         print_info_once(
             "FlashInfer TRTLLM MoE deferred finalize is "

@@ -682,6 +682,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     )
     use_shuffled_weight = quant_info.use_mxfp8
 
+    # FlashInfer supports do_finalize=False for the FP8 block-scale kernel
+    # too; deferring finalize folds the finalize kernel into the shared-
+    # expert add (moe_finalize_fuse_shared) and skips the symmetric-output
+    # workaround copy (flashinfer#2703).
+    defer_finalize = (
+        _deferred_finalize_enabled.get()
+        and not use_routed_topk
+        and quant_info.block_quant
+        and not quant_info.use_mxfp8
+        and TopKOutputChecker.format_is_bypassed(topk_output)
+    )
+
     if quant_info.block_quant:
         assert quant_info.weight_block_k is not None
         assert quant_info.w13_weight_scale_inv is not None
@@ -700,6 +712,52 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states, quant_info.weight_block_k, column_major_scales=True
             )
             a_sf_t = a_sf.t()
+
+        if defer_finalize:
+            from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+            result = trtllm_fp8_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=correction_bias,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights_scale=quant_info.w2_weight_scale_inv,
+                num_experts=quant_info.global_num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=quant_info.intermediate_size,
+                local_expert_offset=quant_info.local_expert_offset,
+                local_num_experts=quant_info.local_num_experts,
+                routed_scaling_factor=(
+                    runner_config.routed_scaling_factor
+                    if runner_config.routed_scaling_factor is not None
+                    else 1.0
+                ),
+                routing_method_type=routing_method_type,
+                use_shuffled_weight=use_shuffled_weight,
+                do_finalize=False,
+                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                fp8_quantization_type=int(fp8_quantization_type),
+                activation_type=quant_info.activation_type,
+            )
+            gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
+            # Same flashinfer#3595 workaround as the FP4 path: the buffer is
+            # sized from routing_logits dtype but always holds bf16 weights.
+            if expert_weights.dtype == torch.float32:
+                n, k = expert_weights.shape
+                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+            return StandardCombineInput(
+                hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
+                    gemm2_out=gemm2_out,
+                    expert_weights=expert_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    top_k=topk_config.top_k,
+                )
+            )
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
