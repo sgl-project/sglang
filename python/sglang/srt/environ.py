@@ -750,7 +750,9 @@ class Envs:
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # Mamba
-    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    # Unset (None) so mamba2_state_dtype() can fall back to the model's own
+    # dtype instead of always forcing bfloat16.
+    SGLANG_MAMBA_CONV_DTYPE = EnvStr(None)
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
 
     # Unified Radix Tree
