@@ -3,32 +3,80 @@ name: PR Test (MLX)
 on:
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      # target_stage is the job id (e.g. stage-b-e2e-test-mlx), distinct from
+      # the run_suite.py suite name it dispatches (e.g. stage-b-e2e-mlx).
+      target_stage:
+        description: "Select a stage to run from dropdown (leave empty for auto-detect)"
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - stage-a-unit-test-mlx
+          - stage-b-e2e-test-mlx
 
 concurrency:
   group: pr-test-mlx-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
-  mlx-unit-test:
-    # Label-gated on 'apple-silicon', reusing the repo's run-ci label-gate mechanism
-    # (pr-test-rust.yml). The gate keys on the PR's current label set, so any
-    # event on a labeled PR re-runs the tests and a later unrelated label can't
-    # mask a prior result. The non-pull_request clause covers push / dispatch.
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true'
+        || steps.filter.outputs.sgl_kernel == 'true'
+        || inputs.target_stage != '' }}
+      main_package: ${{ steps.filter.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # Ignored on pull_request; workflow_dispatch has no PR base without it.
+          base: main
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/pyproject_other.toml"
+              - "test/**/!(*.md)"
+              - ".github/workflows/pr-test-mlx.yml"
+            sgl_kernel:
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - ".github/workflows/pr-test-mlx.yml"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  stage-a-unit-test-mlx:
+    needs: [check-changes, pr-gate]
+    # !cancelled() lets dispatch past a skipped pr-gate; the pull_request
+    # path still requires pr-gate success, keeping the run-ci gate intact.
     if: |
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'apple-silicon')
+      !cancelled() && (
+        (needs.pr-gate.result == 'success' &&
+          (needs.check-changes.outputs.main_package == 'true' ||
+           needs.check-changes.outputs.sgl_kernel == 'true')) ||
+        (github.event_name == 'workflow_dispatch' &&
+         inputs.target_stage == 'stage-a-unit-test-mlx')
+      )
     runs-on: macos-26
     timeout-minutes: 60
     env:
       SGLANG_IS_IN_CI: true
-      # use_mlx() needs this var (and mlx importable); without it the profiler
-      # takes the MPS branch and the MLX capture path goes untested.
+      # use_mlx() needs this; without it the profiler takes the MPS branch.
       SGLANG_USE_MLX: 1
-      # Forbid HF downloads so the model-free guarantee is enforced, not assumed.
+      # Forbid HF downloads to enforce the model-free guarantee.
       HF_HUB_OFFLINE: 1
     steps:
       - name: Checkout code
@@ -54,14 +102,11 @@ jobs:
         timeout-minutes: 30
         run: |
           test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
-          # Swap in the Apple Silicon project metadata, then install the srt_mps
-          # extra (mlx, mlx-lm, runtime_common, torch) into an isolated uv venv.
-          # The all_mps diffusion chain is not needed here.
+          # Swap in the Apple Silicon pyproject; srt_mps skips the all_mps diffusion chain.
           rm -f python/pyproject.toml
           mv python/pyproject_other.toml python/pyproject.toml
           uv venv
-          uv pip install -e "python[srt_mps]"
-          uv pip install pytest
+          uv pip install -e "python[srt_mps,test]"
 
       - name: Report MLX / torch versions
         run: |
@@ -71,28 +116,69 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
-          # Model-free MLX unit tests via pytest, like MUSA's unit-test jobs
-          # (its model and server suites use run_suite.py). None load a model:
-          # signature contracts, mocked Metal capture, dummy ServerArgs patching,
-          # stub concurrency-cap resolution, and quant-config dicts.
-          uv run python -m pytest -v \
-            test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
-            test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
-            test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
-            test/registered/unit/hardware_backend/mlx/test_max_running_requests.py \
-            "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
+          uv run python test/run_suite.py --hw mlx --suite stage-a-unit-test-mlx
+
+  stage-b-e2e-test-mlx:
+    needs: [check-changes, pr-gate]
+    # Manual-only: no self hosted Apple Silicon runner is generally available; hosted runners are too small for e2e.
+    if: |
+      !cancelled() && inputs.target_stage == 'stage-b-e2e-test-mlx'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 120
+    env:
+      SGLANG_IS_IN_CI: true
+      SGLANG_USE_MLX: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
+
+      - name: Verify Apple Silicon runner
+        run: |
+          echo "uname -m: $(uname -m)"
+          python3 -c "import platform; assert platform.machine()=='arm64', platform.machine(); print('machine:', platform.machine(), 'system:', platform.system())"
+
+      - name: Install dependencies (MLX / srt_mps extra)
+        timeout-minutes: 30
+        run: |
+          test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
+          rm -f python/pyproject.toml
+          mv python/pyproject_other.toml python/pyproject.toml
+          uv venv --python 3.11
+          uv pip install -e "python[srt_mps,test]"
+
+      # Needs a warm HF cache or network and roughly 24 GB of unified memory.
+      - name: Run MLX e2e smoke tests
+        timeout-minutes: 90
+        run: |
+          uv run python test/run_suite.py --hw mlx --suite stage-b-e2e-mlx
 
   pr-test-mlx-finish:
-    needs: [mlx-unit-test]
+    needs:
+      [
+        pr-gate,
+        check-changes,
+        stage-a-unit-test-mlx,
+        stage-b-e2e-test-mlx,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check dependent job status
+      - name: Check all dependent job statuses
         run: |
-          result="${{ needs.mlx-unit-test.result }}"
-          echo "mlx-unit-test: $result"
-          if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-            echo "The MLX unit-test job failed."
-            exit 1
-          fi
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
           echo "All jobs completed successfully"

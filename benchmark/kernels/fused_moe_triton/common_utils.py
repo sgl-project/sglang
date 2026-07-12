@@ -95,6 +95,7 @@ def get_model_config(
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (

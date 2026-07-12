@@ -11,21 +11,21 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
-)
-from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
+from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferAttnBackend,
+    FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -714,12 +714,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             # Query-side max length, sourced from the host-resident extend lengths
             # (sync-free); for plain prefill these equal the full seq lens.
-            # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
-            # Python's max() returns a 0-d tensor, but flashinfer expects an int.
-            max_q = max(forward_batch.extend_seq_lens_cpu)
-            metadata.max_seq_len_q = (
-                int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
-            )
+            metadata.max_seq_len_q = int(max(forward_batch.extend_seq_lens_cpu))
             if (
                 forward_batch.extend_prefix_lens_cpu is not None
                 and any(forward_batch.extend_prefix_lens_cpu)

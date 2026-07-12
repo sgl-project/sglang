@@ -4,8 +4,14 @@ from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    format_expert_location_layout,
+    format_expert_location_layout_diff,
+    get_global_expert_location_metadata,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -78,13 +84,22 @@ class EPLBManager:
         )
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
-        for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
+        all_update_layer_ids = [
+            layer_id for chunk in update_layer_ids_chunks for layer_id in chunk
+        ]
+        self._log_rebalance_layout_before_update(
+            expert_location_metadata,
+            update_layer_ids=all_update_layer_ids,
+        )
+        for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
             self._model_runner.update_expert_location(
                 expert_location_metadata,
-                update_layer_ids=update_layer_ids,
+                update_layer_ids=chunk_layer_ids,
             )
+
+        self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
         msg = f"[EPLBManager] rebalance end"
         if enable_timing:
@@ -114,6 +129,56 @@ class EPLBManager:
         )
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
+
+    def _should_log_expert_location_metadata(self) -> bool:
+        return (
+            self._model_runner.tp_rank == 0
+            and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get()
+        )
+
+    def _log_rebalance_layout_before_update(
+        self,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
+    ):
+        if not self._should_log_expert_location_metadata():
+            return
+
+        old_expert_location_metadata = get_global_expert_location_metadata()
+        logger.info(
+            "[EPLBManager] rebalance layout before:\n%s",
+            format_expert_location_layout(
+                old_expert_location_metadata,
+                layer_ids=update_layer_ids,
+            ),
+        )
+        logger.info(
+            "[EPLBManager] rebalance layout target:\n%s",
+            format_expert_location_layout(
+                new_expert_location_metadata,
+                layer_ids=update_layer_ids,
+            ),
+        )
+        logger.info(
+            "[EPLBManager] rebalance layout diff:\n%s",
+            format_expert_location_layout_diff(
+                old_expert_location_metadata,
+                new_expert_location_metadata,
+                layer_ids=update_layer_ids,
+            ),
+        )
+
+    def _log_rebalance_layout_after_update(self, update_layer_ids: List[int]):
+        if not self._should_log_expert_location_metadata():
+            return
+
+        logger.info(
+            "[EPLBManager] rebalance layout after:\n%s",
+            format_expert_location_layout(
+                get_global_expert_location_metadata(),
+                layer_ids=update_layer_ids,
+            ),
+        )
 
 
 def _chunk_list(items: List, chunk_size):
