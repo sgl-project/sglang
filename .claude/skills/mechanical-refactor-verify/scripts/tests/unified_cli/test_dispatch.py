@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 from conftest import _git
 from mechanical_refactor import main
 
@@ -141,7 +142,9 @@ def test_verify_passes_a_chain_whose_every_proof_passes(
     assert (proof / "chain_report.md").exists()
 
 
-def test_verify_fails_the_chain_when_a_proof_fails(repo: Path, tmp_path: Path) -> None:
+def test_verify_fails_the_chain_when_a_proof_fails(
+    repo: Path, tmp_path: Path
+) -> None:
     """verify exits non-zero when a provable commit's proof reports a residual."""
     base, move_sha = _move_chain(repo)
     proof = tmp_path / "proof"
