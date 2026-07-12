@@ -117,7 +117,7 @@ if TYPE_CHECKING:
 
 
 def ragged_verify_full_mode_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    if not spec_algorithm.is_dspark():
+    if not spec_algorithm.supports_ragged_verify():
         return False
     try:
         from sglang.srt.speculative.ragged_verify import (

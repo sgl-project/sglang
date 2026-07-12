@@ -125,6 +125,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_ragged_verify(self) -> bool:
+        """Whether this algorithm's verify step may carry a RaggedVerifyLayout
+        (per-request verify lengths); gates the token-bucket-keyed verify
+        graphs in the decode cuda graph runner."""
+        return self.is_dspark()
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no

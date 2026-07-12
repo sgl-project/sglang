@@ -91,6 +91,9 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
+    def supports_ragged_verify(self) -> bool:
+        return False
+
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True
