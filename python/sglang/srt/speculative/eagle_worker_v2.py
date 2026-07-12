@@ -383,6 +383,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
         # Initialize decode attention backend
