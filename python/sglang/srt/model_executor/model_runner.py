@@ -585,7 +585,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_weight_exporter(self):
-        self.weight_exporter = WeightExporter(_model_runner=self)
+        self.weight_exporter = WeightExporter(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            gpu_id=self.gpu_id,
+            get_model_path=lambda: self.model_config.model_path,
+            get_model=lambda: self.model,
+        )
 
     def init_msprobe(self):
         # Init the msprobe
