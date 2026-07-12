@@ -742,10 +742,17 @@ def latency_test_run_once(
         )
 
     model_runner.synchronize()
+    # Measure the transient activation memory of the prefill forward: reset the
+    # CUDA high-water mark, record the steady-state allocation (weights + KV
+    # pool), then read the peak after extend. peak - steady is the activation
+    # delta -- the number sequence parallelism is meant to shrink.
+    torch.cuda.reset_peak_memory_stats()
+    steady_mem = torch.cuda.memory_allocated()
     tic = time.perf_counter()
     next_token_ids, _, batch = model_runner.extend(reqs)
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
+    prefill_peak_mem = torch.cuda.max_memory_allocated()
 
     if enable_profile_prefill:
         stop_profile(
@@ -762,8 +769,16 @@ def latency_test_run_once(
     rank_print(
         f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
     )
+    rank_print(
+        f"Prefill. peak memory: {prefill_peak_mem / 2**30:6.3f} GiB, "
+        f"activation delta: {(prefill_peak_mem - steady_mem) / 2**30:6.3f} GiB"
+    )
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
+    measurement_results["prefill_peak_memory_gib"] = prefill_peak_mem / 2**30
+    measurement_results["prefill_activation_delta_gib"] = (
+        prefill_peak_mem - steady_mem
+    ) / 2**30
 
     decode_latencies = []
     # Determine profiling start step and end step
