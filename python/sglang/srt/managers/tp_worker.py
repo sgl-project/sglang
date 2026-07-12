@@ -169,10 +169,7 @@ class BaseTpWorker(ABC):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
-        from sglang.srt.model_executor.model_runner import ModelRunner
-
-        success, message = ModelRunner.update_weights_from_tensor(
-            self.model_runner.weight_updater,
+        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
