@@ -875,6 +875,41 @@ class TestSourceFinishAndAbort(unittest.TestCase):
 
 @unittest.skipIf(RUNTIME_IMPORT_ERROR is not None, str(RUNTIME_IMPORT_ERROR))
 class TestMonotonicRelaySequence(unittest.IsolatedAsyncioTestCase):
+    def test_relay_post_requires_and_sends_admin_bearer(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.server_args = types.SimpleNamespace(admin_api_key="secret")
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self):
+                return b'{"success": true}'
+
+        def urlopen(request, timeout):
+            captured["authorization"] = request.get_header("Authorization")
+            return Response()
+
+        with patch("urllib.request.urlopen", side_effect=urlopen):
+            result = manager._pd_flip_post_relay_output(
+                "http://source", "s", "r0", 1, {"rid": "r0"}
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["authorization"], "Bearer secret")
+
+        manager.server_args.admin_api_key = None
+        with patch("urllib.request.urlopen") as send:
+            result = manager._pd_flip_post_relay_output(
+                "http://source", "s", "r0", 1, {"rid": "r0"}
+            )
+        self.assertFalse(result["success"])
+        send.assert_not_called()
+
     async def test_relay_drops_duplicate_and_older_output_sequences(self):
         manager = TokenizerManager.__new__(TokenizerManager)
         manager.pd_flip_last_relay_seq_by_key = {("s", "r0"): 0}
@@ -938,6 +973,35 @@ class TestMonotonicRelaySequence(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(relayed)
         self.assertEqual(captured["output_seq"], 8)
         self.assertEqual(manager.pd_flip_output_relay_baseline[("s", "r0")], 8)
+
+    async def test_failed_relay_stays_in_ordered_outbox_until_ack(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.pd_flip_output_relay_targets = {("s", "r0"): "http://source"}
+        manager.pd_flip_output_relay_baseline = {("s", "r0"): 7}
+        manager.pd_flip_output_relay_outbox = {}
+        manager.pd_flip_output_relay_retry_tasks = {}
+        manager._pd_flip_batch_output_payload = lambda output, index, rid: {"rid": rid}
+        results = iter(({"success": False}, {"success": True}))
+        manager._pd_flip_post_relay_output = lambda *args: next(results)
+        manager._pd_flip_ensure_relay_retry = lambda key: None
+        output = types.SimpleNamespace(
+            finished_reasons=["stop"],
+            pd_flip_session_ids=["s"],
+            pd_flip_output_seqs=[8],
+        )
+
+        with patch(
+            "asyncio.to_thread", new=AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        ):
+            self.assertTrue(
+                await manager._pd_flip_maybe_relay_output(output, 0, "r0")
+            )
+            self.assertEqual(manager.pd_flip_output_relay_baseline[("s", "r0")], 7)
+            self.assertIn(8, manager.pd_flip_output_relay_outbox[("s", "r0")])
+            await manager._pd_flip_flush_relay_key(("s", "r0"))
+
+        self.assertNotIn(("s", "r0"), manager.pd_flip_output_relay_outbox)
+        self.assertNotIn(("s", "r0"), manager.pd_flip_output_relay_targets)
 
 
 if __name__ == "__main__":

@@ -708,7 +708,7 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 
 
 @app.post("/pd_flip/migration/source/start")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def start_pd_flip_migration_source(
     obj: PDFlipMigrationSourceStartReq, request: Request
 ):
@@ -716,7 +716,7 @@ async def start_pd_flip_migration_source(
 
 
 @app.post("/pd_flip/migration/target/prepare")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def prepare_pd_flip_migration_target(
     obj: PDFlipMigrationTargetPrepareReq, request: Request
 ):
@@ -724,7 +724,7 @@ async def prepare_pd_flip_migration_target(
 
 
 @app.post("/pd_flip/migration/target/commit")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def commit_pd_flip_migration_target(
     obj: PDFlipMigrationTargetCommitReq, request: Request
 ):
@@ -732,7 +732,7 @@ async def commit_pd_flip_migration_target(
 
 
 @app.post("/pd_flip/migration/target/activate")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def activate_pd_flip_migration_target(
     obj: PDFlipMigrationTargetActivateReq, request: Request
 ):
@@ -740,7 +740,7 @@ async def activate_pd_flip_migration_target(
 
 
 @app.post("/pd_flip/migration/target/abort")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def abort_pd_flip_migration_target(
     obj: PDFlipMigrationTargetAbortReq, request: Request
 ):
@@ -748,7 +748,7 @@ async def abort_pd_flip_migration_target(
 
 
 @app.get("/pd_flip/migration/status")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def get_pd_flip_migration_status(request: Request):
     return await _global_state.tokenizer_manager.get_pd_flip_migration_status(
         _pd_flip_status_req_from_request(request)
@@ -760,7 +760,7 @@ def _pd_flip_status_req_from_request(request: Request) -> PDFlipMigrationStatusR
 
 
 @app.post("/pd_flip/migration/source/finish")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def finish_pd_flip_migration_source(
     obj: PDFlipMigrationSourceFinishReq, request: Request
 ):
@@ -768,7 +768,7 @@ async def finish_pd_flip_migration_source(
 
 
 @app.post("/pd_flip/migration/source/delta")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def start_pd_flip_migration_source_delta(
     obj: PDFlipMigrationSourceDeltaReq, request: Request
 ):
@@ -778,7 +778,7 @@ async def start_pd_flip_migration_source_delta(
 
 
 @app.post("/pd_flip/migration/target/delta/prepare")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def prepare_pd_flip_migration_target_delta(
     obj: PDFlipMigrationTargetDeltaPrepareReq, request: Request
 ):
@@ -788,13 +788,13 @@ async def prepare_pd_flip_migration_target_delta(
 
 
 @app.post("/pd_flip/migration/abort")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def abort_pd_flip_migration(obj: PDFlipMigrationAbortReq, request: Request):
     return await _global_state.tokenizer_manager.abort_pd_flip_migration(obj)
 
 
 @app.post("/pd_flip/migration/output/relay")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def relay_pd_flip_migration_output(
     obj: PDFlipMigrationOutputRelayReq, request: Request
 ):
@@ -802,7 +802,7 @@ async def relay_pd_flip_migration_output(
 
 
 @app.get("/pd_flip/runtime_role/status")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def get_pd_runtime_role_status(request: Request):
     return await _global_state.tokenizer_manager.get_pd_runtime_role_status(
         PDRuntimeRoleStatusReq()
@@ -810,13 +810,13 @@ async def get_pd_runtime_role_status(request: Request):
 
 
 @app.post("/pd_flip/runtime_role/set")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def set_pd_runtime_role(obj: PDRuntimeRoleSetReq, request: Request):
     return await _global_state.tokenizer_manager.set_pd_runtime_role(obj)
 
 
 @app.post("/pd_flip/runtime_role/admission")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_REQUIRED)
 async def set_pd_runtime_admission(obj: PDRuntimeRoleAdmissionReq, request: Request):
     return await _global_state.tokenizer_manager.set_pd_runtime_admission(obj)
 

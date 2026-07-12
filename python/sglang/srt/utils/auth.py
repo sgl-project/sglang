@@ -23,6 +23,7 @@ class AuthLevel(str, Enum):
     NORMAL = "normal"
     ADMIN_OPTIONAL = "admin_optional"
     ADMIN_FORCE = "admin_force"
+    ADMIN_REQUIRED = "admin_required"
 
 
 def auth_level(level: AuthLevel):
@@ -88,6 +89,8 @@ def decide_request_auth(
       or with api_key/admin_api_key depending on server config.
     - ADMIN_FORCE: requires admin_api_key; if admin_api_key is NOT configured,
       it must be rejected (403) even if api_key is provided.
+    - ADMIN_REQUIRED: requires admin_api_key; if it is not configured, report
+      service unavailability (503) instead of treating configuration as denial.
 
     NOTE :
     - Health/metrics endpoints are always allowed (even when api_key/admin_api_key is set),
@@ -110,6 +113,13 @@ def decide_request_auth(
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return False
         return secrets.compare_digest(parts[1], expected_token)
+
+    if auth_level == AuthLevel.ADMIN_REQUIRED:
+        if not admin_api_key:
+            return AuthDecision(allowed=False, error_status_code=503)
+        if not _check_bearer_token(authorization_header, admin_api_key):
+            return AuthDecision(allowed=False)
+        return AuthDecision(allowed=True)
 
     # Force-auth endpoints: only admin_api_key can unlock them; if admin_api_key is unset,
     # reject them unconditionally (explicitly "not allowed").
@@ -190,7 +200,11 @@ def add_api_key_middleware(
                         "error": (
                             "Unauthorized"
                             if decision.error_status_code == 401
-                            else "Forbidden"
+                            else (
+                                "Service Unavailable"
+                                if decision.error_status_code == 503
+                                else "Forbidden"
+                            )
                         )
                     },
                     status_code=decision.error_status_code,

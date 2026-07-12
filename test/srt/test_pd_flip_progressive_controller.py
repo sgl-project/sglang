@@ -324,13 +324,19 @@ class ProgressiveScenarioClient:
         self.delta_attempts = {}
         self.sessions = {}
         self.source_role = "decode"
+        self.router_roles = {"source": "decode", "target": "decode"}
+        self.router_draining = {"source": False, "target": False}
 
     def get_json(self, base_url, path):
         if path == "/pd_flip/router/workers":
             return {
                 "workers": [
-                    {"worker_id": "source", "role": "decode", "draining": False},
-                    {"worker_id": "target", "role": "decode", "draining": False},
+                    {
+                        "worker_id": worker_id,
+                        "role": self.router_roles[worker_id],
+                        "draining": self.router_draining[worker_id],
+                    }
+                    for worker_id in ("source", "target")
                 ]
             }
         if path == "/pd_flip/runtime_role/status":
@@ -347,6 +353,9 @@ class ProgressiveScenarioClient:
                         "running_requests": [
                             {"rid": rid, "kv_committed_len": 8}
                             for rid in self.running_rids
+                        ],
+                        "waiting_requests": [
+                            {"rid": rid} for rid in self.waiting_rids
                         ],
                     },
                 }
@@ -391,6 +400,7 @@ class ProgressiveScenarioClient:
         ):
             return {"success": False, "message": f"forced failure at {path}"}
         if path == "/pd_flip/router/worker/drain":
+            self.router_draining[payload["worker_id"]] = payload["draining"]
             self.steps.append(
                 "router_drain_source"
                 if payload["draining"]
@@ -399,6 +409,8 @@ class ProgressiveScenarioClient:
             return {"success": True}
         if path == "/pd_flip/router/worker/role":
             self.steps.append("refresh_router_source_role")
+            self.router_roles[payload["worker_id"]] = payload["role"]
+            self.router_draining[payload["worker_id"]] = payload["draining"]
             return {"success": True}
         if path == "/pd_flip/runtime_role/admission":
             self.steps.append(
@@ -566,6 +578,95 @@ def test_progressive_flow_commits_when_prefill_stays_risky():
         "resume_source_admission",
         "router_undrain_source",
     ]
+
+
+def test_progressive_final_batch_migrates_waiting_only_queue():
+    client = ProgressiveScenarioClient(running_rids=["r0"], waiting_rids=["w0"])
+    controller, client, monitor = progressive_scenario(
+        (14, 20, 19, 20), client=client
+    )
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert result.success
+    assert client.source_starts[1]["rids"] == []
+    assert client.source_starts[1]["include_waiting"] is True
+    assert client.sessions["pd-flip-source-to-target-final"] == [{"rid": "w0"}]
+
+
+def test_progressive_router_failure_after_worker_flip_stays_drained(tmp_path):
+    client = ProgressiveScenarioClient(fail_path="/pd_flip/router/worker/role")
+    controller, client, monitor = progressive_scenario(
+        (14, 20, 19, 20), client=client
+    )
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert not result.success
+    assert result.state_trace[-1]["state"] == "flipping_role"
+    assert result.state_trace[-1]["reason"] == "role_flip_router_pending"
+    assert controller.session_journal.read()["phase"] == "role_flip_router_pending"
+    role_index = client.steps.index("set_source_runtime_role")
+    assert "resume_source_admission" not in client.steps[role_index:]
+    assert "router_undrain_source" not in client.steps[role_index:]
+
+    client.fail_path = None
+    reconciled = controller.reconcile_session("pd-flip-source-to-target-role-flip")
+    assert reconciled.success
+    assert controller.session_journal.read()["phase"] == "role_flip_complete"
+
+
+def test_collect_metrics_rejects_multiple_dp_ranks_before_mutation():
+    client = ProgressiveScenarioClient()
+    original = client.get_json
+
+    def get_json(base_url, path):
+        response = original(base_url, path)
+        if path == "/pd_flip/runtime_role/status":
+            first = response
+            second = {
+                "success": True,
+                "status": dict(response["status"], dp_rank=1),
+            }
+            first["status"]["dp_rank"] = 0
+            return [first, second]
+        return response
+
+    client.get_json = get_json
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+
+    with pytest.raises(RuntimeError, match="DP_SIZE=1"):
+        controller.collect_metrics()
+    assert client.posts == []
+
+
+def test_reconcile_observing_crash_restores_decode_admission(tmp_path):
+    client = ProgressiveScenarioClient()
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source,
+        target,
+        "observing-session",
+        ["r0"],
+        "observing",
+        True,
+        {"source_admission_paused": True, "router_drained": True},
+    )
+
+    result = controller.reconcile_session("observing-session")
+
+    assert result.success
+    assert result.target_role == "decode"
+    assert client.steps[-2:] == ["resume_source_admission", "router_undrain_source"]
+    assert controller.session_journal.read()["phase"] == "observation_recovered_safe"
 
 
 def test_progressive_final_batch_uses_all_returned_running_and_waiting_rids():

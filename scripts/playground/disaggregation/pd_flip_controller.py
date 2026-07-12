@@ -364,6 +364,10 @@ class ProgressiveAtomicBatchError(RuntimeError):
         self.source_finished = source_finished
 
 
+class RoleFlipRouterPendingError(RuntimeError):
+    """Worker role changed irreversibly; keep the source paused and drained."""
+
+
 class ForcedRiskSnapshot:
     prefill_slo_attainment = 0.0
     decode_slo_attainment = 1.0
@@ -404,8 +408,9 @@ class PDFlipController:
         batch_rids: Sequence[str],
         phase: str,
         source_finished: bool,
+        metadata: Optional[JsonDict] = None,
     ) -> JsonDict:
-        return {
+        record = {
             "source_name": source.name,
             "source_url": source.worker_url,
             "target_name": target.name,
@@ -415,6 +420,9 @@ class PDFlipController:
             "phase": phase,
             "source_finished": source_finished,
         }
+        if metadata:
+            record.update(metadata)
+        return record
 
     def _write_journal_phase(
         self,
@@ -424,6 +432,7 @@ class PDFlipController:
         batch_rids: Sequence[str],
         phase: str,
         source_finished: bool = False,
+        metadata: Optional[JsonDict] = None,
     ) -> None:
         self.session_journal.write(
             self._journal_record(
@@ -433,6 +442,7 @@ class PDFlipController:
                 batch_rids,
                 phase,
                 source_finished,
+                metadata,
             )
         )
 
@@ -471,6 +481,62 @@ class PDFlipController:
                 target_name,
             )
 
+        configured_source = next(
+            (node for node in self.config.nodes if node.name == source_name), None
+        )
+        source = NodeMetrics(
+            str(source_name),
+            str(source_url),
+            configured_source.router_worker_id
+            if configured_source is not None
+            else str(source_name),
+            bootstrap_port=(
+                configured_source.bootstrap_port
+                if configured_source is not None
+                else None
+            ),
+        )
+        target = NodeMetrics(str(target_name), str(target_url), str(target_name))
+        records: List[ActionRecord] = []
+        if record.get("phase") == "observing":
+            self._resume_decode_source(source, records)
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                batch_rids,
+                "observation_recovered_safe",
+                True,
+                {"source_admission_paused": False, "router_drained": False},
+            )
+            return FlipExecutionResult(
+                True,
+                "observation crash recovered safely; source remains decode",
+                "d_to_p",
+                source.name,
+                "decode",
+                target.name,
+                actions=records,
+            )
+        if record.get("phase") in {
+            "role_flip_worker_prefill",
+            "role_flip_router_pending",
+        }:
+            self._wait_source_role(records, source, "prefill", "reconcile_prefill_loop")
+            self._complete_prefill_router_flip(source, records)
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "role_flip_complete", True
+            )
+            return FlipExecutionResult(
+                True,
+                "pending prefill router role reconciled",
+                "d_to_p",
+                source.name,
+                "prefill",
+                target.name,
+                actions=records,
+            )
+
         try:
             source_statuses = _strict_migration_statuses(
                 self.client.get_json(source_url, "/pd_flip/migration/status"),
@@ -492,9 +558,6 @@ class PDFlipController:
 
         source_states = {status.get("state") for status in source_statuses}
         target_states = {status.get("state") for status in target_statuses}
-        records: List[ActionRecord] = []
-        source = NodeMetrics(str(source_name), str(source_url), str(source_name))
-        target = NodeMetrics(str(target_name), str(target_url), str(target_name))
         if target_states == {"active"}:
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "target_active", True
@@ -658,6 +721,7 @@ class PDFlipController:
             status_body = self.client.get_json(
                 node.worker_url, "/pd_flip/runtime_role/status"
             )
+            _require_single_dp_runtime_status(status_body, node.name)
             loads_body = self.client.get_json(node.worker_url, "/v1/loads?include=all")
             status = _first_successful_response(status_body)
             role, is_idle, admission_paused = _parse_runtime_status(status)
@@ -1087,6 +1151,21 @@ class PDFlipController:
                 "fresh_slo_window",
                 records,
             )
+            self._write_journal_phase(
+                source,
+                target,
+                session_prefix + "-first",
+                selection.selected_rids,
+                "observing",
+                True,
+                {
+                    "batch_ordinal": 1,
+                    "observation_deadline_epoch": time.time()
+                    + self.config.observation_seconds,
+                    "source_admission_paused": True,
+                    "router_drained": True,
+                },
+            )
             observation = self._collect_progressive_observation(
                 slo_monitor, monitor_nodes
             )
@@ -1108,6 +1187,15 @@ class PDFlipController:
                     records,
                 )
                 self._resume_decode_source(source, records)
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_prefix + "-first",
+                    selection.selected_rids,
+                    "observation_recovered_safe",
+                    True,
+                    {"source_admission_paused": False, "router_drained": False},
+                )
                 self._append_progressive_state(
                     state_trace,
                     ProgressiveMonitorState.SAFE,
@@ -1136,8 +1224,8 @@ class PDFlipController:
                 "prefill_risk_persisted",
                 records,
             )
-            remaining = self._source_running_requests(source, records)
-            if remaining:
+            remaining, waiting_count = self._source_pending_requests(source, records)
+            if remaining or waiting_count:
                 source_finished = False
                 self._execute_atomic_batch(
                     source,
@@ -1157,7 +1245,13 @@ class PDFlipController:
                 "source_idle",
                 records,
             )
-            self._flip_idle_source_to_prefill(source, records)
+            self._flip_idle_source_to_prefill(
+                source,
+                target,
+                session_prefix + "-role-flip",
+                selection.selected_rids,
+                records,
+            )
             self._append_progressive_state(
                 state_trace,
                 ProgressiveMonitorState.SAFE,
@@ -1180,13 +1274,25 @@ class PDFlipController:
             post_finish_error = source_finished or (
                 isinstance(exc, ProgressiveAtomicBatchError) and exc.source_finished
             )
-            self._cleanup_source_after_failure(source, records)
+            router_pending = isinstance(exc, RoleFlipRouterPendingError)
+            if not router_pending:
+                self._cleanup_source_after_failure(source, records)
             self._append_progressive_state(
                 state_trace,
-                ProgressiveMonitorState.SAFE,
+                (
+                    ProgressiveMonitorState.FLIPPING_ROLE
+                    if router_pending
+                    else ProgressiveMonitorState.SAFE
+                ),
                 source,
                 target,
-                "post_finish_error" if post_finish_error else "error_recovered",
+                (
+                    "role_flip_router_pending"
+                    if router_pending
+                    else "post_finish_error"
+                    if post_finish_error
+                    else "error_recovered"
+                ),
                 records,
             )
             return self._progressive_result(
@@ -1210,7 +1316,7 @@ class PDFlipController:
     ) -> Tuple[str, ...]:
         records = records if records is not None else []
         requested_rids = tuple(str(rid) for rid in rids)
-        if not requested_rids:
+        if not requested_rids and not include_waiting:
             raise ValueError("atomic migration batch must not have empty rids")
         source_finished = False
         journal_rids = requested_rids
@@ -1488,9 +1594,9 @@ class PDFlipController:
             observing=observing,
         )
 
-    def _source_running_requests(
+    def _source_pending_requests(
         self, source: NodeMetrics, records: List[ActionRecord]
-    ) -> Tuple[str, ...]:
+    ) -> Tuple[Tuple[str, ...], int]:
         response = self._record_get(
             records,
             "get_remaining_source_requests",
@@ -1513,7 +1619,10 @@ class PDFlipController:
             rids.append(str(request_status["rid"]))
         if len(set(rids)) != len(rids):
             raise RuntimeError("source running request status contains duplicate RIDs")
-        return tuple(rids)
+        waiting = status.get("waiting_requests", [])
+        if not isinstance(waiting, list):
+            raise RuntimeError("source waiting request status is not a list")
+        return tuple(rids), len(waiting)
 
     def _resume_decode_source(
         self, source: NodeMetrics, records: List[ActionRecord]
@@ -1534,7 +1643,12 @@ class PDFlipController:
         )
 
     def _flip_idle_source_to_prefill(
-        self, source: NodeMetrics, records: List[ActionRecord]
+        self,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        batch_rids: Sequence[str],
+        records: List[ActionRecord],
     ) -> None:
         self._post_worker(
             records,
@@ -1544,6 +1658,23 @@ class PDFlipController:
             {"role": "prefill", "force": False},
         )
         self._wait_source_role(records, source, "prefill", "wait_source_prefill_loop")
+        self._write_journal_phase(
+            source, target, session_id, batch_rids, "role_flip_worker_prefill", True
+        )
+        try:
+            self._complete_prefill_router_flip(source, records)
+        except Exception as exc:
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "role_flip_router_pending", True
+            )
+            raise RoleFlipRouterPendingError(str(exc)) from exc
+        self._write_journal_phase(
+            source, target, session_id, batch_rids, "role_flip_complete", True
+        )
+
+    def _complete_prefill_router_flip(
+        self, source: NodeMetrics, records: List[ActionRecord]
+    ) -> None:
         self._post_router(
             records,
             "refresh_router_source_role",
@@ -1556,6 +1687,7 @@ class PDFlipController:
                 "draining": True,
             },
         )
+        self._wait_router_role(source, "prefill", require_drained=True)
         self._post_worker(
             records,
             "resume_source_admission",
@@ -1570,6 +1702,31 @@ class PDFlipController:
             "/pd_flip/router/worker/drain",
             {"worker_id": source.router_worker_id, "draining": False},
         )
+
+    def _wait_router_role(
+        self, source: NodeMetrics, expected_role: str, *, require_drained: bool
+    ) -> None:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        last: Optional[JsonDict] = None
+        while True:
+            last = self._fetch_router_workers().get(source.router_worker_id)
+            if (
+                isinstance(last, dict)
+                and _normalize_role(last.get("role")) == expected_role
+                and (not require_drained or bool(last.get("draining")))
+            ):
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"router role agreement timed out for {source.name}: {last}"
+                )
+            time.sleep(
+                min(
+                    self.config.migration_poll_interval_seconds,
+                    max(0.0, deadline - now),
+                )
+            )
 
     def _wait_source_role(
         self,
@@ -3429,6 +3586,32 @@ def _parse_runtime_status(item: JsonDict) -> Tuple[str, bool, bool]:
         status.get("admission_paused") or status.get("pd_runtime_admission_paused")
     )
     return role, is_idle, admission_paused
+
+
+def _require_single_dp_runtime_status(body: Any, node_name: str) -> None:
+    responses = body if isinstance(body, list) else [body]
+    if len(responses) <= 1:
+        return
+    dp_ranks = []
+    for item in responses:
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"progressive PD flip requires DP_SIZE=1 for {node_name}; "
+                "multi-response status has no DP metadata"
+            )
+        status = item.get("status") if isinstance(item.get("status"), dict) else item
+        rank = status.get("dp_rank")
+        if rank is None:
+            raise RuntimeError(
+                f"progressive PD flip requires DP_SIZE=1 for {node_name}; "
+                "multi-response status has no dp_rank"
+            )
+        dp_ranks.append(int(rank))
+    if len(set(dp_ranks)) > 1:
+        raise RuntimeError(
+            f"progressive PD flip requires DP_SIZE=1 for {node_name}; "
+            f"observed DP ranks {sorted(set(dp_ranks))}"
+        )
 
 
 def _parse_loads(body: Any) -> Tuple[int, int, int, Optional[float], List[JsonDict]]:

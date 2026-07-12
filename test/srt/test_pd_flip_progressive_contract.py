@@ -162,7 +162,7 @@ def test_progressive_endpoints_are_admin_authenticated():
         "/pd_flip/runtime_role/admission",
     )
     for endpoint in endpoints:
-        assert "@auth_level(AuthLevel.ADMIN_OPTIONAL)" in route_block(endpoint)
+        assert "@auth_level(AuthLevel.ADMIN_REQUIRED)" in route_block(endpoint)
 
 
 def test_example_environment_is_one_prefill_three_decode_and_progressive_safe():

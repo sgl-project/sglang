@@ -1296,6 +1296,11 @@ class Scheduler(
                 for req in running
                 if not req.finished()
             ],
+            "waiting_requests": [
+                {"rid": str(req.rid)}
+                for req in getattr(self, "waiting_queue", [])
+                if not req.finished()
+            ],
         }
 
     def _pd_runtime_role_status_dict(self) -> Dict[str, Any]:

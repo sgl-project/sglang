@@ -406,6 +406,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state: Dict[str, ReqState] = {}
         self.pd_flip_output_relay_targets: Dict[Tuple[str, str], str] = {}
         self.pd_flip_output_relay_baseline: Dict[Tuple[str, str], int] = {}
+        self.pd_flip_output_relay_outbox: Dict[
+            Tuple[str, str], Dict[int, Dict[str, Any]]
+        ] = {}
+        self.pd_flip_output_relay_retry_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self.pd_flip_output_relay_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self.pd_flip_last_relay_seq_by_key: Dict[Tuple[str, str], int] = {}
         self.pd_flip_relay_session_by_rid: Dict[str, str] = {}
         self.event_loop = None
@@ -2174,6 +2179,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         output_seq: int,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
+        admin_api_key = getattr(self.server_args, "admin_api_key", None)
+        if not admin_api_key:
+            return {
+                "success": False,
+                "message": "PD flip relay requires a configured admin_api_key",
+            }
         url = source_url.rstrip("/") + "/pd_flip/migration/output/relay"
         data = json.dumps(
             {
@@ -2186,7 +2197,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {admin_api_key}",
+            },
             method="POST",
         )
         try:
@@ -2202,6 +2216,75 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             json.JSONDecodeError,
         ) as exc:
             return {"success": False, "message": str(exc)}
+
+    async def _pd_flip_flush_relay_key(self, relay_key: Tuple[str, str]) -> bool:
+        locks = getattr(self, "pd_flip_output_relay_locks", None)
+        if locks is None:
+            locks = {}
+            self.pd_flip_output_relay_locks = locks
+        lock = locks.setdefault(relay_key, asyncio.Lock())
+        async with lock:
+            return await self._pd_flip_flush_relay_key_locked(relay_key)
+
+    async def _pd_flip_flush_relay_key_locked(
+        self, relay_key: Tuple[str, str]
+    ) -> bool:
+        outboxes = getattr(self, "pd_flip_output_relay_outbox", {})
+        outbox = outboxes.get(relay_key)
+        if not outbox:
+            outboxes.pop(relay_key, None)
+            return True
+        for output_seq in sorted(outbox):
+            entry = outbox[output_seq]
+            result = await asyncio.to_thread(
+                self._pd_flip_post_relay_output,
+                entry["source_url"],
+                relay_key[0],
+                relay_key[1],
+                output_seq,
+                entry["payload"],
+            )
+            if not result.get("success"):
+                logger.error(
+                    "Failed to relay PD flip migrated output for %s to %s: %s",
+                    relay_key[1],
+                    entry["source_url"],
+                    result.get("message", result),
+                )
+                return False
+            self.pd_flip_output_relay_baseline[relay_key] = output_seq
+            outbox.pop(output_seq, None)
+            if entry["finished"]:
+                self.pd_flip_output_relay_targets.pop(relay_key, None)
+                self.pd_flip_output_relay_baseline.pop(relay_key, None)
+        if not outbox:
+            outboxes.pop(relay_key, None)
+        return True
+
+    def _pd_flip_ensure_relay_retry(self, relay_key: Tuple[str, str]) -> None:
+        tasks = getattr(self, "pd_flip_output_relay_retry_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self.pd_flip_output_relay_retry_tasks = tasks
+        task = tasks.get(relay_key)
+        if task is not None and not task.done():
+            return
+
+        async def retry_until_ack() -> None:
+            delay = 0.05
+            try:
+                while relay_key in self.pd_flip_output_relay_outbox:
+                    await asyncio.sleep(delay)
+                    if await self._pd_flip_flush_relay_key(relay_key):
+                        return
+                    delay = min(delay * 2, 5.0)
+            finally:
+                self.pd_flip_output_relay_retry_tasks.pop(relay_key, None)
+
+        task = asyncio.create_task(retry_until_ack())
+        tasks[relay_key] = task
+        self.asyncio_tasks.add(task)
+        task.add_done_callback(self.asyncio_tasks.discard)
 
     async def _pd_flip_maybe_relay_output(
         self,
@@ -2236,31 +2319,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return True
 
         payload = self._pd_flip_batch_output_payload(recv_obj, index, rid)
-        result = await asyncio.to_thread(
-            self._pd_flip_post_relay_output,
-            source_url,
-            session_id,
-            rid,
+        outboxes = getattr(self, "pd_flip_output_relay_outbox", None)
+        if outboxes is None:
+            outboxes = {}
+            self.pd_flip_output_relay_outbox = outboxes
+        outbox = outboxes.setdefault(relay_key, {})
+        outbox.setdefault(
             output_seq,
-            payload,
-        )
-        if result.get("success"):
-            self.pd_flip_output_relay_baseline[relay_key] = output_seq
-            if (
-                self._pd_flip_output_item(
+            {
+                "source_url": source_url,
+                "payload": payload,
+                "finished": self._pd_flip_output_item(
                     getattr(recv_obj, "finished_reasons", None), index
                 )
-                is not None
-            ):
-                self.pd_flip_output_relay_targets.pop(relay_key, None)
-                self.pd_flip_output_relay_baseline.pop(relay_key, None)
-        else:
-            logger.error(
-                "Failed to relay PD flip migrated output for %s to %s: %s",
-                rid,
-                source_url,
-                result.get("message", result),
-            )
+                is not None,
+            },
+        )
+        if not await self._pd_flip_flush_relay_key(relay_key):
+            self._pd_flip_ensure_relay_retry(relay_key)
         return True
 
     async def relay_pd_flip_migration_output(self, obj: PDFlipMigrationOutputRelayReq):
@@ -2322,9 +2398,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for mapping in (
             self.pd_flip_output_relay_targets,
             self.pd_flip_output_relay_baseline,
+            getattr(self, "pd_flip_output_relay_outbox", {}),
         ):
             for key in [key for key in mapping if key[0] == session_id]:
                 mapping.pop(key, None)
+        for key in [
+            key
+            for key in getattr(self, "pd_flip_output_relay_locks", {})
+            if key[0] == session_id
+        ]:
+            self.pd_flip_output_relay_locks.pop(key, None)
+        for key in [
+            key
+            for key in getattr(self, "pd_flip_output_relay_retry_tasks", {})
+            if key[0] == session_id
+        ]:
+            task = self.pd_flip_output_relay_retry_tasks.pop(key)
+            task.cancel()
         if not keep_receive:
             for key in [
                 key
