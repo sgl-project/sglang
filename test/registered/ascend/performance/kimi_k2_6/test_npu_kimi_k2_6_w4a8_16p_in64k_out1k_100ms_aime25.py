@@ -48,7 +48,7 @@ OTHER_ARGS = [
     "--nnodes",
     2,
     "--mem-fraction-static",
-    0.55,
+    0.662,
     "--max-running-requests",
     32,
     "--chunked-prefill-size",
@@ -82,6 +82,10 @@ OTHER_ARGS = [
     4,
     "--speculative-draft-model-quantization",
     "unquant",
+    "--reasoning-parser",
+    "kimi_k2",
+    "--tool-call-parser",
+    "kimi_k2",
 ]
 
 MODEL_CONFIG = {
@@ -114,6 +118,7 @@ class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(TestNpuPerfMultiNodePdMixTestCa
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 100
     output_token_throughput = 160
 
