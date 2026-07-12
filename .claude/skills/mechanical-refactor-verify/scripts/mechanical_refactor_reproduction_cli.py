@@ -37,7 +37,9 @@ _OK_VERDICTS = (VERDICT_PASS, VERDICT_HUMAN_REVIEW)
 
 # The words are matched standalone: delimited by any non-[0-9A-Za-z_] character or the
 # string boundary, so `non_mechanical_provable` never also counts as the bare word.
-_KIND_WORD_RE = re.compile(r"(?<![0-9A-Za-z_])(non_)?mechanical_provable(?![0-9A-Za-z_])")
+_KIND_WORD_RE = re.compile(
+    r"(?<![0-9A-Za-z_])(non_)?mechanical_provable(?![0-9A-Za-z_])"
+)
 
 # The arbiter's verdict line (Repro.run / verify_mechanical_refactor both print `PASS:`).
 _PASS_LINE_RE = re.compile(r"^PASS:", re.MULTILINE)
@@ -178,7 +180,12 @@ def render_report(result: ChainResult) -> str:
     if failures:
         lines += ["", "## Failure details"]
         for v in failures:
-            lines += ["", f"### `{v.sha[:9]}` — {v.verdict}", "", v.detail or "(no detail)"]
+            lines += [
+                "",
+                f"### `{v.sha[:9]}` — {v.verdict}",
+                "",
+                v.detail or "(no detail)",
+            ]
     return "\n".join(lines) + "\n"
 
 

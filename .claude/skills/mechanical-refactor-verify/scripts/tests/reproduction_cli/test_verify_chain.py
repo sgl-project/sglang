@@ -8,10 +8,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from cli_testlib import _chain, _commit, _git, _write, _write_stub_proof
 from mechanical_refactor_proof_generator import generate_range
 from mechanical_refactor_reproduction_cli import (
-    ChainVerificationError,
     VERDICT_FAIL,
     VERDICT_HUMAN_REVIEW,
     VERDICT_PASS,
+    ChainVerificationError,
     main,
     verify_chain,
 )
@@ -69,8 +69,14 @@ def test_main_exit_codes_reflect_the_chain_verdict(repo: Path, tmp_path: Path) -
     base, shas = _chain(repo, ["mechanical_provable: move"])
     _write_stub_proof(proof, shas[0])
     args = [
-        "--base", base, "--branch", "chain",
-        "--proof", str(proof), "--repo-root", str(repo),
+        "--base",
+        base,
+        "--branch",
+        "chain",
+        "--proof",
+        str(proof),
+        "--repo-root",
+        str(repo),
     ]
 
     assert main(args) == 0
@@ -127,18 +133,12 @@ def test_non_ancestor_base_and_empty_range_are_setup_errors(
     off_branch = _commit(repo, "unrelated main-side commit")
 
     with pytest.raises(ChainVerificationError):
-        verify_chain(
-            base=off_branch, branch="chain", proof=proof, repo_root=str(repo)
-        )
+        verify_chain(base=off_branch, branch="chain", proof=proof, repo_root=str(repo))
     with pytest.raises(ChainVerificationError):
-        verify_chain(
-            base=shas[0], branch=shas[0], proof=proof, repo_root=str(repo)
-        )
+        verify_chain(base=shas[0], branch=shas[0], proof=proof, repo_root=str(repo))
 
 
-def test_merge_commit_in_the_chain_is_a_setup_error(
-    repo: Path, tmp_path: Path
-) -> None:
+def test_merge_commit_in_the_chain_is_a_setup_error(repo: Path, tmp_path: Path) -> None:
     """A non-linear chain (contains a merge commit) refuses to verify."""
     proof = tmp_path / "proof"
     proof.mkdir()

@@ -75,8 +75,14 @@ def test_main_writes_the_report_into_the_proof_folder_by_default(
     base, shas = _chain(repo, ["mechanical_provable: move foo"])
     _write_stub_proof(proof, shas[0])
     args = [
-        "--base", base, "--branch", "chain",
-        "--proof", str(proof), "--repo-root", str(repo),
+        "--base",
+        base,
+        "--branch",
+        "chain",
+        "--proof",
+        str(proof),
+        "--repo-root",
+        str(repo),
     ]
 
     assert main(args) == 0

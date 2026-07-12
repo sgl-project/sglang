@@ -54,9 +54,7 @@ def test_provable_commit_without_a_proof_script_is_missing_proof(
     assert not result.passed
 
 
-def test_unrelated_and_non_hex_scripts_do_not_match(
-    repo: Path, tmp_path: Path
-) -> None:
+def test_unrelated_and_non_hex_scripts_do_not_match(repo: Path, tmp_path: Path) -> None:
     """Scripts named for another sha or with a non-hex stem are not this commit's proof."""
     proof = tmp_path / "proof"
     scripts = proof / "repro_scripts"

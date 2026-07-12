@@ -7,9 +7,7 @@ _PASSING_PROOF = (
     "sys.exit(0)\n"
 )
 _FAILING_PROOF = (
-    "import sys\n"
-    'print("RESIDUAL (2 lines):\\n+x\\n-y")\n'
-    "sys.exit(1)\n"
+    "import sys\n" 'print("RESIDUAL (2 lines):\\n+x\\n-y")\n' "sys.exit(1)\n"
 )
 
 

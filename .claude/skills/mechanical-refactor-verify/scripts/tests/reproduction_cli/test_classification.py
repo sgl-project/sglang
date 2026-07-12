@@ -43,7 +43,10 @@ def test_non_mechanical_provable_word_is_not_double_counted_as_the_bare_word(
 ) -> None:
     """non_mechanical_provable classifies as non-mechanical, not as both words at once."""
     verdict = _single_verdict(
-        repo, tmp_path, "grp(step,non_mechanical_provable): rework foo", with_proof=False
+        repo,
+        tmp_path,
+        "grp(step,non_mechanical_provable): rework foo",
+        with_proof=False,
     )
     assert verdict.kind == KIND_NON_MECHANICAL
     assert verdict.verdict == VERDICT_HUMAN_REVIEW
