@@ -1758,18 +1758,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return True, "Succeeded to update model weights."
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]
         )
-        success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
+        success, message = ModelRunner.update_weights_from_tensor(
+            self.draft_worker.draft_runner.weight_updater,
             named_tensors=named_tensors,
             load_format=recv_req.load_format,
         )
         if not success:
             return success, message
 
-        success, message = self.target_worker.model_runner.update_weights_from_tensor(
+        success, message = ModelRunner.update_weights_from_tensor(
+            self.target_worker.model_runner.weight_updater,
             named_tensors=named_tensors,
             load_format=recv_req.load_format,
         )
