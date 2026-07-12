@@ -172,8 +172,16 @@ class EagerRunner(BaseRunner):
     ) -> ForwardBatch:
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
-        load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+        load_batch.
+
+        Skipped only when the caller marks the batch as already backed by
+        graph-stable input buffers; generic graph capture is not enough to
+        prove that aliasing contract.
+        """
+        if (
+            envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+            or forward_batch.skip_eager_input_staging
+        ):
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:

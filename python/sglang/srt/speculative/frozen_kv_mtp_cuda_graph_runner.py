@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -291,6 +292,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            skip_eager_input_staging=(
+                envs.SGLANG_EAGER_INPUT_NO_COPY_IN_DRAFT_CAPTURE.get()
+            ),
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
