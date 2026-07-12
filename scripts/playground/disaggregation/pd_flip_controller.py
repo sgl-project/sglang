@@ -89,11 +89,9 @@ JsonDict = Dict[str, Any]
 
 
 class HttpLike:
-    def get_json(self, base_url: str, path: str) -> Any:
-        ...
+    def get_json(self, base_url: str, path: str) -> Any: ...
 
-    def post_json(self, base_url: str, path: str, payload: JsonDict) -> Any:
-        ...
+    def post_json(self, base_url: str, path: str, payload: JsonDict) -> Any: ...
 
 
 class HttpClient:
@@ -134,7 +132,9 @@ class HttpClient:
                 return resp.read().decode("utf-8")
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{req.full_url} returned HTTP {exc.code}: {body}") from exc
+            raise RuntimeError(
+                f"{req.full_url} returned HTTP {exc.code}: {body}"
+            ) from exc
         except error.URLError as exc:
             raise RuntimeError(f"failed to connect to {req.full_url}: {exc}") from exc
 
@@ -211,9 +211,7 @@ class PDClusterConfig:
             post_migration_idle_timeout_seconds=float(
                 data.get(
                     "post_migration_idle_timeout_seconds",
-                    os.environ.get(
-                        "PD_FLIP_POST_MIGRATION_IDLE_TIMEOUT_SECONDS", 2.0
-                    ),
+                    os.environ.get("PD_FLIP_POST_MIGRATION_IDLE_TIMEOUT_SECONDS", 2.0),
                 )
             ),
             first_migration_ratio=float(data.get("first_migration_ratio", 0.5)),
@@ -317,6 +315,16 @@ class MonitorState:
     FLIPPING_ROLE = "flipping_role"
 
 
+class ProgressiveMonitorState:
+    SAFE = "safe"
+    SELECTING = "selecting"
+    FIRST_MIGRATING = "first_migrating"
+    OBSERVING = "observing"
+    RECOVERING = "recovering"
+    SECOND_MIGRATING = "second_migrating"
+    FLIPPING_ROLE = "flipping_role"
+
+
 class ForcedRiskSnapshot:
     prefill_slo_attainment = 0.0
     decode_slo_attainment = 1.0
@@ -366,9 +374,7 @@ class PDFlipController:
             if committed_tokens < 0:
                 return None
             requests.append(
-                RequestCapacity(
-                    rid=str(item["rid"]), committed_tokens=committed_tokens
-                )
+                RequestCapacity(rid=str(item["rid"]), committed_tokens=committed_tokens)
             )
         return select_first_batch(
             requests,
@@ -665,6 +671,638 @@ class PDFlipController:
             state_trace=state_trace,
         )
 
+    def monitor_progressive(
+        self,
+        slo_monitor: PDFlipSLOMonitor,
+        *,
+        iterations: int,
+        poll_interval_seconds: Optional[float] = None,
+    ) -> MonitorLoopResult:
+        snapshots: List[JsonDict] = []
+        records: List[ActionRecord] = []
+        state_trace: List[JsonDict] = []
+        interval = (
+            self.config.migration_poll_interval_seconds
+            if poll_interval_seconds is None
+            else max(0.0, poll_interval_seconds)
+        )
+        iteration_count = max(1, iterations)
+        for idx in range(iteration_count):
+            metrics = self.collect_metrics()
+            monitor_nodes = [
+                (metric.name, metric.worker_url, metric.effective_role)
+                for metric in metrics
+            ]
+            snapshot = slo_monitor.collect_cluster(monitor_nodes)
+            snapshots.append(snapshot.to_dict())
+            if not state_trace:
+                state_trace.append(
+                    _monitor_state_record(
+                        state=ProgressiveMonitorState.SAFE,
+                        reason="monitor_sampled",
+                        snapshot_index=len(snapshots) - 1,
+                    )
+                )
+            decision = self._evaluate_progressive_snapshot(snapshot, observing=False)
+            if decision is ProgressiveDecision.START:
+                source = self._select_source(
+                    metrics,
+                    source_name=None,
+                    expected_role="decode",
+                    prefer_high_load=True,
+                )
+                target = self._select_decode_migration_target(metrics, source)
+                return self._execute_progressive_d_to_p(
+                    source=source,
+                    target=target,
+                    slo_monitor=slo_monitor,
+                    monitor_nodes=monitor_nodes,
+                    snapshots=snapshots,
+                    records=records,
+                    state_trace=state_trace,
+                    iterations=idx + 1,
+                )
+            if idx + 1 < iteration_count:
+                time.sleep(interval)
+
+        return MonitorLoopResult(
+            success=True,
+            message="no progressive flip decision",
+            iterations=iteration_count,
+            snapshots=snapshots,
+            actions=records,
+            state_trace=state_trace,
+        )
+
+    def _execute_progressive_d_to_p(
+        self,
+        *,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        slo_monitor: PDFlipSLOMonitor,
+        monitor_nodes: List[Tuple[str, str, str]],
+        snapshots: List[JsonDict],
+        records: List[ActionRecord],
+        state_trace: List[JsonDict],
+        iterations: int,
+    ) -> MonitorLoopResult:
+        session_prefix = f"pd-flip-{source.name}-to-{target.name}"
+        source_finished = False
+        try:
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.SELECTING,
+                source,
+                target,
+                "prefill_risky_decode_healthy",
+                records,
+            )
+            selection = self._select_progressive_first_batch(source, target)
+            if selection is None:
+                self._append_progressive_state(
+                    state_trace,
+                    ProgressiveMonitorState.SAFE,
+                    source,
+                    target,
+                    "first_batch_capacity_insufficient",
+                    records,
+                )
+                return self._progressive_result(
+                    True,
+                    "no feasible first migration batch",
+                    iterations,
+                    snapshots,
+                    records,
+                    state_trace,
+                )
+
+            self._post_router(
+                records,
+                "router_drain_source",
+                source,
+                "/pd_flip/router/worker/drain",
+                {"worker_id": source.router_worker_id, "draining": True},
+            )
+            self._post_worker(
+                records,
+                "pause_source_admission",
+                source,
+                "/pd_flip/runtime_role/admission",
+                {"paused": True},
+            )
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.FIRST_MIGRATING,
+                source,
+                target,
+                "first_batch_selected",
+                records,
+            )
+            self._execute_atomic_batch(
+                source,
+                target,
+                session_prefix + "-first",
+                selection.selected_rids,
+                False,
+                records=records,
+            )
+            source_finished = True
+
+            slo_monitor.reset_window()
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.OBSERVING,
+                source,
+                target,
+                "fresh_slo_window",
+                records,
+            )
+            observation = self._collect_progressive_observation(
+                slo_monitor, monitor_nodes
+            )
+            snapshots.append(observation.to_dict())
+            decision = self._evaluate_progressive_snapshot(observation, observing=True)
+            if decision in (
+                ProgressiveDecision.RECOVER,
+                ProgressiveDecision.INSUFFICIENT_SAMPLES,
+            ):
+                self._append_progressive_state(
+                    state_trace,
+                    ProgressiveMonitorState.RECOVERING,
+                    source,
+                    target,
+                    decision.value,
+                    records,
+                )
+                self._resume_decode_source(source, records)
+                self._append_progressive_state(
+                    state_trace,
+                    ProgressiveMonitorState.SAFE,
+                    source,
+                    target,
+                    "source_remains_decode",
+                    records,
+                )
+                return self._progressive_result(
+                    True,
+                    "source remains decode",
+                    iterations,
+                    snapshots,
+                    records,
+                    state_trace,
+                )
+
+            if decision is not ProgressiveDecision.COMMIT:
+                raise RuntimeError(f"unexpected observation decision: {decision}")
+
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.SECOND_MIGRATING,
+                source,
+                target,
+                "prefill_risk_persisted",
+                records,
+            )
+            remaining = self._source_running_requests(source, records)
+            if remaining:
+                source_finished = False
+                self._execute_atomic_batch(
+                    source,
+                    target,
+                    session_prefix + "-final",
+                    remaining,
+                    True,
+                    records=records,
+                )
+                source_finished = True
+            self._assert_source_idle_after_migration(records, source)
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.FLIPPING_ROLE,
+                source,
+                target,
+                "source_idle",
+                records,
+            )
+            self._flip_idle_source_to_prefill(source, records)
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.SAFE,
+                source,
+                target,
+                "role_flip_complete",
+                records,
+            )
+            return self._progressive_result(
+                True,
+                "source switched to prefill",
+                iterations,
+                snapshots,
+                records,
+                state_trace,
+            )
+        except Exception as exc:
+            # An atomic batch owns its pre-finish abort. Once source finish has
+            # succeeded, ownership must never be rolled back by the controller.
+            self._cleanup_source_after_failure(source, records)
+            self._append_progressive_state(
+                state_trace,
+                ProgressiveMonitorState.SAFE,
+                source,
+                target,
+                "error_recovered" if not source_finished else "post_finish_error",
+                records,
+            )
+            return self._progressive_result(
+                False,
+                str(exc),
+                iterations,
+                snapshots,
+                records,
+                state_trace,
+            )
+
+    def _execute_atomic_batch(
+        self,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        rids: Sequence[str],
+        include_waiting: bool,
+        *,
+        records: Optional[List[ActionRecord]] = None,
+    ) -> Tuple[str, ...]:
+        records = records if records is not None else []
+        requested_rids = tuple(str(rid) for rid in rids)
+        if not requested_rids:
+            raise ValueError("atomic migration batch must not have empty rids")
+        source_finished = False
+        try:
+            source_start = self._post_worker(
+                records,
+                "start_decode_migration_source",
+                source,
+                "/pd_flip/migration/source/start",
+                _migration_source_start_payload(
+                    session_id,
+                    target.worker_url,
+                    list(requested_rids),
+                    include_waiting=include_waiting,
+                ),
+            )
+            manifests = _all_response_manifests(source_start)
+            batch_rids = tuple(_manifest_rids(manifests))
+            if not batch_rids or len(set(batch_rids)) != len(batch_rids):
+                raise RuntimeError("source start returned an invalid manifest RID set")
+            if include_waiting:
+                if batch_rids[: len(requested_rids)] != requested_rids:
+                    raise RuntimeError(
+                        "source start did not preserve requested running RID prefix"
+                    )
+            elif batch_rids != requested_rids:
+                raise RuntimeError(
+                    "source start manifests do not match selected first-batch RIDs"
+                )
+
+            self._post_worker(
+                records,
+                "prepare_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/prepare",
+                {
+                    "session_id": session_id,
+                    "source_url": source.worker_url,
+                    "manifests": manifests,
+                    "prepare_only": True,
+                    "adopt_on_commit": False,
+                },
+            )
+            self._wait_migration(records, "wait_decode_migration_source", source)
+            self._wait_migration(records, "wait_decode_migration_target", target)
+            delta_manifests = self._poll_source_delta_manifests(
+                records, source, session_id, batch_rids
+            )
+            delta_rids = tuple(_manifest_rids(delta_manifests))
+            if delta_rids != batch_rids:
+                raise RuntimeError(
+                    "source delta manifests do not match atomic batch RIDs"
+                )
+            self._post_worker(
+                records,
+                "prepare_decode_migration_target_delta",
+                target,
+                "/pd_flip/migration/target/delta/prepare",
+                {
+                    "session_id": session_id,
+                    "source_url": source.worker_url,
+                    "manifests": delta_manifests,
+                },
+            )
+            self._wait_migration(records, "wait_decode_migration_source_delta", source)
+            self._wait_migration(records, "wait_decode_migration_target_delta", target)
+            self._post_worker(
+                records,
+                "commit_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/commit",
+                {"session_id": session_id, "rids": list(batch_rids)},
+            )
+            self._post_worker(
+                records,
+                "finish_decode_migration_source",
+                source,
+                "/pd_flip/migration/source/finish",
+                {"session_id": session_id, "released_rids": list(batch_rids)},
+            )
+            source_finished = True
+            self._post_worker(
+                records,
+                "activate_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/activate",
+                {"session_id": session_id, "rids": list(batch_rids)},
+            )
+            return batch_rids
+        except Exception:
+            if not source_finished:
+                self._abort_two_phase_migration(source, target, session_id, records)
+            raise
+
+    def _poll_source_delta_manifests(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        session_id: str,
+        rids: Sequence[str],
+    ) -> List[JsonDict]:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        payload = {"session_id": session_id, "rids": list(rids)}
+        last_response: Any = None
+        while True:
+            started = time.monotonic()
+            path = "/pd_flip/migration/source/delta"
+            url = _join_url(source.worker_url, path)
+            try:
+                response = self.client.post_json(source.worker_url, path, payload)
+                last_response = response
+                manifests = _all_response_manifests(response)
+                if _delta_quiesce_pending(response):
+                    records.append(
+                        ActionRecord(
+                            step="start_decode_migration_source_delta",
+                            target=source.name,
+                            method="POST",
+                            url=url,
+                            payload=payload,
+                            response=response,
+                            message="quiesce pending",
+                            elapsed_seconds=time.monotonic() - started,
+                        )
+                    )
+                else:
+                    _raise_if_unsuccessful(
+                        response, "start_decode_migration_source_delta"
+                    )
+                    if not manifests:
+                        raise RuntimeError(
+                            "source delta completed without migration manifests"
+                        )
+                    records.append(
+                        ActionRecord(
+                            step="start_decode_migration_source_delta",
+                            target=source.name,
+                            method="POST",
+                            url=url,
+                            payload=payload,
+                            response=response,
+                            elapsed_seconds=time.monotonic() - started,
+                        )
+                    )
+                    return manifests
+            except Exception as exc:
+                records.append(
+                    ActionRecord(
+                        step="start_decode_migration_source_delta",
+                        target=source.name,
+                        method="POST",
+                        url=url,
+                        payload=payload,
+                        response=last_response,
+                        success=False,
+                        message=str(exc),
+                        elapsed_seconds=time.monotonic() - started,
+                    )
+                )
+                raise
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"source delta quiesce timed out for {source.name}: {last_response}"
+                )
+            time.sleep(
+                min(
+                    self.config.migration_poll_interval_seconds,
+                    max(0.0, deadline - now),
+                )
+            )
+
+    def _collect_progressive_observation(
+        self,
+        slo_monitor: PDFlipSLOMonitor,
+        monitor_nodes: List[Tuple[str, str, str]],
+    ) -> ClusterSLOSnapshot:
+        deadline = time.monotonic() + self.config.observation_seconds
+        snapshot: Optional[ClusterSLOSnapshot] = None
+        while True:
+            snapshot = slo_monitor.collect_cluster(monitor_nodes)
+            now = time.monotonic()
+            if now >= deadline:
+                return snapshot
+            time.sleep(
+                min(
+                    self.config.migration_poll_interval_seconds,
+                    max(0.0, deadline - now),
+                )
+            )
+
+    def _evaluate_progressive_snapshot(
+        self, snapshot: ClusterSLOSnapshot, *, observing: bool
+    ) -> ProgressiveDecision:
+        prefill = snapshot.prefill_counts
+        decode = snapshot.decode_counts
+        if prefill is None or decode is None:
+            return ProgressiveDecision.INSUFFICIENT_SAMPLES
+        return evaluate_slo_decision(
+            prefill.good,
+            prefill.total,
+            decode.good,
+            decode.total,
+            self.config.slo_threshold,
+            self.config.min_prefill_slo_samples,
+            self.config.min_decode_slo_samples,
+            observing=observing,
+        )
+
+    def _source_running_requests(
+        self, source: NodeMetrics, records: List[ActionRecord]
+    ) -> Tuple[str, ...]:
+        response = self._record_get(
+            records,
+            "get_remaining_source_requests",
+            source.name,
+            source.worker_url,
+            "/pd_flip/runtime_role/status",
+        )
+        item = _first_successful_response(response)
+        status = item.get("status") if isinstance(item.get("status"), dict) else item
+        running = status.get("running_requests", [])
+        if not isinstance(running, list):
+            raise RuntimeError("source running request status is not a list")
+        rids: List[str] = []
+        for request_status in running:
+            if (
+                not isinstance(request_status, dict)
+                or request_status.get("rid") is None
+            ):
+                raise RuntimeError("source running request status has no RID")
+            rids.append(str(request_status["rid"]))
+        if len(set(rids)) != len(rids):
+            raise RuntimeError("source running request status contains duplicate RIDs")
+        return tuple(rids)
+
+    def _resume_decode_source(
+        self, source: NodeMetrics, records: List[ActionRecord]
+    ) -> None:
+        self._post_worker(
+            records,
+            "resume_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": False},
+        )
+        self._post_router(
+            records,
+            "router_undrain_source",
+            source,
+            "/pd_flip/router/worker/drain",
+            {"worker_id": source.router_worker_id, "draining": False},
+        )
+
+    def _flip_idle_source_to_prefill(
+        self, source: NodeMetrics, records: List[ActionRecord]
+    ) -> None:
+        self._post_worker(
+            records,
+            "resume_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": False},
+        )
+        self._post_worker(
+            records,
+            "set_source_runtime_role",
+            source,
+            "/pd_flip/runtime_role/set",
+            {"role": "prefill", "force": False},
+        )
+        self._wait_source_role(records, source, "prefill", "wait_source_prefill_loop")
+        self._post_router(
+            records,
+            "refresh_router_source_role",
+            source,
+            "/pd_flip/router/worker/role",
+            {
+                "worker_id": source.router_worker_id,
+                "role": "prefill",
+                "bootstrap_port": source.bootstrap_port,
+                "draining": True,
+            },
+        )
+        self._post_router(
+            records,
+            "router_undrain_source",
+            source,
+            "/pd_flip/router/worker/drain",
+            {"worker_id": source.router_worker_id, "draining": False},
+        )
+
+    def _wait_source_role(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        expected_role: str,
+        step: str,
+    ) -> Any:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        last_response: Any = None
+        while True:
+            last_response = self._record_get(
+                records,
+                step,
+                source.name,
+                source.worker_url,
+                "/pd_flip/runtime_role/status",
+            )
+            status = _first_successful_response(last_response)
+            role, _, _ = _parse_runtime_status(status)
+            if role == expected_role:
+                return last_response
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"{step} timed out for {source.name}: {last_response}"
+                )
+            time.sleep(
+                min(
+                    self.config.migration_poll_interval_seconds,
+                    max(0.0, deadline - now),
+                )
+            )
+
+    def _append_progressive_state(
+        self,
+        state_trace: List[JsonDict],
+        state: str,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        reason: str,
+        records: List[ActionRecord],
+    ) -> None:
+        state_trace.append(
+            _monitor_state_record(
+                state=state,
+                direction="d_to_p",
+                source=source.name,
+                migration_target=target.name,
+                role_before=source.effective_role,
+                role_after=(
+                    "prefill"
+                    if state == ProgressiveMonitorState.FLIPPING_ROLE
+                    else source.effective_role
+                ),
+                reason=reason,
+                action_index=len(records),
+            )
+        )
+
+    @staticmethod
+    def _progressive_result(
+        success: bool,
+        message: str,
+        iterations: int,
+        snapshots: List[JsonDict],
+        records: List[ActionRecord],
+        state_trace: List[JsonDict],
+    ) -> MonitorLoopResult:
+        return MonitorLoopResult(
+            success=success,
+            message=message,
+            iterations=iterations,
+            snapshots=snapshots,
+            actions=records,
+            state_trace=state_trace,
+        )
+
     def _execute_d_to_p(
         self,
         source: NodeMetrics,
@@ -777,6 +1415,7 @@ class PDFlipController:
         records: List[ActionRecord] = []
         session_id = f"pd-flip-{source.name}-to-{target.name}"
         migration_seconds = 0.0
+        source_finished = False
         monitor_nodes = [
             (metric.name, metric.worker_url, metric.effective_role)
             for metric in self.collect_metrics()
@@ -873,7 +1512,7 @@ class PDFlipController:
                     "source_url": source.worker_url,
                     "manifests": manifests,
                     "prepare_only": True,
-                    "adopt_on_commit": True,
+                    "adopt_on_commit": False,
                 },
             )
 
@@ -967,19 +1606,27 @@ class PDFlipController:
             migration_seconds = time.monotonic() - migration_started
             self._post_worker(
                 records,
+                "commit_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/commit",
+                {"session_id": session_id, "rids": released_rids},
+            )
+            self._post_worker(
+                records,
                 "finish_decode_migration_source",
                 source,
                 "/pd_flip/migration/source/finish",
                 {"session_id": session_id, "released_rids": released_rids},
             )
-            self._assert_source_idle_after_migration(records, source)
+            source_finished = True
             self._post_worker(
                 records,
-                "commit_decode_migration_target",
+                "activate_decode_migration_target",
                 target,
-                "/pd_flip/migration/target/commit",
-                {"session_id": session_id},
+                "/pd_flip/migration/target/activate",
+                {"session_id": session_id, "rids": released_rids},
             )
+            self._assert_source_idle_after_migration(records, source)
             self._post_worker(
                 records,
                 "set_source_runtime_role",
@@ -1038,7 +1685,8 @@ class PDFlipController:
                 migration_seconds=migration_seconds,
             )
         except Exception as exc:
-            self._abort_two_phase_migration(source, target, session_id, records)
+            if not source_finished:
+                self._abort_two_phase_migration(source, target, session_id, records)
             self._cleanup_source_after_failure(source, records)
             state_trace.append(
                 _monitor_state_record(
@@ -1110,9 +1758,9 @@ class PDFlipController:
             )
             last_source_status = source_status
             last_target_status = target_status
-            if _migration_response_complete(source_status) and _migration_response_complete(
-                target_status
-            ):
+            if _migration_response_complete(
+                source_status
+            ) and _migration_response_complete(target_status):
                 transfer_complete = True
                 if time.monotonic() >= observe_until:
                     return "transferred"
@@ -1146,16 +1794,12 @@ class PDFlipController:
         session_id: str,
         released_rids: List[str],
     ) -> List[JsonDict]:
-        source_delta = self._post_worker(
+        delta_manifests = self._poll_source_delta_manifests(
             records,
-            "start_decode_migration_source_delta",
             source,
-            "/pd_flip/migration/source/delta",
-            {"session_id": session_id, "rids": released_rids},
+            session_id,
+            released_rids,
         )
-        delta_manifests = _response_manifests(source_delta)
-        if not delta_manifests:
-            return []
 
         self._post_worker(
             records,
@@ -1202,9 +1846,9 @@ class PDFlipController:
             )
             last_source_status = source_status
             last_target_status = target_status
-            if _migration_response_complete(source_status) and _migration_response_complete(
-                target_status
-            ):
+            if _migration_response_complete(
+                source_status
+            ) and _migration_response_complete(target_status):
                 return
             failures = []
             if _migration_response_failed(source_status):
@@ -1423,7 +2067,9 @@ class PDFlipController:
         path: str,
         payload: JsonDict,
     ) -> Any:
-        return self._record_post(records, step, node.name, node.worker_url, path, payload)
+        return self._record_post(
+            records, step, node.name, node.worker_url, path, payload
+        )
 
     def _post_router(
         self,
@@ -1626,11 +2272,15 @@ class PDFlipController:
         )
         decode_prealloc_reqs = _sum_load_metric(raw_loads, "decode_prealloc_queue_reqs")
         decode_transfer_reqs = _sum_load_metric(raw_loads, "decode_transfer_queue_reqs")
-        decode_retracted_reqs = _sum_load_metric(raw_loads, "decode_retracted_queue_reqs")
+        decode_retracted_reqs = _sum_load_metric(
+            raw_loads, "decode_retracted_queue_reqs"
+        )
         prefill_bootstrap_reqs = _sum_load_metric(
             raw_loads, "prefill_bootstrap_queue_reqs"
         )
-        prefill_inflight_reqs = _sum_load_metric(raw_loads, "prefill_inflight_queue_reqs")
+        prefill_inflight_reqs = _sum_load_metric(
+            raw_loads, "prefill_inflight_queue_reqs"
+        )
         total_residual_reqs = (
             running_reqs
             + waiting_reqs
@@ -2173,6 +2823,43 @@ def _response_manifests(response: Any) -> List[JsonDict]:
     return [manifest for manifest in manifests if isinstance(manifest, dict)]
 
 
+def _all_response_manifests(response: Any) -> List[JsonDict]:
+    responses = response if isinstance(response, list) else [response]
+    manifests: List[JsonDict] = []
+    seen_rids = set()
+    for item in responses:
+        if not isinstance(item, dict):
+            continue
+        for manifest in item.get("manifests", []):
+            if not isinstance(manifest, dict):
+                continue
+            rid = manifest.get("rid")
+            rid_key = None if rid is None else str(rid)
+            if rid_key is not None and rid_key in seen_rids:
+                continue
+            if rid_key is not None:
+                seen_rids.add(rid_key)
+            manifests.append(manifest)
+    return manifests
+
+
+def _delta_quiesce_pending(response: Any) -> bool:
+    responses = response if isinstance(response, list) else [response]
+    if not responses or _all_response_manifests(response):
+        return False
+    saw_pending = False
+    for item in responses:
+        if not isinstance(item, dict):
+            return False
+        if item.get("success", True):
+            continue
+        message = str(item.get("message") or "").lower()
+        if "quiesce" not in message or "pending" not in message:
+            return False
+        saw_pending = True
+    return saw_pending
+
+
 def _manifest_rids(manifests: List[JsonDict]) -> List[str]:
     return [
         str(manifest["rid"])
@@ -2262,9 +2949,14 @@ def _load_sort_key(metric: NodeMetrics) -> Tuple[int, int, int, float, str]:
     )
 
 
-def _find_metric(metrics: List[NodeMetrics], name_or_worker_id: str) -> Optional[NodeMetrics]:
+def _find_metric(
+    metrics: List[NodeMetrics], name_or_worker_id: str
+) -> Optional[NodeMetrics]:
     for metric in metrics:
-        if metric.name == name_or_worker_id or metric.router_worker_id == name_or_worker_id:
+        if (
+            metric.name == name_or_worker_id
+            or metric.router_worker_id == name_or_worker_id
+        ):
             return metric
     return None
 
@@ -2322,7 +3014,9 @@ def _parse_node_spec(value: str) -> PDNode:
     for item in value.split(","):
         key, sep, val = item.partition("=")
         if not sep:
-            raise ValueError(f"invalid --node entry {value!r}; expected key=value pairs")
+            raise ValueError(
+                f"invalid --node entry {value!r}; expected key=value pairs"
+            )
         parts[key.strip()] = val.strip()
     name = parts["name"]
     return PDNode(
@@ -2341,7 +3035,9 @@ def config_from_args(args: argparse.Namespace) -> PDClusterConfig:
     if not args.router_url:
         raise ValueError("--router-url is required when --config is not provided")
     if not args.node:
-        raise ValueError("at least one --node is required when --config is not provided")
+        raise ValueError(
+            "at least one --node is required when --config is not provided"
+        )
     return PDClusterConfig(
         router_url=args.router_url,
         nodes=[_parse_node_spec(value) for value in args.node],
@@ -2407,9 +3103,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "execute-two-phase",
         help="Force the monitor-style two-phase D->P path with prepare_only/commit.",
     )
-    execute_two_phase.add_argument(
-        "--direction", choices=["d_to_p"], default="d_to_p"
-    )
+    execute_two_phase.add_argument("--direction", choices=["d_to_p"], default="d_to_p")
     execute_two_phase.add_argument("--source-name", default=None)
     execute_two_phase.add_argument("--migration-target-name", default=None)
 

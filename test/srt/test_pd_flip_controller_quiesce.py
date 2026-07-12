@@ -174,7 +174,13 @@ class PDFlipControllerQuiesceTest(unittest.TestCase):
         controller = PDFlipController(
             PDClusterConfig(
                 router_url="http://router",
-                nodes=[PDNode(name="node2", worker_url="http://node2", router_worker_id="node2")],
+                nodes=[
+                    PDNode(
+                        name="node2",
+                        worker_url="http://node2",
+                        router_worker_id="node2",
+                    )
+                ],
             ),
             FakeClient(),
         )
@@ -304,7 +310,7 @@ class PDFlipControllerQuiesceTest(unittest.TestCase):
         self.assertEqual(result, "transferred")
         self.assertGreaterEqual(time.monotonic() - started, 0.015)
 
-    def test_two_phase_finishes_source_before_committing_target(self):
+    def test_two_phase_commits_target_before_source_finish_then_activates(self):
         from scripts.playground.disaggregation.pd_flip_controller import (
             ActionRecord,
             NodeMetrics,
@@ -378,12 +384,12 @@ class PDFlipControllerQuiesceTest(unittest.TestCase):
         controller._post_worker = record_worker
         controller._post_router = record_router
         controller._observe_source_quiesce = lambda records, source: {}
-        controller._wait_two_phase_migration_or_recovery = (
-            lambda **kwargs: "complete"
+        controller._wait_two_phase_migration_or_recovery = lambda **kwargs: "complete"
+        controller._poll_source_delta_manifests = (
+            lambda records, source, session_id, rids: [{"rid": rid} for rid in rids]
         )
-        controller._assert_source_idle_after_migration = (
-            lambda records, source: None
-        )
+        controller._wait_two_phase_delta = lambda **kwargs: None
+        controller._assert_source_idle_after_migration = lambda records, source: None
         controller.collect_metrics = lambda: [source, target]
 
         result = controller._execute_d_to_p_two_phase(
@@ -398,8 +404,12 @@ class PDFlipControllerQuiesceTest(unittest.TestCase):
         self.assertTrue(result.success)
         steps = [record.step for record in result.actions]
         self.assertLess(
-            steps.index("finish_decode_migration_source"),
             steps.index("commit_decode_migration_target"),
+            steps.index("finish_decode_migration_source"),
+        )
+        self.assertLess(
+            steps.index("finish_decode_migration_source"),
+            steps.index("activate_decode_migration_target"),
         )
 
 

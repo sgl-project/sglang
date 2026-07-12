@@ -4,6 +4,7 @@ from typing import Optional, get_type_hints
 import pytest
 
 from scripts.playground.disaggregation import pd_flip_controller as controller_module
+from scripts.playground.disaggregation.pd_flip_monitor import SampleCounts
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -280,3 +281,306 @@ def test_progressive_policy_symbols_are_the_production_helpers():
         )["return"]
         == Optional[controller_module.RatioSelection]
     )
+
+
+class ProgressiveScenarioClient:
+    def __init__(self, *, running_rids=None, waiting_rids=None, fail_path=None):
+        self.running_rids = list(running_rids or ["r0", "r1"])
+        self.waiting_rids = list(waiting_rids or [])
+        self.fail_path = fail_path
+        self.steps = []
+        self.posts = []
+        self.source_starts = []
+        self.delta_attempts = {}
+        self.sessions = {}
+        self.source_role = "decode"
+
+    def get_json(self, base_url, path):
+        if path == "/pd_flip/router/workers":
+            return {
+                "workers": [
+                    {"worker_id": "source", "role": "decode", "draining": False},
+                    {"worker_id": "target", "role": "decode", "draining": False},
+                ]
+            }
+        if path == "/pd_flip/runtime_role/status":
+            if base_url == "http://source":
+                if self.source_role == "prefill":
+                    self.steps.append("wait_source_prefill_loop")
+                return {
+                    "success": True,
+                    "role": self.source_role,
+                    "status": {
+                        "role": self.source_role,
+                        "is_idle": not self.running_rids,
+                        "running_requests": [
+                            {"rid": rid, "kv_committed_len": 8}
+                            for rid in self.running_rids
+                        ],
+                    },
+                }
+            return {
+                "success": True,
+                "role": "decode",
+                "status": {
+                    "role": "decode",
+                    "is_idle": True,
+                    "free_request_slots": 8,
+                    "available_kv_tokens": 1024,
+                    "reserved_decode_tokens_per_req": 1,
+                    "running_requests": [],
+                },
+            }
+        if path == "/v1/loads?include=all":
+            return {
+                "loads": [
+                    {
+                        "num_running_reqs": (
+                            len(self.running_rids) if base_url == "http://source" else 0
+                        ),
+                        "num_waiting_reqs": (
+                            len(self.waiting_rids) if base_url == "http://source" else 0
+                        ),
+                        "num_total_tokens": 16 if base_url == "http://source" else 0,
+                    }
+                ]
+            }
+        if path == "/pd_flip/migration/status":
+            return {
+                "success": True,
+                "status": {"state": "transferred", "pending_reqs": 0, "failed_reqs": 0},
+            }
+        raise AssertionError((base_url, path))
+
+    def post_json(self, base_url, path, payload):
+        self.posts.append((base_url, path, dict(payload)))
+        if path == self.fail_path:
+            return {"success": False, "message": f"forced failure at {path}"}
+        if path == "/pd_flip/router/worker/drain":
+            self.steps.append(
+                "router_drain_source"
+                if payload["draining"]
+                else "router_undrain_source"
+            )
+            return {"success": True}
+        if path == "/pd_flip/router/worker/role":
+            self.steps.append("refresh_router_source_role")
+            return {"success": True}
+        if path == "/pd_flip/runtime_role/admission":
+            self.steps.append(
+                "pause_source_admission"
+                if payload["paused"]
+                else "resume_source_admission"
+            )
+            return {"success": True}
+        if path == "/pd_flip/runtime_role/set":
+            self.steps.append("set_source_runtime_role")
+            self.source_role = payload["role"]
+            return {"success": True}
+        if path == "/pd_flip/migration/source/start":
+            self.steps.append("source_start")
+            self.source_starts.append(dict(payload))
+            rids = list(payload["rids"])
+            if payload["include_waiting"]:
+                rids.extend(self.waiting_rids)
+            manifests = [{"rid": rid} for rid in rids]
+            self.sessions[payload["session_id"]] = manifests
+            return {"success": True, "manifests": manifests}
+        if path == "/pd_flip/migration/target/prepare":
+            self.steps.append("target_prepare")
+            return {"success": True}
+        if path == "/pd_flip/migration/source/delta":
+            session_id = payload["session_id"]
+            attempts = self.delta_attempts.get(session_id, 0) + 1
+            self.delta_attempts[session_id] = attempts
+            self.steps.append("source_delta")
+            if attempts == 1:
+                return {
+                    "success": False,
+                    "message": "quiesce pending",
+                    "manifests": [],
+                }
+            return {"success": True, "manifests": self.sessions[session_id]}
+        if path == "/pd_flip/migration/target/delta/prepare":
+            self.steps.append("target_delta_prepare")
+            return {"success": True}
+        if path == "/pd_flip/migration/target/commit":
+            self.steps.append("target_commit")
+            return {"success": True}
+        if path == "/pd_flip/migration/source/finish":
+            self.steps.append("source_finish")
+            released = set(payload["released_rids"])
+            self.running_rids = [
+                rid for rid in self.running_rids if rid not in released
+            ]
+            self.waiting_rids = [
+                rid for rid in self.waiting_rids if rid not in released
+            ]
+            return {"success": True}
+        if path == "/pd_flip/migration/target/activate":
+            self.steps.append("target_activate")
+            return {"success": True}
+        if path in (
+            "/pd_flip/migration/target/abort",
+            "/pd_flip/migration/abort",
+        ):
+            self.steps.append("abort")
+            return {"success": True}
+        raise AssertionError((base_url, path, payload))
+
+
+class ProgressiveScenarioMonitor:
+    def __init__(self, observation):
+        self.observation = observation
+        self.reset_calls = 0
+        self.collect_calls = 0
+
+    def collect_cluster(self, nodes):
+        list(nodes)
+        self.collect_calls += 1
+        counts = (14, 20, 19, 20) if self.reset_calls == 0 else self.observation
+        prefill_good, prefill_total, decode_good, decode_total = counts
+        return controller_module.ClusterSLOSnapshot(
+            timestamp=float(self.collect_calls),
+            prefill_nodes=1,
+            decode_nodes=2,
+            prefill_slo_attainment=prefill_good / prefill_total,
+            decode_slo_attainment=decode_good / decode_total,
+            nodes=[],
+            prefill_counts=SampleCounts(prefill_good, prefill_total),
+            decode_counts=SampleCounts(decode_good, decode_total),
+        )
+
+    def reset_window(self):
+        self.reset_calls += 1
+
+
+def progressive_scenario(observation, *, client=None):
+    client = client or ProgressiveScenarioClient()
+    config = controller_module.PDClusterConfig(
+        router_url="http://router",
+        nodes=[
+            controller_module.PDNode("source", "http://source", "source"),
+            controller_module.PDNode("target", "http://target", "target"),
+        ],
+        migration_poll_interval_seconds=0.0,
+        observation_seconds=0.0,
+        post_migration_idle_timeout_seconds=0.0,
+        min_prefill_slo_samples=20,
+        min_decode_slo_samples=20,
+    )
+    controller = controller_module.PDFlipController(config, client)
+    return controller, client, ProgressiveScenarioMonitor(observation)
+
+
+def test_progressive_flow_recovers_after_first_batch():
+    controller, client, monitor = progressive_scenario((18, 20, 19, 20))
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert result.success
+    assert [item["state"] for item in result.state_trace] == [
+        "safe",
+        "selecting",
+        "first_migrating",
+        "observing",
+        "recovering",
+        "safe",
+    ]
+    assert client.steps.count("set_source_runtime_role") == 0
+    assert client.source_starts == [
+        {
+            "session_id": "pd-flip-source-to-target-first",
+            "target_url": "http://target",
+            "rids": ["r0"],
+            "include_waiting": False,
+        }
+    ]
+    assert client.delta_attempts == {"pd-flip-source-to-target-first": 2}
+    assert monitor.reset_calls == 1
+
+
+def test_progressive_flow_commits_when_prefill_stays_risky():
+    controller, client, monitor = progressive_scenario((14, 20, 19, 20))
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert result.success
+    assert "second_migrating" in [item["state"] for item in result.state_trace]
+    assert client.source_starts[0]["rids"] == ["r0"]
+    assert client.source_starts[0]["include_waiting"] is False
+    assert client.source_starts[1]["rids"] == ["r1"]
+    assert client.source_starts[1]["include_waiting"] is True
+    assert client.steps[-4:] == [
+        "set_source_runtime_role",
+        "wait_source_prefill_loop",
+        "refresh_router_source_role",
+        "router_undrain_source",
+    ]
+
+
+def test_progressive_final_batch_uses_all_returned_running_and_waiting_rids():
+    client = ProgressiveScenarioClient(waiting_rids=["w0"])
+    controller, client, monitor = progressive_scenario((14, 20, 19, 20), client=client)
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert result.success
+    final_session = "pd-flip-source-to-target-final"
+    payloads = [
+        payload
+        for _, path, payload in client.posts
+        if path
+        in {
+            "/pd_flip/migration/source/delta",
+            "/pd_flip/migration/target/commit",
+            "/pd_flip/migration/source/finish",
+            "/pd_flip/migration/target/activate",
+        }
+        and payload["session_id"] == final_session
+    ]
+    assert payloads
+    assert all(
+        payload.get("rids", payload.get("released_rids")) == ["r1", "w0"]
+        for payload in payloads
+    )
+
+
+def test_progressive_commit_skips_empty_final_source_start():
+    client = ProgressiveScenarioClient(running_rids=["only"])
+    controller, client, monitor = progressive_scenario((14, 20, 19, 20), client=client)
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert result.success
+    assert len(client.source_starts) == 1
+    assert client.source_starts[0]["rids"] == ["only"]
+
+
+def test_progressive_failure_before_source_finish_aborts_both_sides():
+    client = ProgressiveScenarioClient(fail_path="/pd_flip/migration/target/commit")
+    controller, client, monitor = progressive_scenario((18, 20, 19, 20), client=client)
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert not result.success
+    abort_records = [
+        record for record in result.actions if record.step == "abort_decode_migration"
+    ]
+    assert [record.target for record in abort_records] == ["target", "source"]
+    assert "source_finish" not in client.steps
+    assert client.steps[-2:] == ["resume_source_admission", "router_undrain_source"]
+
+
+def test_progressive_failure_after_source_finish_does_not_abort_ownership():
+    client = ProgressiveScenarioClient(fail_path="/pd_flip/migration/target/activate")
+    controller, client, monitor = progressive_scenario((18, 20, 19, 20), client=client)
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert not result.success
+    assert "source_finish" in client.steps
+    assert not [
+        record for record in result.actions if record.step == "abort_decode_migration"
+    ]
+    assert client.running_rids == ["r1"]
