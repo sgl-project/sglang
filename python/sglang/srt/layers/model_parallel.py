@@ -156,3 +156,14 @@ def tensor_parallel(
     # `apply` is a native method of `nn.Module` that recursively applies a
     # function to every submodule.
     module.apply(tplize)
+
+
+def apply_torch_tp(
+    *,
+    model: nn.Module,
+    device: str,
+    tp_size: int,
+):
+    logger.info(f"Enabling torch tensor parallelism on {tp_size} devices.")
+    device_mesh = torch.distributed.init_device_mesh(device, (tp_size,))
+    tensor_parallel(model, device_mesh)

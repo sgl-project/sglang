@@ -132,7 +132,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.model_parallel import tensor_parallel
+from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
@@ -293,17 +293,6 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
-
-
-def apply_torch_tp(
-    *,
-    model: nn.Module,
-    device: str,
-    tp_size: int,
-):
-    logger.info(f"Enabling torch tensor parallelism on {tp_size} devices.")
-    device_mesh = torch.distributed.init_device_mesh(device, (tp_size,))
-    tensor_parallel(model, device_mesh)
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
