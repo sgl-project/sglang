@@ -454,6 +454,15 @@ class TestRegexMaxLength(CustomTestCase):
         """Test that character class '[a-z]' gives max length 1."""
         self.assertEqual(get_max_seq_length("[a-z]"), 1)
 
+    def test_negated_single_char_class(self):
+        """Test that a single-char negated class '[^a]' gives max length 1,
+        matching the multi-char negated form '[^ab]' rather than falling
+        into the unhandled-token MAX_LEN fallback (sre_parse emits a
+        distinct NOT_LITERAL token for the single-char case)."""
+        self.assertEqual(get_max_seq_length("[^a]"), 1)
+        self.assertEqual(get_max_seq_length("[^ab]"), 1)
+        self.assertEqual(get_max_seq_length("a[^b]c"), 3)
+
     def test_dot_any(self):
         """Test that dot wildcard '.' gives max length 1."""
         self.assertEqual(get_max_seq_length("."), 1)
