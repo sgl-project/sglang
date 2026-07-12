@@ -891,6 +891,11 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # Low-latency small-batch serving: dequantize fp8 block-quant DENSE linear
+    # weights to bf16 at load time so tiny-M GEMMs run through cuBLAS instead of
+    # the fp8 path plus its per-call activation quant. MoE expert weights are
+    # unaffected. Trades ~2x dense weight memory for decode latency.
+    SGLANG_BS1_BF16_DENSE = EnvBool(False)
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
     # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
