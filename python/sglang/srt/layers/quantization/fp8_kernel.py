@@ -29,6 +29,7 @@ except:
     pass
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -55,11 +56,10 @@ _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_musa:
-    from sgl_kernel import sgl_per_token_quant_fp8
-
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
     # Temporary
     try:
@@ -145,6 +145,17 @@ def deep_gemm_fp8_fp8_bf16_nt(
     C: torch.Tensor,
 ) -> None:
     deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+
+
+@register_custom_op(mutates_args=["C"])
+def deep_gemm_mxfp8_fp8_bf16_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_mxfp8_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -335,7 +346,6 @@ def _per_token_group_quant_8bit_raw(
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
 
-        assert group_size == 128
         x_s = transform_sf_into_required_layout(
             x_s,
             num_groups=None,
@@ -405,7 +415,6 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         scale_ue8m0=scale_ue8m0,
     )
 
-    assert group_size == 128
     output_scale = transform_sf_into_required_layout(
         output_scale_for_kernel,
         num_groups=output.shape[0],
@@ -466,7 +475,7 @@ def create_per_token_group_quant_fp8_output_scale(
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
             *x_batch, x_q_mn, x_q_k = x_shape
-            x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+            x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
             aligned_mn = ceil_align(x_s_mn, 4)
             aligned_k = ceil_align(x_s_k, 4)
             # TODO(FIXME): Fix cuda kernel and recover here to empty.
@@ -511,6 +520,105 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
+_V2_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
+
+
+def _run_per_token_group_quant_8bit_kernel(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    *,
+    column_major_scales: bool,
+    scale_ue8m0: bool,
+    fuse_silu_and_mul: bool,
+    masked_m: Optional[torch.Tensor],
+    enable_v2: Optional[bool],
+) -> None:
+    # V1 JIT (.cuh) is byte-identical to V2 but CUDA-only and col-major-UE8M0-only;
+    # gate it to opt-in plain-2D non-MUSA calls, else fall back to V2 / AOT v1.
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+
+    use_jit_per_token_group_v1_quant = (
+        envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
+        and enable_v2
+        and not _is_musa
+        and not fuse_silu_and_mul
+        and masked_m is None
+        and x.dim() == 2
+        and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+        and not (scale_ue8m0 and not column_major_scales)
+    )
+
+    if use_jit_per_token_group_v1_quant:
+        sgl_per_token_group_quant_8bit_jit(
+            input=x,
+            output_q=x_q,
+            output_s=x_s,
+            group_size=group_size,
+            eps=eps,
+            fp8_min=fp8_min,
+            fp8_max=fp8_max,
+            scale_ue8m0=scale_ue8m0,
+        )
+        return
+
+    if not enable_sgl_per_token_group_quant_8bit:
+        assert not enable_v2
+        sgl_per_token_group_quant_fp8(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        )
+        return
+
+    if enable_v2 and _is_musa:
+        # JIT v2 .cuh is CUDA-only (no MUSA fallback); AOT v2 carries the USE_MUSA path.
+        sgl_per_token_group_quant_8bit(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+            enable_v2=True,
+        )
+    elif enable_v2:
+        sgl_per_token_group_quant_8bit_jit_v2(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+        )
+    else:
+        # JIT kernels static_assert on group_size in {16,32,64,128}; keep AOT v1 otherwise.
+        sgl_per_token_group_quant_8bit(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+            enable_v2=enable_v2,
+        )
+
+
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -539,60 +647,21 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
-    # Enable v2 kernel by default on supported group sizes
-    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
-    if enable_v2 is None:
-        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
-
     if x.shape[0] > 0:
-        # Temporary
-        if enable_sgl_per_token_group_quant_8bit:
-            if enable_v2 and _is_musa:
-                # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and
-                # has no MUSA fallback, so keep MUSA on the AOT v2 op, which
-                # carries the USE_MUSA vector load/store fallbacks.
-                sgl_per_token_group_quant_8bit(
-                    x,
-                    x_q,
-                    x_s,
-                    group_size,
-                    eps,
-                    fp8_min,
-                    fp8_max,
-                    scale_ue8m0,
-                    fuse_silu_and_mul,
-                    masked_m,
-                    enable_v2=True,
-                )
-            elif enable_v2:
-                sgl_per_token_group_quant_8bit_jit_v2(
-                    x,
-                    x_q,
-                    x_s,
-                    group_size,
-                    eps,
-                    fp8_min,
-                    fp8_max,
-                    scale_ue8m0=scale_ue8m0,
-                    fuse_silu_and_mul=fuse_silu_and_mul,
-                    masked_m=masked_m,
-                )
-            else:
-                sgl_per_token_group_quant_8bit_jit(
-                    input=x,
-                    output_q=x_q,
-                    output_s=x_s,
-                    group_size=group_size,
-                    eps=eps,
-                    fp8_min=fp8_min,
-                    fp8_max=fp8_max,
-                    scale_ue8m0=scale_ue8m0,
-                )
-        else:
-            assert not enable_v2
-            sgl_per_token_group_quant_fp8(
-                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-            )
+        _run_per_token_group_quant_8bit_kernel(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            column_major_scales=column_major_scales,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+            enable_v2=enable_v2,
+        )
 
     return x_q, x_s
 
@@ -610,7 +679,8 @@ def sglang_per_token_group_quant_fp8_row_padded(
     and scales_a). Allocating the quant outputs with rows already aligned to
     ``row_alignment`` makes the wrapper's pad_tensor() short-circuit (pad_rows
     == 0), removing 2x fill + 2x cat kernels per GEMM. Rows in [m, m_pad) are
-    uninitialized garbage; the caller must slice the GEMM output back to m.
+    zero-filled to match the legacy pad_tensor contract so the padded GEMM is
+    bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
     assert (
@@ -634,19 +704,37 @@ def sglang_per_token_group_quant_fp8_row_padded(
         (k // group_size, m_pad), device=x.device, dtype=torch.float32
     ).transpose(0, 1)
     if m > 0:
-        sgl_per_token_group_quant_8bit(
-            x,
-            x_q[:m],
-            x_s[:m],
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            False,  # scale_ue8m0
-            False,  # fuse_silu_and_mul
-            None,  # masked_m
-            enable_v2=True,
-        )
+        # V1 JIT (.cuh) is CUDA-only; MUSA must stay on the AOT v2 op below.
+        if envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get() and not _is_musa:
+            sgl_per_token_group_quant_8bit_jit(
+                input=x,
+                output_q=x_q[:m],
+                output_s=x_s[:m],
+                group_size=group_size,
+                eps=eps,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=False,
+            )
+        else:
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q[:m],
+                x_s[:m],
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                False,  # scale_ue8m0
+                False,  # fuse_silu_and_mul
+                None,  # masked_m
+                enable_v2=True,
+            )
+    if m_pad != m:
+        # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
+        # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
+        x_q[m:].zero_()
+        x_s[m:].zero_()
     return x_q, x_s
 
 
@@ -1295,6 +1383,25 @@ def w8a8_block_fp8_matmul_deepgemm(
     return C
 
 
+def w8a8_mxfp8_matmul_deepgemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert A.is_contiguous() and B.is_contiguous()
+    assert output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    M = A.numel() // A.shape[-1]
+    N, K = B.shape
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+
+    deep_gemm_mxfp8_fp8_bf16_nt(A, As, B, Bs, C)
+
+    return C
+
+
 def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1536,6 +1643,66 @@ def mxfp8_block_scaled_matmul_triton(
         num_stages,
     )
     return output
+
+
+@triton.jit
+def _pack_mxfp8_scales_kernel(
+    scale_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    K_GROUPS: tl.constexpr,
+    SCALE_K: tl.constexpr,
+    TOTAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < TOTAL
+
+    idx256 = offs % 256
+    tmp = offs // 256
+    two = tmp % 2
+    tmp = tmp // 2
+    scale_k = tmp % SCALE_K
+    scale_m = tmp // SCALE_K
+
+    within = two * 256 + idx256
+    row_inner_32 = within // 16
+    rem = within - row_inner_32 * 16
+    row_outer_4 = rem // 4
+    k_inner_4 = rem - row_outer_4 * 4
+
+    row = scale_m * 128 + row_outer_4 * 32 + row_inner_32
+    col = scale_k * 4 + k_inner_4
+    value = tl.load(scale_ptr + row * K_GROUPS + col, mask & (row < M), other=127)
+    tl.store(out_ptr + offs, value, mask)
+
+
+def pack_mxfp8_scales_triton(scale_u8: torch.Tensor) -> torch.Tensor:
+    assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
+    scale_u8 = scale_u8.contiguous()
+    m, k_groups = scale_u8.shape
+    assert (
+        k_groups % 4 == 0
+    ), f"{k_groups=} must be divisible by 4 (K must be multiple of 128)"
+
+    scale_m = triton.cdiv(m, 128)
+    scale_k = k_groups // 4
+    out = torch.empty(
+        (1, scale_m, scale_k, 2, 256), dtype=scale_u8.dtype, device=scale_u8.device
+    )
+    total = out.numel()
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    _pack_mxfp8_scales_kernel[grid](
+        scale_u8,
+        out,
+        m,
+        k_groups,
+        scale_k,
+        total,
+        BLOCK=block,
+    )
+    return out
 
 
 @triton.jit

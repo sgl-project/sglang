@@ -43,7 +43,6 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -91,6 +90,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -182,7 +182,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Ported from main #27468.
         if (
             model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash()
+            or model_runner.spec_algorithm.is_dflash_family()
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         # EAGLE captures FULL hidden states for the target and LAST for the
@@ -458,9 +458,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             if self.layer_model is not None:
+                positions = self._get_layer_model_positions(forward_batch)
                 return self.layer_model.forward(
                     forward_batch.input_ids,
-                    forward_batch.positions,
+                    positions,
                     forward_batch,
                     forward_batch.input_embeds,
                 )
@@ -469,6 +470,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.positions,
                 forward_batch,
             )
+
+    def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if forward_batch.mrope_positions is None:
+            return forward_batch.positions
+
+        model = self.model_runner.model
+        if getattr(model, "is_mrope_enabled", False):
+            return forward_batch.mrope_positions
+
+        language_model = getattr(model, "language_model", None)
+        if getattr(language_model, "is_mrope_enabled", False):
+            return forward_batch.mrope_positions
+
+        return forward_batch.positions
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
         """Build a dummy ForwardBatch at this shape, init attn metadata,
@@ -712,11 +728,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens=shape_inputs["extend_seq_lens"],
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
-                extend_prefix_lens_cpu=torch.zeros(
-                    (bs,), dtype=torch.int64, device="cpu"
-                ),
-                extend_seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
+                extend_prefix_lens_cpu=[0] * bs,
+                extend_seq_lens_cpu=list(lens_cpu),
+                extend_logprob_start_lens_cpu=list(lens_cpu),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -761,11 +775,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_num_tokens)
         )
         for num_tokens in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,

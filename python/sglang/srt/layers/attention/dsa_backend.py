@@ -56,6 +56,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -136,7 +137,13 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
 
 
 # Reuse this workspace buffer across all DSA backend instances
-global_workspace_buffer = None
+
+# Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
+# Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
+_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
+_USE_FUSED_METADATA_GENERATION = (
+    envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
+)
 
 
 @dataclass(frozen=True)
@@ -443,14 +450,14 @@ class DeepseekSparseAttnBackend(
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
-            global global_workspace_buffer
-            if global_workspace_buffer is None:
-                global_workspace_buffer = torch.empty(
+            self.workspace_buffer = get_buffer(
+                "dsa_trtllm_workspace",
+                lambda: torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
-                )
-            self.workspace_buffer = global_workspace_buffer
+                ),
+            )
         else:
             self.workspace_buffer = None
 
@@ -1374,8 +1381,8 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+            if _USE_FUSED_METADATA_GENERATION and is_cuda() and not _is_hip:
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
 
@@ -1416,8 +1423,8 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+            if _USE_FUSED_METADATA_GENERATION and is_cuda() and not _is_hip:
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
 
@@ -1514,8 +1521,8 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+            if _USE_FUSED_METADATA_GENERATION and is_cuda() and not _is_hip:
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
 

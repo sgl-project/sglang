@@ -9,27 +9,8 @@ import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
-# tilelang isn't shipped on every platform (e.g. Ascend NPU images) and the
-# only tilelang artifacts in this file are pass_configs that downstream
-# tilelang.jit decorators would consume — the kernels actually defined here
-# are Triton. Keep the import optional so this module loads on NPU.
-try:
-    import tilelang
-
-    tilelang.set_log_level("WARNING")
-
-    pass_configs = {
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    }
-except ImportError:
-    logger.info(
-        "tilelang not installed; deepseek_v4_rope pass_configs unset. "
-        "Triton kernels in this module still run; only downstream tilelang.jit "
-        "consumers of pass_configs will need to handle the None."
-    )
-    tilelang = None
-    pass_configs = None
+# This module is imported during model-registry discovery. Keep it free of
+# TileLang imports so discovery does not load TileLang's native CUDA stubs.
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
