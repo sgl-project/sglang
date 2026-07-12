@@ -13,7 +13,6 @@ from sglang.jit_kernel.utils.common import (
     should_run_full_tests,
 )
 from sglang.jit_kernel.utils.compile import KERNEL_PATH, load_jit, make_cpp_args
-from sglang.jit_kernel.utils.deps import register_dependency
 
 __all__ = [
     "should_run_full_tests",
@@ -26,6 +25,5 @@ __all__ = [
     "override_jit_cuda_arch",
     "get_jit_cuda_arch",
     "is_arch_support_pdl",
-    "register_dependency",
     "KERNEL_PATH",
 ]
