@@ -157,6 +157,22 @@ class TokenizerControlMixin:
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
+    @staticmethod
+    def _pd_flip_resolve_effective_session_id(
+        requested_session_id: Optional[str], responses
+    ) -> Optional[str]:
+        if requested_session_id is not None:
+            return str(requested_session_id)
+        resolved = {
+            str(session_id)
+            for response in responses or []
+            for session_id in [
+                (getattr(response, "status", None) or {}).get("session_id")
+            ]
+            if session_id is not None
+        }
+        return next(iter(resolved)) if len(resolved) == 1 else None
+
     def _ensure_pd_flip_migration_bootstrap_server(self: TokenizerManager) -> None:
         if (
             DisaggregationMode(self.server_args.disaggregation_mode)
@@ -916,7 +932,10 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         responses = await self.pd_flip_migration_communicator(obj)
-        self._pd_flip_clear_session_relay_state(obj.session_id, keep_receive=True)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        self._pd_flip_clear_session_relay_state(session_id, keep_receive=True)
         return responses
 
     async def get_pd_flip_migration_status(
@@ -930,7 +949,9 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         responses = await self.pd_flip_migration_communicator(obj)
-        session_id = obj.session_id
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
         if session_id:
             receive = getattr(self, "pd_flip_last_relay_seq_by_key", {})
             for key in [
@@ -961,7 +982,10 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         responses = await self.pd_flip_migration_communicator(obj)
-        self._pd_flip_clear_session_relay_state(obj.session_id)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        self._pd_flip_clear_session_relay_state(session_id)
         return responses
 
     async def set_pd_runtime_role(

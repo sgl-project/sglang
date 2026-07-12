@@ -660,6 +660,143 @@ class TestDecodeLoopAST(unittest.TestCase):
         self.assertLess(min(drop_lines), min(state_lookup_lines))
 
 
+class TestOmittedSessionCleanup(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _compile_methods(path, class_name, method_names):
+        tree = ast.parse((REPO_ROOT / path).read_text(encoding="utf-8"))
+        class_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        selected = [
+            copy.deepcopy(node)
+            for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in method_names
+        ]
+        if {node.name for node in selected} != set(method_names):
+            raise AssertionError("requested production control methods are missing")
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__",
+                    names=[ast.alias(name="annotations")],
+                    level=0,
+                ),
+                *selected,
+            ],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(module)
+        namespace = {}
+        exec(compile(module, "<control-ast>", "exec"), namespace)
+        return namespace
+
+    def _manager(self, response_session="s1"):
+        control_names = {
+            "_pd_flip_resolve_effective_session_id",
+            "abort_pd_flip_migration_target",
+            "finish_pd_flip_migration_source",
+            "abort_pd_flip_migration",
+        }
+        methods = self._compile_methods(
+            "python/sglang/srt/managers/tokenizer_control_mixin.py",
+            "TokenizerControlMixin",
+            control_names,
+        )
+        cleanup = self._compile_methods(
+            "python/sglang/srt/managers/tokenizer_manager.py",
+            "TokenizerManager",
+            {"_pd_flip_clear_session_relay_state"},
+        )
+
+        class Manager:
+            pass
+
+        for name, method in {**methods, **cleanup}.items():
+            setattr(Manager, name, method)
+        manager = Manager()
+        manager.auto_create_handle_loop = lambda: None
+        manager.pd_flip_migration_communicator = AsyncMock(
+            return_value=[
+                types.SimpleNamespace(
+                    success=True, status={"session_id": response_session}
+                )
+            ]
+        )
+        manager.pd_flip_output_relay_targets = {
+            ("s1", "r0"): "u1",
+            ("s2", "r0"): "u2",
+        }
+        manager.pd_flip_output_relay_baseline = {
+            ("s1", "r0"): 3,
+            ("s2", "r0"): 4,
+        }
+        manager.pd_flip_last_relay_seq_by_key = {
+            ("s1", "r0"): 3,
+            ("s2", "r0"): 4,
+        }
+        manager.pd_flip_relay_session_by_rid = {"r0": "s1", "r2": "s2"}
+        manager.rid_to_state = {}
+        return manager
+
+    async def test_target_abort_uses_resolved_session_without_touching_other_session(
+        self,
+    ):
+        manager = self._manager()
+
+        await manager.abort_pd_flip_migration_target(
+            types.SimpleNamespace(session_id=None)
+        )
+
+        self.assertNotIn(("s1", "r0"), manager.pd_flip_output_relay_targets)
+        self.assertIn(("s2", "r0"), manager.pd_flip_output_relay_targets)
+
+    async def test_generic_abort_cleans_resolved_binding_and_last_seen_only(self):
+        manager = self._manager()
+
+        await manager.abort_pd_flip_migration(types.SimpleNamespace(session_id=None))
+
+        self.assertNotIn(("s1", "r0"), manager.pd_flip_last_relay_seq_by_key)
+        self.assertIn(("s2", "r0"), manager.pd_flip_last_relay_seq_by_key)
+        self.assertNotEqual(manager.pd_flip_relay_session_by_rid.get("r0"), "s1")
+        self.assertEqual(manager.pd_flip_relay_session_by_rid["r2"], "s2")
+
+    async def test_source_finish_cleans_resolved_inactive_binding_only(self):
+        manager = self._manager()
+
+        await manager.finish_pd_flip_migration_source(
+            types.SimpleNamespace(session_id=None)
+        )
+
+        self.assertNotIn(("s1", "r0"), manager.pd_flip_last_relay_seq_by_key)
+        self.assertIn(("s2", "r0"), manager.pd_flip_last_relay_seq_by_key)
+
+    async def test_ambiguous_response_sessions_do_not_trigger_cleanup(self):
+        manager = self._manager()
+        manager.pd_flip_migration_communicator = AsyncMock(
+            return_value=[
+                types.SimpleNamespace(success=True, status={"session_id": "s1"}),
+                types.SimpleNamespace(success=True, status={"session_id": "s2"}),
+            ]
+        )
+
+        await manager.abort_pd_flip_migration(types.SimpleNamespace(session_id=None))
+
+        self.assertIn(("s1", "r0"), manager.pd_flip_last_relay_seq_by_key)
+        self.assertIn(("s2", "r0"), manager.pd_flip_last_relay_seq_by_key)
+
+    async def test_missing_response_session_does_not_trigger_cleanup(self):
+        manager = self._manager()
+        manager.pd_flip_migration_communicator = AsyncMock(return_value=[])
+
+        await manager.abort_pd_flip_migration(types.SimpleNamespace(session_id=None))
+
+        self.assertIn(("s1", "r0"), manager.pd_flip_last_relay_seq_by_key)
+        self.assertIn(("s2", "r0"), manager.pd_flip_last_relay_seq_by_key)
+
+
 @unittest.skipIf(RUNTIME_IMPORT_ERROR is not None, str(RUNTIME_IMPORT_ERROR))
 class TestSourceFinishAndAbort(unittest.TestCase):
     def test_source_finish_filters_only_selected_and_resumes(self):
