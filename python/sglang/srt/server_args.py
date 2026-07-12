@@ -2223,9 +2223,15 @@ class ServerArgs:
         bool,
         "Adopt base image processor instead of fast image processor.",
     ] = False
+    mm_feature_transport: A[
+        Optional[Literal["cpu", "cuda_ipc"]],
+        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
+        "The default is CPU transport; CUDA IPC reserves GPU memory on the base GPU.",
+    ] = None
     keep_mm_feature_on_device: A[
         bool,
-        "Keep multimodal feature tensors on device after processing to save D2H copy.",
+        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
+        "multimodal feature transport.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -6116,7 +6122,81 @@ class ServerArgs:
                 "and min_new_tokens are unavailable."
             )
 
+    def _handle_multimodal_feature_transport(self):
+        """Resolve multimodal feature transport before tokenizer workers start.
+
+        CUDA IPC is deliberately opt-in: its fixed pool lives on ``base_gpu_id``
+        and reduces the memory left for model/KV-cache allocations.  The legacy
+        flag and environment variable remain supported so existing deployments
+        continue to work, but both map to this single policy.
+        """
+        requested_transport = self.mm_feature_transport
+        legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
+        legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
+
+        if self.keep_mm_feature_on_device:
+            if requested_transport == "cpu":
+                raise ValueError(
+                    "--keep-mm-feature-on-device conflicts with "
+                    "--mm-feature-transport=cpu. Use only "
+                    "--mm-feature-transport=cuda_ipc."
+                )
+            requested_transport = "cuda_ipc"
+            logger.warning(
+                "--keep-mm-feature-on-device is deprecated; using "
+                "--mm-feature-transport=cuda_ipc instead."
+            )
+
+        if requested_transport is None:
+            if legacy_ipc_is_set:
+                requested_transport = "cuda_ipc" if legacy_ipc_enabled else "cpu"
+                logger.warning(
+                    "SGLANG_USE_CUDA_IPC_TRANSPORT is deprecated; use "
+                    "--mm-feature-transport=%s instead.",
+                    requested_transport,
+                )
+            else:
+                requested_transport = "cpu"
+        elif legacy_ipc_is_set and legacy_ipc_enabled != (
+            requested_transport == "cuda_ipc"
+        ):
+            logger.warning(
+                "--mm-feature-transport=%s overrides the conflicting legacy "
+                "SGLANG_USE_CUDA_IPC_TRANSPORT=%s setting.",
+                requested_transport,
+                int(legacy_ipc_enabled),
+            )
+
+        if requested_transport == "cuda_ipc":
+            if not is_cuda():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA."
+                )
+            if self.nnodes != 1:
+                raise ValueError(
+                    "--mm-feature-transport=cuda_ipc only supports a single node."
+                )
+
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            logger.info(
+                "Using CUDA IPC for multimodal features: reserving up to %d MiB "
+                "on base GPU %d across %d tokenizer worker(s). This reduces KV "
+                "cache headroom; a full pool falls back to CPU transport.",
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
+            )
+
+        self.mm_feature_transport = requested_transport
+        # The bounded IPC pool owns device residency. Do not retain unpooled
+        # tensors after a pool miss, which would make HBM use request-dependent.
+        self.keep_mm_feature_on_device = False
+        envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
+            "1" if requested_transport == "cuda_ipc" else "0"
+        )
+
     def _handle_environment_variables(self):
+        self._handle_multimodal_feature_transport()
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
