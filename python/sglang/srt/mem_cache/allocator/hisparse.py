@@ -347,10 +347,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
     def full_available_size(self):
-        return min(
-            self.logical_attn_allocator.full_available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        # HiSparse keeps the full logical KV allocation separate from the
+        # bounded C4 device working set. The device pool is checked explicitly
+        # by alloc_extend() and alloc_device_buffer(); using it here makes an
+        # empty logical pool look mostly occupied when host_to_device_ratio > 1.
+        return self.logical_attn_allocator.full_available_size()
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
@@ -368,10 +369,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_free_group.append(self._copy_for_free_group(free_indices))
 
     def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
