@@ -24,7 +24,7 @@ if _is_cuda:
     from sgl_kernel import bmm_fp8
 
 if _is_hip:
-    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+    from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
 

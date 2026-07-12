@@ -86,6 +86,9 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for batched IPC payloads."""
 
     rids: Optional[List[str]] = None
+    # Used by batch messages whose items are parallel arrays, such as scheduler
+    # outputs. Tokenized input batches store routing on batch[i].http_worker_ipc
+    # because the scheduler unpacks them into single-request handlers.
     http_worker_ipcs: Optional[List[Optional[str]]] = None
 
     @classmethod
@@ -806,7 +809,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
-    session_id: Optional[str] = field(default=None, kw_only=True)
+    session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
 
     # LoRA related
@@ -881,6 +884,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
+    # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
     batch: List[TokenizedGenerateReqInput]
 
     def __len__(self):
@@ -1166,6 +1170,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
 
 class BatchTokenizedEmbeddingReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized embedding requests
+    # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
     batch: List[TokenizedEmbeddingReqInput]
 
     def __len__(self):
@@ -1269,8 +1274,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
+    spec_num_block_accept_tokens: Optional[List[int]] = None
+    spec_num_cap_tokens: Optional[List[int]] = None
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+    spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
@@ -1344,8 +1352,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
+    spec_num_block_accept_tokens: Optional[List[int]] = None
+    spec_num_cap_tokens: Optional[List[int]] = None
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+    spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -1712,6 +1723,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
+    allow_quant_error: bool = False
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
@@ -1972,102 +1984,6 @@ class BlockReqType(Enum):
 
 class BlockReqInput(BaseReq, kw_only=True):
     req_type: BlockReqType
-
-
-class MemoryMetrics(msgspec.Struct, array_like=True):
-    """Memory breakdown metrics."""
-
-    weight_gb: float
-    kv_cache_gb: float
-    graph_gb: float
-    token_capacity: int
-
-
-class SpeculativeMetrics(msgspec.Struct, array_like=True):
-    """Speculative decoding metrics."""
-
-    accept_length: float
-    accept_rate: float
-
-
-class LoRAMetrics(msgspec.Struct, array_like=True):
-    """LoRA adapter pool metrics."""
-
-    slots_used: int
-    slots_total: int
-    utilization: float
-
-
-class DisaggregationMetrics(msgspec.Struct, array_like=True):
-    """PD disaggregation metrics."""
-
-    mode: str  # "prefill", "decode", or "null"
-    prefill_bootstrap_queue_reqs: int = 0
-    prefill_inflight_queue_reqs: int = 0
-    decode_prealloc_queue_reqs: int = 0
-    decode_transfer_queue_reqs: int = 0
-    decode_retracted_queue_reqs: int = 0
-    kv_transfer_speed_gb_s: float = 0.0
-    kv_transfer_latency_ms: float = 0.0
-
-
-class QueueMetrics(msgspec.Struct, array_like=True):
-    """Detailed queue info breakdown."""
-
-    waiting: int
-    grammar: int
-    paused: int
-    retracted: int
-
-
-class GetLoadsReqInput(BaseReq, kw_only=True):
-    """Request for /v1/loads endpoint."""
-
-    VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
-    )
-
-    include: List[str] = msgspec.field(default_factory=lambda: ["all"])
-    dp_rank: Optional[int] = None
-
-    def __post_init__(self):
-        """Validate include sections."""
-        if self.include:
-            invalid = set(self.include) - self.VALID_SECTIONS
-            if invalid:
-                raise ValueError(
-                    f"Invalid include sections: {invalid}. "
-                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
-                )
-
-
-class GetLoadsReqOutput(BaseReq, kw_only=True):
-    """Per-DP-rank load metrics for /v1/loads endpoint."""
-
-    dp_rank: int
-    timestamp: float
-
-    num_running_reqs: int
-    num_waiting_reqs: int
-    num_waiting_uncached_tokens: int
-    num_used_tokens: int
-    # num_used_tokens plus pending tokens not already allocated in the KV pool.
-    # Used for DP balance.
-    num_total_tokens: int
-    max_total_num_tokens: int
-    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
-    # not just KV token usage. Rename requires API deprecation.
-    token_usage: float
-    gen_throughput: float
-    cache_hit_rate: float
-    utilization: float
-    max_running_requests: int
-
-    memory: Optional[MemoryMetrics] = None
-    speculative: Optional[SpeculativeMetrics] = None
-    lora: Optional[LoRAMetrics] = None
-    disaggregation: Optional[DisaggregationMetrics] = None
-    queues: Optional[QueueMetrics] = None
 
 
 class SetInjectDumpMetadataReqInput(BaseReq, kw_only=True):

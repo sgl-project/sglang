@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
+from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -123,9 +123,6 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
-global_workspace_buffer = None
-
-
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
@@ -139,7 +136,7 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+        from sglang.kernels.ops.attention.extend_attention import (
             extend_attention_fwd,
         )
 
@@ -845,6 +842,8 @@ class AiterAttnBackend(AttentionBackend):
             reduce_final_map,
             reduce_partial_map,
             tile_q,
+            # Prefill PS metadata has no split cap; 0 keeps AITER's default reduce sizing.
+            0,
             output,
             final_lse,
         )
