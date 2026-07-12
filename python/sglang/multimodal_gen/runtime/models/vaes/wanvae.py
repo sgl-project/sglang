@@ -1477,22 +1477,41 @@ class AutoencoderKLWan(ParallelTiledVAE):
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
 
+    @staticmethod
+    def _count_conv3d(model) -> int:
+        count = 0
+        for m in model.modules():
+            if isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d)):
+                count += 1
+        return count
+
     def clear_cache(self) -> None:
-
-        def _count_conv3d(model) -> int:
-            count = 0
-            for m in model.modules():
-                if isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d)):
-                    count += 1
-            return count
-
         if self.config.load_decoder:
-            self._conv_num = _count_conv3d(self.decoder)
+            self._conv_num = self._count_conv3d(self.decoder)
             self._conv_idx = 0
             self._feat_map = [None] * self._conv_num
         # cache encode
         if self.config.load_encoder:
-            self._enc_conv_num = _count_conv3d(self.encoder)
+            self._enc_conv_num = self._count_conv3d(self.encoder)
+            self._enc_conv_idx = 0
+            self._enc_feat_map = [None] * self._enc_conv_num
+
+    def clear_encode_cache(self) -> None:
+        """Reset ONLY the encoder feature cache, leaving the decoder's
+        ``_feat_map`` untouched.
+
+        ``encode()`` must not disturb the decoder cache: in OmniDreams realtime
+        the hdmap encoder and the latent decoder share one cached WanVAE
+        instance (memory optimization), and a full ``clear_cache()`` inside
+        ``encode()`` would wipe the decoder's persistent per-chunk
+        ``_feat_map`` mid-rollout, collapsing each steady chunk's temporal
+        upsample to the causal-anchor (1 frame) path. ``encode`` only ever
+        touches ``_enc_feat_map``, so scoping the reset to it is sufficient and
+        side-effect-free for the shared-instance case; standalone encoders are
+        unaffected (they have no live decoder cache to preserve).
+        """
+        if self.config.load_encoder:
+            self._enc_conv_num = self._count_conv3d(self.encoder)
             self._enc_conv_idx = 0
             self._enc_feat_map = [None] * self._enc_conv_num
 
@@ -1539,7 +1558,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
-            self.clear_cache()
+            # Reset only the ENCODER cache: this WanVAE instance may be shared
+            # with an in-flight causal decode rollout (OmniDreams realtime reuses
+            # one cached instance for hdmap-encode + latent-decode), whose
+            # persistent ``_feat_map`` must survive across the interleaved
+            # per-chunk encode calls. A full ``clear_cache()`` here would wipe it.
+            self.clear_encode_cache()
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
             with forward_context(
@@ -1558,7 +1582,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
             enc = torch.cat([mu, logvar], dim=1)
             enc = DiagonalGaussianDistribution(enc)
-            self.clear_cache()
+            self.clear_encode_cache()
         else:
             for block in self.encoder.down_blocks:
                 if isinstance(block, WanResample) and block.mode == "downsample3d":

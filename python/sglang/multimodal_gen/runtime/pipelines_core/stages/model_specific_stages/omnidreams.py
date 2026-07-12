@@ -60,10 +60,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     DecodingStage,
-    _ensure_tensor_decode_output,
-    scale_and_shift_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
+    CausalVaeDecodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams_hdmap_decode import (
     decode_hdmap_ab,
 )
@@ -73,9 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.states import (
-    RealtimeCausalDecodeState,
     RealtimeCausalDiTState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -1620,7 +1619,12 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         #  4. both None -> zeros (HDMap disabled).
         hdmap_pixel_chunk = st.get("hdmap_pixel_chunk")
         if hdmap_pixel_chunk is not None:
-            chunk_clip = hdmap_pixel_chunk.to(device=device)
+            # Closed-loop pixels arrive as fp32 from the realtime adapter's
+            # _decode_hdmap_chunk; the offline path pre-casts to the VAE dtype in
+            # _preprocess_pixels, so cast here to match the encoder's conv dtype.
+            chunk_clip = hdmap_pixel_chunk.to(
+                device=device, dtype=next(self.encoder.parameters()).dtype
+            )
             chunk_latent = _vae_encode_normalized(
                 chunk_clip,
                 self.encoder,
@@ -1683,8 +1687,12 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         batch.latents = chunk_latent_btchw
         _log_omnidreams_stats("realtime_chunk_latents", batch.latents)
 
-        # ---- per-chunk streaming VAE decode ---- #
-        self._realtime_stream_decode(batch, server_args, block_idx)
+        # Per-chunk streaming VAE decode is owned by the downstream
+        # ``omnidreams_decoding`` stage (``OmniDreamsCausalDecodingStage``),
+        # which is the authoritative path whose output ``gpu_worker`` ships over
+        # the WebSocket. Do NOT decode here: a second decode would be discarded
+        # (its ``batch.raw_frame_batches`` is overwritten by the decoding stage's
+        # ``output_batch.output``) and would double the VAE cost per chunk.
 
         return batch
 
@@ -1758,187 +1766,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 "OmniDreams: fp8_compute requested but unavailable; eager bf16."
             )
 
-    @torch.no_grad()
-    def _realtime_stream_decode(
-        self, batch: Req, server_args: ServerArgs, block_idx: int
-    ) -> None:
-        """Per-chunk streaming VAE decode for realtime mode.
-
-        Mirrors ``realtime_vae.py``'s ``CausalVaeDecodingStage``: a persistent
-        ``RealtimeCausalDecodeState`` holds the Wan VAE causal conv cache
-        across chunks. chunk 0 resets the cache; every chunk decodes its own
-        latent slice with ``is_first_chunk=(block_idx==0)``. Decoded frames are
-        written to ``batch.raw_frame_batches`` (list[list[bytes]]) for the
-        realtime adapter to push over the WebSocket.
-        """
-        if self.vae is None:
-            return  # decoder not wired (e.g. LightTAE path handles decode elsewhere)
-
-        decode_state = batch.session.get_or_create_state(RealtimeCausalDecodeState)
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
-        latents = batch.latents.to(get_local_torch_device())
-
-        # Reset the causal VAE conv cache on the first chunk so the streaming
-        # left-context starts fresh (matches realtime_vae.py block_idx==0 reset).
-        reset_fn = getattr(self.vae, "reset_causal_decode_state", None) or getattr(
-            self.vae, "clear_cache", None
-        )
-        if block_idx == 0 and callable(reset_fn):
-            reset_fn()
-            decode_state.conv_cache = None
-            decode_state.next_dec_idx = 0
-
-        # scale_and_shift + preprocess (same as DecodingStage.decode).
-        latents = scale_and_shift_latents(latents, server_args, self.vae)
-        latents = server_args.pipeline_config.preprocess_decoding(
-            latents, server_args, vae=self.vae
-        )
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
-
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
-            try:
-                if server_args.pipeline_config.vae_tiling:
-                    self.vae.enable_tiling()
-            except Exception:
-                pass
-            if not vae_autocast_enabled:
-                latents = latents.to(vae_dtype)
-
-            is_first_chunk = block_idx == 0
-            decode_fn = getattr(self.vae, "causal_decode", None)
-            if callable(decode_fn):
-                decode_output = decode_fn(latents)
-                image = _ensure_tensor_decode_output(decode_output)
-            elif self._supports_wan_decoder_cache():
-                image = self._decode_wan_with_persistent_cache(
-                    latents,
-                    first_chunk=is_first_chunk,
-                )
-            else:
-                # TODO(realtime): non-causal VAE fallback decodes this chunk
-                # independently (no cross-chunk conv continuity). Correct for
-                # chunk-0; later chunks may have a boundary discontinuity.
-                decode_output = self.vae.decode(latents)
-                image = _ensure_tensor_decode_output(decode_output)
-
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = server_args.pipeline_config.post_decoding(image, server_args)
-
-        # Encode frames to bytes per realtime_output_format (default raw uint8).
-        batch.raw_frame_batches = self._encode_realtime_frames(
-            image, batch, server_args
-        )
-        # Track the decode frontier for diagnostics / parity checks.
-        decode_state.next_dec_idx += image.shape[2]
-
-    def _supports_wan_decoder_cache(self) -> bool:
-        # Mirrors realtime_vae.CausalVaeDecodingStage._supports_wan_decoder_cache.
-        vae = self.vae
-        return all(
-            hasattr(vae, attr)
-            for attr in (
-                "clear_cache",
-                "post_quant_conv",
-                "decoder",
-                "_feat_map",
-                "_conv_idx",
-            )
-        )
-
-    def _decode_wan_with_persistent_cache(
-        self, latents: torch.Tensor, *, first_chunk: bool
-    ) -> torch.Tensor:
-        """Mirrors ``realtime_vae.CausalVaeDecodingStage`` exactly."""
-        x = self.vae.post_quant_conv(latents)
-        decoded_frames = []
-        for frame_idx in range(x.shape[2]):
-            self.vae._conv_idx = [0]
-            decoded = self.vae.decoder(
-                x[:, :, frame_idx : frame_idx + 1],
-                feat_cache=self.vae._feat_map,
-                feat_idx=self.vae._conv_idx,
-                first_chunk=first_chunk and frame_idx == 0,
-            )
-            decoded_frames.append(decoded)
-        image = torch.cat(decoded_frames, dim=2)
-        from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
-            unpatchify as wan_unpatchify,
-        )
-
-        if getattr(self.vae.config, "patch_size", None) is not None:
-            image = wan_unpatchify(image, patch_size=self.vae.config.patch_size)
-        return image.clamp(-1.0, 1.0)
-
-    @staticmethod
-    def _encode_realtime_frames(
-        image: torch.Tensor,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> list[list[bytes]]:
-        """Encode decoded frames ``[B, C, T, H, W]`` in [0,1] to per-batch bytes.
-
-        Default format is raw uint8 RGB24 bytes (one bytes object per frame),
-        matching ``build_raw_rgb_frame_batches`` in ``realtime_video.py``. When
-        ``batch.realtime_output_format`` is ``"jpeg"`` or ``"webp"``, frames are
-        PIL-encoded to the corresponding image format.
-        """
-        import numpy as np
-
-        fmt = (batch.realtime_output_format or "raw").lower()
-        # [B, C, T, H, W] -> per-sample frame list
-        frame_batches: list[list[bytes]] = []
-        if fmt in ("jpeg", "jpg", "webp"):
-            import io
-
-            from PIL import Image as _PILImage
-        samples = list(image)
-        for sample in samples:
-            if isinstance(sample, torch.Tensor):
-                # [C, T, H, W] -> [T, H, W, C] uint8
-                arr = (
-                    (sample * 255)
-                    .clamp(0, 255)
-                    .to(torch.uint8)
-                    .permute(1, 2, 3, 0)
-                    .contiguous()
-                    .cpu()
-                    .numpy()
-                )
-            else:
-                arr = np.asarray(sample)
-                if arr.ndim == 3:
-                    arr = arr[None]
-            frames: list[bytes] = []
-            for frame_idx in range(arr.shape[0]):
-                frame = arr[frame_idx]
-                if frame.ndim == 2:
-                    frame = frame[:, :, None]
-                if frame.shape[-1] == 1:
-                    frame = np.repeat(frame, 3, axis=-1)
-                elif frame.shape[-1] > 3:
-                    frame = frame[:, :, :3]
-                frame = np.ascontiguousarray(frame)
-                if fmt in ("jpeg", "jpg"):
-                    buf = io.BytesIO()
-                    _PILImage.fromarray(frame).save(buf, format="JPEG")
-                    frames.append(buf.getvalue())
-                elif fmt == "webp":
-                    buf = io.BytesIO()
-                    _PILImage.fromarray(frame).save(buf, format="WEBP")
-                    frames.append(buf.getvalue())
-                else:
-                    # raw RGB24 bytes (default).
-                    frames.append(frame.tobytes())
-            frame_batches.append(frames)
-        return frame_batches
-
     def _postprocess_sp_latents(
         self, batch: Req, server_args: ServerArgs
     ) -> torch.Tensor:
@@ -1978,6 +1805,25 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         result = VerificationResult()
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         return result
+
+
+class OmniDreamsCausalDecodingStage(CausalVaeDecodingStage):
+    """Realtime-aware Wan VAE decode for OmniDreams.
+
+    Reuses :class:`CausalVaeDecodingStage` verbatim: offline (no session) falls
+    through to the base :class:`DecodingStage` single-pass decode; realtime
+    (session present) uses the persistent per-chunk causal streaming decode with
+    a conv ``_feat_map`` carried across AR chunks, so a steady chunk of ``len_t``
+    latents emits the full ``len_t * temporal_compression`` pixel frames.
+
+    This subclass exists only to be the OmniDreams decoding stage identity; the
+    behaviour lives in the base class. The correctness of steady-chunk frame
+    counts depends on the decoder's persistent ``_feat_map`` surviving across
+    chunks -- see ``WanVAE.clear_encode_cache``: because OmniDreams shares one
+    cached WanVAE instance for hdmap-encode and latent-decode, ``encode()`` must
+    NOT run a full ``clear_cache()`` (which would wipe the live decode cache and
+    collapse each steady chunk to the causal-anchor 1-frame path).
+    """
 
 
 class OmniDreamsLightTAEDecodingStage(DecodingStage):

@@ -61,6 +61,12 @@ OMNIDREAMS_REALTIME_DEFAULT_NUM_INFERENCE_STEPS = 2
 # except the very first chunk which has one extra "anchor" pixel frame.
 _OMNIDREAMS_TEMPORAL_RATIO = 4
 
+# HD-map event ring-buffer depth (pixel frames). Must hold >= one steady AR
+# chunk (``len_t * _OMNIDREAMS_TEMPORAL_RATIO``); sized here for two chunks at
+# the default len_t=2 so a slightly-lagging client still supplies distinct
+# per-frame conditioning instead of repeated tail padding.
+_HDMAP_QUEUE_DEPTH = 16
+
 
 def _len_t(server_args: ServerArgs) -> int:
     """Return the AR chunk size (latent frames per block) from the pipeline config.
@@ -166,8 +172,13 @@ class OmniDreamsRealtimeState:
     """Per-session mutable state for the OmniDreams realtime adapter.
 
     Holds a :class:`ControlSignalQueue` keyed on ``"prompt"`` (max 1 queued
-    entry — latest wins) and ``"hdmap"`` (max 4 queued chunks of per-frame
-    pixel data, ring-buffer semantics to bound memory under a lagging client).
+    entry — latest wins) and ``"hdmap"`` (ring-buffer of per-frame pixel data,
+    bounding memory under a lagging client).
+
+    The hdmap depth must hold at least one steady AR chunk's worth of *pixel*
+    frames (``_get_num_frames`` steady = ``len_t*4`` = 8 for the default len_t=2)
+    so :meth:`sample_hdmap_chunk` returns distinct frames rather than repeated
+    tail padding; ``_HDMAP_QUEUE_DEPTH`` buffers two such chunks.
 
     ``latest_sampled_event_id`` tracks the ``event_id`` of the most recently
     consumed condition event so the downstream stage can gate deferred KV
@@ -175,7 +186,9 @@ class OmniDreamsRealtimeState:
     """
 
     def __init__(self) -> None:
-        self.events = ControlSignalQueue(max_events={"prompt": 1, "hdmap": 4})
+        self.events = ControlSignalQueue(
+            max_events={"prompt": 1, "hdmap": _HDMAP_QUEUE_DEPTH}
+        )
         self.latest_sampled_event_id: int | None = None
 
     def clear(self) -> None:
@@ -321,18 +334,21 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
         -----------------------------------------------
         ``event.payload`` is expected to be one of:
 
-        * ``bytes`` — JPEG- or PNG-encoded image for a single HDMap frame.
-        * ``list[bytes]`` — one JPEG/PNG per latent frame within the chunk
-          (``len_t`` items).  The ``ControlSignalQueue`` expands the list and
-          samples exactly ``len_t`` frames in :meth:`prepare_next_request`.
+        * ``bytes`` — JPEG- or PNG-encoded image for a single HDMap *pixel*
+          frame.
+        * ``list[bytes]`` — one JPEG/PNG per pixel frame within the chunk.  The
+          ``ControlSignalQueue`` expands the list; :meth:`prepare_next_request`
+          samples ``_get_num_frames(chunk.index, len_t)`` pixel frames (chunk-0
+          -> ``1+(len_t-1)*4``, later -> ``len_t*4``) so the causal VAE (4x
+          temporal compression) encodes them to exactly ``len_t`` latent frames.
         * ``str`` — base64-encoded JPEG/PNG (or a data-URL / file path), for
           JSON transport.
 
         In :meth:`prepare_next_request` each sampled frame is decoded (via
         ``vision_utils.load_image``) and preprocessed into a single clip tensor
-        ``[1, 3, len_t, H, W]`` in ``[-1, 1]`` — the exact contract the Before
-        denoising stage's ``_realtime_prepare_subsequent`` expects
-        (``torch.is_tensor(hdmap_in)`` at ``omnidreams.py:898``).
+        ``[1, 3, num_pixel_frames, H, W]`` in ``[-1, 1]`` — the exact contract
+        the Before denoising stage's ``_realtime_before_subsequent_chunk``
+        expects (``torch.is_tensor(hdmap_in)``).
         """
         state = self._state(session)
         if event.kind == "prompt":
@@ -369,12 +385,20 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
         else:
             prompt = request.prompt
 
-        # HDMap: sample chunk_size frames and decode them into a single clip
-        # tensor ``[1, 3, chunk_size, H, W]`` in ``[-1, 1]`` on CPU, mirroring
-        # the Before stage's ``_preprocess_hdmap_clip``. ``None`` (no hdmap has
-        # ever arrived, or a frame failed to decode) leaves the condition unset
-        # so the denoise stage falls back to its stashed clip / zeros path.
-        hdmap_frames = state.sample_hdmap_chunk(chunk_size)
+        # HDMap: sample this chunk's *pixel* frames and decode them into a single
+        # clip tensor ``[1, 3, num_pixel_frames, H, W]`` in ``[-1, 1]`` on CPU,
+        # mirroring the Before stage's ``_preprocess_hdmap_clip``. The count is
+        # the pixel-frame count (``_get_num_frames``: chunk-0 -> 1+(len_t-1)*4,
+        # later -> len_t*4), NOT ``chunk_size`` (which is len_t *latent* frames):
+        # the causal VAE compresses temporally by 4, so ``num_pixel_frames``
+        # pixels encode to exactly ``len_t`` latent frames, matching the DiT
+        # hidden-state token count. Sampling ``chunk_size`` here yields only 1
+        # latent frame on steady chunks -> token-count mismatch in the denoise
+        # stage. ``None`` (no hdmap has ever arrived, or a frame failed to
+        # decode) leaves the condition unset so the denoise stage falls back to
+        # its stashed clip / zeros path.
+        num_pixel_frames = _get_num_frames(chunk.index, chunk_size)
+        hdmap_frames = state.sample_hdmap_chunk(num_pixel_frames)
         condition_inputs: dict[str, Any] = {}
         if hdmap_frames is not None:
             w, h = _parse_size_or_raise(request.size) if request.size else (None, None)

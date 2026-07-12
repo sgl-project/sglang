@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
     OmniDreamsBeforeDenoisingStage,
+    OmniDreamsCausalDecodingStage,
     OmniDreamsDenoisingStage,
     OmniDreamsLightTAEDecodingStage,
 )
@@ -293,10 +294,19 @@ class OmniDreamsPipeline(ComposedPipelineBase):
                 ),
             )
         else:
-            # Standard WanVAE decode
-            self.add_standard_decoding_stage(
+            # WanVAE: realtime uses causal streaming decode with a persistent
+            # per-chunk conv cache (steady chunks emit len_t*tc frames); offline
+            # (no session) falls through to the base DecodingStage plain decode.
+            # Correctness depends on WanVAE.clear_encode_cache() keeping the
+            # decoder _feat_map alive across interleaved per-chunk hdmap encodes
+            # (this instance is shared for encode + decode -- see _wanvae_cache).
+            self.add_stage(
                 stage_name="omnidreams_decoding",
-                vae_key="decoder",
+                stage=OmniDreamsCausalDecodingStage(
+                    vae=self.get_module("decoder"),
+                    pipeline=self,
+                    component_name="decoder",
+                ),
             )
 
 
