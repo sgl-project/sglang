@@ -558,16 +558,12 @@ class DeepseekV4AttnBackend(
         # spec-v2; without spec the flag has no consumer either way).
         # DSPARK is the exception: its draft path carries its own host lens
         # (reserved_seq_lens_cpu) and its verify prep is device-side.
-        spec_alg = model_runner.server_args.speculative_algorithm
-        if spec_alg is not None and spec_alg != "DSPARK":
+        spec_alg = model_runner.spec_algorithm
+        if not spec_alg.is_none() and not spec_alg.is_dspark():
             self.needs_cpu_seq_lens = True
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
 
-        self.is_dspark_draft = bool(
-            getattr(model_runner, "is_draft_worker", False)
-            and model_runner.spec_algorithm is not None
-            and model_runner.spec_algorithm.is_dspark()
-        )
+        self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1224,7 +1220,6 @@ class DeepseekV4AttnBackend(
         elif bucket == _GraphBucket.TARGET_VERIFY and self.is_dspark_draft:
             block_size = self.speculative_num_draft_tokens - 1
             num_tokens_block = block_size * bs
-            graph_key = bs
             assert out_cache_loc is not None
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
