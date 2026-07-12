@@ -337,3 +337,46 @@ def test_infer_recipe_module_level_def_shadowed_by_method_name(repo: Path) -> No
     assert [mv["name"] for mv in recipe.moves] == ["foo"]
     assert recipe.moves[0]["from_class"] is None
     assert recipe.moves[0]["into_class"] is None
+
+
+def test_infer_recipe_class_move_between_existing_files(repo: Path) -> None:
+    """A top-level class relocated to an existing module moves whole; its methods do not."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class Payload:\n"
+                "    def get(self):\n"
+                "        return 1\n"
+                "\n"
+                "\n"
+                "def stay():\n"
+                "    return 2\n"
+            ),
+            "comp.py": "def keep():\n    return 3\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def stay():\n    return 2\n",
+            "comp.py": (
+                "def keep():\n"
+                "    return 3\n"
+                "\n"
+                "\n"
+                "class Payload:\n"
+                "    def get(self):\n"
+                "        return 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move Payload to comp")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [mv["name"] for mv in recipe.moves] == ["Payload"]
+    assert recipe.moves[0]["from_class"] is None
+    assert recipe.moves[0]["into_class"] is None

@@ -510,6 +510,9 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             if (m := re.match(r"\s*(?:async\s+)?def\s+(\w+)", ln))
         }
 
+    def class_names(lines: list[str]) -> set[str]:
+        return {m.group(1) for ln in lines if (m := re.match(r"class\s+(\w+)", ln))}
+
     new_files = {p for p, f in files.items() if f["new"]}
 
     # A new file is a staged module body cut from one source: its top-level defs and classes
@@ -597,10 +600,47 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             }
         )
 
-    # A move whose destination already exists becomes a move_symbol (the def relocated in
-    # order); a moved class to an existing file is left unsupported (move_symbol moves defs).
     all_removed = [ln for f in files.values() for ln in f["removed"]]
     all_added = [ln for f in files.values() for ln in f["added"]]
+
+    # A top-level class relocated between existing files moves as one block: move_symbol
+    # cuts the ClassDef; its methods are excluded from the per-def loop below.
+    moved_classes: set[str] = set()
+    for cname in sorted(class_names(all_removed) & class_names(all_added)):
+        csrc = next(
+            (p for p, f in files.items() if cname in class_names(f["removed"])), None
+        )
+        cdst = next(
+            (p for p, f in files.items() if cname in class_names(f["added"])), None
+        )
+        if csrc is None or cdst is None or csrc == cdst or cdst in new_files:
+            continue
+        cdst_tree = ast.parse(_git_output(["show", f"{commit}:{cdst}"], root))
+        cdst_def = rr._find_def(cdst_tree, cname) or next(
+            (
+                n
+                for n in ast.walk(cdst_tree)
+                if isinstance(n, ast.ClassDef) and n.name == cname
+            ),
+            None,
+        )
+        moved_classes.add(cname)
+        recipe.moves.append(
+            {
+                "name": cname,
+                "src": csrc,
+                "dst": cdst,
+                "into_class": None,
+                "from_class": None,
+                "dedent": 0,
+                "dst_order": cdst_def.lineno if cdst_def else 0,
+                "before": _next_sibling_def_name(cdst_tree, cname, None),
+                "drop_self_annotation": False,
+            }
+        )
+
+    # A move whose destination already exists becomes a move_symbol (the def relocated in
+    # order).
     for name in sorted(def_names(all_removed) & def_names(all_added)):
         src = next(
             (p for p, f in files.items() if name in def_names(f["removed"])), None
@@ -619,6 +659,9 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         # The diff's def-line indentation says which same-named def actually moved: a
         # column-0 cut is the module-level def even when a class method shares its name.
         src_class = None if src_indent == 0 else _enclosing_class_of_def(src_tree, name)
+        if src_class in moved_classes:
+            recipe.notes.append(f"skip {name}: method of relocated class {src_class}")
+            continue
         into_class = (
             None if dst_indent == 0 else _enclosing_class_of_def(dst_tree, name)
         )
