@@ -333,13 +333,15 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        rids_to_check: Optional[List[str]] = None,
-    ) -> List[Req]:
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
+    ) -> List[Req] | tuple[List[Req], List[Req]]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        pp_good_rids: For PP, the rids that PP consensus determined as good (WaitingForInput)
+        pp_bad_rids: For PP, the rids that PP consensus determined as bad (Failed)
         """
 
         bootstrapped_reqs = []
@@ -352,21 +354,33 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
-        )
+        # In PP mode with consensus results, skip local polling and use PP consensus
+        # This prevents divergence when abort notifications arrive between consensus
+        # and pop_bootstrapped execution on different PP ranks.
+        is_pp_mode = pp_good_rids is not None and pp_bad_rids is not None
+
+        if is_pp_mode:
+            # Fake polls based on PP consensus - no need to poll local state
+            # which may have changed due to abort notifications arriving at different times
+            polls = []
+            for req in self.queue:
+                if req.rid in pp_good_rids:
+                    polls.append(KVPoll.WaitingForInput)
+                elif req.rid in pp_bad_rids:
+                    polls.append(KVPoll.Failed)
+                else:
+                    # Request not in consensus - skip it
+                    polls.append(None)
+        else:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
-                and poll != KVPoll.Failed
-            ):
-                # In PP mode, successful bootstrap still requires cross-rank
-                # consensus. Local failures are terminal and must be drained
-                # even if an earlier PP rank has already removed the request.
+            if poll is None:
+                # In PP mode, skip requests not in consensus
                 continue
 
             if poll == KVPoll.Failed:
