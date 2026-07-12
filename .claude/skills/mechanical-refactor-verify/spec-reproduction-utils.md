@@ -159,7 +159,8 @@
   blocks) and the default (after the last import) would land in the wrong block; a substring
   matching no top-level import raises.
 - `add_typechecking_import(rel, import_stmt)` — appends inside the destination's
-  `if TYPE_CHECKING:` block; the sorter orders it. A lone `pass` placeholder (the block's
+  `if TYPE_CHECKING:` block (creating the block after the trailing module import when
+  absent); the sorter orders it. A lone `pass` placeholder (the block's
   only statement) is dropped, since populating an empty block makes its placeholder redundant.
 - `repath_import(rel, *, old_module, new_module, name)` — repaths a function-scoped
   `from old import … name …` (relative imports included) in place; module-level repaths

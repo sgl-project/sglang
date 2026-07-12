@@ -107,6 +107,33 @@ def test_add_typechecking_import_inserts_in_block(tmp_path: Path) -> None:
     )
 
 
+def test_add_typechecking_import_creates_missing_block(tmp_path: Path) -> None:
+    """With no TYPE_CHECKING block, one is created after the trailing module import."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "from a import X\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+    r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "from a import X\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from b import Y\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+
+
 def test_add_import_into_an_empty_file(tmp_path: Path) -> None:
     """Adding an import to an empty file writes just the statement."""
     (tmp_path / "m.py").write_text("")
@@ -177,9 +204,9 @@ def test_add_typechecking_import_after_a_multiline_final_import(tmp_path: Path) 
     )
 
 
-def test_add_typechecking_import_raises_without_a_block(tmp_path: Path) -> None:
-    """A file lacking a TYPE_CHECKING block fails loudly."""
-    (tmp_path / "m.py").write_text("import os\n\nx = 1\n")
+def test_add_typechecking_import_raises_without_imports(tmp_path: Path) -> None:
+    """A file with no imports cannot anchor a new TYPE_CHECKING block and fails loudly."""
+    (tmp_path / "m.py").write_text("x = 1\n")
     r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)

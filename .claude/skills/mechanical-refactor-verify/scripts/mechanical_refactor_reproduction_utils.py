@@ -778,6 +778,8 @@ class Repro:
         import sorter orders the block, so the exact insertion point does not matter. A lone
         ``pass`` placeholder (the block's only statement) is dropped: populating an empty
         ``TYPE_CHECKING`` block makes its placeholder redundant, so the target removes it.
+        With no existing block, one is created after the trailing module import -- the
+        destination gains the guard together with its first import.
         """
 
         def op(root: Path) -> None:
@@ -804,7 +806,20 @@ class Repro:
                         )
                     _write_source(path, "".join(lines))
                     return
-            raise AssertionError(f"no `if TYPE_CHECKING:` block in {rel}")
+            tree = ast.parse("".join(lines))
+            imports = [
+                node
+                for node in tree.body
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+            ]
+            assert imports, f"no imports to anchor a new `if TYPE_CHECKING:` block in {rel}"
+            insert_at = imports[-1].end_lineno
+            lines[insert_at:insert_at] = [
+                nl,
+                "if TYPE_CHECKING:" + nl,
+                "    " + import_stmt + nl,
+            ]
+            _write_source(path, "".join(lines))
 
         self.ops.append(op)
         return self
