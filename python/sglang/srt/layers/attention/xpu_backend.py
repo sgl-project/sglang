@@ -4,14 +4,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.flashattention_backend import (
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     make_local_attention_virtual_batches,
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
 )
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

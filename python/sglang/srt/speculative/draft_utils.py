@@ -120,7 +120,7 @@ class DraftBackendFactory:
 
     def _create_flashinfer_decode_backend(self):
         if not self.draft_model_runner.use_mla_backend:
-            from sglang.kernels.ops.attention.flashinfer_backend import (
+            from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferMultiStepDraftBackend,
             )
 
@@ -128,7 +128,7 @@ class DraftBackendFactory:
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
         else:
-            from sglang.kernels.ops.attention.flashinfer_mla_backend import (
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
                 FlashInferMLAMultiStepDraftBackend,
             )
 
@@ -177,7 +177,7 @@ class DraftBackendFactory:
 
     def _create_fa_decode_backend(self, fa_impl_ver: int = 3):
         if not is_musa():
-            from sglang.kernels.ops.attention.flashattention_backend import (
+            from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionMultiStepBackend,
             )
         else:
@@ -199,7 +199,7 @@ class DraftBackendFactory:
         return self._create_fa_decode_backend(fa_impl_ver=4)
 
     def _create_flashmla_decode_backend(self):
-        from sglang.kernels.ops.attention.flashmla_backend import (
+        from sglang.srt.layers.attention.flashmla_backend import (
             FlashMLAMultiStepDraftBackend,
         )
 
@@ -284,13 +284,13 @@ class DraftBackendFactory:
 
     def _create_flashinfer_prefill_backend(self):
         if not self.draft_model_runner.use_mla_backend:
-            from sglang.kernels.ops.attention.flashinfer_backend import (
+            from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferAttnBackend,
             )
 
             return FlashInferAttnBackend(self.draft_model_runner, skip_prefill=False)
         else:
-            from sglang.kernels.ops.attention.flashinfer_mla_backend import (
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
                 FlashInferMLAAttnBackend,
             )
 
@@ -313,7 +313,7 @@ class DraftBackendFactory:
 
     def _create_fa_prefill_backend(self, fa_impl_ver: int = 3):
         if not is_musa():
-            from sglang.kernels.ops.attention.flashattention_backend import (
+            from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
             )
         else:

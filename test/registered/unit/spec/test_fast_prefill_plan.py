@@ -16,7 +16,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.flashinfer_backend import fast_prefill_plan
+from sglang.srt.layers.attention.flashinfer_backend import fast_prefill_plan
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

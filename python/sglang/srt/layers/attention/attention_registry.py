@@ -36,7 +36,7 @@ def create_flashinfer_backend(runner):
     import torch
 
     if not runner.use_mla_backend:
-        from sglang.kernels.ops.attention.flashinfer_backend import (
+        from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
 
@@ -51,7 +51,7 @@ def create_flashinfer_backend(runner):
             runner, init_new_workspace=runner.init_new_workspace
         )
     else:
-        from sglang.kernels.ops.attention.flashinfer_mla_backend import (
+        from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
 
@@ -181,7 +181,7 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
-    from sglang.kernels.ops.attention.flashmla_backend import FlashMLABackend
+    from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
 
@@ -195,7 +195,7 @@ def create_flashattention_v3_backend(runner):
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
-        from sglang.kernels.ops.attention.flashattention_backend import (
+        from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
 
@@ -214,7 +214,7 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    from sglang.kernels.ops.attention.flashattention_backend import (
+    from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
 

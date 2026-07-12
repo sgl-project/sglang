@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.kernels.ops.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

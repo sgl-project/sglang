@@ -8,15 +8,15 @@ from flash_attn_interface import flash_attn_varlen_func
 from flash_attn_interface import flash_attn_with_kvcache as mate_flash_attn_with_kvcache
 from flash_attn_interface import get_scheduler_metadata
 
-from sglang.kernels.ops.attention.flashattention_backend import (
-    FlashAttentionBackend,
-    FlashAttentionMultiStepBackend,
-    merge_state_v2_wrapper,
-)
 from sglang.srt.distributed import get_pp_group, get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.musa.layers.utils.cp_utils import (
     musa_cp_attn_forward_extend as cp_attn_forward_extend,
+)
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    FlashAttentionMultiStepBackend,
+    merge_state_v2_wrapper,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (

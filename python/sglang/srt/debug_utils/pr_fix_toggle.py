@@ -49,7 +49,7 @@ patches:
 
 _PR_REVERT_YAML_27338 = """
 patches:
-  - target: sglang.kernels.ops.attention.flashinfer_backend.FlashInferMultiStepDraftBackend.init_cuda_graph_state
+  - target: sglang.srt.layers.attention.flashinfer_backend.FlashInferMultiStepDraftBackend.init_cuda_graph_state
     edits:
       - match: |
           (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
@@ -60,7 +60,7 @@ patches:
 
 _PR_REVERT_YAML_27360 = """
 patches:
-  - target: sglang.kernels.ops.attention.flashattention_backend.FlashAttentionBackend._apply_cuda_graph_metadata
+  - target: sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend._apply_cuda_graph_metadata
     edits:
       - match: |
           cache_loc = cache_loc[:, :decode_length]
@@ -85,7 +85,7 @@ patches:
 
 _PR_REVERT_YAML_27460 = """
 patches:
-  - target: sglang.kernels.ops.attention.flashinfer_mla_backend.FlashInferMLAMultiStepDraftBackend.init_cuda_graph_state
+  - target: sglang.srt.layers.attention.flashinfer_mla_backend.FlashInferMLAMultiStepDraftBackend.init_cuda_graph_state
     edits:
       - match: |
           (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),

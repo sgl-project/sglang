@@ -13,7 +13,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.flashattention_backend import (
+from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
