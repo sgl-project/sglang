@@ -155,7 +155,10 @@ python3 /tmp/proof/<sha>.py               # PASS = byte-identical to this commit
 - Include exactly these commands in the PR description under a
   "Mechanical move — reproducible" heading.
 
-### 5.4 Keep the PR mechanical
+### 5.4 Keep the PR mechanical — in both directions
 
 - A mechanical PR contains **only** mechanical changes (moves, splits, renames, import
   fixes, formatting). Semantic changes go in a separate PR.
+- The dual holds too: a semantic (`non_mechanical_provable`) commit must not swallow a
+  provable relocation to skip the proof — split it out and prove it
+  (`guide-split.md` §2; property: `spec-reproduction-cli.md` §2.1).

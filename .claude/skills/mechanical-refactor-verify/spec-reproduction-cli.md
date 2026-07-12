@@ -21,8 +21,14 @@
 
 - Every commit message must contain **exactly one** of the two words:
     - `mechanical_provable` — the commit claims to be a machine-provable relocation;
-    - `non_mechanical_provable` — the commit declares it carries changes no relocation
-      proof can certify, and is left to human review.
+    - `non_mechanical_provable` — the commit declares that **nothing in it** is
+      expressible as the whitelisted relocations of `spec-reproduction-utils.md` §2 — it
+      is the minimal unprovable residue, left to human review.
+- The declaration is an assertion, not an opt-out: labeling provable content
+  `non_mechanical_provable` to dodge the verifier **violates the chain property**, even
+  where no machine check catches it. A provable part hiding inside a semantic commit
+  belongs in its own `mechanical_provable` commit with a proof
+  (`guide-split.md` §2).
 - The rest of the message format is unconstrained: the word may appear anywhere in the
   subject or body, in any surrounding syntax.
 - A word counts only standalone: delimited by a non-`[0-9A-Za-z_]` character or the
@@ -38,8 +44,12 @@
   none is `MISSING_PROOF`, several is `AMBIGUOUS_PROOF`.
 - The proof must run to a PASS (§3.4): the commit reproduces byte-for-byte from its
   parent (`spec-reproduction-utils.md` §4). Anything else is `FAIL`.
-- A `non_mechanical_provable` commit has no machine obligation; its verdict is
-  `HUMAN_REVIEW` — the report marks it for eyes, never certifies it.
+- A `non_mechanical_provable` commit has no proof obligation, but it is not exempt from
+  machine scrutiny: the **mislabel sniff** (§3.5) runs on it. A commit that reproduces
+  **fully** as pure relocations is machine-proven to be `mechanical_provable`, so its
+  declaration is false: verdict `MISLABELED_PROVABLE`. Otherwise its verdict is
+  `HUMAN_REVIEW` — the report marks it for eyes (with a warning when the sniff found
+  partial relocations), never certifies it.
 - The chain verdict is PASS iff every commit's verdict is `PASS` or `HUMAN_REVIEW`.
 
 ## 3. The CLI contract
@@ -57,6 +67,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
   (`guide-construct-proof.md` §2.2).
 - `--repo-root DIR`: run against that repo instead of the cwd's.
 - `--report PATH`: write the report there instead of `<proof>/chain_report.md`.
+- `--no-provable-sniff`: skip the mislabel sniff (§3.5).
 
 ### 3.2 The chain
 
@@ -84,6 +95,23 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
   residual from false-passing; requiring the exit code keeps a crash before any verdict
   from passing.
 
+### 3.5 The mislabel sniff
+
+- For every `non_mechanical_provable` commit, the verifier runs the proof generator's
+  inference (`mechanical_refactor_proof_generator.py`) on the commit:
+    - inference finds no relocation → nothing to sniff, verdict `HUMAN_REVIEW`;
+    - the inferred recipe reproduces the commit **byte-for-byte** → the whole commit is a
+      pure relocation, the declaration is machine-refuted: verdict `MISLABELED_PROVABLE`
+      (relabel it `mechanical_provable` and attach the generated proof);
+    - the recipe reproduces with a **residual** → the commit bundles relocations with
+      other changes: verdict stays `HUMAN_REVIEW`, but the report carries a **warning**
+      naming the inferred relocations — the reviewer decides whether a
+      `mechanical_provable` split was dodged (`guide-verify-proof.md` §1).
+- The sniff is advisory infrastructure and must never crash the chain walk: a sniff
+  error, or a missing generator module, degrades to `HUMAN_REVIEW` with a warning note.
+- `--no-provable-sniff` disables it (e.g. for speed on a huge chain); the report then
+  carries no mislabel evidence, so only use it when the sniff has already run once.
+
 ## 4. The report
 
 - The full report is markdown, printed to stdout **and** written to the report path
@@ -92,12 +120,14 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
     - the resolved base / branch / proof folder and the **chain verdict**;
     - the commit counts per kind and the proof PASS count;
     - one table row per commit, in chain order: sha, kind, verdict, subject;
+    - a **Warnings** section with one entry per ok commit the mislabel sniff flagged
+      (§3.5) — partial relocations inside a `non_mechanical_provable` commit;
     - a **Failure details** section with one entry per non-ok commit — the missing-proof
-      search locations, the classification rule broken, or the failing proof's output
-      tail.
+      search locations, the classification rule broken, the mislabel evidence, or the
+      failing proof's output tail.
 - Verdict vocabulary: `PASS`, `HUMAN_REVIEW`, `FAIL`, `MISSING_PROOF`,
-  `AMBIGUOUS_PROOF`, `UNCLASSIFIED`, `AMBIGUOUS_KIND` — the first two are the only ok
-  verdicts.
+  `AMBIGUOUS_PROOF`, `MISLABELED_PROVABLE`, `UNCLASSIFIED`, `AMBIGUOUS_KIND` — the first
+  two are the only ok verdicts.
 
 ## 5. Exit codes
 

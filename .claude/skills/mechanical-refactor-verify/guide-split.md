@@ -37,6 +37,15 @@ Hard lines ("prep" below = the prepare phase):
   logic, restructuring control flow, redesigning an API → its **own commit**, reviewed for
   **equivalence** (tests or a written argument). Never smuggled into prep as a "small
   reshape".
+- **Provable content never hides in a non-provable commit.** The dual of the previous
+  two rules: a commit declared `non_mechanical_provable` must be the **minimal residue**
+  the relocation primitives cannot express. Any part reproducible as whitelisted
+  relocations (`spec-reproduction-utils.md` §2.1) — a def moved across files, a scattered
+  extract, an import repoint riding along — is split into its own `mechanical_provable`
+  commit with a proof, never folded into a semantic commit where the verifier cannot see
+  it. Declaring provable work non-provable to dodge the verifier violates the chain
+  property (`spec-reproduction-cli.md` §2.1); the chain verifier machine-refutes the
+  fully-provable case (`MISLABELED_PROVABLE`) and warns on bundled relocations.
 - **"Semantic" is not banned from prepare — oversized or hidden semantics are.** prepare's
   own edits *are* meaning-carrying (de-self, retype-`self`, co-locating bookkeeping);
   "minimal" caps their **size**, it does not forbid semantics. The two bans are narrower:
@@ -259,3 +268,8 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 ```
 
 - The `<phase>:` form is what the range command's `--match -move:` regex keys on.
+- A chain-verified branch (`spec-reproduction-cli.md` §2.1) additionally carries the
+  classification word in every commit message — the phases map onto it directly:
+  **move** commits declare `mechanical_provable`; **prepare**, **postpare**, and
+  standalone semantic commits declare `non_mechanical_provable`. The word may sit
+  anywhere in the message (the format is otherwise free).
