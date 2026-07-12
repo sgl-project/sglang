@@ -133,9 +133,6 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     report_online_quantization,
     resolve_sliding_window_size,
 )
-from sglang.srt.model_executor.model_runner_components.misc_utils import (
-    resolve_pp_proxy_topk_size,
-)
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
@@ -590,7 +587,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
-        return resolve_pp_proxy_topk_size(
+        return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
             pp_size=self.pp_size,
             pp_rank=self.pp_rank,
