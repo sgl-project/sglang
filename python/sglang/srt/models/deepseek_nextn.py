@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -223,17 +222,12 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            use_cp = dsa_use_prefill_cp(
+            if dsa_use_prefill_cp(
                 forward_batch, self.dsa_enable_prefill_cp
-            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-            if use_cp:
+            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
-            should_update_dsa_topk_indices = (
-                forward_batch.reuse_dsa_topk_indices
-                or forward_batch.capture_dsa_topk_indices
-            )
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -242,11 +236,22 @@ class DeepseekModelNextN(nn.Module):
                     residual,
                     zero_allocator,
                     prev_topk_indices=(
-                        getattr(forward_batch.spec_info, "dsa_topk_indices", None)
+                        forward_batch.spec_info.dsa_topk_indices
                         if forward_batch.reuse_dsa_topk_indices
                         else None
                     ),
                 )
+                if forward_batch.reuse_dsa_topk_indices:
+                    forward_batch.spec_info.dsa_topk_indices = topk_indices
+
+                # MTP IndexShare: on draft-extend, publish the last-token DSA
+                # indexer top-k to seed (avoid recomputing in) the draft-decode loop.
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    seed_buf = forward_batch.spec_info.dsa_seed_topk_capture
+                    if seed_buf is not None and topk_indices is not None:
+                        sel = forward_batch.spec_info.dsa_seed_topk_select
+                        src = topk_indices if sel is None else topk_indices[sel]
+                        seed_buf[: src.shape[0]].copy_(src)
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
@@ -254,40 +259,16 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
 
-                if use_cp:
-                    local_num_tokens = hidden_states.shape[0]
+                if dsa_use_prefill_cp(
+                    forward_batch, self.dsa_enable_prefill_cp
+                ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+                    # allgather + rerrange
                     hidden_states = cp_all_gather_rerange_output(
                         hidden_states,
                         self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-                    if should_update_dsa_topk_indices and topk_indices is not None:
-                        if (
-                            is_dsa_prefill_cp_round_robin_split()
-                            and topk_indices.shape[0] < local_num_tokens
-                        ):
-                            pad_rows = local_num_tokens - topk_indices.shape[0]
-                            topk_indices = torch.cat(
-                                [
-                                    topk_indices,
-                                    topk_indices.new_full(
-                                        (pad_rows, topk_indices.shape[1]), -1
-                                    ),
-                                ],
-                                dim=0,
-                            )
-                        topk_indices = cp_all_gather_rerange_output(
-                            topk_indices,
-                            self.cp_size,
-                            forward_batch,
-                            torch.cuda.current_stream(),
-                        )
-            if should_update_dsa_topk_indices and topk_indices is not None:
-                if forward_batch.reuse_dsa_topk_indices:
-                    forward_batch.spec_info.dsa_topk_indices = topk_indices
-                if forward_batch.capture_dsa_topk_indices:
-                    forward_batch.topk_indices = topk_indices
         finally:
             exit_stack.close()
 
@@ -383,12 +364,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)
-        logits_output = self.logits_processor(
+        return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
-        if forward_batch.capture_dsa_topk_indices:
-            logits_output.dsa_topk_indices = forward_batch.topk_indices
-        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
