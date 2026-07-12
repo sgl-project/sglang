@@ -1730,6 +1730,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             if self._engine_paused:
                 continue
+            if self._pd_flip_maybe_enter_batch_quiesce():
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1757,6 +1759,18 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
+                continue
+
+            # A cutover request must observe the last launched result before it
+            # freezes scheduling.  Control requests continue to be polled by
+            # the outer loop while the batch is quiesced.
+            if getattr(self, "pd_flip_quiesce_requested", False):
+                if self.result_queue:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                    self.last_batch = None
+                    self.cur_batch = None
+                self._pd_flip_maybe_enter_batch_quiesce()
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.

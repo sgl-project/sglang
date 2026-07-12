@@ -60,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetActivateReq,
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetDeltaPrepareReq,
@@ -853,7 +854,19 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         self._ensure_pd_flip_migration_bootstrap_server()
-        return await self.pd_flip_migration_communicator(obj)
+        responses = await self.pd_flip_migration_communicator(obj)
+        last_seen = getattr(self, "pd_flip_last_relay_seq_by_rid", None)
+        if last_seen is None:
+            last_seen = {}
+            self.pd_flip_last_relay_seq_by_rid = last_seen
+        for response in responses:
+            for manifest in response.manifests or []:
+                rid = manifest.get("rid")
+                if rid is not None:
+                    last_seen[str(rid)] = int(
+                        manifest.get("last_emitted_output_seq", 0) or 0
+                    )
+        return responses
 
     async def prepare_pd_flip_migration_target(
         self: TokenizerManager, obj: PDFlipMigrationTargetPrepareReq
@@ -865,14 +878,27 @@ class TokenizerControlMixin:
             if targets is None:
                 targets = {}
                 self.pd_flip_output_relay_targets = targets
+            output_seqs = getattr(self, "pd_flip_output_seq_by_rid", None)
+            if output_seqs is None:
+                output_seqs = {}
+                self.pd_flip_output_seq_by_rid = output_seqs
             for manifest in obj.manifests or []:
                 rid = manifest.get("rid") if isinstance(manifest, dict) else None
                 if rid is not None and not bool(manifest.get("stream", False)):
                     targets[str(rid)] = obj.source_url
+                    output_seqs[str(rid)] = int(
+                        manifest.get("last_emitted_output_seq", 0) or 0
+                    )
         return responses
 
     async def commit_pd_flip_migration_target(
         self: TokenizerManager, obj: PDFlipMigrationTargetCommitReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def activate_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetActivateReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         return await self.pd_flip_migration_communicator(obj)
@@ -883,6 +909,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         responses = await self.pd_flip_migration_communicator(obj)
         getattr(self, "pd_flip_output_relay_targets", {}).clear()
+        getattr(self, "pd_flip_output_seq_by_rid", {}).clear()
         return responses
 
     async def get_pd_flip_migration_status(

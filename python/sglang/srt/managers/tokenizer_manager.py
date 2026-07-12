@@ -405,6 +405,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
         self.pd_flip_output_relay_targets: Dict[str, str] = {}
+        self.pd_flip_output_seq_by_rid: Dict[str, int] = {}
+        self.pd_flip_last_relay_seq_by_rid: Dict[str, int] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -2208,6 +2210,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return True
 
         payload = self._pd_flip_batch_output_payload(recv_obj, index, rid)
+        output_seq = int(self.pd_flip_output_seq_by_rid.get(rid, 0)) + 1
+        self.pd_flip_output_seq_by_rid[rid] = output_seq
+        payload["output_seq"] = output_seq
         result = await asyncio.to_thread(
             self._pd_flip_post_relay_output, source_url, rid, payload
         )
@@ -2235,9 +2240,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if rid not in self.rid_to_state:
             return {"success": False, "message": "unknown migrated rid"}
         try:
+            output_seq = int((obj.output or {}).get("output_seq"))
+        except (TypeError, ValueError):
+            return {"success": False, "message": "missing migrated output_seq"}
+        last_seen = int(self.pd_flip_last_relay_seq_by_rid.get(rid, 0))
+        if output_seq <= last_seen:
+            return {"success": True, "dropped": True}
+        try:
             output = self._pd_flip_batch_output_from_payload(rid, obj.output or {})
         except Exception as exc:
             return {"success": False, "message": str(exc)}
+        self.pd_flip_last_relay_seq_by_rid[rid] = output_seq
         await self._handle_batch_output(output)
         return {"success": True}
 

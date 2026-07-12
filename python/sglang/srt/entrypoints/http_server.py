@@ -133,6 +133,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetActivateReq,
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetDeltaPrepareReq,
@@ -728,6 +729,14 @@ async def commit_pd_flip_migration_target(
     obj: PDFlipMigrationTargetCommitReq, request: Request
 ):
     return await _global_state.tokenizer_manager.commit_pd_flip_migration_target(obj)
+
+
+@app.post("/pd_flip/migration/target/activate")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def activate_pd_flip_migration_target(
+    obj: PDFlipMigrationTargetActivateReq, request: Request
+):
+    return await _global_state.tokenizer_manager.activate_pd_flip_migration_target(obj)
 
 
 @app.post("/pd_flip/migration/target/abort")

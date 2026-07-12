@@ -1784,6 +1784,12 @@ class PDFlipMigrationTargetCommitReq(BaseReq):
 
 
 @dataclass
+class PDFlipMigrationTargetActivateReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
 class PDFlipMigrationTargetAbortReq(BaseReq):
     session_id: Optional[str] = None
     reason: str = ""
