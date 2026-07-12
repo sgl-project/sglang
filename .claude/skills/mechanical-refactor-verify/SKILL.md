@@ -65,8 +65,7 @@ description: Make mechanical refactoring (file splits, function moves, module ex
   pre-commit + byte-diff scaffold. Self-contained — only git and the standard library.
 - [`scripts/mechanical_refactor_reproduction_cli.py`](scripts/mechanical_refactor_reproduction_cli.py) — the
   **chain verifier**: classifies every commit in `base..branch`, runs every provable
-  commit's proof from the proof folder, sniffs `non_mechanical_provable` commits for
-  mislabeled provable relocations, and emits the full chain report.
+  commit's proof from the proof folder, and emits the full chain report.
 - [`scripts/tests/`](scripts/tests/) — pytest suites, one folder per module:
   `reproduction_utils/` for the proof engine, `proof_generator/` for the generator,
   `reproduction_cli/` for the chain verifier.

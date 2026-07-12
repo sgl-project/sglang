@@ -60,7 +60,7 @@
   cd scripts && uv run --with pytest --python 3.12 python -m pytest tests/ -q
   ```
 
-  Baseline at the time of writing: **183 passed**. Your change must leave the count at or
+  Baseline at the time of writing: **178 passed**. Your change must leave the count at or
   above baseline — never delete a case to make the suite pass.
 - Layout mirrors the modules; put your test where it belongs:
     - `tests/reproduction_utils/` — one `test_<primitive>.py` per engine primitive.

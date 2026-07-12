@@ -6,10 +6,7 @@ rest of the message format is free). Every ``mechanical_provable`` commit must s
 proof script in the proof folder (``<proof>/repro_scripts/<sha-prefix>.py`` or a flat
 ``<proof>/<sha-prefix>.py``), and running the proof must PASS -- reproduce the commit
 byte-for-byte. A ``non_mechanical_provable`` commit carries no machine proof and is left
-to human review — but the mislabel sniff runs the proof generator's inference on it: a
-commit that reproduces fully as pure relocations is machine-refuted
-(``MISLABELED_PROVABLE``), and bundled relocations surface as a report warning, so
-provable work cannot silently hide behind the non-provable label.
+to human review.
 
 The run prints a markdown report, writes it into the proof folder (``chain_report.md``),
 and exits 0 iff the whole chain verifies. Normative contract: spec-reproduction-cli.md.
@@ -19,15 +16,11 @@ and exits 0 iff the whole chain verifies. Normative contract: spec-reproduction-
 """
 
 import argparse
-import contextlib
-import io
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 KIND_MECHANICAL = "mechanical_provable"
 KIND_NON_MECHANICAL = "non_mechanical_provable"
@@ -36,7 +29,6 @@ VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
 VERDICT_MISSING_PROOF = "MISSING_PROOF"
 VERDICT_AMBIGUOUS_PROOF = "AMBIGUOUS_PROOF"
-VERDICT_MISLABELED_PROVABLE = "MISLABELED_PROVABLE"
 VERDICT_HUMAN_REVIEW = "HUMAN_REVIEW"
 VERDICT_UNCLASSIFIED = "UNCLASSIFIED"
 VERDICT_AMBIGUOUS_KIND = "AMBIGUOUS_KIND"
@@ -68,7 +60,6 @@ class CommitVerdict:
     kind: "str | None"
     verdict: str
     detail: str = ""
-    warning: str = ""
 
     @property
     def ok(self) -> bool:
@@ -102,12 +93,6 @@ def main(argv: "list[str]") -> int:
         default=None,
         help=f"report file path (default: <proof>/{_REPORT_FILENAME})",
     )
-    parser.add_argument(
-        "--no-provable-sniff",
-        dest="provable_sniff",
-        action="store_false",
-        help="skip the mislabel sniff on non_mechanical_provable commits",
-    )
     args = parser.parse_args(argv)
 
     try:
@@ -116,7 +101,6 @@ def main(argv: "list[str]") -> int:
             branch=args.branch,
             proof=Path(args.proof),
             repo_root=args.repo_root,
-            provable_sniff=args.provable_sniff,
         )
     except ChainVerificationError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -138,7 +122,6 @@ def verify_chain(
     branch: str,
     proof: Path,
     repo_root: "str | None" = None,
-    provable_sniff: bool = True,
 ) -> ChainResult:
     """Classify every commit in ``base..branch`` and run every provable commit's proof."""
     root = repo_root or _repo_root()
@@ -154,12 +137,7 @@ def verify_chain(
         message = _git_output(["log", "-1", "--format=%B", sha], root)
         verdicts.append(
             _verdict_for_commit(
-                sha=sha,
-                subject=subject,
-                message=message,
-                proof=proof,
-                root=root,
-                provable_sniff=provable_sniff,
+                sha=sha, subject=subject, message=message, proof=proof, root=root
             )
         )
     return ChainResult(
@@ -198,12 +176,6 @@ def render_report(result: ChainResult) -> str:
         subject = v.subject.replace("|", "\\|")
         lines.append(f"| {i} | `{v.sha[:9]}` | {kind} | {v.verdict} | {subject} |")
 
-    warned = [v for v in result.verdicts if v.ok and v.warning]
-    if warned:
-        lines += ["", "## Warnings"]
-        for v in warned:
-            lines += ["", f"### `{v.sha[:9]}` — {v.verdict}", "", v.warning]
-
     failures = [v for v in result.verdicts if not v.ok]
     if failures:
         lines += ["", "## Failure details"]
@@ -218,13 +190,7 @@ def render_report(result: ChainResult) -> str:
 
 
 def _verdict_for_commit(
-    *,
-    sha: str,
-    subject: str,
-    message: str,
-    proof: Path,
-    root: str,
-    provable_sniff: bool,
+    *, sha: str, subject: str, message: str, proof: Path, root: str
 ) -> CommitVerdict:
     kind, classification_error = _classify(message)
     if kind is None:
@@ -239,8 +205,12 @@ def _verdict_for_commit(
             ),
         )
     if kind == KIND_NON_MECHANICAL:
-        return _non_mechanical_verdict(
-            sha=sha, subject=subject, root=root, provable_sniff=provable_sniff
+        return CommitVerdict(
+            sha=sha,
+            subject=subject,
+            kind=kind,
+            verdict=VERDICT_HUMAN_REVIEW,
+            detail="declared non_mechanical_provable: no machine proof, review by hand",
         )
 
     scripts = _find_proof_scripts(proof=proof, sha=sha)
@@ -277,76 +247,6 @@ def _verdict_for_commit(
         kind=kind,
         verdict=VERDICT_FAIL,
         detail=f"proof `{scripts[0]}` did not PASS; output tail:\n\n```\n{tail}\n```",
-    )
-
-
-_NON_MECHANICAL_DETAIL = (
-    "declared non_mechanical_provable: no machine proof, review by hand"
-)
-
-
-def _non_mechanical_verdict(
-    *, sha: str, subject: str, root: str, provable_sniff: bool
-) -> CommitVerdict:
-    if not provable_sniff:
-        return CommitVerdict(
-            sha=sha,
-            subject=subject,
-            kind=KIND_NON_MECHANICAL,
-            verdict=VERDICT_HUMAN_REVIEW,
-            detail=_NON_MECHANICAL_DETAIL,
-        )
-    fully_provable, warning = _sniff_mislabeled_relocation(sha=sha, root=root)
-    if fully_provable:
-        return CommitVerdict(
-            sha=sha,
-            subject=subject,
-            kind=KIND_NON_MECHANICAL,
-            verdict=VERDICT_MISLABELED_PROVABLE,
-            detail=(
-                "the whole commit reproduces byte-for-byte as pure relocations "
-                "(proof generator PASS), so it is mechanical_provable — relabel it "
-                "and attach the generated proof"
-            ),
-        )
-    return CommitVerdict(
-        sha=sha,
-        subject=subject,
-        kind=KIND_NON_MECHANICAL,
-        verdict=VERDICT_HUMAN_REVIEW,
-        detail=_NON_MECHANICAL_DETAIL,
-        warning=warning,
-    )
-
-
-def _sniff_mislabeled_relocation(*, sha: str, root: str) -> "tuple[bool, str]":
-    """Run the proof generator's inference on a declared non-mechanical commit.
-
-    Returns (fully_provable, warning): a full byte-for-byte reproduction machine-refutes
-    the declaration; inferred relocations with a residual are a warning for the reviewer.
-    The sniff is advisory and never raises — an error degrades to a warning note."""
-    try:
-        import mechanical_refactor_proof_generator as generator
-    except ImportError as exc:
-        return False, f"provable-sniff skipped (generator unavailable: {exc})"
-    try:
-        recipe = generator.infer_recipe(sha, root)
-        relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
-        if not (recipe.supported and relocates):
-            return False, ""
-        with contextlib.redirect_stdout(io.StringIO()):
-            residual = generator.build_repro(recipe, repo_root=root).run()
-    except Exception as exc:
-        return False, f"provable-sniff errored: {type(exc).__name__}: {exc}"
-    if residual == "":
-        return True, ""
-    relocated = [mv["name"] for mv in recipe.moves] + [
-        ex["dst"] for ex in recipe.extracts + recipe.scatter_extracts
-    ]
-    return False, (
-        f"provable-sniff: the generator inferred relocations "
-        f"({', '.join(relocated)}) with a {len(residual.splitlines())}-line residual — "
-        f"check whether a mechanical_provable split was dodged"
     )
 
 

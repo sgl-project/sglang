@@ -27,9 +27,8 @@ following must hold over `base..branch`; run the chain verifier
    expressible as the whitelisted relocations (an extract-function, a bulk move, a file
    split, an import repoint, …) is its own `mechanical_provable` commit. Hiding provable
    content inside a `non_mechanical_provable` commit — dodging the verifier — is
-   forbidden (§2.2 maximality; the mislabel sniff machine-refutes the fully-provable case
-   and warns on bundled relocations, `spec-reproduction-cli.md` §3.5). How to split so
-   this holds: §2.
+   forbidden (§2.2 maximality); catching it is the reviewer's duty
+   (`guide-verify-proof.md` §1). How to split so this holds: §2.
 3. **Every `mechanical_provable` commit has a proof that PASSes.** Produce the proofs
    with the generator (`guide-construct-proof.md` §1); the chain verifier re-runs every
    one of them against the proof folder.
@@ -99,8 +98,8 @@ Hard lines ("prep" below = the prepare phase):
   extract, an import repoint riding along — is split into its own `mechanical_provable`
   commit with a proof, never folded into a semantic commit where the verifier cannot see
   it. Declaring provable work non-provable to dodge the verifier violates the chain
-  property (`spec-reproduction-cli.md` §2.1); the chain verifier machine-refutes the
-  fully-provable case (`MISLABELED_PROVABLE`) and warns on bundled relocations.
+  property (`spec-reproduction-cli.md` §2.1); the reviewer is instructed to hunt for
+  exactly this (`guide-verify-proof.md` §1).
 - **"Semantic" is not banned from prepare — oversized or hidden semantics are.** prepare's
   own edits *are* meaning-carrying (de-self, retype-`self`, co-locating bookkeeping);
   "minimal" caps their **size**, it does not forbid semantics. The two bans are narrower:

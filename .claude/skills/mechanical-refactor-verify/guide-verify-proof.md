@@ -45,12 +45,7 @@
 - Duty 2 — **verify the declaration itself**: the commit asserts **nothing in it is a
   provable relocation** (`spec-reproduction-cli.md` §2.1), and hiding provable content
   there to dodge the verifier is exactly the escape this chain check exists to close.
-    - The verifier already machine-refutes the blatant case: a commit that reproduces
-      fully as pure relocations fails as `MISLABELED_PROVABLE`, and a commit bundling
-      relocations with other changes appears under **Warnings** with the inferred moves
-      named (the mislabel sniff, `spec-reproduction-cli.md` §3.5).
-    - Your job is the rest: read the commit's diff for relocated code the inference
-      cannot see. Concretely, run
+    - Read the commit's diff for relocated code. Concretely, run
       `git show <sha> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
       and look for moved blocks, and run
       `python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <sha>`
