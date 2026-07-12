@@ -3136,6 +3136,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        indexer_layer_ids: Optional[List[int]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -3161,6 +3162,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
+        # Compact indexer layout: only these (absolute) layer ids own an
+        # index_k slot. skip_topk (shared) layers reuse the previous full
+        # layer's top-k and never read their own indexer cache (see
+        # should_run_indexer), so with sharing enabled their slots are
+        # dropped. None keeps the dense one-slot-per-layer layout.
+        if indexer_layer_ids is None:
+            indexer_layer_ids = list(
+                range(self.start_layer, self.start_layer + layer_num)
+            )
+        self.indexer_layer_ids = list(indexer_layer_ids)
+        self._indexer_slot_by_layer = {
+            lid: slot for slot, lid in enumerate(self.indexer_layer_ids)
+        }
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
@@ -3204,8 +3218,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
+                for _ in self.indexer_layer_ids
             ]
+
+    def _get_index_buf(self, layer_id: int) -> torch.Tensor:
+        slot = self._indexer_slot_by_layer.get(layer_id)
+        assert slot is not None, (
+            f"DSA indexer K cache accessed for layer {layer_id}, which owns no "
+            f"indexer slot (skip_topk/shared layer under the compact layout)"
+        )
+        return self.index_k_with_scale_buffer[slot]
 
     def _clear_buffers(self):
         super()._clear_buffers()
@@ -3226,7 +3248,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self._get_index_buf(layer_id)
 
     def get_index_k_continuous(
         self,
@@ -3236,7 +3258,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf(layer_id)
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -3249,7 +3271,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf(layer_id)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -3275,7 +3297,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf(layer_id)
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -3292,7 +3314,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf(layer_id)
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
@@ -3310,13 +3332,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
+        for slot in range(len(self.index_k_with_scale_buffer)):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.index_k_with_scale_buffer[layer_id][
-                    chunk_page_indices
-                ].to("cpu", non_blocking=True)
+                idx_cpu = self.index_k_with_scale_buffer[slot][chunk_page_indices].to(
+                    "cpu", non_blocking=True
+                )
                 index_k_cpu[-1].append(idx_cpu)
         torch.cuda.synchronize()
 
@@ -3332,26 +3354,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
+        for slot in range(len(self.index_k_with_scale_buffer)):
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
+                idx_cpu = index_k_cpu[slot][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
                 idx_chunk = idx_cpu.to(
                     self.index_k_with_scale_buffer[0].device, non_blocking=True
                 )
-                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+                self.index_k_with_scale_buffer[slot][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
 
     def get_state_buf_infos(self):
+        num_bufs = len(self.index_k_with_scale_buffer)
         data_ptrs = [
-            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i].data_ptr() for i in range(num_bufs)
         ]
-        data_lens = [
-            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
-        ]
+        data_lens = [self.index_k_with_scale_buffer[i].nbytes for i in range(num_bufs)]
         item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i][0].nbytes for i in range(num_bufs)
         ]
         return data_ptrs, data_lens, item_lens
 

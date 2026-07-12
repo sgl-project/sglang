@@ -972,6 +972,13 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
             else:
                 PoolCls = DSATokenToKVPool
+                from sglang.srt.model_executor.pool_configurator import (
+                    get_dsa_compact_indexer_layer_ids,
+                )
+
+                pool_kwargs["indexer_layer_ids"] = get_dsa_compact_indexer_layer_ids(
+                    self
+                )
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

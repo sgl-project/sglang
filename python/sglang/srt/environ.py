@@ -643,6 +643,11 @@ class Envs:
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+    # Allocate DSA indexer K-cache slots only for layers that own an indexer
+    # (skip_topk/shared layers reuse the previous full layer's top-k and
+    # never read their own indexer cache). Escape hatch: set to false to
+    # restore the dense one-slot-per-layer layout.
+    SGLANG_DSA_COMPACT_INDEXER_CACHE = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"

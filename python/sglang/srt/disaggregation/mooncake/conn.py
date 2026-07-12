@@ -1042,6 +1042,20 @@ class MooncakeKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
+                if (
+                    st == StateType.DSA
+                    and dst_data_ptrs
+                    and len(src_data_ptrs) != len(dst_data_ptrs)
+                ):
+                    # Positional pairing: a buffer-count mismatch means the two
+                    # sides disagree on the indexer layout (e.g. compact vs
+                    # dense across versions) -- pairing would corrupt KV.
+                    raise RuntimeError(
+                        f"DSA indexer state buffer count mismatch between "
+                        f"prefill ({len(src_data_ptrs)}) and decode "
+                        f"({len(dst_data_ptrs)}); both sides must run the same "
+                        f"sglang version and indexer cache layout."
+                    )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (

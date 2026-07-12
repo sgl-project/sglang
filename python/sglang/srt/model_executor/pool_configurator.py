@@ -216,9 +216,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
-                )
+                num_indexer_layers = effective_num_layers
+                compact_indexer_layer_ids = get_dsa_compact_indexer_layer_ids(mr)
+                if compact_indexer_layer_ids is not None:
+                    num_indexer_layers = len(compact_indexer_layer_ids)
+                cell_size += indexer_size_per_token * num_indexer_layers * element_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
@@ -792,3 +794,44 @@ def create_memory_pool_configurator(
         return HybridSWAPoolConfigurator(mr)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(mr)
+
+
+def get_dsa_compact_indexer_layer_ids(mr) -> Optional[list[int]]:
+    """Absolute layer ids that own a DSA indexer K-cache slot, or None for
+    the dense one-slot-per-layer layout.
+
+    skip_topk (shared) layers reuse the previous full layer's top-k; their
+    indexer cache is never read (see should_run_indexer), so their slots are
+    pure waste (57/78 layers on GLM-5.2 == ~13.6% of the KV pool). Dense
+    layout is kept for: models without shared layers (e.g. DeepSeek-V3.2),
+    draft/NextN workers (the NextN layer owns indexer weights), hisparse and
+    hierarchical cache (their host mirrors assume the dense layout), DSA
+    cache layer split (per-rank shard bookkeeping assumes dense), and when
+    SGLANG_DSA_COMPACT_INDEXER_CACHE is false.
+    """
+    from sglang.srt.configs.model_config import dsa_layer_skips_topk
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+    hf_config = mr.model_config.hf_config
+    if not is_deepseek_dsa(hf_config):
+        return None
+    if not envs.SGLANG_DSA_COMPACT_INDEXER_CACHE.get():
+        return None
+    if mr.is_draft_worker:
+        return None
+    if getattr(mr, "enable_hisparse", False):
+        return None
+    if mr.server_args.enable_hierarchical_cache:
+        return None
+    shard_rank, _ = get_glm_dsa_cp_layer_shard_info(mr)
+    if shard_rank is not None:
+        return None
+    layer_ids = [
+        layer_id
+        for layer_id in range(mr.start_layer, mr.end_layer)
+        if not dsa_layer_skips_topk(hf_config, layer_id)
+    ]
+    if len(layer_ids) == mr.end_layer - mr.start_layer:
+        return None
+    return layer_ids
