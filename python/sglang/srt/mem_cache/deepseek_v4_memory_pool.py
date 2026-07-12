@@ -14,7 +14,7 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
