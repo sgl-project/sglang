@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
@@ -863,14 +864,7 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            if (
-                getattr(
-                    getattr(forward_batch, "spec_info", None),
-                    "ragged_verify_layout",
-                    None,
-                )
-                is not None
-            ):
+            if resolve_ragged_verify_layout(forward_batch) is not None:
                 raise NotImplementedError(
                     "DSV4 ragged verify is not supported on the HIP backend "
                     "(DeepseekV4HipRadixBackend) cuda-graph path; disable "
@@ -963,14 +957,7 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
-            if (
-                getattr(
-                    getattr(forward_batch, "spec_info", None),
-                    "ragged_verify_layout",
-                    None,
-                )
-                is not None
-            ):
+            if resolve_ragged_verify_layout(forward_batch) is not None:
                 raise NotImplementedError(
                     "DSV4 ragged verify is not supported on the HIP backend "
                     "(DeepseekV4HipRadixBackend); disable SGLANG_RAGGED_VERIFY_MODE "
