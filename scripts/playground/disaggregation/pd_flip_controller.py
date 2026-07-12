@@ -44,6 +44,30 @@ except ModuleNotFoundError:
     _TRACE_SLO_SPEC.loader.exec_module(_TRACE_SLO_MODULE)
     TraceSLOMonitor = _TRACE_SLO_MODULE.TraceSLOMonitor
 
+try:
+    from pd_flip_progressive_policy import (
+        ProgressiveDecision,
+        RequestCapacity,
+        evaluate_slo_decision,
+        select_first_batch,
+    )
+except ModuleNotFoundError:
+    import importlib.util
+
+    _PROGRESSIVE_POLICY_PATH = Path(__file__).with_name("pd_flip_progressive_policy.py")
+    _PROGRESSIVE_POLICY_SPEC = importlib.util.spec_from_file_location(
+        "pd_flip_progressive_policy", _PROGRESSIVE_POLICY_PATH
+    )
+    _PROGRESSIVE_POLICY_MODULE = importlib.util.module_from_spec(
+        _PROGRESSIVE_POLICY_SPEC
+    )
+    sys.modules[_PROGRESSIVE_POLICY_SPEC.name] = _PROGRESSIVE_POLICY_MODULE
+    _PROGRESSIVE_POLICY_SPEC.loader.exec_module(_PROGRESSIVE_POLICY_MODULE)
+    ProgressiveDecision = _PROGRESSIVE_POLICY_MODULE.ProgressiveDecision
+    RequestCapacity = _PROGRESSIVE_POLICY_MODULE.RequestCapacity
+    evaluate_slo_decision = _PROGRESSIVE_POLICY_MODULE.evaluate_slo_decision
+    select_first_batch = _PROGRESSIVE_POLICY_MODULE.select_first_batch
+
 
 def _migration_source_start_payload(
     session_id: str,
@@ -134,6 +158,12 @@ class PDClusterConfig:
     migration_poll_interval_seconds: float = 0.5
     observation_quiesce_seconds: float = 0.0
     post_migration_idle_timeout_seconds: float = 2.0
+    first_migration_ratio: float = 0.5
+    observation_seconds: float = 10.0
+    slo_threshold: float = 0.9
+    min_prefill_slo_samples: int = 20
+    min_decode_slo_samples: int = 20
+    session_journal_path: str = "pd_flip_session.json"
 
     @staticmethod
     def from_dict(data: JsonDict) -> "PDClusterConfig":
@@ -169,6 +199,14 @@ class PDClusterConfig:
                         "PD_FLIP_POST_MIGRATION_IDLE_TIMEOUT_SECONDS", 2.0
                     ),
                 )
+            ),
+            first_migration_ratio=float(data.get("first_migration_ratio", 0.5)),
+            observation_seconds=float(data.get("observation_seconds", 10.0)),
+            slo_threshold=float(data.get("slo_threshold", 0.9)),
+            min_prefill_slo_samples=int(data.get("min_prefill_slo_samples", 20)),
+            min_decode_slo_samples=int(data.get("min_decode_slo_samples", 20)),
+            session_journal_path=str(
+                data.get("session_journal_path", "pd_flip_session.json")
             ),
         )
 
@@ -286,6 +324,28 @@ class PDFlipController:
             raise ValueError("PDClusterConfig.nodes must not be empty")
         self.config = config
         self.client = client
+
+    def _select_progressive_first_batch(
+        self, source: NodeMetrics, target: NodeMetrics
+    ) -> Any:
+        source_status = source.raw_status.get("status", source.raw_status)
+        target_status = target.raw_status.get("status", target.raw_status)
+        requests = [
+            RequestCapacity(
+                rid=str(item["rid"]),
+                committed_tokens=int(item["kv_committed_len"]),
+            )
+            for item in source_status.get("running_requests", [])
+        ]
+        return select_first_batch(
+            requests,
+            self.config.first_migration_ratio,
+            target_req_slots=int(target_status.get("free_request_slots", 0)),
+            target_kv_tokens=int(target_status.get("available_kv_tokens", 0)),
+            reserve_tokens_per_req=int(
+                target_status.get("reserved_decode_tokens_per_req", 0)
+            ),
+        )
 
     def collect_metrics(self) -> List[NodeMetrics]:
         router_workers = self._fetch_router_workers()
@@ -2259,6 +2319,12 @@ def config_from_args(args: argparse.Namespace) -> PDClusterConfig:
         post_migration_idle_timeout_seconds=float(
             os.environ.get("PD_FLIP_POST_MIGRATION_IDLE_TIMEOUT_SECONDS", 2.0)
         ),
+        first_migration_ratio=args.first_migration_ratio,
+        observation_seconds=args.observation_seconds,
+        slo_threshold=args.slo_threshold,
+        min_prefill_slo_samples=args.min_prefill_slo_samples,
+        min_decode_slo_samples=args.min_decode_slo_samples,
+        session_journal_path=args.session_journal_path,
     )
 
 
@@ -2284,6 +2350,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--first-migration-ratio", type=float, default=0.5)
+    parser.add_argument("--observation-seconds", type=float, default=10.0)
+    parser.add_argument("--slo-threshold", type=float, default=0.9)
+    parser.add_argument("--min-prefill-slo-samples", type=int, default=20)
+    parser.add_argument("--min-decode-slo-samples", type=int, default=20)
+    parser.add_argument("--session-journal-path", default="pd_flip_session.json")
 
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("metrics", help="Collect router/worker metrics")
