@@ -119,16 +119,6 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
     return draft_count // draft_token_num
 
 
-RAGGED_VERIFY_STATIC = RaggedVerifyMode.STATIC.value
-RAGGED_VERIFY_CAP_ACCEPT = RaggedVerifyMode.CAP_ACCEPT.value
-RAGGED_VERIFY_COMPACT = RaggedVerifyMode.COMPACT.value
-RAGGED_VERIFY_CHOICES = tuple(m.value for m in RaggedVerifyMode)
-
-
-def _ragged_verify_mode() -> str:
-    return read_ragged_verify_mode().value
-
-
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
@@ -592,7 +582,7 @@ class DeepseekV4AttnBackend(
         layout = resolve_ragged_verify_layout(forward_batch)
         if layout is None:
             return None
-        if _ragged_verify_mode() != RAGGED_VERIFY_COMPACT:
+        if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
             return None
         if get_parallel().attn_cp_size > 1:
             raise NotImplementedError(
