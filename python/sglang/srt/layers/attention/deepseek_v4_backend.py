@@ -21,6 +21,11 @@ import torch.nn.functional as F
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    BuildPageTablePositions,
+    ExpandPrefillCausally,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -51,11 +56,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
-    BuildCausalSwaPageIndices,
     BuildDsparkSwaPageIndices,
-    BuildPageTablePositions,
     ComputeDsparkWindowGather,
-    ExpandPrefillCausally,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (

@@ -12,6 +12,7 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.dsv4 import attn_metadata_kernels
 from sglang.srt.speculative import ragged_verify_kernels
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
@@ -179,7 +180,7 @@ def _case_causal_swa_page_indices(tc):
     # Lens short of / straddling / beyond the SWA window boundary.
     for lo, hi in ((1, swa), (swa - 4, swa + 4), (swa + 1, pool_len)):
         lens = _ri(lo, hi, (num_q,), torch.int32, g)
-        cls = dspark_attn_metadata.BuildCausalSwaPageIndices
+        cls = attn_metadata_kernels.BuildCausalSwaPageIndices
         ref = cls.torch(seq_lens_casual=lens, **kw)
         got = cls.triton(seq_lens_casual=lens, **kw)
         tc.assertEqual(got.shape, ref.shape)
@@ -307,7 +308,7 @@ def _case_expand_prefill_causally(tc):
     req_pool_indices = torch.randperm(512, device=DEVICE)[:bs]
     seq_lens = _ri(8, 500, (bs,))
     tc._parity(
-        dspark_attn_metadata.ExpandPrefillCausally,
+        attn_metadata_kernels.ExpandPrefillCausally,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         extend_seq_lens=extend,
@@ -320,7 +321,7 @@ def _case_expand_prefill_causally(tc):
     # Loop branch: uniform extend with CPU lens and no padding.
     bs2, block = 8, 6
     tc._parity(
-        dspark_attn_metadata.ExpandPrefillCausally,
+        attn_metadata_kernels.ExpandPrefillCausally,
         req_pool_indices=req_pool_indices[:bs2],
         seq_lens=seq_lens[:bs2],
         extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
@@ -386,7 +387,7 @@ def _case_page_table_positions(tc):
     # Large page + non-pool-aligned max_seq_len, then page_size 1.
     for num_q, page_size, max_seq_len in ((300, 64, 4000), (56, 1, 4096)):
         tc._parity(
-            dspark_attn_metadata.BuildPageTablePositions,
+            attn_metadata_kernels.BuildPageTablePositions,
             req_to_token=req_to_token,
             req_pool_indices_repeated=_ri(0, num_pool, (num_q,), torch.int32, g),
             seq_lens_casual=_ri(1, pool_len, (num_q,), torch.int64, g),
