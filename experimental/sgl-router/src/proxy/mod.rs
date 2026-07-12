@@ -68,7 +68,8 @@ pub(crate) enum AbortReason {
     /// the response Body (client TCP close, HTTP/2 RST_STREAM, or a middle
     /// box severing the connection). The most common streaming abort cause.
     StreamClientGone = 5,
-    /// Streaming guard: the pump waited `STREAM_SEND_STALL` (120 s) for the
+    /// Streaming guard: the pump waited the configured send-stall budget
+    /// (`STREAM_SEND_STALL` by default) for the
     /// client to drain the read-ahead buffer and the client never made
     /// progress. Treated as "client is present but not consuming"; the abort
     /// releases the engine slot so a working consumer can be served.
@@ -450,6 +451,16 @@ pub struct Proxy {
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+    /// Between-bytes idle timeout for the upstream→router streaming leg — how
+    /// long the engine may go silent mid-stream before the pump aborts. A stall
+    /// cap, not a total-time cap. Defaults to `STREAM_IDLE_TIMEOUT`; prod
+    /// overrides it from config via [`Self::with_stream_timeouts`].
+    pub stream_idle_timeout: Duration,
+    /// Backpressure stall timeout for the router→client streaming leg — how long
+    /// a connected-but-non-draining client may block the pump before it releases
+    /// the per-worker slot. Defaults to `STREAM_SEND_STALL`; prod overrides it
+    /// from config via [`Self::with_stream_timeouts`].
+    pub stream_send_stall: Duration,
     /// Metrics sink for the drop-side of `AbortOnDrop`. Filled once at startup
     /// via [`Self::attach_metrics`] — matching the same pattern
     /// `ActiveLoadRegistry` and `PolicyRegistry` use — so tests that build a
@@ -491,8 +502,25 @@ impl Proxy {
             http1_client: build_client(WireProtocol::Http1)?,
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
+            // Defaults; prod overrides from config via `with_stream_timeouts`.
+            stream_idle_timeout: STREAM_IDLE_TIMEOUT,
+            stream_send_stall: sse::STREAM_SEND_STALL,
             metrics: OnceLock::new(),
         })
+    }
+
+    /// Override the streaming stall budgets (upstream idle / client backpressure)
+    /// from configuration. Chained after [`Self::new`] at startup; tests that
+    /// build a bare `Proxy` keep the `STREAM_IDLE_TIMEOUT` / `STREAM_SEND_STALL`
+    /// defaults.
+    pub fn with_stream_timeouts(
+        mut self,
+        stream_idle_timeout: Duration,
+        stream_send_stall: Duration,
+    ) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self.stream_send_stall = stream_send_stall;
+        self
     }
 
     /// Wire a metrics registry into this proxy — every subsequent
@@ -887,7 +915,7 @@ impl Proxy {
         // tells the engine to stop. A non-2xx stream is the engine's own error
         // body (it isn't generating), so it is never abortable.
         let upstream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
-            sse::idle_timeout_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT);
+            sse::idle_timeout_stream(resp.bytes_stream(), self.stream_idle_timeout);
         let (upstream, abort_guard, abort_reason_handle) = match abort_rid {
             Some(rid) if status.is_success() => match worker_url.join("/abort_request") {
                 Ok(abort_url) => {
@@ -921,13 +949,14 @@ impl Proxy {
             (None, Some(a)) => Some(Box::new((pump_phase, a))),
             (None, None) => Some(Box::new(pump_phase)),
         };
-        let body = sse::bytes_stream_to_body(
+        let body = sse::bytes_stream_to_body_with_stall(
             upstream,
             guards,
             on_complete,
             first_byte_hook,
             abort_reason_handle,
             inter_chunk_hook,
+            self.stream_send_stall,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
@@ -959,6 +988,20 @@ mod tests {
     #[tokio::test]
     async fn new_returns_result_not_panic() {
         let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        assert_eq!(p.request_timeout, Duration::from_secs(5));
+        // Bare `new` keeps the streaming-stall defaults.
+        assert_eq!(p.stream_idle_timeout, STREAM_IDLE_TIMEOUT);
+        assert_eq!(p.stream_send_stall, sse::STREAM_SEND_STALL);
+    }
+
+    #[tokio::test]
+    async fn with_stream_timeouts_overrides_both_legs() {
+        let p = Proxy::new(Duration::from_secs(5))
+            .unwrap()
+            .with_stream_timeouts(Duration::from_secs(90), Duration::from_secs(45));
+        assert_eq!(p.stream_idle_timeout, Duration::from_secs(90));
+        assert_eq!(p.stream_send_stall, Duration::from_secs(45));
+        // Untouched by the builder.
         assert_eq!(p.request_timeout, Duration::from_secs(5));
     }
 

@@ -11,7 +11,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
-    default_stale_request_timeout_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
+    default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
+    default_stream_send_stall_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
     AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
     K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
     RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
@@ -144,6 +145,28 @@ pub struct Cli {
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
+    /// Between-bytes idle timeout (seconds) for the upstream→router streaming
+    /// leg. If the engine delivers no bytes for this long mid-stream, the pump
+    /// aborts and releases the request's guards. A stall cap, NOT a total-time
+    /// cap: a slow-but-progressing generation is unaffected. Also settable via
+    /// the `SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS",
+        default_value_t = default_stream_idle_timeout_secs()
+    )]
+    pub stream_idle_timeout_secs: u64,
+    /// Backpressure stall timeout (seconds) for the router→client streaming
+    /// leg. If the client accepts no bytes for this long while the pump is
+    /// blocked on read-ahead permits, the pump gives up and releases the
+    /// per-worker in-flight slot. Also settable via the
+    /// `SGLANG_ROUTER_STREAM_SEND_STALL_SECS` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_STREAM_SEND_STALL_SECS",
+        default_value_t = default_stream_send_stall_secs()
+    )]
+    pub stream_send_stall_secs: u64,
     /// Max lifetime of an in-flight request entry before the janitor
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
@@ -363,6 +386,8 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.request_timeout_secs,
+                stream_idle_timeout_secs: self.stream_idle_timeout_secs,
+                stream_send_stall_secs: self.stream_send_stall_secs,
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
@@ -497,6 +522,9 @@ mod tests {
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 5);
+        // Streaming stall budgets default to 180 s (both legs).
+        assert_eq!(c.proxy.stream_idle_timeout_secs, 180);
+        assert_eq!(c.proxy.stream_send_stall_secs, 180);
     }
 
     #[test]
@@ -1051,10 +1079,16 @@ mod tests {
             "120",
             "--stale-request-timeout-secs",
             "240",
+            "--stream-idle-timeout-secs",
+            "90",
+            "--stream-send-stall-secs",
+            "45",
         ]))
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
         assert_eq!(c.active_load.stale_request_timeout_secs, 240);
+        assert_eq!(c.proxy.stream_idle_timeout_secs, 90);
+        assert_eq!(c.proxy.stream_send_stall_secs, 45);
     }
 
     #[test]

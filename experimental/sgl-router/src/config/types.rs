@@ -36,16 +36,41 @@ pub struct ProxyConfig {
     /// for long generations, so this budget deliberately does not apply
     /// there — see `forward_streaming_to`'s `send()` timeout comment).
     pub request_timeout_secs: u64,
+    /// Between-bytes idle timeout (seconds) for the UPSTREAM→router streaming
+    /// leg: if the engine delivers no bytes for this long mid-stream the pump
+    /// treats the upstream as hung and aborts, releasing the guards it holds.
+    /// A *stall* cap, not a total-duration cap — a slow-but-progressing
+    /// generation is never affected. Wired into `STREAM_IDLE_TIMEOUT`'s slot.
+    pub stream_idle_timeout_secs: u64,
+    /// Backpressure stall timeout (seconds) for the router→CLIENT streaming
+    /// leg: if the client accepts no bytes for this long while the pump is
+    /// blocked on read-ahead permits, the pump gives up and releases the
+    /// per-worker in-flight slot (otherwise a non-draining client pins it
+    /// forever). Wired into `STREAM_SEND_STALL`'s slot.
+    pub stream_send_stall_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
     300
 }
 
+// Default streaming stall budgets. Must stay in sync with the `STREAM_IDLE_TIMEOUT`
+// / `STREAM_SEND_STALL` fallback consts in `proxy` (used when a `Proxy` is built
+// without config, e.g. in tests).
+pub fn default_stream_idle_timeout_secs() -> u64 {
+    180
+}
+
+pub fn default_stream_send_stall_secs() -> u64 {
+    180
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            stream_send_stall_secs: default_stream_send_stall_secs(),
         }
     }
 }

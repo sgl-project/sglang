@@ -153,7 +153,11 @@ async fn main() -> Result<()> {
         sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
             cfg.proxy.request_timeout_secs,
         ))
-        .context("construct proxy")?,
+        .context("construct proxy")?
+        .with_stream_timeouts(
+            std::time::Duration::from_secs(cfg.proxy.stream_idle_timeout_secs),
+            std::time::Duration::from_secs(cfg.proxy.stream_send_stall_secs),
+        ),
     );
 
     // Spawn discovery + manager tasks. The manager resolves each worker's wire

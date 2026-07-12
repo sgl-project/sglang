@@ -30,10 +30,16 @@ const PUMP_LOG_SAMPLE: u64 = 64;
 /// permit acquire. Without this bound the pump parks forever, its
 /// `stream_guards` (the per-worker admission slot + active-load entry) never
 /// drop, and the in-flight counter leaks until every worker is pinned at its cap
-/// and all traffic is shed while the engines sit idle. 120 s mirrors the
+/// and all traffic is shed while the engines sit idle. The default mirrors the
 /// upstream idle timeout: a client that accepts no bytes for that long is
 /// treated as gone.
-const STREAM_SEND_STALL: std::time::Duration = std::time::Duration::from_secs(120);
+///
+/// Default client-backpressure stall budget, used when a `Proxy` is built
+/// without config (tests) and as the `bytes_stream_to_body` wrapper's value.
+/// Prod overrides it per-request via `bytes_stream_to_body_with_stall`
+/// (see `ProxyConfig::stream_send_stall_secs`). Must match
+/// `config::default_stream_send_stall_secs`.
+pub(crate) const STREAM_SEND_STALL: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Per-stream read-ahead budget, in bytes.
 ///
@@ -254,6 +260,36 @@ where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
+    bytes_stream_to_body_with_stall(
+        stream,
+        stream_guards,
+        on_complete,
+        on_first_byte,
+        abort_reason,
+        on_inter_chunk,
+        STREAM_SEND_STALL,
+    )
+}
+
+/// Same as [`bytes_stream_to_body`] but with a caller-supplied client-backpressure
+/// stall budget (`send_stall`) instead of the default [`STREAM_SEND_STALL`]. The
+/// production forward path passes `Proxy::stream_send_stall` (from
+/// `ProxyConfig::stream_send_stall_secs`); the no-arg wrapper above is kept for
+/// tests and callers that just want the default.
+#[allow(clippy::too_many_arguments)]
+pub fn bytes_stream_to_body_with_stall<S, E>(
+    stream: S,
+    stream_guards: Option<Box<dyn Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
+    on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    abort_reason: Option<Arc<AtomicU8>>,
+    on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
+    send_stall: std::time::Duration,
+) -> Body
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
     // Byte-bounded read-ahead budget shared between the pump (acquires permits
     // before sending) and the client-facing stream (returns them as it yields).
@@ -427,7 +463,7 @@ where
                             break;
                         }
                         res = tokio::time::timeout(
-                            STREAM_SEND_STALL,
+                            send_stall,
                             readahead_pump.acquire_many(want),
                         ) => res,
                     };
@@ -471,7 +507,7 @@ where
                             // must be able to tell its response was cut short, not
                             // mistake a short body for a complete one.
                             tracing::warn!(
-                                stall = ?STREAM_SEND_STALL,
+                                stall = ?send_stall,
                                 "SSE downstream not draining; aborting to release in-flight slot"
                             );
                             let _ = tx.send(Err(std::io::Error::other(
