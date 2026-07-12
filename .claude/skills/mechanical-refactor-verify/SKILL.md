@@ -22,7 +22,7 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 - **Author a compliant refactor branch — split it into commits, satisfy the contract**
   (extract, move, file split) → `guide-split.md`: §1 splits the PR into classified pieces
   (the chain contract: classification format, correct labeling, proofs PASS,
-  non-mechanical commits equivalence-reviewed); §2 splits one piece into prepare + move +
+  non-mechanical commits correctness-reviewed); §2 splits one piece into prepare + move +
   postpare (the case recipes and the anti-patterns).
 - **Construct the proof — for the chain or one commit** → `guide-construct-proof.md`: §1
   generates + publishes the whole chain's proof folder; §2 proves a single commit (the

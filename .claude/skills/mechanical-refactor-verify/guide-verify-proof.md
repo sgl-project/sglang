@@ -23,11 +23,14 @@
   non-mechanical commits, plus the §2.3 authored-surface audit of each PASS.
 - Each `HUMAN_REVIEW` row carries **two** review duties, and the commit is not approved
   until both hold.
-- Duty 1 — **equivalence-review the diff itself**: a `non_mechanical_provable` commit is
-  exactly the part the machine never certifies, so read its diff and confirm it is
-  genuinely equivalent to what its message claims — no lost logic (a branch, a write, an
-  early return dropped on the floor), no hidden bug, no unrelated behavior change riding
-  along. Tests passing is supporting evidence, not the review.
+- Duty 1 — **correctness-review the diff itself**: a `non_mechanical_provable` commit is
+  exactly the part the machine never certifies, so read its diff and confirm it does
+  exactly what its message claims — no lost logic (a branch, a write, an early return
+  dropped on the floor), no hidden bug, no unintended behavior change riding along. When
+  the commit claims to be behavior-preserving, that means checking equivalence; a commit
+  that intentionally changes behavior (a chain need not be a pure refactor) is reviewed
+  for the correctness of that change instead. Tests passing is supporting evidence, not
+  the review.
 - Duty 2 — **verify the declaration itself**: the commit asserts **nothing in it is a
   provable relocation** (`spec-reproduction-cli.md` §2.1), and hiding provable content
   there to dodge the verifier is exactly the escape this chain check exists to close.

@@ -33,10 +33,13 @@ following must hold over `base..branch`; run the chain verifier
 3. **Every `mechanical_provable` commit has a proof that PASSes.** Produce the proofs
    with the generator (`guide-construct-proof.md` §1); the chain verifier re-runs every
    one of them against the proof folder.
-4. **Every `non_mechanical_provable` commit is equivalence-reviewed by eyes.** Its diff
-   must be confirmed genuinely equivalent to its claim: no lost logic, no hidden bug, no
-   accidental behavior change riding along (`guide-verify-proof.md` §1). The machine
-   never certifies these — that is exactly why they must stay minimal (item 2).
+4. **Every `non_mechanical_provable` commit is correctness-reviewed by eyes.** Its diff
+   must be confirmed to do exactly what its message claims: no lost logic, no hidden bug,
+   no unintended behavior change riding along (`guide-verify-proof.md` §1). When the
+   commit claims to be behavior-preserving that means checking equivalence — but a chain
+   need not be a pure refactor, and a commit that intentionally changes behavior is
+   reviewed for the correctness of that change instead. The machine never certifies
+   these — that is exactly why they must stay minimal (item 2).
 
 ### 1.2 Commit naming and classification
 
