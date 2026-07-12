@@ -21,10 +21,16 @@
   `spec-reproduction-cli.md`.
 - The `HUMAN_REVIEW` rows in the report are your remaining manual surface — the declared
   non-mechanical commits, plus the §2.3 authored-surface audit of each PASS.
-- On each `HUMAN_REVIEW` row, verify the declaration itself: a `non_mechanical_provable`
-  commit asserts **nothing in it is a provable relocation**
-  (`spec-reproduction-cli.md` §2.1), and hiding provable content there to dodge the
-  verifier is exactly the escape this chain check exists to close.
+- Each `HUMAN_REVIEW` row carries **two** review duties, and the commit is not approved
+  until both hold.
+- Duty 1 — **equivalence-review the diff itself**: a `non_mechanical_provable` commit is
+  exactly the part the machine never certifies, so read its diff and confirm it is
+  genuinely equivalent to what its message claims — no lost logic (a branch, a write, an
+  early return dropped on the floor), no hidden bug, no unrelated behavior change riding
+  along. Tests passing is supporting evidence, not the review.
+- Duty 2 — **verify the declaration itself**: the commit asserts **nothing in it is a
+  provable relocation** (`spec-reproduction-cli.md` §2.1), and hiding provable content
+  there to dodge the verifier is exactly the escape this chain check exists to close.
     - The verifier already machine-refutes the blatant case: a commit that reproduces
       fully as pure relocations fails as `MISLABELED_PROVABLE`, and a commit bundling
       relocations with other changes appears under **Warnings** with the inferred moves

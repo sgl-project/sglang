@@ -19,6 +19,8 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 
 ## 2. What do you want to do?
 
+- **Make a refactor branch satisfy this skill** (the whole authoring contract, in one
+  place) → §3 below; verify the result with the chain verifier.
 - **Split a change into commits** (extract, move, file split) → `guide-split.md`: the
   prepare + move + postpare rule, the case recipes, and the anti-patterns.
 - **Construct the proof for a move commit** → `guide-construct-proof.md`: run
@@ -36,7 +38,39 @@ description: Make mechanical refactoring (file splits, function moves, module ex
   `guide-modify-skill.md`: the spec-leads rule, the faithfulness invariant, and the testing
   bar a change must clear before it is trusted.
 
-## 3. Files
+## 3. The chain contract — what a compliant branch satisfies
+
+When asked to make (or fix) a refactor branch so it "satisfies this skill", ALL of the
+following must hold over `base..branch`; run the chain verifier
+(`guide-verify-proof.md` §1) to check the machine-checkable part in one command.
+
+1. **Every commit is classified, in the required subject format:**
+
+   ```text
+   <group-id>(<commit-id>,<kind>): <message>
+   ```
+
+   with `<kind>` exactly `mechanical_provable` or `non_mechanical_provable`, and
+   `<group-id>` / `<commit-id>` kebab-case (contiguous same-`<group-id>` commits form one
+   future PR). The verifier machine-checks the standalone-word rule
+   (`spec-reproduction-cli.md` §2.1); the full format is required on top of it so the
+   chain can be grouped into PRs.
+2. **Classification is correct — mechanical work is labeled mechanical.** Every operation
+   expressible as the whitelisted relocations (an extract-function, a bulk move, a file
+   split, an import repoint, …) is its own `mechanical_provable` commit. Hiding provable
+   content inside a `non_mechanical_provable` commit — dodging the verifier — is
+   forbidden (`guide-split.md` §2 maximality; the mislabel sniff machine-refutes the
+   fully-provable case and warns on bundled relocations,
+   `spec-reproduction-cli.md` §3.5). How to split so this holds: `guide-split.md`.
+3. **Every `mechanical_provable` commit has a proof that PASSes.** Produce the proofs
+   with the generator (`guide-construct-proof.md` §2); the chain verifier re-runs every
+   one of them against the proof folder.
+4. **Every `non_mechanical_provable` commit is equivalence-reviewed by eyes.** Its diff
+   must be confirmed genuinely equivalent to its claim: no lost logic, no hidden bug, no
+   accidental behavior change riding along (`guide-verify-proof.md` §1). The machine
+   never certifies these — that is exactly why they must stay minimal (§3 item 2).
+
+## 4. Files
 
 - [`guide-split.md`](guide-split.md) — split a change into prepare + move + postpare: the
   case recipes, what stays mechanical, and the anti-patterns.
