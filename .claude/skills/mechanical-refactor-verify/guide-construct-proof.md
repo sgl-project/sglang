@@ -53,22 +53,15 @@ gh gist create --desc "mechanical-move proof for PR #NNNN" \
 
 - `gh gist create` flattens paths — fine per §1.3.1.
 - Alternatives: a PR attachment (zip the `--out` folder) or a branch holding it.
+- Put the reviewer's download-and-re-run commands (`guide-verify-proof.md` §2.1) in the
+  PR description under a "Mechanical move — reproducible" heading.
 
-#### 1.3.3 Reviewer: download and re-run
+#### 1.3.3 Keep the classification honest — in both directions
 
-```bash
-gh gist clone <gist_id> /tmp/proof        # or: git clone https://gist.github.com/<gist_id>.git /tmp/proof
-cd <repo-root>                            # the run resolves the repo from the cwd
-python3 /tmp/proof/<sha>.py               # PASS = byte-identical to this commit
-```
-
-- Include exactly these commands in the PR description under a
-  "Mechanical move — reproducible" heading.
-
-#### 1.3.4 Keep the PR mechanical — in both directions
-
-- A mechanical PR contains **only** mechanical changes (moves, splits, renames, import
-  fixes, formatting). Semantic changes go in a separate PR.
+- A `mechanical_provable` commit (and a PR made only of such commits) contains **only**
+  mechanical changes (moves, splits, renames, import fixes, formatting). Semantic changes
+  go in their own `non_mechanical_provable` commits — a chain, and therefore a PR, need
+  not be purely mechanical, but a single commit never mixes the two.
 - The dual holds too: a semantic (`non_mechanical_provable`) commit must not swallow a
   provable relocation to skip the proof — split it out and prove it
   (`guide-split.md` §2.2; property: `spec-reproduction-cli.md` §2.1).

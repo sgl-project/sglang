@@ -57,6 +57,14 @@
   python3 <folder>/repro_scripts/<sha>.py
   ```
 
+- When the proof arrived as a gist (`guide-construct-proof.md` §1.3), download it first:
+
+  ```bash
+  gh gist clone <gist_id> /tmp/proof        # or: git clone https://gist.github.com/<gist_id>.git /tmp/proof
+  cd <repo-root>                            # the run resolves the repo from the cwd
+  python3 /tmp/proof/<sha>.py               # PASS = byte-identical to this commit
+  ```
+
 - The run *is* the proof — it replays the primitives from the base commit and byte-diffs
   against the target in a throwaway worktree.
 - The script prints the verdict and exits 0 only on PASS (a residual exits non-zero), so
