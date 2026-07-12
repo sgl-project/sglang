@@ -1,4 +1,5 @@
 import functools
+import types
 import unittest
 
 import torch
@@ -495,6 +496,89 @@ class TestGraphTierFillBudget(CustomTestCase):
             )
             total = int(verify_lens.to(torch.int64).sum().item())
             self.assertEqual(total, min(graph_num_tokens, bs * cap))
+
+
+class _FakeRaggedRunner(types.SimpleNamespace):
+    pass
+
+
+def _fake_model_runner(capture_num_tokens, max_bs):
+    runner = _FakeRaggedRunner(
+        ragged_verify_mode=True,
+        capture_num_tokens=capture_num_tokens,
+        max_bs=max_bs,
+    )
+    return types.SimpleNamespace(decode_cuda_graph_runner=runner)
+
+
+class TestBudgetTierSelection(CustomTestCase):
+    def test_floor_uses_tier_hint_capped_at_uniform_window(self):
+        from sglang.srt.speculative.dspark_components.dspark_planner import (
+            verify_layout_graph_num_tokens_floor,
+        )
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
+        floor = verify_layout_graph_num_tokens_floor(
+            num_reqs=100,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            verify_num_draft_tokens=8,
+            model_runner=model_runner,
+            tier_num_tokens=150,
+        )
+        self.assertEqual(floor, 150)
+        capped = verify_layout_graph_num_tokens_floor(
+            num_reqs=10,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            verify_num_draft_tokens=8,
+            model_runner=model_runner,
+            tier_num_tokens=150,
+        )
+        self.assertEqual(capped, 80)
+        pinned = verify_layout_graph_num_tokens_floor(
+            num_reqs=100,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            verify_num_draft_tokens=8,
+            model_runner=model_runner,
+        )
+        self.assertEqual(pinned, 800)
+
+    def test_exceeds_gate_checks_slots_and_tier(self):
+        from sglang.srt.speculative.dspark_components.dspark_planner import (
+            ragged_layout_exceeds_captured_grid,
+        )
+
+        model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
+        self.assertTrue(
+            ragged_layout_exceeds_captured_grid(
+                num_reqs=129,
+                verify_num_draft_tokens=8,
+                model_runner=model_runner,
+                tier_tokens_hint=200,
+            )
+        )
+        self.assertFalse(
+            ragged_layout_exceeds_captured_grid(
+                num_reqs=128,
+                verify_num_draft_tokens=8,
+                model_runner=model_runner,
+                tier_tokens_hint=512,
+            )
+        )
+        self.assertFalse(
+            ragged_layout_exceeds_captured_grid(
+                num_reqs=128,
+                verify_num_draft_tokens=8,
+                model_runner=model_runner,
+            )
+        )
+        self.assertTrue(
+            ragged_layout_exceeds_captured_grid(
+                num_reqs=128,
+                verify_num_draft_tokens=9,
+                model_runner=model_runner,
+            )
+        )
 
 
 if __name__ == "__main__":
