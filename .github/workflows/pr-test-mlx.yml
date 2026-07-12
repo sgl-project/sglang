@@ -74,11 +74,12 @@ jobs:
           # Model-free MLX unit tests via pytest, like MUSA's unit-test jobs
           # (its model and server suites use run_suite.py). None load a model:
           # signature contracts, mocked Metal capture, dummy ServerArgs patching,
-          # and quant-config dicts.
+          # stub concurrency-cap resolution, and quant-config dicts.
           uv run python -m pytest -v \
             test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
             test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
             test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
+            test/registered/unit/hardware_backend/mlx/test_max_running_requests.py \
             "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
 
   pr-test-mlx-finish:
