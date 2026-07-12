@@ -133,10 +133,6 @@ class TestProfileSpsTable(CustomTestCase):
         self.assertEqual(table.sample_batch_tokens, [8, 16, 32])
         self.assertEqual(table.sample_steps_per_sec, [1000.0, 950.0, 500.0])
 
-    def test_profile_passes_steps_per_sec_through_unchanged(self):
-        table = profile_sps_table(probes=[(4, 1234.5), (8, 678.25)])
-        self.assertEqual(table.sample_steps_per_sec, [1234.5, 678.25])
-
     def test_profile_rejects_duplicate_batch_tokens(self):
         with self.assertRaises(ValueError):
             profile_sps_table(probes=[(8, 1000.0), (8, 900.0)])

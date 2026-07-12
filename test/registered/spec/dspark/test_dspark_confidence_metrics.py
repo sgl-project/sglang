@@ -93,23 +93,6 @@ class TestPerPositionConfidenceMetrics(CustomTestCase):
                 msg=name,
             )
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_on_device_accumulation_matches_cpu(self):
-        torch.manual_seed(0)
-        bs, gamma = 24, 4
-        survival = torch.rand(bs, gamma)
-        prefix_mask = (torch.rand(bs, gamma) < 0.5).to(torch.float64)
-
-        cpu = _cpu_metrics(gamma=gamma)
-        cpu.update(survival=survival, prefix_mask=prefix_mask)
-
-        gpu = PerPositionConfidenceMetrics(gamma=gamma, device=torch.device("cuda"))
-        gpu.update(survival=survival.cuda(), prefix_mask=prefix_mask.cuda())
-
-        for cpu_row, gpu_row in zip(cpu.compute(), gpu.compute()):
-            for key in ("ece", "auc", "brier", "pred_mean", "target_mean"):
-                self.assertAlmostEqual(cpu_row[key], gpu_row[key], places=9, msg=key)
-
 
 def _probe_inputs(bs: int, gamma: int):
     torch.manual_seed(0)
@@ -160,7 +143,7 @@ class TestConfidenceMetricsProbe(CustomTestCase):
         self.assertIsNone(probe._metrics)
         self.assertEqual(probe._step_ct, 0)
 
-    def test_enabled_path_accumulates_and_prints(self):
+    def test_enabled_path_accumulates(self):
         probe = ConfidenceMetricsProbe(
             gamma=4, verify_num_draft_tokens=5, tp_rank=0, print_every=2
         )

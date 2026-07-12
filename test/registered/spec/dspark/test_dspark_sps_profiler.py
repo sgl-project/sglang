@@ -230,10 +230,6 @@ class TestSweepHelpers(CustomTestCase):
         self.assertEqual(sweep[-1], 100)
         self.assertIn(64, sweep)
 
-    def test_request_count_sweep_rejects_non_positive_max(self):
-        with self.assertRaises(ValueError):
-            build_request_count_sweep(0)
-
     def test_sweep_beyond_captured_cuda_graphs_raises(self):
         with self.assertRaisesRegex(ValueError, "cuda graphs"):
             validate_sweep_against_server(

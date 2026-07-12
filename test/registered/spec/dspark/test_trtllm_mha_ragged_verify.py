@@ -4,12 +4,12 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import (
-    TRTLLMHAAttnBackend,
-    _resolve_ragged_verify_layout,
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    resolve_ragged_verify_layout,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,25 +23,38 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
     def test_base_backend_defaults_false(self):
         self.assertFalse(AttentionBackend.supports_ragged_verify_graph)
 
-    def test_trtllm_mha_supports_ragged_verify_graph(self):
-        self.assertTrue(TRTLLMHAAttnBackend.supports_ragged_verify_graph)
-
-    def test_dsv4_supports_ragged_verify_graph(self):
+    def test_ragged_implementing_backends_declare_the_flag(self):
+        """Every backend with a ragged-verify metadata path must opt in; a
+        dropped flag silently disables ragged graphs for that backend (the
+        runner falls back to eager with no other test going red)."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
 
-        self.assertTrue(DeepseekV4AttnBackend.supports_ragged_verify_graph)
+        for backend in (
+            TRTLLMHAAttnBackend,
+            DeepseekV4AttnBackend,
+            FlashAttentionBackend,
+        ):
+            with self.subTest(backend=backend.__name__):
+                self.assertTrue(backend.supports_ragged_verify_graph)
 
 
 class TestResolveRaggedVerifyLayout(CustomTestCase):
     def test_none_without_spec_info(self):
         fb = types.SimpleNamespace(spec_info=None)
-        self.assertIsNone(_resolve_ragged_verify_layout(fb))
+        self.assertIsNone(resolve_ragged_verify_layout(fb))
 
-    def test_none_without_layout_attr(self):
-        fb = types.SimpleNamespace(spec_info=types.SimpleNamespace())
-        self.assertIsNone(_resolve_ragged_verify_layout(fb))
+    def test_none_when_layout_field_unset(self):
+        # ragged_verify_layout is declared on the SpecInput base, so every
+        # spec_info carries it; unset (None) must resolve to no layout.
+        fb = types.SimpleNamespace(
+            spec_info=types.SimpleNamespace(ragged_verify_layout=None)
+        )
+        self.assertIsNone(resolve_ragged_verify_layout(fb))
 
     def test_returns_attached_layout(self):
         layout = RaggedVerifyLayout.uniform(
@@ -50,7 +63,7 @@ class TestResolveRaggedVerifyLayout(CustomTestCase):
         fb = types.SimpleNamespace(
             spec_info=types.SimpleNamespace(ragged_verify_layout=layout)
         )
-        self.assertIs(_resolve_ragged_verify_layout(fb), layout)
+        self.assertIs(resolve_ragged_verify_layout(fb), layout)
 
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):

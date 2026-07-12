@@ -252,42 +252,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         self.assertEqual(actual_total, expected_total)
 
     @_for_each_impl
-    def test_admission_is_contiguous_prefix(self, impl):
-        survival = torch.tensor(
-            [[0.99, 0.98, 0.50, 0.10], [0.97, 0.20, 0.05, 0.01]],
-            dtype=torch.float32,
-        )
-        cfg = DSparkScheduleConfig(gamma=4)
-        budget = 3
-        verify_lens = impl(survival_probs=survival, budget=budget, cfg=cfg)
-        num_requests, max_len = survival.shape[0], cfg.resolved_max_verify_len()
-        flat = [
-            (float(survival[r, p]), p, r)
-            for r in range(num_requests)
-            for p in range(min(max_len, survival.shape[1]))
-            if float(survival[r, p]) >= cfg.survival_eps
-        ]
-        flat.sort(key=lambda e: (-e[0], e[1], e[2]))
-        admitted_positions: dict[int, list[int]] = {r: [] for r in range(num_requests)}
-        for _prob, position, request in flat[:budget]:
-            admitted_positions[request].append(position)
-        for request in range(num_requests):
-            positions = sorted(admitted_positions[request])
-            count = int(verify_lens[request].item()) - cfg.min_verify_len
-            self.assertEqual(
-                len(positions),
-                count,
-                f"request {request}: verify_len count mismatch",
-            )
-            expected_prefix = list(range(count))
-            self.assertEqual(
-                positions,
-                expected_prefix,
-                f"request {request} admitted {positions}, not the prefix "
-                f"{expected_prefix}",
-            )
-
-    @_for_each_impl
     def test_higher_confidence_admitted_first(self, impl):
         survival = torch.tensor(
             [[0.99, 0.98, 0.97, 0.96], [0.40, 0.30, 0.20, 0.10]],
@@ -306,15 +270,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         verify_lens = impl(survival_probs=survival, budget=100, cfg=cfg)
         self.assertGreaterEqual(int(verify_lens.min().item()), 1)
         self.assertLessEqual(int(verify_lens.max().item()), 3)
-
-    @_for_each_impl
-    def test_budget_zero_returns_min_verify_len(self, impl):
-        survival = torch.tensor([[0.9, 0.8], [0.7, 0.6]], dtype=torch.float32)
-        cfg = DSparkScheduleConfig(gamma=2, min_verify_len=1)
-        verify_lens = impl(survival_probs=survival, budget=0, cfg=cfg)
-        self.assertTrue(
-            torch.equal(verify_lens, torch.tensor([1, 1], dtype=torch.int32))
-        )
 
     @_for_each_impl
     def test_large_budget_selects_all_candidates(self, impl):

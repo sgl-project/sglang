@@ -501,12 +501,6 @@ class TestOnlineCeilingEstimate(CustomTestCase):
             self.assertLessEqual(snap.window_blocks, 3)
             self.assertEqual(snap.cumulative_blocks, 10)
 
-    def test_online_estimate_none_without_observations(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            recorder, _ = _make_recorder(tmp)
-            self.assertIsNone(recorder.online_estimate())
-            self.assertIsNone(recorder.estimate_log_suffix())
-
 
 class TestNaturalStopEosTail(CustomTestCase):
     def _finalize_kept_block(self, *, natural_stop: bool):

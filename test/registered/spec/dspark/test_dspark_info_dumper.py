@@ -387,9 +387,11 @@ class TestReqsAndGpuTiming(CustomTestCase):
                 torch.zeros(1024, device="cuda").sum()
             dumper.observe_decode_step(self._cuda_obs(forward_ct=forward_ct))
         record = next(r for r in dumper.dump()["records"] if r["forward_ct"] == 1)
-        self.assertGreaterEqual(record["step_gpu_ms"], 0.0)
-        self.assertGreaterEqual(record["draft_gpu_ms"], 0.0)
-        self.assertGreaterEqual(record["target_verify_gpu_ms"], 0.0)
+        # The segments launch real kernels, so resolved event pairs must
+        # measure strictly positive time; 0.0 would mean the events never ran.
+        self.assertGreater(record["step_gpu_ms"], 0.0)
+        self.assertGreater(record["draft_gpu_ms"], 0.0)
+        self.assertGreater(record["target_verify_gpu_ms"], 0.0)
 
 
 if __name__ == "__main__":
