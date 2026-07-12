@@ -24,12 +24,16 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
 
 
-if _is_hip:
+if _has_visible_hip_device:
     from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+else:
+    shuffle_weight = None
+    ON_GFX950 = False
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +353,12 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         tqdm_reset_no_print(self.online_quant_progress_bar, total=total)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if shuffle_weight is None:
+            raise NotImplementedError(
+                "Quark INT4-FP8 MoE weight shuffling requires AITer with a "
+                "visible AMD ROCm device."
+            )
+
         if _is_hip and not ON_GFX950:
             # CDNA3 does not support OCP FP8E4M3FN, but uses FP8E4M3FNUZ.
             # CDNA4 supports OCP FP8E4M3FN.

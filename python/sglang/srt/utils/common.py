@@ -1001,39 +1001,52 @@ def set_cuda_arch():
         )
 
 
+_HIP_GCN_ARCH_NAME_CACHE = None
+
+
+def _clear_hip_gcn_arch_name_cache():
+    global _HIP_GCN_ARCH_NAME_CACHE
+    _HIP_GCN_ARCH_NAME_CACHE = None
+
+
+def _hip_gcn_arch_name_or_none():
+    global _HIP_GCN_ARCH_NAME_CACHE
+    if _HIP_GCN_ARCH_NAME_CACHE is not None:
+        return _HIP_GCN_ARCH_NAME_CACHE
+    if not torch.version.hip or not torch.cuda.is_available():
+        return None
+    try:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    except RuntimeError as err:
+        if "No HIP GPUs are available" in str(err):
+            return None
+        raise
+    _HIP_GCN_ARCH_NAME_CACHE = gcn_arch
+    return gcn_arch
+
+
 def mxfp_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
+    gcn_arch = _hip_gcn_arch_name_or_none()
+    return gcn_arch is not None and any(gfx in gcn_arch for gfx in ["gfx95"])
 
 
-@lru_cache(maxsize=1)
 def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
+    gcn_arch = _hip_gcn_arch_name_or_none()
+    return gcn_arch is not None and any(gfx in gcn_arch for gfx in ["gfx95"])
 
 
-@lru_cache(maxsize=1)
 def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
-        return False
+    gcn_arch = _hip_gcn_arch_name_or_none()
+    return gcn_arch is not None and any(gfx in gcn_arch for gfx in ["gfx942"])
 
 
 def get_hip_version():

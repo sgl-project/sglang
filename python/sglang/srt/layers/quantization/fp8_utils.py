@@ -190,7 +190,15 @@ def use_rowwise_torch_scaled_mm():
         # torch._scaled_mm rowwise feature.
         # The condition is determined once as the operations
         # are time consuming.
-        return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+        device_capability = get_device_capability()
+        if (
+            device_capability is None
+            or len(device_capability) < 2
+            or device_capability[0] is None
+            or device_capability[1] is None
+        ):
+            return False
+        return device_capability >= (9, 4) and torch_release >= (2, 7)
     return False
 
 
