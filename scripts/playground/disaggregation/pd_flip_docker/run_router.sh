@@ -21,6 +21,7 @@ if [[ "${router_admin_key}" != "${ADMIN_API_KEY}" ]]; then
   echo "PD_FLIP_ROUTER_ADMIN_API_KEY must match ADMIN_API_KEY because the controller uses one credential" >&2
   exit 2
 fi
+export PD_FLIP_ROUTER_ADMIN_API_KEY="${router_admin_key}"
 
 mounts=(-v "${SGLANG_REPO}:/sgl-workspace/sglang")
 if [[ -d "${MODEL_PATH}" ]]; then
@@ -31,7 +32,6 @@ args=(
   --host 0.0.0.0
   --port "${ROUTER_PORT}"
   --model-id "${MODEL_ID}"
-  --pd-flip-router-admin-api-key "${router_admin_key}"
 )
 router_tokenizer_path="${TOKENIZER_PATH:-}"
 if [[ -d "${router_tokenizer_path}" && -f "${router_tokenizer_path}/tokenizer.json" ]]; then
@@ -56,6 +56,7 @@ extra_docker_args=(${EXTRA_DOCKER_ARGS:-})
 exec docker run --rm \
   -i \
   --network host \
+  -e PD_FLIP_ROUTER_ADMIN_API_KEY \
   "${extra_docker_args[@]}" \
   "${mounts[@]}" \
   "${IMAGE}" \

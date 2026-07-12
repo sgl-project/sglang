@@ -35,10 +35,6 @@ pub struct Cli {
     /// Port to bind the HTTP server to.
     #[arg(long, default_value_t = 30000)]
     pub port: u16,
-    /// Bearer secret required by all /pd_flip/router/* endpoints.
-    #[arg(long)]
-    pub pd_flip_router_admin_api_key: Option<String>,
-
     // ---- model (exactly one) ----
     /// Model id this router serves (the OpenAI `model` field).
     #[arg(long)]
@@ -147,6 +143,8 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+        let pd_flip_router_admin_api_key =
+            load_pd_flip_router_admin_key(|name| std::env::var(name))?;
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -256,7 +254,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.host,
                 port: self.port,
-                pd_flip_router_admin_api_key: self.pd_flip_router_admin_api_key,
+                pd_flip_router_admin_api_key,
             },
             observability: ObservabilityConfig {
                 log_level: self.log_level,
@@ -342,6 +340,29 @@ impl Cli {
     }
 }
 
+fn load_pd_flip_router_admin_key(
+    read_env: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<crate::config::SecretString>> {
+    match read_env("PD_FLIP_ROUTER_ADMIN_API_KEY") {
+        Ok(value) => {
+            if value.is_empty()
+                || value.starts_with("replace-with-")
+                || matches!(value.as_str(), "changeme" | "CHANGE_ME")
+                || value.bytes().any(|byte| byte.is_ascii_whitespace())
+            {
+                return Err(anyhow!(
+                    "PD_FLIP_ROUTER_ADMIN_API_KEY must be a non-placeholder Bearer token without whitespace"
+                ));
+            }
+            Ok(Some(crate::config::SecretString::new(value)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(anyhow!("PD_FLIP_ROUTER_ADMIN_API_KEY is not valid UTF-8"))
+        }
+    }
+}
+
 /// Join space/repeated `key=value` selector terms into the single
 /// comma-joined string the k8s backend's `labels_match_selector`
 /// expects. `None` for an empty term list so [`resolve_mode`] can apply
@@ -399,20 +420,39 @@ mod tests {
     }
 
     #[test]
-    fn pd_flip_router_admin_key_is_preserved() {
-        let c = into_config(&[
+    fn pd_flip_router_admin_key_is_env_only_and_redacted() {
+        let secret = "never-print-router-secret";
+        let argv = with_model(&["--worker-urls", "http://x:30000"]);
+        let cli = Cli::try_parse_from(
+            std::iter::once("sgl-router").chain(argv.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert!(!format!("{cli:?}").contains(secret));
+        let key = load_pd_flip_router_admin_key(|name| {
+            assert_eq!(name, "PD_FLIP_ROUTER_ADMIN_API_KEY");
+            Ok(secret.to_string())
+        })
+        .unwrap();
+        let mut config = cli.into_config().unwrap();
+        config.server.pd_flip_router_admin_api_key = key;
+        assert!(!format!("{config:?}").contains(secret));
+        assert_eq!(
+            config
+                .server
+                .pd_flip_router_admin_api_key
+                .as_ref()
+                .map(|key| key.expose()),
+            Some(secret)
+        );
+        let rejected = into_config(&[
             "--model-id",
             "qwen3",
             "--worker-urls",
             "http://x:30000",
             "--pd-flip-router-admin-api-key",
-            "test-secret",
-        ])
-        .unwrap();
-        assert_eq!(
-            c.server.pd_flip_router_admin_api_key.as_deref(),
-            Some("test-secret")
-        );
+            secret,
+        ]);
+        assert!(rejected.is_err(), "secret-bearing CLI flag must not exist");
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

@@ -1,5 +1,24 @@
 use std::num::NonZeroU32;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
 /// [`Config::validate`]. The router serves exactly one model.
@@ -103,7 +122,7 @@ pub struct ServerConfig {
     pub port: u16,
     /// Exact Bearer secret for the PD runtime control plane. `None` remains a
     /// valid process configuration, but the protected endpoints fail closed.
-    pub pd_flip_router_admin_api_key: Option<String>,
+    pub pd_flip_router_admin_api_key: Option<SecretString>,
 }
 
 #[derive(Debug, Clone)]

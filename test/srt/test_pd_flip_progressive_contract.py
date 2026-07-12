@@ -233,7 +233,8 @@ def test_valid_admin_key_is_forwarded_to_worker_controller_and_router(tmp_path):
         assert result.returncode == 0, result.stderr
     assert "--admin-api-key secret" in worker.stdout
     assert "ARG=--api-key\nARG=secret" in controller.stdout
-    assert "ARG=--pd-flip-router-admin-api-key\nARG=secret" in router.stdout
+    assert "secret" not in router.stdout
+    assert "ARG=-e\nARG=PD_FLIP_ROUTER_ADMIN_API_KEY" in router.stdout
 
 
 def test_router_rejects_a_key_the_controller_cannot_use(tmp_path):
@@ -279,6 +280,15 @@ def test_router_auth_contract_is_fail_closed_in_rust_source():
         "correct_bearer_authorizes_controls",
     ):
         assert case in source
+    assert "duplicate_authorization_headers_are_rejected" in source
+    assert "bearer_scheme_is_ascii_case_insensitive" in source
+    assert "malformed_or_whitespace_bearers_are_rejected" in source
+    types_source = read(ROOT / "experimental/sgl-router/src/config/types.rs")
+    cli_source = read(ROOT / "experimental/sgl-router/src/config/cli.rs")
+    assert "SecretString" in types_source and "[REDACTED]" in types_source
+    assert "load_pd_flip_router_admin_key" in cli_source
+    assert '"PD_FLIP_ROUTER_ADMIN_API_KEY"' in cli_source
+    assert "pub pd_flip_router_admin_api_key" not in cli_source
 
 
 def test_windows_helper_uses_1p3d_secrets_and_authenticated_status():

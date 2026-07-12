@@ -73,18 +73,33 @@ fn require_admin(headers: &HeaderMap, ctx: &AppContext) -> Result<(), ApiError> 
         .config
         .server
         .pd_flip_router_admin_api_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
+        .as_ref()
         .ok_or(ApiError::Unauthorized)?;
-    let expected = format!("Bearer {key}");
-    let actual = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(ApiError::Unauthorized)?;
-    if actual != expected {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let actual = values.next().ok_or(ApiError::Unauthorized)?;
+    if values.next().is_some() {
+        return Err(ApiError::Unauthorized);
+    }
+    let actual = actual.as_bytes();
+    if actual.len() < 8
+        || !actual[..6].eq_ignore_ascii_case(b"Bearer")
+        || actual[6] != b' '
+        || !constant_time_eq(&actual[7..], key.expose().as_bytes())
+    {
         return Err(ApiError::Unauthorized);
     }
     Ok(())
+}
+
+fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
+    let max_len = actual.len().max(expected.len());
+    let mut difference = actual.len() ^ expected.len();
+    for index in 0..max_len {
+        let left = actual.get(index).copied().unwrap_or(0);
+        let right = expected.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 pub async fn list_workers(
@@ -152,7 +167,8 @@ mod tests {
 
     fn app_with_worker(admin_key: Option<&str>) -> (axum::Router, Arc<AppContext>) {
         let mut ctx = AppContext::stub();
-        ctx.config.server.pd_flip_router_admin_api_key = admin_key.map(str::to_owned);
+        ctx.config.server.pd_flip_router_admin_api_key =
+            admin_key.map(crate::config::SecretString::new);
         ctx.registry
             .add(WorkerSpec {
                 id: WorkerId("w1".into()),
@@ -279,5 +295,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_ascii_case_insensitive() {
+        let (app, _) = app_with_worker(Some("test-secret"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pd_flip/router/workers")
+                    .header("authorization", "bEaReR test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn duplicate_authorization_headers_are_rejected() {
+        let (app, _) = app_with_worker(Some("test-secret"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pd_flip/router/workers")
+                    .header("authorization", "Bearer test-secret")
+                    .header("authorization", "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn malformed_or_whitespace_bearers_are_rejected() {
+        for value in [
+            "Basic test-secret",
+            "Bearer  test-secret",
+            "Bearer\ttest-secret",
+            "Bearer test-secret extra",
+        ] {
+            let (app, _) = app_with_worker(Some("test-secret"));
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/pd_flip/router/workers")
+                        .header("authorization", value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "value={value:?}");
+        }
     }
 }
