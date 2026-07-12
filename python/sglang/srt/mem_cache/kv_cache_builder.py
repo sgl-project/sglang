@@ -174,14 +174,25 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode radix cache is unsupported with hybrid SSM/Mamba models, and with
+    # hybrid SWA models whose allocator cannot preallocate the sliding-window
+    # tail. When the allocator exposes ``alloc_extend_swa_tail`` (page_size > 1),
+    # disaggregation/decode.py drives a full SWA-tail-prealloc decode-radix path
+    # (DecodeTransferQueue._uses_swa_tail_prealloc): decode receives the full KV
+    # for full-attention layers and only the sliding-window tail for SWA layers,
+    # which is compatible with the prefix-match-and-lock allocation path. So
+    # decode radix IS supported on those SWA pools (e.g. SWAKVPool /
+    # DeepSeekV4TokenToKVPool); only reject SWA models whose allocator lacks that
+    # capability.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
     ):
-        if is_hybrid_swa:
+        swa_tail_prealloc_supported = (
+            hasattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+            and getattr(token_to_kv_pool_allocator, "page_size", 1) > 1
+        )
+        if is_hybrid_swa and not swa_tail_prealloc_supported:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
                 "with sliding window attention (SWA) models"

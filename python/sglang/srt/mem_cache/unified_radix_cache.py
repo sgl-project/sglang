@@ -847,10 +847,46 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
+        # Match prefix.
+        #
+        # match_prefix() gates the returned device indices on ALL components. For
+        # a hybrid-SWA tree the SWA validator stops at the first out-of-window
+        # tombstone, so device_indices collapses to length 0 for a long prefix
+        # even though the FULL-attention KV for the whole prefix is still
+        # device-resident. That makes the len(new_indices) assert below fatal on
+        # decode radix (new_prefix_len is the full-attention prefix length). Walk
+        # the just-inserted path read-only to collect the ungated FULL-component
+        # indices and re-point the request onto them, protecting the deepest full
+        # node from eviction. SWA reuse stays correctly window-gated elsewhere.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        full_values = []
+        full_last_node = self.root_node
+        remaining_key = radix_key
+        walk_node = self.root_node
+        if len(remaining_key) > 0:
+            child_key = remaining_key.child_key(self.page_size)
+            while len(remaining_key) > 0 and child_key in walk_node.children:
+                child = walk_node.children[child_key]
+                full_data = child.component_data[BASE_COMPONENT_TYPE]
+                if full_data.value is None:
+                    break
+                matched = child.key.match(remaining_key, page_size=self.page_size)
+                value = full_data.value
+                if matched < len(child.key):
+                    value = value[:matched]
+                full_values.append(value)
+                full_last_node = child
+                walk_node = child
+                remaining_key = remaining_key[matched:]
+                if len(remaining_key) == 0:
+                    break
+                child_key = remaining_key.child_key(self.page_size)
+        if full_values:
+            new_indices = torch.cat(full_values)
+            new_last_node = full_last_node
+        else:
+            new_indices = match_result.device_indices
+            new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
