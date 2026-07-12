@@ -20,7 +20,12 @@ base_args=(
   --slo-threshold "${PD_FLIP_SLO_THRESHOLD:-0.9}"
   --min-prefill-slo-samples "${PD_FLIP_MIN_PREFILL_SLO_SAMPLES:-20}"
   --min-decode-slo-samples "${PD_FLIP_MIN_DECODE_SLO_SAMPLES:-20}"
+  --session-journal-path "${PD_FLIP_ARTIFACT_DIR:-/sgl-workspace/sglang/pd-flip-artifacts/four-node-progressive}/pd_flip_session.json"
 )
+
+if [[ -n "${ADMIN_API_KEY:-}" ]]; then
+  base_args+=(--api-key "${ADMIN_API_KEY}")
+fi
 
 run_controller() {
   if [[ "${PD_FLIP_CONTROLLER_USE_DOCKER:-1}" == "1" ]]; then

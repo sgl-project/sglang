@@ -49,7 +49,12 @@ if [[ "${ENABLE_PD_FLIP_HICACHE_STITCH:-1}" == "1" ]]; then
     --disaggregation-decode-enable-radix-cache
     --enable-hierarchical-cache
     --hicache-storage-backend "${HICACHE_STORAGE_BACKEND:-mooncake}"
+    --hicache-write-policy "${HICACHE_WRITE_POLICY:-write_through}"
   )
+fi
+
+if [[ -n "${ADMIN_API_KEY:-}" ]]; then
+  server_args+=(--admin-api-key "${ADMIN_API_KEY}")
 fi
 
 if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
@@ -63,6 +68,16 @@ launch_cmd="cd /sgl-workspace/sglang && PYTHONPATH=python exec ${server_cmd}"
 
 # shellcheck disable=SC2206
 extra_docker_args=(${EXTRA_DOCKER_ARGS:-})
+for name in \
+  MOONCAKE_MASTER \
+  MOONCAKE_TE_META_DATA_SERVER \
+  MOONCAKE_GLOBAL_SEGMENT_SIZE \
+  MOONCAKE_PROTOCOL \
+  MOONCAKE_DEVICE; do
+  if [[ -n "${!name:-}" && "${EXTRA_DOCKER_ARGS:-}" != *"${name}"* ]]; then
+    extra_docker_args+=(-e "${name}=${!name}")
+  fi
+done
 if [[ "${EXTRA_DOCKER_ARGS:-}" != *"MOONCAKE_LOCAL_HOSTNAME"* ]]; then
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   if [[ -n "${host_ip}" ]]; then
