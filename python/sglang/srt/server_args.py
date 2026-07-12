@@ -7450,6 +7450,7 @@ class ServerArgs:
             return None
         if not host or not (0 < port < 65536):
             return None
+
         return {
             "publisher": cfg.publisher,
             "endpoint_host": host,
