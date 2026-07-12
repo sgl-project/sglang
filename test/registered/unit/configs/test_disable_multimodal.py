@@ -8,12 +8,16 @@ import torch.nn as nn
 
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.models import qwen3_vl, qwen3_vl_moe
+from sglang.srt.models import qwen3_omni_moe, qwen3_vl, qwen3_vl_moe
 from sglang.srt.models.interns1pro import InternS1ProForConditionalGeneration
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5MoeForConditionalGeneration,
+)
+from sglang.srt.models.qwen3_omni_moe import (
+    Qwen3OmniMoeForConditionalGeneration,
+    Qwen3OmniMoeThinkerForConditionalGeneration,
 )
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.server_args import ServerArgs
@@ -29,6 +33,10 @@ class _FakeLanguageModel(nn.Module):
         super().__init__()
 
 
+class _FakeOmniThinker(nn.Module):
+    pad_input_ids = None
+
+
 def _qwen35_config(*, enable_multimodal: bool):
     return SimpleNamespace(
         enable_multimodal=enable_multimodal,
@@ -40,7 +48,9 @@ def _qwen35_config(*, enable_multimodal: bool):
             rope_parameters={"mrope_section": [16, 24, 24]},
             rope_scaling={},
             tie_word_embeddings=False,
+            pad_token_id=None,
         ),
+        audio_config=SimpleNamespace(),
         vision_config=SimpleNamespace(deepstack_visual_indexes=[8, 16, 24]),
     )
 
@@ -194,6 +204,111 @@ class TestMultimodalConfiguration(CustomTestCase):
                 )
 
                 self.assertEqual(loaded, set())
+
+    def test_qwen3_omni_propagates_runtime_config_to_thinker(self):
+        for runtime_config, expected_enable_multimodal in (
+            ({}, True),
+            (
+                {
+                    "enable_multimodal": False,
+                    "encoder_only": False,
+                    "language_only": False,
+                },
+                False,
+            ),
+        ):
+            with self.subTest(runtime_config=runtime_config):
+                thinker_config = SimpleNamespace()
+                config = SimpleNamespace(
+                    thinker_config=thinker_config,
+                    **runtime_config,
+                )
+
+                with (
+                    patch.object(
+                        qwen3_omni_moe.PreTrainedModel,
+                        "__init__",
+                        lambda self, config: nn.Module.__init__(self),
+                    ),
+                    patch.object(
+                        qwen3_omni_moe,
+                        "Qwen3OmniMoeThinkerForConditionalGeneration",
+                        return_value=_FakeOmniThinker(),
+                    ),
+                ):
+                    model = Qwen3OmniMoeForConditionalGeneration(config)
+
+                self.assertIs(model.enable_multimodal, expected_enable_multimodal)
+                self.assertIs(
+                    thinker_config.enable_multimodal, expected_enable_multimodal
+                )
+                self.assertFalse(thinker_config.encoder_only)
+                self.assertFalse(thinker_config.language_only)
+
+    def test_qwen3_omni_enabled_towers_use_text_norm_eps(self):
+        config = _qwen35_config(enable_multimodal=True)
+        config.text_config.rms_norm_eps = 1e-5
+        pp_group = SimpleNamespace(is_last_rank=False, world_size=1)
+        server_args = SimpleNamespace(mm_enable_dp_encoder=False)
+
+        with (
+            patch.object(qwen3_vl, "get_pp_group", return_value=pp_group),
+            patch.object(qwen3_vl, "get_server_args", return_value=server_args),
+            patch.object(qwen3_omni_moe, "Qwen3MoeLLMModel", _FakeLanguageModel),
+            patch.object(qwen3_vl, "Qwen3VLMoeVisionModel"),
+            patch.object(qwen3_vl, "LogitsProcessor", return_value=nn.Identity()),
+            patch.object(qwen3_vl, "Pooler", return_value=nn.Identity()),
+            patch.object(qwen3_omni_moe, "Qwen3OmniMoeAudioEncoder") as audio_model,
+            patch.object(qwen3_omni_moe, "Qwen3OmniMoeVisionEncoder") as vision_model,
+        ):
+            model = Qwen3OmniMoeThinkerForConditionalGeneration(config)
+
+        audio_model.assert_called_once_with(config.audio_config, None)
+        vision_model.assert_called_once_with(
+            config.vision_config,
+            quant_config=None,
+            norm_eps=config.text_config.rms_norm_eps,
+            prefix="visual",
+        )
+        self.assertIs(model.visual, vision_model.return_value)
+
+    def test_qwen3_omni_skips_disabled_multimodal_towers_and_weights(self):
+        config = _qwen35_config(enable_multimodal=False)
+        pp_group = SimpleNamespace(is_last_rank=False, world_size=1)
+        server_args = SimpleNamespace(mm_enable_dp_encoder=False)
+
+        with (
+            patch.object(qwen3_vl, "get_pp_group", return_value=pp_group),
+            patch.object(qwen3_vl, "get_server_args", return_value=server_args),
+            patch.object(qwen3_omni_moe, "Qwen3MoeLLMModel", _FakeLanguageModel),
+            patch.object(qwen3_vl, "LogitsProcessor", return_value=nn.Identity()),
+            patch.object(qwen3_vl, "Pooler", return_value=nn.Identity()),
+            patch.object(qwen3_omni_moe, "Qwen3OmniMoeAudioEncoder") as audio_model,
+            patch.object(qwen3_omni_moe, "Qwen3OmniMoeVisionEncoder") as vision_model,
+        ):
+            model = Qwen3OmniMoeThinkerForConditionalGeneration(config)
+
+        audio_model.assert_not_called()
+        vision_model.assert_not_called()
+        self.assertIsNone(model.audio_tower)
+        self.assertIsNone(model.visual)
+
+        outer_model = Qwen3OmniMoeForConditionalGeneration.__new__(
+            Qwen3OmniMoeForConditionalGeneration
+        )
+        nn.Module.__init__(outer_model)
+        outer_model.config = SimpleNamespace(num_experts=1)
+        outer_model.enable_talker = False
+        outer_model.enable_multimodal = False
+        weights = [
+            ("thinker.visual.patch_embed.proj.weight", None),
+            ("thinker.audio_tower.conv1.weight", None),
+        ]
+
+        with patch.object(qwen3_omni_moe.logger, "warning") as warning:
+            outer_model.load_weights(weights)
+
+        warning.assert_not_called()
 
 
 class TestDisabledMultimodalRequests(CustomTestCase):
