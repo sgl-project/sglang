@@ -714,12 +714,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             # Query-side max length, sourced from the host-resident extend lengths
             # (sync-free); for plain prefill these equal the full seq lens.
-            # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
-            # Python's max() returns a 0-d tensor, but flashinfer expects an int.
-            max_q = max(forward_batch.extend_seq_lens_cpu)
-            metadata.max_seq_len_q = (
-                int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
-            )
+            metadata.max_seq_len_q = int(max(forward_batch.extend_seq_lens_cpu))
             if (
                 forward_batch.extend_prefix_lens_cpu is not None
                 and any(forward_batch.extend_prefix_lens_cpu)
