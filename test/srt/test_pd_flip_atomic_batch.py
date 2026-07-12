@@ -498,9 +498,19 @@ class TestDecodeLoopAST(unittest.TestCase):
             "event_loop_normal_disagg_decode",
             "event_loop_overlap_disagg_decode",
         ):
+            wrapper_impl_calls = [
+                node.func.attr
+                for node in ast.walk(methods[name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr.endswith("_impl")
+            ]
+            self.assertEqual(len(wrapper_impl_calls), 1, name)
+            impl_name = wrapper_impl_calls[0]
+            self.assertIn(impl_name, methods, name)
             calls = [
                 node
-                for node in ast.walk(methods[name])
+                for node in ast.walk(methods[impl_name])
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             ]
             quiesce_lines = [
@@ -517,7 +527,7 @@ class TestDecodeLoopAST(unittest.TestCase):
             self.assertLess(min(quiesce_lines), min(next_lines), name)
             paused_lines = [
                 node.lineno
-                for node in ast.walk(methods[name])
+                for node in ast.walk(methods[impl_name])
                 if isinstance(node, ast.Attribute) and node.attr == "_engine_paused"
             ]
             self.assertTrue(paused_lines)
