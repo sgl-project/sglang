@@ -618,9 +618,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         dst_indent = _def_indent(files[dst]["added"], name)
         # The diff's def-line indentation says which same-named def actually moved: a
         # column-0 cut is the module-level def even when a class method shares its name.
-        src_class = (
-            None if src_indent == 0 else _enclosing_class_of_def(src_tree, name)
-        )
+        src_class = None if src_indent == 0 else _enclosing_class_of_def(src_tree, name)
         into_class = (
             None if dst_indent == 0 else _enclosing_class_of_def(dst_tree, name)
         )
