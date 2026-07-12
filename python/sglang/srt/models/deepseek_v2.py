@@ -1978,9 +1978,6 @@ class DeepseekV2AttentionMLA(
     ):
         assert self.q_lora_rank is not None
         if self.use_min_latency_fused_a_gemm:
-            # A separately configured general bf16 GEMM cutedsl kernel can be a
-            # better fit for this shape than the specialized fused-A-GEMM path;
-            # defer to it when its own heuristic prefers it for this shape.
             cutedsl_bf16_preferred = False
             if (
                 not isinstance(hidden_states, tuple)
