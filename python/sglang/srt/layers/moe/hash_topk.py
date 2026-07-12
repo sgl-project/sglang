@@ -95,7 +95,7 @@ class HashTopK(nn.Module):
 
     def empty_topk_output(
         self, device: torch.device, *, layer_id: Optional[int] = None
-    ):
+    ) -> StandardTopKOutput:
         # self.topk includes any fused shared-expert columns.
         topk = self.topk
         if layer_id is not None:
