@@ -499,6 +499,8 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_topk_length_enabled: bool = (
             envs.SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH.get()
         )
+        # Persistent (grow-only) kernel-output buffers (out/max_logits/lse).
+        self._q8kv8_out_bufs: Optional[tuple] = None
 
         # Born-fp8 q handshake (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): when the
         # model's q-prep decides (via q8kv8_born_fp8_q_eligible) that this
@@ -2655,6 +2657,26 @@ class DeepseekSparseAttnBackend(
         if self._q8kv8_topk_length_enabled:
             topk_length = q8kv8_topk_length_from_indices(page_table_1)
 
+        # Persistent kernel-output buffers (out / max_logits / lse): the
+        # wrapper otherwise torch.empty's all three per layer-call.  The
+        # kernel fully overwrites the active [:s_q] rows and everything runs
+        # on one stream, so reuse is safe — same argument as _q8kv8_qpad_buf.
+        s_q, pad_heads = q_fp8.shape[0], q_fp8.shape[1]
+        out_bufs = self._q8kv8_out_bufs
+        if (
+            out_bufs is None
+            or out_bufs[0].shape[0] < s_q
+            or out_bufs[0].shape[1] != pad_heads
+        ):
+            out_bufs = (
+                torch.empty(
+                    s_q, pad_heads, v_head_dim, dtype=torch.bfloat16, device=dev
+                ),
+                torch.empty(s_q, pad_heads, dtype=torch.float32, device=dev),
+                torch.empty(s_q, pad_heads, dtype=torch.float32, device=dev),
+            )
+            self._q8kv8_out_bufs = out_bufs
+
         o, _, _ = sparse_mla_q8kv8_prefill_fwd(
             q=q_fp8,
             kv=kv_padded,
@@ -2665,6 +2687,9 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             attn_sink=None,
             topk_length=topk_length,
+            out=out_bufs[0][:s_q],
+            max_logits=out_bufs[1][:s_q],
+            lse=out_bufs[2][:s_q],
         )
 
         # Trim the output back to the original head count if we padded.
