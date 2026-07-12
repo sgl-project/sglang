@@ -947,6 +947,10 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
+        # GLM-Image is the only model here whose output head predicts vision tokens.
+        # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
+        if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
+            self.vocab_size = self.hf_text_config.vision_vocab_size
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -1654,6 +1658,7 @@ multimodal_model_archs = [
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
+    "GlmImageForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -1724,6 +1729,8 @@ piecewise_cuda_graph_disabled_model_archs = [
 # cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
 multimodal_piecewise_cuda_graph_supported_model_archs = [
     "Cohere2VisionForConditionalGeneration",
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
 ]
 
 # Multimodal archs whose LM prefill is validated under breakable CUDA graph;
@@ -1789,14 +1796,6 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
         arch in piecewise_cuda_graph_disabled_model_archs
         for arch in model_architectures
     )
-
-
-# Multimodal archs whose LM-decoder prefill is validated under piecewise CUDA
-# graph (capture wraps only the decoder; the image encoder runs eager).
-multimodal_piecewise_cuda_graph_supported_archs = [
-    "MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration",
-]
 
 
 def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):

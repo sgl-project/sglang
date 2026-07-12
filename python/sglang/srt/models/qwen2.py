@@ -50,8 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -97,7 +96,7 @@ class Qwen2MLP(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
@@ -292,7 +291,7 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
+                    if get_server_args().rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -328,7 +327,7 @@ class Qwen2Model(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target is not None
+                if get_server_args().rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(

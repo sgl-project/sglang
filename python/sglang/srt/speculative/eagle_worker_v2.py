@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -22,7 +23,6 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -90,7 +91,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens_func
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -175,7 +175,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
+            ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             ctx = empty_context()
         with (
@@ -471,6 +471,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(DeepseekSparseAttnBackend)
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4AttnBackend,
+            )
+
+            graph_supported_backend_types.append(DeepseekV4AttnBackend)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,

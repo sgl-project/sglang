@@ -33,7 +33,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -126,10 +125,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_parallel().tp_size
-        if (
-            is_npu()
-            and get_global_server_args().speculative_draft_model_quantization is None
-        ):
+        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config
 
