@@ -30,9 +30,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
-    dsa_layer_skips_topk,
     get_num_indexer_layers,
-    is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -134,6 +132,9 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
     resolve_sliding_window_size,
+)
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    resolve_pp_proxy_topk_size,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
@@ -2017,17 +2018,3 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
-
-
-def resolve_pp_proxy_topk_size(
-    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
-) -> Optional[int]:
-    hf_config = model_config.hf_text_config
-    if (
-        pp_size <= 1
-        or pp_rank == 0
-        or not is_deepseek_dsa(hf_config)
-        or not dsa_layer_skips_topk(hf_config, start_layer)
-    ):
-        return None
-    return getattr(hf_config, "index_topk", None)
