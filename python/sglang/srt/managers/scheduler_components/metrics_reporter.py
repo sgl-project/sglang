@@ -558,6 +558,8 @@ class SchedulerMetricsReporter:
             msg += (
                 f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
             )
+            num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
+            msg += f"#optimistic-req: {num_optimistic}, "
 
         if (
             self.scheduler.server_args.language_only

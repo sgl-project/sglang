@@ -129,7 +129,11 @@ class TestOptimisticPrefill(
 
         self.assertGreater(j["meta_info"]["prompt_tokens"], 512)
         assert len(output_logprobs) == completion_tokens
-        assert len(input_logprobs) > 0
+        # Input logprobs must be complete: retried or pending chunks must not
+        # drop their logprobs.
+        self.assertGreaterEqual(
+            len(input_logprobs), j["meta_info"]["prompt_tokens"] - 1
+        )
 
 
 class TestOptimisticPrefillFailure(PDDisaggregationServerBase):

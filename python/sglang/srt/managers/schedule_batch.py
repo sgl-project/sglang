@@ -1483,6 +1483,8 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
+        self.temp_input_token_ids_logprobs_val = None
+        self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None

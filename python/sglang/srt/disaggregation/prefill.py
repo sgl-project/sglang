@@ -467,6 +467,12 @@ class SchedulerDisaggregationPrefillMixin:
                 req for req in self.waiting_queue if req not in failed
             ]
 
+    def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
+        return any(
+            not req.pending_bootstrap and not is_aborted(req)
+            for req in self.waiting_queue
+        )
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
@@ -479,9 +485,9 @@ class SchedulerDisaggregationPrefillMixin:
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
-
         self.resolve_waiting_queue_bootstrap()
+
+        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -707,10 +713,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
 
-                # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
-                if req.pending_bootstrap:
-                    advance_logprob_pt(i, req)
+                # Still chunking iff its next chunk was launched: either it is
+                # still self.chunked_req, or its final chunk (extend_range
+                # reaching the end of the input) is in flight. A yielded req
+                # is neither, so do its deferred release here.
+                still_chunking = self.chunked_req is req or (
+                    req.extend_range is not None
+                    and req.extend_range.end >= len(req.origin_input_ids)
+                )
+                if req.pending_bootstrap and not still_chunking:
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
@@ -736,7 +749,9 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
-                if self.enable_overlap:
+                # In non-overlap-mode, KV is sent in process_prefill_chunk
+                # Only send when req's sender is initialized
+                if self.enable_overlap and not req.pending_bootstrap:
                     assert (
                         req.metadata_buffer_index >= 0
                     ), f"Req {req.rid} does not have metadata buffer allocated"
@@ -950,9 +965,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
-        return self.handle_pending_bootstrap(
-            req, polls[0], defer_release=self.enable_overlap
-        )
+        return self.handle_pending_bootstrap(req, polls[0], defer_release=True)
 
     def process_prefill_chunk(
         self: Scheduler,
@@ -960,20 +973,28 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
     ) -> None:
         chunked_req_to_exclude = set()
-        if self.chunked_req:
-            chunked_req_to_exclude.add(self.chunked_req)
-            maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
+        if (req := self.chunked_req) is not None:
+            chunked_req_to_exclude.add(req)
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
-            if not self.check_bootstrap(self.chunked_req):
-                self.chunked_req = None  # stop the current chunked prefill
+            if not self.check_bootstrap(req):
+                if is_aborted(req):
+                    # bootstrap failed
+                    self.chunked_req = None
+                elif self.has_bootstrapped_waiting_req():
+                    # optimistic request yields to waiting requests
+                    self.chunked_req = None
+                    if not self.enable_overlap:
+                        self.optimistic_release_and_requeue(req)
+                # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                self.chunked_req.tmp_end_idx = min(
-                    self.chunked_req.extend_range.end,
-                    len(self.chunked_req.origin_input_ids),
+                req.tmp_end_idx = min(
+                    req.extend_range.end,
+                    len(req.origin_input_ids),
                 )
             else:
-                self.send_kv_chunk(self.chunked_req)
+                self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
                 running_batch.batch_is_full = False
