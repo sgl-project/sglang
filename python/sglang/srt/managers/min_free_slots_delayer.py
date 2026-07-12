@@ -1,4 +1,7 @@
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 
 def resolve_min_free_slots(
@@ -34,8 +37,20 @@ class MinFreeSlotsDelayer:
     with free slots does not wait for a congested peer.
     """
 
-    def __init__(self, min_free_slots: int):
+    def __init__(
+        self,
+        min_free_slots: int,
+        metrics_collector: Optional["SchedulerMetricsCollector"] = None,
+    ):
         self._min_free_slots = min_free_slots
+        self._metrics_collector = metrics_collector
 
     def should_delay(self, *, running_bs: int, num_allocatable_reqs: int) -> bool:
-        return running_bs > 0 and num_allocatable_reqs < self._min_free_slots
+        delayed = running_bs > 0 and num_allocatable_reqs < self._min_free_slots
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_min_free_slots_check(
+                running_bs=running_bs,
+                num_allocatable_reqs=num_allocatable_reqs,
+                delayed=delayed,
+            )
+        return delayed

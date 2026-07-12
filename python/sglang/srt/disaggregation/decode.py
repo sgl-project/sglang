@@ -1853,6 +1853,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+
+                # JoyFuture: record post-transfer checksum verification
+                if getattr(self.scheduler, "kv_checksum_verifier", None) is not None:
+                    self.scheduler.kv_checksum_verifier.record_post(
+                        request_id=decode_req.req.rid,
+                        layer_idx=0,
+                        post_checksum=f"pages_received",
+                        num_tokens=decode_req.req.cached_tokens,
+                    )
+
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

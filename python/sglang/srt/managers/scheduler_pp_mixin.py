@@ -39,6 +39,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ class PPBatchMetadata:
 
 class SchedulerPPMixin:
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_pp", color="dark_blue")
     def event_loop_pp(self: Scheduler):
         """
         A scheduler loop for pipeline parallelism.
@@ -92,6 +94,7 @@ class SchedulerPPMixin:
         self.init_pp_loop_state()
         while True:
             server_is_idle = True
+            _loop_iter_start = time.monotonic()
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
@@ -173,7 +176,15 @@ class SchedulerPPMixin:
             if server_is_idle:
                 self.on_idle()
 
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if getattr(self, "metrics_collector", None) is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=not server_is_idle,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
+
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_pp_disagg_prefill", color="teal")
     def event_loop_pp_disagg_prefill(self: Scheduler):
         """
         This is the prefill server event loop for pipeline parallelism.
@@ -226,6 +237,7 @@ class SchedulerPPMixin:
 
         while True:
             server_is_idle = True
+            _loop_iter_start = time.monotonic()
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
@@ -357,7 +369,15 @@ class SchedulerPPMixin:
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
 
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if getattr(self, "metrics_collector", None) is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=not server_is_idle,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
+
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_pp_disagg_decode", color="magenta")
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.init_pp_loop_state()
 
@@ -377,6 +397,7 @@ class SchedulerPPMixin:
 
         while True:
             server_is_idle = True
+            _loop_iter_start = time.monotonic()
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
@@ -554,6 +575,13 @@ class SchedulerPPMixin:
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
+
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if getattr(self, "metrics_collector", None) is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=not server_is_idle,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
@@ -1255,6 +1283,7 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
+    @scheduler_nvtx_method("scheduler._pp_launch_batch", color="red")
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,

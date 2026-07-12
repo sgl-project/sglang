@@ -1137,6 +1137,15 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+
+        # JoyFuture: record pre-transfer checksum for integrity verification
+        if getattr(self, "kv_checksum_verifier", None) is not None:
+            self.kv_checksum_verifier.record_pre(
+                request_id=req.rid,
+                layer_idx=0,
+                checksum=f"pages={len(page_indices)}_last={int(last_chunk)}",
+            )
+
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
+import time
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
@@ -136,11 +137,13 @@ class FutureMap:
         spec_algo: SpeculativeAlgorithm,
         req_to_token_pool: ReqToTokenPool,
         needs_cpu_seq_lens: bool = True,
+        metrics_collector: Optional[Any] = None,
     ):
         # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
+        self._metrics_collector = metrics_collector
         # Computed by decide_needs_cpu_seq_lens(); see that helper for the
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
@@ -285,6 +288,7 @@ class FutureMap:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        _resolve_start = time.perf_counter()
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -338,11 +342,17 @@ class FutureMap:
             # After the D2H copy completed (synchronize above), so the pinned
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_future_map_resolve(
+                (time.perf_counter() - _resolve_start) * 1000.0
+            )
 
     def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_future_map_publish()
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
@@ -365,6 +375,8 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
+        if self._metrics_collector is not None:
+            self._metrics_collector.observe_future_map_stash()
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(

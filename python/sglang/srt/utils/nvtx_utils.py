@@ -23,12 +23,16 @@ A span has two independent emitters:
 
 Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
+
+Extended by JoyFuture: added markers for the overlap event loop, running batch
+update, and prefill batch selection so the full scheduler pipeline is visible
+in Nsight Systems.
 """
 
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -38,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
+_SCHEDULER_NVTX_SAMPLE_RATE = max(1, envs.SGLANG_SCHEDULER_NVTX_SAMPLE_RATE.get())
 
 _nvtx_module = None
 if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
@@ -62,6 +67,38 @@ _NVTX_COLOR_MAP = {
     "scheduler.get_next_batch_to_run": "green",
     "scheduler.run_batch": "red",
     "scheduler.process_batch_result": "cyan",
+    # === Extended markers (JoyFuture) ===
+    "scheduler.event_loop_normal": "dark_blue",
+    "scheduler.event_loop_overlap": "teal",
+    "scheduler.update_running_batch": "orange",
+    "scheduler.get_new_batch_prefill": "magenta",
+    # Pipeline-parallel event loops
+    "scheduler.event_loop_pp": "dark_blue",
+    "scheduler.event_loop_pp_disagg_prefill": "teal",
+    "scheduler.event_loop_pp_disagg_decode": "magenta",
+    # PP batch launch
+    "scheduler._pp_launch_batch": "red",
+    # run_batch sub-stages
+    "scheduler.run_batch.prebuilt": "cyan",
+    "scheduler.run_batch.overlap": "teal",
+    "scheduler.run_batch.pdmux": "orange",
+    "scheduler.run_batch.non_overlap_spec": "purple",
+    "scheduler.run_batch.plain": "gray",
+    # process_batch_result sub-stages
+    "scheduler.process_batch_result.decode": "red",
+    "scheduler.process_batch_result.dllm": "orange",
+    "scheduler.process_batch_result.disagg_prefill": "magenta",
+    "scheduler.process_batch_result.prefill": "purple",
+    "scheduler.process_batch_result.prebuilt": "cyan",
+    "scheduler.process_batch_result.idle": "gray",
+    # Request entry points
+    "scheduler.handle_generate_request": "blue",
+    "scheduler.handle_batch_generate_request": "light_blue",
+    # Timeout / abort / idle paths
+    "scheduler._abort_on_running_timeout": "red",
+    "scheduler._abort_on_queued_limit": "orange",
+    "scheduler.abort_request": "magenta",
+    "scheduler.on_idle": "gray",
 }
 
 _NULL_CONTEXT = nullcontext()
@@ -116,4 +153,48 @@ def profile_method(
 # Pre-bound per-subsystem helpers: torch spans always (under a profiler), nvtx
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
+scheduler_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+
+# Sampled variants: emit only every SGLANG_SCHEDULER_NVTX_SAMPLE_RATE-th call.
+# Per-call-site counters ensure independent sampling for each decorated function
+# or context manager block. Sample rate of 1 (default) means "always emit".
+_nvtx_sample_counters: Dict[int, int] = {}
+_nvtx_sample_rate = _SCHEDULER_NVTX_SAMPLE_RATE
+
+
+def _should_sample(key: int) -> bool:
+    if _nvtx_sample_rate <= 1:
+        return True
+    count = _nvtx_sample_counters.get(key, 0) + 1
+    _nvtx_sample_counters[key] = count
+    return count % _nvtx_sample_rate == 0
+
+
+def scheduler_nvtx_method_sampled(debug_name: str, *, color: Optional[str] = None):
+    """Decorator that emits NVTX only on sampled calls.
+
+    Controlled by ``SGLANG_SCHEDULER_NVTX_SAMPLE_RATE`` (default 1 = always).
+    Each decorated function is sampled independently.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if _should_sample(id(func)):
+                with profile_range(debug_name, color=color, nvtx_enabled=NVTX_SCHEDULER_ENABLED):
+                    return func(*args, **kwargs)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def scheduler_nvtx_range_sampled(debug_name: str, *, color: Optional[str] = None):
+    """Context manager that emits NVTX only on sampled calls.
+
+    Controlled by ``SGLANG_SCHEDULER_NVTX_SAMPLE_RATE`` (default 1 = always).
+    Each distinct debug_name is sampled independently.
+    """
+    key = hash(debug_name)
+    if _should_sample(key):
+        return profile_range(debug_name, color=color, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
+    return _NULL_CONTEXT

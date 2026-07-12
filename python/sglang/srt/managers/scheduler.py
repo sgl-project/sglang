@@ -269,7 +269,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method, scheduler_nvtx_range
+from sglang.srt.scheduler_env_vars import scheduler_envs
+from sglang.srt.request_latency_tracker import RequestLatencyTracker
+from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -395,6 +398,19 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
+
+        # Init JoyFuture scheduler observability (latency tracking + KV checksum)
+        self.latency_tracker = RequestLatencyTracker(
+            enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
+            on_phase_complete=(
+                lambda stage, elapsed: self.metrics_collector.observe_per_stage_req_latency(
+                    stage, elapsed
+                )
+                if self.metrics_collector is not None
+                else None
+            ),
+        )
+        self.kv_checksum_verifier = KVTransferChecksumVerifier() if scheduler_envs.SGLANG_ENABLE_KV_TRANSFER_CHECKSUM.get() else None
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -888,7 +904,12 @@ class Scheduler(
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
-                min_free_slots=min_free_slots
+                min_free_slots=min_free_slots,
+                metrics_collector=(
+                    self.metrics_collector
+                    if self.metrics_reporter.enable_metrics
+                    else None
+                ),
             )
         if not get_server_args().pp_max_micro_batch_size:
             get_server_args().override(
@@ -1256,6 +1277,7 @@ class Scheduler(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+            metrics_collector=self.metrics_collector,
         )
 
         if use_mlx():
@@ -1459,6 +1481,7 @@ class Scheduler(
             ]
         )
 
+    @scheduler_nvtx_method("scheduler._abort_on_running_timeout", color="red")
     def _abort_on_running_timeout(self, running_batch: ScheduleBatch):
         # NOTE: this should be called before a batch is launched.
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
@@ -1473,6 +1496,8 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
+                if self.metrics_collector is not None:
+                    self.metrics_collector.observe_scheduler_abort("running_timeout")
 
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
@@ -1532,11 +1557,14 @@ class Scheduler(
             self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_normal", color="dark_blue")
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             if self.gracefully_exit:
                 break
+
+            _loop_iter_start = time.monotonic()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1553,6 +1581,7 @@ class Scheduler(
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
+            dispatched = bool(batch)
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -1565,7 +1594,15 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=dispatched,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
+
     @DynamicGradMode()
+    @scheduler_nvtx_method("scheduler.event_loop_overlap", color="teal")
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
@@ -1580,6 +1617,8 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+
+            _loop_iter_start = time.monotonic()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1611,9 +1650,12 @@ class Scheduler(
                     try:
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Opportunistic KV pool flush failed (non-critical)"
+                        )
 
             # Launch the current batch
+            dispatched = bool(batch)
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
@@ -1632,6 +1674,13 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # JoyFuture: observe scheduler loop iteration for health dashboard
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_loop_iteration(
+                    dispatched_batch=dispatched,
+                    lag_ms=(time.monotonic() - _loop_iter_start) * 1000.0,
+                )
 
             # Update last_batch
             self.last_batch = batch
@@ -1679,6 +1728,12 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
+            # JoyFuture: start latency tracking for new requests
+            if self.latency_tracker.enabled and hasattr(recv_req, "rid"):
+                record = self.latency_tracker.start_request(recv_req)
+                if record:
+                    record.start_phase("prefill")
+
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -2045,6 +2100,7 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    @scheduler_nvtx_method("scheduler.handle_generate_request")
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2275,6 +2331,7 @@ class Scheduler(
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
 
+    @scheduler_nvtx_method("scheduler.handle_batch_generate_request")
     def handle_batch_generate_request(
         self,
         recv_req: BatchTokenizedGenerateReqInput,
@@ -2360,6 +2417,7 @@ class Scheduler(
             return False
         return True
 
+    @scheduler_nvtx_method("scheduler._abort_on_queued_limit", color="orange")
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -2407,6 +2465,8 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_scheduler_abort("queue_full")
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2438,6 +2498,8 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_abort("waiting_timeout")
 
     def handle_embedding_request(
         self,
@@ -2616,6 +2678,9 @@ class Scheduler(
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
+
+        # JoyFuture: time the batch selection decision
+        batch_selection_start = time.monotonic()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout(running_batch)
         if self.dllm_config is not None:
@@ -2741,6 +2806,12 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        # JoyFuture: record batch selection latency
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_per_stage_req_latency(
+                "scheduler.batch_selection", (time.monotonic() - batch_selection_start)
+            )
+
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2748,6 +2819,7 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    @scheduler_nvtx_method("scheduler.get_new_batch_prefill", color="magenta")
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3059,6 +3131,7 @@ class Scheduler(
                 new_lora_set
             )
 
+    @scheduler_nvtx_method("scheduler.update_running_batch", color="orange")
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -3229,7 +3302,8 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            with scheduler_nvtx_range("scheduler.run_batch.prebuilt", color="cyan"):
+                return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3243,124 +3317,128 @@ class Scheduler(
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
 
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    # resolve consumes SB staging (prefill_input_ids_cpu /
-                    # mix_running_indices). Run OUTSIDE isolation so the
-                    # snapshot captures the post-consume state — restoring
-                    # post-forward must not un-consume staging.
-                    resolve_forward_inputs(batch, self.future_map)
+                with scheduler_nvtx_range("scheduler.run_batch.overlap", color="teal"):
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        # resolve consumes SB staging (prefill_input_ids_cpu /
+                        # mix_running_indices). Run OUTSIDE isolation so the
+                        # snapshot captures the post-consume state — restoring
+                        # post-forward must not un-consume staging.
+                        resolve_forward_inputs(batch, self.future_map)
 
-                    with self._forward_isolation(batch, overlap=True):
-                        future_indices = batch.req_pool_indices
+                        with self._forward_isolation(batch, overlap=True):
+                            future_indices = batch.req_pool_indices
 
-                        # Spec_v2 fires on_publish mid-worker (between verify and
-                        # draft_extend) so schedule prep can overlap with draft_extend.
-                        # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = (
-                            {
-                                "on_publish": partial(
-                                    self.future_map.publish, future_indices
-                                )
-                            }
-                            if not batch.spec_algorithm.is_none()
-                            else {}
-                        )
-
-                        # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
-                        if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
-                        # Park any refs the worker wants kept alive 2 iters
-                        # (cross-stream tensor lifetime; pinned in the same
-                        # ring slot as the SB attr snapshot).
-                        if batch_result.extra_keep_alive_refs:
-                            self.batch_record_buf[self.batch_record_ct].extend(
-                                batch_result.extra_keep_alive_refs
+                            # Spec_v2 fires on_publish mid-worker (between verify and
+                            # draft_extend) so schedule prep can overlap with draft_extend.
+                            # Non-spec has no later work — scheduler publishes after return.
+                            fwd_kwargs = (
+                                {
+                                    "on_publish": partial(
+                                        self.future_map.publish, future_indices
+                                    )
+                                }
+                                if not batch.spec_algorithm.is_none()
+                                else {}
                             )
-                        if self.enable_unified_memory:
-                            # Record a `forward_done` event after the forward (before
-                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
-                            allocator = self.token_to_kv_pool_allocator
-                            forward_done = self.device_module.Event()
-                            forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
-                            # Write-set classification: hand the allocator this
-                            # forward's virtual out_cache_loc as a tensor ref (no GPU work).
-                            allocator.set_inflight_forward(
-                                forward_done,
-                                batch.out_cache_loc,
+
+                            # FIXME: pp is not compatible with overlap
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
                             )
-                        # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
-                        if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
-                                # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                            if batch.spec_algorithm.is_none():
+                                self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            # Park any refs the worker wants kept alive 2 iters
+                            # (cross-stream tensor lifetime; pinned in the same
+                            # ring slot as the SB attr snapshot).
+                            if batch_result.extra_keep_alive_refs:
+                                self.batch_record_buf[self.batch_record_ct].extend(
+                                    batch_result.extra_keep_alive_refs
                                 )
-                            else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
+                            if self.enable_unified_memory:
+                                # Record a `forward_done` event after the forward (before
+                                # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
+                                # it. Only the unified pool's allocator exposes these hooks.
+                                allocator = self.token_to_kv_pool_allocator
+                                forward_done = self.device_module.Event()
+                                forward_done.record(stream=self.forward_stream)
+                                allocator.set_latest_forward_done_event(forward_done)
+                                # Write-set classification: hand the allocator this
+                                # forward's virtual out_cache_loc as a tensor ref (no GPU work).
+                                allocator.set_inflight_forward(
+                                    forward_done,
+                                    batch.out_cache_loc,
+                                )
+                            # FIXME(lsyin): maybe move this to forward_batch_generation
+                            batch_result.copy_done = self.device_module.Event()
+                            if batch_result.delay_sample_func is None:
+                                self._relay_forward_payload(future_indices, batch_result)
+                                if _is_hip:
+                                    # Cross-stream sync costs more than the tiny D2H it
+                                    # overlaps.
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
-                        else:
-                            batch_result.future_indices = future_indices
+                                else:
+                                    # Result D2H on copy_stream overlaps the next forward
+                                    # instead of serializing on forward_stream; it's a leaf
+                                    # gated by copy_done, so nothing on forward_stream waits.
+                                    self.copy_stream.wait_stream(self.forward_stream)
+                                    with self.copy_stream_ctx:
+                                        batch_result.copy_to_cpu(
+                                            return_logprob=batch.return_logprob,
+                                            return_hidden_states=batch.return_hidden_states,
+                                        )
+                            else:
+                                batch_result.future_indices = future_indices
 
-                # Next-iter input_ids relayed via future_map.
-                batch.input_ids = None
+                    # Next-iter input_ids relayed via future_map.
+                    batch.input_ids = None
 
-                if not batch.spec_algorithm.is_none():
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    if not batch.spec_algorithm.is_none():
+                        batch.spec_info = batch_result.next_draft_input
+                        batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch.req_pool_indices, batch_result)
-                batch.input_ids = None
+                with scheduler_nvtx_range("scheduler.run_batch.pdmux", color="orange"):
+                    resolve_forward_inputs(batch, self.future_map)
+                    batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                    batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                with scheduler_nvtx_range("scheduler.run_batch.non_overlap_spec", color="purple"):
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(batch)
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    # Sync D2H so the result processor can read CPU tensors.
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                with scheduler_nvtx_range("scheduler.run_batch.plain", color="gray"):
+                    resolve_forward_inputs(batch, self.future_map)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -3473,19 +3551,41 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        # JoyFuture: end the appropriate latency phase for each request
+        if self.latency_tracker.enabled:
+            if batch.forward_mode.is_decode():
+                for req in batch.reqs:
+                    self.latency_tracker.end_phase(req.rid, "decode", num_tokens=1)
+            elif batch.forward_mode.is_extend():
+                for req in batch.reqs:
+                    num_tokens = len(getattr(req, "origin_input_ids", []))
+                    self.latency_tracker.end_phase(req.rid, "prefill", num_tokens=num_tokens)
+
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            with scheduler_nvtx_range("scheduler.process_batch_result.decode", color="red"):
+                self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
+                with scheduler_nvtx_range("scheduler.process_batch_result.dllm", color="orange"):
+                    self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_batch_result_disagg_prefill(batch, result)
+                with scheduler_nvtx_range("scheduler.process_batch_result.disagg_prefill", color="magenta"):
+                    self.process_batch_result_disagg_prefill(batch, result)
             else:
-                self.batch_result_processor.process_batch_result_prefill(batch, result)
+                with scheduler_nvtx_range("scheduler.process_batch_result.prefill", color="purple"):
+                    self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
+            with scheduler_nvtx_range("scheduler.process_batch_result.prebuilt", color="cyan"):
+                self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            self.batch_result_processor.process_batch_result_idle(batch, result)
+            with scheduler_nvtx_range("scheduler.process_batch_result.idle", color="gray"):
+                self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        # JoyFuture: end latency tracking for naturally completed requests
+        if self.latency_tracker.enabled:
+            for req in batch.reqs:
+                if req.finished() and not req.is_retracted:
+                    self.latency_tracker.end_request(req.rid)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
@@ -3548,6 +3648,7 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    @scheduler_nvtx_method("scheduler.on_idle", color="gray")
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
@@ -3557,7 +3658,9 @@ class Scheduler(
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:
-                pass
+                logger.debug(
+                    "Opportunistic KV pool flush during idle failed (non-critical)"
+                )
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
@@ -3887,7 +3990,22 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    @scheduler_nvtx_method("scheduler.abort_request", color="magenta")
     def abort_request(self, recv_req: AbortReq):
+        # JoyFuture: end latency tracking for aborted requests
+        if self.latency_tracker.enabled:
+            aborted_rids = set()
+            for req in self.waiting_queue:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    aborted_rids.add(req.rid)
+            for req in self.running_batch.reqs if self.running_batch else []:
+                if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    aborted_rids.add(req.rid)
+            for rid in aborted_rids:
+                self.latency_tracker.end_request(rid, aborted=True, abort_reason="user_abort")
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_scheduler_abort("user_abort")
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
