@@ -208,6 +208,13 @@ class SchedulerPPMixin:
 
         """
         self.active_pd_event_loop_role = "prefill"
+        try:
+            self._event_loop_pp_disagg_prefill_impl()
+        finally:
+            if self.active_pd_event_loop_role == "prefill":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_pp_disagg_prefill_impl(self: Scheduler):
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -223,7 +230,6 @@ class SchedulerPPMixin:
 
         while True:
             if self._pd_role_loop_should_exit(DisaggregationMode.PREFILL):
-                self.active_pd_event_loop_role = None
                 return
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -354,6 +360,13 @@ class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.active_pd_event_loop_role = "decode"
+        try:
+            self._event_loop_pp_disagg_decode_impl()
+        finally:
+            if self.active_pd_event_loop_role == "decode":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_pp_disagg_decode_impl(self: Scheduler):
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -372,7 +385,6 @@ class SchedulerPPMixin:
 
         while True:
             if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
-                self.active_pd_event_loop_role = None
                 return
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):

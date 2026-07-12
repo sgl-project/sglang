@@ -1249,25 +1249,44 @@ class PDFlipController:
         deadline = time.monotonic() + self.config.migration_timeout_seconds
         last_response: Any = None
         while True:
-            last_response = self._record_get(
-                records,
-                step,
-                source.name,
-                source.worker_url,
-                "/pd_flip/runtime_role/status",
-            )
-            status = _first_successful_response(last_response)
-            role, _, _ = _parse_runtime_status(status)
-            runtime_status = (
-                status.get("status")
-                if isinstance(status.get("status"), dict)
-                else status
-            )
-            active_event_loop_role = _normalize_role(
-                runtime_status.get("active_event_loop_role")
-            )
-            if role == expected_role and active_event_loop_role == expected_role:
-                return last_response
+            try:
+                last_response = self._record_get(
+                    records,
+                    step,
+                    source.name,
+                    source.worker_url,
+                    "/pd_flip/runtime_role/status",
+                )
+            except Exception as exc:
+                last_response = {"success": False, "message": str(exc)}
+            else:
+                statuses = (
+                    last_response
+                    if isinstance(last_response, list)
+                    else [last_response]
+                )
+                all_active = bool(statuses)
+                for status in statuses:
+                    if (
+                        not isinstance(status, dict)
+                        or status.get("success") is not True
+                    ):
+                        all_active = False
+                        break
+                    role, _, _ = _parse_runtime_status(status)
+                    runtime_status = (
+                        status.get("status")
+                        if isinstance(status.get("status"), dict)
+                        else status
+                    )
+                    active_event_loop_role = _normalize_role(
+                        runtime_status.get("active_event_loop_role")
+                    )
+                    if role != expected_role or active_event_loop_role != expected_role:
+                        all_active = False
+                        break
+                if all_active:
+                    return last_response
             now = time.monotonic()
             if now >= deadline:
                 raise TimeoutError(

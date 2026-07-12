@@ -425,11 +425,17 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         self.active_pd_event_loop_role = "prefill"
+        try:
+            self._event_loop_normal_disagg_prefill_impl()
+        finally:
+            if self.active_pd_event_loop_role == "prefill":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_normal_disagg_prefill_impl(self: Scheduler) -> None:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             if self._pd_role_loop_should_exit(DisaggregationMode.PREFILL):
-                self.active_pd_event_loop_role = None
                 return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -461,16 +467,24 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.active_pd_event_loop_role = "prefill"
+        try:
+            self._event_loop_overlap_disagg_prefill_impl()
+        finally:
+            if self.active_pd_event_loop_role == "prefill":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_overlap_disagg_prefill_impl(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             if self._pd_role_loop_should_exit(DisaggregationMode.PREFILL):
                 if self.result_queue:
-                    raise RuntimeError(
-                        "Cannot leave the prefill overlap event loop with pending results."
-                    )
-                self.active_pd_event_loop_role = None
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                    self.last_batch = None
+                    self.cur_batch = None
+                    continue
                 return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()

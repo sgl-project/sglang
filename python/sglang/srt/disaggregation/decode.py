@@ -1723,10 +1723,15 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
         self.active_pd_event_loop_role = "decode"
+        try:
+            self._event_loop_normal_disagg_decode_impl()
+        finally:
+            if self.active_pd_event_loop_role == "decode":
+                self.active_pd_event_loop_role = None
 
+    def _event_loop_normal_disagg_decode_impl(self: Scheduler):
         while True:
             if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
-                self.active_pd_event_loop_role = None
                 return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1755,16 +1760,24 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.active_pd_event_loop_role = "decode"
+        try:
+            self._event_loop_overlap_disagg_decode_impl()
+        finally:
+            if self.active_pd_event_loop_role == "decode":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_overlap_disagg_decode_impl(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
             if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
                 if self.result_queue:
-                    raise RuntimeError(
-                        "Cannot leave the decode overlap event loop with pending results."
-                    )
-                self.active_pd_event_loop_role = None
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                    self.last_batch = None
+                    self.cur_batch = None
+                    continue
                 return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
