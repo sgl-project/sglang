@@ -111,7 +111,11 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
 
 @cache_once
 def _resolve_kernel_path() -> pathlib.Path:
-    cur_dir = pathlib.Path(__file__).parent.resolve()
+    # Resolve via the package spec instead of __file__ so the lookup is
+    # independent of where this function lives inside the package.
+    spec = importlib.util.find_spec("sglang.jit_kernel")
+    assert spec is not None and spec.origin is not None
+    cur_dir = pathlib.Path(spec.origin).parent.resolve()
 
     # first, try this directory structure
     def _environment_install():
