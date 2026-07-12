@@ -43,6 +43,7 @@ from sglang.srt.configs import (
     LongcatFlashConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
+    MiniMaxM3VLConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -112,6 +113,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        MiniMaxM3VLConfig,
     ]
 }
 
@@ -137,6 +139,16 @@ try:
         model_type = "kimi_k2"
 
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+except ImportError:
+    pass
+
+try:
+    from transformers import Gemma4Config as _HFGemma4Config
+
+    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
+        model_type = "gemma4_unified"
+
+    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
 except ImportError:
     pass
 

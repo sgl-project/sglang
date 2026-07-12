@@ -39,7 +39,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -357,6 +357,8 @@ class Scheduler(
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_dp_attention = server_args.enable_dp_attention
+        self.enable_unified_memory = server_args.enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -470,7 +472,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(
                     self.attn_tp_cpu_group
-                    if self.server_args.enable_dp_attention
+                    if self.enable_dp_attention
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
@@ -911,9 +913,7 @@ class Scheduler(
         # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
         # stream/device coupling (#11910).
         self.dp_tp_group = (
-            self.attn_tp_group
-            if self.server_args.enable_dp_attention
-            else self.tp_group
+            self.attn_tp_group if self.enable_dp_attention else self.tp_group
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
@@ -1139,8 +1139,11 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
+        ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            buffer_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -1604,7 +1607,7 @@ class Scheduler(
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.server_args.enable_unified_memory:
+                if self.enable_unified_memory:
                     try:
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
@@ -2624,7 +2627,12 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+                if self.dllm_config.first_done_first_out_mode:
+                    if not req.dllm_incomplete_ids:
+                        self.stash_chunked_request(req)
+                    self.req_to_token_pool.free(req)
+                else:
+                    self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -2892,9 +2900,9 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -3272,7 +3280,7 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        if self.server_args.enable_unified_memory:
+                        if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
                             # it. Only the unified pool's allocator exposes these hooks.
@@ -3401,8 +3409,7 @@ class Scheduler(
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
-            self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend is not None
+            self.enable_dp_attention and self.server_args.elastic_ep_backend is not None
         ):
             return
         # Get the tensors indicating rank activeness
@@ -3546,7 +3553,7 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-        if self.server_args.enable_unified_memory:
+        if self.enable_unified_memory:
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:

@@ -204,7 +204,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -259,7 +258,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        if self.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -821,21 +820,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     **kwargs,
                 )
-                dflash_sampler = getattr(
-                    self.model_runner, "dflash_draft_sampler", None
-                )
-                if dflash_sampler is not None:
-                    # Must be captured here, or replay leaves a stale output buffer
-                    # the worker would read as valid tokens -- fail loudly instead.
-                    if (
-                        not isinstance(out, LogitsProcessorOutput)
-                        or out.hidden_states is None
-                    ):
-                        raise RuntimeError(
-                            "DFLASH draft sampler set but the draft forward has no "
-                            "hidden_states to capture into the graph."
-                        )
-                    dflash_sampler(out.hidden_states)
+                for capture_hook in self.model_runner.capture_tail_hooks:
+                    capture_hook(self, out, forward_batch, num_tokens)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -882,7 +868,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
-            if self.model_runner.server_args.enable_return_hidden_states
+            if self.enable_return_hidden_states
             else CaptureHiddenMode.NULL
         )
 

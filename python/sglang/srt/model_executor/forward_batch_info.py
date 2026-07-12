@@ -32,10 +32,11 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -48,7 +49,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -442,6 +442,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+
+    minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
@@ -1078,14 +1080,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
+        rl_on_policy_target = get_server_args().rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if (
-                    mm_input is None
-                    or get_server_args().rl_on_policy_target is not None
-                ):
+                if mm_input is None or rl_on_policy_target is not None:
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -1101,10 +1101,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     batch.extend_lens[batch_idx],
                     batch.prefix_lens[batch_idx],
                 )
-                if (
-                    mm_input is None
-                    or get_server_args().rl_on_policy_target is not None
-                ):
+                if mm_input is None or rl_on_policy_target is not None:
                     # text only
                     mrope_positions = torch.tensor(
                         [
@@ -1270,8 +1267,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_start_loc = torch.arange(
                         bs, dtype=torch.int32, device=self.seq_lens.device
                     )
-                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
-                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
@@ -1305,7 +1302,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
-        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.lora_ids is not None:
+            self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -1420,22 +1418,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.req_pool_indices = self.req_pool_indices[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):

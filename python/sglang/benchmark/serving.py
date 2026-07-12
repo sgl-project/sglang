@@ -136,7 +136,12 @@ def get_request_headers() -> Dict[str, str]:
 
 
 def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
-    return (message.get("reasoning_content") or "") + (message.get("content") or "")
+    # Most OpenAI-compatible servers use ``reasoning_content``. vLLM's Kimi
+    # parser instead streams its reasoning in ``reasoning``. Prefer the
+    # standard field when both are present to avoid counting the same tokens
+    # twice on servers that expose aliases.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    return reasoning + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -2281,7 +2286,9 @@ def cli_main():
         default="1080p",
         help=(
             "Resolution of images for image dataset. "
-            "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+            "Supports presets 4k/1080p/720p/360p, custom 'heightxwidth' "
+            "(e.g., 1080x1920), or random 'random:<min_h>x<min_w>-<max_h>x<max_w>' "
+            "bounds (e.g., random:256x256-1024x1024)."
         ),
     )
     parser.add_argument(

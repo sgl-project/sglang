@@ -268,6 +268,13 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
 ]
 
+MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
+    "cutlass",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
+]
+
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -365,6 +372,10 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_mxfp8_moe_runner_backend_choices(choices):
+    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_fp8_gemm_runner_backend_choices(choices):
@@ -2349,6 +2360,13 @@ class ServerArgs:
         Optional[str],
         "The diffusion LLM algorithm configurations. Must be a YAML file.",
     ] = None
+    dllm_fdfo: A[
+        bool,
+        Arg(
+            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM inference. Enabled by default; use --no-dllm-fdfo to fall back to synchronous block scheduling.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -6418,14 +6436,26 @@ class ServerArgs:
                 os.environ[key] = value
                 logger.info("Auto-set %s=%s (from --crash-dump-folder)", key, value)
 
-                if key == "CUDA_COREDUMP_FILE":
-                    # cuda curedump cannot write to a folder that does not exist,
-                    # so we have to create the folder first.
-                    hostname = socket.gethostname()
-                    os.makedirs(
-                        os.path.join(self.crash_dump_folder, hostname),
-                        exist_ok=True,
-                    )
+        coredump_dir = os.path.dirname(
+            os.environ["CUDA_COREDUMP_FILE"].replace("%h", socket.gethostname())
+        )
+        if "%" in coredump_dir:
+            logger.warning(
+                "Cannot pre-create CUDA coredump directory %s: only %%h is "
+                "supported in the directory part of CUDA_COREDUMP_FILE; "
+                "coredumps may fail to write.",
+                coredump_dir,
+            )
+        elif coredump_dir:
+            try:
+                os.makedirs(coredump_dir, exist_ok=True)
+            except OSError as e:
+                logger.warning(
+                    "Failed to create CUDA coredump directory %s: %s; "
+                    "coredumps may fail to write.",
+                    coredump_dir,
+                    e,
+                )
 
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
@@ -7450,6 +7480,7 @@ class ServerArgs:
             return None
         if not host or not (0 < port < 65536):
             return None
+
         return {
             "publisher": cfg.publisher,
             "endpoint_host": host,

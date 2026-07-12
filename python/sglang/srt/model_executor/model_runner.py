@@ -101,6 +101,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -389,6 +390,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.capture_tail_hooks = []
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -670,7 +672,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
+                    "Initial expert_location_metadata:\n%s",
+                    format_expert_location_layout(
+                        get_global_expert_location_metadata()
+                    ),
                 )
 
             set_global_expert_distribution_recorder(
@@ -744,14 +749,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
+        if self.is_draft_worker and model_has_mtp_layers:
+            model_num_layers = getattr(
+                self.model, "num_stages", self.model_config.num_nextn_predict_layers
+            )
+        else:
+            model_num_layers = max(
                 self.model_config.num_hidden_layers,
                 self.model_config.num_attention_layers,
             )
-        )
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
         elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
@@ -3050,7 +3056,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.server_args.elastic_ep_backend is not None:
+        if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
         return output
