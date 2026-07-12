@@ -474,7 +474,6 @@ class DSparkDraftMixin:
             k, v = attn.kv_proj_only(ctx_hidden)
             k = attn.apply_k_norm(k)
             k = attn.apply_k_rope(positions, k)
-            v = attn.apply_v_norm(v)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             if cache_loc_2d is not None and commit_lens is not None:
