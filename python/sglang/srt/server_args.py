@@ -5211,6 +5211,24 @@ class ServerArgs:
 
         run_post_process_pass(self, _data_parallelism_defaults)
 
+        if self.mm_enable_dp_encoder:
+            if self.tp_size == 1:
+                logger.warning(
+                    "--mm-enable-dp-encoder is enabled with TP=1, so the encoder "
+                    "has no data-parallel work to distribute. Disable it unless "
+                    "you need to validate this configuration."
+                )
+            else:
+                logger.info(
+                    "--mm-enable-dp-encoder is enabled across TP=%d. It replicates "
+                    "the vision encoder and distributes image work across ranks; "
+                    "this is most useful when high-resolution or multi-image ViT "
+                    "prefill is a material part of TTFT. Measure against the default "
+                    "for small-image workloads because replication and aggregation "
+                    "can increase memory use and overhead.",
+                    self.tp_size,
+                )
+
         if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
