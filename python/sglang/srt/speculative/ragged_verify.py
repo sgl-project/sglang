@@ -3,7 +3,7 @@ from __future__ import annotations
 import bisect
 import logging
 from enum import Enum
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -254,4 +254,77 @@ def build_ragged_target_verify_geometry(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=max_seq_len_q,
+    )
+
+
+def compute_target_verify_graph_key(
+    *,
+    bs: int,
+    num_draft_tokens: int,
+    ragged_layout: Optional[RaggedVerifyLayout],
+) -> Tuple[int, int]:
+    num_tokens_full_block = num_draft_tokens * bs
+    if ragged_layout is None:
+        return bs, num_tokens_full_block
+    graph_num_tokens = ragged_layout.graph_num_tokens
+    assert graph_num_tokens <= num_tokens_full_block, (
+        f"ragged verify graph_num_tokens={graph_num_tokens} exceeds full block "
+        f"num_draft*bs={num_tokens_full_block}"
+    )
+    total_verify_tokens = ragged_layout.total_verify_tokens
+    if total_verify_tokens is not None:
+        assert total_verify_tokens <= graph_num_tokens, (
+            f"ragged verify total_verify_tokens={total_verify_tokens} exceeds the "
+            f"round-up bucket graph_num_tokens={graph_num_tokens}"
+        )
+    return graph_num_tokens, graph_num_tokens
+
+
+class VerifyExtendLengths(msgspec.Struct, frozen=True):
+    seq_lens_extended: torch.Tensor
+    seq_lens_cpu_extended: List[int]
+    extend_seq_lens_cpu: List[int]
+    num_tokens: int
+    extend_start_loc: Optional[torch.Tensor]
+
+
+def compute_uniform_extend_lengths(
+    *,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: List[int],
+    extend_len: int,
+) -> VerifyExtendLengths:
+    batch_size = len(seq_lens_cpu)
+    seq_lens_extended = seq_lens + extend_len
+    seq_lens_cpu_extended = [x + extend_len for x in seq_lens_cpu]
+    extend_seq_lens_cpu = [extend_len] * batch_size
+    num_tokens = extend_len * batch_size
+    return VerifyExtendLengths(
+        seq_lens_extended=seq_lens_extended,
+        seq_lens_cpu_extended=seq_lens_cpu_extended,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        num_tokens=num_tokens,
+        extend_start_loc=None,
+    )
+
+
+def compute_ragged_extend_lengths(
+    *,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: List[int],
+    ragged_layout: RaggedVerifyLayout,
+) -> VerifyExtendLengths:
+    extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+    seq_lens_extended = seq_lens + ragged_layout.verify_lens
+    seq_lens_cpu_extended = [
+        raw + length for raw, length in zip(seq_lens_cpu, extend_seq_lens_cpu)
+    ]
+    num_tokens = ragged_layout.total_verify_tokens
+    extend_start_loc = ragged_layout.extend_start_loc
+    return VerifyExtendLengths(
+        seq_lens_extended=seq_lens_extended,
+        seq_lens_cpu_extended=seq_lens_cpu_extended,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        num_tokens=num_tokens,
+        extend_start_loc=extend_start_loc,
     )

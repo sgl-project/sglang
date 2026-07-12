@@ -15,7 +15,6 @@ from typing import (
     Union,
 )
 
-import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -61,6 +60,9 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata impor
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
+    compute_ragged_extend_lengths,
+    compute_target_verify_graph_key,
+    compute_uniform_extend_lengths,
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import ceil_align, is_xpu
@@ -133,29 +135,6 @@ def _resolve_ragged_verify_layout(
     return getattr(spec_info, "ragged_verify_layout", None)
 
 
-def compute_target_verify_graph_key(
-    *,
-    bs: int,
-    num_draft_tokens: int,
-    ragged_layout: Optional[RaggedVerifyLayout],
-) -> Tuple[int, int]:
-    num_tokens_full_block = num_draft_tokens * bs
-    if ragged_layout is None:
-        return bs, num_tokens_full_block
-    graph_num_tokens = ragged_layout.graph_num_tokens
-    assert graph_num_tokens <= num_tokens_full_block, (
-        f"ragged verify graph_num_tokens={graph_num_tokens} exceeds full block "
-        f"num_draft*bs={num_tokens_full_block}"
-    )
-    total_verify_tokens = ragged_layout.total_verify_tokens
-    if total_verify_tokens is not None:
-        assert total_verify_tokens <= graph_num_tokens, (
-            f"ragged verify total_verify_tokens={total_verify_tokens} exceeds the "
-            f"round-up bucket graph_num_tokens={graph_num_tokens}"
-        )
-    return graph_num_tokens, graph_num_tokens
-
-
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
@@ -165,56 +144,6 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
-
-
-class VerifyExtendLengths(msgspec.Struct, frozen=True):
-    seq_lens_extended: torch.Tensor
-    seq_lens_cpu_extended: List[int]
-    extend_seq_lens_cpu: List[int]
-    num_tokens: int
-    extend_start_loc: Optional[torch.Tensor]
-
-
-def compute_uniform_extend_lengths(
-    *,
-    seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
-    extend_len: int,
-) -> VerifyExtendLengths:
-    batch_size = len(seq_lens_cpu)
-    seq_lens_extended = seq_lens + extend_len
-    seq_lens_cpu_extended = [x + extend_len for x in seq_lens_cpu]
-    extend_seq_lens_cpu = [extend_len] * batch_size
-    num_tokens = extend_len * batch_size
-    return VerifyExtendLengths(
-        seq_lens_extended=seq_lens_extended,
-        seq_lens_cpu_extended=seq_lens_cpu_extended,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
-        num_tokens=num_tokens,
-        extend_start_loc=None,
-    )
-
-
-def compute_ragged_extend_lengths(
-    *,
-    seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
-    ragged_layout: RaggedVerifyLayout,
-) -> VerifyExtendLengths:
-    extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
-    seq_lens_extended = seq_lens + ragged_layout.verify_lens
-    seq_lens_cpu_extended = [
-        raw + length for raw, length in zip(seq_lens_cpu, extend_seq_lens_cpu)
-    ]
-    num_tokens = ragged_layout.total_verify_tokens
-    extend_start_loc = ragged_layout.extend_start_loc
-    return VerifyExtendLengths(
-        seq_lens_extended=seq_lens_extended,
-        seq_lens_cpu_extended=seq_lens_cpu_extended,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
-        num_tokens=num_tokens,
-        extend_start_loc=extend_start_loc,
-    )
 
 
 def _create_flashmla_metadata():
