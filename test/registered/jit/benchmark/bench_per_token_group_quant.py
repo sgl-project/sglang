@@ -16,7 +16,7 @@ register_cuda_ci(
     est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
-HIDDEN = 4096
+HIDDEN = 2048
 LAYOUTS = {
     "row_major_fp32": (False, False),
     "col_major_fp32": (True, False),
@@ -44,7 +44,7 @@ def _jit_v3(G, x, x_q, x_s, scale_ue8m0):
 FN = {"jit_v2": _jit_v2, "jit_v3": _jit_v3}
 
 
-@marker.parametrize("group_size", [32, 128], ci_vals=[128])
+@marker.parametrize("group_size", [32, 64, 128], ci_vals=[128])
 @marker.parametrize("layout", list(LAYOUTS), ci_vals=["col_major_ue8m0"])
 @marker.parametrize("num_tokens", [2**n for n in range(0, 14)], ci_vals=[1, 32, 2048])
 @marker.benchmark("impl", ["jit_v2", "jit_v3"])

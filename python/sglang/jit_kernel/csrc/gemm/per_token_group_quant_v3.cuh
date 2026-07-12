@@ -135,6 +135,29 @@ struct ScaleStoreArgs {
   }
 };
 
+template <typename T2>
+struct Vec32B {
+ public:
+  static_assert(sizeof(T2) == 4, "must be packed fp16/bf16");
+  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(T2);
+  static constexpr uint32_t kNumVecs = 32 / device::kMaxVecBytes;
+  SGL_DEVICE void load(const void* ptr, const uint32_t lane_id) {
+#pragma unroll
+    for (uint32_t v = 0; v < kNumVecs; ++v) {
+      m_vecs[v].load(ptr, lane_id * kNumVecs + v);
+    }
+  }
+  SGL_DEVICE auto operator[](const uint32_t i) -> T2& {
+    return m_vecs[i / kVecSize][i % kVecSize];
+  }
+  SGL_DEVICE auto operator[](const uint32_t i) const -> T2 {
+    return m_vecs[i / kVecSize][i % kVecSize];
+  }
+
+ private:
+  device::AlignedVector<T2, kVecSize> m_vecs[kNumVecs];
+};
+
 // Quantized-tensor accessor: strides fit uint32 (host-verified) so the row
 // base costs one widening multiply.
 struct TensorArgs {
@@ -187,15 +210,10 @@ struct QuantTrait {
   static constexpr bool kRowMajor = kRowMajor_;
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
-  // some derived configs
   static constexpr uint32_t kBlockSize = 256;
-  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(InputType);
+  static constexpr uint32_t kVecSize = 32u / sizeof(InputType);
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
   static_assert(sizeof(InputType) == 2, "v3 only supports 16-bit inputs (bf16/fp16)");
-  // Upper bound is portable, not arch-specific: every arch guarantees a 16-byte
-  // (128-bit) vector, i.e. kVecSize >= 8 for a 16-bit input, so one group spans
-  // at most kGroupSize / 8 lanes; capping at 256 keeps that <= a full warp on
-  // every arch (Blackwell's 256-bit vector uses only half the warp for 256).
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "v3 supports group sizes 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
@@ -214,7 +232,7 @@ struct QuantTrait {
     using Q = QuantType;
     using WTrait = details::WeightTrait<Q>;
     using Q2 = typename WTrait::packed2_t;
-    using in_vec_t = AlignedVector<T2, kVecSize / 2>;
+    using in_vec_t = details::Vec32B<T2>;
     using out_vec_t = AlignedVector<Q2, kVecSize / 2>;
     constexpr float kMaxValue = WTrait::kMaxValue;
     constexpr float kMaxValueInv = 1.f / kMaxValue;
