@@ -2489,6 +2489,14 @@ class ServerArgs:
         bool,
         "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
     ] = False
+    weight_loader_fastsafetensors_bbuf_size_kb: A[
+        int,
+        "Bounce buffer size in KB for fastsafetensors loader (default: 16384 = 16MB).",
+    ] = 16 * 1024
+    weight_loader_fastsafetensors_max_threads: A[
+        int,
+        "Max threads for fastsafetensors loader (default: 16).",
+    ] = 16
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
         "The ip of the seed instance for loading weights from remote instance.",

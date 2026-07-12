@@ -983,6 +983,8 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    bbuf_size_kb: int = 16 * 1024,
+    max_threads: int = 16,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -998,12 +1000,7 @@ def fastsafetensors_weights_iterator(
     else:
         pg = SingleGroup()
 
-    try:
-        rank = pg.rank()
-    except Exception:
-        rank = 0
-
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
@@ -1020,7 +1017,12 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        loader = SafeTensorsFileLoader(
+            pg,
+            device,
+            bbuf_size_kb=bbuf_size_kb,
+            max_threads=max_threads,
+        )
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
