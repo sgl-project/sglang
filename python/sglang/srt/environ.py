@@ -991,6 +991,12 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # Low-latency small-batch serving: dequantize fp8 block-quant DENSE linear
+    # weights to bf16 at load time so tiny-M GEMMs run through cuBLAS instead of
+    # the fp8 path plus its per-call activation quant. MoE expert weights are
+    # unaffected. Trades ~2x dense weight memory for decode latency.
+    SGLANG_BS1_BF16_DENSE = EnvBool(False)
+
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
     # Plugin system

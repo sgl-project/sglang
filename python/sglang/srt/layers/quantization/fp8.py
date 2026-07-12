@@ -639,6 +639,30 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             return
         else:
+            # Low-latency small-batch path (SGLANG_BS1_BF16_DENSE): dequantize
+            # dense-linear weights to bf16 at load so tiny-M GEMMs (e.g. bs=1
+            # speculative decode) run through cuBLAS, which is near weight-BW-
+            # bound at M<=8, instead of the fp8 path plus its per-call
+            # activation-quant kernel. MoE experts (Fp8MoEMethod) are unaffected.
+            if (
+                envs.SGLANG_BS1_BF16_DENSE.get()
+                and layer.weight.dim() == 2
+                and not getattr(layer.weight_scale_inv, "format_ue8m0", False)
+            ):
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    block_quant_dequant,
+                )
+
+                w_bf16 = block_quant_dequant(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size,
+                    torch.bfloat16,
+                )
+                layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
+                layer._bs1_bf16_dense = True
+                return
+
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
             use_deepgemm_runner = (
                 self.w8a8_block_fp8_linear
@@ -947,6 +971,11 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if getattr(layer, "_bs1_bf16_dense", False):
+                # Weight was dequantized to bf16 at load (SGLANG_BS1_BF16_DENSE).
+                x_in = x[0] if isinstance(x, tuple) else x
+                return F.linear(x_in, layer.weight, bias)
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
