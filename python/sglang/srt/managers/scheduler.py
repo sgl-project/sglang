@@ -2019,26 +2019,61 @@ class Scheduler(
                 message=f"local migration role is {session.get('role')}, not target",
                 status=self._pd_flip_migration_status_dict(),
             )
-        if recv_req.session_id and recv_req.session_id != session.get("session_id"):
+        if recv_req.session_id is None or str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
             return PDFlipMigrationReqOutput(
                 success=False,
                 message="target migration session id does not match",
                 status=self._pd_flip_migration_status_dict(),
             )
 
-        self._pd_flip_target_pump_transfer(session)
-        entries = session.get("target_entries") or {}
-        manifests = list(recv_req.manifests or [])
-        real_error = ""
-        delta_entries = 0
-        for manifest in manifests:
+        manifests = []
+        for item in recv_req.manifests or []:
+            if not isinstance(item, dict):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="target delta manifest is not an object",
+                    status=self._pd_flip_migration_status_dict(),
+                )
+            manifest = dict(item)
             manifest_session_id = manifest.get("pd_flip_session_id")
             if manifest_session_id is not None and str(manifest_session_id) != str(
                 session.get("session_id")
             ):
-                real_error = "target delta manifest session id does not match"
-                break
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="target delta manifest session id does not match",
+                    status=self._pd_flip_migration_status_dict(),
+                )
             manifest["pd_flip_session_id"] = session.get("session_id")
+            manifests.append(manifest)
+        signature = self._pd_flip_delta_manifest_signature(manifests)
+        existing_signature = session.get("target_delta_manifest_signature")
+        if existing_signature is not None:
+            matches = signature == existing_signature
+            repeatable = session.get("state") in {
+                "target_delta_started",
+                "target_delta_transferred",
+                "ready_to_activate",
+                "active",
+            }
+            return PDFlipMigrationReqOutput(
+                success=matches and repeatable,
+                message=(
+                    "target migration delta already prepared"
+                    if matches and repeatable
+                    else "target migration delta conflicts with existing preparation"
+                ),
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("delta_manifests") or []),
+            )
+
+        self._pd_flip_target_pump_transfer(session)
+        entries = session.get("target_entries") or {}
+        real_error = ""
+        delta_entries = 0
+        for manifest in manifests:
             rid = str(manifest.get("rid", ""))
             entry = entries.get(rid)
             if entry is None:
@@ -2067,6 +2102,7 @@ class Scheduler(
                 break
 
         session["delta_manifests"] = manifests
+        session["target_delta_manifest_signature"] = signature
         session["delta_pending_reqs"] = delta_entries
         session["pending_reqs"] = delta_entries
         if real_error:
@@ -2086,6 +2122,10 @@ class Scheduler(
             status=self._pd_flip_migration_status_dict(),
             manifests=manifests,
         )
+
+    @staticmethod
+    def _pd_flip_delta_manifest_signature(manifests: List[Dict[str, Any]]) -> str:
+        return json.dumps(manifests, sort_keys=True, separators=(",", ":"))
 
     def commit_pd_flip_migration_target(
         self, recv_req: PDFlipMigrationTargetCommitReq
@@ -3397,6 +3437,7 @@ class Scheduler(
                         entry, "source_set_metadata", metadata_started
                     )
                     send_started = time.monotonic()
+                    self._pd_flip_note_timing(entry, "source_transfer_started")
                     self._pd_flip_source_send_initial(entry)
                     self._pd_flip_note_timing(entry, "source_send", send_started)
                     self._pd_flip_note_timing(entry, "source_sent")
@@ -3415,6 +3456,8 @@ class Scheduler(
             if poll == KVPoll.Success:
                 entry["transferred"] = True
                 transferred.add(rid)
+                self._pd_flip_note_timing(entry, "source_transfer_completed")
+                self._pd_flip_record_sender_metric(entry, sender, "source")
                 self._pd_flip_note_timing(entry, "source_transferred")
                 self._pd_flip_free_source_metadata(entry)
 
@@ -3489,6 +3532,7 @@ class Scheduler(
                     state_indices = self._pd_flip_source_state_indices(
                         req, delta["to_len"], sender.kv_mgr
                     )
+                    self._pd_flip_note_timing(entry, "delta_transfer_started")
                     sender.send(page_indices, state_indices)
                     delta["sent"] = True
                     self._pd_flip_note_timing(entry, "source_delta_sent")
@@ -3506,6 +3550,8 @@ class Scheduler(
             if poll == KVPoll.Success:
                 delta["transferred"] = True
                 transferred.add(rid)
+                self._pd_flip_note_timing(entry, "delta_transfer_completed")
+                self._pd_flip_record_sender_metric(entry, sender, "delta")
                 entry["committed_len"] = int(delta["to_len"])
                 entry["manifest"] = delta.get("manifest") or entry.get("manifest")
                 self._pd_flip_note_timing(entry, "source_delta_transferred")
@@ -4004,7 +4050,7 @@ class Scheduler(
                     self._pd_flip_note_timing(entry, "target_transferring")
 
                 if entry.get("phase") == "transferring":
-                    if self._pd_flip_target_hicache_restore_pending(decode_req):
+                    if self._pd_flip_target_hicache_restore_pending(entry):
                         continue
                     poll = decode_req.kv_receiver.poll()
                     if poll == KVPoll.Failed:
@@ -4064,8 +4110,9 @@ class Scheduler(
         self._pd_flip_target_pump_delta_transfer(session)
 
     def _pd_flip_target_hicache_restore_pending(
-        self, decode_req: DecodeRequest
+        self, entry: Dict[str, Any]
     ) -> bool:
+        decode_req: DecodeRequest = entry["decode_req"]
         prefix_match = getattr(decode_req, "prefix_match", None)
         if prefix_match is None or not getattr(
             prefix_match, "needs_local_restore", False
@@ -4084,6 +4131,7 @@ class Scheduler(
             raise RuntimeError(
                 "migration target requires HiCache restore but no restore processor is available"
             )
+        self._pd_flip_note_timing(entry, "target_hicache_restore_started")
         transfer_queue._process_hicache_local_restores([decode_req])
         status_value = getattr(
             getattr(decode_req, "hicache_restore_status", None), "value", None
@@ -4093,6 +4141,12 @@ class Scheduler(
         if status_value == "pending":
             return True
         if status_value == "ready":
+            timing = entry.setdefault("timing_debug", {})
+            started = timing.get("target_hicache_restore_started_mono")
+            if isinstance(started, (int, float)):
+                self._pd_flip_note_timing(
+                    entry, "target_hicache_restore_duration", started
+                )
             return False
         raise RuntimeError(
             f"migration target HiCache restore returned invalid status {status_value!r}"
@@ -4254,6 +4308,10 @@ class Scheduler(
                 total_prefix_len=total_prefix_len,
             )
         if prefix_match is not None and getattr(self, "enable_decode_hicache", False):
+            if int(getattr(prefix_match, "l3_storage_hit_length", 0) or 0) > 0:
+                entry.setdefault("timing_debug", {}).setdefault(
+                    "target_hicache_restore_started_mono", time.monotonic()
+                )
             queue._start_hicache_prefetch(req, prefix_match)
 
         if getattr(self.server_args, "enable_pd_flip_hicache_stitch", False):
@@ -4517,13 +4575,6 @@ class Scheduler(
         for rid, entry in entries.items():
             manifest = entry.get("manifest") or {}
             timing = entry.get("timing_debug") or {}
-            delta_started = timing.get("source_delta_sent_mono")
-            delta_finished = timing.get("source_delta_transferred_mono")
-            delta_duration = None
-            if isinstance(delta_started, (int, float)) and isinstance(
-                delta_finished, (int, float)
-            ):
-                delta_duration = max(0.0, delta_finished - delta_started)
             c0 = manifest.get("kv_committed_len")
             c1 = entry.get("committed_len")
             if c1 is None:
@@ -4537,13 +4588,22 @@ class Scheduler(
                     "c1_tokens": int(c1 or 0),
                     "stitch_mode": entry.get("stitch_mode"),
                     "mooncake_bytes": entry.get("mooncake_bytes"),
+                    "mooncake_bytes_available": entry.get("mooncake_bytes")
+                    is not None,
                     "source_bytes": entry.get("source_transfer_bytes"),
                     "delta_bytes": entry.get("delta_transfer_bytes"),
-                    "mooncake_duration_seconds": entry.get(
-                        "target_hicache_prefix_match_s"
+                    "mooncake_restore_tokens": int(
+                        entry.get("target_hicache_restore_tokens") or 0
                     ),
-                    "source_duration_seconds": timing.get("source_send_s"),
-                    "delta_duration_seconds": delta_duration,
+                    "mooncake_duration_seconds": timing.get(
+                        "target_hicache_restore_duration_s"
+                    ),
+                    "source_duration_seconds": entry.get(
+                        "source_transfer_duration_s"
+                    ),
+                    "delta_duration_seconds": entry.get(
+                        "delta_transfer_duration_s"
+                    ),
                     "held_at_mono": timing.get("target_held_mono"),
                     "freeze_at_mono": timing.get("source_waiting_frozen_mono"),
                     "commit_at_mono": timing.get("target_commit_ready_mono")
@@ -4557,6 +4617,27 @@ class Scheduler(
                 }
             )
         return rows
+
+    @staticmethod
+    def _pd_flip_record_sender_metric(
+        entry: Dict[str, Any], sender: Any, segment: str
+    ) -> None:
+        get_metric = getattr(sender, "get_transfer_metric", None)
+        metric = get_metric() if callable(get_metric) else None
+        transfer_bytes = getattr(metric, "transfer_total_bytes", None)
+        entry[f"{segment}_transfer_bytes"] = (
+            int(transfer_bytes) if transfer_bytes is not None else None
+        )
+        duration = getattr(metric, "transfer_latency_s", None)
+        if duration is None:
+            timing = entry.get("timing_debug") or {}
+            started = timing.get(f"{segment}_transfer_started_mono")
+            completed = timing.get(f"{segment}_transfer_completed_mono")
+            if isinstance(started, (int, float)) and isinstance(
+                completed, (int, float)
+            ):
+                duration = max(0.0, completed - started)
+        entry[f"{segment}_transfer_duration_s"] = duration
 
     @staticmethod
     def _pd_flip_note_timing(

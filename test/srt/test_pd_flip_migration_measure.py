@@ -52,6 +52,8 @@ class PDFlipMigrationMeasureTest(unittest.TestCase):
                 "c0_tokens",
                 "c1_tokens",
                 "mooncake_bytes",
+                "mooncake_bytes_available",
+                "mooncake_restore_tokens",
                 "source_bytes",
                 "delta_bytes",
                 "held_at_mono",

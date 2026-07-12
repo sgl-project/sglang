@@ -803,6 +803,8 @@ def migration_request_fields() -> List[str]:
         "c1_tokens",
         "stitch_mode",
         "mooncake_bytes",
+        "mooncake_bytes_available",
+        "mooncake_restore_tokens",
         "source_bytes",
         "delta_bytes",
         "mooncake_duration_seconds",

@@ -243,7 +243,10 @@ class PDFlipSessionJournal:
     def read(self) -> Optional[JsonDict]:
         if not self.path.exists():
             return None
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        record = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("session journal root is not an object")
+        return record
 
     def clear(self) -> None:
         if self.path.exists():
@@ -422,7 +425,17 @@ class PDFlipController:
         )
 
     def reconcile_session(self, session_id: str) -> FlipExecutionResult:
-        record = self.session_journal.read()
+        try:
+            record = self.session_journal.read()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return FlipExecutionResult(
+                False,
+                "session state requires operator recovery: invalid journal",
+                "d_to_p",
+                None,
+                None,
+                None,
+            )
         if record is None or str(record.get("session_id")) != str(session_id):
             return FlipExecutionResult(
                 False, "session journal not found", "d_to_p", None, None, None
@@ -446,28 +459,31 @@ class PDFlipController:
                 target_name,
             )
 
-        source_response = self.client.get_json(source_url, "/pd_flip/migration/status")
-        target_response = self.client.get_json(target_url, "/pd_flip/migration/status")
-        source_status = source_response.get("status", source_response)
-        target_status = target_response.get("status", target_response)
-        if str(source_status.get("session_id")) != str(session_id) or str(
-            target_status.get("session_id")
-        ) != str(session_id):
+        try:
+            source_statuses = _strict_migration_statuses(
+                self.client.get_json(source_url, "/pd_flip/migration/status"),
+                session_id,
+            )
+            target_statuses = _strict_migration_statuses(
+                self.client.get_json(target_url, "/pd_flip/migration/status"),
+                session_id,
+            )
+        except (TypeError, ValueError):
             return FlipExecutionResult(
                 False,
-                "session state requires operator recovery: worker session mismatch",
+                "session state requires operator recovery: invalid worker status",
                 "d_to_p",
                 source_name,
                 None,
                 target_name,
             )
 
-        source_state = source_status.get("state")
-        target_state = target_status.get("state")
+        source_states = {status.get("state") for status in source_statuses}
+        target_states = {status.get("state") for status in target_statuses}
         records: List[ActionRecord] = []
         source = NodeMetrics(str(source_name), str(source_url), str(source_name))
         target = NodeMetrics(str(target_name), str(target_url), str(target_name))
-        if target_state == "active":
+        if target_states == {"active"}:
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "target_active", True
             )
@@ -480,7 +496,10 @@ class PDFlipController:
                 target.name,
                 actions=records,
             )
-        if source_state == "source_aborted" and target_state == "target_aborted":
+        if (
+            source_states == {"source_aborted"}
+            and target_states == {"target_aborted"}
+        ):
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "aborted", False
             )
@@ -494,8 +513,8 @@ class PDFlipController:
                 actions=records,
             )
         if (
-            source_state in {"released", "source_released"}
-            and target_state == "ready_to_activate"
+            source_states == {"source_released"}
+            and target_states == {"ready_to_activate"}
         ):
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "target_activate_intent", True
@@ -519,12 +538,26 @@ class PDFlipController:
                 target.name,
                 actions=records,
             )
-        if source_state not in {"released", "source_released"} and target_state in {
-            "prepared",
+        safe_source_abort_states = {
+            "source_started",
+            "source_transferred",
+            "source_quiesce_requested",
+            "source_delta_started",
+            "source_delta_transferred",
+            "source_failed",
+        }
+        safe_target_abort_states = {
             "target_prepared",
-            "transferred_held",
+            "target_transferred_held",
+            "target_delta_started",
+            "target_delta_transferred",
             "ready_to_activate",
-        }:
+            "target_failed",
+        }
+        if (
+            source_states <= safe_source_abort_states
+            and target_states <= safe_target_abort_states
+        ):
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "abort_intent", False
             )
@@ -1168,6 +1201,7 @@ class PDFlipController:
         if not requested_rids:
             raise ValueError("atomic migration batch must not have empty rids")
         source_finished = False
+        journal_rids = requested_rids
         try:
             self._write_journal_phase(
                 source,
@@ -1204,6 +1238,7 @@ class PDFlipController:
                     "selected first-batch RIDs do not match"
                 )
 
+            journal_rids = batch_rids
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "source_started"
             )
@@ -1312,7 +1347,7 @@ class PDFlipController:
                     source,
                     target,
                     session_id,
-                    requested_rids,
+                    journal_rids,
                     "abort_intent",
                 )
                 abort_complete = self._abort_two_phase_migration(
@@ -1322,7 +1357,7 @@ class PDFlipController:
                     source,
                     target,
                     session_id,
-                    requested_rids,
+                    journal_rids,
                     "aborted" if abort_complete else "abort_incomplete",
                 )
             raise ProgressiveAtomicBatchError(
@@ -1762,6 +1797,7 @@ class PDFlipController:
         session_id = f"pd-flip-{source.name}-to-{target.name}"
         migration_seconds = 0.0
         source_finished = False
+        released_rids: List[str] = []
         monitor_nodes = [
             (metric.name, metric.worker_url, metric.effective_role)
             for metric in self.collect_metrics()
@@ -1838,6 +1874,9 @@ class PDFlipController:
                 )
 
             migration_started = time.monotonic()
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "source_start_intent"
+            )
             source_start = self._post_worker(
                 records,
                 "start_decode_migration_source",
@@ -1847,7 +1886,16 @@ class PDFlipController:
                     session_id, target.worker_url, None, include_waiting=True
                 ),
             )
-            manifests = _response_manifests(source_start)
+            manifests = _strict_response_manifests(
+                source_start, "invalid source start response manifests"
+            )
+            released_rids = _manifest_rids(manifests)
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "source_started"
+            )
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "target_prepare_intent"
+            )
             self._post_worker(
                 records,
                 "prepare_decode_migration_target",
@@ -1861,6 +1909,9 @@ class PDFlipController:
                     "adopt_on_commit": False,
                 },
             )
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "target_prepared"
+            )
 
             transfer_result = self._wait_two_phase_migration_or_recovery(
                 records=records,
@@ -1872,7 +1923,32 @@ class PDFlipController:
             )
             migration_seconds = time.monotonic() - migration_started
             if transfer_result == "recovered":
-                self._abort_two_phase_migration(source, target, session_id, records)
+                self._write_journal_phase(
+                    source, target, session_id, released_rids, "abort_intent"
+                )
+                abort_complete = self._abort_two_phase_migration(
+                    source, target, session_id, records
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    released_rids,
+                    "aborted" if abort_complete else "abort_incomplete",
+                )
+                if not abort_complete:
+                    self._cleanup_source_after_failure(source, records)
+                    return FlipExecutionResult(
+                        success=False,
+                        message="abort incomplete; session requires operator recovery",
+                        direction="d_to_p",
+                        source=source.name,
+                        target_role="decode",
+                        migration_target=target.name,
+                        actions=records,
+                        total_seconds=time.monotonic() - started,
+                        migration_seconds=migration_seconds,
+                    )
                 self._cleanup_source_after_failure(source, records)
                 state_trace.append(
                     _monitor_state_record(
@@ -1901,7 +1977,32 @@ class PDFlipController:
 
             snapshot = slo_monitor.collect_cluster(monitor_nodes)
             if not _prefill_risk(snapshot, commit_threshold):
-                self._abort_two_phase_migration(source, target, session_id, records)
+                self._write_journal_phase(
+                    source, target, session_id, released_rids, "abort_intent"
+                )
+                abort_complete = self._abort_two_phase_migration(
+                    source, target, session_id, records
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    released_rids,
+                    "aborted" if abort_complete else "abort_incomplete",
+                )
+                if not abort_complete:
+                    self._cleanup_source_after_failure(source, records)
+                    return FlipExecutionResult(
+                        success=False,
+                        message="abort incomplete; session requires operator recovery",
+                        direction="d_to_p",
+                        source=source.name,
+                        target_role="decode",
+                        migration_target=target.name,
+                        actions=records,
+                        total_seconds=time.monotonic() - started,
+                        migration_seconds=migration_seconds,
+                    )
                 self._cleanup_source_after_failure(source, records)
                 state_trace.append(
                     _monitor_state_record(
@@ -1941,7 +2042,6 @@ class PDFlipController:
                     action_index=len(records),
                 )
             )
-            released_rids = _manifest_rids(manifests)
             self._sync_two_phase_delta_before_commit(
                 records=records,
                 source=source,
@@ -1950,12 +2050,21 @@ class PDFlipController:
                 released_rids=released_rids,
             )
             migration_seconds = time.monotonic() - migration_started
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "target_commit_intent"
+            )
             self._post_worker(
                 records,
                 "commit_decode_migration_target",
                 target,
                 "/pd_flip/migration/target/commit",
                 {"session_id": session_id, "rids": released_rids},
+            )
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "target_ready"
+            )
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "source_finish_intent"
             )
             self._post_worker(
                 records,
@@ -1965,12 +2074,31 @@ class PDFlipController:
                 {"session_id": session_id, "released_rids": released_rids},
             )
             source_finished = True
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                released_rids,
+                "source_finish_complete",
+                True,
+            )
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                released_rids,
+                "target_activate_intent",
+                True,
+            )
             self._post_worker(
                 records,
                 "activate_decode_migration_target",
                 target,
                 "/pd_flip/migration/target/activate",
                 {"session_id": session_id, "rids": released_rids},
+            )
+            self._write_journal_phase(
+                source, target, session_id, released_rids, "target_active", True
             )
             self._assert_source_idle_after_migration(records, source)
             self._post_worker(
@@ -2032,7 +2160,19 @@ class PDFlipController:
             )
         except Exception as exc:
             if not source_finished:
-                self._abort_two_phase_migration(source, target, session_id, records)
+                self._write_journal_phase(
+                    source, target, session_id, released_rids, "abort_intent"
+                )
+                abort_complete = self._abort_two_phase_migration(
+                    source, target, session_id, records
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    released_rids,
+                    "aborted" if abort_complete else "abort_incomplete",
+                )
             self._cleanup_source_after_failure(source, records)
             state_trace.append(
                 _monitor_state_record(
@@ -3156,6 +3296,25 @@ def _first_successful_response(response: Any) -> JsonDict:
     if responses and isinstance(responses[0], dict):
         return responses[0]
     return {}
+
+
+def _strict_migration_statuses(response: Any, session_id: str) -> List[JsonDict]:
+    responses = response if isinstance(response, list) else [response]
+    if not responses:
+        raise ValueError("migration status response is empty")
+    statuses = []
+    for item in responses:
+        if not isinstance(item, dict):
+            raise ValueError("migration status response item is not an object")
+        if item.get("success") is not True:
+            raise ValueError("migration status response item was unsuccessful")
+        status = item.get("status")
+        if not isinstance(status, dict):
+            raise ValueError("migration status response status is not an object")
+        if str(status.get("session_id")) != str(session_id):
+            raise ValueError("migration status response session id does not match")
+        statuses.append(status)
+    return statuses
 
 
 def _raise_if_unsuccessful(response: Any, step: str) -> None:

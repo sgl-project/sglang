@@ -21,6 +21,7 @@ def load_scheduler_methods():
     names = {
         "start_pd_flip_migration_source",
         "prepare_pd_flip_migration_target",
+        "prepare_pd_flip_migration_target_delta",
         "commit_pd_flip_migration_target",
         "activate_pd_flip_migration_target",
         "get_pd_flip_migration_status",
@@ -28,6 +29,8 @@ def load_scheduler_methods():
         "abort_pd_flip_migration",
         "_pd_flip_migration_status_dict",
         "_pd_flip_migration_request_measurements",
+        "_pd_flip_delta_manifest_signature",
+        "_pd_flip_record_sender_metric",
         "_pd_flip_migration_timing_debug",
         "_pd_flip_migration_index_debug",
         "_pd_flip_json_safe_timing",
@@ -71,6 +74,7 @@ def load_scheduler_methods():
     namespace = {
         "PDFlipMigrationReqOutput": Output,
         "DisaggregationMode": ForbiddenMode,
+        "json": json,
         "time": __import__("time"),
     }
     exec(compile(extracted, str(scheduler_path), "exec"), namespace)
@@ -91,10 +95,16 @@ class ReconciliationClient:
 
     def get_json(self, base_url, path):
         assert path == "/pd_flip/migration/status"
-        return {
-            "success": True,
-            "status": {"session_id": "s", "state": self.states[base_url]},
-        }
+        states = self.states[base_url]
+        if not isinstance(states, list):
+            states = [states]
+        return [
+            {
+                "success": True,
+                "status": {"session_id": "s", "state": state},
+            }
+            for state in states
+        ]
 
     def post_json(self, base_url, path, payload):
         assert payload["session_id"] == "s"
@@ -193,6 +203,31 @@ def test_reconcile_activates_ready_target_after_source_finished(tmp_path):
     assert controller.session_journal.read()["phase"] == "target_active"
 
 
+def test_reconcile_activates_only_when_every_dp_rank_is_ready(tmp_path):
+    controller, client = make_controller(
+        tmp_path,
+        ["source_released", "source_released"],
+        ["ready_to_activate", "ready_to_activate"],
+    )
+
+    assert controller.reconcile_session("s").success
+    assert client.steps == ["activate_target"]
+
+
+def test_reconcile_mixed_dp_target_states_require_operator(tmp_path):
+    controller, client = make_controller(
+        tmp_path,
+        ["source_released", "source_released"],
+        ["active", "ready_to_activate"],
+    )
+
+    result = controller.reconcile_session("s")
+
+    assert not result.success
+    assert "operator recovery" in result.message
+    assert client.steps == []
+
+
 def test_reconcile_does_not_repeat_active_session(tmp_path):
     controller, client = make_controller(tmp_path, "source_released", "active")
 
@@ -202,7 +237,15 @@ def test_reconcile_does_not_repeat_active_session(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "target_state", ["target_prepared", "transferred_held", "ready_to_activate"]
+    "target_state",
+    [
+        "target_prepared",
+        "target_transferred_held",
+        "target_delta_started",
+        "target_delta_transferred",
+        "ready_to_activate",
+        "target_failed",
+    ],
 )
 def test_reconcile_aborts_both_sides_before_source_release(tmp_path, target_state):
     controller, client = make_controller(tmp_path, "source_started", target_state)
@@ -212,6 +255,34 @@ def test_reconcile_aborts_both_sides_before_source_release(tmp_path, target_stat
     assert result.success
     assert client.steps == ["abort_target", "abort_source"]
     assert controller.session_journal.read()["phase"] == "aborted"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        [],
+        [None],
+        [{"success": False, "status": {"session_id": "s", "state": "active"}}],
+        [{"success": True}],
+        [{"success": True, "status": []}],
+        [{"success": True, "status": {"session_id": "other", "state": "active"}}],
+    ],
+)
+def test_strict_status_aggregation_rejects_invalid_rank_response(response):
+    with pytest.raises(ValueError):
+        controller_module._strict_migration_statuses(response, "s")
+
+
+@pytest.mark.parametrize("content", ["{broken", "[]", "null"])
+def test_reconcile_corrupt_journal_requires_operator_without_actions(tmp_path, content):
+    controller, client = make_controller(tmp_path, "source_released", "active")
+    controller.session_journal.path.write_text(content, encoding="utf-8")
+
+    result = controller.reconcile_session("s")
+
+    assert not result.success
+    assert "operator recovery" in result.message
+    assert client.steps == []
 
 
 def test_reconcile_requires_operator_for_ambiguous_ownership(tmp_path):
@@ -321,6 +392,71 @@ def test_worker_repeated_target_prepare_returns_existing_session_without_allocat
     assert output.status["state"] == "ready_to_activate"
 
 
+def test_worker_repeated_target_delta_prepare_is_signature_idempotent():
+    worker = worker_with_session("target", "target_delta_transferred")
+    manifests = [
+        {
+            "rid": "r0",
+            "pd_flip_session_id": "s",
+            "delta_from_len": 7,
+            "kv_committed_len": 9,
+        }
+    ]
+    worker.pd_flip_migration_session.update(
+        delta_manifests=manifests,
+        target_delta_manifest_signature=Scheduler._pd_flip_delta_manifest_signature(
+            manifests
+        ),
+    )
+    worker._pd_flip_target_pump_transfer = lambda _: pytest.fail("must not pump")
+
+    output = Scheduler.prepare_pd_flip_migration_target_delta(
+        worker,
+        Req(session_id="s", source_url="http://source", manifests=manifests),
+    )
+
+    assert output.success
+    assert output.manifests == manifests
+
+
+@pytest.mark.parametrize("session_id", [None, "other"])
+def test_worker_target_delta_prepare_rejects_missing_or_conflicting_session(session_id):
+    worker = worker_with_session("target", "target_transferred_held")
+    worker._pd_flip_target_pump_transfer = lambda _: pytest.fail("must not pump")
+
+    output = Scheduler.prepare_pd_flip_migration_target_delta(
+        worker,
+        Req(session_id=session_id, source_url="http://source", manifests=[]),
+    )
+
+    assert not output.success
+    assert worker.pd_flip_migration_session["state"] == "target_transferred_held"
+
+
+def test_worker_target_delta_prepare_rejects_different_signature_without_side_effects():
+    worker = worker_with_session("target", "target_delta_transferred")
+    previous = [{"rid": "r0", "kv_committed_len": 9}]
+    worker.pd_flip_migration_session.update(
+        delta_manifests=previous,
+        target_delta_manifest_signature=Scheduler._pd_flip_delta_manifest_signature(
+            previous
+        ),
+    )
+    worker._pd_flip_target_pump_transfer = lambda _: pytest.fail("must not pump")
+
+    output = Scheduler.prepare_pd_flip_migration_target_delta(
+        worker,
+        Req(
+            session_id="s",
+            source_url="http://source",
+            manifests=[{"rid": "r0", "kv_committed_len": 10}],
+        ),
+    )
+
+    assert not output.success
+    assert worker.pd_flip_migration_session["delta_manifests"] == previous
+
+
 def test_worker_status_rejects_conflicting_session_without_pump():
     worker = worker_with_session("source", "source_started")
     worker._pd_flip_source_pump_transfer = lambda _: pytest.fail("must not pump")
@@ -400,7 +536,10 @@ def test_worker_status_exports_real_request_measurement_fields():
                 "mooncake_bytes": 101,
                 "source_transfer_bytes": 202,
                 "delta_transfer_bytes": 33,
+                "source_transfer_duration_s": 0.2,
+                "delta_transfer_duration_s": 0.4,
                 "target_hicache_prefix_match_s": 0.1,
+                "target_hicache_restore_tokens": 2,
                 "final_owner": "target",
                 "timing_debug": {
                     "source_send_s": 0.2,
@@ -409,6 +548,7 @@ def test_worker_status_exports_real_request_measurement_fields():
                     "target_held_mono": 12.0,
                     "source_waiting_frozen_mono": 10.0,
                     "target_adopted_mono": 15.0,
+                    "target_hicache_restore_duration_s": 0.6,
                 },
             }
         },
@@ -425,9 +565,11 @@ def test_worker_status_exports_real_request_measurement_fields():
         "c1_tokens": 9,
         "stitch_mode": "partial_prefix_stitch",
         "mooncake_bytes": 101,
+        "mooncake_bytes_available": True,
         "source_bytes": 202,
         "delta_bytes": 33,
-        "mooncake_duration_seconds": 0.1,
+        "mooncake_restore_tokens": 2,
+        "mooncake_duration_seconds": 0.6,
         "source_duration_seconds": 0.2,
         "delta_duration_seconds": pytest.approx(0.4),
         "held_at_mono": 12.0,
@@ -450,8 +592,48 @@ def test_worker_status_measurement_missing_fields_are_stable():
     assert row["p_tokens"] == 0
     assert row["c0_tokens"] == 0
     assert row["mooncake_bytes"] is None
+    assert row["mooncake_bytes_available"] is False
     assert row["delta_duration_seconds"] is None
     assert row["final_owner"] is None
+
+
+@pytest.mark.parametrize(
+    ("segment", "metric_latency", "expected_duration"),
+    [("source", 0.25, 0.25), ("delta", None, 0.4)],
+)
+def test_worker_records_exact_sender_transfer_metric(
+    segment, metric_latency, expected_duration
+):
+    started_key = f"{segment}_transfer_started_mono"
+    completed_key = f"{segment}_transfer_completed_mono"
+    entry = {"timing_debug": {started_key: 10.0, completed_key: 10.4}}
+    sender = Req(
+        get_transfer_metric=lambda: Req(
+            transfer_total_bytes=4096,
+            transfer_latency_s=metric_latency,
+        )
+    )
+
+    Scheduler._pd_flip_record_sender_metric(entry, sender, segment)
+
+    assert entry[f"{segment}_transfer_bytes"] == 4096
+    assert entry[f"{segment}_transfer_duration_s"] == pytest.approx(
+        expected_duration
+    )
+
+
+def test_worker_sender_without_metric_api_keeps_bytes_unknown():
+    entry = {
+        "timing_debug": {
+            "source_transfer_started_mono": 10.0,
+            "source_transfer_completed_mono": 10.5,
+        }
+    }
+
+    Scheduler._pd_flip_record_sender_metric(entry, Req(), "source")
+
+    assert entry["source_transfer_bytes"] is None
+    assert entry["source_transfer_duration_s"] == 0.5
 
 
 def test_controller_progressive_observability_uses_raw_policy_and_slo_counts(tmp_path):
@@ -473,3 +655,152 @@ def test_controller_progressive_observability_uses_raw_policy_and_slo_counts(tmp
         "decode_slo_good": 19,
         "decode_slo_total": 20,
     }
+
+
+def legacy_two_phase_scenario(
+    tmp_path, *, transfer_result="complete", fail_source_abort=False
+):
+    journal_path = tmp_path / "legacy-session.json"
+    config = controller_module.PDClusterConfig(
+        router_url="http://router",
+        nodes=[
+            controller_module.PDNode("source", "http://source", "source"),
+            controller_module.PDNode("target", "http://target", "target"),
+        ],
+        session_journal_path=str(journal_path),
+    )
+    controller = controller_module.PDFlipController(config, client=object())
+    source = controller_module.NodeMetrics(
+        "source", "http://source", "source", worker_role="decode"
+    )
+    target = controller_module.NodeMetrics(
+        "target", "http://target", "target", worker_role="decode"
+    )
+    observed_phases = []
+
+    controller.collect_metrics = lambda: [source, target]
+    controller._post_router = lambda *args, **kwargs: {"success": True}
+    controller._observe_source_quiesce_for_duration = lambda *args, **kwargs: None
+    controller._wait_two_phase_migration_or_recovery = (
+        lambda **kwargs: transfer_result
+    )
+    controller._sync_two_phase_delta_before_commit = lambda **kwargs: None
+    controller._assert_source_idle_after_migration = lambda *args, **kwargs: None
+    controller._cleanup_source_after_failure = lambda *args, **kwargs: None
+
+    def post_worker(records, step, node, path, payload):
+        record = controller.session_journal.read()
+        observed_phases.append((path, record and record.get("phase")))
+        if fail_source_abort and path == "/pd_flip/migration/abort":
+            raise RuntimeError("source abort failed")
+        if path == "/pd_flip/migration/source/start":
+            return {
+                "success": True,
+                "manifests": [{"rid": "r0"}, {"rid": "waiting-r1"}],
+            }
+        return {"success": True}
+
+    controller._post_worker = post_worker
+    monitor = Req(
+        collect_cluster=lambda _: Req(
+            prefill_slo_attainment=0.0, decode_slo_attainment=1.0
+        )
+    )
+    return controller, source, target, monitor, observed_phases
+
+
+def test_legacy_two_phase_journals_every_ownership_action_with_full_batch(tmp_path):
+    controller, source, target, monitor, phases = legacy_two_phase_scenario(tmp_path)
+
+    result = controller._execute_d_to_p_two_phase(
+        source=source,
+        target=target,
+        slo_monitor=monitor,
+        enter_threshold=0.9,
+        exit_threshold=0.9,
+        commit_threshold=0.9,
+    )
+
+    assert result.success
+    assert dict(phases)["/pd_flip/migration/target/commit"] == "target_commit_intent"
+    assert dict(phases)["/pd_flip/migration/source/finish"] == "source_finish_intent"
+    assert dict(phases)["/pd_flip/migration/target/activate"] == "target_activate_intent"
+    record = controller.session_journal.read()
+    assert record["batch_rids"] == ["r0", "waiting-r1"]
+    assert record["phase"] == "target_active"
+    assert record["source_finished"] is True
+
+
+def test_legacy_two_phase_recovery_journals_abort_with_full_batch(tmp_path):
+    controller, source, target, monitor, phases = legacy_two_phase_scenario(
+        tmp_path, transfer_result="recovered"
+    )
+
+    result = controller._execute_d_to_p_two_phase(
+        source=source,
+        target=target,
+        slo_monitor=monitor,
+        enter_threshold=0.9,
+        exit_threshold=0.9,
+        commit_threshold=0.9,
+    )
+
+    assert result.success
+    abort_phases = [phase for path, phase in phases if path.endswith("/abort")]
+    assert abort_phases == ["abort_intent", "abort_intent"]
+    record = controller.session_journal.read()
+    assert record["batch_rids"] == ["r0", "waiting-r1"]
+    assert record["phase"] == "aborted"
+    assert record["source_finished"] is False
+
+
+def test_legacy_two_phase_partial_abort_requires_operator_recovery(tmp_path):
+    controller, source, target, monitor, _ = legacy_two_phase_scenario(
+        tmp_path, transfer_result="recovered", fail_source_abort=True
+    )
+
+    result = controller._execute_d_to_p_two_phase(
+        source=source,
+        target=target,
+        slo_monitor=monitor,
+        enter_threshold=0.9,
+        exit_threshold=0.9,
+        commit_threshold=0.9,
+    )
+
+    assert not result.success
+    assert "operator recovery" in result.message
+    assert controller.session_journal.read()["phase"] == "abort_incomplete"
+
+
+def test_progressive_abort_keeps_source_verified_full_batch(tmp_path):
+    controller, _ = make_controller(tmp_path, "source_started", "target_prepared")
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+
+    def post_worker(records, step, node, path, payload):
+        if path == "/pd_flip/migration/source/start":
+            return {
+                "success": True,
+                "manifests": [{"rid": "r0"}, {"rid": "waiting-r1"}],
+            }
+        return {"success": True}
+
+    controller._post_worker = post_worker
+    controller._wait_migration = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("interrupt after source verification")
+    )
+    controller._abort_two_phase_migration = lambda *args, **kwargs: True
+
+    with pytest.raises(controller_module.ProgressiveAtomicBatchError):
+        controller._execute_atomic_batch(
+            source,
+            target,
+            "s",
+            ["r0"],
+            True,
+        )
+
+    record = controller.session_journal.read()
+    assert record["batch_rids"] == ["r0", "waiting-r1"]
+    assert record["phase"] == "aborted"
