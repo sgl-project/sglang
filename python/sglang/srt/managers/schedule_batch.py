@@ -965,10 +965,16 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
 
+        self.spec_num_block_accept_tokens = 0
+
+        self.spec_num_cap_tokens = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_correct_drafts_histogram: List[int] = []
+
+        self.spec_cap_lens_histogram: List[int] = []
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
@@ -1093,6 +1099,14 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def update_spec_cap_lens_histogram(self, cap_len: int):
+        cap_len = int(cap_len)
+        if len(self.spec_cap_lens_histogram) <= cap_len:
+            self.spec_cap_lens_histogram.extend(
+                [0] * (cap_len - len(self.spec_cap_lens_histogram) + 1)
+            )
+        self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -1865,6 +1879,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
+    spec_verify_tier_num_tokens: int = -1
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1910,6 +1925,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
