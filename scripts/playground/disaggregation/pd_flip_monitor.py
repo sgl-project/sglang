@@ -72,8 +72,21 @@ class ClusterSLOSnapshot:
     prefill_slo_attainment: Optional[float]
     decode_slo_attainment: Optional[float]
     nodes: List[NodeSLOSample]
-    prefill_counts: SampleCounts
-    decode_counts: SampleCounts
+    prefill_counts: Optional[SampleCounts] = None
+    decode_counts: Optional[SampleCounts] = None
+
+    def __post_init__(self) -> None:
+        if self.prefill_counts is not None and self.decode_counts is not None:
+            return
+        prefill_counts, decode_counts = _aggregate_slo_counts(self.nodes)
+        if self.prefill_counts is None:
+            object.__setattr__(self, "prefill_counts", prefill_counts)
+            object.__setattr__(
+                self, "prefill_slo_attainment", prefill_counts.attainment
+            )
+        if self.decode_counts is None:
+            object.__setattr__(self, "decode_counts", decode_counts)
+            object.__setattr__(self, "decode_slo_attainment", decode_counts.attainment)
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -95,14 +108,7 @@ class SLOWindow:
 
         prefill_nodes = {sample.name for sample in self.samples if sample.role == "prefill"}
         decode_nodes = {sample.name for sample in self.samples if sample.role == "decode"}
-        prefill_counts = _sum_counts(
-            sample.ttft for sample in self.samples if sample.role == "prefill"
-        )
-        if prefill_counts.total <= 0 and prefill_nodes:
-            prefill_counts = _sum_counts(sample.ttft for sample in self.samples)
-        decode_counts = _sum_counts(
-            sample.tpot for sample in self.samples if sample.role == "decode"
-        )
+        prefill_counts, decode_counts = _aggregate_slo_counts(self.samples)
         return ClusterSLOSnapshot(
             timestamp=timestamp,
             prefill_nodes=len(prefill_nodes),
@@ -292,6 +298,23 @@ def _sum_counts(counts: Iterable[SampleCounts]) -> SampleCounts:
         good += count.good
         total += count.total
     return SampleCounts(good=good, total=total)
+
+
+def _aggregate_slo_counts(
+    samples: Iterable[NodeSLOSample],
+) -> Tuple[SampleCounts, SampleCounts]:
+    samples = list(samples)
+    prefill_counts = _sum_counts(
+        sample.ttft for sample in samples if sample.role == "prefill"
+    )
+    if prefill_counts.total <= 0 and any(
+        sample.role == "prefill" for sample in samples
+    ):
+        prefill_counts = _sum_counts(sample.ttft for sample in samples)
+    decode_counts = _sum_counts(
+        sample.tpot for sample in samples if sample.role == "decode"
+    )
+    return prefill_counts, decode_counts
 
 
 def build_parser() -> argparse.ArgumentParser:

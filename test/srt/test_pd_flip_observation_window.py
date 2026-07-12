@@ -31,6 +31,7 @@ def test_reset_window_excludes_triggering_samples():
     monitor.reset_window()
     snapshot = monitor.window.snapshot(timestamp=2.0)
 
+    assert monitor.window.window_seconds == 10.0
     assert snapshot.prefill_counts == m.SampleCounts()
     assert snapshot.decode_counts == m.SampleCounts()
 
@@ -49,3 +50,58 @@ def test_snapshot_attainment_uses_aggregate_sample_counts():
 
     assert snapshot.prefill_counts == m.SampleCounts(1, 10)
     assert snapshot.prefill_slo_attainment == 0.1
+
+
+def test_legacy_snapshot_constructor_infers_counts_from_nodes():
+    m = load_monitor_module()
+    nodes = [
+        m.NodeSLOSample(
+            1.0,
+            "p0",
+            "prefill",
+            ttft=m.SampleCounts(0, 0),
+        ),
+        m.NodeSLOSample(
+            1.0,
+            "d0",
+            "decode",
+            ttft=m.SampleCounts(3, 4),
+            tpot=m.SampleCounts(8, 10),
+        ),
+    ]
+
+    snapshot = m.ClusterSLOSnapshot(
+        timestamp=1.0,
+        prefill_nodes=1,
+        decode_nodes=1,
+        prefill_slo_attainment=None,
+        decode_slo_attainment=None,
+        nodes=nodes,
+    )
+
+    assert snapshot.prefill_counts == m.SampleCounts(3, 4)
+    assert snapshot.decode_counts == m.SampleCounts(8, 10)
+    assert snapshot.prefill_slo_attainment == 0.75
+    assert snapshot.decode_slo_attainment == 0.8
+
+
+def test_snapshot_constructor_preserves_explicit_counts():
+    m = load_monitor_module()
+    explicit_prefill = m.SampleCounts(1, 2)
+    explicit_decode = m.SampleCounts(2, 5)
+
+    snapshot = m.ClusterSLOSnapshot(
+        timestamp=1.0,
+        prefill_nodes=0,
+        decode_nodes=0,
+        prefill_slo_attainment=0.5,
+        decode_slo_attainment=0.4,
+        nodes=[],
+        prefill_counts=explicit_prefill,
+        decode_counts=explicit_decode,
+    )
+
+    assert snapshot.prefill_counts is explicit_prefill
+    assert snapshot.decode_counts is explicit_decode
+    assert snapshot.prefill_slo_attainment == 0.5
+    assert snapshot.decode_slo_attainment == 0.4
