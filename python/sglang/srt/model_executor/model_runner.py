@@ -135,6 +135,9 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     report_online_quantization,
     resolve_sliding_window_size,
 )
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    maybe_disable_chunked_prefix_cache,
+)
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
@@ -237,31 +240,6 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
-
-
-def maybe_disable_chunked_prefix_cache(
-    *, server_args: ServerArgs, use_mla_backend: bool, is_draft_worker: bool
-) -> None:
-    # Chunked prefix caching requires an MLA model on a backend whose
-    # kernels read that layout. This is a load-time gate, not a
-    # resolution-time one: out-of-tree platforms register their supported
-    # backends in init_backend(), which runs when this module is imported
-    # — after ServerArgs.__post_init__. Target runner only: a draft
-    # model's (often non-MLA) config must not flip the shared setting.
-    if is_draft_worker:
-        return
-    if (
-        not use_mla_backend
-        or server_args.attention_backend
-        not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-    ):
-        if not server_args.disable_chunked_prefix_cache:
-            server_args.override(
-                "model_runner.chunked_prefix_cache_gate",
-                disable_chunked_prefix_cache=True,
-            )
-    if not server_args.disable_chunked_prefix_cache:
-        logger.info("Chunked prefix cache is turned on.")
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
