@@ -991,6 +991,20 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # jit_kernel port of the flashinfer trtllm mnnvl fused allreduce
+    # (+residual add +rmsnorm) with a small-batch specialization. Opt-in;
+    # only the oneshot bf16 decode regime is routed, everything else stays
+    # on the stock flashinfer path.
+    SGLANG_JIT_MNNVL_AR = EnvBool(False)
+    # Use the bs<=8-specialized kernel flavor (constant-folded dims,
+    # spin-hidden prefetch, block-arrival barrier); uncovered shapes fall
+    # back to the verbatim port inside the same call.
+    SGLANG_JIT_MNNVL_AR_OPT = EnvBool(False)
+    # Restrict the jit route to one call site: "all" | "attn" | "moe".
+    SGLANG_JIT_MNNVL_AR_SCOPE = EnvStr("all")
+    # Debug: compile the verbatim-port module even when _OPT is set.
+    SGLANG_JIT_MNNVL_AR_USE_STOCK_MODULE = EnvBool(False)
+
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
     # Plugin system
