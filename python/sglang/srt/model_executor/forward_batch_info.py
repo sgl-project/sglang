@@ -491,6 +491,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
+    # Token count before DP padding; used to unpad after MLP sync.
+    original_num_tokens: Optional[int] = None
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # For logits and logprobs post processing
@@ -1359,7 +1361,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         # Token count before DP padding; used to unpad after MLP sync.
-        self.orig_num_tokens = self.input_ids.shape[0]
+        self.original_num_tokens = self.input_ids.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
@@ -1474,11 +1476,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
-                # STANDALONE has no hidden_states_backup; use orig_num_tokens.
+                # STANDALONE has no hidden_states_backup; use original_num_tokens.
                 num_tokens = (
                     self.hidden_states_backup.shape[0]
                     if self.hidden_states_backup is not None
-                    else self.orig_num_tokens
+                    else self.original_num_tokens
                 )
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
