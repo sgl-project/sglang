@@ -159,8 +159,14 @@ def test_report_counts_reused_proofs_and_main_accepts_the_flag(
     base, shas = _chain(repo, [_MSG])
     _write_stub_proof(proof, shas[0])
     cli_args = [
-        "--base", base, "--branch", "chain",
-        "--proof", str(proof), "--repo-root", str(repo),
+        "--base",
+        base,
+        "--branch",
+        "chain",
+        "--proof",
+        str(proof),
+        "--repo-root",
+        str(repo),
     ]
 
     assert main(cli_args) == 0
