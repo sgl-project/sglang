@@ -526,7 +526,15 @@ class ModelRunner:
 
         # Expert parallelism
         self.eplb_manager = (
-            EPLBManager(self)
+            EPLBManager(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                ps=self.ps,
+                get_model=lambda: self.model,
+                get_expert_location_updater=lambda: self.expert_location_updater,
+                get_expert_backup_client=lambda: self.expert_backup_client,
+                get_weight_updater=lambda: self.weight_updater,
+            )
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
@@ -556,7 +564,13 @@ class ModelRunner:
 
         # Load the expert backup client
         self.expert_backup_client = (
-            ExpertBackupClient(self.server_args, self)
+            ExpertBackupClient(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                moe_ep_size=self.ps.moe_ep_size,
+                moe_ep_rank=self.ps.moe_ep_rank,
+                get_model=lambda: self.model,
+            )
             if (
                 self.server_args.enable_elastic_expert_backup
                 and self.server_args.elastic_ep_backend is not None
