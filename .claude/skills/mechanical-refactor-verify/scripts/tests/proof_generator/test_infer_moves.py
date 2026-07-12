@@ -380,3 +380,48 @@ def test_infer_recipe_class_move_between_existing_files(repo: Path) -> None:
     assert [mv["name"] for mv in recipe.moves] == ["Payload"]
     assert recipe.moves[0]["from_class"] is None
     assert recipe.moves[0]["into_class"] is None
+
+
+def test_infer_recipe_move_leaving_a_forwarding_delegate(repo: Path) -> None:
+    """A same-named stub re-added to the source infers leave_delegate on the move."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    def work(self, x):\n"
+                "        return x + 1\n"
+            ),
+            "comp.py": "class C:\n    def keep(self):\n        return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    def work(self, x):\n"
+                "        return self.comp.work(x)\n"
+            ),
+            "comp.py": (
+                "class C:\n"
+                "    def keep(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def work(self, x):\n"
+                "        return x + 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move M.work onto C, leaving a delegate")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [mv["name"] for mv in recipe.moves] == ["work"]
+    assert recipe.moves[0]["dst"] == "comp.py"
+    assert recipe.moves[0]["leave_delegate"] == "comp"
+    assert recipe.moves[0]["delegate_name"] is None
+    script = recipe_to_script(recipe, "move with delegate")
+    assert "leave_delegate='comp'" in script

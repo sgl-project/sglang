@@ -121,6 +121,29 @@ def _enclosing_class_of_def(tree: ast.AST, name: str) -> str | None:
     return None
 
 
+def _delegate_stub_attr(tree: ast.AST, name: str) -> tuple[str, str] | None:
+    """The component attribute a forwarding stub ``def name``: ``return self.<attr>.<m>(...)``
+    delegates through, with the forwarded method name -- None when no such stub exists."""
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
+            continue
+        if (
+            len(node.body) == 1
+            and isinstance(node.body[0], ast.Return)
+            and isinstance(node.body[0].value, ast.Call)
+            and isinstance(node.body[0].value.func, ast.Attribute)
+            and isinstance(node.body[0].value.func.value, ast.Attribute)
+            and isinstance(node.body[0].value.func.value.value, ast.Name)
+            and node.body[0].value.func.value.value.id == "self"
+        ):
+            return (node.body[0].value.func.value.attr, node.body[0].value.func.attr)
+        return None
+    return None
+
+
 def _nested_in_function(tree: ast.AST, name: str) -> bool:
     target = rr._find_def(tree, name)
     if target is None:
@@ -645,8 +668,15 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         src = next(
             (p for p, f in files.items() if name in def_names(f["removed"])), None
         )
-        dst = next((p for p, f in files.items() if name in def_names(f["added"])), None)
-        if src is None or dst is None or src == dst or dst in new_files:
+        dst = next(
+            (
+                p
+                for p, f in files.items()
+                if name in def_names(f["added"]) and p != src
+            ),
+            None,
+        )
+        if src is None or dst is None or dst in new_files:
             continue
         src_before = _git_output(["show", f"{commit}^:{src}"], root)
         if _nested_in_function(ast.parse(src_before), name):
@@ -678,6 +708,18 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             continue
         src_indent = src_indent or 0
         dst_indent = dst_indent or 0
+        # A same-named def re-added to the source is a forwarding delegate the move
+        # leaves behind: a body of exactly `return self.<attr>.<name>(...)` names the
+        # component attribute move_symbol authors the stub through.
+        leave_delegate = None
+        delegate_name = None
+        if name in def_names(files[src]["added"]):
+            src_after_tree = ast.parse(_git_output(["show", f"{commit}:{src}"], root))
+            stub = _delegate_stub_attr(src_after_tree, name)
+            if stub is not None:
+                leave_delegate, forwarded = stub
+                if forwarded != name:
+                    delegate_name = forwarded
         recipe.moves.append(
             {
                 "name": name,
@@ -689,6 +731,8 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "dst_order": dst_def.lineno if dst_def else 0,
                 "before": _next_sibling_def_name(dst_tree, name, into_class),
                 "drop_self_annotation": _self_annotation_dropped(src_def, dst_def),
+                "leave_delegate": leave_delegate,
+                "delegate_name": delegate_name,
             }
         )
         if src_class is not None:
@@ -706,6 +750,72 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             _infer_function_scoped_repaths(
                 recipe, files, name=name, src=src, dst=dst, commit=commit, root=root
             )
+
+    # A method whose signature line never changed leaves no def-line in the removed set:
+    # the body was replaced by a forwarding stub in place while the full body landed in
+    # another file. Detect it from the destination's added def + the source's after-state
+    # delegate stub.
+    for name in sorted(def_names(all_added) - def_names(all_removed)):
+        dst = next(
+            (p for p, f in files.items() if name in def_names(f["added"])), None
+        )
+        if dst is None or dst in new_files:
+            continue
+        src = None
+        stub_info = None
+        for p in files:
+            if p == dst:
+                continue
+            try:
+                after_tree = ast.parse(_git_output(["show", f"{commit}:{p}"], root))
+                before_tree = ast.parse(_git_output(["show", f"{commit}^:{p}"], root))
+            except Exception:
+                continue
+            stub = _delegate_stub_attr(after_tree, name)
+            if stub is None:
+                continue
+            full_before = rr._find_def(before_tree, name)
+            if full_before is None or _delegate_stub_attr(before_tree, name):
+                continue
+            src, stub_info = p, stub
+            break
+        if src is None:
+            continue
+        src_before = _git_output(["show", f"{commit}^:{src}"], root)
+        src_tree = ast.parse(src_before)
+        dst_tree = ast.parse(_git_output(["show", f"{commit}:{dst}"], root))
+        src_class = _enclosing_class_of_def(src_tree, name)
+        dst_indent = _def_indent(files[dst]["added"], name)
+        into_class = (
+            None if dst_indent == 0 else _enclosing_class_of_def(dst_tree, name)
+        )
+        try:
+            src_def = rr._find_unique_def(
+                src_tree, name, from_class=src_class, where=src
+            )
+            dst_def = rr._find_unique_def(
+                dst_tree, name, from_class=into_class, where=dst
+            )
+        except AssertionError as exc:
+            recipe.supported = False
+            recipe.notes.append(f"{name}: cannot disambiguate moved def ({exc})")
+            continue
+        leave_delegate, forwarded = stub_info
+        recipe.moves.append(
+            {
+                "name": name,
+                "src": src,
+                "dst": dst,
+                "into_class": into_class,
+                "from_class": src_class,
+                "dedent": (src_def.col_offset or 0) - (dst_indent or 0),
+                "dst_order": dst_def.lineno if dst_def else 0,
+                "before": _next_sibling_def_name(dst_tree, name, into_class),
+                "drop_self_annotation": _self_annotation_dropped(src_def, dst_def),
+                "leave_delegate": leave_delegate,
+                "delegate_name": forwarded if forwarded != name else None,
+            }
+        )
 
     # Module-level imports a file gained or lost are realised directly from the symmetric
     # base<->target diff: a gained name is added (the destination needs the moved code's
@@ -804,6 +914,8 @@ def _recipe_ops(recipe: Recipe) -> list:
                     "dedent": mv["dedent"],
                     "drop_self_annotation": mv["drop_self_annotation"],
                     "before": mv.get("before"),
+                    "leave_delegate": mv.get("leave_delegate"),
+                    "delegate_name": mv.get("delegate_name"),
                 },
             )
         )
