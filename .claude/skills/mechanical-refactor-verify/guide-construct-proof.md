@@ -12,12 +12,12 @@
 
 ```bash
 # a range: write a self-contained folder for every mechanical_provable commit
-python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor.py construct \
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py \
     <base>..<tip> --match '(?<!_)mechanical_provable' --out repro_out
 ```
 
-- `construct` dispatches to `mechanical_refactor_proof_generator.py` (same arguments),
-  which infers each recipe from a commit's diff and before-state AST.
+- `mechanical_refactor_proof_generator.py` infers each recipe from a commit's diff and
+  before-state AST.
 - It emits and runs a standalone, auditable script per commit — no one hand-writes it.
 
 ### 1.2 The folder product
@@ -77,7 +77,7 @@ gh gist create --desc "mechanical-move proof for PR #NNNN" \
 
 ```bash
 # one commit: print the inferred script and run it (non-zero exit unless PASS)
-python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor.py split <commit>
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <commit>
 ```
 
 #### 2.2.1 What the inference covers

@@ -62,8 +62,6 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
     --base <base-commit> --branch <pr-branch-name> --proof path/to/proof/folder
 ```
 
-- The unified entry `scripts/mechanical_refactor.py verify` dispatches here with the
-  same arguments; the two forms are equivalent.
 - `--base` / `--branch`: any commit-ish; both must resolve, `base` must be an ancestor of
   `branch`.
 - `--proof`: the proof folder (must exist) — typically the generator's `--out` product
