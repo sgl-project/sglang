@@ -700,7 +700,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend
     writes, the max_running_requests fill and the validations stay in the
     hook at its legacy slot."""
-    from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
     model_arch = hf_config.architectures[0]
@@ -734,19 +733,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use flashinfer_trtllm_routed as MoE runner backend for "
                 f"{model_arch} hybrid FP8+NVFP4 checkpoint."
             )
-        elif model_config.is_fp4_experts and not envs.SGLANG_DSV4_FP4_DEQUANT.get():
-            if is_sm100_supported():
-                overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-                logger.info(
-                    "Use flashinfer_mxfp4 as MoE runner backend for "
-                    f"{model_arch} packed-FP4 checkpoint on SM100."
-                )
-            elif is_sm90_supported() or is_sm120_supported():
-                overrides["moe_runner_backend"] = "marlin"
-                logger.info(
-                    "Use marlin as MoE runner backend for "
-                    f"{model_arch} packed-FP4 checkpoint on SM90/SM120."
-                )
     return overrides
 
 
@@ -1977,6 +1963,53 @@ def _a2a_backend_overrides(view: Any) -> dict:
         )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
+    return {}
+
+
+@register_post_process
+def _deepseek_v4_fp4_moe_runner(view: Any) -> dict:
+    """Resolve packed-FP4 DeepSeek-V4 runners after A2A normalization.
+
+    Any non-``none`` A2A backend owns its runner selection: keeping the
+    user-requested ``auto`` lets DeepEP select DeepGEMM internally and lets
+    MegaMoE bypass the regular runner. The hardware-specific runners are only
+    valid for the standard no-A2A path.
+    """
+    from sglang.srt.environ import envs
+
+    model_config = view.get_model_config()
+    if model_config.hf_config.architectures[0] != "DeepseekV4ForCausalLM":
+        return {}
+    if view._server_args.moe_runner_backend != "auto":
+        return {}
+    if (
+        model_config.nvfp4_moe_meta is not None
+        or not model_config.is_fp4_experts
+        or envs.SGLANG_DSV4_FP4_DEQUANT.get()
+    ):
+        return {}
+
+    if view.moe_a2a_backend != "none":
+        # The SM120 pass runs before A2A normalization. Restore auto when its
+        # provisional Marlin override would otherwise mask distributed A2A.
+        if view.moe_runner_backend == "marlin":
+            return {"moe_runner_backend": "auto"}
+        return {}
+
+    if view.moe_runner_backend != "auto":
+        return {}
+    if is_sm100_supported():
+        logger.info(
+            "Use flashinfer_mxfp4 as MoE runner backend for "
+            "DeepseekV4ForCausalLM packed-FP4 checkpoint on SM100."
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
+    if is_sm90_supported() or is_sm120_supported():
+        logger.info(
+            "Use marlin as MoE runner backend for "
+            "DeepseekV4ForCausalLM packed-FP4 checkpoint on SM90/SM120."
+        )
+        return {"moe_runner_backend": "marlin"}
     return {}
 
 
