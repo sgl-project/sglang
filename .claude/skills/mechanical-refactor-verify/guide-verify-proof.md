@@ -14,6 +14,8 @@
 
 - The run *is* the proof — it replays the primitives from the base commit and byte-diffs
   against the target in a throwaway worktree.
+- The script prints the verdict and exits 0 only on PASS (a residual exits non-zero), so
+  a harness can consume the exit code.
 - Do not trust a pasted verdict you did not re-run.
 
 ## 2. Read the verdict

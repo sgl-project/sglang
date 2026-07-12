@@ -8,7 +8,8 @@ imports were repathed, and the symmetric module-level import diff each file gain
 (realised directly with add_import / remove_imported_name, since an import diff is always
 whitelisted).
 ``recipe_to_script`` emits a standalone ``repro_scripts/<sha>.py`` (importing only the
-reproduce util); running it reproduces the commit and diffs it byte-for-byte.
+reproduce util); running it reproduces the commit, diffs it byte-for-byte, and exits
+non-zero unless the diff is empty (PASS).
 ``generate_range`` writes a whole folder (scripts + output.log + output.html) for a range.
 
 Handles a method moved onto an existing class (call sites lowered), a method moved to a
@@ -817,7 +818,7 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
     for method, args, kwargs in _recipe_ops(recipe):
         rendered = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
         lines.append(f"r.{method}(" + ", ".join(rendered) + ")")
-    lines += ["r.run()", ""]
+    lines += ["residual = r.run()", "sys.exit(1 if residual else 0)", ""]
     return "\n".join(lines)
 
 
