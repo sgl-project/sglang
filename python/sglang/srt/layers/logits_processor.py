@@ -21,9 +21,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.kernels.ops.activation.softcap import (
+    softcap_inplace_logits as fused_softcap,
+)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
-from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -34,8 +36,6 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,
@@ -49,8 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -62,6 +61,74 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+_UNQUANTIZED_LM_HEAD_METHODS = {
+    "UnquantizedEmbeddingMethod",
+    "UnquantizedLinearMethod",
+    "PackWeightMethod",
+}
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # Some draft models share an unquantized target lm_head tensor while still
+    # carrying the draft model's stale ModelOpt quant_method. Only use the
+    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if method_name == "ModelOptFp4LinearMethod":
+        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        ):
+            return True
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale_interleaved",
+                "alpha",
+                "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptNvFp4A16LinearMethod":
+        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptFp8LinearMethod":
+        return (
+            lm_head.weight.dtype == torch.float8_e4m3fn
+            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
+
+    return True
+
 
 # When set, LogitsProcessor.forward returns an empty output and skips the
 # LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
@@ -269,8 +336,8 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
-        self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
+        self.use_attn_tp_group = get_server_args().enable_dp_lm_head
+        self.use_fp32_lm_head = get_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -294,7 +361,8 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        self.enable_mis = get_global_server_args().enable_mis
+        self.enable_mis = get_server_args().enable_mis
+        self.rl_on_policy_target = get_server_args().rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -870,7 +938,7 @@ class LogitsProcessor(nn.Module):
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
-            if not _is_npu:
+            if not (_is_npu or _is_cpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(
@@ -885,23 +953,12 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
-        elif (
-            getattr(lm_head, "quant_method", None) is not None
-            and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
-            and not isinstance(lm_head.quant_method, PackWeightMethod)
-        ):
-            if self.use_fp32_lm_head:
-                with torch.cuda.amp.autocast(enabled=False):
-                    logits = lm_head.quant_method.apply(
-                        lm_head, hidden_states.to(torch.float32), embedding_bias
-                    )
-            else:
-                logits = lm_head.quant_method.apply(
-                    lm_head, hidden_states, embedding_bias
-                )
+        elif should_apply_lm_head_quant_method(lm_head, quant_method):
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:
@@ -915,7 +972,7 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
-            elif get_global_server_args().rl_on_policy_target is not None:
+            elif self.rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
@@ -997,14 +1054,19 @@ class LogitsProcessor(nn.Module):
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer
-        # The shared logits buffer is keyed by vocab width; skip it when this
-        # model's vocab doesn't match (e.g. hot-vocab draft vs full-vocab target).
-        if logits_buffer is not None and logits_buffer.shape[-1] == self.vocab_size:
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        logits_width = logits.shape[-1]
+        # The shared logits buffer is keyed by vocab width and rows; skip it
+        # when this batch has a different logits shape than the graph buffer.
+        if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
+            logits.shape
+        ):
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.vocab_size])
+            logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
-            logits = logits[:, : self.vocab_size].float()
+            logits = logits.float()
         return logits
 
     def _get_dllm_logits(

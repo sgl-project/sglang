@@ -59,8 +59,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of logical expert IDs per batch when submitting P2P ops during EPLB rebalance on ROCm. Smaller values prevent RCCL GPU-side accumulation hangs but increase overhead.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of expert IDs per batch when submitting P2P ops during EPLB rebalance (CUDA and ROCm). Smaller values prevent NCCL/RCCL GPU-side accumulation hangs but increase overhead; set <code>&gt;= num_physical_experts</code> to submit a single batch. Deprecated alias: <code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>32</code></td>
     </tr>
     <tr>
@@ -520,16 +520,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tie-break mode for FlashInfer DSA topk when <code>--dsa-topk-backend=flashinfer</code>: unset disables explicit tie-breaking, <code>small</code> prefers the smaller candidate index for equal scores, and <code>large</code> prefers the larger candidate index for equal scores. Setting this variable makes FlashInfer use deterministic topk.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Precompute metadata that can be shared among different draft steps when MTP is enabled. <code>SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA</code> is a deprecated alias.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_FUSED_METADATA_COPY</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use fused metadata copy kernel for cuda graph replay</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code></td>

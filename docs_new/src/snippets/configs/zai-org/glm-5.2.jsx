@@ -97,10 +97,6 @@ sgl-eval run aime25 \\
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
-    // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
-    "b200|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "b300|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
-    "gb300|nvfp4": "lmsysorg/sglang:dev-glm52-nvfp4",
   },
 
   github: {
@@ -164,7 +160,48 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 5: "Hierarchical KV Cache" -----
+    // ----- Card 5: "PD Disaggregation" -----
+    // GLM-5.2 is a DSA model (same family as DeepSeek-V3.2/V4) and supports
+    // prefill/decode disaggregation. Owns the `--disaggregation-*` flags; the
+    // engine also pins role-specific serving ports (spaced apart) so prefill +
+    // decode don't collide on one host.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        // Mooncake (recommended). The NCCL/MNNVL env is only needed on the
+        // NVLink-multinode Grace-Blackwell platform (GB300 here).
+        { id: "mooncake", label: "Mooncake",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+          ],
+          envWhen: { hw: ["gb300"] } },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      // No IB-device knob: mooncake auto-detects the HCA. Pass
+      // --disaggregation-ib-device only if discovery picks the wrong NIC
+      // (see Configuration Tips).
+      // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       backends: [
         { id: null,       label: "Auto" },
@@ -627,7 +664,6 @@ sgl-eval run aime25 \\
     // high-throughput add DP-Attention (dp8). low-latency uses MTP 5-1-6, balanced MTP 2-1-3.
     // GB300: 4-GPU single node, TP4 (the node fits the ~381 GB build); GB300 adds dp4 on
     // balanced & high-throughput; low-latency uses MTP 5-1-6.
-    // Blackwell NVFP4 measured on the dev-glm52-nvfp4 preview image.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -702,6 +738,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -764,6 +805,11 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
+        "--kv-cache-dtype fp8_e4m3",
+        "--bf16-gemm-backend cutedsl",
+        "--max-running-requests 16",
+        "--cuda-graph-max-bs 16",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

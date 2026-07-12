@@ -19,7 +19,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -52,46 +52,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
-
-    def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
-        """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if (
-            not forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-            or self.is_draft_worker
-        ):
-            return
-        if (
-            forward_batch.mamba_clear_indices is not None
-            and len(forward_batch.mamba_clear_indices) > 0
-        ):
-            # mamba_pool is a pure PHYSICAL store; translate before zeroing or
-            # clear_slots zeroes the wrong physical slots.
-            self.req_to_token_pool.mamba_pool.clear_slots(
-                self._translate_mamba_indices(forward_batch.mamba_clear_indices)
-            )
-        if (
-            forward_batch.mamba_cow_src_indices is not None
-            and len(forward_batch.mamba_cow_src_indices) > 0
-        ):
-            ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
-            if ckpt_pool is not None:
-                # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
-                ckpt_pool.load_to_active(
-                    self.req_to_token_pool.mamba_pool,
-                    forward_batch.mamba_cow_src_indices,
-                    forward_batch.mamba_cow_dst_indices,
-                )
-            else:
-                # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                self.req_to_token_pool.mamba_pool.copy_from(
-                    self._translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    self._translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
-                )
-        forward_batch.mamba_clear_indices = None
-        forward_batch.mamba_cow_src_indices = None
-        forward_batch.mamba_cow_dst_indices = None
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -274,7 +234,6 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
 
     def _init_track_conv_indices(
@@ -287,7 +246,7 @@ class MambaAttnBackendBase(AttentionBackend):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
@@ -306,7 +265,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -377,7 +336,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """Per-row (length bs) bool flush mask = the radix track's seq_lens_cpu %
         mamba_track_interval == 0, so force-flush and snapshot fire on the same
         steps (no off-by-one)."""
-        interval = get_global_server_args().mamba_track_interval
+        interval = get_server_args().mamba_track_interval
         if seq_lens_cpu is None:
             # Should not happen for the supported config; stay safe and never flush.
             return torch.zeros((bs,), dtype=torch.bool)
@@ -767,7 +726,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata,
@@ -789,8 +747,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         # Page-major stores state strided; only the stride-aware Triton causal-conv
         # reads it (CUDA causal_conv1d garbles it). A model may also force Triton.
         use_triton_causal_conv = (
-            use_triton_causal_conv
-            or get_global_server_args().enable_page_major_kv_layout
+            use_triton_causal_conv or get_server_args().enable_page_major_kv_layout
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         mixer_out, intermediate_states = mixer.forward(
@@ -879,6 +836,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
