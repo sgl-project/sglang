@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -34,7 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -58,12 +58,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         config = copy.deepcopy(config)
 
         # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "modelopt_fp4":
-            quant_config = None
-        if (
-            is_npu()
-            and get_global_server_args().speculative_draft_model_quantization is None
+        if quant_config and quant_config.get_name() in (
+            "modelopt_fp4",
+            "modelopt_mixed",
         ):
+            quant_config = None
+        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
             quant_config = None
 
         # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
@@ -79,7 +79,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 quant_config = None
 
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
@@ -89,10 +89,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3_5ForCausalLM(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
@@ -133,6 +134,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_lm_head_from_target(self, target_lm_head):
+        if self.config.tie_word_embeddings:
+            return
+
+        self.lm_head = target_lm_head
+
     @torch.no_grad()
     def forward(
         self,
@@ -146,7 +153,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if (
             is_npu()
             and self.quant_config is None
-            and get_global_server_args().quantization is not None
+            and get_server_args().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
@@ -160,7 +167,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert input_embeds is not None
                 last_indices = (

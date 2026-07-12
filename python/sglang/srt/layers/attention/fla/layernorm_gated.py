@@ -6,6 +6,7 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
+from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
@@ -15,6 +16,7 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -192,9 +194,10 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
-    # When piecewise cuda graph is enabled, use a constant value to avoid
-    # torch.compile creating guards on the dynamic batch dimension.
-    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+    # Use a constant value when the row count must not affect kernel numerics.
+    if is_batch_invariant_mode_enabled() or check_cuda_graph_backend(
+        Phase.PREFILL, Backend.TC_PIECEWISE
+    ):
         return MAX_ROWS_PER_BLOCK
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
@@ -252,7 +255,21 @@ def _layer_norm_fwd(
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    with device_context(x.device):
+    # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
+    # in that release — it creates a DynamoConfigPatchProxy that
+    # SourcelessBuilder cannot wrap, causing a hard error under
+    # torch.compile(fullgraph=True).  The device context is a functional no-op
+    # for Triton kernel launches (device is determined by the tensor, not the
+    # surrounding context), so we simply skip it when Dynamo is tracing.
+    # PyTorch main already has the proper fix (XPUDeviceVariable registered in
+    # torch/_dynamo/variables/ctx_manager.py analogous to CUDADeviceVariable).
+    # TODO: remove this branch once we upgrade from PyTorch 2.12.
+    device_ctx = (
+        nullcontext()
+        if x.device.type == "xpu" and torch.compiler.is_compiling()
+        else device_context(x.device)
+    )
+    with device_ctx:
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,

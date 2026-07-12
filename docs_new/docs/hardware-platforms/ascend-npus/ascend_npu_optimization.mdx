@@ -5,9 +5,9 @@ metatags:
 ---
 
 This guide explains the role of each parameter used in SGLang deployments on Ascend NPU. It uses
-the [DeepSeek-V3.2 best practice configuration](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#deepseek-v3-2-128k-1k-26ms-on-a3-32-cards-disaggregation-mode)
+the [DeepSeek-V3.2 best practice configuration](/docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2#pd-disaggregation)
 as the reference example. For a complete list of tested deployment configurations, see the
-[Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) page.
+[Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) page.
 
 <Note>
   Parameters in this guide fall into two categories:
@@ -218,12 +218,12 @@ These arguments and environment variables are critical for tuning decode perform
   </thead>
   <tbody>
     <tr>
-      <td>`--dp-size`</td>
+      <td>`--dp-size` / `--data-parallel-size`</td>
       <td>Sets the data parallelism degree for the decode server. With DP attention enabled, attention layers are sharded across DP ranks while FFN/MoE layers use tensor parallelism. Higher values create more independent decode instances, increasing throughput through parallel request processing. Choose a value that divides evenly into your total card count, with remaining cards used for TP/EP.</td>
       <td>`8`</td>
     </tr>
     <tr>
-      <td>`--ep`</td>
+      <td>`--ep` / `--ep-size` / `--expert-parallel-size`</td>
       <td>Sets the expert parallelism degree. For MoE models, this distributes experts across cards, reducing per-card expert loading overhead and enabling all-to-all dispatch. The code default is `1`; set explicitly for MoE models. The optimal value depends on your model's expert count and architecture. DeepSeek V3.2 with 256 routed experts uses `ep=32`. For models with fewer experts, use a proportionally smaller value.</td>
       <td>`32`</td>
     </tr>
@@ -238,7 +238,7 @@ These arguments and environment variables are critical for tuning decode perform
       <td>Enabled</td>
     </tr>
     <tr>
-      <td>`--cuda-graph-max-bs`</td>
+      <td>`--cuda-graph-max-bs-decode`</td>
       <td>Caps the maximum batch size for which CUDA Graphs are captured. Larger values cover more batch sizes but increase graph capture time and memory overhead. If your `max-running-requests` is high but typical batch sizes are lower, use a smaller value to reduce capture overhead. Tune based on your observed batch size distribution during serving.</td>
       <td>`4`</td>
     </tr>
@@ -275,7 +275,7 @@ Speculative decoding reduces per-token latency by generating draft tokens that a
     </tr>
     <tr>
       <td>`--speculative-eagle-topk`</td>
-      <td>Limits the number of draft tokens considered per position. Lower values reduce compute on unlikely tokens and are required for the experimental SpecV2 overlap scheduler. Higher values may increase acceptance rates but add overhead. Start with `1` if using SpecV2; otherwise, `4`–`8` is typical.</td>
+      <td>Limits the number of draft tokens considered per position. Lower values reduce compute on unlikely tokens and are required for the overlap scheduler (enabled by default). Higher values may increase acceptance rates but add overhead. Start with `1` for the overlap scheduler; otherwise, `4`–`8` is typical.</td>
       <td>`1`</td>
     </tr>
     <tr>
@@ -286,11 +286,6 @@ Speculative decoding reduces per-token latency by generating draft tokens that a
     <tr>
       <td>`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`</td>
       <td>Enables the overlap plan stream feature for EAGLE v2/v3 speculative decoding workers. This overlaps draft model computation with target model verification, effectively hiding draft latency. Enable when using EAGLE-based speculative decoding; not applicable for NEXTN.</td>
-      <td>`1`</td>
-    </tr>
-    <tr>
-      <td>`SGLANG_ENABLE_SPEC_V2=1`</td>
-      <td>Enables the experimental SpecV2 overlap scheduler for speculative decoding. Works with `--speculative-eagle-topk 1` to overlap the draft generation and verification stages. Requires `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`.</td>
       <td>`1`</td>
     </tr>
   </tbody>
@@ -395,6 +390,7 @@ The following environment variables are used in other best practice configuratio
 The table shows feature-by-feature compatibility of SGLang capabilities on Ascend NPU. Features that have performance impact on Ascend are included. Each cell at the intersection of two features indicates whether they can be used together.
 
 The symbols used are defined as follows:
+
 - 🟢 = Full compatibility
 - 🟠 = Partial compatibility
 - ❌ = No compatibility
@@ -764,9 +760,13 @@ Breaks large prefill computations into smaller, fixed-size chunks for better sch
 
 Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs`). Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
 
+<Note>
+  `--enable-torch-compile` is incompatible with NPU Graph. When torch.compile is enabled, NPU Graph must be disabled via `--disable-cuda-graph`.
+</Note>
+
 ### Speculative Decoding (`--speculative-algorithm`)
 
-Reduces per-token latency by predicting multiple future tokens in a single forward pass, then verifying them against the model. Ascend supports `NEXTN` (for DeepSeek models, using the model's own hidden states) and `EAGLE3` (for Qwen MoE models, using a separate draft model). Controlled by `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. On Ascend, `SGLANG_ENABLE_SPEC_V2=1` and `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` enable the optimized overlap scheduler for speculative decoding.
+Reduces per-token latency by predicting multiple future tokens in a single forward pass, then verifying them against the model. Ascend supports `NEXTN` (for DeepSeek models, using the model's own hidden states) and `EAGLE3` (for Qwen MoE models, using a separate draft model). Controlled by `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. On Ascend, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` enables the optimized overlap scheduler for speculative decoding.
 
 ### PrefixCache (`--disable-radix-cache`)
 
@@ -774,7 +774,7 @@ Reuses KV cache across requests that share common prompt prefixes (Radix Cache),
 
 ### Overlap Schedule
 
-On Ascend, this is primarily controlled via environment variable SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1. For speculative decoding scenarios, combining it with SGLANG_ENABLE_SPEC_V2=1 enables the optimized overlap scheduler. Most effective during decode with speculative decoding and DP attention, where expert dispatch/reduce communication can be overlapped with the next batch's computation.
+On Ascend, this is primarily controlled via environment variable SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1, which enables the optimized overlap scheduler for speculative decoding scenarios. Most effective during decode with speculative decoding and DP attention, where expert dispatch/reduce communication can be overlapped with the next batch's computation.
 
 ### DP LM Head (`--enable-dp-lm-head`)
 
@@ -796,10 +796,9 @@ Enables Expert Parallelism Load Balancing to dynamically redistribute experts ac
 
 Casts model weight tensors to the Ascend NPU ACL FRACTAL_NZ format (format 29) for improved memory access efficiency on Da Vinci AI cores. Enabled by default globally; disable with `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` when the format conflicts with other features (e.g., EPLB). Applied to linear weights, MoE weights, quantized weights, MLA QKV projections, and KV Cache (via `PA_NZ` / `nzcache` modes for FIA). Related env var: `SGLANG_USE_FIA_NZ=1` (requires `SGLANG_NPU_USE_MLAPO=1`).
 
-
 ## See Also
 
-- [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) — Complete deployment configurations and benchmark results for all supported models
+- [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) — Complete deployment configurations and benchmark results for all supported models
 - [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables) — Reference for all Ascend NPU-related environment variables
 - [DeepSeek V3.2 Guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2) — Detailed usage guide for DeepSeek V3.2 deployment
 - [Expert Parallelism](/docs/advanced_features/expert_parallelism) — DeepEP configuration and tuning guide

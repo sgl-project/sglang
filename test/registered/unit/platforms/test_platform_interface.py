@@ -10,7 +10,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
-from sglang.srt.platforms.cuda import CudaDeviceMixin, CudaSRTPlatform
+from sglang.srt.platforms.cpu import CpuSRTPlatform
+from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
     CpuArchEnum,
     DeviceCapability,
@@ -44,41 +45,6 @@ def _make_device_mixin(enum, name, dtype):
             return 5 * 10**8
 
     return M()
-
-
-class _StubPlatform(SRTPlatform):
-    """Concrete SRTPlatform with minimal defaults for testing overrides."""
-
-    _enum = PlatformEnum.CUDA
-    device_name = "cuda"
-    device_type = "cuda"
-
-    def get_device_total_memory(self, device_id=0):
-        return 10**9
-
-    def get_current_memory_usage(self, device=None):
-        return 5 * 10**8
-
-    def get_default_attention_backend(self):
-        return "flashinfer"
-
-    def get_graph_runner_cls(self):
-        return object
-
-    def get_mha_kv_pool_cls(self):
-        return object
-
-    def get_mla_kv_pool_cls(self):
-        return object
-
-    def get_dsa_kv_pool_cls(self):
-        return object
-
-    def get_paged_allocator_cls(self):
-        return object
-
-    def get_piecewise_backend_cls(self):
-        return object
 
 
 def _make_platform_ep(name, load_fn=None):
@@ -239,77 +205,11 @@ class TestCudaDeviceMixin(CustomTestCase):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("cuda", 2))
 
-    def test_cuda_platform_identity(self):
-        base = CudaSRTPlatform()
-        self.assertTrue(base.is_cuda())
-        self.assertTrue(base.is_cuda_alike())
-        self.assertIsInstance(base, CudaDeviceMixin)
-
-    @patch("torch.cuda.get_device_properties")
-    def test_default_get_device_total_memory_uses_cuda(
-        self, mock_get_device_properties
-    ):
-        mock_get_device_properties.return_value.total_memory = 123
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_device_total_memory(1), 123)
-        mock_get_device_properties.assert_called_once_with(1)
-
-    @patch("torch.cuda.max_memory_allocated", return_value=456)
-    def test_default_get_current_memory_usage_uses_cuda(
-        self, mock_max_memory_allocated
-    ):
-        base = CudaSRTPlatform()
-        device = torch.device("cuda", 1)
-        self.assertEqual(base.get_current_memory_usage(device), 456.0)
-        mock_max_memory_allocated.assert_called_once_with(device)
-
-    @patch("torch.cuda.set_device")
-    def test_default_set_device_uses_cuda(self, mock_set_device):
-        base = CudaSRTPlatform()
-        device = torch.device("cuda", 1)
-        base.set_device(device)
-        mock_set_device.assert_called_once_with(device)
-
-    @patch("torch.cuda.get_device_name", return_value="NVIDIA H100")
-    def test_default_get_device_name_uses_cuda(self, mock_get_device_name):
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_device_name(1), "NVIDIA H100")
-        mock_get_device_name.assert_called_once_with(1)
-
-    @patch("torch.cuda.get_device_properties")
-    def test_default_get_device_uuid_uses_cuda(self, mock_get_device_properties):
-        mock_get_device_properties.return_value.uuid = "1234"
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_device_uuid(1), "1234")
-        mock_get_device_properties.assert_called_once_with(1)
-
     @patch("torch.cuda.get_device_capability", return_value=(9, 0))
     def test_default_get_device_capability_uses_cuda(self, mock_get_device_capability):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_device_capability(1), DeviceCapability(9, 0))
         mock_get_device_capability.assert_called_once_with(1)
-
-    @patch("torch.cuda.empty_cache")
-    def test_default_empty_cache_uses_cuda(self, mock_empty_cache):
-        base = CudaSRTPlatform()
-        base.empty_cache()
-        mock_empty_cache.assert_called_once_with()
-
-    @patch("torch.cuda.synchronize")
-    def test_default_synchronize_uses_cuda(self, mock_synchronize):
-        base = CudaSRTPlatform()
-        base.synchronize()
-        mock_synchronize.assert_called_once_with()
-
-    @patch("torch.cuda.mem_get_info", return_value=(123, 456), create=True)
-    def test_default_get_available_memory_uses_cuda(self, mock_mem_get_info):
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_available_memory(1), (123, 456))
-        mock_mem_get_info.assert_called_once_with(1)
-
-    def test_default_distributed_backend_is_nccl(self):
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_torch_distributed_backend_str(), "nccl")
 
     @patch("torch.cuda.manual_seed_all")
     @patch("torch.manual_seed")
@@ -331,30 +231,68 @@ class TestCudaDeviceMixin(CustomTestCase):
         self.assertTrue(base.support_piecewise_cuda_graph())
 
 
-class TestSRTPlatformOverrides(CustomTestCase):
-    """Tests for SRTPlatform method overrides via plugins."""
+class TestCpuDeviceMixin(CustomTestCase):
+    """Tests for CPU device operation defaults (covers both x86 and ARM)."""
 
-    def test_custom_get_dispatch_key_name(self):
-        class P(_StubPlatform):
-            _enum = PlatformEnum.NPU
-            device_name = "npu"
-            device_type = "npu"
+    def test_default_get_device_returns_cpu_device(self):
+        base = CpuSRTPlatform()
+        # ``local_rank`` is ignored — CPU has no per-rank device.
+        self.assertEqual(base.get_device(0), torch.device("cpu"))
+        self.assertEqual(base.get_device(7), torch.device("cpu"))
 
-            def get_dispatch_key_name(self):
-                return "npu"
+    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    def test_default_get_current_memory_usage_is_system_used(self, mock_vm):
+        mock_vm.return_value.total = 1000
+        mock_vm.return_value.available = 300
+        base = CpuSRTPlatform()
+        # system-used == total - available (not per-process RSS)
+        self.assertEqual(base.get_current_memory_usage(), 700.0)
 
-        self.assertEqual(P().get_dispatch_key_name(), "npu")
+    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    def test_memory_free_contract_yields_available(self, mock_vm):
+        # The [Active] contract free = total - used must yield psutil.available.
+        mock_vm.return_value.total = 1000
+        mock_vm.return_value.available = 300
+        base = CpuSRTPlatform()
+        free = base.get_device_total_memory() - base.get_current_memory_usage()
+        self.assertEqual(free, 300)
 
-    def test_custom_get_compile_backend(self):
-        class P(_StubPlatform):
-            _enum = PlatformEnum.NPU
-            device_name = "npu"
-            device_type = "npu"
+    def test_default_set_device_does_not_flip_default(self):
+        base = CpuSRTPlatform()
+        # Must not call torch.set_default_device — process-wide default stays put.
+        before = torch.empty(0).device
+        base.set_device(torch.device("cpu"))
+        after = torch.empty(0).device
+        self.assertEqual(before, after)
 
-            def get_compile_backend(self, mode=None):
-                return "inductor"
+    @patch("platform.machine", return_value="aarch64")
+    def test_cpu_arch_property_resolves_and_caches(self, mock_machine):
+        base = CpuSRTPlatform()
+        self.assertEqual(base.cpu_arch, CpuArchEnum.ARM)
+        # cached_property: second access must not re-query platform.machine
+        call_count = mock_machine.call_count
+        self.assertEqual(base.cpu_arch, CpuArchEnum.ARM)
+        self.assertEqual(mock_machine.call_count, call_count)
 
-        self.assertEqual(P().get_compile_backend(mode="npugraph_ex"), "inductor")
+    @patch("platform.machine", return_value="aarch64")
+    def test_get_device_name_arm_branch(self, _mock_machine):
+        base = CpuSRTPlatform()
+        name = base.get_device_name()
+        self.assertIn("aarch64", name)
+
+    @patch("platform.machine", return_value="x86_64")
+    def test_get_device_name_x86_branch(self, _mock_machine):
+        base = CpuSRTPlatform()
+        name = base.get_device_name()
+        self.assertIn("x86_64", name)
+
+    def test_cpu_srt_platform_capabilities(self):
+        base = CpuSRTPlatform()
+        self.assertFalse(base.supports_fp8())
+        self.assertFalse(base.support_cuda_graph())
+        self.assertFalse(base.support_piecewise_cuda_graph())
+        # Override of the SRTPlatform default (True) — no GPU to pin to.
+        self.assertFalse(base.is_pin_memory_available())
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +433,51 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_cpu_engine_enabled_activates_cpu_fallback(
+        self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
+    ):
+        """SGLANG_USE_CPU_ENGINE=1 + no plugins → CpuSRTPlatform."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cpu.return_value = True
+        mock_is_cuda.return_value = False
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CpuSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_cpu_engine_wins_over_cuda(
+        self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
+    ):
+        """When both CPU engine and CUDA are available, explicit opt-in wins."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cpu.return_value = True
+        mock_is_cuda.return_value = True
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CpuSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_cpu_engine_disabled_prefers_cuda(
+        self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
+    ):
+        """Regression: CPU opt-out leaves the existing CUDA fallback path intact."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cpu.return_value = False
+        mock_is_cuda.return_value = True
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.envs")

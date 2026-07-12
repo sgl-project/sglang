@@ -10,10 +10,12 @@ import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
+    split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
 W8A8_FP8_GEMM_ENV = "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
@@ -240,6 +242,156 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         )
         if self.gather_output:
             return tensor_model_parallel_all_gather(
+                output_parallel, tp_group=self.tp_group
+            )
+        return output_parallel
+
+
+class WeightOnlyFP8MergedColumnParallelLinear(WeightOnlyFP8ColumnParallelLinear):
+    """Column-parallel storage-only FP8 packed linear."""
+
+    def __init__(
+        self,
+        in_features: int,
+        output_sizes: list[int],
+        bias: bool = True,
+        compute_dtype: torch.dtype | None = None,
+        gather_output: bool = False,
+        tp_group=None,
+        enable_fused_w8a8: bool | None = None,
+    ) -> None:
+        self.output_sizes = output_sizes
+        super().__init__(
+            in_features,
+            sum(output_sizes),
+            bias=bias,
+            compute_dtype=compute_dtype,
+            gather_output=gather_output,
+            tp_group=tp_group,
+            enable_fused_w8a8=enable_fused_w8a8,
+        )
+        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
+
+    def weight_loader(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is not None:
+            shards = []
+            current_offset = 0
+            for output_size in self.output_sizes:
+                loaded_shard = loaded_weight.narrow(
+                    output_dim, current_offset, output_size
+                )
+                shard_size = output_size // self.tp_size
+                loaded_shard = loaded_shard.narrow(
+                    output_dim, self.tp_rank * shard_size, shard_size
+                )
+                shards.append(loaded_shard)
+                current_offset += output_size
+            loaded_weight = torch.cat(shards, dim=output_dim)
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param.data.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+
+class WeightOnlyFP8RowParallelLinear(nn.Module):
+    """Row-parallel storage-only e4m3 FP8 linear."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        compute_dtype: torch.dtype | None = None,
+        input_is_parallel: bool = True,
+        reduce_results: bool = True,
+        tp_group=None,
+        enable_fused_w8a8: bool | None = None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.compute_dtype = compute_dtype
+        self.input_is_parallel = input_is_parallel
+        self.reduce_results = reduce_results
+        self.enable_fused_w8a8 = _resolve_enable_fused_w8a8(enable_fused_w8a8)
+        self.tp_group = tp_group or get_tp_group()
+        self.tp_size = get_group_size(self.tp_group)
+        self.tp_rank = get_group_rank(self.tp_group)
+        self.in_features_per_partition = divide(in_features, self.tp_size)
+        self.weight = nn.Parameter(
+            torch.empty(
+                out_features,
+                self.in_features_per_partition,
+                dtype=FP8_WEIGHT_DTYPE,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            self.weight,
+            {
+                "input_dim": 1,
+                "weight_loader": self.weight_loader,
+            },
+        )
+        self.weight_scale = nn.Parameter(
+            torch.empty(out_features, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            self.weight_scale,
+            {
+                "missing_param_init": "error",
+                "weight_loader": self.weight_loader,
+            },
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(
+                    out_features, dtype=compute_dtype or torch.get_default_dtype()
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(self.bias, {"weight_loader": self.weight_loader})
+        else:
+            self.register_parameter("bias", None)
+
+    def weight_loader(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is not None:
+            shard_size = param.data.shape[input_dim]
+            loaded_weight = loaded_weight.narrow(
+                input_dim, self.tp_rank * shard_size, shard_size
+            )
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param.data.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_is_parallel:
+            input_parallel = x
+        else:
+            input_parallel = split_tensor_along_last_dim(
+                x, num_partitions=self.tp_size
+            )[self.tp_rank].contiguous()
+
+        compute_dtype = self.compute_dtype or x.dtype
+        bias = None if self.tp_rank > 0 else self.bias
+        output_parallel = _apply_weight_only_fp8_linear(
+            input_parallel,
+            self.weight,
+            self.weight_scale,
+            bias,
+            compute_dtype,
+            self.enable_fused_w8a8,
+        )
+        if self.reduce_results and self.tp_size > 1:
+            return tensor_model_parallel_all_reduce(
                 output_parallel, tp_group=self.tp_group
             )
         return output_parallel

@@ -24,8 +24,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -35,7 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -91,7 +89,7 @@ logger = logging.getLogger(__name__)
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
@@ -281,14 +279,8 @@ class XIELU(MultiPlatformOp):
                 )
                 self._xielu_cuda_fn = self._xielu_cuda
             logger.warning_once(msg)
-        except Exception as err:
+        except Exception:
             pass
-            # logger.warning_once(
-            #     "CUDA-fused xIELU not available (%s) –"
-            #     " falling back to a Python version.\n"
-            #     "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
-            #     str(err),
-            # )
 
     def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
         alpha_p = nn.functional.softplus(self.alpha_p)
@@ -356,7 +348,7 @@ class ScaledActivation(nn.Module):
         self.act = act_module
         self.input_is_parallel = input_is_parallel
         if input_is_parallel:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
             intermediate_size_per_partition = divide(intermediate_size, tp_size)
         else:
             intermediate_size_per_partition = intermediate_size
@@ -373,7 +365,7 @@ class ScaledActivation(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if self.input_is_parallel:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             shard_size = param_data.shape[0]
             start_idx = tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)

@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections import deque
-from typing import Deque, Generic, List, Optional, TypeVar
-
-import zmq
+from typing import Callable, Generic, List, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -22,37 +19,37 @@ class FanOutCommunicator(Generic[T]):
     Only one request is in-flight at any time in either mode.
     """
 
-    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
-        self._sender = sender
+    def __init__(
+        self,
+        send: Callable[[T], None],
+        fan_out: int,
+        mode: str = "queueing",
+    ):
+        self._send = send
         self._fan_out = fan_out
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Event] = deque()
+        self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+        # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
+        # callers are still waiting, so requests are strictly serialized in
+        # arrival order. It also releases on exception/cancellation, so a
+        # failed caller never blocks the callers queued behind it.
+        async with self._queueing_lock:
+            if obj is not None:
+                self._send(obj)
 
-        if obj is not None:
-            self._sender.send_pyobj(obj)
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            await self._result_event.wait()
+            result_values = self._result_values
+            self._result_event = self._result_values = None
 
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+            return result_values
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -61,7 +58,7 @@ class FanOutCommunicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj is not None:
-                self._sender.send_pyobj(obj)
+                self._send(obj)
 
         # Capture local refs before await -- after event fires, the first
         # awakened coroutine clears shared state; later awaiters use local refs.

@@ -19,7 +19,7 @@ __all__ = ["AWQIntelAMXLinearKernel", "AWQIntelAMXMoEKernel"]
 
 
 class AWQIntelAMXLinearKernel:
-    def __init__(self, quant_config: "AWQConfig"):
+    def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -46,7 +46,7 @@ class AWQIntelAMXLinearKernel:
 
 
 class AWQIntelAMXMoEKernel:
-    def __init__(self, quant_config: "AWQConfig"):
+    def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
         self.moe_runner_config: Optional[MoeRunnerConfig] = None
 
@@ -66,7 +66,7 @@ class AWQIntelAMXMoEKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

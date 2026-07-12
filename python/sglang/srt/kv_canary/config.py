@@ -60,7 +60,7 @@ class CanaryConfig:
     stats_print_every_n_steps: int
 
     @classmethod
-    def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
+    def from_env(cls, server_args: ServerArgs) -> CanaryConfig:
         mode_raw = server_args.kv_canary.strip().lower()
         if mode_raw not in ("none", "log", "raise"):
             raise ValueError(

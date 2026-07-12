@@ -73,19 +73,29 @@ class MlxPendingJob:
     """
 
     lazy_tokens: Optional[mx.array]
-    prefills: list["MlxPendingPrefill"]
-    extends: list["MlxPendingExtend"]
-    decode: Optional["MlxPendingDecode"]
+    prefills: list[MlxPendingPrefill]
+    extends: list[MlxPendingExtend]
+    decode: Optional[MlxPendingDecode]
     mode: str
-    batch_copy: "ScheduleBatch"
-    schedule_batch: "ScheduleBatch"
+    batch_copy: ScheduleBatch
+    schedule_batch: ScheduleBatch
     reqs: List[Req]
 
 
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
 
-    def _finalize_mlx_pending_job(self: "Scheduler", pending: MlxPendingJob):
+    def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
+        # Account for this completed forward step. The standard scheduler does
+        # this inside run_batch(), but the MLX overlap loop bypasses run_batch,
+        # so without this forward_ct never advances on MLX. That stalls the
+        # watchdog liveness counter and, more importantly, breaks step-bounded
+        # profiling: _profile_batch_predicate auto-starts/stops based on
+        # forward_ct, so `--profile-steps` (and the server /start_profile
+        # num_steps path) only takes effect once the counter moves here.
+        self.forward_ct += 1
+        self.profiler_manager._profile_batch_predicate(pending.schedule_batch)
+
         result = self.tp_worker.finalize_mlx_result(
             pending.prefills,
             pending.extends,
@@ -100,7 +110,7 @@ class SchedulerMlxOverlapMixin:
         self.process_batch_result(pending.batch_copy, result)
 
     @DynamicGradMode()
-    def event_loop_overlap_mlx(self: "Scheduler"):
+    def event_loop_overlap_mlx(self: Scheduler):
         """MLX-specific overlap loop modelled on ``mlx_lm.generate.generate_step``.
 
         At steady state we keep TWO in-flight MLX graphs queued on the
@@ -142,7 +152,7 @@ class SchedulerMlxOverlapMixin:
         pending_curr: Optional[MlxPendingJob] = None
         pending_next: Optional[MlxPendingJob] = None
 
-        def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
+        def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
@@ -224,7 +234,7 @@ class SchedulerMlxOverlapMixin:
             ):
                 pending_curr = pending_next
                 pending_next = None
-                self.cur_batch = pending_curr.schedule_batch
+                self.cur_batch_for_debug = pending_curr.schedule_batch
                 self.last_batch = pending_curr.schedule_batch
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                     self.invariant_checker.self_check_during_busy()
@@ -236,8 +246,12 @@ class SchedulerMlxOverlapMixin:
                 self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
                 pending_next = None
-            next_batch = self.get_next_batch_to_run()
-            self.cur_batch = next_batch
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            next_batch = plan.batch_to_run
+            self.cur_batch_for_debug = next_batch
             if next_batch:
                 pending_curr = _launch_fresh(next_batch)
                 self.result_queue.append(pending_curr)
