@@ -28,11 +28,11 @@
   `non_mechanical_provable` to dodge the verifier **violates the chain property**, even
   where no machine check catches it. A provable part hiding inside a semantic commit
   belongs in its own `mechanical_provable` commit with a proof
-  (`guide-split.md` §2).
+  (`guide-split.md` §2.2).
 - The rest of the message format is unconstrained **by the machine rule**: the word may
   appear anywhere in the subject or body, in any surrounding syntax. The authoring
   contract additionally fixes the subject format
-  (`<group-id>(<commit-id>,<kind>): <message>`, `guide-split.md` §5), which satisfies
+  (`<group-id>(<commit-id>,<kind>): <message>`, `guide-split.md` §1.1), which satisfies
   this rule by construction; the verifier deliberately checks only the word, so a chain
   from a different convention still verifies.
 - A word counts only standalone: delimited by a non-`[0-9A-Za-z_]` character or the
@@ -68,7 +68,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
 - `--base` / `--branch`: any commit-ish; both must resolve, `base` must be an ancestor of
   `branch`.
 - `--proof`: the proof folder (must exist) — typically the generator's `--out` product
-  (`guide-construct-proof.md` §2.2).
+  (`guide-construct-proof.md` §1.2).
 - `--repo-root DIR`: run against that repo instead of the cwd's.
 - `--report PATH`: write the report there instead of `<proof>/chain_report.md`.
 - `--no-provable-sniff`: skip the mislabel sniff (§3.5).
@@ -86,7 +86,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
   characters, and a prefix of the commit's full sha.
 - Searched locations, in order, both always considered: `<proof>/repro_scripts/` (the
   generator layout) and `<proof>/` flat (the gist layout,
-  `guide-construct-proof.md` §5.1).
+  `guide-construct-proof.md` §1.3.1).
 - Proofs are keyed by current shas: after a rebase the shas change, so the proofs must be
   regenerated for the rebased chain.
 

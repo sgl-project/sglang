@@ -42,7 +42,7 @@
       `python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <sha>`
       to see what a relocation recipe would cover.
     - A hidden provable part is not a judgement call: demand the split
-      (`guide-split.md` §2) — do not approve the commit as-is.
+      (`guide-split.md` §2.2) — do not approve the commit as-is.
 
 ## 2. Verify a single commit
 
@@ -67,7 +67,7 @@
 - **RESIDUAL** — a non-empty diff: precisely the bundled non-move change. Review it as
   semantic content; a legitimate tail fixup (string-literal module path, doc reference)
   belongs in a postpare commit, not the move.
-- **UNSUPPORTED** — no recipe inferred (cases: `guide-construct-proof.md` §2.4). Not
+- **UNSUPPORTED** — no recipe inferred (cases: `guide-construct-proof.md` §2.2.2). Not
   thereby wrong, but not machine-certified: review by hand as a prepare-style reshape, or
   ask the author for a hand-written `Repro`.
 

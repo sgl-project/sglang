@@ -1,6 +1,63 @@
-# Split a mechanical change: prepare, move, postpare
+# Split a mechanical refactor
 
-## 1. Why split
+- Two levels of splitting, one chapter each: §1 splits the **PR/branch** into small
+  classified pieces (the chain contract); §2 splits **one piece** into prepare + move +
+  postpare so its move is provable.
+
+## 1. Split the PR into small verifiable pieces
+
+### 1.1 The chain contract — what a compliant branch satisfies
+
+When asked to make (or fix) a refactor branch so it "satisfies this skill", ALL of the
+following must hold over `base..branch`; run the chain verifier
+(`guide-verify-proof.md` §1) to check the machine-checkable part in one command.
+
+1. **Every commit is classified, in the required subject format:**
+
+   ```text
+   <group-id>(<commit-id>,<kind>): <message>
+   ```
+
+   with `<kind>` exactly `mechanical_provable` or `non_mechanical_provable`, and
+   `<group-id>` / `<commit-id>` kebab-case (contiguous same-`<group-id>` commits form one
+   future PR). The verifier machine-checks the standalone-word rule
+   (`spec-reproduction-cli.md` §2.1); the full format is required on top of it so the
+   chain can be grouped into PRs.
+2. **Classification is correct — mechanical work is labeled mechanical.** Every operation
+   expressible as the whitelisted relocations (an extract-function, a bulk move, a file
+   split, an import repoint, …) is its own `mechanical_provable` commit. Hiding provable
+   content inside a `non_mechanical_provable` commit — dodging the verifier — is
+   forbidden (§2.2 maximality; the mislabel sniff machine-refutes the fully-provable case
+   and warns on bundled relocations, `spec-reproduction-cli.md` §3.5). How to split so
+   this holds: §2.
+3. **Every `mechanical_provable` commit has a proof that PASSes.** Produce the proofs
+   with the generator (`guide-construct-proof.md` §1); the chain verifier re-runs every
+   one of them against the proof folder.
+4. **Every `non_mechanical_provable` commit is equivalence-reviewed by eyes.** Its diff
+   must be confirmed genuinely equivalent to its claim: no lost logic, no hidden bug, no
+   accidental behavior change riding along (`guide-verify-proof.md` §1). The machine
+   never certifies these — that is exactly why they must stay minimal (item 2).
+
+### 1.2 Commit naming and classification
+
+- Consecutive commits with reserved suffixes; short kebab `<id>`:
+
+```
+<id>-prepare: <subject>    # optional: minimal in-place reshape (de-self, or retype-self)
+<id>-move: <subject>       # pure relocation, certified by the reproduce proof
+<id>-postpare: <subject>   # optional: minimal tail fixup (e.g. a string-literal path)
+```
+
+- The `<phase>:` form is what the range command's `--match -move:` regex keys on.
+- A chain-verified branch (`spec-reproduction-cli.md` §2.1) additionally carries the
+  classification word in every commit message — the phases map onto it directly:
+  **move** commits declare `mechanical_provable`; **prepare**, **postpare**, and
+  standalone semantic commits declare `non_mechanical_provable`. The full subject format:
+  §1.1 item 1.
+
+## 2. Split one piece into prepare + move + postpare
+
+### 2.1 Why split
 
 - A "move a method/function" change is really **two operations with different
   correctness criteria**:
@@ -16,7 +73,7 @@
     - neither a human nor a tool can mechanically confirm "the body that landed is the
       body that left" — you must re-read the logic.
 
-## 2. The rule — up to three commits, in this order
+### 2.2 The rule — up to three commits, in this order
 
 - **prepare (optional)** — a **minimal** in-place reshape the relocation needs (de-self a
   method, retype `self`). Human-reviewed, so: small, **no cross-file def relocation, no
@@ -55,15 +112,13 @@ Hard lines ("prep" below = the prepare phase):
   *before* the move is legitimate — that is exactly what "its own commit" means, and it
   may serve as the prepare.
 
-- The prep's shape depends on the destination: a module-level function (§3.1) or a class
-  (§3.2).
+- The prep's shape depends on the destination: a module-level function (§2.3) or a class
+  (§2.4).
 - The move is the same idea in both: a pure relocation, body byte-identical.
 
-## 3. Cases
+### 2.3 Case 1: method → free function
 
-### 3.1 Case 1: method → free function
-
-#### 3.1.1 Commit 1 — prep: de-self in place (no relocation)
+#### 2.3.1 Commit 1 — prep: de-self in place (no relocation)
 
 Reshape the method **in its original file and position** so it no longer needs `self`.
 The body stays put:
@@ -78,12 +133,12 @@ The body stays put:
 - **Seed the destination's module-level scaffolding here too**, if the target module
   lacks what the moved body needs — a `logger = logging.getLogger(__name__)`, a
   module-level constant the body reads (`_is_hip = is_hip()`), and the `import` each
-  requires. This is destination groundwork (like a class skeleton, §4.4), **not** the
+  requires. This is destination groundwork (like a class skeleton, §2.7.4), **not** the
   body: adding it in prep keeps the move a pure cut+paste. Folding it into the move
   instead bundles a non-relocation edit and breaks the byte proof (the move would both
   paste the body **and** author a new `logger`, which the whitelist does not forgive).
   A move into a **new** module is the exception — there the whole header, logger
-  included, is authored in the move itself (§3.3).
+  included, is authored in the move itself (§2.5).
 
 - The decorator and the qualifier are the only artifacts the move will carry — exactly
   what the whitelist (`spec-reproduction-utils.md` §2.1) forgives.
@@ -91,7 +146,7 @@ The body stays put:
 **Check:** lint + tests pass; the diff is the body reshape, the call-site qualifier, and
 any destination scaffolding seeded above; nothing moved.
 
-#### 3.1.2 Commit 2 — move: relocate to the module
+#### 2.3.2 Commit 2 — move: relocate to the module
 
 - Cut the `@staticmethod` block; paste into the target module.
 - Drop `@staticmethod`, dedent to module level — body **unchanged, line for line**.
@@ -102,13 +157,13 @@ any destination scaffolding seeded above; nothing moved.
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
 marks the whole block as moved.
 
-### 3.2 Case 2: method → method on a class
+### 2.4 Case 2: method → method on a class
 
 - For pulling **several methods and the fields they touch** into a new (or existing)
   class.
 - Prep does **not** de-self — it builds the class and retypes `self`, body untouched.
 
-#### 3.2.1 Commit 1 — prep: build the class, retype `self`
+#### 2.4.1 Commit 1 — prep: build the class, retype `self`
 
 1. Create the target class with the fields the moved methods touch (a frozen dataclass is
    simplest; drop `frozen` only if they mutate).
@@ -169,7 +224,7 @@ Boundaries:
 **Check:** lint + tests pass; body unchanged; types check (`self: Target` matches the
 instance the caller passes).
 
-#### 3.2.2 Commit 2 — move: relocate into the class
+#### 2.4.2 Commit 2 — move: relocate into the class
 
 - Cut `foo` into the target class; drop `@staticmethod` — body **unchanged, line for
   line**.
@@ -180,7 +235,7 @@ instance the caller passes).
 **Check:** `mechanical_refactor_proof_generator.py <commit>` reports `PASS`. The split
 paid off: prep left the body untouched, so the move is a clean cut/paste.
 
-### 3.3 Case 3: extract to a new module — one move commit, no prep
+### 2.5 Case 3: extract to a new module — one move commit, no prep
 
 - The move gathers the defs **from wherever they sit** — no prep staging at the source
   tail. Replayed by `extract_symbols_to_new_module`.
@@ -192,9 +247,9 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - The only work outside the move: a non-mechanical reference the move cannot derive (a
   string-literal module path) — a one-line **postpare**.
 - A symbol **not top-level** in the source (a method still in a class): prepare de-selfs
-  it out first (§3.1); the proof reports `UNSUPPORTED` until then.
+  it out first (§2.3); the proof reports `UNSUPPORTED` until then.
 
-### 3.4 Case 4: extract-function — the bulk goes in the move
+### 2.6 Case 4: extract-function — the bulk goes in the move
 
 - The relocated body belongs in a certified move, not buried in a prep: the
   `extract_function` primitive cuts the inline block **verbatim** and authors only the
@@ -205,9 +260,9 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - An extraction that rewrites the body *as* it extracts is a semantic commit, not a
   certifiable move — do not dress it up as one.
 
-## 4. Remarks
+### 2.7 Remarks
 
-### 4.1 A move never renames
+#### 2.7.1 A move never renames
 
 - The moved symbol keeps the **same name on both sides**.
 - A rename — even a privacy flip `_foo` → `foo` — is its own single-purpose commit
@@ -215,7 +270,7 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - A move that also renames cannot be machine-certified: split it — rename first, then
   move.
 
-### 4.2 Anti-pattern: prep adds the body, move deletes it
+#### 2.7.2 Anti-pattern: prep adds the body, move deletes it
 
 - Symptom: prep **adds** a large block to the target; the move **deletes** the same block
   from the source. The order is reversed.
@@ -224,14 +279,14 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - The body appears and disappears exactly once — on the move side. Fix by pushing the
   "add the body" work out of prep into the move.
 
-### 4.3 When NOT to split (single commit)
+#### 2.7.3 When NOT to split (single commit)
 
 - Moving an **already** module-level free function.
 - Pure file rename / whole-file move.
 - Trivial field deletion, or `getattr(obj, "x", ...)` → direct attribute access.
 - A class-internal helper relocated next to another helper in the same module.
 
-### 4.4 Which actions are mechanical vs not
+#### 2.7.4 Which actions are mechanical vs not
 
 - Boundary: building the component correctly the first time is mechanical; reshaping it
   *after* it exists is not.
@@ -256,52 +311,3 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - Many small, independently reviewable commits beat one big prep mixing ten flavors of
   change.
 - Review order = commit order: prep → move → non-mechanical follow-ups.
-
-### 4.5 Naming
-
-- Consecutive commits with reserved suffixes; short kebab `<id>`:
-
-```
-<id>-prepare: <subject>    # optional: minimal in-place reshape (de-self, or retype-self)
-<id>-move: <subject>       # pure relocation, certified by the reproduce proof
-<id>-postpare: <subject>   # optional: minimal tail fixup (e.g. a string-literal path)
-```
-
-- The `<phase>:` form is what the range command's `--match -move:` regex keys on.
-- A chain-verified branch (`spec-reproduction-cli.md` §2.1) additionally carries the
-  classification word in every commit message — the phases map onto it directly:
-  **move** commits declare `mechanical_provable`; **prepare**, **postpare**, and
-  standalone semantic commits declare `non_mechanical_provable`. The full subject format:
-  §5 item 1.
-
-## 5. The chain contract — what a compliant branch satisfies
-
-When asked to make (or fix) a refactor branch so it "satisfies this skill", ALL of the
-following must hold over `base..branch`; run the chain verifier
-(`guide-verify-proof.md` §1) to check the machine-checkable part in one command.
-
-1. **Every commit is classified, in the required subject format:**
-
-   ```text
-   <group-id>(<commit-id>,<kind>): <message>
-   ```
-
-   with `<kind>` exactly `mechanical_provable` or `non_mechanical_provable`, and
-   `<group-id>` / `<commit-id>` kebab-case (contiguous same-`<group-id>` commits form one
-   future PR). The verifier machine-checks the standalone-word rule
-   (`spec-reproduction-cli.md` §2.1); the full format is required on top of it so the
-   chain can be grouped into PRs.
-2. **Classification is correct — mechanical work is labeled mechanical.** Every operation
-   expressible as the whitelisted relocations (an extract-function, a bulk move, a file
-   split, an import repoint, …) is its own `mechanical_provable` commit. Hiding provable
-   content inside a `non_mechanical_provable` commit — dodging the verifier — is
-   forbidden (§2 maximality; the mislabel sniff machine-refutes the fully-provable case
-   and warns on bundled relocations, `spec-reproduction-cli.md` §3.5). How to split so
-   this holds: §2–§4.
-3. **Every `mechanical_provable` commit has a proof that PASSes.** Produce the proofs
-   with the generator (`guide-construct-proof.md` §2); the chain verifier re-runs every
-   one of them against the proof folder.
-4. **Every `non_mechanical_provable` commit is equivalence-reviewed by eyes.** Its diff
-   must be confirmed genuinely equivalent to its claim: no lost logic, no hidden bug, no
-   accidental behavior change riding along (`guide-verify-proof.md` §1). The machine
-   never certifies these — that is exactly why they must stay minimal (item 2).

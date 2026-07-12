@@ -48,7 +48,7 @@
   the pre-commit pass in the §4 arbiter, applied to **both** sides; primitives do
   relocation only.
 - When the generator cannot infer a move, the answer is a hand-written `Repro`
-  (guide-construct-proof §3) — **not** loosening a primitive to make it fit.
+  (guide-construct-proof §2.3) — **not** loosening a primitive to make it fit.
 
 ## 4. Testing rules — the hard bar
 

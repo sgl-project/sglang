@@ -20,12 +20,13 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 ## 2. What do you want to do?
 
 - **Author a compliant refactor branch — split it into commits, satisfy the contract**
-  (extract, move, file split) → `guide-split.md`: the prepare + move + postpare rule, the
-  case recipes, the anti-patterns, and the chain contract (§5: classification format,
-  correct labeling, proofs PASS, non-mechanical commits equivalence-reviewed).
-- **Construct the proof for a move commit** → `guide-construct-proof.md`: run
-  `scripts/mechanical_refactor_proof_generator.py`, or hand-write a `Repro` when the
-  generator reports `UNSUPPORTED`.
+  (extract, move, file split) → `guide-split.md`: §1 splits the PR into classified pieces
+  (the chain contract: classification format, correct labeling, proofs PASS,
+  non-mechanical commits equivalence-reviewed); §2 splits one piece into prepare + move +
+  postpare (the case recipes and the anti-patterns).
+- **Construct the proof — for the chain or one commit** → `guide-construct-proof.md`: §1
+  generates + publishes the whole chain's proof folder; §2 proves a single commit (the
+  generator, or a hand-written `Repro` when it reports `UNSUPPORTED`).
 - **Verify someone's proof — a whole chain / PR branch, or a single commit** →
   `guide-verify-proof.md`: run the chain verifier (every commit declares
   `mechanical_provable` or `non_mechanical_provable`, every provable commit's proof
@@ -40,11 +41,12 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 
 ## 3. Files
 
-- [`guide-split.md`](guide-split.md) — split a change into prepare + move + postpare: the
-  case recipes, what stays mechanical, the anti-patterns, and the chain contract a
-  compliant branch satisfies (§5).
-- [`guide-construct-proof.md`](guide-construct-proof.md) — produce the proof: the
-  generator, the hand-written `Repro`, and publishing the proof with the PR.
+- [`guide-split.md`](guide-split.md) — split the PR into classified pieces (§1, the
+  chain contract) and each piece into prepare + move + postpare (§2: case recipes, what
+  stays mechanical, anti-patterns).
+- [`guide-construct-proof.md`](guide-construct-proof.md) — produce the proof: the whole
+  chain's proof folder + publishing (§1), and a single commit's proof — generator or
+  hand-written `Repro` (§2).
 - [`guide-verify-proof.md`](guide-verify-proof.md) — consume the proof: the whole-chain
   verifier, single-commit re-runs, verdicts, and the audit checklist for authored
   surfaces.
