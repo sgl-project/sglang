@@ -15,15 +15,24 @@
   approve from the author's pasted output.
 - This is cheap by design: the whole point of the machinery is that re-verification is
   one command, so there is no excuse to trust instead of re-run.
+- **Sampling is not verification.** Re-running a subset of the proofs ("spot-check 8 of
+  43") proves nothing about the rest and must never be the basis for approval — the only
+  acceptable run is the §1 chain verifier, which executes **every** provable commit's
+  proof. The same holds for the manual duties: audit every `HUMAN_REVIEW` row and every
+  PASS's authored surfaces (§2.3), not a sample of them.
 
 ## 1. Verify the whole chain
 
-- The default entry point: do not re-run proofs one by one — run the chain verifier:
+- The default — and the only sufficient — entry point: do not re-run proofs one by one,
+  and never a sample; run the chain verifier over the whole chain:
 
   ```bash
-  python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_reproduction_cli.py \
+  python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor.py verify \
       --base <base-commit> --branch <pr-branch-name> --proof <folder>
   ```
+
+  (`mechanical_refactor.py verify` dispatches to
+  `mechanical_refactor_reproduction_cli.py`, which takes the same arguments.)
 
 - It checks every commit declares `mechanical_provable` or `non_mechanical_provable`,
   runs every provable commit's proof, and prints + writes a full report
@@ -54,12 +63,16 @@
     - Read the commit's diff for relocated code. Concretely, run
       `git show <sha> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
       and look for moved blocks, and run
-      `python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <sha>`
+      `python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor.py split <sha>`
       to see what a relocation recipe would cover.
     - A hidden provable part is not a judgement call: demand the split
       (`guide-split.md` §2.2) — do not approve the commit as-is.
 
 ## 2. Verify a single commit
+
+- For diagnosing one commit (a failing proof, a suspicious script) — never a substitute
+  for §1: approving a chain requires the full §1 run, not single-commit re-runs of a
+  chosen subset.
 
 ### 2.1 Re-run it
 
