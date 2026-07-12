@@ -82,6 +82,18 @@ _OWNER_SITES = {
         "alloc_for_decode_prealloc_hisparse",
         "kv_allocated_len",
     ): 1,
+    # startup self-benchmark: synthetic decode reqs start at the post-prefill
+    # boundary, so their KV clocks are seeded to the synthetic context length.
+    (
+        "managers/scheduler_components/self_benchmark.py",
+        "SelfBenchmark._inject_synthetic_decode",
+        "kv_committed_len",
+    ): 1,
+    (
+        "managers/scheduler_components/self_benchmark.py",
+        "SelfBenchmark._inject_synthetic_decode",
+        "kv_allocated_len",
+    ): 1,
     # streaming session slot save/restore and tail trimming
     (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
     (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,
