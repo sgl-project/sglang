@@ -239,6 +239,31 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+def maybe_disable_chunked_prefix_cache(
+    *, server_args: ServerArgs, use_mla_backend: bool, is_draft_worker: bool
+) -> None:
+    # Chunked prefix caching requires an MLA model on a backend whose
+    # kernels read that layout. This is a load-time gate, not a
+    # resolution-time one: out-of-tree platforms register their supported
+    # backends in init_backend(), which runs when this module is imported
+    # — after ServerArgs.__post_init__. Target runner only: a draft
+    # model's (often non-MLA) config must not flip the shared setting.
+    if is_draft_worker:
+        return
+    if (
+        not use_mla_backend
+        or server_args.attention_backend
+        not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+    ):
+        if not server_args.disable_chunked_prefix_cache:
+            server_args.override(
+                "model_runner.chunked_prefix_cache_gate",
+                disable_chunked_prefix_cache=True,
+            )
+    if not server_args.disable_chunked_prefix_cache:
+        logger.info("Chunked prefix cache is turned on.")
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
@@ -326,24 +351,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        # Chunked prefix caching requires an MLA model on a backend whose
-        # kernels read that layout. This is a load-time gate, not a
-        # resolution-time one: out-of-tree platforms register their supported
-        # backends in init_backend(), which runs when this module is imported
-        # — after ServerArgs.__post_init__. Target runner only: a draft
-        # model's (often non-MLA) config must not flip the shared setting.
-        if not self.is_draft_worker and (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            if not server_args.disable_chunked_prefix_cache:
-                server_args.override(
-                    "model_runner.chunked_prefix_cache_gate",
-                    disable_chunked_prefix_cache=True,
-                )
-        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
+        maybe_disable_chunked_prefix_cache(
+            server_args=server_args,
+            use_mla_backend=self.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
+        )
 
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
