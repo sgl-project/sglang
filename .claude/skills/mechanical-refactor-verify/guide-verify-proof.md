@@ -54,7 +54,24 @@
   these relocations", not "this relocation was a good idea". Confirm the commit's subject
   matches what the script actually moves before approving.
 
-## 5. Why the mechanism is trustworthy
+## 5. Verify the whole chain at once
+
+- For a multi-commit chain, do not re-run proofs one by one — run the chain verifier:
+
+  ```bash
+  python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_reproduction_cli.py \
+      --base <base-commit> --branch <pr-branch-name> --proof <folder>
+  ```
+
+- It checks every commit declares `mechanical_provable` or `non_mechanical_provable`,
+  runs every provable commit's proof, and prints + writes a full report
+  (`<folder>/chain_report.md`); exit 0 iff the chain verifies.
+- The contract (word rule, proof resolution, PASS criterion, exit codes):
+  `spec-reproduction-cli.md`.
+- The `HUMAN_REVIEW` rows in the report are your remaining manual surface — the declared
+  non-mechanical commits, plus the §3 authored-surface audit of each PASS.
+
+## 6. Why the mechanism is trustworthy
 
 - It runs the real formatter and compares bytes — no diff-shape heuristic to fool
   (`spec-reproduction-utils.md` §4).

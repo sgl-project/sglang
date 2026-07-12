@@ -32,6 +32,9 @@ Self-contained, auditable without the skill installed:
 - `output.log` + `output.html` — the verdicts;
 - a copy of `mechanical_refactor_reproduction_utils.py` — the scripts' only dependency.
 
+The folder is also the `--proof` input to the chain verifier
+(`mechanical_refactor_reproduction_cli.py`, contract in `spec-reproduction-cli.md`).
+
 ### 2.3 What the inference covers
 
 - **Method → existing class**: call sites lowered (`Owner.m(recv, …)` → `recv.m(…)`), the

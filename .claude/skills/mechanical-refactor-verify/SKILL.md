@@ -26,6 +26,10 @@ description: Make mechanical refactoring (file splits, function moves, module ex
   generator reports `UNSUPPORTED`.
 - **Verify someone's proof** → `guide-verify-proof.md`: re-run it, read the verdict, audit
   the authored surfaces.
+- **Verify a whole chain / PR branch** → `spec-reproduction-cli.md` +
+  `scripts/mechanical_refactor_reproduction_cli.py`: every commit declares
+  `mechanical_provable` or `non_mechanical_provable`, every provable commit's proof
+  exists and PASSes, one full report at the end.
 - **Decide whether a change counts as a clean move** → `spec-reproduction-utils.md`: the
   property, the whole whitelist / not-allowed list, and each primitive's contract. The
   source of truth for the reproduction module; if any other file disagrees, it wins.
@@ -43,6 +47,9 @@ description: Make mechanical refactoring (file splits, function moves, module ex
   and the audit checklist for authored surfaces.
 - [`spec-reproduction-utils.md`](spec-reproduction-utils.md) — the normative spec of the
   clean-move property and the reproduction primitives.
+- [`spec-reproduction-cli.md`](spec-reproduction-cli.md) — the normative spec of the
+  verified-chain property: the classification word rule, the proof obligation, the report,
+  and the exit codes.
 - [`guide-modify-skill.md`](guide-modify-skill.md) — change the engine, the generator, or
   the spec: the spec-leads rule, the byte-faithfulness invariant, and the testing bar.
 - [`scripts/mechanical_refactor_proof_generator.py`](scripts/mechanical_refactor_proof_generator.py) —
@@ -51,5 +58,9 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 - [`scripts/mechanical_refactor_reproduction_utils.py`](scripts/mechanical_refactor_reproduction_utils.py) — the
   **proof engine**: the `Repro` builder's faithful relocation primitives plus the worktree +
   pre-commit + byte-diff scaffold. Self-contained — only git and the standard library.
+- [`scripts/mechanical_refactor_reproduction_cli.py`](scripts/mechanical_refactor_reproduction_cli.py) — the
+  **chain verifier**: classifies every commit in `base..branch`, runs every provable
+  commit's proof from the proof folder, and emits the full chain report.
 - [`scripts/tests/`](scripts/tests/) — pytest suites, one folder per module:
-  `reproduction_utils/` for the proof engine, `proof_generator/` for the generator.
+  `reproduction_utils/` for the proof engine, `proof_generator/` for the generator,
+  `reproduction_cli/` for the chain verifier.
