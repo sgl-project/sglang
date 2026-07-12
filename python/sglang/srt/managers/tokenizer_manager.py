@@ -32,6 +32,7 @@ from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
+from functools import lru_cache
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -141,6 +142,19 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _ragged_verify_cap_accept() -> bool:
+    # The mode env is fixed at server launch; cache to keep it off the
+    # per-request metrics path.
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+
 
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
@@ -2374,13 +2388,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["spec_cap_length"] = (
                         recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
                     )
-                from sglang.srt.speculative.ragged_verify import (
-                    RaggedVerifyMode,
-                    read_ragged_verify_mode,
-                )
-
                 if (
-                    read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+                    _ragged_verify_cap_accept()
                     and getattr(recv_obj, "spec_num_block_accept_tokens", None)
                     is not None
                     and len(recv_obj.spec_num_block_accept_tokens) > i
