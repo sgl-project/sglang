@@ -447,6 +447,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            pd_flip_output_seqs=recv_obj.pd_flip_output_seqs,
+            pd_flip_session_ids=recv_obj.pd_flip_session_ids,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

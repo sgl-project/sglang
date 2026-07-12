@@ -279,6 +279,8 @@ class _GenerationStreamAccumulator:
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
+    pd_flip_output_seqs: list = field(default_factory=list)
+    pd_flip_session_ids: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -345,6 +347,13 @@ class _GenerationStreamAccumulator:
         if not should_output:
             return
 
+        req.pd_flip_last_emitted_output_seq = (
+            int(getattr(req, "pd_flip_last_emitted_output_seq", 0) or 0) + 1
+        )
+        self.pd_flip_output_seqs.append(req.pd_flip_last_emitted_output_seq)
+        self.pd_flip_session_ids.append(
+            getattr(req, "pd_flip_migration_session_id", None)
+        )
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
@@ -526,4 +535,6 @@ class _GenerationStreamAccumulator:
             retraction_counts=self.retraction_counts,
             load=load,
             dp_ranks=dp_ranks,
+            pd_flip_output_seqs=self.pd_flip_output_seqs,
+            pd_flip_session_ids=self.pd_flip_session_ids,
         )

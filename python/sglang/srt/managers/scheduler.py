@@ -968,6 +968,7 @@ class Scheduler(
         self.pd_flip_quiesce_requested = False
         self.pd_flip_batch_quiesced = False
         self.pd_flip_quiesce_rids: Tuple[str, ...] = ()
+        self.pd_flip_quiesce_session_id: Optional[str] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1814,11 +1815,13 @@ class Scheduler(
         timing_debug["waiting_skipped_count"] = len(waiting_skipped)
         timing_debug["waiting_skipped"] = waiting_skipped
 
+        session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
         manifest_started = time.monotonic()
         manifests = []
         migration_reqs = []
         source_waiting_reqs = []
         for req in running_reqs:
+            req.pd_flip_migration_session_id = session_id
             manifest = self._pd_flip_build_migration_manifest(req)
             manifest["pd_flip_source_queue"] = "running"
             manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
@@ -1836,6 +1839,7 @@ class Scheduler(
         timing_debug["running_manifest_count"] = len(manifests)
         waiting_manifest_started = time.monotonic()
         for queue_index, req in waiting_selected:
+            req.pd_flip_migration_session_id = session_id
             manifest = self._pd_flip_build_migration_manifest(req)
             manifest["pd_flip_source_queue"] = "waiting"
             manifest["pd_flip_waiting_queue_index"] = queue_index
@@ -1864,7 +1868,6 @@ class Scheduler(
         timing_debug["waiting_manifest_count"] = len(source_waiting_reqs)
         timing_debug["build_manifests_s"] = time.monotonic() - manifest_started
         timing_debug["manifest_count"] = len(manifests)
-        session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
         entry_started = time.monotonic()
         real_entries, real_error = self._pd_flip_start_source_entries(
             migration_reqs, manifests
@@ -1912,6 +1915,18 @@ class Scheduler(
 
         session_id = recv_req.session_id or f"pd-flip-target-{int(time.time() * 1000)}"
         manifests = list(recv_req.manifests or [])
+        for manifest in manifests:
+            manifest_session_id = manifest.get("pd_flip_session_id")
+            if manifest_session_id is not None and str(manifest_session_id) != str(
+                session_id
+            ):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="target manifest session id does not match",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=manifests,
+                )
+            manifest["pd_flip_session_id"] = session_id
         timing_debug = {"manifest_count": len(manifests)}
         entry_started = time.monotonic()
         target_entries, real_error = self._pd_flip_prepare_target_entries(
@@ -1962,6 +1977,12 @@ class Scheduler(
                 message=f"local migration role is {session.get('role')}, not target",
                 status=self._pd_flip_migration_status_dict(),
             )
+        if recv_req.session_id and recv_req.session_id != session.get("session_id"):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+            )
 
         self._pd_flip_target_pump_transfer(session)
         entries = session.get("target_entries") or {}
@@ -1969,6 +1990,13 @@ class Scheduler(
         real_error = ""
         delta_entries = 0
         for manifest in manifests:
+            manifest_session_id = manifest.get("pd_flip_session_id")
+            if manifest_session_id is not None and str(manifest_session_id) != str(
+                session.get("session_id")
+            ):
+                real_error = "target delta manifest session id does not match"
+                break
+            manifest["pd_flip_session_id"] = session.get("session_id")
             rid = str(manifest.get("rid", ""))
             entry = entries.get(rid)
             if entry is None:
@@ -2043,7 +2071,10 @@ class Scheduler(
         self._pd_flip_note_timing(session, "commit_received")
         self._pd_flip_target_pump_transfer(session)
         entries = session.get("target_entries") or {}
-        requested_rids = [str(rid) for rid in (recv_req.rids or entries.keys())]
+        requested_rids = [
+            str(rid)
+            for rid in (entries.keys() if recv_req.rids is None else recv_req.rids)
+        ]
         requested = set(requested_rids)
         if (
             not requested_rids
@@ -2103,7 +2134,10 @@ class Scheduler(
             )
 
         entries = session.get("target_entries") or {}
-        requested_rids = [str(rid) for rid in (recv_req.rids or entries.keys())]
+        requested_rids = [
+            str(rid)
+            for rid in (entries.keys() if recv_req.rids is None else recv_req.rids)
+        ]
         requested = set(requested_rids)
         if (
             not requested_rids
@@ -2123,23 +2157,24 @@ class Scheduler(
             for rid in requested_rids
             if not entries[rid].get("drop_on_commit")
         ]
-        requests = [entry["decode_req"].req for entry in adopt_entries]
-        try:
-            for req in requests:
-                req.init_next_round_input(self.tree_cache)
-                if hasattr(req, "time_stats") and hasattr(
-                    req.time_stats, "set_wait_queue_entry_time"
-                ):
-                    req.time_stats.set_wait_queue_entry_time()
-        except Exception as exc:
+        requests = [
+            getattr(entry.get("decode_req"), "req", None) for entry in adopt_entries
+        ]
+        if any(
+            req is None
+            or entry.get("request_released")
+            or entry.get("request_adopted")
+            or any(req is queued for queued in self.waiting_queue)
+            for entry, req in zip(adopt_entries, requests)
+        ):
             return PDFlipMigrationReqOutput(
                 success=False,
-                message=f"target batch activation failed: {exc}",
+                message="target batch activation preflight failed",
                 status=self._pd_flip_migration_status_dict(),
                 manifests=list(session.get("manifests", [])),
             )
 
-        queue_start = len(self.waiting_queue)
+        previous_waiting_queue = self.waiting_queue
         previous_entry_state = {
             rid: (
                 entries[rid].get("phase"),
@@ -2149,7 +2184,7 @@ class Scheduler(
             for rid in requested_rids
         }
         try:
-            self.waiting_queue.extend(requests)
+            self.waiting_queue = [*previous_waiting_queue, *requests]
             for rid in requested_rids:
                 entry = entries[rid]
                 if not entry.get("drop_on_commit"):
@@ -2158,7 +2193,7 @@ class Scheduler(
                 entry["held"] = False
                 entry["phase"] = "active"
         except Exception as exc:
-            del self.waiting_queue[queue_start:]
+            self.waiting_queue = previous_waiting_queue
             for rid, (phase, held, request_adopted) in previous_entry_state.items():
                 entry = entries[rid]
                 entry["phase"] = phase
@@ -2178,6 +2213,18 @@ class Scheduler(
         session["released_reqs"] = int(session.get("released_reqs", 0)) + len(
             requested_rids
         )
+        for req in requests:
+            try:
+                if hasattr(req, "time_stats") and hasattr(
+                    req.time_stats, "set_wait_queue_entry_time"
+                ):
+                    req.time_stats.set_wait_queue_entry_time()
+            except Exception:
+                logger.warning(
+                    "Failed to record target activation wait-queue timing for %s",
+                    getattr(req, "rid", ""),
+                    exc_info=True,
+                )
         return PDFlipMigrationReqOutput(
             success=True,
             message="target batch activated",
@@ -2361,7 +2408,23 @@ class Scheduler(
 
         self._pd_flip_source_pump_transfer(session)
         entries = session.get("source_entries") or {}
-        requested = set(recv_req.rids or entries.keys())
+        requested_rids = [
+            str(rid)
+            for rid in (entries.keys() if recv_req.rids is None else recv_req.rids)
+        ]
+        requested = set(requested_rids)
+        if (
+            not requested_rids
+            or len(requested) != len(requested_rids)
+            or not requested.issubset(entries)
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source delta batch is empty, duplicated, or unknown",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+            )
+        requested_key = tuple(sorted(requested))
         captured_rids = set(session.get("delta_request_rids") or ())
         if captured_rids:
             if requested != captured_rids:
@@ -2379,7 +2442,22 @@ class Scheduler(
                 manifests=list(session.get("delta_manifests") or []),
             )
         if not getattr(self, "pd_flip_batch_quiesced", False):
-            self._pd_flip_request_batch_quiesce(sorted(requested))
+            resolved_session_id = str(session.get("session_id") or "")
+            frozen_session_id = getattr(self, "pd_flip_quiesce_session_id", None)
+            frozen_rids = tuple(getattr(self, "pd_flip_quiesce_rids", ()))
+            if getattr(self, "pd_flip_quiesce_requested", False):
+                if (
+                    frozen_session_id != resolved_session_id
+                    or frozen_rids != requested_key
+                ):
+                    return PDFlipMigrationReqOutput(
+                        success=False,
+                        message="source batch quiesce key does not match pending request",
+                        status=self._pd_flip_migration_status_dict(),
+                        manifests=[],
+                    )
+            else:
+                self._pd_flip_request_batch_quiesce(resolved_session_id, requested_key)
             session["state"] = "source_quiesce_requested"
             return PDFlipMigrationReqOutput(
                 success=False,
@@ -2387,7 +2465,9 @@ class Scheduler(
                 status=self._pd_flip_migration_status_dict(),
                 manifests=[],
             )
-        if requested != set(getattr(self, "pd_flip_quiesce_rids", ())):
+        if str(session.get("session_id") or "") != getattr(
+            self, "pd_flip_quiesce_session_id", None
+        ) or requested_key != tuple(getattr(self, "pd_flip_quiesce_rids", ())):
             return PDFlipMigrationReqOutput(
                 success=False,
                 message="source delta rids do not match the quiesced batch",
@@ -2446,7 +2526,8 @@ class Scheduler(
             manifests=delta_manifests,
         )
 
-    def _pd_flip_request_batch_quiesce(self, rids) -> None:
+    def _pd_flip_request_batch_quiesce(self, session_id: str, rids) -> None:
+        self.pd_flip_quiesce_session_id = session_id
         self.pd_flip_quiesce_rids = tuple(str(rid) for rid in rids)
         self.pd_flip_quiesce_requested = True
         self.pd_flip_batch_quiesced = False
@@ -2463,6 +2544,7 @@ class Scheduler(
         self.pd_flip_quiesce_requested = False
         self.pd_flip_batch_quiesced = False
         self.pd_flip_quiesce_rids = ()
+        self.pd_flip_quiesce_session_id = None
 
     def abort_pd_flip_migration(
         self, recv_req: PDFlipMigrationAbortReq
@@ -3478,6 +3560,10 @@ class Scheduler(
             manifest.get("kv_committed_len")
             or len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         )
+        req.pd_flip_migration_session_id = manifest.get("pd_flip_session_id")
+        req.pd_flip_last_emitted_output_seq = int(
+            manifest.get("last_emitted_output_seq", 0) or 0
+        )
         return req
 
     @staticmethod
@@ -3532,6 +3618,10 @@ class Scheduler(
         )
         req.kv_committed_len = committed_len
         req.kv_allocated_len = max(int(getattr(req, "kv_allocated_len", 0) or 0), committed_len)
+        req.pd_flip_migration_session_id = manifest.get("pd_flip_session_id")
+        req.pd_flip_last_emitted_output_seq = int(
+            manifest.get("last_emitted_output_seq", 0) or 0
+        )
         entry["committed_len"] = committed_len
         entry["manifest"] = manifest
         self._pd_flip_note_timing(entry, "target_delta_state_applied")
@@ -4179,6 +4269,7 @@ class Scheduler(
             "last_emitted_output_seq": int(
                 getattr(req, "pd_flip_last_emitted_output_seq", 0) or 0
             ),
+            "pd_flip_session_id": getattr(req, "pd_flip_migration_session_id", None),
         }
 
     @staticmethod

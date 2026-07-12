@@ -100,11 +100,13 @@ class FakeReq:
         self.pd_flip_deferred_kv_release_is_insert = False
         self.time_stats = types.SimpleNamespace(set_wait_queue_entry_time=lambda: None)
         self._fail_init = fail_init
+        self.init_calls = 0
 
     def finished(self):
         return self.to_finish is not None
 
     def init_next_round_input(self, tree_cache):
+        self.init_calls += 1
         if self._fail_init:
             raise RuntimeError("init failed")
 
@@ -184,6 +186,18 @@ class TestAtomicTargetHandoff(unittest.TestCase):
             scheduler, PDFlipMigrationTargetCommitReq(session_id="s", rids=["r0", "r1"])
         )
 
+    def test_explicit_empty_commit_batch_is_rejected(self):
+        scheduler = target_scheduler(
+            {"r0": "transferred_held", "r1": "transferred_held"}
+        )
+
+        out = Scheduler.commit_pd_flip_migration_target(
+            scheduler, PDFlipMigrationTargetCommitReq(session_id="s", rids=[])
+        )
+
+        self.assertFalse(out.success)
+        self.assertEqual(scheduler.waiting_queue, [])
+
         self.assertFalse(out.success)
         self.assertEqual(scheduler.waiting_queue, [])
         self.assertTrue(
@@ -250,7 +264,7 @@ class TestAtomicTargetHandoff(unittest.TestCase):
             {"active"},
         )
 
-    def test_activate_exception_keeps_queue_and_phases_unchanged(self):
+    def test_activate_defers_request_initialization_to_decode_admission(self):
         scheduler = target_scheduler(
             {"r0": "ready_to_activate", "r1": "ready_to_activate"},
             fail_init_rid="r1",
@@ -261,8 +275,17 @@ class TestAtomicTargetHandoff(unittest.TestCase):
             types.SimpleNamespace(session_id="s", rids=["r0", "r1"]),
         )
 
-        self.assertFalse(out.success)
-        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertTrue(out.success)
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["r0", "r1"])
+        self.assertEqual(
+            [
+                entry["decode_req"].req.init_calls
+                for entry in scheduler.pd_flip_migration_session[
+                    "target_entries"
+                ].values()
+            ],
+            [0, 0],
+        )
         self.assertEqual(
             {
                 entry["phase"]
@@ -270,8 +293,20 @@ class TestAtomicTargetHandoff(unittest.TestCase):
                     "target_entries"
                 ].values()
             },
-            {"ready_to_activate"},
+            {"active"},
         )
+
+    def test_explicit_empty_activate_batch_is_rejected(self):
+        scheduler = target_scheduler(
+            {"r0": "ready_to_activate", "r1": "ready_to_activate"}
+        )
+
+        out = Scheduler.activate_pd_flip_migration_target(
+            scheduler, types.SimpleNamespace(session_id="s", rids=[])
+        )
+
+        self.assertFalse(out.success)
+        self.assertEqual(scheduler.waiting_queue, [])
 
 
 class TestSourceQuiesce(unittest.TestCase):
@@ -315,6 +350,50 @@ class TestSourceQuiesce(unittest.TestCase):
         self.assertEqual(
             scheduler.pd_flip_migration_session["delta_generation"], generation
         )
+
+    def test_quiesce_request_freezes_session_and_rids(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pd_flip_migration_session = {
+            "session_id": "s",
+            "role": "source",
+            "source_entries": {
+                "r0": {"source_queue": "running"},
+                "r1": {"source_queue": "running"},
+            },
+        }
+        scheduler._pd_flip_source_pump_transfer = lambda session: None
+        scheduler._pd_flip_migration_status_dict = lambda: {}
+        scheduler.pd_flip_batch_quiesced = False
+
+        first = Scheduler.start_pd_flip_migration_source_delta(
+            scheduler, PDFlipMigrationSourceDeltaReq(session_id="s", rids=["r0"])
+        )
+        different = Scheduler.start_pd_flip_migration_source_delta(
+            scheduler, PDFlipMigrationSourceDeltaReq(session_id="s", rids=["r1"])
+        )
+
+        self.assertFalse(first.success)
+        self.assertFalse(different.success)
+        self.assertEqual(scheduler.pd_flip_quiesce_rids, ("r0",))
+        self.assertEqual(scheduler.pd_flip_quiesce_session_id, "s")
+
+    def test_explicit_empty_delta_batch_is_rejected(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pd_flip_migration_session = {
+            "session_id": "s",
+            "role": "source",
+            "source_entries": {"r0": {"source_queue": "running"}},
+        }
+        scheduler._pd_flip_source_pump_transfer = lambda session: None
+        scheduler._pd_flip_migration_status_dict = lambda: {}
+        scheduler.pd_flip_batch_quiesced = False
+
+        out = Scheduler.start_pd_flip_migration_source_delta(
+            scheduler, PDFlipMigrationSourceDeltaReq(session_id="s", rids=[])
+        )
+
+        self.assertFalse(out.success)
+        self.assertFalse(getattr(scheduler, "pd_flip_quiesce_requested", False))
 
     def test_pending_overlap_result_blocks_quiesce(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -436,6 +515,13 @@ class TestDecodeLoopAST(unittest.TestCase):
             ]
             self.assertTrue(quiesce_lines, name)
             self.assertLess(min(quiesce_lines), min(next_lines), name)
+            paused_lines = [
+                node.lineno
+                for node in ast.walk(methods[name])
+                if isinstance(node, ast.Attribute) and node.attr == "_engine_paused"
+            ]
+            self.assertTrue(paused_lines)
+            self.assertLess(min(quiesce_lines), min(paused_lines), name)
             if name == "event_loop_overlap_disagg_decode":
                 result_lines = [
                     node.lineno
@@ -444,6 +530,134 @@ class TestDecodeLoopAST(unittest.TestCase):
                 ]
                 self.assertTrue(result_lines)
                 self.assertLess(min(result_lines), min(quiesce_lines))
+
+    def test_output_sequence_and_session_cross_every_output_boundary(self):
+        io_tree = self._module("python/sglang/srt/managers/io_struct.py")
+        output_classes = {
+            node.name: node
+            for node in io_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name in {"BatchTokenIDOutput", "BatchStrOutput"}
+        }
+        for name in ("BatchTokenIDOutput", "BatchStrOutput"):
+            fields = {
+                node.target.id
+                for node in output_classes[name].body
+                if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            }
+            self.assertIn("pd_flip_output_seqs", fields, name)
+            self.assertIn("pd_flip_session_ids", fields, name)
+
+        relay_cls = next(
+            node
+            for node in io_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "PDFlipMigrationOutputRelayReq"
+        )
+        relay_fields = {
+            node.target.id
+            for node in relay_cls.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        self.assertTrue({"session_id", "output_seq"} <= relay_fields)
+
+        streamer = self._module(
+            "python/sglang/srt/managers/scheduler_components/output_streamer.py"
+        )
+        accept = next(
+            node
+            for node in ast.walk(streamer)
+            if isinstance(node, ast.FunctionDef) and node.name == "accept"
+        )
+        assigned_attrs = {
+            node.attr for node in ast.walk(accept) if isinstance(node, ast.Attribute)
+        }
+        self.assertIn("pd_flip_last_emitted_output_seq", assigned_attrs)
+
+        detokenizer = self._module("python/sglang/srt/managers/detokenizer_manager.py")
+        handle = next(
+            node
+            for node in ast.walk(detokenizer)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "handle_batch_token_id_out"
+        )
+        copied_keywords = {
+            keyword.arg
+            for node in ast.walk(handle)
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+        }
+        self.assertIn("pd_flip_output_seqs", copied_keywords)
+        self.assertIn("pd_flip_session_ids", copied_keywords)
+
+    def test_manifest_target_and_relay_share_session_sequence_baseline(self):
+        scheduler = self._module("python/sglang/srt/managers/scheduler.py")
+        methods = {
+            node.name: node
+            for node in ast.walk(scheduler)
+            if isinstance(node, ast.FunctionDef)
+        }
+        manifest_constants = {
+            node.value
+            for node in ast.walk(methods["_pd_flip_build_migration_manifest"])
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertIn("last_emitted_output_seq", manifest_constants)
+        self.assertIn("pd_flip_session_id", manifest_constants)
+
+        for method_name in (
+            "_pd_flip_manifest_to_req",
+            "_pd_flip_apply_delta_manifest_to_target",
+        ):
+            assigned = {
+                node.attr
+                for node in ast.walk(methods[method_name])
+                if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+            }
+            self.assertIn("pd_flip_last_emitted_output_seq", assigned, method_name)
+            self.assertIn("pd_flip_migration_session_id", assigned, method_name)
+
+        control = self._module("python/sglang/srt/managers/tokenizer_control_mixin.py")
+        prepare = next(
+            node
+            for node in ast.walk(control)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "prepare_pd_flip_migration_target"
+        )
+        prepare_names = {
+            node.id for node in ast.walk(prepare) if isinstance(node, ast.Name)
+        }
+        self.assertIn("relay_key", prepare_names)
+        prepare_attrs = {
+            node.attr for node in ast.walk(prepare) if isinstance(node, ast.Attribute)
+        }
+        self.assertIn("pd_flip_output_relay_baseline", prepare_attrs)
+
+        manager = self._module("python/sglang/srt/managers/tokenizer_manager.py")
+        handle = next(
+            node
+            for node in ast.walk(manager)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_handle_batch_output"
+        )
+        calls = [
+            node
+            for node in ast.walk(handle)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        ]
+        drop_lines = [
+            node.lineno
+            for node in calls
+            if node.func.attr == "_pd_flip_drop_or_record_output_seq"
+        ]
+        state_lookup_lines = [
+            node.lineno
+            for node in calls
+            if node.func.attr == "get"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "rid_to_state"
+        ]
+        self.assertLess(min(drop_lines), min(state_lookup_lines))
 
 
 @unittest.skipIf(RUNTIME_IMPORT_ERROR is not None, str(RUNTIME_IMPORT_ERROR))
@@ -516,33 +730,56 @@ class TestSourceFinishAndAbort(unittest.TestCase):
 class TestMonotonicRelaySequence(unittest.IsolatedAsyncioTestCase):
     async def test_relay_drops_duplicate_and_older_output_sequences(self):
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.rid_to_state = {"r0": object()}
-        manager.pd_flip_last_relay_seq_by_rid = {}
-        manager._pd_flip_batch_output_from_payload = lambda rid, payload: object()
-        manager._handle_batch_output = AsyncMock()
+        manager.pd_flip_last_relay_seq_by_key = {("s", "r0"): 0}
 
+        dropped = []
         for seq in (1, 1, 0, 2):
-            result = await TokenizerManager.relay_pd_flip_migration_output(
-                manager,
-                PDFlipMigrationOutputRelayReq(
-                    rid="r0", output={"rid": "r0", "output_seq": seq}
-                ),
+            output = types.SimpleNamespace(
+                pd_flip_session_ids=["s"], pd_flip_output_seqs=[seq]
             )
-            self.assertTrue(result["success"])
+            dropped.append(
+                TokenizerManager._pd_flip_drop_or_record_output_seq(
+                    manager, output, 0, "r0"
+                )
+            )
 
-        self.assertEqual(manager._handle_batch_output.await_count, 2)
-        self.assertEqual(manager.pd_flip_last_relay_seq_by_rid["r0"], 2)
+        self.assertEqual(dropped, [False, True, True, False])
+        self.assertEqual(manager.pd_flip_last_relay_seq_by_key[("s", "r0")], 2)
+        manager.pd_flip_last_relay_seq_by_key[("s2", "r0")] = 0
+        self.assertFalse(
+            TokenizerManager._pd_flip_drop_or_record_output_seq(
+                manager,
+                types.SimpleNamespace(
+                    pd_flip_session_ids=["s2"], pd_flip_output_seqs=[1]
+                ),
+                0,
+                "r0",
+            )
+        )
 
-    async def test_target_increments_sequence_before_relay(self):
+    async def test_target_relays_scheduler_sequence_without_reincrementing(self):
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.pd_flip_output_relay_targets = {"r0": "http://source"}
-        manager.pd_flip_output_seq_by_rid = {"r0": 7}
+        manager.pd_flip_output_relay_targets = {("s", "r0"): "http://source"}
+        manager.pd_flip_output_relay_baseline = {("s", "r0"): 7}
         manager._pd_flip_batch_output_payload = lambda output, index, rid: {"rid": rid}
-        manager._pd_flip_post_relay_output = lambda source, rid, payload: {
-            "success": True,
-            "output_seq": payload["output_seq"],
-        }
-        output = types.SimpleNamespace(finished_reasons=[None])
+        captured = {}
+
+        def post(source, session_id, rid, output_seq, payload):
+            captured.update(
+                source=source,
+                session_id=session_id,
+                rid=rid,
+                output_seq=output_seq,
+                payload=payload,
+            )
+            return {"success": True}
+
+        manager._pd_flip_post_relay_output = post
+        output = types.SimpleNamespace(
+            finished_reasons=[None],
+            pd_flip_session_ids=["s"],
+            pd_flip_output_seqs=[8],
+        )
 
         with patch(
             "asyncio.to_thread", new=AsyncMock(side_effect=lambda fn, *args: fn(*args))
@@ -552,7 +789,8 @@ class TestMonotonicRelaySequence(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(relayed)
-        self.assertEqual(manager.pd_flip_output_seq_by_rid["r0"], 8)
+        self.assertEqual(captured["output_seq"], 8)
+        self.assertEqual(manager.pd_flip_output_relay_baseline[("s", "r0")], 8)
 
 
 if __name__ == "__main__":

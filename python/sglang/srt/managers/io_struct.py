@@ -1174,6 +1174,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    pd_flip_output_seqs: Optional[List[int]] = None
+    pd_flip_session_ids: Optional[List[Optional[str]]] = None
 
 
 @dataclass
@@ -1240,6 +1242,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    pd_flip_output_seqs: Optional[List[int]] = None
+    pd_flip_session_ids: Optional[List[Optional[str]]] = None
 
 
 @dataclass
@@ -1803,6 +1807,8 @@ class PDFlipMigrationAbortReq(BaseReq):
 
 @dataclass
 class PDFlipMigrationOutputRelayReq(BaseReq):
+    session_id: Optional[str] = None
+    output_seq: Optional[int] = None
     output: Dict[str, Any] = field(default_factory=dict)
 
 

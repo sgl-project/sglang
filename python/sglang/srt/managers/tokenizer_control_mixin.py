@@ -855,17 +855,19 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         self._ensure_pd_flip_migration_bootstrap_server()
         responses = await self.pd_flip_migration_communicator(obj)
-        last_seen = getattr(self, "pd_flip_last_relay_seq_by_rid", None)
+        last_seen = getattr(self, "pd_flip_last_relay_seq_by_key", None)
         if last_seen is None:
             last_seen = {}
-            self.pd_flip_last_relay_seq_by_rid = last_seen
+            self.pd_flip_last_relay_seq_by_key = last_seen
         for response in responses:
             for manifest in response.manifests or []:
                 rid = manifest.get("rid")
-                if rid is not None:
-                    last_seen[str(rid)] = int(
+                session_id = manifest.get("pd_flip_session_id") or obj.session_id
+                if rid is not None and session_id is not None:
+                    last_seen[(str(session_id), str(rid))] = int(
                         manifest.get("last_emitted_output_seq", 0) or 0
                     )
+                    self.pd_flip_relay_session_by_rid[str(rid)] = str(session_id)
         return responses
 
     async def prepare_pd_flip_migration_target(
@@ -878,15 +880,21 @@ class TokenizerControlMixin:
             if targets is None:
                 targets = {}
                 self.pd_flip_output_relay_targets = targets
-            output_seqs = getattr(self, "pd_flip_output_seq_by_rid", None)
-            if output_seqs is None:
-                output_seqs = {}
-                self.pd_flip_output_seq_by_rid = output_seqs
+            baselines = getattr(self, "pd_flip_output_relay_baseline", None)
+            if baselines is None:
+                baselines = {}
+                self.pd_flip_output_relay_baseline = baselines
             for manifest in obj.manifests or []:
                 rid = manifest.get("rid") if isinstance(manifest, dict) else None
-                if rid is not None and not bool(manifest.get("stream", False)):
-                    targets[str(rid)] = obj.source_url
-                    output_seqs[str(rid)] = int(
+                session_id = (
+                    manifest.get("pd_flip_session_id")
+                    if isinstance(manifest, dict)
+                    else None
+                ) or obj.session_id
+                if rid is not None and session_id is not None:
+                    relay_key = (str(session_id), str(rid))
+                    targets[relay_key] = obj.source_url
+                    baselines[relay_key] = int(
                         manifest.get("last_emitted_output_seq", 0) or 0
                     )
         return responses
@@ -908,8 +916,7 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         responses = await self.pd_flip_migration_communicator(obj)
-        getattr(self, "pd_flip_output_relay_targets", {}).clear()
-        getattr(self, "pd_flip_output_seq_by_rid", {}).clear()
+        self._pd_flip_clear_session_relay_state(obj.session_id, keep_receive=True)
         return responses
 
     async def get_pd_flip_migration_status(
@@ -922,7 +929,19 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: PDFlipMigrationSourceFinishReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
-        return await self.pd_flip_migration_communicator(obj)
+        responses = await self.pd_flip_migration_communicator(obj)
+        session_id = obj.session_id
+        if session_id:
+            receive = getattr(self, "pd_flip_last_relay_seq_by_key", {})
+            for key in [
+                key
+                for key in receive
+                if key[0] == str(session_id) and key[1] not in self.rid_to_state
+            ]:
+                receive.pop(key, None)
+                if self.pd_flip_relay_session_by_rid.get(key[1]) == key[0]:
+                    self.pd_flip_relay_session_by_rid.pop(key[1], None)
+        return responses
 
     async def start_pd_flip_migration_source_delta(
         self: TokenizerManager, obj: PDFlipMigrationSourceDeltaReq
@@ -941,7 +960,9 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: PDFlipMigrationAbortReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
-        return await self.pd_flip_migration_communicator(obj)
+        responses = await self.pd_flip_migration_communicator(obj)
+        self._pd_flip_clear_session_relay_state(obj.session_id)
+        return responses
 
     async def set_pd_runtime_role(
         self: TokenizerManager, obj: PDRuntimeRoleSetReq

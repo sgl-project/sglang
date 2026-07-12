@@ -1728,9 +1728,9 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
-            if self._engine_paused:
-                continue
             if self._pd_flip_maybe_enter_batch_quiesce():
+                continue
+            if self._engine_paused:
                 continue
 
             # Get the next batch to run
@@ -1758,8 +1758,6 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
-            if self._engine_paused:
-                continue
 
             # A cutover request must observe the last launched result before it
             # freezes scheduling.  Control requests continue to be polled by
@@ -1771,6 +1769,8 @@ class SchedulerDisaggregationDecodeMixin:
                     self.last_batch = None
                     self.cur_batch = None
                 self._pd_flip_maybe_enter_batch_quiesce()
+                continue
+            if self._engine_paused:
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.

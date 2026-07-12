@@ -404,9 +404,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
-        self.pd_flip_output_relay_targets: Dict[str, str] = {}
-        self.pd_flip_output_seq_by_rid: Dict[str, int] = {}
-        self.pd_flip_last_relay_seq_by_rid: Dict[str, int] = {}
+        self.pd_flip_output_relay_targets: Dict[Tuple[str, str], str] = {}
+        self.pd_flip_output_relay_baseline: Dict[Tuple[str, str], int] = {}
+        self.pd_flip_last_relay_seq_by_key: Dict[Tuple[str, str], int] = {}
+        self.pd_flip_relay_session_by_rid: Dict[str, str] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -2166,10 +2167,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         raise ValueError(f"Unsupported PD flip relay output kind: {payload.get('kind')}")
 
     def _pd_flip_post_relay_output(
-        self, source_url: str, rid: str, payload: Dict[str, Any]
+        self,
+        source_url: str,
+        session_id: str,
+        rid: str,
+        output_seq: int,
+        payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         url = source_url.rstrip("/") + "/pd_flip/migration/output/relay"
-        data = json.dumps({"rid": rid, "output": payload}).encode("utf-8")
+        data = json.dumps(
+            {
+                "rid": rid,
+                "session_id": session_id,
+                "output_seq": output_seq,
+                "output": payload,
+            }
+        ).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=data,
@@ -2200,9 +2213,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         index: int,
         rid: str,
     ) -> bool:
-        source_url = self.pd_flip_output_relay_targets.get(rid)
+        session_id = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_session_ids", None), index, None
+        )
+        output_seq = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_output_seqs", None), index, None
+        )
+        if session_id is None or output_seq is None:
+            return False
+        session_id = str(session_id)
+        output_seq = int(output_seq)
+        relay_key = (session_id, rid)
+        source_url = self.pd_flip_output_relay_targets.get(relay_key)
         if not source_url:
             return False
+        if output_seq <= int(self.pd_flip_output_relay_baseline.get(relay_key, 0)):
+            return True
         if isinstance(recv_obj, BatchEmbeddingOutput):
             logger.warning(
                 "PD flip output relay does not support embedding output for %s", rid
@@ -2210,17 +2236,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return True
 
         payload = self._pd_flip_batch_output_payload(recv_obj, index, rid)
-        output_seq = int(self.pd_flip_output_seq_by_rid.get(rid, 0)) + 1
-        self.pd_flip_output_seq_by_rid[rid] = output_seq
-        payload["output_seq"] = output_seq
         result = await asyncio.to_thread(
-            self._pd_flip_post_relay_output, source_url, rid, payload
+            self._pd_flip_post_relay_output,
+            source_url,
+            session_id,
+            rid,
+            output_seq,
+            payload,
         )
         if result.get("success"):
-            if self._pd_flip_output_item(
-                getattr(recv_obj, "finished_reasons", None), index
-            ) is not None:
-                self.pd_flip_output_relay_targets.pop(rid, None)
+            self.pd_flip_output_relay_baseline[relay_key] = output_seq
+            if (
+                self._pd_flip_output_item(
+                    getattr(recv_obj, "finished_reasons", None), index
+                )
+                is not None
+            ):
+                self.pd_flip_output_relay_targets.pop(relay_key, None)
+                self.pd_flip_output_relay_baseline.pop(relay_key, None)
         else:
             logger.error(
                 "Failed to relay PD flip migrated output for %s to %s: %s",
@@ -2237,22 +2270,73 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not rid:
             return {"success": False, "message": "missing migrated rid"}
         rid = str(rid)
+        if not obj.session_id:
+            return {"success": False, "message": "missing migration session_id"}
+        relay_key = (str(obj.session_id), rid)
+        if (
+            relay_key not in self.pd_flip_last_relay_seq_by_key
+            or self.pd_flip_relay_session_by_rid.get(rid) != str(obj.session_id)
+        ):
+            return {"success": False, "message": "unknown migration session/rid"}
         if rid not in self.rid_to_state:
             return {"success": False, "message": "unknown migrated rid"}
         try:
-            output_seq = int((obj.output or {}).get("output_seq"))
+            output_seq = int(obj.output_seq)
         except (TypeError, ValueError):
             return {"success": False, "message": "missing migrated output_seq"}
-        last_seen = int(self.pd_flip_last_relay_seq_by_rid.get(rid, 0))
-        if output_seq <= last_seen:
-            return {"success": True, "dropped": True}
         try:
             output = self._pd_flip_batch_output_from_payload(rid, obj.output or {})
         except Exception as exc:
             return {"success": False, "message": str(exc)}
-        self.pd_flip_last_relay_seq_by_rid[rid] = output_seq
+        output.pd_flip_session_ids = [str(obj.session_id)]
+        output.pd_flip_output_seqs = [output_seq]
         await self._handle_batch_output(output)
         return {"success": True}
+
+    def _pd_flip_drop_or_record_output_seq(
+        self, recv_obj, index: int, rid: str
+    ) -> bool:
+        session_id = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_session_ids", None), index, None
+        )
+        output_seq = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_output_seqs", None), index, None
+        )
+        if session_id is None or output_seq is None:
+            return False
+        relay_key = (str(session_id), str(rid))
+        if relay_key not in self.pd_flip_last_relay_seq_by_key:
+            return False
+        output_seq = int(output_seq)
+        if output_seq <= int(self.pd_flip_last_relay_seq_by_key[relay_key]):
+            return True
+        self.pd_flip_last_relay_seq_by_key[relay_key] = output_seq
+        return False
+
+    def _pd_flip_clear_session_relay_state(
+        self, session_id: Optional[str], *, keep_receive: bool = False
+    ) -> None:
+        if not session_id:
+            return
+        session_id = str(session_id)
+        for mapping in (
+            self.pd_flip_output_relay_targets,
+            self.pd_flip_output_relay_baseline,
+        ):
+            for key in [key for key in mapping if key[0] == session_id]:
+                mapping.pop(key, None)
+        if not keep_receive:
+            for key in [
+                key
+                for key in self.pd_flip_last_relay_seq_by_key
+                if key[0] == session_id
+            ]:
+                self.pd_flip_last_relay_seq_by_key.pop(key, None)
+            for rid, bound_session_id in list(
+                self.pd_flip_relay_session_by_rid.items()
+            ):
+                if bound_session_id == session_id:
+                    self.pd_flip_relay_session_by_rid.pop(rid, None)
 
     async def _handle_batch_output(
         self,
@@ -2265,6 +2349,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            if self._pd_flip_drop_or_record_output_seq(recv_obj, i, rid):
+                continue
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 if await self._pd_flip_maybe_relay_output(recv_obj, i, rid):
@@ -2502,6 +2588,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                session_id = self._pd_flip_output_item(
+                    getattr(recv_obj, "pd_flip_session_ids", None), i, None
+                )
+                if session_id is not None:
+                    self.pd_flip_last_relay_seq_by_key.pop(
+                        (str(session_id), str(rid)), None
+                    )
+                    if self.pd_flip_relay_session_by_rid.get(str(rid)) == str(
+                        session_id
+                    ):
+                        self.pd_flip_relay_session_by_rid.pop(str(rid), None)
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
