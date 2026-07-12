@@ -722,9 +722,13 @@ def test_reconcile_observation_activation_crash(tmp_path, target_state):
         target,
         "obs-pending",
         ["r0"],
-        "observing_activation_pending",
-        True,
-        {"source_admission_paused": True, "router_drained": True},
+            "observing_activation_pending",
+            True,
+            {
+                "next_fsm_phase": "observing",
+                "source_admission_paused": True,
+                "router_drained": True,
+            },
     )
 
     result = controller.reconcile_session("obs-pending")
@@ -780,6 +784,121 @@ def test_reconcile_waiting_only_pending_manifest_aborts_session_wide(
     assert result.success
     assert client.steps.count("abort") == 2
     assert controller.session_journal.read()["phase"] == "aborted"
+
+
+@pytest.mark.parametrize(
+    "seam,source_state,target_state,source_finished",
+    [
+        ("before_finish_post", "source_started", "ready_to_activate", False),
+        ("finish_ack_lost", "source_released", "ready_to_activate", False),
+        ("after_finish_before_activate", "source_released", "ready_to_activate", True),
+        ("after_activate_before_return", "source_released", "active", True),
+    ],
+)
+@pytest.mark.parametrize(
+    "next_fsm_phase,expected_phase",
+    [
+        ("observing", "observation_recovered_safe"),
+        ("role_flip_worker_prefill_intent", "role_flip_complete"),
+    ],
+)
+def test_reconcile_ownership_cutover_crash_seams(
+    tmp_path,
+    seam,
+    source_state,
+    target_state,
+    source_finished,
+    next_fsm_phase,
+    expected_phase,
+):
+    client = ProgressiveScenarioClient()
+    original = client.get_json
+    session_id = "cutover-first" if next_fsm_phase == "observing" else "cutover-final"
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = source_state if base_url == "http://source" else target_state
+            return {
+                "success": True,
+                "status": {"session_id": session_id, "state": state},
+            }
+        return original(base_url, path)
+
+    client.get_json = get_json
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / f"{seam}-{next_fsm_phase}.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source,
+        target,
+        session_id,
+        ["r0"],
+        "ownership_cutover_intent",
+        source_finished,
+        {
+            "next_fsm_phase": next_fsm_phase,
+            "batch_ordinal": 1 if next_fsm_phase == "observing" else 2,
+            "source_admission_paused": True,
+            "router_drained": True,
+        },
+    )
+
+    result = controller.reconcile_session(session_id)
+
+    assert result.success
+    phase = controller.session_journal.read()["phase"]
+    if seam == "before_finish_post":
+        assert phase == "cutover_aborted_safe"
+        assert client.steps.count("abort") == 2
+    else:
+        assert phase == expected_phase
+        assert client.steps.count("target_activate") == (
+            1 if target_state == "ready_to_activate" else 0
+        )
+
+
+@pytest.mark.parametrize(
+    "suffix,expected_phase",
+    [("first", "observation_recovered_safe"), ("final", "role_flip_complete")],
+)
+def test_reconcile_legacy_cutover_journal_infers_next_phase(
+    tmp_path, suffix, expected_phase
+):
+    client = ProgressiveScenarioClient()
+    original = client.get_json
+    session_id = f"upgrade-{suffix}"
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = (
+                "source_released"
+                if base_url == "http://source"
+                else "ready_to_activate"
+            )
+            return {
+                "success": True,
+                "status": {"session_id": session_id, "state": state},
+            }
+        return original(base_url, path)
+
+    client.get_json = get_json
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / f"legacy-{suffix}.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source, target, session_id, ["r0"], "source_finish_complete", True
+    )
+
+    result = controller.reconcile_session(session_id)
+
+    assert result.success
+    assert controller.session_journal.read()["phase"] == expected_phase
 
 
 def test_progressive_final_batch_uses_all_returned_running_and_waiting_rids():
@@ -847,7 +966,7 @@ def test_progressive_failure_after_source_finish_does_not_abort_ownership():
         record for record in result.actions if record.step == "abort_decode_migration"
     ]
     assert client.running_rids == ["r1"]
-    assert result.state_trace[-1]["reason"] == "post_finish_error"
+    assert result.state_trace[-1]["reason"] == "ownership_cutover_pending"
 
 
 def test_progressive_final_batch_activate_failure_reports_post_finish_phase():
@@ -861,7 +980,7 @@ def test_progressive_final_batch_activate_failure_reports_post_finish_phase():
 
     assert not result.success
     assert len(client.source_starts) == 2
-    assert result.state_trace[-1]["reason"] == "post_finish_error"
+    assert result.state_trace[-1]["reason"] == "ownership_cutover_pending"
     assert not [
         record for record in result.actions if record.step == "abort_decode_migration"
     ]
@@ -892,6 +1011,7 @@ def test_atomic_batch_rejects_malformed_source_start_manifests(response):
             "strict-source-start",
             ("r0",),
             False,
+            next_fsm_phase="observing",
             records=records,
         )
 

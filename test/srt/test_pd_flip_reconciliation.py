@@ -948,6 +948,7 @@ def test_progressive_abort_keeps_source_verified_full_batch(tmp_path):
             "s",
             ["r0"],
             True,
+            next_fsm_phase="role_flip_worker_prefill_intent",
         )
 
     record = controller.session_journal.read()
