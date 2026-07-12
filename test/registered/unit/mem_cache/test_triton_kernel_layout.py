@@ -57,7 +57,7 @@ class TestTritonKernelLayoutParity(unittest.TestCase):
         return q, logical_kv_k, logical_kv_v, kv_indptr, kv_indices, seq_len
 
     def _run_decode(self, q, k_buf, v_buf, kv_indptr, kv_indices, page_size):
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+        from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
         )
 
@@ -115,7 +115,7 @@ class TestTritonKernelLayoutParity(unittest.TestCase):
 
     def test_extend_3d_vs_4d_ps1_byte_identical(self):
         """Same parity check for extend kernel."""
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+        from sglang.kernels.ops.attention.extend_attention import (
             extend_attention_fwd,
         )
 

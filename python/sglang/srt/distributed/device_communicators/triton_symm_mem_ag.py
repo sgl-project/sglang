@@ -423,9 +423,9 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
     chunk. Returns ``floor`` if server args are unavailable."""
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        sa = get_global_server_args()
+        sa = get_server_args()
 
         def g(name: str) -> int:
             v = getattr(sa, name, 0)

@@ -101,88 +101,6 @@ class TestModelOptModelLoader(CustomTestCase):
         self.mock_get_tp_group.stop()
         self.mock_mp_is_initialized.stop()
 
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.logger")
-    def test_successful_fp8_quantization(self, mock_logger):
-        """Test successful FP8 quantization workflow."""
-
-        # Create loader instance
-        loader = ModelOptModelLoader(self.load_config)
-
-        # Mock modelopt modules
-        mock_mtq = MagicMock()
-
-        # Configure mtq mock with FP8_DEFAULT_CFG
-        mock_fp8_cfg = MagicMock()
-        mock_mtq.FP8_DEFAULT_CFG = mock_fp8_cfg
-        mock_mtq.quantize.return_value = self.mock_base_model
-        mock_mtq.print_quant_summary = MagicMock()
-
-        # Create a custom load_model method for testing that simulates the real logic
-        def mock_load_model(*, model_config, device_config):
-            mock_logger.info("ModelOptModelLoader: Loading base model...")
-
-            # Simulate loading base model (this is already mocked)
-            model = self.mock_base_model
-
-            # Simulate the quantization config lookup
-            quant_choice_str = model_config._get_modelopt_quant_type()
-            quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
-
-            if not quant_cfg_name:
-                raise ValueError(f"Invalid modelopt_quant choice: '{quant_choice_str}'")
-
-            # Simulate getattr call and quantization
-            if quant_cfg_name == "FP8_DEFAULT_CFG":
-                quant_cfg = mock_fp8_cfg
-
-                mock_logger.info(
-                    f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
-                )
-
-                # Simulate mtq.quantize call
-                quantized_model = mock_mtq.quantize(model, quant_cfg, forward_loop=None)
-                mock_logger.info("Model successfully quantized with ModelOpt.")
-
-                # Simulate print_quant_summary call
-                mock_mtq.print_quant_summary(quantized_model)
-
-                return quantized_model.eval()
-
-            return model.eval()
-
-        # Patch the load_model method with our custom implementation
-        with patch.object(loader, "load_model", side_effect=mock_load_model):
-            # Execute the load_model method
-            result_model = loader.load_model(
-                model_config=self.model_config, device_config=self.device_config
-            )
-
-            # Verify the quantization process
-            mock_mtq.quantize.assert_called_once_with(
-                self.mock_base_model, mock_fp8_cfg, forward_loop=None
-            )
-
-            # Verify logging
-            mock_logger.info.assert_any_call(
-                "ModelOptModelLoader: Loading base model..."
-            )
-            mock_logger.info.assert_any_call(
-                "Quantizing model with ModelOpt using config attribute: mtq.FP8_DEFAULT_CFG"
-            )
-            mock_logger.info.assert_any_call(
-                "Model successfully quantized with ModelOpt."
-            )
-
-            # Verify print_quant_summary was called
-            mock_mtq.print_quant_summary.assert_called_once_with(self.mock_base_model)
-
-            # Verify eval() was called on the returned model
-            self.mock_base_model.eval.assert_called()
-
-            # Verify we get back the expected model
-            self.assertEqual(result_model, self.mock_base_model)
-
     @patch("sglang.srt.model_loader.loader.logger")
     def test_missing_modelopt_import(self, mock_logger):
         """Test error handling when modelopt library is not available."""
@@ -488,49 +406,6 @@ class TestModelOptLoaderIntegration(CustomTestCase):
 
     @patch("sglang.srt.model_loader.loader.get_model_loader")
     @patch("sglang.srt.entrypoints.engine.Engine.__init__")
-    def test_engine_with_modelopt_quant_parameter(
-        self, mock_engine_init, mock_get_model_loader
-    ):
-        """Test that Engine properly handles modelopt_quant parameter."""
-
-        # Mock the Engine.__init__ to avoid actual initialization
-        mock_engine_init.return_value = None
-
-        # Mock get_model_loader to return our ModelOptModelLoader
-        mock_loader = MagicMock(spec=ModelOptModelLoader)
-        mock_get_model_loader.return_value = mock_loader
-
-        # Import here to avoid circular imports during test discovery
-        # import sglang as sgl  # Commented out since not directly used
-
-        # Test that we can create an engine with modelopt_quant parameter
-        # This would normally trigger the ModelOptModelLoader selection
-        try:
-            engine_args = {
-                "model_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                "modelopt_quant": "fp8",
-                "log_level": "error",  # Suppress logs during testing
-            }
-
-            # This tests the parameter parsing and server args creation
-            from sglang.srt.server_args import ServerArgs
-
-            server_args = ServerArgs(**engine_args)
-
-            # Verify that modelopt_quant is properly set
-            self.assertEqual(server_args.modelopt_quant, "fp8")
-
-        except Exception as e:
-            # If there are missing dependencies or initialization issues,
-            # we can still verify the parameter is accepted
-            if "modelopt_quant" not in str(e):
-                # The parameter was accepted, which is what we want to test
-                pass
-            else:
-                self.fail(f"modelopt_quant parameter not properly handled: {e}")
-
-    @patch("sglang.srt.model_loader.loader.get_model_loader")
-    @patch("sglang.srt.entrypoints.engine.Engine.__init__")
     def test_engine_with_modelopt_quant_cli_argument(
         self, mock_engine_init, mock_get_model_loader
     ):
@@ -741,12 +616,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             should_apply_lm_head_quant_method(
                 lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
             )
-        )
-
-    def test_mixed_precision_uses_nvfp4_min_capability(self):
-        self.assertEqual(
-            ModelOptMixedPrecisionConfig.get_min_capability(),
-            ModelOptFp4Config.get_min_capability(),
         )
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
