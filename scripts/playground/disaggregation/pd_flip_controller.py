@@ -468,9 +468,14 @@ class PDFlipController:
         source_url = record.get("source_url")
         target_url = record.get("target_url")
         batch_rids = [str(rid) for rid in record.get("batch_rids") or []]
+        waiting_only_pending = (
+            record.get("phase") == "source_start_intent"
+            and record.get("include_waiting") is True
+            and record.get("batch_scope") == "waiting_only_pending_manifest"
+        )
         if (
             not all((source_name, target_name, source_url, target_url))
-            or not batch_rids
+            or (not batch_rids and not waiting_only_pending)
         ):
             return FlipExecutionResult(
                 False,
@@ -519,9 +524,44 @@ class PDFlipController:
                 actions=records,
             )
         if record.get("phase") in {
+            "role_flip_worker_prefill_intent",
             "role_flip_worker_prefill",
             "role_flip_router_pending",
         }:
+            if record.get("phase") == "role_flip_worker_prefill_intent":
+                runtime = self.client.get_json(
+                    source.worker_url, "/pd_flip/runtime_role/status"
+                )
+                _require_single_dp_runtime_status(runtime, source.name)
+                statuses = runtime if isinstance(runtime, list) else [runtime]
+                roles = set()
+                for status in statuses:
+                    role, _, _ = _parse_runtime_status(status)
+                    inner = (
+                        status.get("status")
+                        if isinstance(status.get("status"), dict)
+                        else status
+                    )
+                    active = _normalize_role(inner.get("active_event_loop_role"))
+                    roles.add((role, active))
+                if roles == {("decode", "decode")}:
+                    self._post_worker(
+                        records,
+                        "set_source_runtime_role",
+                        source,
+                        "/pd_flip/runtime_role/set",
+                        {"role": "prefill", "force": False},
+                    )
+                elif roles != {("prefill", "prefill")}:
+                    return FlipExecutionResult(
+                        False,
+                        f"session state requires operator recovery: mixed runtime roles {roles}",
+                        "d_to_p",
+                        source.name,
+                        "prefill",
+                        target.name,
+                        actions=records,
+                    )
             self._wait_source_role(records, source, "prefill", "reconcile_prefill_loop")
             self._complete_prefill_router_flip(source, records)
             self._write_journal_phase(
@@ -538,14 +578,25 @@ class PDFlipController:
             )
 
         try:
-            source_statuses = _strict_migration_statuses(
-                self.client.get_json(source_url, "/pd_flip/migration/status"),
-                session_id,
+            source_status_response = self.client.get_json(
+                source_url, "/pd_flip/migration/status"
             )
-            target_statuses = _strict_migration_statuses(
-                self.client.get_json(target_url, "/pd_flip/migration/status"),
-                session_id,
+            target_status_response = self.client.get_json(
+                target_url, "/pd_flip/migration/status"
             )
+            if waiting_only_pending:
+                # The intent is durable before source/start. A crash may therefore
+                # leave no worker-side session at all; querying both workers is
+                # still required, but session-wide abort is safe and idempotent.
+                source_statuses = []
+                target_statuses = []
+            else:
+                source_statuses = _strict_migration_statuses(
+                    source_status_response, session_id
+                )
+                target_statuses = _strict_migration_statuses(
+                    target_status_response, session_id
+                )
         except (TypeError, ValueError):
             return FlipExecutionResult(
                 False,
@@ -558,6 +609,85 @@ class PDFlipController:
 
         source_states = {status.get("state") for status in source_statuses}
         target_states = {status.get("state") for status in target_statuses}
+        if waiting_only_pending:
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                [],
+                "abort_intent",
+                False,
+                {
+                    "include_waiting": True,
+                    "batch_scope": "waiting_only_pending_manifest",
+                },
+            )
+            abort_complete = self._abort_two_phase_migration(
+                source, target, session_id, records
+            )
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                [],
+                "aborted" if abort_complete else "abort_incomplete",
+                False,
+                {
+                    "include_waiting": True,
+                    "batch_scope": "waiting_only_pending_manifest",
+                },
+            )
+            return FlipExecutionResult(
+                abort_complete,
+                (
+                    "waiting-only session aborted during reconciliation"
+                    if abort_complete
+                    else "session state requires operator recovery: abort incomplete"
+                ),
+                "d_to_p",
+                source.name,
+                None,
+                target.name,
+                actions=records,
+            )
+        if record.get("phase") == "observing_activation_pending":
+            if target_states == {"ready_to_activate"}:
+                self._post_worker(
+                    records,
+                    "activate_decode_migration_target",
+                    target,
+                    "/pd_flip/migration/target/activate",
+                    {"session_id": session_id, "rids": batch_rids},
+                )
+            elif target_states != {"active"}:
+                return FlipExecutionResult(
+                    False,
+                    "session state requires operator recovery: observation target not activatable",
+                    "d_to_p",
+                    source.name,
+                    "decode",
+                    target.name,
+                    actions=records,
+                )
+            self._resume_decode_source(source, records)
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                batch_rids,
+                "observation_recovered_safe",
+                True,
+                {"source_admission_paused": False, "router_drained": False},
+            )
+            return FlipExecutionResult(
+                True,
+                "observation activation recovered safely; source remains decode",
+                "d_to_p",
+                source.name,
+                "decode",
+                target.name,
+                actions=records,
+            )
         if target_states == {"active"}:
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "target_active", True
@@ -1139,6 +1269,7 @@ class PDFlipController:
                 selection.selected_rids,
                 False,
                 records=records,
+                activation_recovery_phase="observing",
             )
             source_finished = True
 
@@ -1150,21 +1281,6 @@ class PDFlipController:
                 target,
                 "fresh_slo_window",
                 records,
-            )
-            self._write_journal_phase(
-                source,
-                target,
-                session_prefix + "-first",
-                selection.selected_rids,
-                "observing",
-                True,
-                {
-                    "batch_ordinal": 1,
-                    "observation_deadline_epoch": time.time()
-                    + self.config.observation_seconds,
-                    "source_admission_paused": True,
-                    "router_drained": True,
-                },
             )
             observation = self._collect_progressive_observation(
                 slo_monitor, monitor_nodes
@@ -1313,6 +1429,7 @@ class PDFlipController:
         include_waiting: bool,
         *,
         records: Optional[List[ActionRecord]] = None,
+        activation_recovery_phase: Optional[str] = None,
     ) -> Tuple[str, ...]:
         records = records if records is not None else []
         requested_rids = tuple(str(rid) for rid in rids)
@@ -1327,6 +1444,14 @@ class PDFlipController:
                 session_id,
                 requested_rids,
                 "source_start_intent",
+                metadata=(
+                    {
+                        "include_waiting": True,
+                        "batch_scope": "waiting_only_pending_manifest",
+                    }
+                    if include_waiting and not requested_rids
+                    else {"include_waiting": include_waiting}
+                ),
             )
             source_start = self._post_worker(
                 records,
@@ -1448,6 +1573,20 @@ class PDFlipController:
                 "target_activate_intent",
                 True,
             )
+            if activation_recovery_phase:
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    batch_rids,
+                    "observing_activation_pending",
+                    True,
+                    {
+                        "next_phase": activation_recovery_phase,
+                        "source_admission_paused": True,
+                        "router_drained": True,
+                    },
+                )
             self._post_worker(
                 records,
                 "activate_decode_migration_target",
@@ -1455,9 +1594,26 @@ class PDFlipController:
                 "/pd_flip/migration/target/activate",
                 {"session_id": session_id, "rids": list(batch_rids)},
             )
-            self._write_journal_phase(
-                source, target, session_id, batch_rids, "target_active", True
-            )
+            if activation_recovery_phase:
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    batch_rids,
+                    activation_recovery_phase,
+                    True,
+                    {
+                        "batch_ordinal": 1,
+                        "observation_deadline_epoch": time.time()
+                        + self.config.observation_seconds,
+                        "source_admission_paused": True,
+                        "router_drained": True,
+                    },
+                )
+            else:
+                self._write_journal_phase(
+                    source, target, session_id, batch_rids, "target_active", True
+                )
             return batch_rids
         except Exception as exc:
             if not source_finished:
@@ -1650,14 +1806,28 @@ class PDFlipController:
         batch_rids: Sequence[str],
         records: List[ActionRecord],
     ) -> None:
-        self._post_worker(
-            records,
-            "set_source_runtime_role",
+        self._write_journal_phase(
             source,
-            "/pd_flip/runtime_role/set",
-            {"role": "prefill", "force": False},
+            target,
+            session_id,
+            batch_rids,
+            "role_flip_worker_prefill_intent",
+            True,
+            {"source_admission_paused": True, "router_drained": True},
         )
-        self._wait_source_role(records, source, "prefill", "wait_source_prefill_loop")
+        try:
+            self._post_worker(
+                records,
+                "set_source_runtime_role",
+                source,
+                "/pd_flip/runtime_role/set",
+                {"role": "prefill", "force": False},
+            )
+            self._wait_source_role(
+                records, source, "prefill", "wait_source_prefill_loop"
+            )
+        except Exception as exc:
+            raise RoleFlipRouterPendingError(str(exc)) from exc
         self._write_journal_phase(
             source, target, session_id, batch_rids, "role_flip_worker_prefill", True
         )

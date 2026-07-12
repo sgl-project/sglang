@@ -2,6 +2,9 @@ import ast
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +77,73 @@ def test_existing_admin_levels_keep_their_absent_key_behavior():
     assert optional.allowed
     assert not forced.allowed
     assert forced.error_status_code == 403
+
+
+def test_middleware_install_helper_detects_admin_required_endpoint():
+    auth = _load_auth_module()
+
+    @auth.auth_level(auth.AuthLevel.ADMIN_REQUIRED)
+    def required_endpoint():
+        pass
+
+    app = SimpleNamespace(
+        router=SimpleNamespace(routes=[SimpleNamespace(endpoint=required_endpoint)])
+    )
+
+    assert auth.app_has_admin_middleware_endpoints(app)
+    assert auth.app_has_admin_force_endpoints(app)  # Legacy server import remains valid.
+
+
+def _make_fastapi_app(auth, *, admin_api_key):
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+
+    app = fastapi.FastAPI()
+
+    @app.get("/legacy-optional")
+    @auth.auth_level(auth.AuthLevel.ADMIN_OPTIONAL)
+    async def legacy_optional():
+        return {"ok": True}
+
+    @app.post("/admin-required")
+    @auth.auth_level(auth.AuthLevel.ADMIN_REQUIRED)
+    async def admin_required():
+        return {"ok": True}
+
+    # Mirror the HTTP server's middleware-install condition. In particular, an
+    # ADMIN_REQUIRED route must install middleware even when neither key exists.
+    if admin_api_key or auth.app_has_admin_force_endpoints(app):
+        auth.add_api_key_middleware(
+            app,
+            api_key=None,
+            admin_api_key=admin_api_key,
+        )
+
+    return testclient.TestClient(app)
+
+
+def test_middleware_is_installed_for_admin_required_without_keys():
+    auth = _load_auth_module()
+
+    with _make_fastapi_app(auth, admin_api_key=None) as client:
+        assert client.get("/legacy-optional").status_code == 200
+        response = client.post("/admin-required")
+
+    assert response.status_code == 503
+
+
+def test_admin_required_middleware_enforces_configured_admin_key():
+    auth = _load_auth_module()
+
+    with _make_fastapi_app(auth, admin_api_key="admin-secret") as client:
+        assert client.post("/admin-required").status_code == 401
+        assert client.post(
+            "/admin-required", headers={"Authorization": "Bearer wrong"}
+        ).status_code == 401
+        assert client.post(
+            "/admin-required",
+            headers={"Authorization": "Bearer admin-secret"},
+        ).status_code == 200
 
 
 def test_every_pd_flip_http_route_requires_admin_configuration():

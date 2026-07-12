@@ -1,5 +1,9 @@
 import ast
+import asyncio
+import time
+import types
 from pathlib import Path
+from typing import Dict, Tuple
 
 
 SOURCE = Path("python/sglang/srt/managers/tokenizer_manager.py")
@@ -50,3 +54,49 @@ def test_abort_cleanup_cancels_retry_tasks_and_drops_outbox():
     assert "pd_flip_output_relay_outbox" in source
     assert "pd_flip_output_relay_retry_tasks" in source
     assert "task.cancel()" in source
+
+
+def _relay_harness_class():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TokenizerManager")
+    names = {
+        "relay_pd_flip_migration_output",
+        "_pd_flip_prune_terminal_relay_tombstones",
+        "_pd_flip_record_terminal_relay_tombstone",
+    }
+    methods = [node for node in cls.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+    module = ast.Module(body=[ast.ClassDef(name="Harness", bases=[], keywords=[], decorator_list=[], body=methods)], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"time": time, "Dict": Dict, "Tuple": Tuple, "PDFlipMigrationOutputRelayReq": object}
+    exec(compile(module, str(SOURCE), "exec"), namespace)
+    return namespace["Harness"]
+
+
+def test_terminal_ack_loss_replay_uses_tombstone_without_duplicate_forward():
+    manager = _relay_harness_class()()
+    manager.pd_flip_last_relay_seq_by_key = {("s1", "r0"): 0}
+    manager.pd_flip_relay_session_by_rid = {"r0": "s1"}
+    manager.pd_flip_terminal_relay_tombstones = {}
+    manager.rid_to_state = {"r0": object()}
+    manager._pd_flip_batch_output_from_payload = lambda rid, payload: types.SimpleNamespace()
+    calls = []
+
+    async def handle(output):
+        calls.append(output.pd_flip_output_seqs[0])
+        manager.rid_to_state.pop("r0", None)
+
+    manager._handle_batch_output = handle
+    request = types.SimpleNamespace(
+        rid="r0", session_id="s1", output_seq=9, output={"rid": "r0"}
+    )
+
+    first = asyncio.run(manager.relay_pd_flip_migration_output(request))
+    second = asyncio.run(manager.relay_pd_flip_migration_output(request))
+
+    assert first["success"]
+    assert second == {"success": True, "duplicate_terminal": True}
+    assert calls == [9]
+    other_session = types.SimpleNamespace(
+        rid="r0", session_id="s2", output_seq=9, output={"rid": "r0"}
+    )
+    assert not asyncio.run(manager.relay_pd_flip_migration_output(other_session))["success"]

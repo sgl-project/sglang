@@ -413,6 +413,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.pd_flip_output_relay_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self.pd_flip_last_relay_seq_by_key: Dict[Tuple[str, str], int] = {}
         self.pd_flip_relay_session_by_rid: Dict[str, str] = {}
+        self.pd_flip_terminal_relay_tombstones: Dict[
+            Tuple[str, str], Tuple[int, float]
+        ] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -2349,6 +2352,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not obj.session_id:
             return {"success": False, "message": "missing migration session_id"}
         relay_key = (str(obj.session_id), rid)
+        try:
+            output_seq = int(obj.output_seq)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "missing migrated output_seq"}
+        self._pd_flip_prune_terminal_relay_tombstones()
+        tombstone = getattr(self, "pd_flip_terminal_relay_tombstones", {}).get(
+            relay_key
+        )
+        if tombstone is not None and output_seq <= tombstone[0]:
+            return {"success": True, "duplicate_terminal": True}
         if (
             relay_key not in self.pd_flip_last_relay_seq_by_key
             or self.pd_flip_relay_session_by_rid.get(rid) != str(obj.session_id)
@@ -2357,17 +2370,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if rid not in self.rid_to_state:
             return {"success": False, "message": "unknown migrated rid"}
         try:
-            output_seq = int(obj.output_seq)
-        except (TypeError, ValueError):
-            return {"success": False, "message": "missing migrated output_seq"}
-        try:
             output = self._pd_flip_batch_output_from_payload(rid, obj.output or {})
         except Exception as exc:
             return {"success": False, "message": str(exc)}
         output.pd_flip_session_ids = [str(obj.session_id)]
         output.pd_flip_output_seqs = [output_seq]
         await self._handle_batch_output(output)
+        if rid not in self.rid_to_state:
+            self._pd_flip_record_terminal_relay_tombstone(relay_key, output_seq)
         return {"success": True}
+
+    def _pd_flip_prune_terminal_relay_tombstones(self) -> None:
+        tombstones = getattr(self, "pd_flip_terminal_relay_tombstones", None)
+        if tombstones is None:
+            tombstones = {}
+            self.pd_flip_terminal_relay_tombstones = tombstones
+        cutoff = time.monotonic() - 600.0
+        for key, (_, created) in list(tombstones.items()):
+            if created < cutoff:
+                tombstones.pop(key, None)
+        while len(tombstones) > 4096:
+            tombstones.pop(next(iter(tombstones)))
+
+    def _pd_flip_record_terminal_relay_tombstone(
+        self, relay_key: Tuple[str, str], output_seq: int
+    ) -> None:
+        tombstones = getattr(self, "pd_flip_terminal_relay_tombstones", None)
+        if tombstones is None:
+            tombstones = {}
+            self.pd_flip_terminal_relay_tombstones = tombstones
+        tombstones.pop(relay_key, None)
+        tombstones[relay_key] = (int(output_seq), time.monotonic())
+        self._pd_flip_prune_terminal_relay_tombstones()
 
     def _pd_flip_drop_or_record_output_seq(
         self, recv_obj, index: int, rid: str
@@ -2395,6 +2429,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not session_id:
             return
         session_id = str(session_id)
+        for key in [
+            key
+            for key in getattr(self, "pd_flip_terminal_relay_tombstones", {})
+            if key[0] == session_id
+        ]:
+            self.pd_flip_terminal_relay_tombstones.pop(key, None)
         for mapping in (
             self.pd_flip_output_relay_targets,
             self.pd_flip_output_relay_baseline,

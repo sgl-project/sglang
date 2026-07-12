@@ -669,6 +669,119 @@ def test_reconcile_observing_crash_restores_decode_admission(tmp_path):
     assert controller.session_journal.read()["phase"] == "observation_recovered_safe"
 
 
+@pytest.mark.parametrize("role", ["decode", "prefill"])
+def test_reconcile_role_flip_intent_before_or_after_worker_post(tmp_path, role):
+    client = ProgressiveScenarioClient()
+    client.source_role = role
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source,
+        target,
+        "role-intent",
+        ["r0"],
+        "role_flip_worker_prefill_intent",
+        True,
+        {"source_admission_paused": True, "router_drained": True},
+    )
+
+    result = controller.reconcile_session("role-intent")
+
+    assert result.success
+    assert client.steps.count("set_source_runtime_role") == (1 if role == "decode" else 0)
+    assert controller.session_journal.read()["phase"] == "role_flip_complete"
+
+
+@pytest.mark.parametrize("target_state", ["ready_to_activate", "active"])
+def test_reconcile_observation_activation_crash(tmp_path, target_state):
+    client = ProgressiveScenarioClient()
+    original = client.get_json
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = "source_released" if base_url == "http://source" else target_state
+            return {
+                "success": True,
+                "status": {"session_id": "obs-pending", "state": state},
+            }
+        return original(base_url, path)
+
+    client.get_json = get_json
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source,
+        target,
+        "obs-pending",
+        ["r0"],
+        "observing_activation_pending",
+        True,
+        {"source_admission_paused": True, "router_drained": True},
+    )
+
+    result = controller.reconcile_session("obs-pending")
+
+    assert result.success
+    assert client.steps.count("target_activate") == (
+        1 if target_state == "ready_to_activate" else 0
+    )
+    assert controller.session_journal.read()["phase"] == "observation_recovered_safe"
+
+
+@pytest.mark.parametrize(
+    "source_state,target_state",
+    [("source_started", "idle"), ("idle", "idle"), (None, None)],
+)
+def test_reconcile_waiting_only_pending_manifest_aborts_session_wide(
+    tmp_path, source_state, target_state
+):
+    client = ProgressiveScenarioClient()
+    original = client.get_json
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = source_state if base_url == "http://source" else target_state
+            return {
+                "success": True,
+                "status": {
+                    "session_id": "waiting-only" if state is not None else None,
+                    "state": state or "idle",
+                },
+            }
+        return original(base_url, path)
+
+    client.get_json = get_json
+    controller, _, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source,
+        target,
+        "waiting-only",
+        [],
+        "source_start_intent",
+        False,
+        {"include_waiting": True, "batch_scope": "waiting_only_pending_manifest"},
+    )
+
+    result = controller.reconcile_session("waiting-only")
+
+    assert result.success
+    assert client.steps.count("abort") == 2
+    assert controller.session_journal.read()["phase"] == "aborted"
+
+
 def test_progressive_final_batch_uses_all_returned_running_and_waiting_rids():
     client = ProgressiveScenarioClient(waiting_rids=["w0"])
     controller, client, monitor = progressive_scenario((14, 20, 19, 20), client=client)
