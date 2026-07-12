@@ -1,7 +1,6 @@
 import unittest
 
 from sglang.benchmark.dspark_sps_profiler import (
-    INFO_RECORD_SOURCE,
     LoadInfo,
     ServerContext,
     SpsRow,
@@ -55,7 +54,6 @@ def make_context(**overrides) -> ServerContext:
         cuda_graph_max_bs=128,
         skip_max_running_requests_threshold=float("inf"),
         skip_token_capacity_threshold=float("inf"),
-        record_source=INFO_RECORD_SOURCE,
     )
     values.update(overrides)
     return ServerContext(**values)
