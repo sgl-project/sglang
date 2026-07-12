@@ -27,7 +27,12 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    sequence_parallel_region,
+    sp_all_gather,
+    sp_scatter,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -44,7 +49,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -99,6 +108,8 @@ class Qwen2MLP(nn.Module):
         if get_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
+        # Under SP, gate_up_proj / down_proj (participants) fuse the g / g-bar
+        # collectives with their GEMMs while the SP forward region is active.
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
@@ -268,6 +279,12 @@ class Qwen2DecoderLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
+    # Whether this model's decoder layers implement Megatron LayerNorm sequence
+    # parallelism (the per-layer g / g-bar wiring). Only subclasses using an
+    # SP-wired decoder layer (Qwen3) set this True; the shared entry-scatter /
+    # exit-gather below stays inert otherwise.
+    enable_layernorm_sp_supported: bool = False
+
     def __init__(
         self,
         config: Qwen2Config,
@@ -281,6 +298,30 @@ class Qwen2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+
+        if get_server_args().enable_layernorm_sp:
+            if get_server_args().tp_size <= 1:
+                raise ValueError(
+                    "--enable-layernorm-sp requires tp_size > 1: there is no "
+                    "sequence to shard across a single TP rank."
+                )
+            if not self.enable_layernorm_sp_supported:
+                raise ValueError(
+                    "--enable-layernorm-sp is only supported for Qwen3 dense models; "
+                    f"{type(self).__name__} does not implement sequence parallelism."
+                )
+            if get_server_args().enable_dp_attention:
+                raise ValueError(
+                    "--enable-layernorm-sp is not compatible with --enable-dp-attention: "
+                    "SP shards the sequence across the full TP group, which under DP "
+                    "attention spans data-parallel groups holding different sequences."
+                )
+            if get_server_args().speculative_algorithm is not None:
+                raise ValueError(
+                    "--enable-layernorm-sp is not compatible with speculative decoding "
+                    "(EAGLE/EAGLE3): the captured aux hidden states would be "
+                    "sequence-sharded. Disable one of them."
+                )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -357,30 +398,53 @@ class Qwen2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
+        # Megatron LayerNorm sequence parallelism (arXiv:2205.05198): keep the
+        # norm/residual regions sequence-scattered across the layers. Qwen3-only
+        # (see enable_layernorm_sp_supported) and gated on EXTEND specifically:
+        # is_extend() also covers MIXED / TARGET_VERIFY / SPLIT_PREFILL, and
+        # SPLIT_PREFILL runs through forward_split_prefill (no entry scatter),
+        # which would mismatch the per-layer g-bar. (Chunked/split-prefill and
+        # speculative SP are follow-ups.)
+        sp = (
+            self.enable_layernorm_sp_supported
+            and get_server_args().enable_layernorm_sp
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+        )
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
+            if sp:
+                # Entry scatter: shard the replicated hidden states along the
+                # token dim (a local slice, since the input is replicated).
+                hidden_states = sp_scatter(hidden_states)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+        # Mark the decoder-layer loop as the SP region: the participant linears
+        # and each layer's LayerCommunicator read this at depth (no per-layer
+        # enable_sp threading). Inert when sp is False.
+        with sequence_parallel_region(sp, num_tokens=input_ids.shape[0]):
+            for i in range(self.start_layer, self.end_layer):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
                 )
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -394,6 +458,14 @@ class Qwen2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+            if sp:
+                # Exit: activations are sequence-sharded under SP -- all-gather
+                # back to the full sequence (dropping padding) for the LM head.
+                # Kept independent of the residual branch above so a layer-less
+                # last PP rank still gathers.
+                hidden_states = sp_all_gather(
+                    hidden_states, num_tokens=input_ids.shape[0]
+                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

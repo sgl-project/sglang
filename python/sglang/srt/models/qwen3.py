@@ -5,9 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -170,6 +168,8 @@ class Qwen3Attention(nn.Module):
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
     def forward_prepare_native(self, positions, hidden_states):
+        # Under SP, qkv_proj (a participant) fuses the "g" all-gather with the
+        # QKV GEMM and returns the full-sequence QKV.
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
@@ -303,6 +303,8 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        # Under SP, o_proj (a participant) fuses the "g-bar" reduce-scatter with
+        # the GEMM instead of all-reducing.
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -379,11 +381,24 @@ class Qwen3DecoderLayer(nn.Module):
             is_previous_layer_sparse=False,
             is_next_layer_sparse=False,
         )
+        # Megatron LayerNorm sequence parallelism (arXiv:2205.05198): the
+        # communicator delegates to an all-SCATTERED variant while the SP
+        # forward region is active (norm on the sequence shard). Prefill-only.
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            enable_layernorm_sp=get_server_args().enable_layernorm_sp,
         )
+
+        # Mark the block's row/column-parallel linears as SP participants so they
+        # fuse the g / g-bar collectives with their GEMMs when the region is
+        # active (o_proj / down_proj reduce-scatter; qkv / gate_up all-gather).
+        if get_server_args().enable_layernorm_sp:
+            self.self_attn.qkv_proj.sequence_parallel = True
+            self.self_attn.o_proj.sequence_parallel = True
+            self.mlp.gate_up_proj.sequence_parallel = True
+            self.mlp.down_proj.sequence_parallel = True
 
     def forward(
         self,
@@ -393,6 +408,9 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Under --enable-layernorm-sp (prefill EXTEND), the communicator delegates
+        # to its all-SCATTERED variant and the participant linears fuse the
+        # g / g-bar collectives; the SP forward region is set by Qwen2Model.forward.
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -433,6 +451,10 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(Qwen2Model):
+    # Qwen3DecoderLayer implements the per-layer SP wiring, so the shared
+    # entry-scatter / exit-gather in Qwen2Model.forward is safe to run here.
+    enable_layernorm_sp_supported: bool = True
+
     def __init__(
         self,
         config: Qwen3Config,

@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -248,6 +248,72 @@ def get_is_extend_in_batch() -> bool:
     from sglang.srt.runtime_context import get_forward
 
     return get_forward().is_extend_in_batch
+
+
+# --- Megatron LayerNorm sequence parallelism (arXiv:2205.05198) ---
+# SP is scoped to a single forward via the ForwardFlags tier (get_forward()),
+# set once by the model around its decoder loop. sp_active / sp_num_tokens are
+# _GRAPH_VISIBLE flags (read inside compiled Row/ColumnParallelLinear.forward and
+# the LayerCommunicator), so no enable_sp flag is threaded through the call sites.
+# A linear engages SP only if it is a construction-time participant
+# (sequence_parallel=True) AND sp_active; the LayerCommunicator delegates to its
+# all-SCATTERED variant while sp_active.
+
+
+def is_sp_active() -> bool:
+    """Whether the current forward is running Megatron LayerNorm SP."""
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().sp_active
+
+
+def sp_num_tokens() -> int:
+    """Real (unpadded) token count of the current SP forward."""
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().sp_num_tokens
+
+
+def sequence_parallel_region(active: bool, num_tokens: int):
+    """Mark the enclosed forward region as sequence-parallel. Thin wrapper over
+    the ForwardFlags scoped writer (transactional, restores on exit)."""
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().scoped(sp_active=active, sp_num_tokens=num_tokens)
+
+
+def sp_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Entry scatter: pad the token dim to a multiple of tp_size and slice this
+    rank's shard. The post-embedding hidden states are replicated across the TP
+    group, so this is a local slice with no communication."""
+    tp_group = get_tp_group()
+    tp_size = tp_group.world_size
+    if tp_size == 1:
+        return hidden_states
+    num_tokens = hidden_states.shape[0]
+    padded = ceil_align(num_tokens, tp_size)
+    if padded != num_tokens:
+        hidden_states = torch.nn.functional.pad(
+            hidden_states, (0, 0, 0, padded - num_tokens)
+        )
+    return hidden_states.tensor_split(tp_size)[tp_group.rank_in_group].contiguous()
+
+
+def sp_all_gather(hidden_states: torch.Tensor, num_tokens=None) -> torch.Tensor:
+    """"g": all-gather the per-rank sequence shard back to the full (padded)
+    sequence along dim 0, then narrow to the real token count when given."""
+    tp_group = get_tp_group()
+    tp_size = tp_group.world_size
+    if tp_size == 1:
+        return hidden_states if num_tokens is None else hidden_states[:num_tokens]
+    hidden_states = hidden_states.contiguous()
+    output = hidden_states.new_empty(
+        (hidden_states.shape[0] * tp_size, *hidden_states.shape[1:])
+    )
+    tp_group.all_gather_into_tensor(output, hidden_states)
+    if num_tokens is not None:
+        output = output[:num_tokens]
+    return output
 
 
 def is_dp_max_padding() -> bool:

@@ -1099,6 +1099,10 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3LLMModel(Qwen3Model):
+    # Qwen3-VL overrides forward() without the LayerNorm-SP region/scatter/gather,
+    # so SP would be a silent no-op here; keep it unsupported so the flag is
+    # rejected rather than quietly ignored.
+    enable_layernorm_sp_supported = False
 
     def __init__(
         self,

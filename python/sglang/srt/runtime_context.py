@@ -439,6 +439,12 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # Megatron LayerNorm sequence parallelism (--enable-layernorm-sp): set by
+        # the model around its decoder loop; read inside the participant linears
+        # and the LayerCommunicator. sp_num_tokens is the real (unpadded) token
+        # count used to narrow the padded shards.
+        "sp_active": False,
+        "sp_num_tokens": 0,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -453,6 +459,8 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "sp_active",
+            "sp_num_tokens",
         }
     )
 

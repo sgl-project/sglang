@@ -26,6 +26,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
+    is_sp_active,
+    sp_num_tokens,
 )
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
@@ -39,7 +41,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    ceil_align,
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -53,6 +62,39 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 )
 
 logger = logging.getLogger(__name__)
+
+# --- Megatron sequence-parallel fused collectives (torch symmetric memory) ---
+# Fused matmul+reduce-scatter ("g-bar") and all-gather+matmul ("g"), used as the
+# fast-paths for Row/ColumnParallelLinear under --enable-layernorm-sp -- they
+# overlap the collective with the GEMM. Availability is probed once at import;
+# TP groups are registered for symmetric memory lazily by the fused ops on
+# first use, so there is no explicit enable call (the old
+# enable_symm_mem_for_group is a deprecated no-op). Import the module only to
+# register the torch.ops.symm_mem namespace the probe below checks. Requires
+# NVLink/NVSwitch.
+try:
+    import torch.distributed._symmetric_memory  # noqa: F401
+
+    _HAS_TORCH_SYMM_MEM_FUSED = hasattr(
+        torch.ops.symm_mem, "fused_matmul_reduce_scatter"
+    ) and hasattr(torch.ops.symm_mem, "fused_all_gather_matmul")
+except Exception:
+    _HAS_TORCH_SYMM_MEM_FUSED = False
+
+
+def _sp_fused_matmul_eligible(linear) -> bool:
+    """Whether the torch symm_mem fused matmul+collective fast-path applies:
+    the ops are available and ``linear`` is unquantized, bias-free, bf16/fp16
+    (the case the fused ops support). Depends only on static layer properties,
+    so the decision is identical across TP ranks.
+    """
+    if not _HAS_TORCH_SYMM_MEM_FUSED or linear.bias is not None:
+        return False
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    if not isinstance(linear.quant_method, UnquantizedLinearMethod):
+        return False
+    return linear.weight.dtype in (torch.bfloat16, torch.float16)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -333,6 +375,10 @@ class ColumnParallelLinear(LinearBase):
 
         self.gather_output = gather_output
         self.use_presharded_weights = use_presharded_weights
+        # Set True by the model on qkv_proj / gate_up_proj to mark this linear as
+        # a Megatron-SP participant (fuses the "g" all-gather with the GEMM when
+        # the SP forward region is active). See layers/dp_attention.py.
+        self.sequence_parallel = False
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
@@ -465,6 +511,24 @@ class ColumnParallelLinear(LinearBase):
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
+        # Megatron SP "g": when this linear is an SP participant and the SP
+        # forward region is active, the input is this rank's sequence shard
+        # [M_pad/tp, K]; all-gather it back to the full sequence and matmul, then
+        # narrow to the real token count. The fused symm-mem kernel does the
+        # all-gather + GEMM in one shot (overlapping comm with compute); anything
+        # ineligible (quantized / biased) falls back to a plain all-gather +
+        # matmul. Only qkv_proj / gate_up_proj are participants, and both have
+        # gather_output=False, so there is no output all-gather to reconcile.
+        if self.sequence_parallel and is_sp_active() and self.tp_size > 1:
+            num_tokens = sp_num_tokens()
+            if _sp_fused_matmul_eligible(self):
+                output = self._fused_all_gather_matmul(input_, num_tokens)
+            else:
+                gathered = self._all_gather_along_first_dim(input_, num_tokens)
+                output = self.quant_method.apply(self, gathered, bias)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         # Matrix multiply.
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
@@ -475,6 +539,43 @@ class ColumnParallelLinear(LinearBase):
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def _fused_all_gather_matmul(
+        self, input_parallel: torch.Tensor, num_tokens: Optional[int]
+    ) -> torch.Tensor:
+        """Fused all-gather + matmul (Megatron SP "g") via torch symmetric memory.
+
+        All-gathers ``input_parallel`` (this rank's [M_pad/tp, K] sequence shard)
+        to the full sequence and computes ``@ weight.T`` in one kernel, then
+        narrows to the real (unpadded) token count. Overlaps the collective with
+        the GEMM.
+        """
+        tp_group = get_tp_group()
+        group_name = tp_group.device_group.group_name
+        _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+            input_parallel.contiguous(),
+            [self.weight.t()],
+            gather_dim=0,
+            group_name=group_name,
+        )
+        output = mm_outputs[0]
+        if num_tokens is not None:
+            output = output[:num_tokens]
+        return output
+
+    def _all_gather_along_first_dim(
+        self, x: torch.Tensor, num_tokens: Optional[int]
+    ) -> torch.Tensor:
+        """Plain all-gather of a sequence shard along dim 0 (the Megatron SP "g"
+        fallback when the fused kernel is ineligible), narrowed to the real token
+        count.
+        """
+        x = x.contiguous()
+        output = x.new_empty((x.shape[0] * self.tp_size, *x.shape[1:]))
+        get_tp_group().all_gather_into_tensor(output, x)
+        if num_tokens is not None:
+            output = output[:num_tokens]
+        return output
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -1395,6 +1496,10 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        # Set True by the model on o_proj / down_proj to mark this linear as a
+        # Megatron-SP participant (reduce-scatter "g-bar" instead of all-reduce
+        # when the SP forward region is active). See layers/dp_attention.py.
+        self.sequence_parallel = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -1529,6 +1634,24 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Megatron SP is active for this linear when it is a participant
+        # (o_proj / down_proj) and the SP forward region is active.
+        sp = self.sequence_parallel and is_sp_active()
+
+        # Megatron SP fused "g-bar" fast-path: fuse the row-parallel matmul with
+        # the reduce-scatter into a single torch symmetric-memory kernel,
+        # overlapping the collective with the GEMM. Only for unquantized,
+        # bias-free bf16/fp16 linears; anything else falls through to the plain
+        # matmul + separate reduce-scatter below.
+        if (
+            sp
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and _sp_fused_matmul_eligible(self)
+        ):
+            return self._fused_matmul_reduce_scatter(input_parallel), None
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
@@ -1538,10 +1661,19 @@ class RowParallelLinear(LinearBase):
         with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
+        if sp and self.tp_size > 1 and not skip_all_reduce:
+            # Megatron sequence-parallel "g-bar": replace the row-parallel
+            # all-reduce with reduce-scatter along the token (sequence) dim,
+            # leaving the output sequence-sharded for the following SP LayerNorm
+            # region. Fires regardless of reduce_results -- o_proj is built with
+            # reduce_results=False (the LayerCommunicator normally owns the
+            # reduction), but under SP the communicator only norms on the shard,
+            # so the linear must own the reduce-scatter for o_proj and down_proj.
+            output = self._reduce_scatter_along_first_dim(output_parallel)
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
         # the decoder — callers should not thread those flags into modules.
-        if (
+        elif (
             self.reduce_results
             and self.tp_size > 1
             and not skip_all_reduce
@@ -1568,6 +1700,51 @@ class RowParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias
+
+    def _reduce_scatter_along_first_dim(self, x: torch.Tensor) -> torch.Tensor:
+        """Reduce-scatter ``x`` across the TP group along dim 0 (tokens).
+
+        Used by Megatron sequence parallelism to shard the row-parallel output
+        along the sequence dimension. The token dim is padded up to a multiple
+        of ``tp_size`` so the shards are equal-sized; the padding rows carry no
+        real tokens and are dropped by the ``g`` all-gather in the model (which
+        narrows back to the real token count).
+        """
+        x = x.contiguous()
+        num_tokens = x.shape[0]
+        padded = ceil_align(num_tokens, self.tp_size)
+        if padded != num_tokens:
+            x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
+        output = x.new_empty((padded // self.tp_size, *x.shape[1:]))
+        get_tp_group().reduce_scatter_tensor(output, x)
+        return output
+
+    def _fused_matmul_reduce_scatter(
+        self, input_parallel: torch.Tensor
+    ) -> torch.Tensor:
+        """Fused row-parallel matmul + reduce-scatter (Megatron SP "g-bar").
+
+        Computes ``input_parallel @ weight.T`` and reduce-scatters (sum) the
+        result across the TP group along dim 0 in one symmetric-memory kernel,
+        overlapping the collective with the GEMM. Equivalent to
+        ``quant_method.apply(...)`` + ``_reduce_scatter_along_first_dim``. The
+        token dim is padded to a multiple of tp_size (padding rows are zeros,
+        dropped by the model's g all-gather narrow).
+        """
+        tp_group = get_tp_group()
+        group_name = tp_group.device_group.group_name
+        x = input_parallel.contiguous()
+        num_tokens = x.shape[0]
+        padded = ceil_align(num_tokens, self.tp_size)
+        if padded != num_tokens:
+            x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
+        return torch.ops.symm_mem.fused_matmul_reduce_scatter(
+            x,
+            self.weight.t(),
+            "sum",
+            scatter_dim=0,
+            group_name=group_name,
+        )
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

@@ -962,6 +962,15 @@ class ServerArgs:
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
     ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (SP) for the LayerNorm/residual "
+        "regions under pure tensor parallelism. The row-parallel all-reduce is split "
+        "into reduce-scatter + all-gather so LayerNorm runs on sequence-sharded "
+        "activations, cutting activation memory with no extra communication volume. "
+        "Prefill-only; requires tp_size > 1 and NVLink/NVSwitch. See "
+        "https://arxiv.org/abs/2205.05198.",
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "

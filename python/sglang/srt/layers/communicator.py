@@ -50,6 +50,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
+    is_sp_active,
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
@@ -447,6 +448,7 @@ class LayerCommunicator:
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
+        enable_layernorm_sp: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -464,6 +466,30 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_server_args().speculative_algorithm
         )
+
+        # Megatron LayerNorm sequence parallelism (arXiv:2205.05198): build an
+        # all-SCATTERED sibling communicator that prepare_attn / prepare_mlp /
+        # postprocess_layer delegate to while the SP forward region is active
+        # (LayerNorm on the sequence shard; the g / g-bar collectives are fused
+        # into the participant linears). Built with enable_layernorm_sp=False so
+        # it has no nested variant.
+        self._sp_variant: Optional["LayerCommunicator"] = None
+        if enable_layernorm_sp:
+            self._sp_variant = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes(
+                    layer_input_mode=ScatterMode.SCATTERED,
+                    attn_mode=ScatterMode.SCATTERED,
+                    mlp_mode=ScatterMode.SCATTERED,
+                    middle_residual_mode=ScatterMode.SCATTERED,
+                    layer_output_mode=ScatterMode.SCATTERED,
+                ),
+                input_layernorm=input_layernorm,
+                post_attention_layernorm=post_attention_layernorm,
+                allow_reduce_scatter=allow_reduce_scatter,
+                is_last_layer=is_last_layer,
+                qkv_latent_func=qkv_latent_func,
+                force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
+            )
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -552,6 +578,14 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if self._sp_variant is not None and is_sp_active():
+            return self._sp_variant.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format,
+                post_residual_addition,
+            )
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -727,6 +761,10 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if self._sp_variant is not None and is_sp_active():
+            return self._sp_variant.prepare_mlp(
+                hidden_states, residual, forward_batch, cache
+            )
         if cache is not None:
             self._context.cache = cache
 
@@ -744,6 +782,10 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if self._sp_variant is not None and is_sp_active():
+            return self._sp_variant.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -953,6 +995,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            return CommunicateWithAllReduceAndLayerNormFn._simple
+
+        if (
+            hidden_states_input_mode == ScatterMode.SCATTERED
+            and residual_input_mode == ScatterMode.SCATTERED
+            and hidden_states_output_mode == ScatterMode.SCATTERED
+            and residual_output_mode == ScatterMode.SCATTERED
+        ):
+            # LayerNorm sequence parallelism (--enable-layernorm-sp): activations
+            # stay sequence-sharded across the attn->mlp boundary. The row-parallel
+            # o_proj already issued the reduce-scatter (enable_sp=True), so there is
+            # no all-reduce to do here -- just the residual-add + LayerNorm on the
+            # local shard. The "g" all-gather before the MLP block is issued by the
+            # model (qwen3), not here.
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
