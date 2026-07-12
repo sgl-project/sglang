@@ -102,6 +102,68 @@ class _DflashDraftSampler:
         self.out[: tokens.shape[0]].copy_(tokens)
 
 
+class _DflashTreeDraftSampler:
+    """Capture-safe per-step top-k + draft-tree build for DFLASH TREE verify.
+
+    The tree analogue of ``_DflashDraftSampler``. Folded into the draft decode cuda
+    graph so BOTH the extra tree top-k GEMM and the fixed-shape draft-tree pruning
+    (``build_tree_verify_tokens``) are captured instead of launched eagerly each step.
+    The top-k mirrors ``_greedy_sample_from_vocab_parallel_head(return_topk=...)``
+    byte-for-byte (full LM-head matmul, ``topk`` over logits, softmax over the k
+    selected logits); the tree build is the same fused-kernel path the eager worker
+    used. tp=1 / no-added-vocab only (same as the eager top-k fast path).
+
+    After replay the worker reads the static (draft_tokens, parent_list,
+    selected_index) buffers directly and skips the eager sample + tree build.
+    """
+
+    def __init__(self, *, weight, block_size, topk, num_draft_tokens, max_bs):
+        self.weight = weight
+        self.block_size = int(block_size)
+        self.topk = int(topk)
+        self.num_draft_tokens = int(num_draft_tokens)
+        num_steps = self.block_size - 1
+        max_bs = int(max_bs)
+        device = weight.device
+        parent_width = 1 + self.topk * (num_steps - 1) if num_steps > 1 else 0
+        # Written in-graph, read by the worker after replay (bs-major layout).
+        self.out_draft_tokens = torch.empty(
+            (max_bs * self.num_draft_tokens,), dtype=torch.int64, device=device
+        )
+        self.out_parent_list = torch.empty(
+            (max_bs, parent_width), dtype=torch.int64, device=device
+        )
+        self.out_selected_index = torch.empty(
+            (max_bs, self.num_draft_tokens - 1), dtype=torch.int64, device=device
+        )
+
+    def __call__(self, hidden_states, input_ids=None):
+        bs = hidden_states.shape[0] // self.block_size
+        num_steps = self.block_size - 1
+        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
+            -1, hidden_states.shape[-1]
+        )
+        if hs.dtype != self.weight.dtype:
+            hs = hs.to(self.weight.dtype)
+        logits = torch.matmul(hs, self.weight.T)
+        topk_vals, topk_idx = torch.topk(logits, k=self.topk, dim=-1)
+        probs = torch.softmax(topk_vals, dim=-1).to(self.weight.dtype)
+        topk_ids = topk_idx.to(torch.int64).view(bs, num_steps, self.topk)
+        topk_probs = probs.view(bs, num_steps, self.topk)
+        # verified_id (root per req) = draft-block position 0 (the seeded bonus token).
+        verified_id = input_ids.view(bs, self.block_size)[:, 0]
+        draft_tokens, parent_list, selected_index = build_tree_verify_tokens(
+            verified_id=verified_id,
+            topk_probs=topk_probs,
+            topk_ids=topk_ids,
+            topk=self.topk,
+            num_draft_tokens=self.num_draft_tokens,
+        )
+        self.out_draft_tokens[: draft_tokens.numel()].copy_(draft_tokens)
+        self.out_parent_list[:bs].copy_(parent_list)
+        self.out_selected_index[:bs].copy_(selected_index)
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -410,6 +472,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
+        max_bs = max(self.server_args.cuda_graph_config.decode.bs)
+        if self._tree_verify_enabled:
+            # Tree top-k needs the base-vocab fast path (full weight, no offset), which
+            # matches the eager return_topk path (already tp=1 / no-added-vocab gated).
+            if org_vocab_start != 0:
+                return _eager("tree top-k needs org_vocab_start==0")
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH draft top-k head folded into the draft cuda graph (tree)."
+                )
+            return _DflashTreeDraftSampler(
+                weight=lm_head.weight,
+                block_size=self.block_size,
+                topk=self._tree_verify_topk,
+                num_draft_tokens=self._tree_num_draft_tokens,
+                max_bs=max_bs,
+            )
         if self.tp_rank == 0:
             logger.info("DFLASH draft greedy head folded into the draft cuda graph.")
         return _DflashDraftSampler(
@@ -417,7 +496,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            max_bs=max_bs,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1714,13 +1793,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # the tree). The chain fast path uses the graph-captured draft sampler, which
         # yields draft_next directly without materializing hidden states. Only fetch
         # hidden when tree is on or the sampler fast path is unavailable.
-        chain_sampler_fast_path = (
-            not self._tree_verify_enabled
-            and self._draft_sampler is not None
-            and draft_out.can_run_graph
+        # The draft sampler (argmax for chain, top-k for tree) is folded into the
+        # draft decode cuda graph; on graph replay it has already written its output
+        # buffers, so we skip the eager head GEMM and even materializing draft_hidden.
+        sampler_fast_path = (
+            self._draft_sampler is not None and draft_out.can_run_graph
         )
         draft_hidden = None
-        if not chain_sampler_fast_path:
+        if not sampler_fast_path:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
@@ -1730,31 +1810,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             # --- 2a) EAGLE-style tree verify input.
             tree_topk = int(self._tree_verify_topk)
             tree_num_draft_tokens = int(self._tree_num_draft_tokens)
-            num_steps = int(draft_hidden.shape[1]) - 1
-            topk_result = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-                return_topk=tree_topk,
-            )
-            _, draft_topk_ids, draft_topk_probs = cast(
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
-            )
-            draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
-            draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
-
-            (
-                tree_draft_tokens,
-                tree_parent_list,
-                tree_selected_index,
-            ) = build_tree_verify_tokens(
-                verified_id=block_ids[:, 0],  # [bs]
-                topk_probs=draft_topk_probs,
-                topk_ids=draft_topk_ids,
-                topk=tree_topk,
-                num_draft_tokens=tree_num_draft_tokens,
-            )
+            num_steps = int(self.block_size) - 1
+            if sampler_fast_path:
+                # Top-k sample AND draft-tree build already ran in-graph
+                # (_DflashTreeDraftSampler); read its static output buffers.
+                s = self._draft_sampler
+                tree_draft_tokens = s.out_draft_tokens[: bs * tree_num_draft_tokens]
+                tree_parent_list = s.out_parent_list[:bs]
+                tree_selected_index = s.out_selected_index[:bs]
+            else:
+                topk_result = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                    return_topk=tree_topk,
+                )
+                _, draft_topk_ids, draft_topk_probs = cast(
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
+                )
+                draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
+                draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
+                (
+                    tree_draft_tokens,
+                    tree_parent_list,
+                    tree_selected_index,
+                ) = build_tree_verify_tokens(
+                    verified_id=block_ids[:, 0],  # [bs]
+                    topk_probs=draft_topk_probs,
+                    topk_ids=draft_topk_ids,
+                    topk=tree_topk,
+                    num_draft_tokens=tree_num_draft_tokens,
+                )
             # positions=None / custom_mask=None signals prepare_for_verify to run
             # build_tree_kernel_efficient, which fills positions, custom_mask, the
             # retrieve buffers, and reorders draft_token into kernel layout.
@@ -1777,7 +1864,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         else:
             # z-lab DFlash chain: single block-parallel argmax over the draft block.
-            if chain_sampler_fast_path:
+            if sampler_fast_path:
                 draft_next = self._draft_sampler.out[
                     : bs * (int(self.block_size) - 1)
                 ].view(bs, int(self.block_size) - 1)
