@@ -107,13 +107,25 @@ class CPPArgList(list[str]):
 
 
 CPP_DTYPE_MAP = {
-    torch.float: "fp32_t",
+    torch.float64: "double",
+    torch.float32: "fp32_t",
     torch.float16: "fp16_t",
-    torch.float8_e4m3fn: "fp8_e4m3_t",
     torch.bfloat16: "bf16_t",
+    # The fnuz variants are the ROCm-side torch dtypes; fp8_*_t resolves to
+    # the matching HIP type there (see HIP_FP8_TYPE_* in utils.cuh).
+    torch.float8_e4m3fn: "fp8_e4m3_t",
+    torch.float8_e4m3fnuz: "fp8_e4m3_t",
+    torch.float8_e5m2: "fp8_e5m2_t",
+    torch.float8_e5m2fnuz: "fp8_e5m2_t",
     torch.int8: "int8_t",
+    torch.int16: "int16_t",
     torch.int32: "int32_t",
     torch.int64: "int64_t",
+    torch.uint8: "uint8_t",
+    torch.uint16: "uint16_t",
+    torch.uint32: "uint32_t",
+    torch.uint64: "uint64_t",
+    torch.bool: "bool",
 }
 
 
