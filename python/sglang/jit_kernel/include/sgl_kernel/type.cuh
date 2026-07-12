@@ -44,7 +44,7 @@ struct DTypeTrait {};
   static_assert(true)
 
 // Also emits a `kHas_<NAME>` flag so reduction dispatch can detect the op via
-// plain member SFINAE (see details::HasMax below) — hipcc mis-evaluates
+// plain member SFINAE (see details::HasMax below) - hipcc mis-evaluates
 // requires-expressions that probe device functions, so detection must only
 // ever look at data members.
 #define SGL_REGISTER_BINARY_FUNCTION(NAME, FN)                      \
@@ -122,10 +122,12 @@ struct DTypeTrait<fp16x2_t> {
   SGL_REGISTER_FROM_FUNCTION(fp32x2_t, __float22half2_rn);
   SGL_REGISTER_UNARY_FUNCTION(abs, __habs2);
 #ifndef USE_ROCM
+  SGL_REGISTER_BINARY_FUNCTION(add, __hadd2);
   SGL_REGISTER_BINARY_FUNCTION(max, __hmax2);
   SGL_REGISTER_BINARY_FUNCTION(min, __hmin2);
 #else
   // HIP only provides __hmax2/__hmin2 for __hip_bfloat162, not __half2.
+  // No `add` registered on HIP (packed SUM falls back to lane-wise scalar).
   static constexpr bool kHas_max = true;
   static constexpr bool kHas_min = true;
   SGL_DEVICE static self_t max(const self_t& x, const self_t& y) {
@@ -163,6 +165,11 @@ struct DTypeTrait<bf16x2_t> {
   SGL_REGISTER_FROM_DEFAULT();
   SGL_REGISTER_FROM_FUNCTION(fp32x2_t, __float22bfloat162_rn);
   SGL_REGISTER_UNARY_FUNCTION(abs, __habs2);
+#ifndef USE_ROCM
+  // No `add` on HIP: bf162 __hadd2 is unverified there (packed SUM falls
+  // back to lane-wise scalar).
+  SGL_REGISTER_BINARY_FUNCTION(add, __hadd2);
+#endif
   SGL_REGISTER_BINARY_FUNCTION(max, __hmax2);
   SGL_REGISTER_BINARY_FUNCTION(min, __hmin2);
 };
@@ -284,7 +291,7 @@ SGL_DEVICE T reduce_recursive(const T& x, const T& y) {
 }  // namespace details
 
 // Dispatch rules, chosen so correctness never depends on detection:
-// scalars (kVecSize == 1) call the trait member / operator directly — a
+// scalars (kVecSize == 1) call the trait member / operator directly - a
 // missing op is a clear compile error at the call line; packed types use the
 // native op when the trait registered one and fall back to lane-wise
 // recursion otherwise (worst case for a mis-detecting compiler is a slightly
@@ -331,7 +338,7 @@ struct ReductionTrait<ReductionOp::MIN, T> {
 }  // namespace device
 
 // ---------------------------------------------------------------------------
-// FP8 max clamp value — platform-dependent
+// FP8 max clamp value - platform-dependent
 //   CUDA (e4m3fn):      448.0f
 //   AMD FNUZ (e4m3fnuz): 224.0f
 //   AMD E4M3 (e4m3fn):  448.0f
