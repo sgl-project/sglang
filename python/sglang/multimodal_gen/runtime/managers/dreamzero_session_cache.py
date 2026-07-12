@@ -343,9 +343,6 @@ class DreamZeroCachePoolManager:
         if slot is not None:
             self.pool.reset_slot(slot, preserve_text=preserve_text)
 
-    def get_active_count(self) -> int:
-        return len(self._sessions)
-
 
 @dataclass
 class DreamZeroRequestCache:
@@ -369,10 +366,6 @@ class DreamZeroRequestCache:
     @property
     def batch_size(self) -> int:
         return len(self.logical_session_ids)
-
-    @property
-    def has_logical_batch(self) -> bool:
-        return self.batch_size > 1
 
     def pool(
         self, cache_manager: DreamZeroCachePoolManager | None
@@ -655,14 +648,8 @@ def resolve_request_cache(
         persistent=persistent,
     )
     batch.dreamzero_cache = request_cache
-    batch.dreamzero_cache_id = request_cache.cache_id
     batch.dreamzero_session_ids = logical_session_ids
-    batch.dreamzero_session_slots = slot_indices
     batch.dreamzero_reset_mask = reset_mask
-    batch.dreamzero_session_cache_hit = cache_hit
-    batch.dreamzero_prompt_reusable = prompt_reusable
-    batch.dreamzero_neg_prompt_reusable = neg_prompt_reusable
-    batch.dreamzero_session_persistent = persistent
     if getattr(batch, "dreamzero_reset_apply_token", None) is None:
         batch.dreamzero_reset_apply_token = uuid.uuid4().hex
     record_session_timing(
@@ -744,46 +731,6 @@ def enter_request_cache(
     )
     apply_request_lifecycle_resets(batch, cache_manager, request_cache)
     return request_cache, request_cache.pool(cache_manager)
-
-
-def session_metadata_from_batch(batch) -> list[dict[str, Any]]:
-    request_cache = getattr(batch, "dreamzero_cache", None)
-    if isinstance(request_cache, DreamZeroRequestCache):
-        frame_value = getattr(batch, "dreamzero_current_start_frame", None)
-        if isinstance(frame_value, list):
-            frames = [int(value) for value in frame_value]
-        elif frame_value is None:
-            frames = [None] * request_cache.batch_size
-        else:
-            frames = [int(frame_value)] * request_cache.batch_size
-        return [
-            {
-                "session_id": session_id,
-                "cache_id": request_cache.cache_id,
-                "slot": int(slot),
-                "cache_hit": bool(cache_hit),
-                "prompt_reusable": bool(prompt_reusable),
-                "neg_prompt_reusable": bool(neg_prompt_reusable),
-                "current_start_frame": None if frame is None else int(frame),
-            }
-            for (
-                session_id,
-                slot,
-                cache_hit,
-                prompt_reusable,
-                neg_prompt_reusable,
-                frame,
-            ) in zip(
-                request_cache.logical_session_ids,
-                request_cache.slot_indices,
-                request_cache.cache_hit,
-                request_cache.prompt_reusable,
-                request_cache.neg_prompt_reusable,
-                frames,
-                strict=True,
-            )
-        ]
-    raise ValueError("DreamZero session metadata requires resolved request cache")
 
 
 def _prompt_hash(

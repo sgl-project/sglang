@@ -233,13 +233,13 @@ class Req:
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
-        for name, field_info in self.__class__.__dataclass_fields__.items():
+        for name, field in self.__class__.__dataclass_fields__.items():
             if name in kwargs:
                 object.__setattr__(self, name, kwargs.pop(name))
-            elif field_info.default is not MISSING:
-                object.__setattr__(self, name, field_info.default)
-            elif field_info.default_factory is not MISSING:
-                object.__setattr__(self, name, field_info.default_factory())
+            elif field.default is not MISSING:
+                object.__setattr__(self, name, field.default)
+            elif field.default_factory is not MISSING:
+                object.__setattr__(self, name, field.default_factory())
 
         for name, value in kwargs.items():
             setattr(self, name, value)

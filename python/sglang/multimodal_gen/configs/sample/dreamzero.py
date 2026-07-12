@@ -4,54 +4,59 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 
 
 @dataclass
-class DreamZeroSamplingParams(SamplingParams):
+class DreamZeroSamplingParams(VLASamplingParams):
     """Request parameters for DreamZero observation-to-action inference."""
 
-    data_type: DataType = DataType.ACTION
     prompt: str | list[str] | None = None
     negative_prompt: str = ""
-    image_path: str | list[str] | None = None
 
-    num_frames: int = 1
-    fps: int = 1
     num_inference_steps: int = 4
     guidance_scale: float = 5.0
-    save_output: bool = False
-    return_file_paths_only: bool = False
-    adjust_frames: bool = False
 
-    dreamzero_obs: dict[str, Any] | None = field(
+    observation: dict[str, Any] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    embodiment_tag: str | None = field(
+    session_ids: list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    language: str | None = field(default=None, metadata={"batch_sig_exclude": True})
-    action_horizon: int = 24
-    relative_action_per_horizon: bool = False
+    reset_mask: list[bool] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
+    negative_prompts: list[str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
+    dreamzero_prompts: str | list[str] | None = field(
+        default=None, init=False, metadata={"batch_sig_exclude": True}
+    )
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
-        if self.dreamzero_obs is not None:
-            extra["dreamzero_obs"] = self.dreamzero_obs
-        if self.embodiment_tag is not None:
-            extra["dreamzero_embodiment_tag"] = self.embodiment_tag
-        if self.language is not None:
-            extra["dreamzero_language"] = self.language
-        extra["dreamzero_action_horizon"] = self.action_horizon
-        extra["dreamzero_relative_action_per_horizon"] = (
-            self.relative_action_per_horizon
-        )
+        if self.observation is not None:
+            extra["dreamzero_normalized_input"] = self.observation
+        if self.session_ids is not None:
+            extra["dreamzero_session_ids"] = self.session_ids
+        if self.reset_mask is not None:
+            extra["dreamzero_reset_mask"] = self.reset_mask
+        if self.dreamzero_prompts is not None:
+            extra["dreamzero_prompts"] = self.dreamzero_prompts
+        if self.negative_prompts is not None:
+            extra["dreamzero_negative_prompts"] = self.negative_prompts
         return extra
+
+    def _adjust(self, server_args):
+        self.dreamzero_prompts = self.prompt
+        if isinstance(self.prompt, list):
+            self.prompt = self.prompt[0] if self.prompt else ""
+        elif self.prompt is None:
+            self.prompt = ""
+        super()._adjust(server_args)
+        self.num_inference_steps = type(self).num_inference_steps
 
     def _set_output_file_name(self):
         if self.output_file_name is None:
             self.output_file_name = "dreamzero_action"
-        self._set_output_file_ext()
+        super()._set_output_file_name()

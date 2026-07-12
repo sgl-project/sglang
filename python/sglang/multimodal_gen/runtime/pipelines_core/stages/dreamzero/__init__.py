@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.action_postproc import (
-    DreamZeroActionUnnormalizeStage,
+    DreamZeroActionOutputStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.denoising import (
     DreamZeroCausalDenoisingStage,
@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.text_encoding
 )
 
 __all__ = [
-    "DreamZeroActionUnnormalizeStage",
+    "DreamZeroActionOutputStage",
     "DreamZeroCausalDenoisingStage",
     "DreamZeroObsPrepStage",
     "DreamZeroTextEncodingStage",

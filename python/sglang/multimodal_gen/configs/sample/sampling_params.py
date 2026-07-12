@@ -83,9 +83,9 @@ class DataType(Enum):
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
-        if self == DataType.MESH:
-            return "glb"
-        return "json"
+        if self == DataType.ACTION:
+            return "json"
+        return "glb"
 
 
 @dataclass

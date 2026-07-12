@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero import (
-    DreamZeroActionUnnormalizeStage,
+    DreamZeroActionOutputStage,
     DreamZeroCausalDenoisingStage,
     DreamZeroObsPrepStage,
     DreamZeroTextEncodingStage,
@@ -33,6 +33,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    build_torch_compile_kwargs,
+    maybe_enable_inductor_compute_comm_overlap,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -51,49 +55,21 @@ def _dtype_from_precision(precision: str | None) -> torch.dtype:
     return PRECISION_TO_TYPE.get(precision or "bf16", torch.bfloat16)
 
 
-def _compile_component_forward(forward):
-    return torch.compile(
-        mode="reduce-overhead",
-        fullgraph=True,
-        dynamic=False,
-    )(forward)
+def _compile_dreamzero_dit_blocks(transformer: Any) -> int:
+    blocks = getattr(transformer, "blocks", None)
+    if not isinstance(blocks, torch.nn.ModuleList):
+        logger.warning("Skipping DreamZero DiT compile; transformer.blocks not found")
+        return 0
 
+    maybe_enable_inductor_compute_comm_overlap()
 
-def _resolve_attr(root: Any, attr_path: str) -> tuple[Any, str] | None:
-    parent = root
-    parts = attr_path.split(".")
-    for part in parts[:-1]:
-        parent = getattr(parent, part, None)
-        if parent is None:
-            return None
-    leaf = parts[-1]
-    if not hasattr(parent, leaf):
-        return None
-    return parent, leaf
-
-
-def _compile_first_available_method(
-    module: Any,
-    *,
-    component_name: str,
-    method_paths: tuple[str, ...],
-) -> str | None:
-    for method_path in method_paths:
-        resolved = _resolve_attr(module, method_path)
-        if resolved is None:
-            continue
-        parent, leaf = resolved
-        method = getattr(parent, leaf)
-        if not callable(method):
-            continue
-        setattr(parent, leaf, _compile_component_forward(method))
-        return method_path
-    logger.warning(
-        "Skipping DreamZero %s compile; none of the expected methods exist: %s",
-        component_name,
-        ", ".join(method_paths),
+    torch._dynamo.config.cache_size_limit = max(
+        getattr(torch._dynamo.config, "cache_size_limit", 64), 128
     )
-    return None
+    compile_kwargs = build_torch_compile_kwargs(mode="default")
+    for index, block in enumerate(blocks):
+        blocks[index] = torch.compile(block, **compile_kwargs)
+    return len(blocks)
 
 
 class DreamZeroPipeline(ComposedPipelineBase):
@@ -211,28 +187,8 @@ class DreamZeroPipeline(ComposedPipelineBase):
         modules["image_encoder"] = image_encoder
 
         if getattr(pc, "dreamzero_compile_components", True):
-            logger.info("Compiling DreamZero text/image/VAE components")
-            compiled = {
-                "text_encoder": _compile_first_available_method(
-                    text_encoder,
-                    component_name="text_encoder",
-                    method_paths=("forward",),
-                ),
-                "image_encoder": _compile_first_available_method(
-                    image_encoder,
-                    component_name="image_encoder",
-                    method_paths=("model.visual.forward", "encode_image", "forward"),
-                ),
-                "vae": _compile_first_available_method(
-                    vae,
-                    component_name="vae",
-                    method_paths=("model.encode", "encode"),
-                ),
-            }
-            logger.info(
-                "Compiled DreamZero component methods: %s",
-                {name: path for name, path in compiled.items() if path is not None},
-            )
+            compiled_blocks = _compile_dreamzero_dit_blocks(transformer)
+            logger.info("Compiled %d DreamZero DiT blocks", compiled_blocks)
         return modules
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
@@ -281,7 +237,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
             "dreamzero_causal_denoising_stage",
         )
         self.add_stage(
-            DreamZeroActionUnnormalizeStage(),
+            DreamZeroActionOutputStage(),
             "dreamzero_action_postproc_stage",
         )
 

@@ -1,6 +1,5 @@
 import types
 
-import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -10,15 +9,27 @@ from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
 from sglang.multimodal_gen.configs.sample.dreamzero import DreamZeroSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
-    SamplingParams,
 )
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
+    action_generation_response,
+    action_metadata,
+    build_action_sampling_params,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
     DreamZeroCheckpointLoadReport,
     load_matching_tensors,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_encoder_loader import (
+    expected_dreamzero_text_state_keys,
+    remap_dreamzero_image_model_key,
+    remap_dreamzero_text_model_key,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_vae_loader import (
+    remap_dreamzero_vae_model_key,
 )
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     BRANCH_COND,
@@ -28,22 +39,9 @@ from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     normalize_batched_session_fields,
     resolve_request_cache,
 )
-from sglang.multimodal_gen.runtime.models.encoders.dreamzero_image import (
-    VisionAttentionBlock,
-    VisionSelfAttention,
-    WanImageEncoderStateDictConverter,
-    XLMRobertaAttentionBlock,
-    XLMRobertaSelfAttention,
-)
-from sglang.multimodal_gen.runtime.models.encoders.dreamzero_text import (
-    WanTextEncoder,
-    WanTextEncoderStateDictConverter,
-)
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import DreamZeroPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.denoising import (
     DreamZeroCausalDenoisingStage,
-    validate_dreamzero_request_config,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
@@ -66,47 +64,115 @@ def test_dreamzero_config_and_sampling_defaults_are_action_typed():
     config = DreamZeroPipelineConfig()
     params = DreamZeroSamplingParams()
 
-    assert config.task_type is ModelTaskType.ACTION
+    assert config.task_type is ModelTaskType.VLA_ACTION
     assert config.task_type.data_type() is DataType.ACTION
     assert params.data_type is DataType.ACTION
-    assert params.build_request_extra()["dreamzero_action_horizon"] == 24
+    extra = params.build_request_extra()
+    assert "dreamzero_action_horizon" not in extra
+    assert "dreamzero_relative_action_per_horizon" not in extra
+    assert "dreamzero_embodiment_tag" not in extra
 
 
-def test_dreamzero_request_action_config_must_match_pipeline_config():
-    config = DreamZeroPipelineConfig()
-    matching_batch = types.SimpleNamespace(
-        extra=DreamZeroSamplingParams().build_request_extra()
+def test_dreamzero_action_response_uses_common_action_contract():
+    server_args = types.SimpleNamespace(
+        model_id=None,
+        model_path="dreamzero-test",
+        pipeline_config=DreamZeroPipelineConfig(),
+    )
+    output = {
+        "actions": torch.zeros(1, 24, 7).numpy(),
+        "parameters": {"num_inference_steps": 16},
+    }
+
+    response = action_generation_response(output, server_args)
+
+    assert response["object"] == "action.generation"
+    assert response["data"][0]["action"]["shape"] == [1, 24, 7]
+    assert response["usage"]["denoise_steps"] == 16
+
+    response_without_parameters = action_generation_response(
+        {"actions": torch.zeros(1, 24, 7).numpy()},
+        server_args,
     )
 
-    validate_dreamzero_request_config(matching_batch, config)
+    assert response_without_parameters["usage"]["denoise_steps"] == 16
 
-    mismatched_horizon = types.SimpleNamespace(
-        extra=DreamZeroSamplingParams(action_horizon=12).build_request_extra()
+
+def test_dreamzero_action_request_builder_uses_fixed_sampling_params():
+    server_args = types.SimpleNamespace(
+        model_path="nvidia/DreamZero-DROID",
+        model_id=None,
+        backend="sglang",
+        pipeline_class_name=None,
+        output_path=None,
+        comfyui_mode=False,
+        pipeline_config=DreamZeroPipelineConfig(),
     )
-    with pytest.raises(ValueError, match="dreamzero_action_horizon"):
-        validate_dreamzero_request_config(mismatched_horizon, config)
+    payload = {
+        "id": "req-1",
+        "input": {
+            "prompt": ["pick the cube"],
+            "observation": {
+                "state": {"values": [1.0, 2.0], "dtype": "float32", "shape": [2]},
+            },
+        },
+        "parameters": {
+            "session_ids": ["session-a"],
+            "reset_mask": [True],
+            "negative_prompts": [""],
+            "embodiment_tag": "libero_sim",
+            "action_horizon": 24,
+            "relative_action_per_horizon": False,
+            "guidance_scale": 9.0,
+            "seed": 7,
+            "num_inference_steps": 99,
+        },
+    }
 
-    mismatched_relative = types.SimpleNamespace(
-        extra=DreamZeroSamplingParams(
-            relative_action_per_horizon=True
-        ).build_request_extra()
+    params = build_action_sampling_params(payload, server_args)
+    extra = params.build_request_extra()
+
+    assert params.request_id == "req-1"
+    assert params.prompt == "pick the cube"
+    assert params.num_inference_steps == 4
+    assert params.guidance_scale == DreamZeroSamplingParams().guidance_scale
+    assert extra["dreamzero_session_ids"] == ["session-a"]
+    assert extra["dreamzero_reset_mask"] == [True]
+    assert extra["dreamzero_prompts"] == ["pick the cube"]
+    assert extra["dreamzero_normalized_input"]["state"].shape == (2,)
+    assert "dreamzero_action_horizon" not in extra
+    assert "dreamzero_relative_action_per_horizon" not in extra
+    assert "dreamzero_embodiment_tag" not in extra
+
+
+def test_dreamzero_action_metadata_is_wam_specific():
+    server_args = types.SimpleNamespace(
+        model_id=None,
+        model_path="dreamzero-test",
+        num_gpus=1,
+        tp_size=1,
+        sp_degree=1,
+        ulysses_degree=1,
+        ring_degree=1,
+        pipeline_config=DreamZeroPipelineConfig(),
     )
-    with pytest.raises(ValueError, match="dreamzero_relative_action_per_horizon"):
-        validate_dreamzero_request_config(mismatched_relative, config)
+
+    metadata = action_metadata(server_args)
+
+    assert metadata["object"] == "action.metadata"
+    assert metadata["policy_family"] == "dreamzero"
+    assert metadata["defaults"]["num_inference_steps"] == 16
 
 
-def test_action_api_additions_do_not_change_non_dreamzero_defaults():
-    req = Req(sampling_params=SamplingParams())
-
-    assert req.sampling_params.data_type is DataType.VIDEO
+def test_vla_action_additions_do_not_change_visual_defaults():
     assert ModelTaskType.T2V.data_type() is DataType.VIDEO
     assert ModelTaskType.I2V.data_type() is DataType.VIDEO
     assert ModelTaskType.T2I.data_type() is DataType.IMAGE
     assert ModelTaskType.I2M.data_type() is DataType.MESH
     assert ModelTaskType.T2V.requires_image_input() is False
     assert ModelTaskType.I2V.requires_image_input() is True
-    assert ModelTaskType.ACTION.requires_image_input() is False
-    assert ModelTaskType.ACTION.accepts_image_input() is False
+    assert ModelTaskType.VLA_ACTION.requires_image_input() is False
+    assert ModelTaskType.VLA_ACTION.accepts_image_input() is True
 
 
 def test_dreamzero_single_request_session_fields_still_use_batched_contract():
@@ -367,7 +433,11 @@ def test_dreamzero_text_encoding_masks_padding_without_python_seq_len_sync():
                 dtype=torch.float32,
                 device=input_ids.device,
             )
-            return values.reshape(input_ids.shape[0], input_ids.shape[1], 2)
+            return types.SimpleNamespace(
+                last_hidden_state=values.reshape(
+                    input_ids.shape[0], input_ids.shape[1], 2
+                )
+            )
 
     stage = DreamZeroTextEncodingStage()
     output = stage._encode_prompt(
@@ -390,14 +460,12 @@ def test_dreamzero_text_encoding_masks_padding_without_python_seq_len_sync():
 
 
 def test_dreamzero_checkpoint_helper_loads_parameters_buffers_and_reports_errors():
-    class Report(DreamZeroCheckpointLoadReport):
-        include_fallback_impl = True
-
     class SmallModule(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(2, 2))
             self.mismatch = torch.nn.Parameter(torch.zeros(2))
+            self.log_scale = torch.nn.Parameter(torch.zeros(()))
             self.register_buffer("scale", torch.zeros(2))
 
     model = SmallModule()
@@ -406,55 +474,144 @@ def test_dreamzero_checkpoint_helper_loads_parameters_buffers_and_reports_errors
         [
             ("prefix.weight", torch.ones(2, 2)),
             ("prefix.scale", torch.ones(2) * 2),
+            ("prefix.log_scale", torch.ones(1) * 3),
             ("prefix.mismatch", torch.ones(3)),
             ("prefix.unused", torch.ones(1)),
         ],
         device=torch.device("cpu"),
         key_mapper=lambda key: key.removeprefix("prefix."),
-        report_cls=Report,
-        fallback_impl="test.Loader",
+        report_cls=DreamZeroCheckpointLoadReport,
     )
 
     assert torch.equal(model.weight, torch.ones(2, 2))
     assert torch.equal(model.scale, torch.ones(2) * 2)
-    assert report.loaded_keys == ["weight", "scale"]
+    assert torch.equal(model.log_scale, torch.tensor(3.0))
+    assert report.loaded_keys == ["weight", "scale", "log_scale"]
     assert report.unexpected_keys == ["unused"]
     assert report.shape_mismatches == {"mismatch": ((2,), (3,))}
-    assert report.as_dict()["fallback_impl"] == "test.Loader"
 
 
-def test_dreamzero_encoder_converters_and_lightweight_text_forward():
-    assert XLMRobertaAttentionBlock(
-        dim=4, num_heads=2, post_norm=True
-    ).attn.__class__ is (XLMRobertaSelfAttention)
-    assert VisionAttentionBlock(dim=4, mlp_ratio=2, num_heads=2).attn.__class__ is (
-        VisionSelfAttention
+def test_dreamzero_vae_loader_remaps_original_wan_keys_to_sglang_wan_vae():
+    cases = {
+        "encoder.conv1.weight": "encoder.conv_in.weight",
+        "encoder.downsamples.3.residual.2.weight": (
+            "encoder.down_blocks.3.conv1.weight"
+        ),
+        "encoder.downsamples.3.shortcut.bias": (
+            "encoder.down_blocks.3.conv_shortcut.bias"
+        ),
+        "encoder.middle.1.to_qkv.weight": (
+            "encoder.mid_block.attentions.0.to_qkv.weight"
+        ),
+        "encoder.head.2.bias": "encoder.conv_out.bias",
+        "conv1.weight": "quant_conv.weight",
+        "conv2.bias": "post_quant_conv.bias",
+        "decoder.conv1.weight": "decoder.conv_in.weight",
+        "decoder.upsamples.7.time_conv.weight": (
+            "decoder.up_blocks.1.upsamplers.0.time_conv.weight"
+        ),
+        "decoder.head.0.gamma": "decoder.norm_out.gamma",
+    }
+
+    for old_key, new_key in cases.items():
+        assert remap_dreamzero_vae_model_key(old_key) == new_key
+
+
+def test_dreamzero_vae_loader_remaps_original_wan38_keys_to_sglang_wan_vae():
+    cases = {
+        "encoder.downsamples.1.downsamples.0.shortcut.weight": (
+            "encoder.down_blocks.1.resnets.0.conv_shortcut.weight"
+        ),
+        "encoder.downsamples.2.downsamples.2.time_conv.bias": (
+            "encoder.down_blocks.2.downsampler.time_conv.bias"
+        ),
+        "decoder.upsamples.0.upsamples.3.time_conv.weight": (
+            "decoder.up_blocks.0.upsampler.time_conv.weight"
+        ),
+        "decoder.upsamples.3.upsamples.0.shortcut.bias": (
+            "decoder.up_blocks.3.resnets.0.conv_shortcut.bias"
+        ),
+        "decoder.head.2.weight": "decoder.conv_out.weight",
+    }
+
+    for old_key, new_key in cases.items():
+        assert remap_dreamzero_vae_model_key(old_key) == new_key
+
+
+def test_dreamzero_text_encoder_key_remap():
+    cases = {
+        "token_embedding.weight": "shared.weight",
+        "norm.weight": "encoder.final_layer_norm.weight",
+        "blocks.3.norm1.weight": "encoder.block.3.layer.0.layer_norm.weight",
+        "blocks.3.attn.q.weight": ("encoder.block.3.layer.0.SelfAttention.q.weight"),
+        "blocks.3.attn.k.weight": ("encoder.block.3.layer.0.SelfAttention.k.weight"),
+        "blocks.3.attn.v.weight": ("encoder.block.3.layer.0.SelfAttention.v.weight"),
+        "blocks.3.attn.o.weight": ("encoder.block.3.layer.0.SelfAttention.o.weight"),
+        "blocks.3.pos_embedding.embedding.weight": (
+            "encoder.block.3.layer.0.SelfAttention.relative_attention_bias.weight"
+        ),
+        "blocks.3.norm2.weight": "encoder.block.3.layer.1.layer_norm.weight",
+        "blocks.3.ffn.gate.0.weight": (
+            "encoder.block.3.layer.1.DenseReluDense.wi_0.weight"
+        ),
+        "blocks.3.ffn.fc1.weight": (
+            "encoder.block.3.layer.1.DenseReluDense.wi_1.weight"
+        ),
+        "blocks.3.ffn.fc2.weight": ("encoder.block.3.layer.1.DenseReluDense.wo.weight"),
+    }
+    for old_key, new_key in cases.items():
+        assert remap_dreamzero_text_model_key(old_key) == new_key
+
+
+def test_dreamzero_image_encoder_key_remap():
+    cases = {
+        "model.visual.cls_embedding": "vision_model.embeddings.class_embedding",
+        "model.visual.patch_embedding.weight": (
+            "vision_model.embeddings.patch_embedding.weight"
+        ),
+        "model.visual.pos_embedding": (
+            "vision_model.embeddings.position_embedding.weight"
+        ),
+        "model.visual.pre_norm.weight": "vision_model.pre_layrnorm.weight",
+        "model.visual.transformer.3.norm1.bias": (
+            "vision_model.encoder.layers.3.layer_norm1.bias"
+        ),
+        "model.visual.transformer.3.attn.to_qkv.weight": (
+            "vision_model.encoder.layers.3.self_attn.qkv_proj.weight"
+        ),
+        "model.visual.transformer.3.attn.proj.bias": (
+            "vision_model.encoder.layers.3.self_attn.out_proj.bias"
+        ),
+        "model.visual.transformer.3.mlp.0.weight": (
+            "vision_model.encoder.layers.3.mlp.fc1.weight"
+        ),
+        "model.visual.transformer.3.mlp.2.bias": (
+            "vision_model.encoder.layers.3.mlp.fc2.bias"
+        ),
+    }
+    for old_key, new_key in cases.items():
+        assert remap_dreamzero_image_model_key(old_key) == new_key
+
+    assert remap_dreamzero_image_model_key("model.log_scale") is None
+    assert remap_dreamzero_image_model_key("model.visual.head") is None
+    assert remap_dreamzero_image_model_key("model.visual.post_norm.weight") is None
+    assert (
+        remap_dreamzero_image_model_key(
+            "model.visual.transformer.31.attn.to_qkv.weight"
+        )
+        is None
     )
 
-    image_converter = WanImageEncoderStateDictConverter()
-    converted = image_converter.from_civitai(
-        {
-            "visual.weight": torch.tensor([1.0]),
-            "textual.weight": torch.tensor([2.0]),
-        }
+
+def test_dreamzero_text_expected_keys_ignore_tied_embedding_alias():
+    state_keys = {
+        "shared.weight",
+        "encoder.embed_tokens.weight",
+        "encoder.final_layer_norm.weight",
+    }
+
+    expected = expected_dreamzero_text_state_keys(
+        state_keys, {"shared.weight", "encoder.final_layer_norm.weight"}
     )
-    assert list(converted) == ["model.visual.weight"]
 
-    text_converter = WanTextEncoderStateDictConverter()
-    text_state = {"token_embedding.weight": torch.ones(4, 4)}
-    assert text_converter.from_diffusers(text_state) is text_state
-    assert text_converter.from_civitai(text_state) is text_state
-
-    encoder = WanTextEncoder(
-        vocab=8,
-        dim=4,
-        dim_attn=4,
-        dim_ffn=8,
-        num_heads=2,
-        num_layers=1,
-        num_buckets=4,
-        dropout=0.0,
-    )
-    output = encoder(torch.tensor([[1, 2, 3]], dtype=torch.long))
-
-    assert output.shape == (1, 3, 4)
+    assert expected == {"shared.weight", "encoder.final_layer_norm.weight"}

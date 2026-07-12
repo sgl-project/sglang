@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     DreamZeroCachePool,
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
+    infer_dreamzero_batch_size,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -68,6 +72,32 @@ def _select_image_context(
     if first_frame:
         return videos_bcthw[:, :, :1].transpose(1, 2)
     return videos_bcthw[:, :, :1].transpose(1, 2)
+
+
+def _clip_pixel_values(image: torch.Tensor, image_size: int) -> torch.Tensor:
+    pixel_values = torch.cat(
+        [
+            F.interpolate(
+                frame_group,
+                size=(image_size, image_size),
+                mode="bicubic",
+                align_corners=False,
+            )
+            for frame_group in image
+        ]
+    )
+    pixel_values = pixel_values.mul(0.5).add(0.5)
+    mean = torch.tensor(
+        [0.48145466, 0.4578275, 0.40821073],
+        device=pixel_values.device,
+        dtype=pixel_values.dtype,
+    ).view(1, 3, 1, 1)
+    std = torch.tensor(
+        [0.26862954, 0.26130258, 0.27577711],
+        device=pixel_values.device,
+        dtype=pixel_values.dtype,
+    ).view(1, 3, 1, 1)
+    return (pixel_values - mean) / std
 
 
 def _dreamzero_videos(batch: Req) -> torch.Tensor:
@@ -288,14 +318,22 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                         getattr(arch, "concat_first_frame_latent", True)
                     ),
                 )
-            batch.dreamzero_image_context_input = image
             with torch.amp.autocast(
                 dtype=torch.bfloat16,
                 device_type=device.type,
                 enabled=device.type == "cuda",
             ):
                 with set_forward_context(current_timestep=0, attn_metadata=None):
-                    return image_encoder.encode_image(image).to(dtype=dtype)
+                    image_size = image_encoder.config.image_size
+                    pixel_values = _clip_pixel_values(image, image_size)
+                    pixel_values = pixel_values.to(
+                        dtype=next(image_encoder.parameters()).dtype
+                    )
+                    return (
+                        image_encoder(pixel_values=pixel_values)
+                        .last_hidden_state.clone()
+                        .to(dtype=dtype)
+                    )
 
     def _encode_vae_context(
         self,
@@ -357,7 +395,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                         getattr(arch, "concat_first_frame_latent", True)
                     ),
                 )
-            batch.dreamzero_image_context_input = image
             image_input = image.transpose(1, 2).contiguous()
             batch_size = image_input.shape[0]
             num_frames = server_args.pipeline_config.num_frames
@@ -441,13 +478,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                 posterior = vae.encode(videos)
                 return self._normalize_sglang_wan_latent(vae, posterior).to(dtype=dtype)
 
-    @staticmethod
-    def _infer_batch_size(inputs: dict[str, Any]) -> int:
-        for value in inputs.values():
-            if torch.is_tensor(value):
-                return int(value.shape[0])
-        raise ValueError("DreamZero visual stage cannot infer batch size")
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         arch = server_args.pipeline_config.dit_config.arch_config
         max_chunk_size = int(getattr(arch, "max_chunk_size", -1))
@@ -461,7 +491,10 @@ class DreamZeroVisualEncodingStage(PipelineStage):
             batch,
             self.cache_manager,
             local_attn_size=local_attn_size,
-            batch_size=self._infer_batch_size(inputs),
+            batch_size=infer_dreamzero_batch_size(
+                inputs,
+                error_message="DreamZero visual stage cannot infer batch size",
+            ),
         )
         return self._forward_cache_manager(batch, server_args, request_cache)
 
@@ -498,7 +531,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                 videos,
                 first_frame=not bool(getattr(arch, "concat_first_frame_latent", True)),
             )
-            batch.dreamzero_image_context_input = image
 
         current_start_frame = request_cache.uniform_current_start_frame(
             self.cache_manager

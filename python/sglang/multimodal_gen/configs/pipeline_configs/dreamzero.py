@@ -24,6 +24,7 @@ def _dreamzero_image_encoder_config() -> EncoderConfig:
 class DreamZeroPipelineConfig(PipelineConfig):
     """Configuration for the DreamZero DROID one-shot action pipeline."""
 
+    # DreamZero is a WAM-style policy, exposed through the shared action endpoint.
     task_type: ModelTaskType = ModelTaskType.VLA_ACTION
 
     dit_config: DiTConfig = field(default_factory=DreamZeroCausalWanConfig)
@@ -53,9 +54,25 @@ class DreamZeroPipelineConfig(PipelineConfig):
     should_use_guidance: bool = True
     cfg_scale: float = 5.0
 
-    embodiment_tag: str = "oxe_droid"
+    policy_family: str = "dreamzero"
+    image_keys: tuple[str, ...] = ()
+    image_size: tuple[int, ...] = ()
+    state_dim: int | None = None
     action_horizon: int = 24
-    num_inference_steps: int = 16
+    action_dim: int = 0
+    output_action_dim: int | None = None
+    default_num_inference_steps: int = 16
+    materialize_dtype: str | None = None
+    enable_global_prefix_cache: bool = False
+    enable_action_cuda_graph: bool = False
+    exact_prefix_cache: bool = False
+    realtime_websocket: bool = False
+    openpi_websocket: bool = False
+    batch_inputs: bool = True
+    multiple_candidates: bool = False
+    prefix_parallel_strategy: str | None = None
+    action_parallel_strategy: str | None = None
+    parallel_layout_version: str | None = None
     dit_step_mask: tuple[bool, ...] | None = (
         True,
         True,
@@ -75,7 +92,6 @@ class DreamZeroPipelineConfig(PipelineConfig):
         True,
     )
     dynamic_cache_schedule: bool = False
-    relative_action_per_horizon: bool = False
 
     num_frames: int = 33
     synthetic_height: int = 180

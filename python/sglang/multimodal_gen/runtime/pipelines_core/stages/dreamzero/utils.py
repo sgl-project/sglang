@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -102,3 +105,36 @@ def flatten_dim_sp_into_sequence(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.permute(1, 0, 2, *range(3, tensor.dim())).reshape(
         batch, seq_len * sp_size, *tensor.shape[3:]
     )
+
+
+def infer_dreamzero_batch_size(
+    inputs: Mapping[str, Any],
+    *,
+    error_message: str = "Cannot infer DreamZero batch size",
+) -> int:
+    for value in inputs.values():
+        if torch.is_tensor(value) and value.ndim > 0:
+            return int(value.shape[0])
+    raise ValueError(error_message)
+
+
+def infer_dreamzero_model_input_batch_size(model_inputs: Mapping[str, Any]) -> int:
+    for key in (
+        "images",
+        "videos",
+        "state",
+        "text",
+        "text_negative",
+        "clip_feature",
+        "y",
+        "latent_video",
+    ):
+        value = model_inputs.get(key)
+        if torch.is_tensor(value) and value.ndim > 0:
+            return int(value.shape[0])
+    prompt_embs = model_inputs.get("prompt_embs")
+    if isinstance(prompt_embs, (list, tuple)):
+        for value in prompt_embs:
+            if torch.is_tensor(value) and value.ndim > 0:
+                return int(value.shape[0])
+    raise ValueError("Cannot infer DreamZero batch size from normalized input")

@@ -2,7 +2,6 @@
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.dits.dreamzero_causal import (
-    DreamZeroCausalWanArchConfig,
     DreamZeroCausalWanConfig,
 )
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
@@ -21,7 +20,6 @@ from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
 __all__ = [
     "Cosmos3VideoConfig",
-    "DreamZeroCausalWanArchConfig",
     "DreamZeroCausalWanConfig",
     "HeliosConfig",
     "HunyuanVideoConfig",

@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DreamZero causal Wan DiT pieces."""
+"""DreamZero causal Wan DiT pieces.
+
+Adapted from the official DreamZero causal Wan/action implementation:
+https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+"""
 
 from __future__ import annotations
 
@@ -58,22 +63,26 @@ class DreamZeroT2VCrossAttention(nn.Module):
         )
         self.head_dim = dim // num_heads
         self.use_tensor_parallel = use_tensor_parallel
-        linear_out = lambda: (
-            RowParallelLinear(
-                dim,
-                dim,
-                input_is_parallel=True,
-                skip_bias_add=False,
-                reduce_results=True,
+        def linear_out():
+            return (
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    input_is_parallel=True,
+                    skip_bias_add=False,
+                    reduce_results=True,
+                )
+                if use_tensor_parallel
+                else nn.Linear(dim, dim)
             )
-            if use_tensor_parallel
-            else nn.Linear(dim, dim)
-        )
-        linear_in = lambda: (
-            ColumnParallelLinear(dim, dim, gather_output=False)
-            if use_tensor_parallel
-            else nn.Linear(dim, dim)
-        )
+
+        def linear_in():
+            return (
+                ColumnParallelLinear(dim, dim, gather_output=False)
+                if use_tensor_parallel
+                else nn.Linear(dim, dim)
+            )
+
         self.q = linear_in()
         self.k = linear_in()
         self.v = linear_in()
@@ -113,11 +122,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         context: torch.Tensor,
-        context_lens: torch.Tensor | None = None,
         crossattn_cache: dict | None = None,
     ) -> torch.Tensor:
-        if context_lens is not None:
-            raise NotImplementedError("context_lens masking is not part of Phase 2.1")
         batch = x.shape[0]
         q = self._project_query(x, batch)
         k, v = self._project_text_kv(context, batch, crossattn_cache)
@@ -191,7 +197,6 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         num_heads: int,
         frame_seqlen: int,
         local_attn_size: int = -1,
-        sink_size: int = 0,
         num_frame_per_block: int = 1,
         qk_norm=True,
         eps: float = 1e-6,
@@ -208,7 +213,6 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         )
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
-        self.sink_size = sink_size
         self.num_frame_per_block = num_frame_per_block
         self.use_tensor_parallel = use_tensor_parallel
         self.max_attention_size = (
@@ -870,7 +874,6 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         num_heads: int,
         frame_seqlen: int,
         local_attn_size: int = -1,
-        sink_size: int = 0,
         num_frame_per_block: int = 1,
         qk_norm=True,
         cross_attn_norm: bool = False,
@@ -894,7 +897,6 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             num_heads=num_heads,
             frame_seqlen=frame_seqlen,
             local_attn_size=local_attn_size,
-            sink_size=sink_size,
             num_frame_per_block=num_frame_per_block,
             qk_norm=qk_norm,
             eps=eps,
@@ -1050,17 +1052,13 @@ class DreamZeroCausalWanModel(nn.Module):
         num_heads: int = 16,
         num_layers: int = 32,
         max_chunk_size: int = -1,
-        sink_size: int = 0,
         qk_norm: bool = True,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
         num_frame_per_block: int = 1,
         action_dim: int = 32,
-        num_registers: int = 8,
         max_state_dim: int = 64,
-        max_num_embodiments: int = 32,
         hidden_size: int = 1024,
-        diffusion_model_pretrained_path=None,
         num_action_per_block: int = 32,
         num_state_per_block: int = 1,
         concat_first_frame_latent: bool = True,
@@ -1090,20 +1088,16 @@ class DreamZeroCausalWanModel(nn.Module):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
         self.num_frame_per_block = num_frame_per_block
-        self.diffusion_model_pretrained_path = diffusion_model_pretrained_path
         self.action_dim = action_dim
-        self.num_registers = num_registers
         self.max_state_dim = max_state_dim
-        self.max_num_embodiments = max_num_embodiments
         self.hidden_size = hidden_size
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.concat_first_frame_latent = concat_first_frame_latent
         self.use_tensor_parallel = use_tensor_parallel
 
-        max_num_embodiments = 1
         self.state_encoder = CategorySpecificMLP(
-            num_categories=max_num_embodiments,
+            num_categories=1,
             input_dim=max_state_dim,
             hidden_dim=self.hidden_size,
             output_dim=self.dim,
@@ -1111,10 +1105,10 @@ class DreamZeroCausalWanModel(nn.Module):
         self.action_encoder = MultiEmbodimentActionEncoder(
             action_dim=action_dim,
             hidden_size=self.dim,
-            num_embodiments=max_num_embodiments,
+            num_embodiments=1,
         )
         self.action_decoder = CategorySpecificMLP(
-            num_categories=max_num_embodiments,
+            num_categories=1,
             input_dim=dim,
             hidden_dim=self.hidden_size,
             output_dim=action_dim,
@@ -1145,7 +1139,6 @@ class DreamZeroCausalWanModel(nn.Module):
                     num_heads,
                     frame_seqlen,
                     self.local_attn_size,
-                    sink_size,
                     num_frame_per_block,
                     qk_norm,
                     cross_attn_norm,
@@ -1170,9 +1163,6 @@ class DreamZeroCausalWanModel(nn.Module):
         ]
         if model_type in ("i2v", "ti2v"):
             self.img_emb = MLPProj(1280, dim)
-
-        self.gradient_checkpointing = True
-        self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
     def _create_freqs(self, grid_size: torch.Tensor, start_frame: int) -> torch.Tensor:
         device = self.patch_embedding.weight.device

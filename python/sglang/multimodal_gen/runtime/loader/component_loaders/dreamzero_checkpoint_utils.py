@@ -8,7 +8,7 @@ import os
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, TypeVar
+from typing import Any, TypeVar
 
 import torch
 from safetensors.torch import safe_open
@@ -21,9 +21,6 @@ class DreamZeroCheckpointLoadReport:
     missing_keys: list[str]
     unexpected_keys: list[str]
     shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]]
-    fallback_impl: str | None = None
-
-    include_fallback_impl: ClassVar[bool] = False
 
     @property
     def loaded_count(self) -> int:
@@ -42,7 +39,7 @@ class DreamZeroCheckpointLoadReport:
         return len(self.shape_mismatches)
 
     def as_dict(self) -> dict[str, Any]:
-        report = {
+        return {
             "loaded_count": self.loaded_count,
             "missing_count": self.missing_count,
             "unexpected_count": self.unexpected_count,
@@ -54,9 +51,6 @@ class DreamZeroCheckpointLoadReport:
                 for key, (target, checkpoint) in self.shape_mismatches.items()
             },
         }
-        if self.include_fallback_impl:
-            report["fallback_impl"] = self.fallback_impl
-        return report
 
 
 ReportT = TypeVar("ReportT", bound=DreamZeroCheckpointLoadReport)
@@ -74,11 +68,11 @@ def assign_tensor(model: nn.Module, name: str, tensor: torch.Tensor) -> None:
     raise KeyError(f"{name} is neither a parameter nor a buffer")
 
 
-def iter_prefixed_safetensors(
+def iter_indexed_safetensors(
     model_path: str | os.PathLike[str],
-    prefix: str,
     *,
     index_name: str = "model.safetensors.index.json",
+    prefix_filter: str | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     model_dir = Path(model_path)
     index_path = model_dir / index_name
@@ -88,17 +82,40 @@ def iter_prefixed_safetensors(
     files: list[str] = []
     seen_files: set[str] = set()
     for key, file_name in weight_map.items():
-        if not key.startswith(prefix) or file_name in seen_files:
+        if prefix_filter is not None and not key.startswith(prefix_filter):
+            continue
+        if file_name in seen_files:
             continue
         seen_files.add(file_name)
         files.append(file_name)
 
     for file_name in files:
         file_path = model_dir / file_name
-        with safe_open(file_path, framework="pt", device="cpu") as handle:
-            for checkpoint_key in handle.keys():
-                if checkpoint_key.startswith(prefix):
-                    yield checkpoint_key, handle.get_tensor(checkpoint_key)
+        yield from iter_safetensor_file(file_path, prefix_filter=prefix_filter)
+
+
+def iter_safetensor_file(
+    file_path: str | os.PathLike[str],
+    *,
+    prefix_filter: str | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    with safe_open(file_path, framework="pt", device="cpu") as handle:
+        for checkpoint_key in handle.keys():
+            if prefix_filter is None or checkpoint_key.startswith(prefix_filter):
+                yield checkpoint_key, handle.get_tensor(checkpoint_key)
+
+
+def iter_prefixed_safetensors(
+    model_path: str | os.PathLike[str],
+    prefix: str,
+    *,
+    index_name: str = "model.safetensors.index.json",
+) -> Iterator[tuple[str, torch.Tensor]]:
+    yield from iter_indexed_safetensors(
+        model_path,
+        index_name=index_name,
+        prefix_filter=prefix,
+    )
 
 
 def load_matching_tensors(
@@ -108,7 +125,6 @@ def load_matching_tensors(
     device: torch.device,
     key_mapper: Callable[[str], str | None] | None = None,
     report_cls: type[ReportT],
-    fallback_impl: str | None = None,
 ) -> ReportT:
     meta_sd = model.state_dict()
     loaded_keys: list[str] = []
@@ -125,11 +141,14 @@ def load_matching_tensors(
                 unexpected_keys.append(target_name)
                 continue
             if tuple(full_tensor.shape) != tuple(meta_tensor.shape):
-                shape_mismatches[target_name] = (
-                    tuple(meta_tensor.shape),
-                    tuple(full_tensor.shape),
-                )
-                continue
+                if meta_tensor.ndim == 0 and full_tensor.numel() == 1:
+                    full_tensor = full_tensor.reshape(())
+                else:
+                    shape_mismatches[target_name] = (
+                        tuple(meta_tensor.shape),
+                        tuple(full_tensor.shape),
+                    )
+                    continue
             target_tensor = full_tensor.to(device=device, dtype=meta_tensor.dtype)
             assign_tensor(model, target_name, target_tensor)
             loaded_keys.append(target_name)
@@ -139,7 +158,6 @@ def load_matching_tensors(
         missing_keys=sorted(set(meta_sd) - set(loaded_keys)),
         unexpected_keys=unexpected_keys,
         shape_mismatches=shape_mismatches,
-        fallback_impl=fallback_impl,
     )
 
 

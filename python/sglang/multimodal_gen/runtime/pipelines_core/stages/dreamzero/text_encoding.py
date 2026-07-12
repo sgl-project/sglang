@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
+    infer_dreamzero_batch_size,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -126,7 +129,8 @@ class DreamZeroTextEncodingStage(PipelineStage):
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         else:
             attention_mask = attention_mask.to(device=device, dtype=torch.long)
-        prompt_emb = encoder(input_ids, attention_mask)
+        prompt_output = encoder(input_ids=input_ids, attention_mask=attention_mask)
+        prompt_emb = prompt_output.last_hidden_state
         prompt_emb = self._fit_text_len(prompt_emb.clone(), text_len)
         attention_mask = attention_mask[:, : prompt_emb.shape[1]]
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
@@ -158,13 +162,6 @@ class DreamZeroTextEncodingStage(PipelineStage):
             return int(videos.shape[2])
         return int(videos.shape[2])
 
-    @staticmethod
-    def _infer_batch_size(inputs: dict[str, Any]) -> int:
-        for value in inputs.values():
-            if torch.is_tensor(value):
-                return int(value.shape[0])
-        raise ValueError("DreamZero text stage cannot infer batch size")
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         inputs: dict[str, Any] = batch.dreamzero_inputs
         cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
@@ -181,7 +178,10 @@ class DreamZeroTextEncodingStage(PipelineStage):
             batch,
             self.cache_manager,
             local_attn_size=self._local_attn_size(server_args),
-            batch_size=self._infer_batch_size(inputs),
+            batch_size=infer_dreamzero_batch_size(
+                inputs,
+                error_message="DreamZero text stage cannot infer batch size",
+            ),
         )
         return self._forward_cache_manager(
             batch,
@@ -273,8 +273,6 @@ class DreamZeroTextEncodingStage(PipelineStage):
         # resolve a fresh request cache and should not depend on these fields.
         request_cache.prompt_reusable = prompt_reusable
         request_cache.neg_prompt_reusable = neg_prompt_reusable
-        batch.dreamzero_prompt_reusable = prompt_reusable
-        batch.dreamzero_neg_prompt_reusable = neg_prompt_reusable
 
         precomputed = inputs.get("prompt_embs")
         if precomputed is None:
@@ -293,8 +291,7 @@ class DreamZeroTextEncodingStage(PipelineStage):
                 values = list(precomputed)
                 if branch >= len(values):
                     raise ValueError(
-                        "DreamZero precomputed prompt_embs is missing branch "
-                        f"{branch}"
+                        f"DreamZero precomputed prompt_embs is missing branch {branch}"
                     )
                 prompt = values[branch]
             else:
@@ -366,7 +363,6 @@ class DreamZeroTextEncodingStage(PipelineStage):
                         reusable=neg_prompt_reusable,
                     )
                 )
-        batch.dreamzero_session_reset_reason = reset_reasons
         self._set_prompt_metadata(
             batch,
             prompt_embs,

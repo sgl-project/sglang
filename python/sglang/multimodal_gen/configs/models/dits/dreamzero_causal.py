@@ -6,7 +6,12 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 @dataclass
 class DreamZeroCausalWanArchConfig(DiTArchConfig):
-    """DROID DreamZero causal Wan DiT architecture defaults."""
+    """DROID DreamZero causal Wan DiT architecture defaults.
+
+    Architecture values follow the official DreamZero implementation:
+    https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+    https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+    """
 
     model_type: str = "i2v"
     patch_size: tuple[int, int, int] = (1, 2, 2)
@@ -21,7 +26,6 @@ class DreamZeroCausalWanArchConfig(DiTArchConfig):
     num_heads: int = 40
     num_layers: int = 40
     max_chunk_size: int = 4
-    sink_size: int = 0
     qk_norm: bool = True
     cross_attn_norm: bool = False
     eps: float = 1e-6

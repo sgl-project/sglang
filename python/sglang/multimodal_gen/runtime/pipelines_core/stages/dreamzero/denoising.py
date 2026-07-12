@@ -99,64 +99,6 @@ class SchedulerStepState:
     skip_state: dict[str, int]
 
 
-def _validate_optional_int_extra(
-    extra: dict[str, Any],
-    field_name: str,
-    expected_value: int,
-) -> None:
-    request_value = extra.get(field_name)
-    if request_value is None:
-        return
-    if isinstance(request_value, bool):
-        raise ValueError(f"{field_name} must be an integer, got bool")
-    try:
-        normalized_value = int(request_value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be an integer") from exc
-    if normalized_value != expected_value:
-        config_name = field_name.removeprefix("dreamzero_")
-        raise ValueError(
-            f"{field_name}={normalized_value} does not match "
-            f"pipeline_config.{config_name}={expected_value}. Per-request "
-            "DreamZero action shapes are not supported; update the pipeline "
-            "config instead."
-        )
-
-
-def _validate_optional_bool_extra(
-    extra: dict[str, Any],
-    field_name: str,
-    expected_value: bool,
-) -> None:
-    request_value = extra.get(field_name)
-    if request_value is None:
-        return
-    if not isinstance(request_value, bool):
-        raise ValueError(f"{field_name} must be a bool")
-    if request_value != expected_value:
-        config_name = field_name.removeprefix("dreamzero_")
-        raise ValueError(
-            f"{field_name}={request_value} does not match "
-            f"pipeline_config.{config_name}={expected_value}. Per-request "
-            "DreamZero action conversion is not supported; update the pipeline "
-            "config instead."
-        )
-
-
-def validate_dreamzero_request_config(batch: Req, pipeline_config: Any) -> None:
-    extra = getattr(batch, "extra", {}) or {}
-    _validate_optional_int_extra(
-        extra,
-        "dreamzero_action_horizon",
-        int(pipeline_config.action_horizon),
-    )
-    _validate_optional_bool_extra(
-        extra,
-        "dreamzero_relative_action_per_horizon",
-        bool(pipeline_config.relative_action_per_horizon),
-    )
-
-
 class DreamZeroCausalDenoisingStage(PipelineStage):
     """One-shot DreamZero causal video/action denoising stage."""
 
@@ -520,7 +462,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         device: torch.device,
     ) -> DreamZeroNoiseContext:
         arch_config = server_args.pipeline_config.dit_config.arch_config
-        validate_dreamzero_request_config(batch, server_args.pipeline_config)
         action_dim = arch_config.action_dim
         max_state_dim = arch_config.max_state_dim
         action_horizon = server_args.pipeline_config.action_horizon
@@ -898,13 +839,13 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
         ctx: DreamZeroDenoisingContext,
-    ) -> torch.Tensor:
+    ) -> None:
         state = self._prepare_rollout_state(ctx)
         scheduler = self._new_unipc_scheduler()
         action_scheduler = self._new_unipc_scheduler()
         for rollout_scheduler in (scheduler, action_scheduler):
             rollout_scheduler.set_timesteps(
-                server_args.pipeline_config.num_inference_steps,
+                server_args.pipeline_config.default_num_inference_steps,
                 device=ctx.inputs.device,
                 shift=server_args.pipeline_config.flow_shift,
             )
@@ -944,14 +885,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                 step_index=step_index,
             )
         batch.dreamzero_action_pred = noisy_action.float()
-        if ctx.cache.current_start_frame == 1:
-            batch.dreamzero_video_pred = torch.cat(
-                [ctx.inputs.latent_video.transpose(1, 2), noisy_input], dim=1
-            ).transpose(1, 2)
-        else:
-            batch.dreamzero_video_pred = noisy_input.transpose(1, 2)
-        prev_predictions.clear()
-        return noisy_input
 
     def _set_request_metadata(
         self,

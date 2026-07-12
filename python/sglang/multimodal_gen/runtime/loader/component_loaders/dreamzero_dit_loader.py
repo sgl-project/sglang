@@ -8,14 +8,12 @@ names that match :mod:`dreamzero_causal` after that prefix is stripped.
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors.torch import safe_open
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -25,6 +23,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
     DreamZeroCheckpointLoadReport,
     assign_tensor,
+    iter_indexed_safetensors,
+    iter_prefixed_safetensors,
+    iter_safetensor_file,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_config import (
     dreamzero_dit_init_kwargs_from_checkpoint_config,
@@ -45,10 +46,6 @@ _WAN_DIT_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
 _WAN_DIT_SINGLE_NAME = "diffusion_pytorch_model.safetensors"
 
 
-class DreamZeroDiTLoadReport(DreamZeroCheckpointLoadReport):
-    pass
-
-
 def remap_dreamzero_dit_key(checkpoint_key: str) -> str | None:
     if not checkpoint_key.startswith(_DROID_DIT_PREFIX):
         return None
@@ -66,30 +63,6 @@ def _load_config(model_path: str | os.PathLike[str]) -> dict[str, Any]:
     return load_dreamzero_checkpoint_config(model_path)
 
 
-def _iter_indexed_safetensors(
-    model_path: str | os.PathLike[str],
-) -> Iterator[tuple[str, torch.Tensor]]:
-    model_dir = Path(model_path)
-    index_path = model_dir / _DROID_INDEX_NAME
-    with index_path.open() as f:
-        weight_map = json.load(f)["weight_map"]
-
-    files: list[str] = []
-    seen_files: set[str] = set()
-    for key, file_name in weight_map.items():
-        if not key.startswith(_DROID_DIT_PREFIX) or file_name in seen_files:
-            continue
-        seen_files.add(file_name)
-        files.append(file_name)
-
-    for file_name in files:
-        file_path = model_dir / file_name
-        with safe_open(file_path, framework="pt", device="cpu") as handle:
-            for checkpoint_key in handle.keys():
-                if checkpoint_key.startswith(_DROID_DIT_PREFIX):
-                    yield checkpoint_key, handle.get_tensor(checkpoint_key)
-
-
 def _iter_wan_component_safetensors(
     model_path: str | os.PathLike[str],
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -97,21 +70,13 @@ def _iter_wan_component_safetensors(
     index_path = model_dir / _WAN_DIT_INDEX_NAME
     single_path = model_dir / _WAN_DIT_SINGLE_NAME
     if index_path.is_file():
-        with index_path.open() as f:
-            weight_map = json.load(f)["weight_map"]
-        files = sorted(set(weight_map.values()))
+        yield from iter_indexed_safetensors(model_dir, index_name=_WAN_DIT_INDEX_NAME)
     elif single_path.is_file():
-        files = [_WAN_DIT_SINGLE_NAME]
+        yield from iter_safetensor_file(single_path)
     else:
         raise FileNotFoundError(
             f"Cannot find {_WAN_DIT_INDEX_NAME} or {_WAN_DIT_SINGLE_NAME} in {model_dir}"
         )
-
-    for file_name in files:
-        file_path = model_dir / file_name
-        with safe_open(file_path, framework="pt", device="cpu") as handle:
-            for checkpoint_key in handle.keys():
-                yield checkpoint_key, handle.get_tensor(checkpoint_key)
 
 
 def _iter_dit_tensors(
@@ -120,7 +85,7 @@ def _iter_dit_tensors(
     if _has_wan_component_dit(model_path):
         yield from _iter_wan_component_safetensors(model_path)
     else:
-        yield from _iter_indexed_safetensors(model_path)
+        yield from iter_prefixed_safetensors(model_path, _DROID_DIT_PREFIX)
 
 
 def _remap_dit_key(
@@ -162,7 +127,7 @@ def load_dreamzero_dit_checkpoint(
     *,
     device: torch.device,
     strict: bool = False,
-) -> DreamZeroDiTLoadReport:
+) -> DreamZeroCheckpointLoadReport:
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
     loaded_keys: list[str] = []
@@ -209,7 +174,7 @@ def load_dreamzero_dit_checkpoint(
             loaded_keys.append(target_name)
 
     missing_keys = sorted(set(meta_sd) - set(loaded_keys))
-    report = DreamZeroDiTLoadReport(
+    report = DreamZeroCheckpointLoadReport(
         loaded_keys=loaded_keys,
         missing_keys=missing_keys,
         unexpected_keys=unexpected_keys,
