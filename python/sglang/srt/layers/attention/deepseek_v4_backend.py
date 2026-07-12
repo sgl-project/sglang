@@ -515,7 +515,6 @@ class DeepseekV4AttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
-        self.max_context_len = model_runner.model_config.context_len
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -594,9 +593,9 @@ class DeepseekV4AttnBackend(
                 "DSV4 ragged verify does not support online c128 MTP; "
                 "set SGLANG_RAGGED_VERIFY_MODE off or disable online compress."
             )
-        if layout.verify_lens_cpu is not None:
-            assert int(layout.verify_lens.min()) >= 1
-            assert layout.total_verify_tokens == int(layout.verify_lens.sum())
+        # Layout invariants (verify_lens >= 1, total == sum) are enforced at
+        # construction in RaggedVerifyLayout.__post_init__; re-checking the
+        # device tensor here would cost two D2H syncs per verify prep.
         layout = layout.padded_to_bucket(padded_bs=bs)
         return layout
 
@@ -953,7 +952,7 @@ class DeepseekV4AttnBackend(
         if is_ragged:
             seq_lens = seq_lens + extend_seq_lens
             num_q_tokens = raw_metadata.total_verify_tokens
-            assert num_q_tokens is not None, "ragged verify num_q_tokens is None"
+            assert num_q_tokens > 0, "ragged verify raw metadata is stale/empty"
             seq_lens_casual, req_pool_indices_repeated = (
                 self._expand_prefill_casually_vectorized(
                     num_tokens=num_q_tokens,
