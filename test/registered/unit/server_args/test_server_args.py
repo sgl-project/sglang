@@ -133,6 +133,30 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             server_args._handle_multimodal_feature_transport()
 
 
+class TestMmEncoderDataParallelLogging(CustomTestCase):
+    def test_logs_when_encoder_dp_has_no_parallelism(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=1
+        )
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=1", logs.output[0])
+        self.assertIn("no data-parallel work", logs.output[0])
+
+    def test_logs_encoder_dp_tradeoff_for_tp(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=4
+        )
+
+        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=4", logs.output[0])
+        self.assertIn("high-resolution or multi-image", logs.output[0])
+
+
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
         server_args = ServerArgs(
