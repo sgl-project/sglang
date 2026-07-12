@@ -37,7 +37,7 @@ OTHER_ARGS = [
     "--dtype",
     "bfloat16",
     "--max-running-requests",
-    8,
+    12,
     "--trust-remote-code",
     "--mem-fraction-static",
     0.5,
