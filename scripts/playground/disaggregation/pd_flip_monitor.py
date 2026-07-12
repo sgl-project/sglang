@@ -72,6 +72,8 @@ class ClusterSLOSnapshot:
     prefill_slo_attainment: Optional[float]
     decode_slo_attainment: Optional[float]
     nodes: List[NodeSLOSample]
+    prefill_counts: SampleCounts
+    decode_counts: SampleCounts
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -108,6 +110,8 @@ class SLOWindow:
             prefill_slo_attainment=prefill_counts.attainment,
             decode_slo_attainment=decode_counts.attainment,
             nodes=list(self.samples),
+            prefill_counts=prefill_counts,
+            decode_counts=decode_counts,
         )
 
     def _prune(self, now: float) -> None:
@@ -190,6 +194,9 @@ class PDFlipSLOMonitor:
         for name, url, role in nodes:
             self.window.add(self.collect_node(name, url, role))
         return self.window.snapshot(now)
+
+    def reset_window(self) -> None:
+        self.window = SLOWindow(self.window.window_seconds)
 
 
 def parse_histogram_counts(
