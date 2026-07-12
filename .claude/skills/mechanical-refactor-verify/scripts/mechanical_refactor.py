@@ -66,9 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="regex a commit subject must match to get a proof "
         "(e.g. '(?<!_)mechanical_provable'); default: every commit in the range",
     )
-    construct.add_argument(
-        "--out", required=True, help="output folder for the proof"
-    )
+    construct.add_argument("--out", required=True, help="output folder for the proof")
     construct.add_argument(
         "--repo-root", default=None, help="repo root (default: cwd's repo)"
     )
@@ -83,9 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--base", required=True, help="base commit of the chain")
     verify.add_argument("--branch", required=True, help="PR branch name (chain tip)")
     verify.add_argument("--proof", required=True, help="proof folder path")
-    verify.add_argument(
-        "--repo-root", default=None, help="repo root (default: cwd's)"
-    )
+    verify.add_argument("--repo-root", default=None, help="repo root (default: cwd's)")
     verify.add_argument(
         "--report", default=None, help="report file path (default: inside --proof)"
     )
