@@ -30,6 +30,10 @@
   (`<folder>/chain_report.md`); exit 0 iff the chain verifies.
 - Proofs run up to `--jobs` at a time (default 3; each proof works in its own throwaway
   worktree, so this is safe) — raise it to shorten a long chain's wall clock.
+- Re-running a long chain: add `--skip-passed` to reuse **this machine's own** earlier
+  PASS verdicts for unchanged proofs (keyed by sha + script hash + utils hash, stored
+  under the repo's `.git/`, never shipped with the proof folder — so §0 still holds;
+  contract: `spec-reproduction-cli.md` §3.5).
 - The contract (word rule, proof resolution, PASS criterion, exit codes):
   `spec-reproduction-cli.md`.
 - The `HUMAN_REVIEW` rows in the report are your remaining manual surface — the declared

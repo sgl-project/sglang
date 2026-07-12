@@ -69,6 +69,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
 - `--repo-root DIR`: run against that repo instead of the cwd's.
 - `--report PATH`: write the report there instead of `<proof>/chain_report.md`.
 - `--jobs N`: run up to N proofs concurrently (default 3).
+- `--skip-passed`: reuse this machine's own earlier PASS verdicts (§3.5).
 
 ### 3.2 The chain
 
@@ -102,13 +103,40 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
   regardless of completion order. A completion line (`sha  PASS/FAIL`) is printed as each
   proof finishes, so a long chain shows progress.
 
+### 3.5 The passed-proof cache (`--skip-passed`)
+
+- Purpose: incremental re-verification. Re-running a long chain repeats work for proofs
+  whose commit and proof did not change; those earlier PASSes can be reused.
+- **What is recorded.** Every run (flag or not) records each proof that PASSed into the
+  cache; a FAIL is **never** recorded. An entry's key is the triple:
+    - the commit's **full sha** (a rebase changes the sha, so a rebased commit never
+      hits);
+    - the **sha256 of the proof script's bytes**;
+    - the **sha256 of the `mechanical_refactor_reproduction_utils.py` bytes** sitting
+      next to the script or one level up (the script's only dependency; `""` when
+      absent) — an edited engine invalidates the cache.
+- **What is skipped.** Only with `--skip-passed`, and only on an exact triple match, is a
+  pending proof skipped: its verdict is `PASS`, marked as reused (a
+  `proof <sha>  PASS (cached)` progress line, and a reused count in the report). Any
+  mismatch — different sha, edited script, edited utils, no entry — runs the proof
+  normally.
+- **Where the cache lives — and why that is trust-safe.** The cache file
+  (`mechanical_refactor_passed_proofs.json`) sits in the repo's **git common dir**
+  (`git rev-parse --git-common-dir`), shared across that repo's worktrees. It is
+  machine-local state: it never travels with the proof folder, a gist, or the PR, so
+  `--skip-passed` can only ever reuse verdicts **this machine's own runs** produced —
+  the do-not-trust-the-PR rule (`guide-verify-proof.md` §0) is not weakened.
+- A missing, corrupt, or unreadable cache file is treated as empty; the cache is
+  best-effort infrastructure and must never fail the chain walk.
+
 ## 4. The report
 
 - The full report is markdown, printed to stdout **and** written to the report path
   (§3.1), so the folder stays self-describing.
 - It contains:
     - the resolved base / branch / proof folder and the **chain verdict**;
-    - the commit counts per kind and the proof PASS count;
+    - the commit counts per kind and the proof PASS count (plus, when any proof was
+      skipped via `--skip-passed`, the reused count);
     - one table row per commit, in chain order: sha, kind, verdict, subject;
     - a **Failure details** section with one entry per non-ok commit — the missing-proof
       search locations, the classification rule broken, or the failing proof's output

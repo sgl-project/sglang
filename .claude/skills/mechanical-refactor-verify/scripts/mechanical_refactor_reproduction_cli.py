@@ -16,6 +16,8 @@ and exits 0 iff the whole chain verifies. Normative contract: spec-reproduction-
 """
 
 import argparse
+import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -24,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _DEFAULT_JOBS = 3
+_PASSED_CACHE_FILENAME = "mechanical_refactor_passed_proofs.json"
+_CACHED_PASS_DETAIL = "reused this machine's earlier PASS (--skip-passed)"
 
 KIND_MECHANICAL = "mechanical_provable"
 KIND_NON_MECHANICAL = "non_mechanical_provable"
@@ -63,6 +67,7 @@ class CommitVerdict:
     kind: "str | None"
     verdict: str
     detail: str = ""
+    cached: bool = False
 
     @property
     def ok(self) -> bool:
@@ -110,6 +115,11 @@ def main(argv: "list[str]") -> int:
         default=_DEFAULT_JOBS,
         help=f"max concurrent proof runs (default {_DEFAULT_JOBS})",
     )
+    parser.add_argument(
+        "--skip-passed",
+        action="store_true",
+        help="reuse this machine's earlier PASS verdicts for unchanged proofs",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -119,6 +129,7 @@ def main(argv: "list[str]") -> int:
             proof=Path(args.proof),
             repo_root=args.repo_root,
             jobs=args.jobs,
+            skip_passed=args.skip_passed,
         )
     except ChainVerificationError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -141,12 +152,15 @@ def verify_chain(
     proof: Path,
     repo_root: "str | None" = None,
     jobs: int = _DEFAULT_JOBS,
+    skip_passed: bool = False,
 ) -> ChainResult:
     """Classify every commit in ``base..branch`` and run every provable commit's proof.
 
     Classification and proof resolution are sequential (cheap); the proof runs execute
     concurrently, up to ``jobs`` at a time — safe because each proof works in its own
-    throwaway worktree. The verdict list keeps chain order."""
+    throwaway worktree. The verdict list keeps chain order. With ``skip_passed``, a
+    pending proof whose (sha, script hash, utils hash) triple this machine already ran to
+    a PASS is reused instead of re-executed; every fresh PASS is recorded either way."""
     root = repo_root or _repo_root()
     if not proof.is_dir():
         raise ChainVerificationError(f"proof folder does not exist: {proof}")
@@ -162,8 +176,22 @@ def verify_chain(
             _resolve_commit(sha=sha, subject=subject, message=message, proof=proof)
         )
 
+    cache_path = _passed_cache_path(root)
+    cache = _load_passed_cache(cache_path)
+    if skip_passed:
+        resolved = [_reuse_cached_pass(item, cache=cache) for item in resolved]
+
+    pending_by_sha = {
+        item.sha: item for item in resolved if isinstance(item, _PendingProof)
+    }
     verdicts: "list[CommitVerdict]" = _run_pending_proofs(
         resolved=resolved, root=root, jobs=jobs
+    )
+    _record_passes(
+        cache=cache,
+        cache_path=cache_path,
+        verdicts=verdicts,
+        pending_by_sha=pending_by_sha,
     )
     return ChainResult(
         base=base,
@@ -181,6 +209,7 @@ def render_report(result: ChainResult) -> str:
     n_non_mech = sum(1 for v in result.verdicts if v.kind == KIND_NON_MECHANICAL)
     n_unclassified = sum(1 for v in result.verdicts if v.kind is None)
     n_pass = sum(1 for v in result.verdicts if v.verdict == VERDICT_PASS)
+    n_cached = sum(1 for v in result.verdicts if v.cached)
 
     lines = [
         "# Mechanical refactor chain report",
@@ -192,6 +221,11 @@ def render_report(result: ChainResult) -> str:
         f"- commits: {len(result.verdicts)} total — {n_mech} {KIND_MECHANICAL}, "
         f"{n_non_mech} {KIND_NON_MECHANICAL}, {n_unclassified} classification error(s)",
         f"- proofs: {n_pass}/{n_mech} PASS",
+        *(
+            [f"- reused from the passed-proof cache (--skip-passed): {n_cached}"]
+            if n_cached
+            else []
+        ),
         "",
         "| # | commit | kind | verdict | subject |",
         "|---|--------|------|---------|---------|",
@@ -212,6 +246,83 @@ def render_report(result: ChainResult) -> str:
                 v.detail or "(no detail)",
             ]
     return "\n".join(lines) + "\n"
+
+
+def _reuse_cached_pass(
+    item: "CommitVerdict | _PendingProof", *, cache: dict
+) -> "CommitVerdict | _PendingProof":
+    """Turn a pending proof into a cached PASS verdict on an exact cache-key match."""
+    if not isinstance(item, _PendingProof):
+        return item
+    if cache.get("passed", {}).get(item.sha) != _proof_cache_key(item.script):
+        return item
+    print(f"proof {item.sha[:9]}  {VERDICT_PASS} (cached)", flush=True)
+    return CommitVerdict(
+        sha=item.sha,
+        subject=item.subject,
+        kind=item.kind,
+        verdict=VERDICT_PASS,
+        detail=_CACHED_PASS_DETAIL,
+        cached=True,
+    )
+
+
+def _record_passes(
+    *,
+    cache: dict,
+    cache_path: Path,
+    verdicts: "list[CommitVerdict]",
+    pending_by_sha: "dict[str, _PendingProof]",
+) -> None:
+    """Record every freshly-run PASS into the cache (a FAIL is never recorded)."""
+    fresh = [
+        v
+        for v in verdicts
+        if v.verdict == VERDICT_PASS and not v.cached and v.sha in pending_by_sha
+    ]
+    if not fresh:
+        return
+    for v in fresh:
+        cache.setdefault("passed", {})[v.sha] = _proof_cache_key(
+            pending_by_sha[v.sha].script
+        )
+    try:
+        cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"note: could not write passed-proof cache {cache_path}: {exc}")
+
+
+def _proof_cache_key(script: Path) -> "dict[str, str]":
+    """The cache key parts beyond the sha: hashes of the script and its utils module."""
+    utils_sha256 = ""
+    for directory in (script.parent, script.parent.parent):
+        utils = directory / "mechanical_refactor_reproduction_utils.py"
+        if utils.is_file():
+            utils_sha256 = hashlib.sha256(utils.read_bytes()).hexdigest()
+            break
+    return {
+        "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "utils_sha256": utils_sha256,
+    }
+
+
+def _passed_cache_path(root: str) -> Path:
+    common_dir = _git_output(["rev-parse", "--git-common-dir"], root).strip()
+    common = Path(common_dir)
+    if not common.is_absolute():
+        common = Path(root) / common
+    return common / _PASSED_CACHE_FILENAME
+
+
+def _load_passed_cache(path: Path) -> dict:
+    """The cache is best-effort: missing, corrupt, or unreadable means empty."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {"passed": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("passed"), dict):
+        return {"passed": {}}
+    return data
 
 
 def _run_pending_proofs(
