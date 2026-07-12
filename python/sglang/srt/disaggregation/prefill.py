@@ -78,7 +78,8 @@ logger = logging.getLogger(__name__)
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
-    if retry_prob <= 0 or req.time_stats.prefill_retry_count > 0 or req.is_retracted:
+    # Force only before/during the first attempt (count is 1 while it runs).
+    if retry_prob <= 0 or req.prefill_attempt_count > 1 or req.is_retracted:
         return False
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
@@ -374,12 +375,13 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.time_stats.prefill_retry_count
-                    < self.scheduler.server_args.optimistic_prefill_retries
+                    req.prefill_attempt_count
+                    < self.scheduler.server_args.optimistic_prefill_attempts
                     and not req.is_retracted  # engine paused
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
+                    req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
@@ -387,6 +389,7 @@ class PrefillBootstrapQueue:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
+                    req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
@@ -1163,7 +1166,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
-        max_retries = self.server_args.optimistic_prefill_retries
+        max_attempts = self.server_args.optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
@@ -1173,19 +1176,19 @@ class SchedulerDisaggregationPrefillMixin:
         req.hidden_states_tensor = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
-        if req.time_stats.prefill_retry_count >= max_retries:
+        if req.prefill_attempt_count >= max_attempts:
             logger.info(
-                f"Req {req.rid} exhausted optimistic prefill retries "
+                f"Req {req.rid} exhausted optimistic prefill attempts "
                 "falling back to bootstrap queue"
             )
             # Reset it so the next real bootstrap done can be recorded.
             req.time_stats.bootstrap_done_time = 0.0
             self.disagg_prefill_bootstrap_queue.queue.append(req)
         else:
-            req.time_stats.prefill_retry_count += 1
+            req.prefill_attempt_count += 1
             logger.info(
-                f"Req {req.rid} optimistic prefill retry "
-                f"{req.time_stats.prefill_retry_count}/{max_retries}"
+                f"Req {req.rid} optimistic prefill attempt "
+                f"{req.prefill_attempt_count}/{max_attempts}"
             )
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)

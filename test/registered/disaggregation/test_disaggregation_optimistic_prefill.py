@@ -29,7 +29,7 @@ def rid_that_forces_retry(prefix: str) -> str:
         req = SimpleNamespace(
             rid=rid,
             is_retracted=False,
-            time_stats=SimpleNamespace(prefill_retry_count=0),
+            prefill_attempt_count=0,
         )
         if should_force_retry(req):
             return rid
@@ -72,7 +72,7 @@ class TestOptimisticPrefill(
         envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(FORCE_RETRY_PROB)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.extra_prefill_args = [
-            "--optimistic-prefill-retries",
+            "--optimistic-prefill-attempts",
             "3",
             "--chunked-prefill-size",
             "128",
@@ -154,7 +154,7 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.extra_prefill_args = [
-            "--optimistic-prefill-retries",
+            "--optimistic-prefill-attempts",
             "3",
             "--chunked-prefill-size",
             "128",
