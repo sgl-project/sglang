@@ -199,7 +199,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_mlp_tp_gather = require_mlp_tp_gather(
+            model_runner.server_args
+        ) and not self._forward_is_dp_local(model_runner)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.enable_two_batch_overlap = (
@@ -442,6 +444,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
+    @staticmethod
+    def _forward_is_dp_local(model_runner) -> bool:
+        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
+        DP rank drafts independently with no cross-DP collective, so its
+        hand-built batches carry no dp-global metadata and must key graphs by
+        local batch size. Everything else keeps the dp-global padding path."""
+        if not model_runner.is_draft_worker:
+            return False
+        if not model_runner.spec_algorithm.is_dspark():
+            return False
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            draft_is_deepseek_v4,
+        )
+
+        return not draft_is_deepseek_v4(server_args=model_runner.server_args)
+
     def _ragged_verify_layout(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         if spec_info is None:
@@ -489,10 +507,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
             return False
 
-        if (
-            self.require_mlp_tp_gather
-            and forward_batch.global_num_tokens_cpu is not None
-        ):
+        if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -1091,10 +1106,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = graph_size_key
         else:
             raw_num_token = raw_bs * self.num_tokens_per_bs
-            if (
-                self.require_mlp_tp_gather
-                and forward_batch.global_num_tokens_cpu is not None
-            ):
+            if self.require_mlp_tp_gather:
                 max_num_tokens = max(forward_batch.global_num_tokens_cpu)
                 max_batch_size = (
                     max_num_tokens / self.num_tokens_per_bs
