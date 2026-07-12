@@ -3,8 +3,10 @@
 Drop-in replacement for the 2-stage split-K Triton topk
 (``_topk_index_partial_kernel`` + ``_topk_index_merge_kernel``): given the
 decode score tensor ``[num_heads, batch, max_seqblock]`` it produces
-``topk_idx`` ``[num_heads, batch, topk]`` (0-indexed block ids, front-packed,
-``-1`` padded), matching the consumer ``_gqa_share_sparse_decode_kernel``.
+``topk_idx`` ``[num_heads, batch, topk]`` (0-indexed block ids, sorted
+ascending, ``-1`` padded at the tail). Ascending order is required by the MSA
+fmha_sm100 consumer; the Triton ``_gqa_share_sparse_decode_kernel`` is
+order-insensitive.
 
 ``minimax_decode_topk_page_table`` additionally fuses the page-table transform
 for the dense paged backend (trtllm_mha / fa3) and returns the page table plus
