@@ -1674,18 +1674,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     except StopAsyncIteration:
                         pass
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        if not abort_all and self.server_args.tokenizer_worker_num == 1:
+            if prefix:
+                if not any(r.startswith(rid) for r in self.rid_to_state):
+                    return
+            elif rid not in self.rid_to_state:
+                return
+        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
