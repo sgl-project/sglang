@@ -232,3 +232,32 @@ def test_move_symbol_leave_delegate_on_self_annotated_staticmethod(
         "    def work(self, n: int) -> int:\n"
         "        return n + self.base\n"
     )
+
+
+def test_move_symbol_leave_delegate_keeps_unrelated_self_annotation(
+    tmp_path: Path,
+) -> None:
+    """A self annotation naming a class other than the destination survives in the stub."""
+    (tmp_path / "src.py").write_text(
+        "class Mixin:\n"
+        "    def work(self: Runner, n: int) -> int:\n"
+        "        return n + self.base\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class Comp:\n    def existing(self):\n        return 0\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "work",
+        src="src.py",
+        dst="dst.py",
+        into_class="Comp",
+        from_class="Mixin",
+        drop_self_annotation=True,
+        leave_delegate="comp",
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "src.py").read_text() == (
+        "class Mixin:\n"
+        "    def work(self: Runner, n: int) -> int:\n"
+        "        return self.comp.work(n)\n"
+    )

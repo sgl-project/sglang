@@ -1001,7 +1001,18 @@ class Repro:
                 )
                 sig_start = node.lineno - 1 if has_move_decorator else start - 1
                 signature_text = "".join(src_lines[sig_start:header_end])
-                if self_annotated:
+                # The stub drops the self annotation only when it names the class the
+                # def moved into (now redundant); an unrelated annotation (a mixin's
+                # `self: ModelRunner`) is part of the surviving header and stays.
+                ann = arg_list[0].annotation if self_annotated else None
+                ann_name = None
+                if isinstance(ann, ast.Name):
+                    ann_name = ann.id
+                elif isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+                    ann_name = ann.value.split(".")[-1]
+                elif isinstance(ann, ast.Attribute):
+                    ann_name = ann.attr
+                if self_annotated and ann_name == into_class:
                     sig_indent = len(signature_text) - len(signature_text.lstrip(" "))
                     parsable = signature_text + " " * sig_indent + "    pass" + src_nl
                     stripped = _drop_self_annotation(parsable, name)
