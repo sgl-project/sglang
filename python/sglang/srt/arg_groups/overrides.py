@@ -1683,9 +1683,12 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         or view.decode_attention_backend == "trtllm_mha"
         or view.prefill_attention_backend == "trtllm_mha"
     ):
-        if page_size not in [16, 32, 64]:
+        # 128 runs on trtllm-gen's dynamic tokens-per-page kernels (flashinfer
+        # >= 0.6.12), which require GQA and equal QK/V head dims — validated at
+        # TRTLLMHAAttnBackend init where the model config is known.
+        if page_size not in [16, 32, 64, 128]:
             logger.warning(
-                f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
+                f"TensorRT-LLM MHA only supports page_size of 16, 32, 64 or 128, changing page_size from {page_size} to 64."
             )
             page_size = 64
     if page_size != view.page_size:

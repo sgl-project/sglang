@@ -1626,6 +1626,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {"page_size": 64},
         )
+        # trtllm_mha accepts 128 (trtllm-gen dynamic tokens-per-page kernels)
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mha", page_size=128)
+            ),
+            {},
+        )
+        # trtllm_mha with an unsupported page still snaps to 64
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mha", page_size=256)
+            ),
+            {"page_size": 64},
+        )
+        # chained: cutlass_mla decode -> 128, then trtllm_mha prefill keeps 128
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(
+                    decode_attention_backend="cutlass_mla",
+                    prefill_attention_backend="trtllm_mha",
+                )
+            ),
+            {"page_size": 128},
+        )
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
 
