@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -24,10 +25,18 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
-# Measured 0.925 (dp) / 0.93 (non-dp) on Qwen3-30B-A3B.
+# Measured 0.925 (dp) / 0.930 (non-dp) on Qwen3-30B-A3B.
 GSM8K_ACCURACY_FLOOR = 0.90
-# Measured 3.95 on GSM8K; margin for fa3/triton drift.
+# Measured 3.95 on GSM8K (triton); margin for fa3 backend drift.
 SPEC_ACCEPT_LENGTH_FLOOR = 3.5
+
+
+def _select_attention_backend() -> str:
+    """Pick a backend the local GPU supports so the test runs both in CI and locally."""
+    if is_in_amd_ci():
+        return "triton"
+    major = torch.cuda.get_device_capability()[0]
+    return "fa3" if major in (8, 9) else "triton"
 
 
 class TestStandaloneSpecDPAttention(CustomTestCase):
@@ -53,7 +62,7 @@ class TestStandaloneSpecDPAttention(CustomTestCase):
             "4",
             "--enable-dp-attention",
             "--attention-backend",
-            "triton" if is_in_amd_ci() else "fa3",
+            _select_attention_backend(),
             "--mem-fraction-static",
             "0.75",
             "--cuda-graph-max-bs-decode",
@@ -98,16 +107,10 @@ class TestStandaloneSpecDPAttention(CustomTestCase):
                 f'{metrics["score"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["score"], GSM8K_ACCURACY_FLOOR)
-            self.assertGreater(avg_spec_accept_length, SPEC_ACCEPT_LENGTH_FLOOR)
+        self.assertGreater(metrics["score"], GSM8K_ACCURACY_FLOOR)
+        self.assertGreater(avg_spec_accept_length, SPEC_ACCEPT_LENGTH_FLOOR)
 
     def test_b_bs1_no_hang(self):
-        """Single-request decode is the idle-rank scenario the capture-mode fix
-        repairs: with dp attention the other DP ranks go idle, and before the
-        fix they fell to eager while the active rank replayed the cuda graph,
-        mismatching the MoE all-gather and hanging NCCL. If that regresses this
-        test hangs and times out.
-        """
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=256)
         acc_length, speed = send_one_prompt(args)
         print(f"{acc_length=:.2f} {speed=:.2f} token/s")
@@ -118,8 +121,8 @@ class TestStandaloneSpecDPAttention(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            # Speed is printed for visibility, not asserted (hardware-dependent).
-            self.assertGreater(acc_length, 1.0)
+        # Speed is printed for visibility, not asserted (hardware-dependent).
+        self.assertGreater(acc_length, 1.0)
 
 
 if __name__ == "__main__":
