@@ -248,12 +248,14 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
+        speculative_algorithm: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -529,6 +531,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
+            speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
 
@@ -548,8 +551,20 @@ class ModelConfig:
             is_draft_model
             and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
         ):
-            if getattr(self.hf_config, "dspark_block_size", None) is not None:
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+
+            # A dspark-bundled checkpoint may also carry MTP layers; the
+            # selected algorithm decides which draft arch to load.
+            if checkpoint_bundles_dspark_draft(self.hf_config) and (
+                self.speculative_algorithm in (None, "DSPARK")
+            ):
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+                logger.info(
+                    "Draft checkpoint bundles a DSpark head; loading draft arch "
+                    "DeepseekV4ForCausalLMDSpark."
+                )
             else:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1

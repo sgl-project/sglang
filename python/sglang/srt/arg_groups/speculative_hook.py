@@ -266,16 +266,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
 
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
-    hf_config = server_args.get_model_config().hf_config
-    return any(
-        getattr(hf_config, key, None) is not None
-        for key in (
-            "dspark_block_size",
-            "dspark_markov_rank",
-            "dspark_noise_token_id",
-            "dspark_target_layer_ids",
-        )
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        checkpoint_bundles_dspark_draft,
     )
+
+    return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:

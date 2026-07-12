@@ -140,6 +140,21 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
     )
 
 
+def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
+    """The checkpoint carries a bundled DSpark draft head, marked by the
+    prefixed dspark_* keys on the target hf config. Single source of truth
+    for the bundling convention (draft-path defaulting, draft-arch remap)."""
+    return any(
+        _cfg_get(hf_config, key, None) is not None
+        for key in (
+            "dspark_block_size",
+            "dspark_markov_rank",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+        )
+    )
+
+
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)
