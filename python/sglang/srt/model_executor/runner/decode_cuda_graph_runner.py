@@ -116,7 +116,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def ragged_verify_full_mode_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
+def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
     from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
@@ -270,7 +270,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         self.ragged_verify_mode = (
-            ragged_verify_full_mode_enabled(self.model_runner.spec_algorithm)
+            ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
