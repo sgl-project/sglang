@@ -520,6 +520,7 @@ class Envs:
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
@@ -598,6 +599,11 @@ class Envs:
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
+    # Chunk size for the rebalance expert-weight P2P exchange; set
+    # >= num_physical_experts to submit a single batch_isend_irecv.
+    SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
+        32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
+    )
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -648,6 +654,8 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -656,6 +664,11 @@ class Envs:
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
 
     # Kernels
+    # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
+    # value, e.g. "torch" / "torch_compile" / "triton" / "cuda_aot"); unset =
+    # auto-select by priority. "torch" flips all fused ops to their pure-torch
+    # reference implementations for numerical-bug bisection.
+    SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
@@ -683,6 +696,7 @@ class Envs:
 
     # RoPE cache configuration
     SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
 
@@ -695,6 +709,11 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
+    # eager. Escape hatch for setups where the capture's memory pool costs more
+    # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
+    # capacity).
+    SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
@@ -898,6 +917,14 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+
+    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
+    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
+    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
+    SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+    SGLANG_DISABLE_MSA = EnvBool(False)
+    SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
