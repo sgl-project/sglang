@@ -160,6 +160,23 @@ def flatten_status(payload: Any) -> List[JsonDict]:
     return []
 
 
+def flatten_session_status(payload: Any) -> List[JsonDict]:
+    sessions = []
+    for row in flatten_status(payload):
+        pending = [row.get("status", row)]
+        while pending:
+            session = pending.pop(0)
+            if not isinstance(session, dict):
+                continue
+            sessions.append(session)
+            pending.extend(
+                item
+                for item in (session.get("session_archive") or [])
+                if isinstance(item, dict)
+            )
+    return sessions
+
+
 def atomic_write_json(path: Path, payload: JsonDict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -188,8 +205,8 @@ EXPECTED_STITCH_MODE = {
 def validate_target_measurement(
     source_payload: Any, target_payload: Any, rid: str, mode: str
 ) -> JsonDict:
-    source_rows = [row.get("status", row) for row in flatten_status(source_payload)]
-    target_rows = [row.get("status", row) for row in flatten_status(target_payload)]
+    source_rows = flatten_session_status(source_payload)
+    target_rows = flatten_session_status(target_payload)
     source_sessions = {
         row.get("session_id") for row in source_rows if row.get("session_id")
     }
@@ -204,20 +221,43 @@ def validate_target_measurement(
         if row.get("session_id") not in shared_sessions:
             continue
         for measurement in row.get("request_measurements", []):
-            if measurement.get("rid") == rid:
-                matches.append(measurement)
-    if len(matches) != 1:
+            if measurement.get("rid") == rid and measurement.get("final_owner") == "target":
+                proof = dict(measurement)
+                proof["session_id"] = row.get("session_id")
+                matches.append(proof)
+    if not matches:
         raise RuntimeError("expected exactly one target measurement for rid %s" % rid)
-    measurement = matches[0]
+    proof_fields = (
+        "session_id",
+        "rid",
+        "p_tokens",
+        "h_tokens",
+        "c0_tokens",
+        "c1_tokens",
+        "stitch_mode",
+        "mooncake_bytes",
+        "mooncake_bytes_available",
+        "source_bytes",
+        "delta_bytes",
+        "source_queue",
+        "final_owner",
+        "output_boundary",
+        "rollback_reason",
+    )
+    signatures = {
+        tuple(measurement.get(field) for field in proof_fields)
+        for measurement in matches
+    }
+    if len(signatures) != 1:
+        raise RuntimeError("conflicting target proofs for rid %s" % rid)
+    measurement = matches[-1]
     if measurement.get("stitch_mode") != EXPECTED_STITCH_MODE[mode]:
         raise RuntimeError("target stitch_mode does not match requested trial")
     if measurement.get("final_owner") != "target":
         raise RuntimeError("target did not become final owner")
     if measurement.get("output_boundary") is None:
         raise RuntimeError("target measurement is missing output_boundary")
-    proof = dict(measurement)
-    proof["session_id"] = next(iter(shared_sessions))
-    return proof
+    return measurement
 
 
 def run(args: argparse.Namespace) -> int:

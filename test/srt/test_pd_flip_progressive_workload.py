@@ -5,6 +5,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -278,6 +279,117 @@ def test_router_restore_preserves_original_exception(monkeypatch):
     assert "restore failed" in " ".join(original.__notes__)
 
 
+def exercise_run_case_cleanup(monkeypatch, tmp_path, body_error=None, restore_error=None):
+    module = load_matrix_module()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("SGLANG_REPO", str(repo))
+    monkeypatch.setenv("ADMIN_API_KEY", "secret")
+    args = SimpleNamespace(
+        output_root=str(repo / "artifacts"),
+        reset_store_cmd="reset",
+        store_ready_url="http://store/ready",
+        timeout_seconds=1,
+        poll_interval_seconds=0,
+        measure_command="measure",
+        base_url="http://router",
+        source_url="http://node2",
+        target_url="http://node3",
+        other_decode_url="http://node1",
+        admin_api_key_env="ADMIN_API_KEY",
+        router_admin_api_key_env="ROUTER_KEY",
+        model="model",
+        router_url="http://router",
+        controller_command="controller",
+        summarize_command="summarize",
+        _seen_store_tokens=set(),
+        _seen_store_generations=set(),
+    )
+    proof = {"pid": "1", "starttime": "2", "generation": "g"}
+
+    def run_shell(_command, *, env, log_path=None):
+        if _command == "reset":
+            Path(env["STORE_GENERATION_FILE"]).write_text(
+                json.dumps(dict(proof, token=env["STORE_GENERATION_TOKEN"])),
+                encoding="utf-8",
+            )
+            Path(env["MIGRATION_EVENTS"]).write_text("{}\n", encoding="utf-8")
+        return 0
+
+    class Process:
+        def __init__(self, return_code=None):
+            self.returncode = return_code
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    processes = iter((Process(), Process(), Process()))
+    monkeypatch.setattr(module, "run_shell", run_shell)
+    monkeypatch.setattr(module.time, "time", lambda: 0)
+    monkeypatch.setattr(module, "wait_for_store", lambda *_: proof)
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_a, **_k: next(processes))
+    monkeypatch.setattr(module, "prepare_router_placement", lambda *_: {"workers": []})
+    monkeypatch.setattr(module, "release_targets", lambda *_: None)
+    monkeypatch.setattr(module, "wait_for_target_active", lambda *_: {})
+    monkeypatch.setattr(module, "wait_for_process", lambda *_: 0)
+    monkeypatch.setattr(module, "validate_pressure_timeline", lambda *_: None)
+    monkeypatch.setattr(module, "validate_measurement_exit", lambda *_: None)
+
+    calls = {"wait": 0}
+
+    def wait_for_path(path, *_args, **_kwargs):
+        calls["wait"] += 1
+        if body_error is not None and calls["wait"] == 1:
+            raise body_error
+        path = Path(path)
+        if "pressure.started" in path.name:
+            path.write_text('{"pressure_start":1}', encoding="utf-8")
+        elif "pressure.ended" in path.name:
+            path.write_text('{"pressure_end":4}', encoding="utf-8")
+        else:
+            path.touch()
+
+    monkeypatch.setattr(module, "wait_for_path", wait_for_path)
+
+    def restore(_placement):
+        if restore_error is not None:
+            raise restore_error
+
+    monkeypatch.setattr(module, "restore_router_placement", restore)
+    return module.run_case(args, "full", "commit")
+
+
+def test_run_case_successful_cleanup_has_no_name_error(monkeypatch, tmp_path):
+    exercise_run_case_cleanup(monkeypatch, tmp_path)
+
+
+def test_run_case_preserves_body_error_and_attaches_restore(monkeypatch, tmp_path):
+    body_error = ValueError("body failed")
+    with pytest.raises(ValueError, match="body failed") as caught:
+        exercise_run_case_cleanup(
+            monkeypatch, tmp_path, body_error, RuntimeError("restore failed")
+        )
+    assert "restore failed" in " ".join(caught.value.__notes__)
+
+
+def test_run_case_success_raises_restore_aggregate(monkeypatch, tmp_path):
+    with pytest.raises(RuntimeError, match="restore failed"):
+        exercise_run_case_cleanup(
+            monkeypatch, tmp_path, restore_error=RuntimeError("restore failed")
+        )
+
+
 def test_host_container_case_mapping_and_fake_docker_journal(tmp_path):
     module = load_matrix_module()
     repo = tmp_path / "repo"
@@ -427,9 +539,15 @@ def test_measurement_flattens_archived_session_proofs():
                     "request_measurements": [],
                     "session_archive": [
                         {
-                            "session_id": "s1",
-                            "request_measurements": [
-                                {"rid": "r1", "final_owner": "target"}
+                            "session_id": "s2-old",
+                            "request_measurements": [],
+                            "session_archive": [
+                                {
+                                    "session_id": "s1",
+                                    "request_measurements": [
+                                        {"rid": "r1", "final_owner": "target"}
+                                    ],
+                                }
                             ],
                         }
                     ],
@@ -438,6 +556,50 @@ def test_measurement_flattens_archived_session_proofs():
         ]
     )
     assert [(row["session_id"], row["rid"]) for row in rows] == [("s1", "r1")]
+
+
+def test_workload_validates_rollover_proofs_from_archive_and_current():
+    module = load_module()
+    first = {
+        "rid": "r1",
+        "stitch_mode": "partial_prefix_stitch",
+        "final_owner": "target",
+        "output_boundary": 7,
+    }
+    second = {
+        "rid": "r2",
+        "stitch_mode": "full_prefix_stitch",
+        "final_owner": "target",
+        "output_boundary": 9,
+    }
+    source = {
+        "session_id": "s2",
+        "request_measurements": [],
+        "session_archive": [{"session_id": "s1", "request_measurements": []}],
+    }
+    target = {
+        "session_id": "s2",
+        "request_measurements": [second],
+        "session_archive": [{"session_id": "s1", "request_measurements": [first]}],
+    }
+    assert module.validate_target_measurement(source, target, "r1", "partial")[
+        "session_id"
+    ] == "s1"
+    assert module.validate_target_measurement(source, target, "r2", "full")[
+        "session_id"
+    ] == "s2"
+    duplicate_target = [target, json.loads(json.dumps(target))]
+    assert module.validate_target_measurement(
+        [source, json.loads(json.dumps(source))], duplicate_target, "r1", "partial"
+    )["output_boundary"] == 7
+    conflicting = json.loads(json.dumps(target))
+    conflicting["session_archive"][0]["request_measurements"][0][
+        "output_boundary"
+    ] = 8
+    with pytest.raises(RuntimeError, match="conflicting target proofs"):
+        module.validate_target_measurement(
+            [source, source], [target, conflicting], "r1", "partial"
+        )
 
 
 def test_workload_proves_rid_migration_and_control_output(tmp_path, monkeypatch):

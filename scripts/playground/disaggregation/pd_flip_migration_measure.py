@@ -574,8 +574,14 @@ def flatten_migration_request_samples(events: Sequence[JsonDict]) -> List[JsonDi
         if event.get("event_type") != "migration_status":
             continue
         status = event.get("status") or {}
-        sessions = [status, *(status.get("session_archive") or [])]
-        for session in sessions:
+        sessions = [status]
+        while sessions:
+            session = sessions.pop(0)
+            sessions.extend(
+                archived
+                for archived in (session.get("session_archive") or [])
+                if isinstance(archived, dict)
+            )
             for measurement in session.get("request_measurements") or []:
                 row = {
                     "ts_wall": event.get("ts_wall"),

@@ -175,7 +175,6 @@ def run_shell(command, *, env, log_path=None):
             check=False,
         ).returncode
     finally:
-        original_error = sys.exc_info()[1]
         if output:
             output.close()
 
@@ -406,6 +405,7 @@ def run_case(args, mode, decision_path):
     measurement_rc = None
     measurement_sent_sigterm = False
     timeline = {}
+    original_error: BaseException | None = None
     try:
         placement = prepare_router_placement(
             args.router_url,
@@ -490,6 +490,9 @@ def run_case(args, mode, decision_path):
             timeline.update(json.loads(pressure_ended.read_text(encoding="utf-8")))
         validate_pressure_timeline(timeline, decision_path)
         workload_rc = workload.wait(timeout=args.timeout_seconds)
+    except BaseException as exc:
+        original_error = exc
+        raise
     finally:
         done.touch()
         pressure_stop.touch()
