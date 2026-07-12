@@ -464,9 +464,7 @@ def _next_sibling_assign_or_def(dst_tree: ast.AST, name: str) -> str | None:
             return node.target.id
         return None
 
-    named = [
-        (stmt_name(n), n) for n in getattr(dst_tree, "body", []) if stmt_name(n)
-    ]
+    named = [(stmt_name(n), n) for n in getattr(dst_tree, "body", []) if stmt_name(n)]
     for i, (nm, _) in enumerate(named):
         if nm == name:
             return named[i + 1][0] if i + 1 < len(named) else None

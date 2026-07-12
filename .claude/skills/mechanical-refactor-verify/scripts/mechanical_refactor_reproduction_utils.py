@@ -913,10 +913,13 @@ class Repro:
                         else None
                     )
                     if cand_name == before:
-                        at = min(
-                            [d.lineno for d in getattr(cand, "decorator_list", [])],
-                            default=cand.lineno,
-                        ) - 1
+                        at = (
+                            min(
+                                [d.lineno for d in getattr(cand, "decorator_list", [])],
+                                default=cand.lineno,
+                            )
+                            - 1
+                        )
                         break
                 assert at is not None, f"before={before!r} not found in {dst}"
                 dst_lines[at:at] = [block, dst_nl]
@@ -1003,7 +1006,9 @@ class Repro:
                     parsable = signature_text + " " * sig_indent + "    pass" + src_nl
                     stripped = _drop_self_annotation(parsable, name)
                     assert stripped.endswith(" " * sig_indent + "    pass" + src_nl)
-                    signature_text = stripped[: -len(" " * sig_indent + "    pass" + src_nl)]
+                    signature_text = stripped[
+                        : -len(" " * sig_indent + "    pass" + src_nl)
+                    ]
                 body_indent = " " * node.body[0].col_offset
                 returning = (
                     "return await"
