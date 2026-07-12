@@ -457,7 +457,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     elif backend.is_triton():
         return triton_mxfp8_blockscaled_linear
     elif _is_hip and _is_gfx95_supported:
-        from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
@@ -473,7 +473,7 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     weight_scale_fallback: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
         w8a8_mxfp8_matmul_deepgemm,
     )
