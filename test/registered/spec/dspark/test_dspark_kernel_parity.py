@@ -580,5 +580,35 @@ class TestConfidenceMetricsDeviceParity(CustomTestCase):
                 self.assertAlmostEqual(cpu_row[key], gpu_row[key], places=9, msg=key)
 
 
+class TestRaggedVerifyGraphCapability(CustomTestCase):
+    # Lives in the GPU suite: importing the backend modules pulls GPU-only
+    # wheels (sgl_kernel), which fail to import on the CPU runners.
+
+    def test_base_backend_defaults_false(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+        self.assertFalse(AttentionBackend.supports_ragged_verify_graph)
+
+    def test_ragged_implementing_backends_declare_the_flag(self):
+        """Every backend with a ragged-verify metadata path must opt in; a
+        dropped flag silently disables ragged graphs for that backend (the
+        runner falls back to eager with no other test going red)."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        for backend in (
+            TRTLLMHAAttnBackend,
+            DeepseekV4AttnBackend,
+            FlashAttentionBackend,
+        ):
+            with self.subTest(backend=backend.__name__):
+                self.assertTrue(backend.supports_ragged_verify_graph)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,8 +3,6 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
@@ -18,29 +16,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
 
-
-class TestRaggedVerifyGraphCapability(CustomTestCase):
-    def test_base_backend_defaults_false(self):
-        self.assertFalse(AttentionBackend.supports_ragged_verify_graph)
-
-    def test_ragged_implementing_backends_declare_the_flag(self):
-        """Every backend with a ragged-verify metadata path must opt in; a
-        dropped flag silently disables ragged graphs for that backend (the
-        runner falls back to eager with no other test going red)."""
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-        )
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
-
-        for backend in (
-            TRTLLMHAAttnBackend,
-            DeepseekV4AttnBackend,
-            FlashAttentionBackend,
-        ):
-            with self.subTest(backend=backend.__name__):
-                self.assertTrue(backend.supports_ragged_verify_graph)
+# The backend capability checks (supports_ragged_verify_graph) live in
+# test_dspark_kernel_parity.py: importing the backend modules pulls GPU-only
+# wheels, which fail to import on the CPU runners.
 
 
 class TestResolveRaggedVerifyLayout(CustomTestCase):
