@@ -548,6 +548,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     "return_prompt_token_ids is not supported with streaming. "
                     "Please set stream=false when using return_prompt_token_ids=true."
                 )
+            if request.return_token_ids:
+                raise ValueError(
+                    "return_token_ids is not supported with streaming on "
+                    "/v1/chat/completions. Please set stream=false when using "
+                    "return_token_ids=true."
+                )
             if request.return_meta_info:
                 raise ValueError(
                     "return_meta_info is not supported with streaming. "
@@ -624,7 +630,8 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
-            return_prompt_token_ids=request.return_prompt_token_ids,
+            return_prompt_token_ids=request.return_prompt_token_ids
+            or request.return_token_ids,
         )
 
         return adapted_request, request
@@ -1366,8 +1373,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
                 ret_item.get("prompt_token_ids")
-                if request.return_prompt_token_ids
+                if request.return_prompt_token_ids or request.return_token_ids
                 else None
+            )
+            choice_token_ids = (
+                ret_item["output_ids"] if request.return_token_ids else None
             )
 
             choice_meta_info = (
@@ -1395,6 +1405,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
+                token_ids=choice_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)

@@ -124,6 +124,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
@@ -224,6 +225,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_offsets = {}
         n_prev_tokens = {}
+        n_prev_token_ids = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -313,6 +315,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
+                chunk_token_ids = None
+                chunk_prompt_token_ids = None
+                if request.return_token_ids:
+                    # Chunks carry cumulative ids unless incremental streaming.
+                    output_ids = content["output_ids"]
+                    if (
+                        not self.tokenizer_manager.server_args.incremental_streaming_output
+                    ):
+                        n_prev_token_id = n_prev_token_ids.get(index, 0)
+                        chunk_token_ids = output_ids[n_prev_token_id:]
+                        n_prev_token_ids[index] = len(output_ids)
+                    else:
+                        chunk_token_ids = output_ids
+                    if is_first_chunk:
+                        chunk_prompt_token_ids = content.get("prompt_token_ids")
+
                 # Generate delta
                 delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
@@ -347,6 +365,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
+                    token_ids=chunk_token_ids,
+                    prompt_token_ids=chunk_prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -547,6 +567,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                token_ids=(
+                    ret_item["output_ids"] if request.return_token_ids else None
+                ),
+                prompt_token_ids=(
+                    ret_item.get("prompt_token_ids")
+                    if request.return_token_ids
+                    else None
+                ),
             )
             choices.append(choice_data)
 

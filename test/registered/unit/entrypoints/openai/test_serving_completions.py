@@ -258,6 +258,87 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_token_ids_deltas_cover_output_exactly(self):
+        """Streaming chunks carry cumulative output_ids by default and disjoint
+        deltas with incremental_streaming_output; either way the emitted
+        token_ids must concatenate to the full output and prompt_token_ids
+        must appear only on the first chunk."""
+
+        def _make_chunk(text, output_ids, finished):
+            return {
+                "text": text,
+                "output_ids": output_ids,
+                "prompt_token_ids": [1, 2],
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 2,
+                    "completion_tokens": len(output_ids),
+                    "finish_reason": {"type": "stop"} if finished else None,
+                },
+                "index": 0,
+            }
+
+        cases = {
+            False: [  # cumulative chunks
+                _make_chunk("a", [5], False),
+                _make_chunk("ab", [5, 6], False),
+                _make_chunk("abc", [5, 6, 7], True),
+            ],
+            True: [  # incremental (delta) chunks
+                _make_chunk("a", [5], False),
+                _make_chunk("b", [6], False),
+                _make_chunk("c", [7], True),
+            ],
+        }
+
+        for incremental, chunks in cases.items():
+            with self.subTest(incremental_streaming_output=incremental):
+                self.sc.tokenizer_manager.server_args.incremental_streaming_output = (
+                    incremental
+                )
+                self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
+                    False
+                )
+
+                async def _mock_generate(*args, _chunks=chunks, **kwargs):
+                    for chunk in _chunks:
+                        yield chunk
+
+                self.sc.tokenizer_manager.generate_request = _mock_generate
+
+                req = CompletionRequest(
+                    model="x",
+                    prompt="Hi",
+                    max_tokens=10,
+                    stream=True,
+                    return_token_ids=True,
+                )
+                adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                loop = get_or_create_event_loop()
+                raw_chunks = loop.run_until_complete(run_stream())
+
+                choices = []
+                for raw in raw_chunks:
+                    if not raw.startswith("data: ") or raw.strip() == "data: [DONE]":
+                        continue
+                    data = json.loads(raw[len("data: ") :])
+                    choices.extend(data.get("choices", []))
+
+                token_ids = [tid for c in choices for tid in c.get("token_ids", [])]
+                self.assertEqual(token_ids, [5, 6, 7])
+                self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
+                for choice in choices[1:]:
+                    self.assertNotIn("prompt_token_ids", choice)
+
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""
 
