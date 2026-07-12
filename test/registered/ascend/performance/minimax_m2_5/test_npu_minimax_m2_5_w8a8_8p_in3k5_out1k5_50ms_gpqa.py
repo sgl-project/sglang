@@ -55,7 +55,7 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     500,
     "--enable-prefill-delayer",
     "--chunked-prefill-size",
-    -1,
+    196608,
     "--max-prefill-token",
     8192,
     "--cuda-graph-bs",
@@ -109,6 +109,7 @@ class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_HighThroughput(
     input_len = 3500
     output_len = 1500
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 5717.58
 

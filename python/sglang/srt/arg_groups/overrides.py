@@ -1928,13 +1928,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "flashinfer_trtllm_routed."
             )
     if view.quantization == "mxfp8":
+        from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
+
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
-        allowed = [
-            "cutlass",
-            "deep_gemm",
-            "flashinfer_trtllm",
-            "flashinfer_trtllm_routed",
-        ]
+        allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
         mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
