@@ -95,6 +95,6 @@
 - [ ] New/changed primitive has: byte-exact test + ≥1 adversarial (regeneration-would-differ)
       case + the raise-path tests.
 - [ ] Generator change has a `PASS` test **and** a `RESIDUAL`/`UNSUPPORTED` test.
-- [ ] `SKILL.md` §4 file map and the relevant `guide-*.md` updated for any new file or
+- [ ] `SKILL.md` §3 file map and the relevant `guide-*.md` updated for any new file or
       workflow change.
 - [ ] `mechanical_refactor_reproduction_utils.py` still imports only git + stdlib.

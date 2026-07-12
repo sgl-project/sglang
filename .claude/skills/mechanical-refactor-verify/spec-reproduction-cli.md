@@ -32,9 +32,9 @@
 - The rest of the message format is unconstrained **by the machine rule**: the word may
   appear anywhere in the subject or body, in any surrounding syntax. The authoring
   contract additionally fixes the subject format
-  (`<group-id>(<commit-id>,<kind>): <message>`, SKILL.md §3), which satisfies this rule
-  by construction; the verifier deliberately checks only the word, so a chain from a
-  different convention still verifies.
+  (`<group-id>(<commit-id>,<kind>): <message>`, `guide-split.md` §5), which satisfies
+  this rule by construction; the verifier deliberately checks only the word, so a chain
+  from a different convention still verifies.
 - A word counts only standalone: delimited by a non-`[0-9A-Za-z_]` character or the
   message boundary, lowercase, so `non_mechanical_provable` never also counts as the bare
   word, and `xmechanical_provable` counts as neither.
