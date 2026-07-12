@@ -200,7 +200,9 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
+    def validate_new_adapter(
+        self, lora_config: LoRAConfig, lora_ref: LoRARef, is_update: bool = False
+    ):
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
@@ -214,18 +216,19 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
-        # Check if this LoRA adapter is already loaded
-        for existing_lora_ref in self.lora_refs.values():
-            if lora_ref.lora_name == existing_lora_ref.lora_name:
-                raise ValueError(
-                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-                )
+        # Reject duplicates unless refreshing an existing adapter in place.
+        if not is_update:
+            for existing_lora_ref in self.lora_refs.values():
+                if lora_ref.lora_name == existing_lora_ref.lora_name:
+                    raise ValueError(
+                        f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                    )
 
-            if lora_ref.lora_path == existing_lora_ref.lora_path:
-                logger.warning(
-                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
-                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
-                )
+                if lora_ref.lora_path == existing_lora_ref.lora_path:
+                    logger.warning(
+                        f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                        f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                    )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
@@ -756,16 +759,22 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        upsert: bool = False,
     ) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from tensors and config dict.
+
+        With ``upsert``, an already-loaded adapter has its weights refreshed in
+        place (reusing its lora_id); otherwise the adapter must not be loaded yet.
         """
         assert (
             lora_ref.lora_name is not None and lora_ref.lora_path is not None
         ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        is_update = upsert and (lora_ref.lora_id in self.loras)
+        if not is_update:
+            assert (
+                lora_ref.lora_id not in self.loras
+            ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
             new_adapter = LoRAConfig.from_dict(
@@ -773,13 +782,26 @@ class LoRAManager:
                 added_tokens_config,
                 base_vocab_size=self.base_hf_config.vocab_size,
             )
-            self.validate_new_adapter(new_adapter, lora_ref)
+            self.validate_new_adapter(new_adapter, lora_ref, is_update=is_update)
             self.configs[lora_ref.lora_id] = new_adapter
 
             self.load_lora_weights_from_tensors(lora_ref, tensors)
 
+            if is_update and getattr(self, "memory_pool", None) is not None:
+                uid = lora_ref.lora_id
+                if uid in self.memory_pool.uid_to_buffer_id:
+                    self.memory_pool.load_lora_weight_to_buffer(
+                        uid,
+                        self.memory_pool.uid_to_buffer_id[uid],
+                        self.loras[uid],
+                        self.lora_modules,
+                        self.embed_tokens_module,
+                        self.lm_head_module,
+                    )
+
             self.lora_refs[lora_ref.lora_id] = lora_ref
-            self.num_pinned_loras += int(lora_ref.pinned)
+            if not is_update:
+                self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
