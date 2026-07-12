@@ -1722,8 +1722,12 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        self.active_pd_event_loop_role = "decode"
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
+                self.active_pd_event_loop_role = None
+                return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1750,10 +1754,18 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        self.active_pd_event_loop_role = "decode"
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
+                if self.result_queue:
+                    raise RuntimeError(
+                        "Cannot leave the decode overlap event loop with pending results."
+                    )
+                self.active_pd_event_loop_role = None
+                return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)

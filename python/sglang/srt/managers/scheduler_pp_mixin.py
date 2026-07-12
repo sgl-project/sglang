@@ -14,7 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -204,6 +207,7 @@ class SchedulerPPMixin:
         - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
 
         """
+        self.active_pd_event_loop_role = "prefill"
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -218,6 +222,9 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.PREFILL):
+                self.active_pd_event_loop_role = None
+                return
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -346,6 +353,7 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
+        self.active_pd_event_loop_role = "decode"
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -363,6 +371,9 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
+                self.active_pd_event_loop_role = None
+                return
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]

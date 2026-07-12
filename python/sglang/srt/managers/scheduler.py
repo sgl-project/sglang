@@ -1264,6 +1264,11 @@ class Scheduler(
     def pd_runtime_role(self) -> str:
         return DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
 
+    def _pd_role_loop_should_exit(self, expected: DisaggregationMode) -> bool:
+        return self.disaggregation_mode != expected or bool(
+            getattr(self, "_shutdown_requested", False)
+        )
+
     def pd_runtime_role_switch_enabled(self) -> bool:
         server_args = getattr(self, "server_args", None)
         return bool(getattr(server_args, "enable_pd_runtime_role_switch", False))
@@ -1304,6 +1309,9 @@ class Scheduler(
             "dp_rank": self.ps.dp_rank,
             "tp_rank": self.ps.tp_rank,
             "role": self.pd_runtime_role(),
+            "active_event_loop_role": getattr(
+                self, "active_pd_event_loop_role", None
+            ),
             "runtime_role_switch_enabled": self.pd_runtime_role_switch_enabled(),
             "admission_paused": bool(
                 getattr(self, "pd_runtime_admission_paused", False)
@@ -4741,10 +4749,15 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
+        self._shutdown_requested = False
+        self.active_pd_event_loop_role = None
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
-            dispatch_event_loop(self)
+            if self.pd_runtime_role_switch_enabled():
+                self._run_pd_dispatch_loop()
+            else:
+                dispatch_event_loop(self)
             return
 
         self.schedule_stream = self.device_module.Stream(priority=0)
@@ -4757,6 +4770,13 @@ class Scheduler(
             is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         ) and not self.spec_algorithm.is_dflash()
         with self.device_module.StreamContext(self.schedule_stream):
+            if self.pd_runtime_role_switch_enabled():
+                self._run_pd_dispatch_loop()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_pd_dispatch_loop(self) -> None:
+        while not getattr(self, "_shutdown_requested", False):
             dispatch_event_loop(self)
 
     @DynamicGradMode()

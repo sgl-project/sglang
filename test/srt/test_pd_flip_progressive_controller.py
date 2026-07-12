@@ -324,6 +324,7 @@ class ProgressiveScenarioClient:
                     "role": self.source_role,
                     "status": {
                         "role": self.source_role,
+                        "active_event_loop_role": self.source_role,
                         "is_idle": not self.running_rids,
                         "running_requests": [
                             {"rid": rid, "kv_committed_len": 8}

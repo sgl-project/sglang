@@ -1258,7 +1258,15 @@ class PDFlipController:
             )
             status = _first_successful_response(last_response)
             role, _, _ = _parse_runtime_status(status)
-            if role == expected_role:
+            runtime_status = (
+                status.get("status")
+                if isinstance(status.get("status"), dict)
+                else status
+            )
+            active_event_loop_role = _normalize_role(
+                runtime_status.get("active_event_loop_role")
+            )
+            if role == expected_role and active_event_loop_role == expected_role:
                 return last_response
             now = time.monotonic()
             if now >= deadline:
