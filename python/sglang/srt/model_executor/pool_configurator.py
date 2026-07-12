@@ -129,11 +129,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             effective_layer_ids = [
                 i
                 for i in mambaish.full_attention_layer_ids
-                if mr.start_layer <= i < mr.end_layer
+                if mr.layer_info.start_layer <= i < mr.layer_info.end_layer
             ]
             num_layers = len(effective_layer_ids)
         else:
-            num_layers = mr.num_effective_layers
+            num_layers = mr.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
@@ -230,10 +230,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             local_dense_layer_ids = [
-                l for l in dense_layer_ids if mr.start_layer <= l < mr.end_layer
+                l
+                for l in dense_layer_ids
+                if mr.layer_info.start_layer <= l < mr.layer_info.end_layer
             ]
             local_sparse_layer_ids = [
-                l for l in sparse_layer_ids if mr.start_layer <= l < mr.end_layer
+                l
+                for l in sparse_layer_ids
+                if mr.layer_info.start_layer <= l < mr.layer_info.end_layer
             ]
             num_dense = len(local_dense_layer_ids)
             num_sparse = len(local_sparse_layer_ids)
@@ -535,11 +539,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.indexer_head_dim = cfg.index_head_dim
         self.context_len = mr.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
-        self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
+        self.compression_ratios = cfg.compress_ratios[
+            mr.layer_info.start_layer : mr.layer_info.end_layer
+        ]
         if mr.ps.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={mr.pp_group.rank_in_group} "
-                f"layers=[{mr.start_layer},{mr.end_layer}) "
+                f"layers=[{mr.layer_info.start_layer},{mr.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
