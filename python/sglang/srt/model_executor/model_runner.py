@@ -34,7 +34,7 @@ from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     bootstrap,
-    get_world_group,
+    parallel_state,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
@@ -911,47 +911,6 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
         )
 
-    def maybe_recover_ep_ranks(self):
-        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-        # synchronization, and this function is on the forward-path.
-        # This check only runs when `--elastic-ep-backend` is enabled, so the
-        # synchronization overhead does not propagate to other configs.
-        # Leave for future optimization of the elastic EP path.
-        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
-            return
-
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
-        ranks_to_recover = [
-            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
-        ]
-
-        # try_recover_ranks polls peer state via Mooncake EP backend.
-        # Mooncake's internal semantics guarantee that all ranks observe
-        # consistent peer readiness state, so collective operations below
-        # are safe even though polling appears local.
-        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
-            self.forward_pass_id = 0
-            self.eplb_manager.reset_generator()
-            broadcast_global_expert_location_metadata(
-                src_rank=get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=False
-                )
-            )
-            ElasticEPStateManager.instance().reset()
-
-            broadcast_pyobj(
-                [self.server_args.random_seed],
-                get_world_group().rank,
-                get_world_group().cpu_group,
-                src=get_world_group().ranks[0],
-            )
-            logger.info(f"recover ranks {ranks_to_recover} done")
-
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -1249,8 +1208,14 @@ class ModelRunner:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.enable_elastic_ep:
-            self.maybe_recover_ep_ranks()
+        if self.server_args.elastic_ep_backend is not None:
+            recovered = maybe_recover_ep_ranks(
+                tp_group=self.tp_group,
+                eplb_manager=self.eplb_manager,
+                random_seed=self.server_args.random_seed,
+            )
+            if recovered:
+                self.forward_pass_id = 0
 
         return output
 
@@ -1499,17 +1464,7 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
-        elastic_ep_state = ElasticEPStateManager.instance()
-        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
-            elastic_ep_state.snapshot_active_to_last()
-            elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
-            gen = self.eplb_manager.rebalance()
-            while True:
-                try:
-                    next(gen)
-                except StopIteration:
-                    break
+        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
@@ -1533,3 +1488,67 @@ class ModelRunner:
             load_format=load_format,
         )
         self.load_config = load_config
+
+
+def maybe_recover_ep_ranks(
+    *,
+    tp_group: parallel_state.GroupCoordinator,
+    eplb_manager: EPLBManager,
+    random_seed: int,
+) -> bool:
+    # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+    # synchronization, and this function is on the forward-path.
+    # This check only runs when `--elastic-ep-backend` is enabled, so the
+    # synchronization overhead does not propagate to other configs.
+    # Leave for future optimization of the elastic EP path.
+    if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
+        return False
+
+    tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
+    tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
+    tp_active_ranks &= tp_active_ranks_cpu
+    # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+    # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+    # tp-group index is the same as the global rank index.
+    ranks_to_recover = [
+        i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+    ]
+
+    # try_recover_ranks polls peer state via Mooncake EP backend.
+    # Mooncake's internal semantics guarantee that all ranks observe
+    # consistent peer readiness state, so collective operations below
+    # are safe even though polling appears local.
+    if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+        eplb_manager.reset_generator()
+        broadcast_global_expert_location_metadata(
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
+            )
+        )
+        ElasticEPStateManager.instance().reset()
+        broadcast_pyobj(
+            [random_seed],
+            parallel_state.get_world_group().rank,
+            parallel_state.get_world_group().cpu_group,
+            src=parallel_state.get_world_group().ranks[0],
+        )
+        logger.info(f"recover ranks {ranks_to_recover} done")
+        return True
+
+    return False
+
+
+def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+    elastic_ep_state = ElasticEPStateManager.instance()
+    if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
+        return False
+    elastic_ep_state.snapshot_active_to_last()
+    elastic_ep_state.sync_active_to_cpu()
+    logger.info("EPLB due to rank faults")
+    gen = eplb_manager.rebalance()
+    while True:
+        try:
+            next(gen)
+        except StopIteration:
+            break
+    return True
