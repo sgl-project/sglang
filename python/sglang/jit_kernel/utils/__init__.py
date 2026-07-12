@@ -5,11 +5,13 @@ The implementation lives in the submodules:
 - arch: CUDA/ROCm architecture detection and default compile target flags
 - compile: load_jit, the build cache, and C++ template arguments
 - deps: header-only dependency registration (flashinfer, cutlass, mathdx, ...)
+
+Only the names below are public. Internal helpers (DEFAULT_* flag lists,
+ArchInfo, the dependency registry, ...) stay in their submodule; the rare
+internal consumer imports them from there directly.
 """
 
 from sglang.jit_kernel.utils.arch import (
-    ArchInfo,
-    _get_default_target_flags,
     get_jit_cuda_arch,
     is_arch_support_pdl,
     override_jit_cuda_arch,
@@ -18,28 +20,15 @@ from sglang.jit_kernel.utils.common import (
     cache_once,
     get_ci_test_range,
     is_hip_runtime,
-    is_musa_runtime,
     should_run_full_tests,
 )
 from sglang.jit_kernel.utils.compile import (
     CPP_DTYPE_MAP,
-    CPP_TEMPLATE_TYPE,
-    DEFAULT_CFLAGS,
-    DEFAULT_INCLUDE,
-    DEFAULT_LDFLAGS,
     KERNEL_PATH,
-    CPPArgList,
     load_jit,
     make_cpp_args,
 )
-from sglang.jit_kernel.utils.deps import (
-    _REGISTERED_DEPENDENCIES,
-    get_cutlass_include_paths,
-    get_flashinfer_include_paths,
-    get_mathdx_include_paths,
-    get_mathdx_root,
-    register_dependency,
-)
+from sglang.jit_kernel.utils.deps import register_dependency
 
 __all__ = [
     "should_run_full_tests",
@@ -52,4 +41,6 @@ __all__ = [
     "get_jit_cuda_arch",
     "is_arch_support_pdl",
     "register_dependency",
+    "KERNEL_PATH",
+    "CPP_DTYPE_MAP",
 ]

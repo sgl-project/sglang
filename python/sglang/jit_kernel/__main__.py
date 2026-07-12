@@ -4,13 +4,10 @@ import os
 
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
-from sglang.jit_kernel.utils import (
-    _REGISTERED_DEPENDENCIES,
-    DEFAULT_INCLUDE,
-    _get_default_target_flags,
-    get_jit_cuda_arch,
-    override_jit_cuda_arch,
-)
+from sglang.jit_kernel.utils import get_jit_cuda_arch, override_jit_cuda_arch
+from sglang.jit_kernel.utils.arch import _get_default_target_flags
+from sglang.jit_kernel.utils.compile import DEFAULT_INCLUDE
+from sglang.jit_kernel.utils.deps import _REGISTERED_DEPENDENCIES
 
 
 def generate_clangd():
