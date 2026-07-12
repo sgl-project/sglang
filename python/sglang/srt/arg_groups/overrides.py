@@ -700,6 +700,7 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend
     writes, the max_running_requests fill and the validations stay in the
     hook at its legacy slot."""
+    from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
     model_arch = hf_config.architectures[0]
@@ -724,16 +725,28 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["swa_full_tokens_ratio"] = 0.1
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
-    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
-    if (
-        server_args.moe_runner_backend == "auto"
-        and server_args.get_model_config().nvfp4_moe_meta is not None
-    ):
-        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
-        logger.info(
-            "Use flashinfer_trtllm_routed as MoE runner backend for "
-            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
-        )
+    if server_args.moe_runner_backend == "auto":
+        model_config = server_args.get_model_config()
+        # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
+        if model_config.nvfp4_moe_meta is not None:
+            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+            logger.info(
+                "Use flashinfer_trtllm_routed as MoE runner backend for "
+                f"{model_arch} hybrid FP8+NVFP4 checkpoint."
+            )
+        elif model_config.is_fp4_experts and not envs.SGLANG_DSV4_FP4_DEQUANT.get():
+            if is_sm100_supported():
+                overrides["moe_runner_backend"] = "flashinfer_mxfp4"
+                logger.info(
+                    "Use flashinfer_mxfp4 as MoE runner backend for "
+                    f"{model_arch} packed-FP4 checkpoint on SM100."
+                )
+            elif is_sm90_supported() or is_sm120_supported():
+                overrides["moe_runner_backend"] = "marlin"
+                logger.info(
+                    "Use marlin as MoE runner backend for "
+                    f"{model_arch} packed-FP4 checkpoint on SM90/SM120."
+                )
     return overrides
 
 
@@ -1353,10 +1366,17 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
     tcgen05/TMEM, fall back to the marlin MoE runner (reads the
     mid-resolution moe_runner_backend, after the dispatch-time nvfp4
     default)."""
-    hf_config = view.get_model_config().hf_config
+    from sglang.srt.environ import envs
+
+    model_config = view.get_model_config()
+    hf_config = model_config.hf_config
     if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
-    if is_sm120_supported() and view.moe_runner_backend == "auto":
+    if (
+        is_sm120_supported()
+        and view.moe_runner_backend == "auto"
+        and not (model_config.is_fp4_experts and envs.SGLANG_DSV4_FP4_DEQUANT.get())
+    ):
         logger.info("Use marlin as MoE runner backend on SM120 for DeepseekV4")
         return {"moe_runner_backend": "marlin"}
     return {}

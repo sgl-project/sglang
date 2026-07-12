@@ -56,8 +56,6 @@ class TestDSV4FlashFP4B200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
