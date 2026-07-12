@@ -25,7 +25,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -180,7 +180,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -205,10 +204,8 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     broadcast_pyobj,
     cpu_has_amx_support,
-    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -233,17 +230,10 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
-from sglang.srt.utils.patch_torch import (
-    monkey_patch_torch_reductions,
-    register_sgl_tp_rank,
-)
+from sglang.srt.utils.patch_torch import register_sgl_tp_rank
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
-from sglang.srt.weight_sync.tensor_bucket import (
-    FlattenedTensorBucket,
-    FlattenedTensorMetadata,
-)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1838,71 +1828,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         current_platform.empty_cache()
         return success, message
 
-    @staticmethod
-    def update_weights_from_tensor(
-        self: WeightUpdater,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
-        load_format: Optional[str] = None,
-    ):
-        monkey_patch_torch_reductions()
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return ModelRunner._update_weights_from_flattened_bucket(
-                self, flattened_tensor_bucket_dict=named_tensors
-            )
-
-        # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self._mr.device)
-        infered_device = device_module.current_device()
-
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self._mr.model, named_tensors)
-        elif load_format in self._mr.server_args.custom_weight_loader:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self._mr.model, named_tensors)
-        elif load_format is None:
-            self._mr.model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
-        return True, "Success"
-
-    @staticmethod
-    def _update_weights_from_flattened_bucket(
-        self: WeightUpdater,
-        flattened_tensor_bucket_dict,
-    ):
-        """Handle flattened bucket format for weight updates"""
-        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
-        metadata = flattened_tensor_bucket_dict["metadata"]
-
-        # Convert metadata dict to our format
-        converted_metadata = []
-        for meta in metadata:
-            converted_meta = FlattenedTensorMetadata(
-                name=meta.name,
-                shape=meta.shape,
-                dtype=meta.dtype,
-                start_idx=meta.start_idx,
-                end_idx=meta.end_idx,
-                numel=meta.numel,
-            )
-            converted_metadata.append(converted_meta)
-
-        # Create bucket and reconstruct tensors
-        bucket = FlattenedTensorBucket(
-            flattened_tensor=flattened_tensor, metadata=converted_metadata
-        )
-        reconstructed_tensors = bucket.reconstruct_tensors()
-
-        # Load the reconstructed tensors using the standard method
-        self._mr.model.load_weights(reconstructed_tensors)
-
-        return True, "Success"
-
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
@@ -3015,26 +2940,3 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         return output
-
-
-def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
-    params_dict = dict(model.named_parameters())
-    for name, tensor in named_tensors:
-        default_weight_loader(params_dict[name], tensor)
-
-
-def _unwrap_tensor(tensor, tp_rank, device):
-    if isinstance(tensor, LocalSerializedTensor):
-        tensor = tensor.get(tp_rank)
-    return tensor.to(device)
-
-
-@dataclass
-class LocalSerializedTensor:
-    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
-    The i-th element in the list corresponds to i-th rank's GPU."""
-
-    values: List[bytes]
-
-    def get(self, rank: int):
-        return MultiprocessingSerializer.deserialize(self.values[rank])
