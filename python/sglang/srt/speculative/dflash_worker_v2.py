@@ -32,6 +32,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    compute_dflash_tree_sampling_accept,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -1947,32 +1948,52 @@ class DFlashWorkerV2(BaseSpecWorker):
             candidates = draft_tokens
 
         if self._tree_verify_enabled:
-            # --- EAGLE-style tree accept (greedy only). ---
-            from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
-
+            # --- EAGLE-style tree accept: greedy argmax, or rejection sampling
+            # over the tree for non-greedy requests. Both emit the same
+            # (predicts, accept_index, accept_token_num) for dflash_tree_accept_compact.
             # Tree accept dims follow the VERIFY token count (budget), not block_size.
             block_size = int(verify_input.draft_token_num)
-            target_predict = torch.argmax(
-                logits_output.next_token_logits, dim=-1
-            ).view(bs, block_size)
-            predicts = torch.empty(
-                (bs * block_size,), device=device, dtype=torch.int32
-            )
-            accept_index = torch.full(
-                (bs, block_size), -1, device=device, dtype=torch.int32
-            )
-            accept_token_num = torch.zeros((bs,), device=device, dtype=torch.int32)
-            predicts, accept_index, accept_token_num = verify_tree_greedy_func(
-                predicts=predicts,
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                candidates=candidates,
-                retrieve_index=verify_input.retrieve_index,
-                retrieve_next_token=verify_input.retrieve_next_token,
-                retrieve_next_sibling=verify_input.retrieve_next_sibling,
-                target_predict=target_predict,
-                topk=int(self._tree_verify_topk),
-            )
+            if (
+                sampling_info is not None
+                and not sampling_info.is_all_greedy
+                and is_dflash_sampling_verify_available()
+            ):
+                predicts, accept_index, accept_token_num = (
+                    compute_dflash_tree_sampling_accept(
+                        candidates=candidates,
+                        retrieve_index=verify_input.retrieve_index,
+                        retrieve_next_token=verify_input.retrieve_next_token,
+                        retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                        next_token_logits=logits_output.next_token_logits,
+                        sampling_info=sampling_info,
+                        max_top_k=draft_input.max_top_k,
+                        uniform_top_k_value=draft_input.uniform_top_k_value,
+                    )
+                )
+            else:
+                from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, block_size)
+                predicts = torch.empty(
+                    (bs * block_size,), device=device, dtype=torch.int32
+                )
+                accept_index = torch.full(
+                    (bs, block_size), -1, device=device, dtype=torch.int32
+                )
+                accept_token_num = torch.zeros((bs,), device=device, dtype=torch.int32)
+                predicts, accept_index, accept_token_num = verify_tree_greedy_func(
+                    predicts=predicts,
+                    accept_index=accept_index,
+                    accept_token_num=accept_token_num,
+                    candidates=candidates,
+                    retrieve_index=verify_input.retrieve_index,
+                    retrieve_next_token=verify_input.retrieve_next_token,
+                    retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                    target_predict=target_predict,
+                    topk=int(self._tree_verify_topk),
+                )
             # accept_index is absolute (row offset baked in).
             accept_len = accept_token_num  # [bs] int32, accepted drafts (excl bonus)
             commit_lens = accept_len + 1  # [bs] int32 (accept_token_num is int32)

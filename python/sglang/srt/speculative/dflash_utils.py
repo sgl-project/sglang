@@ -724,6 +724,88 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+def compute_dflash_tree_sampling_accept(
+    *,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    threshold_single: Optional[float] = None,
+    threshold_acc: Optional[float] = None,
+    use_sparse_topk: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Non-greedy accept over the DFlash verify TREE via rejection sampling.
+
+    Wraps ``tree_speculative_sampling_target_only`` (already tree-native) with the
+    pruned tree's retrieve structures. Returns ``(predicts, accept_index,
+    accept_token_num)`` in the SAME layout as ``verify_tree_greedy_func``, so the
+    downstream ``dflash_tree_accept_compact`` path is unchanged. `candidates` is
+    [bs, draft_token_num] in the kernel layout (prepare_for_verify order).
+    """
+    if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
+        raise RuntimeError(
+            "DFLASH non-greedy verification is unavailable on this build/device."
+        )
+    bs, draft_token_num = candidates.shape
+    device = next_token_logits.device
+    if threshold_single is None:
+        from sglang.srt.runtime_context import get_server_args
+
+        threshold_single = get_server_args().speculative_accept_threshold_single
+    if threshold_acc is None:
+        from sglang.srt.runtime_context import get_server_args
+
+        threshold_acc = get_server_args().speculative_accept_threshold_acc
+    threshold_single = float(threshold_single)
+    threshold_acc = max(float(threshold_acc), 1e-9)
+
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        use_sparse_topk=use_sparse_topk,
+    )
+    draft_probs = torch.zeros_like(target_probs)
+    uniform_samples = torch.rand(
+        (bs, draft_token_num), dtype=torch.float32, device=device
+    )
+    uniform_samples_for_final_sampling = torch.rand(
+        (bs,), dtype=torch.float32, device=device
+    )
+    predicts = torch.empty((bs * draft_token_num,), device=device, dtype=torch.int32)
+    accept_index = torch.full(
+        (bs, draft_token_num), -1, device=device, dtype=torch.int32
+    )
+    accept_token_num = torch.zeros((bs,), device=device, dtype=torch.int32)
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates_i64,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=True,
+    )
+    return predicts, accept_index, accept_token_num
+
+
 def build_dflash_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
