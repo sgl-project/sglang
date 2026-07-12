@@ -1167,8 +1167,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             req.prefill_attempt_count += 1
             logger.info(
-                f"Req {req.rid} optimistic prefill attempt "
-                f"{req.prefill_attempt_count}/{max_attempts}"
+                f"Req {req.rid} optimistic prefill yielded "
+                f"({req.prefill_attempt_count}/{max_attempts} attempts used)"
             )
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)
