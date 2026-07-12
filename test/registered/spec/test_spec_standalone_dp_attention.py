@@ -25,9 +25,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
-# Measured 0.925 (dp) / 0.930 (non-dp) on Qwen3-30B-A3B.
+# Measured 0.945 (dp) / 0.960 (non-dp) on Qwen3-30B-A3B.
 GSM8K_ACCURACY_FLOOR = 0.90
-# Measured 3.95 on GSM8K (triton); margin for fa3 backend drift.
+# Measured ~3.93 on GSM8K (triton); margin for fa3 backend drift.
 SPEC_ACCEPT_LENGTH_FLOOR = 3.5
 
 
