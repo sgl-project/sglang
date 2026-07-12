@@ -193,3 +193,42 @@ def test_move_symbol_async_leave_delegate_awaits_the_forwarded_call(
     )
     _apply(r, tmp_path)
     assert "return await self.cfg.compute(n)" in (tmp_path / "src.py").read_text()
+
+
+def test_move_symbol_leave_delegate_on_self_annotated_staticmethod(
+    tmp_path: Path,
+) -> None:
+    """A de-self'd staticmethod (self: Target) moves into Target; the stub drops the
+    decorator and the self annotation."""
+    (tmp_path / "src.py").write_text(
+        "class Runner:\n"
+        "    @staticmethod\n"
+        "    def work(self: Comp, n: int) -> int:\n"
+        "        return n + self.base\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class Comp:\n    def existing(self):\n        return 0\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "work",
+        src="src.py",
+        dst="dst.py",
+        into_class="Comp",
+        from_class="Runner",
+        drop_self_annotation=True,
+        leave_delegate="comp",
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "src.py").read_text() == (
+        "class Runner:\n"
+        "    def work(self, n: int) -> int:\n"
+        "        return self.comp.work(n)\n"
+    )
+    assert (tmp_path / "dst.py").read_text() == (
+        "class Comp:\n"
+        "    def existing(self):\n"
+        "        return 0\n"
+        "\n"
+        "    def work(self, n: int) -> int:\n"
+        "        return n + self.base\n"
+    )

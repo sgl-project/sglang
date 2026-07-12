@@ -423,3 +423,53 @@ def test_infer_recipe_move_leaving_a_forwarding_delegate(repo: Path) -> None:
     assert recipe.moves[0]["delegate_name"] is None
     script = recipe_to_script(recipe, "move with delegate")
     assert "leave_delegate='comp'" in script
+
+
+def test_infer_recipe_constant_relocated_with_the_move(repo: Path) -> None:
+    """A module constant that vanished from the source and appeared in the existing
+    destination becomes a move_assign."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "RATIO = 3\n"
+                "\n"
+                "\n"
+                "def work(x):\n"
+                "    return x * RATIO\n"
+                "\n"
+                "\n"
+                "def stay():\n"
+                "    return 1\n"
+            ),
+            "comp.py": "import os\n\n\ndef keep():\n    return 2\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def stay():\n    return 1\n",
+            "comp.py": (
+                "import os\n"
+                "\n"
+                "RATIO = 3\n"
+                "\n"
+                "\n"
+                "def keep():\n"
+                "    return 2\n"
+                "\n"
+                "\n"
+                "def work(x):\n"
+                "    return x * RATIO\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move work + RATIO to comp")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [am["name"] for am in recipe.assign_moves] == ["RATIO"]
+    script = recipe_to_script(recipe, "move with constant")
+    assert "move_assign" in script

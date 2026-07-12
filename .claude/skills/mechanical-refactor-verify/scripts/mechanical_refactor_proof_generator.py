@@ -296,6 +296,7 @@ class Recipe:
     target: str
     supported: bool = True
     moves: list = field(default_factory=list)
+    assign_moves: list = field(default_factory=list)
     extracts: list = field(default_factory=list)
     scatter_extracts: list = field(default_factory=list)
     lowerings: list = field(default_factory=list)
@@ -443,6 +444,32 @@ def _next_sibling_def_name(
     for i, node in enumerate(defs):
         if node.name == name:
             return defs[i + 1].name if i + 1 < len(defs) else None
+    return None
+
+
+def _next_sibling_assign_or_def(dst_tree: ast.AST, name: str) -> str | None:
+    """The name of the top-level statement (def/class/single-Name assign) that immediately
+    follows the assignment ``name`` in the destination, or None when it is last."""
+
+    def stmt_name(node: ast.AST) -> str | None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return node.name
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            return node.targets[0].id
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            return node.target.id
+        return None
+
+    named = [
+        (stmt_name(n), n) for n in getattr(dst_tree, "body", []) if stmt_name(n)
+    ]
+    for i, (nm, _) in enumerate(named):
+        if nm == name:
+            return named[i + 1][0] if i + 1 < len(named) else None
     return None
 
 
@@ -812,6 +839,44 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             }
         )
 
+    # A module-level constant that vanished from one changed file and appeared in another
+    # relocated with the moved code: realise it as a move_assign.
+    changed_paths = [p for p in files if p.endswith(".py")]
+    texts_before: dict = {}
+    texts_after: dict = {}
+    for p in changed_paths:
+        try:
+            texts_before[p] = (
+                "" if files[p]["new"] else _git_output(["show", f"{commit}^:{p}"], root)
+            )
+            texts_after[p] = _git_output(["show", f"{commit}:{p}"], root)
+        except Exception:
+            continue
+    for p_src in changed_paths:
+        if p_src not in texts_before:
+            continue
+        lost = _module_assign_names(texts_before[p_src]) - _module_assign_names(
+            texts_after.get(p_src, "")
+        )
+        if not lost:
+            continue
+        for p_dst in changed_paths:
+            if p_dst == p_src or p_dst in new_files or p_dst not in texts_after:
+                continue
+            gained = _module_assign_names(texts_after[p_dst]) - _module_assign_names(
+                texts_before.get(p_dst, "")
+            )
+            for cname in sorted(lost & gained):
+                dst_tree = ast.parse(texts_after[p_dst])
+                recipe.assign_moves.append(
+                    {
+                        "name": cname,
+                        "src": p_src,
+                        "dst": p_dst,
+                        "before": _next_sibling_assign_or_def(dst_tree, cname),
+                    }
+                )
+
     # Module-level imports a file gained or lost are realised directly from the symmetric
     # base<->target diff: a gained name is added (the destination needs the moved code's
     # imports, or a caller of a moved free function gains one), a lost name is removed. An
@@ -912,6 +977,14 @@ def _recipe_ops(recipe: Recipe) -> list:
                     "leave_delegate": mv.get("leave_delegate"),
                     "delegate_name": mv.get("delegate_name"),
                 },
+            )
+        )
+    for am in recipe.assign_moves:
+        ops.append(
+            (
+                "move_assign",
+                (am["name"],),
+                {"src": am["src"], "dst": am["dst"], "before": am.get("before")},
             )
         )
     for ex in recipe.extracts:

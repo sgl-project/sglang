@@ -862,6 +862,77 @@ class Repro:
         self.ops.append(op)
         return self
 
+    def move_assign(
+        self,
+        name: str,
+        *,
+        src: str,
+        dst: str,
+        before: str | None = None,
+    ) -> "Repro":
+        """Cut the module-level assignment binding ``name`` from ``src`` and paste it verbatim
+        into ``dst`` at module level -- a module constant relocated together with the code
+        that reads it. Pasted immediately above the top-level statement named ``before``
+        when given, else after the last top-level import."""
+
+        def op(root: Path) -> None:
+            src_path = root / src
+            dst_path = root / dst
+            src_lines = _split_keepends(_read_source(src_path))
+            node = None
+            for cand in ast.parse("".join(src_lines)).body:
+                if (
+                    isinstance(cand, ast.Assign)
+                    and len(cand.targets) == 1
+                    and isinstance(cand.targets[0], ast.Name)
+                    and cand.targets[0].id == name
+                ) or (
+                    isinstance(cand, ast.AnnAssign)
+                    and isinstance(cand.target, ast.Name)
+                    and cand.target.id == name
+                ):
+                    node = cand
+            assert node is not None, f"module assignment {name} not found in {src}"
+            block = "".join(src_lines[node.lineno - 1 : node.end_lineno])
+            _write_source(
+                src_path,
+                "".join(src_lines[: node.lineno - 1] + src_lines[node.end_lineno :]),
+            )
+
+            dst_lines = _split_keepends(_read_source(dst_path))
+            dst_nl = _newline_style("".join(dst_lines))
+            dst_tree = ast.parse("".join(dst_lines))
+            at = None
+            if before is not None:
+                for cand in dst_tree.body:
+                    cand_name = getattr(cand, "name", None) or (
+                        cand.targets[0].id
+                        if isinstance(cand, ast.Assign)
+                        and len(cand.targets) == 1
+                        and isinstance(cand.targets[0], ast.Name)
+                        else None
+                    )
+                    if cand_name == before:
+                        at = min(
+                            [d.lineno for d in getattr(cand, "decorator_list", [])],
+                            default=cand.lineno,
+                        ) - 1
+                        break
+                assert at is not None, f"before={before!r} not found in {dst}"
+                dst_lines[at:at] = [block, dst_nl]
+            else:
+                imports = [
+                    n
+                    for n in dst_tree.body
+                    if isinstance(n, (ast.Import, ast.ImportFrom))
+                ]
+                at = imports[-1].end_lineno if imports else 0
+                dst_lines[at:at] = [dst_nl, block]
+            _write_source(dst_path, "".join(dst_lines))
+
+        self.ops.append(op)
+        return self
+
     def move_symbol(
         self,
         name: str,
@@ -896,10 +967,20 @@ class Repro:
             block = src_lines[start - 1 : end]
             decorator_lines = node.lineno - start
             if leave_delegate is not None:
-                assert not any(
-                    ln.strip() in _MOVE_DECORATORS for ln in block[:decorator_lines]
-                ), f"leave_delegate on a {_MOVE_DECORATORS} method has no self to forward"
                 args = node.args
+                has_move_decorator = any(
+                    ln.strip() in _MOVE_DECORATORS for ln in block[:decorator_lines]
+                )
+                arg_list = args.posonlyargs + args.args
+                self_annotated = (
+                    bool(arg_list)
+                    and arg_list[0].arg == "self"
+                    and arg_list[0].annotation is not None
+                )
+                assert not has_move_decorator or self_annotated, (
+                    f"leave_delegate on a {_MOVE_DECORATORS} method has no self to "
+                    "forward (a de-self'd staticmethod must annotate its self param)"
+                )
                 parts = [p.arg for p in args.posonlyargs + args.args if p.arg != "self"]
                 if args.vararg is not None:
                     parts.append(f"*{args.vararg.arg}")
@@ -915,7 +996,14 @@ class Repro:
                     - 1
                     + _def_header_end("".join(src_lines[node.lineno - 1 : end]))
                 )
-                signature = src_lines[start - 1 : header_end]
+                sig_start = node.lineno - 1 if has_move_decorator else start - 1
+                signature_text = "".join(src_lines[sig_start:header_end])
+                if self_annotated:
+                    sig_indent = len(signature_text) - len(signature_text.lstrip(" "))
+                    parsable = signature_text + " " * sig_indent + "    pass" + src_nl
+                    stripped = _drop_self_annotation(parsable, name)
+                    assert stripped.endswith(" " * sig_indent + "    pass" + src_nl)
+                    signature_text = stripped[: -len(" " * sig_indent + "    pass" + src_nl)]
                 body_indent = " " * node.body[0].col_offset
                 returning = (
                     "return await"
@@ -926,7 +1014,7 @@ class Repro:
                     f"{body_indent}{returning} self.{leave_delegate}."
                     f"{delegate_name or name}({', '.join(parts)})" + src_nl
                 )
-                delegate = "".join(signature) + forward
+                delegate = signature_text + forward
                 _write_source(
                     src_path,
                     "".join(src_lines[: start - 1] + [delegate] + src_lines[end:]),

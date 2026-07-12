@@ -69,7 +69,8 @@
 - **Scaffolding or a constant authored into an existing module** — a logger, a module
   constant, a `TYPE_CHECKING` guard, a re-derived `_flag = compute_flag()`. (A *new*
   module's header is authored from the target, §2.1; an existing module's body is not a
-  place to author fresh code.)
+  place to author fresh code. A constant *relocated* from the source is not authored —
+  `move_assign` certifies it.)
 - A **changed body in an extracted function** — de-self, control-flow restructure, or a
   folded-in bookkeeping change: a semantic rewrite, not a relocation.
 
@@ -122,6 +123,10 @@
     - re-indents under the authored `signature` — multi-line string interiors keep their
       exact bytes;
     - replaces the block with the authored `call`.
+- `move_assign(name, *, src, dst, before)` — cuts the module-level assignment binding
+  `name` from `src` verbatim and pastes it at module level in `dst` (above the named
+  sibling `before`, else after the trailing import) — a module constant relocated
+  together with the code that reads it.
 - `lower_call_sites(name, owner, *, paths)` — `Owner.m(receiver, rest)` →
   `receiver.m(rest)` by splicing the original argument bytes (literal spelling, comments,
   magic trailing comma survive); nested matching calls are all rewritten.
