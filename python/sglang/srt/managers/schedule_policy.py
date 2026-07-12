@@ -1054,7 +1054,7 @@ class PrefillAdder:
             swa_needed = self._swa_budget_for_req(
                 real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
             )
-            if swa_needed >= self.rem_swa_tokens:
+            if swa_needed > self.rem_swa_tokens:
                 swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
@@ -1080,7 +1080,7 @@ class PrefillAdder:
                 swa_needed = self._swa_budget_for_req(
                     real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
                 )
-                if swa_needed >= self.rem_swa_tokens:
+                if swa_needed > self.rem_swa_tokens:
                     swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
