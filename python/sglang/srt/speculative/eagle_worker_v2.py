@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -196,6 +197,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
+        # Eager draft-extend seed buffer (graph paths use their own static ones).
+        self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -520,7 +523,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if (
             can_cuda_graph
             and not forward_batch.forward_mode.is_idle()
-            and self.index_share_for_mtp_iteration
+            and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
         ):
             can_cuda_graph = False
@@ -653,6 +656,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_dsa_topk_indices = True
+            # Keep the draft-extend seed so step 0 reuses it; else recompute it.
+            if not (
+                self.seed_dsa_topk_from_draft_extend
+                and spec_info.dsa_topk_indices is not None
+            ):
+                spec_info.dsa_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -727,7 +736,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None
-            forward_batch.topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False
 
         # Organize the results
@@ -815,12 +823,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
+        # Seed the first draft-decode loop from each request's last prefill
+        # position. Gather last-per-req before the copy (prefill can be long).
+        # Skipped under context-parallel prefill (token layout wouldn't match).
         seed_from_extend = (
             self.seed_dsa_topk_from_draft_extend
             and not forward_batch.forward_mode.is_idle()
+            and not dsa_use_prefill_cp(forward_batch)
         )
         if seed_from_extend:
-            forward_batch.capture_dsa_topk_indices = True
+            bs = forward_batch.batch_size
+            forward_batch.spec_info.dsa_seed_topk_capture = (
+                self._get_dsa_extend_topk_buf(bs)
+            )
+            forward_batch.spec_info.dsa_seed_topk_select = (
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            ).long()
 
         canary_ctx = (
             context_tuple(
@@ -840,12 +858,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         prefill_dsa_topk = None
         if seed_from_extend:
-            prefill_dsa_topk = self.extract_draft_seed_dsa_topk_indices(
-                forward_batch,
-                getattr(logits_output, "dsa_topk_indices", None),
-            )
-            if prefill_dsa_topk is not None:
-                prefill_dsa_topk = prefill_dsa_topk.clone()
+            prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
@@ -869,23 +882,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_topk_indices=prefill_dsa_topk,
         )
 
-    def extract_draft_seed_dsa_topk_indices(
-        self,
-        forward_batch: ForwardBatch,
-        dsa_topk_indices: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if not self.seed_dsa_topk_from_draft_extend:
-            return None
-
-        dsa_topk_indices = (
-            forward_batch.topk_indices if dsa_topk_indices is None else dsa_topk_indices
-        )
-        if dsa_topk_indices is None or forward_batch.extend_seq_lens is None:
-            return None
-
-        extend_seq_lens = forward_batch.extend_seq_lens[: forward_batch.batch_size]
-        last_token_indices = torch.cumsum(extend_seq_lens.to(torch.int64), dim=0) - 1
-        return dsa_topk_indices.index_select(0, last_token_indices)
+    def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
+        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
+        buf = self.dsa_extend_topk_buf
+        if buf is None or buf.shape[0] < num_tokens:
+            buf = torch.full(
+                (num_tokens, self.dsa_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dsa_extend_topk_buf = buf
+        return buf[:num_tokens]
 
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
@@ -938,8 +946,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
+        # Eager path publishes the indexer top-k into a worker buffer (the graph
+        # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_cuda_graph:
-            forward_batch.capture_dsa_topk_indices = True
+            forward_batch.spec_info.dsa_seed_topk_capture = (
+                self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
+            )
 
         canary_ctx = (
             context_tuple(
@@ -975,11 +987,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # seed (select_index already picks the last accepted position per req).
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
-            dsa_extend_topk_capture = getattr(
-                draft_logits_output, "dsa_topk_indices", None
-            )
-            if dsa_extend_topk_capture is not None:
-                dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
+            if can_cuda_graph:
+                dsa_extend_topk_capture = (
+                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+                )
+            else:
+                dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
+            # Fancy indexing returns a fresh tensor (detached from the buffer).
+            dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[

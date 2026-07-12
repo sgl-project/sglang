@@ -13,10 +13,15 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.utils import (
+    MetadataBuffers,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
+from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.speculative.eagle_disaggregation import (
+    build_eagle_disagg_draft_input,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -91,6 +96,96 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestEagleDsaSeedTransfer(unittest.TestCase):
+    @staticmethod
+    def _make_req(seed, metadata_buffer_index=0):
+        return SimpleNamespace(
+            metadata_buffer_index=metadata_buffer_index,
+            output_ids=[101],
+            cached_tokens=0,
+            cached_tokens_device=0,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            multimodal_inputs=None,
+            return_logprob=False,
+            hidden_states_tensor=torch.tensor([1.0, 2.0]),
+            output_topk_p=torch.tensor([1.0]),
+            output_topk_index=torch.tensor([7]),
+            output_dsa_topk_indices=seed,
+            bootstrap_room=9,
+        )
+
+    def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
+        buffers = MetadataBuffers(
+            size=2,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            output_dsa_topk_indices_dim=3,
+        )
+        seed = torch.tensor([4, 5, 6], dtype=torch.int32)
+        buffers.set_buf(self._make_req(seed))
+        buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
+
+        self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
+        self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
+        ptrs, data_lens, item_lens = buffers.get_buf_infos()
+        self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
+        self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
+        self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+    def test_decode_input_requires_valid_seed_for_every_request(self):
+        seeds = (
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+            torch.tensor([4, 5, 6], dtype=torch.int32),
+        )
+        batch = SimpleNamespace(
+            reqs=[self._make_req(seed) for seed in seeds],
+            device="cpu",
+            enable_overlap=False,
+        )
+        server_args = SimpleNamespace(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+        )
+        last_tokens = torch.tensor([11, 12], dtype=torch.int64)
+
+        draft_input = build_eagle_disagg_draft_input(
+            batch, server_args, last_tokens, None
+        )
+        self.assertTrue(torch.equal(draft_input.dsa_topk_indices, torch.stack(seeds)))
+
+        for invalid_seed in (
+            None,
+            torch.full((3,), -1, dtype=torch.int32),
+        ):
+            batch.reqs[1].output_dsa_topk_indices = invalid_seed
+            draft_input = build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens, None
+            )
+            self.assertIsNone(draft_input.dsa_topk_indices)
+
+    def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
+        future_map = object.__new__(FutureMap)
+        future_map.dsa_topk_indices_buf = None
+        future_map.req_pool_size = 4
+        future_map.device = "cpu"
+        future_map._maybe_init_dsa_topk_indices_buf(
+            RelayPayload(bonus_tokens=torch.zeros((2,), dtype=torch.int64))
+        )
+        self.assertIsNone(future_map.dsa_topk_indices_buf)
+
+        seeds = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+        future_map._maybe_init_dsa_topk_indices_buf(
+            RelayPayload(
+                bonus_tokens=torch.zeros((2,), dtype=torch.int64),
+                dsa_topk_indices=seeds,
+            )
+        )
+        self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
+        self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):

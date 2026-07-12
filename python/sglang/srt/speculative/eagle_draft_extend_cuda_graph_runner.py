@@ -69,6 +69,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -234,6 +235,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
+        dsa_seed_topk_capture = (
+            torch.full(
+                (self.max_num_token, self.eagle_worker.dsa_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            if self.eagle_worker.seed_dsa_topk_from_draft_extend
+            else None
+        )
+
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -249,6 +261,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
         self.buffers.share_buffers()
 
@@ -385,9 +398,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             padded_static_len=self.padded_static_len,
         )
 
-        forward_batch.capture_dsa_topk_indices = (
-            self.eagle_worker.seed_dsa_topk_from_draft_extend
-        )
+        if self.buffers.dsa_seed_topk_capture is not None:
+            spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
+                :num_tokens
+            ]
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -404,7 +418,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            topk_indices_backup = forward_batch.topk_indices
 
             ret = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -422,11 +435,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 probs = torch.softmax(ret.next_token_logits, dim=-1)
                 ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret.dsa_topk_indices = forward_batch.topk_indices
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
-            forward_batch.topk_indices = topk_indices_backup
             return ret
 
         with forward_context(
@@ -602,6 +613,5 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
             hidden_states=out.hidden_states[:num_tokens],
-            dsa_topk_indices=getattr(out, "dsa_topk_indices", None),
         )
         return out

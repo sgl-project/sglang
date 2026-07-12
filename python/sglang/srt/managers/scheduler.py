@@ -1138,14 +1138,10 @@ class Scheduler(
             disagg_hidden_states_dtype = torch.float32
 
         output_dsa_topk_indices_dim = 0
-        if (
-            self.spec_algorithm.is_eagle()
-            and self.draft_worker is not None
-            and self.server_args.speculative_eagle_topk == 1
-        ):
-            hf_config = draft_runner.model_config.hf_config
-            if getattr(hf_config, "index_share_for_mtp_iteration", False):
-                output_dsa_topk_indices_dim = getattr(hf_config, "index_topk", 0) or 0
+        if self.spec_algorithm.is_eagle() and self.draft_worker is not None:
+            eagle_draft_worker = self.draft_worker.draft_worker
+            if getattr(eagle_draft_worker, "seed_dsa_topk_from_draft_extend", False):
+                output_dsa_topk_indices_dim = eagle_draft_worker.dsa_index_topk
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
