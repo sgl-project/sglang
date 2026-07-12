@@ -19,7 +19,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -246,7 +246,7 @@ class MambaAttnBackendBase(AttentionBackend):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
@@ -265,7 +265,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -336,7 +336,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """Per-row (length bs) bool flush mask = the radix track's seq_lens_cpu %
         mamba_track_interval == 0, so force-flush and snapshot fire on the same
         steps (no off-by-one)."""
-        interval = get_global_server_args().mamba_track_interval
+        interval = get_server_args().mamba_track_interval
         if seq_lens_cpu is None:
             # Should not happen for the supported config; stay safe and never flush.
             return torch.zeros((bs,), dtype=torch.bool)
@@ -747,8 +747,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         # Page-major stores state strided; only the stride-aware Triton causal-conv
         # reads it (CUDA causal_conv1d garbles it). A model may also force Triton.
         use_triton_causal_conv = (
-            use_triton_causal_conv
-            or get_global_server_args().enable_page_major_kv_layout
+            use_triton_causal_conv or get_server_args().enable_page_major_kv_layout
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         mixer_out, intermediate_states = mixer.forward(

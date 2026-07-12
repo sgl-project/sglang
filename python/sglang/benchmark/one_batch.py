@@ -70,7 +70,6 @@ from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -80,6 +79,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -503,7 +503,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=get_attention_tp_size(),
+            attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,

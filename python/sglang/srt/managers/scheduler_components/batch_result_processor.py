@@ -16,8 +16,8 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
 )
@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -492,7 +492,7 @@ class SchedulerBatchResultProcessor:
             logger.error(
                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
             )
-            self.abort_request(AbortReq(rid=req.rid))
+            req.to_finish = FINISH_ABORT()
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -611,7 +611,7 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            self.abort_request(AbortReq(rid=req.rid))
+            req.to_finish = FINISH_ABORT()
         return retained
 
     def process_batch_result_idle(
@@ -848,7 +848,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_global_server_args().enable_mamba_extra_buffer_lazy()
+                    if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -883,7 +883,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i
         )
@@ -915,7 +915,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_global_server_args().mamba_track_interval
+        interval = get_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
             if req.kv_committed_len % interval == 0:
