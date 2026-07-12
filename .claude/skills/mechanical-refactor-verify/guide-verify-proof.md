@@ -27,12 +27,9 @@
   and never a sample; run the chain verifier over the whole chain:
 
   ```bash
-  python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor.py verify \
+  python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_reproduction_cli.py \
       --base <base-commit> --branch <pr-branch-name> --proof <folder>
   ```
-
-  (`mechanical_refactor.py verify` dispatches to
-  `mechanical_refactor_reproduction_cli.py`, which takes the same arguments.)
 
 - It checks every commit declares `mechanical_provable` or `non_mechanical_provable`,
   runs every provable commit's proof, and prints + writes a full report
@@ -63,7 +60,7 @@
     - Read the commit's diff for relocated code. Concretely, run
       `git show <sha> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
       and look for moved blocks, and run
-      `python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor.py split <sha>`
+      `python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <sha>`
       to see what a relocation recipe would cover.
     - A hidden provable part is not a judgement call: demand the split
       (`guide-split.md` §2.2) — do not approve the commit as-is.
