@@ -25,11 +25,11 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
 
@@ -89,10 +89,8 @@ def maybe_register_hicache_draft(
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
-    from sglang.srt.mem_cache.memory_pool_host import (
-        MLATokenToKVPoolHost,
-        get_mha_host_pool_cls,
-    )
+    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -206,7 +204,9 @@ def build_kv_cache(
         # TreeCache.page_size should keep the same as allocator.page_size to
         # avoid kv page eviction conflicts.
         page_size=(
-            page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
+            page_size
+            if not get_parallel().dcp_enabled
+            else token_to_kv_pool_allocator.page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
