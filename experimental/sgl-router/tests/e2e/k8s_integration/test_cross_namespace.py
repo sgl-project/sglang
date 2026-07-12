@@ -149,49 +149,9 @@ def cluster_scoped_router(k8s_cluster):
     _ensure_namespace(EXTRA_NAMESPACE)
     _ensure_service_in_ns(EXTRA_NAMESPACE)
 
-    # ConfigMap for the cluster-scoped router: empty namespace = watch all
-    cluster_config = """[server]
-host = "0.0.0.0"
-port = 8091
-
-[[models]]
-id = "tiny"
-tokenizer_path = "/etc/tokenizer/tiny.json"
-policy = "round_robin"
-
-[discovery]
-backend = "k8s"
-
-[discovery.k8s]
-namespace = ""
-label_selector = "app=sglang,cross-ns-test=true"
-"""
-    _kubectl(
-        "create",
-        "configmap",
-        "sgl-router-cluster-config",
-        f"--from-literal=router-cluster.toml={cluster_config}",
-        "-n",
-        NAMESPACE,
-        "--dry-run=client",
-        "-o",
-        "yaml",
-        check=True,
-    )
-    # pipe through apply
-    proc = _kubectl(
-        "create",
-        "configmap",
-        "sgl-router-cluster-config",
-        f"--from-literal=router-cluster.toml={cluster_config}",
-        "-n",
-        NAMESPACE,
-        "--dry-run=client",
-        "-o",
-        "yaml",
-    )
-    _apply_from_stdin(proc.stdout)
-
+    # The cluster-scoped router is configured via CLI flags in
+    # router-cluster-scoped.yaml: no --service-discovery-namespace (watch
+    # all namespaces) and --selector app=sglang,cross-ns-test=true.
     _kubectl("apply", "-f", str(router_manifest))
 
     # The cluster-scoped router's /readyz blocks on registry-not-empty, so

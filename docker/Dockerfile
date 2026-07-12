@@ -10,17 +10,18 @@ ARG HOPPER_SBO=0
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.3
+ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.2
+ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.11.post1
+ARG FLASHINFER_VERSION=0.6.14
 ARG MOONCAKE_VERSION=0.3.11.post1
+ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -243,7 +244,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch torchvision torchaudio --force-reinstall; \
+               torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
@@ -331,7 +332,7 @@ ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
 
-# Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
+# Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -341,6 +342,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
+    # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
+    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /flashinfer_jit_output/ \
+    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
@@ -443,6 +448,7 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
+ARG MSCCLPP_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -456,7 +462,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer jit-cache package (if installed)
+# Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
@@ -523,6 +529,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
 
+# Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    && case "${CUDA_VERSION}" in \
+           12.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
+               ;; \
+           13.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda13]"; \
+               ;; \
+           *) \
+               echo "Unsupported CUDA version for MSCCL++: ${CUDA_VERSION}" && exit 1; \
+               ;; \
+       esac \
+    && rm -rf /tmp/mscclpp
+
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -c /sgl-workspace/constraints.txt \
@@ -543,6 +567,30 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     tabulate \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+
+# Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
+# INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
+# it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
+# resolves the latest (highest-version) nightly, matching `pip install --pre`;
+# set it to pin an exact version for a reproducible build.
+ARG INSTALL_DYNAMO=0
+ARG DYNAMO_VERSION=
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        if [ -z "$DYNAMO_VERSION" ]; then \
+            index="$(curl -fsSL --retry 3 --retry-delay 2 https://pypi.nvidia.com/ai-dynamo/)" \
+                || { echo "ERROR: failed to fetch the ai-dynamo index from pypi.nvidia.com"; exit 1; }; \
+            DYNAMO_VERSION="$(printf '%s\n' "$index" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}' | sort -Vu | tail -1)"; \
+            case "$DYNAMO_VERSION" in \
+                *.*.*.dev????????) : ;; \
+                *) echo "ERROR: no X.Y.Z.devYYYYMMDD nightly found in the index (format may have changed)"; exit 1 ;; \
+            esac; \
+        fi; \
+        echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
+        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+    fi
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
@@ -601,6 +649,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_DYNAMO=0
 
 WORKDIR /sgl-workspace
 
@@ -635,6 +684,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                  success=1 && break; \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
+             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
+             # combo (e.g. cu129 publishes no torch>=2.10 cubin), fall back to \
+             # runtime JIT instead of failing the build, mirroring the aarch64 branch. \
+             if [ "$success" != "1" ]; then \
+                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
+                 success=1; \
+             fi; \
          fi; \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
@@ -645,8 +701,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
+# When ai-dynamo is installed (dev image), reinstall the gateway wheel with
+# --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
+# Otherwise resolve the gateway's own dependencies normally.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl; \
+    else \
+        python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl; \
+    fi \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory

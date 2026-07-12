@@ -17,7 +17,6 @@ Usage:
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
 """
 
-from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
@@ -25,7 +24,6 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 import random
-import time
 import unittest
 import unittest.mock
 from array import array
@@ -49,13 +47,6 @@ DEFAULT_PAGE_SIZE = 4
 class TestRadixKey(unittest.TestCase):
     """Test cases for RadixKey class."""
 
-    def test_init_basic(self):
-        """Test basic initialization of RadixKey."""
-        token_ids = [1, 2, 3, 4]
-        key = RadixKey(array("q", token_ids))
-        self.assertEqual(list(key.token_ids), token_ids)
-        self.assertIsNone(key.extra_key)
-
     def test_init_with_extra_key(self):
         """Test initialization with extra_key."""
         token_ids = [1, 2, 3]
@@ -63,20 +54,6 @@ class TestRadixKey(unittest.TestCase):
         key = RadixKey(array("q", token_ids), extra_key)
         self.assertEqual(list(key.token_ids), token_ids)
         self.assertEqual(key.extra_key, extra_key)
-
-    def test_len(self):
-        """Test __len__ method."""
-        key = RadixKey(array("q", [1, 2, 3]))
-        self.assertEqual(len(key), 3)
-
-        empty_key = RadixKey(array("q", []))
-        self.assertEqual(len(empty_key), 0)
-
-    def test_iter(self):
-        """Test __iter__ method."""
-        token_ids = [1, 2, 3, 4]
-        key = RadixKey(array("q", token_ids))
-        self.assertEqual(list(key), token_ids)
 
     def test_len_and_iter(self):
         """Test __len__ and __iter__ methods."""
@@ -127,20 +104,59 @@ class TestRadixKey(unittest.TestCase):
         with self.assertRaises(IndexError):
             _ = key[10]  # Out of bounds
 
-    def test_repr(self):
-        """Test __repr__ method."""
-        key = RadixKey(array("q", [1, 2, 3]), "test")
-        repr_str = repr(key)
-        self.assertIn("RadixKey", repr_str)
-        self.assertIn("extra_key='test'", repr_str)
-        self.assertIn("[1, 2, 3]", repr_str)
+    def _assert_match(self, a, b, page_size, expected, is_bigram=False):
+        key_a = RadixKey(array("q", a), is_bigram=is_bigram)
+        key_b = RadixKey(array("q", b), is_bigram=is_bigram)
+        self.assertEqual(key_a.match(key_b, page_size=page_size), expected)
 
-    def test_repr_long_token_ids(self):
-        """Test __repr__ with long token_ids."""
-        long_tokens = list(range(15))
-        key = RadixKey(array("q", long_tokens))
-        repr_str = repr(key)
-        self.assertIn("...", repr_str)  # Should be truncated
+    def test_match_page_size_1(self):
+        """match() with page_size=1: full, partial, none, prefix, and empty keys."""
+        self._assert_match([1, 2, 3, 4], [1, 2, 3, 4], 1, 4)  # identical
+        self._assert_match([1, 2, 3, 4], [1, 2, 9, 9], 1, 2)  # diverge at index 2
+        self._assert_match([9, 2, 3], [1, 2, 3], 1, 0)  # diverge at index 0
+        self._assert_match([1, 2, 3, 4], [1, 2, 3], 1, 3)  # other is a prefix
+        self._assert_match([], [1, 2], 1, 0)  # empty self
+        self._assert_match([1, 2], [], 1, 0)  # empty other
+        self._assert_match([], [], 1, 0)  # both empty
+
+    def test_match_page_size_gt_1_rounds_down(self):
+        """match() with page_size>1 rounds the shared length down to a page."""
+        self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 9, 8], 4, 4)
+        self._assert_match(
+            [1, 2, 3, 4], [1, 9, 3, 4], 4, 0
+        )  # diverge inside first page
+        self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 9, 6, 7, 8], 4, 4)
+        self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8], 4, 8)
+        self._assert_match([1, 2, 3], [1, 2, 3], 4, 0)  # shorter than one page
+
+    def test_match_long_keys_exponential_search(self):
+        """Deep divergences exercise the doubling gallop windows + binary search.
+
+        ``base`` has distinct values, so flipping one position diverges the prefix
+        exactly there; the shared length is that index rounded down to the page.
+        """
+        base = list(range(2000))
+        for div in (1, 2, 63, 64, 65, 127, 128, 511, 512, 513, 1234, 1999):
+            b = base[:]
+            b[div] = -1
+            for page_size in (1, 4, 64):
+                with self.subTest(div=div, page_size=page_size):
+                    self._assert_match(
+                        base, b, page_size, (div // page_size) * page_size
+                    )
+        # Full match of a long key: the gallop must reach the end.
+        self._assert_match(base, base[:], 64, (2000 // 64) * 64)
+
+    def test_match_bigram(self):
+        """is_bigram: L matching raw tokens imply L-1 matching bigrams."""
+        self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 9, 5], 1, 2, is_bigram=True)
+        self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 4, 5], 1, 4, is_bigram=True)
+        self._assert_match([1, 2], [1, 2], 1, 1, is_bigram=True)
+        # Raw diverge at token 70 -> 69 matching bigrams -> rounded down to 64.
+        long_a = list(range(130))
+        long_b = list(range(130))
+        long_b[70] = -1
+        self._assert_match(long_a, long_b, 64, 64, is_bigram=True)
 
 
 class TestTreeNode(unittest.TestCase):
@@ -170,13 +186,6 @@ class TestTreeNode(unittest.TestCase):
         self.assertEqual(node.id, 42)
         node2 = TreeNode()
         self.assertEqual(node2.id, 1)  # Counter was incremented
-
-    def test_counter_increment(self):
-        """Test that counter increments properly."""
-        node1 = TreeNode()
-        node2 = TreeNode()
-        self.assertEqual(node1.id, 0)
-        self.assertEqual(node2.id, 1)
 
     def test_evicted_backuped_properties(self):
         """Test evicted and backuped properties."""
@@ -258,15 +267,6 @@ class TestTreeNode(unittest.TestCase):
                 n4.parent = n3
                 n4.hash_value = ["h4"]
                 self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
-
-    def test_lt_comparison(self):
-        """Test less than comparison based on last_access_time."""
-        node1 = TreeNode()
-        time.sleep(0.001)  # Small delay to ensure different timestamps
-        node2 = TreeNode()
-
-        self.assertTrue(node1 < node2)
-        self.assertFalse(node2 < node1)
 
 
 class TestRadixCache(unittest.TestCase):
@@ -430,22 +430,25 @@ class TestRadixCache(unittest.TestCase):
         mock_allocator.device = torch.device("cpu")
 
         cache = RadixCache.create_simulated(
-            mock_allocator=mock_allocator, enable_kv_cache_events=True
+            mock_allocator=mock_allocator,
+            page_size=2,
+            enable_kv_cache_events=True,
         )
 
         # Insert and then evict data
+        seq = [1, 2, 3, 4]
         cache.insert(
             InsertParams(
-                key=RadixKey(array("q", [1, 2, 3])),
-                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+                key=RadixKey(array("q", seq)),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
             )
         )
-        result = cache.evict(EvictParams(num_tokens=3))
+        result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertIsInstance(result, EvictResult)
         self.assertGreaterEqual(
             result.num_tokens_evicted,
-            3,
-            f"evicted {result.num_tokens_evicted} tokens, expected at least 3",
+            len(seq),
+            f"evicted {result.num_tokens_evicted} tokens, expected at least {len(seq)}",
         )
 
         # Take events - should include both store and remove events
@@ -456,10 +459,15 @@ class TestRadixCache(unittest.TestCase):
         event_types = [type(event).__name__ for event in events]
         self.assertIn("BlockStored", event_types)
 
+        stored_hashes = [
+            event.block_hashes[0] for event in events if isinstance(event, BlockStored)
+        ]
+        self.assertEqual(len(stored_hashes), 2)
+
         # Verify BlockRemoved event content
         remove_events = [e for e in events if isinstance(e, BlockRemoved)]
-        for event in remove_events:
-            self.assertGreater(len(event.block_hashes), 0)
+        self.assertEqual(len(remove_events), 1)
+        self.assertEqual(remove_events[0].block_hashes, stored_hashes)
 
     def test_extra_key_isolation(self):
         """Test that keys with different extra_key values are isolated."""
@@ -615,46 +623,6 @@ class TestRadixCache(unittest.TestCase):
                 match_len = len(result.device_indices)
                 self.assertEqual(match_len % page_size, 0)
 
-    def test_pretty_print_basic(self):
-        """Test pretty_print produces output."""
-        cache = RadixCache.create_simulated()
-
-        cache.insert(
-            InsertParams(
-                key=RadixKey(array("q", [1, 2, 3])),
-                value=torch.tensor([10, 20, 30], dtype=torch.int64),
-            )
-        )
-
-        # Just test that it doesn't crash
-        try:
-            cache.pretty_print()
-        except Exception as e:
-            self.fail(f"pretty_print raised an exception: {e}")
-
-    def test_all_values_flatten(self):
-        """Test all_values_flatten method."""
-        cache = RadixCache.create_simulated()
-
-        cache.insert(
-            InsertParams(
-                key=RadixKey(array("q", [1, 2])),
-                value=torch.tensor([10, 20], dtype=torch.int64),
-            )
-        )
-        cache.insert(
-            InsertParams(
-                key=RadixKey(array("q", [3, 4])),
-                value=torch.tensor([30, 40], dtype=torch.int64),
-            )
-        )
-
-        all_values = cache.all_values_flatten()
-        self.assertEqual(len(all_values), 4)
-        # Values should contain all inserted values (order may vary)
-        values_set = set(all_values.tolist())
-        self.assertEqual(values_set, {10, 20, 30, 40})
-
     def test_advanced_prefix_match_with_node_splits(self):
         """Advanced prefix matching: splits inside nodes and across pages."""
         for page_size in [1, 2]:
@@ -809,9 +777,11 @@ class TestRadixCache(unittest.TestCase):
         torch_allocated_before = torch.cuda.memory_allocated()
 
         # build dataset with common prefix
-        common_prefix = [random.randint(1, vocab_size) for _ in range(base_prefix_len)]
+        common_prefix = [
+            random.randint(1, vocab_size - 1) for _ in range(base_prefix_len)
+        ]
         for _ in range(num_seqs):
-            suffix = [random.randint(1, vocab_size) for _ in range(suffix_len)]
+            suffix = [random.randint(1, vocab_size - 1) for _ in range(suffix_len)]
             seq = common_prefix + suffix
             keys.append(seq)
             values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))
@@ -830,14 +800,6 @@ class TestRadixCache(unittest.TestCase):
 
         # The cache size should be within reasonable bounds of the actual allocated memory.
         self.assertLess(torch_allocated, cache_size_bytes * 2)
-
-    def test_available_and_evictable_str(self):
-        mock_allocator = unittest.mock.Mock()
-        mock_allocator.available_size.return_value = 10
-        cache: RadixCache = RadixCache.create_simulated(mock_allocator=mock_allocator)
-
-        print(cache.available_and_evictable_str())
-        print(available_and_evictable_str(cache))
 
 
 if __name__ == "__main__":

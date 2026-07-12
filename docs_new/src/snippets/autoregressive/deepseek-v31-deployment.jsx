@@ -9,7 +9,8 @@ export const DeepSeekV31Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     modelname: {
@@ -17,7 +18,8 @@ export const DeepSeekV31Deployment = () => {
       title: 'Model Name',
       items: [
         { id: 'v31', label: 'DeepSeek-V3.1', default: true },
-        { id: 'v31terminus', label: 'DeepSeek-V3.1-Terminus', default: false }
+        { id: 'v31terminus', label: 'DeepSeek-V3.1-Terminus', default: false },
+        { id: 'v31terminusint8', label: 'DeepSeek-V3.1-Terminus-Channel-int8', default: false, xeonOnly: true }
       ]
     },
     strategy: {
@@ -26,9 +28,9 @@ export const DeepSeekV31Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', default: true, required: true },
-        { id: 'dp', label: 'DP attention', default: false },
-        { id: 'ep', label: 'EP', default: false },
-        { id: 'mtp', label: 'Multi-token Prediction', default: false }
+        { id: 'dp', label: 'DP attention', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'ep', label: 'EP', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'mtp', label: 'Multi-token Prediction', default: false, disabledWhen: (v) => v.hardware === 'xeon' }
       ]
     },
     reasoningParser: {
@@ -83,7 +85,28 @@ export const DeepSeekV31Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        if (next.hardware === 'xeon') {
+          next.modelname = 'v31terminusint8';
+        } else {
+          const m = options.modelname.items.find(i => i.id === next.modelname);
+          if (m && m.xeonOnly) {
+            next.modelname = options.modelname.items.find(i => !i.xeonOnly && i.default)?.id || 'v31';
+          }
+        }
+        const strategyItems = options.strategy.items || [];
+        const current = Array.isArray(next.strategy) ? next.strategy : [];
+        next.strategy = current.filter(id => {
+          const item = strategyItems.find(s => s.id === id);
+          if (!item) return false;
+          if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) return false;
+          return true;
+        });
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -104,17 +127,26 @@ export const DeepSeekV31Deployment = () => {
 
     // Model name mapping
     const modelMap = {
-      'v31': 'DeepSeek-V3.1',
-      'v31terminus': 'DeepSeek-V3.1-Terminus'
+      'v31': 'deepseek-ai/DeepSeek-V3.1',
+      'v31terminus': 'deepseek-ai/DeepSeek-V3.1-Terminus',
+      'v31terminusint8': 'IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8'
     };
 
-    const modelName = `deepseek-ai/${modelMap[modelname]}`;
+    const modelName = modelMap[modelname];
+    const isXeon = hardware === 'xeon';
 
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelName}`;
 
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      if (modelname === 'v31terminusint8') {
+        cmd += ` \\\n  --quantization w8a8_int8`;
+      }
+    }
+
     // TP is mandatory
-    cmd += ` \\\n  --tp 8`;
+    cmd += isXeon ? ` \\\n  --tp 6` : ` \\\n  --tp 8`;
     if (strategyArray.includes('dp')) {
       cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
     }
@@ -141,6 +173,7 @@ export const DeepSeekV31Deployment = () => {
       cmd += ` \\\n  --chat-template ./examples/chat_template/tool_chat_template_deepseekv31.jinja`;
     }
 
+
     return cmd;
   };
 
@@ -164,10 +197,11 @@ export const DeepSeekV31Deployment = () => {
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
+                const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
+                const isDisabled = item.required || dynDisabled;
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
+                  <label key={item.id} title={dynDisabled ? 'Not supported on the selected hardware' : ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => !dynDisabled && handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
@@ -176,9 +210,10 @@ export const DeepSeekV31Deployment = () => {
             ) : (
               option.items.map(item => {
                 const isChecked = values[option.name] === item.id;
+                const isDisabled = item.xeonOnly && values.hardware !== 'xeon';
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  <label key={item.id} title={isDisabled ? 'Only available when XEON hardware is selected' : undefined} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>

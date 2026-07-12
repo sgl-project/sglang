@@ -16,6 +16,19 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
+## First-Done-First-Out (FDFO) Scheduling
+
+FDFO scheduling is **enabled by default**: each request leaves the batch as soon as its block is resolved, instead of advancing in lockstep where fast-converging requests must wait for slow long-tail requests before leaving the batch (head-of-line blocking). This improves throughput and is orthogonal to `--dllm-algorithm`, so it works with any dLLM algorithm. Pass `--no-dllm-fdfo` to fall back to synchronous lockstep scheduling:
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path inclusionAI/LLaDA2.0-mini \
+  --dllm-algorithm LowConfidence \
+  --no-dllm-fdfo \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ## Example Configuration File
 
 Depending on the algorithm selected, the configuration parameters vary.
@@ -128,6 +141,11 @@ Below the supported models are summarized in a table.
       <td><strong>SDAR (JetLM)</strong></td>
       <td><code>JetLM/SDAR-30B-A3B-Chat</code></td>
       <td>SDAR series diffusion language model (Chat), MoE architecture.</td>
+    </tr>
+    <tr>
+      <td><strong>DiffusionGemma</strong></td>
+      <td><code>google/diffusiongemma-26B-A4B-it</code></td>
+      <td>Uniform-state (renoising) block-diffusion multimodal (text + image) MoE, 25.2B total / 3.8B active, served with the <code>Gemma4Renoise</code> sampler.</td>
     </tr>
   </tbody>
 </table>

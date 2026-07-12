@@ -18,11 +18,18 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu, support_triton
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    support_triton,
+)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
@@ -31,9 +38,13 @@ if _is_cuda:
 if _is_npu:
     import torch_npu
 
+if _is_xpu:
+    from sgl_kernel import multimodal_rotary_embedding
 
 import triton
 import triton.language as tl
+
+from sglang.srt.runtime_context import get_server_args
 
 
 @triton.jit
@@ -205,7 +216,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.register_buffer("axis_map", axis_map, persistent=False)
         else:
             self.axis_map = None
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
     def get_cos_sin_with_position(self, positions):
@@ -217,7 +228,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_global_server_args().attention_backend):
+            if support_triton(get_server_args().attention_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:
@@ -377,7 +388,20 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
         if positions.ndim == 2 and self.mrope_section:
-            return self.forward_triton(positions, query, key)
+            multimodal_rotary_embedding(
+                query,
+                key,
+                self.cos_sin_cache,
+                positions,
+                self.mrope_section,
+                self.head_size,
+                self.rotary_dim,
+                self.mrope_interleaved,
+                self.mrope_interleaved_glm,
+                self.is_neox_style,
+                self.axis_map,
+            )
+            return query, key
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     @staticmethod

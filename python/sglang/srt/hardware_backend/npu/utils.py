@@ -56,27 +56,28 @@ def set_default_server_args(args: "ServerArgs"):
         args.page_size = 128
 
     # NPU memory settings
+    decode = args.cuda_graph_config.decode
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1
-        # (chunked_prefill_size 4k, cuda_graph_max_bs 16 if tp < 4 else 64)
+        # (chunked_prefill_size 4k, max_bs 16 if tp < 4 else 64)
         if args.chunked_prefill_size is None:
             args.chunked_prefill_size = 4 * 1024
-        if args.cuda_graph_max_bs is None:
+        if decode.max_bs is None:
             if args.tp_size < 4:
-                args.cuda_graph_max_bs = 16
+                decode.max_bs = 16
             else:
-                args.cuda_graph_max_bs = 64
+                decode.max_bs = 64
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
-        # (chunked_prefill_size 8k, cuda_graph_max_bs 64 if tp < 4 else 256)
+        # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
         if args.chunked_prefill_size is None:
             args.chunked_prefill_size = 8 * 1024
-        if args.cuda_graph_max_bs is None:
+        if decode.max_bs is None:
             if args.tp_size < 4:
-                args.cuda_graph_max_bs = 64
+                decode.max_bs = 64
             else:
-                args.cuda_graph_max_bs = 256
+                decode.max_bs = 256
 
     # NPU does not support CustomAllReduce
     args.disable_custom_all_reduce = True
@@ -98,7 +99,12 @@ def init_npu_backend():
 
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
-    import sgl_kernel_npu  # noqa: F401
+    try:
+        import custom_ops  # noqa: F401
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError as e:
+        logger.warning("NPU custom kernel packages unavailable: %s", e)
+
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
@@ -134,6 +140,9 @@ def _is_nz_aligned(tensor: torch.Tensor) -> bool:
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+    *,
+    customize_dtype=None,
+    input_dtype=None,
 ) -> torch.Tensor:
     """
     Cast a tensor to a specific NPU ACL format.
@@ -141,6 +150,12 @@ def npu_format_cast(
     Args:
         tensor (torch.Tensor): The input tensor.
         acl_format (NPUACLFormat): The target NPU ACL format.
+        customize_dtype / input_dtype: packed-FP4 unpack kwargs (e.g.
+            ``customize_dtype=torch.float8_e4m3fn``,
+            ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
+            kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
+            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
+            ND fallback would corrupt results.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -160,6 +175,21 @@ def npu_format_cast(
         )
         return tensor
 
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
+        return tensor
+
+    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
+    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
+    # silent ND fallback would corrupt results.
+    if customize_dtype is not None or input_dtype is not None:
+        return torch.ops.npu.npu_format_cast(
+            tensor,
+            int(acl_format),
+            customize_dtype=customize_dtype,
+            input_dtype=input_dtype,
+        )
+
     if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
         k, n = tensor.shape[-2], tensor.shape[-1]
         logger.warning_once(
@@ -170,10 +200,6 @@ def npu_format_cast(
             n,
             tensor.dtype,
         )
-        return tensor
-
-    # Skip format cast for meta tensors (used in offloader)
-    if tensor.device.type == "meta":
         return tensor
 
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
@@ -216,7 +242,7 @@ def init_zbal(world_size, gpu_id, world_rank, do_check=True):
         gva_is_inited = True
 
         if do_check and not ret:
-            logger.error(f"[ZBAL] zbal init failed!")
+            logger.error("[ZBAL] zbal init failed!")
             sys.exit(-1)
 
         return ret
@@ -271,7 +297,7 @@ def lazy_init_zbal_gva_mem(
 
     gva_is_inited = True
     if do_check and not res:
-        logger.error(f"[ZBAL] zbal lazy init failed!")
+        logger.error("[ZBAL] zbal lazy init failed!")
         sys.exit(-1)
     return res
 

@@ -39,9 +39,11 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     KimiVLConfig,
     LagunaConfig,
+    LocateAnythingConfig,
     LongcatFlashConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
+    MiniMaxM3VLConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -84,6 +86,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
         Step3VLConfig,
@@ -110,6 +113,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        MiniMaxM3VLConfig,
     ]
 }
 
@@ -137,7 +141,6 @@ try:
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
 except ImportError:
     pass
-
 
 # Newer transformers versions (>5.9.0) will expose MellumConfig directly,
 # but fallback to Qwen3MoeConfig for older versions.
@@ -168,6 +171,16 @@ try:
 except ImportError:
     pass
 
+
+try:
+    from transformers import Gemma4Config as _HFGemma4Config
+
+    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
+        model_type = "gemma4_unified"
+
+    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
+except ImportError:
+    pass
 
 for name, cls in _CONFIG_REGISTRY.items():
     try:
@@ -212,6 +225,33 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     return hf_hub_download(
         model_name_or_path, filename, revision=revision, local_files_only=True
     )
+
+
+def _cached_file_exists(model_name_or_path, filename, revision=None) -> bool:
+    """Whether *filename* is available locally or in the HF cache (no network)."""
+    try:
+        _resolve_local_or_cached_file(model_name_or_path, filename, revision)
+        return True
+    except Exception:
+        return False
+
+
+def _remote_file_exists(repo_id, filename, revision=None) -> bool:
+    """Whether *filename* exists on the HF hub (HEAD request only, no download).
+
+    Returns False on any error (offline, gated, network, invalid id) so callers
+    fall back to their default path instead of crashing.
+    """
+    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+    if HF_HUB_OFFLINE:
+        return False
+    try:
+        from huggingface_hub import HfApi
+
+        return HfApi().file_exists(repo_id, filename, revision=revision)
+    except Exception:
+        return False
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:

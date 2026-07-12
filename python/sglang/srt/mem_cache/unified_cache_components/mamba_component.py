@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -52,6 +52,7 @@ class MambaComponent(TreeComponent):
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {cache.page_size}"
         super().__init__(cache, params)
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -83,7 +84,7 @@ class MambaComponent(TreeComponent):
         # states. We temporarily skip branching-state fill in that mode and can
         # add a HiCache-aware branching policy later.
         if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
-            chunk_size = get_global_server_args().mamba_cache_chunk_size
+            chunk_size = get_server_args().mamba_cache_chunk_size
             aligned_seqlen = (
                 sum(len(v) for v in value_chunks) // chunk_size
             ) * chunk_size
@@ -95,7 +96,7 @@ class MambaComponent(TreeComponent):
         if cow_mamba and mamba_value is not None:
             assert req is not None
             if req.mamba_pool_idx is None:
-                dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     # Capture the inc result and thread swa_uuid_for_lock back
                     # into dec. Without it, SWA's release walks past this
@@ -104,7 +105,7 @@ class MambaComponent(TreeComponent):
                     # on ancestor nodes.
                     lock_result = self.cache.inc_lock_ref(last_node)
                     self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                    dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                     self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
                     assert dst_index is not None, "Can not alloc mamba cache"
                 req.mamba_pool_idx = dst_index[0]
@@ -112,10 +113,12 @@ class MambaComponent(TreeComponent):
             req.mamba_needs_clear = False
 
         # HiCache: if mamba was evicted from device but has host backup,
-        # ensure host_hit_length >= 1 so load_back is triggered.
+        # ensure mamba_host_hit_length >= 1 so load_back is triggered.
         cd = last_node.component_data[self.component_type]
         if cd.value is None and cd.host_value is not None:
-            result = result._replace(host_hit_length=max(result.host_hit_length, 1))
+            result = result._replace(
+                mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
+            )
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
 
@@ -171,7 +174,7 @@ class MambaComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            self.cache.req_to_token_pool.mamba_pool.free(cd.value)
+            self._free_mamba_value(cd.value)
             freed = len(cd.value)
             self.cache.component_evictable_size_[self.component_type] -= freed
             cd.value = None
@@ -284,12 +287,39 @@ class MambaComponent(TreeComponent):
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
-        slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+        slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+            slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
+
+    @property
+    def int8_ckpt_pool(self):
+        return getattr(self.cache.req_to_token_pool, "mamba_ckpt_pool", None)
+
+    def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
+        slot = self.int8_ckpt_pool.alloc(1)
+        if slot is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.int8_ckpt_pool.alloc(1)
+            assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
+        return slot
+
+    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
+        ckpt_slot = self._alloc_int8_ckpt_slot()
+        self.int8_ckpt_pool.store_from_active(
+            self.cache.req_to_token_pool.mamba_pool,
+            active_slots.view(-1),
+            ckpt_slot,
+        )
+        return ckpt_slot
+
+    def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
+        if self.int8_ckpt_pool is not None:
+            self.int8_ckpt_pool.free(mamba_value)
+        else:
+            self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
     def prepare_for_caching_req(
         self,
@@ -298,44 +328,74 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        cache_len = (
-            req.mamba_last_track_seqlen
-            if self.enable_mamba_extra_buffer
-            else token_ids_len
-        )
+        if self.enable_mamba_extra_buffer:
+            cache_len = req.mamba_last_track_seqlen
+        else:
+            cache_len = token_ids_len
+            # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
+            # slot's unflushed ring depth (`write_pos`), so on request finish cap
+            # the donate to the last flush boundary (where temporal is current)
+            # and reset the cursor, keeping the donated checkpoint consistent with
+            # its key length. page_size is asserted == 1, so no realign. Mirrors
+            # MambaRadixCache.cache_finished_req.
+            if is_finished:
+                write_pos_buf = (
+                    self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
+                )
+                if write_pos_buf is not None:
+                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
+                    write_pos_buf[req.mamba_pool_idx] = 0
+
         if is_finished:
             if cache_len is None:
                 cache_len = 0
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
+                    req
                 )
-                mamba_value = (
+                active_value = (
                     req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
             else:
-                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
-            insert_params.mamba_value = mamba_value
+                active_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+            if self.int8_ckpt_pool is not None:
+                insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
+            else:
+                insert_params.mamba_value = active_value
             return cache_len
         else:
             if cache_len is None:
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
-            if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
+            if self.int8_ckpt_pool is not None:
+                if self.enable_mamba_extra_buffer:
+                    new_slot = self._alloc_mamba_slot()
+                    src_active = (
+                        self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
+                            req, new_slot
+                        )
+                    )
+                    mamba_value_donated = self._commit_int8_checkpoint(src_active)
+                    self.cache.req_to_token_pool.mamba_allocator.free(src_active)
+                else:
+                    mamba_value_donated = self._commit_int8_checkpoint(
+                        req.mamba_pool_idx.view(-1)
+                    )
+            elif self.enable_mamba_extra_buffer:
+                new_slot = self._alloc_mamba_slot()
                 mamba_value_donated = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
+                        req, new_slot
+                    )
                 )
-                req.mamba_ping_pong_track_buffer[keep_idx] = self._alloc_mamba_slot()[0]
-                self.cache.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                    req.req_pool_idx
-                ] = req.mamba_ping_pong_track_buffer
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
+                # mamba_pool is a pure PHYSICAL store; translate both slot ids
+                # virtual->physical (identity for the non-unified memory pool) first.
+                translate = self.cache.req_to_token_pool.translate_mamba_indices
                 self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
+                    translate(req.mamba_pool_idx.unsqueeze(0)),
+                    translate(mamba_value_donated),
                 )
             insert_params.mamba_value = mamba_value_donated
             return cache_len
@@ -348,27 +408,40 @@ class MambaComponent(TreeComponent):
         insert_params: Optional[InsertParams] = None,
     ) -> None:
         if is_finished:
-            mamba_exist = (
-                insert_result.mamba_exist if insert_result is not None else True
+            mamba_value_inserted = (
+                insert_result is not None and not insert_result.mamba_exist
             )
-            if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+            pool = self.cache.req_to_token_pool
+
+            if self.int8_ckpt_pool is not None:
+                insert_value_unused = (
+                    not mamba_value_inserted
+                    and insert_params is not None
+                    and insert_params.mamba_value is not None
                 )
-            else:
-                keep_idx = None
-            if mamba_exist:
-                keep_idx = None
-            free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
-            if free_mamba_cache:
-                self.cache.req_to_token_pool.free_mamba_cache(
+                if insert_value_unused:
+                    self._free_mamba_value(insert_params.mamba_value)
+                pool.free_mamba_cache(req)
+                return
+
+            if self.enable_mamba_extra_buffer:
+                keep_idx = (
+                    pool.get_mamba_ping_pong_keep_idx(req)
+                    if mamba_value_inserted
+                    else None
+                )
+                pool.free_mamba_cache(
                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )
+                return
+
+            if not mamba_value_inserted:
+                pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
-                self.cache.req_to_token_pool.mamba_pool.free(insert_params.mamba_value)
+                self._free_mamba_value(insert_params.mamba_value)
             req.mamba_last_track_seqlen = None
 
     # ---- HiCache Hooks ----
@@ -417,10 +490,10 @@ class MambaComponent(TreeComponent):
             cd = node.component_data[ct]
             if req is not None and cd.host_value is not None:
                 if req.mamba_pool_idx is None:
-                    dst = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                    dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                     if dst is None:
                         self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                        dst = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                         assert dst is not None, "Cannot alloc mamba for load_back"
                     req.mamba_pool_idx = dst[0]
                 transfers.append(
@@ -537,9 +610,9 @@ class MambaComponent(TreeComponent):
         Host leaves: atomic eviction via _evict_host_leaf."""
         ct = self.component_type
         host_lru = self.cache.host_lru_lists[ct]
-        x = host_lru.get_lru_no_lock()
+        x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            x_next = host_lru.get_prev_no_lock(x)
+            x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
             if x in self.cache.evictable_host_leaves:
                 # Host leaf: atomic eviction (all components host + delete)

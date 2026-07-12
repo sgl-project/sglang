@@ -14,7 +14,10 @@
 """Sampling parameters for text generation."""
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+import math
+from typing import Dict, List, Optional, Set, Union
+
+import msgspec
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
@@ -22,13 +25,54 @@ try:
 except ImportError:
     import sre_parse  # Python < 3.11
 
+# JSON-safe value types for custom_params.  Must survive msgpack IPC
+# without PickleWrapper.  After deserialization on the scheduler side,
+# Req.__init__ injects "__req__" (a Req object) into the dict in-process;
+# that augmented dict is never re-serialized.
+_JsonScalar = Union[None, bool, int, float, str]
+CustomParamValue = Union[
+    _JsonScalar,
+    List[_JsonScalar],
+    Dict[str, _JsonScalar],
+]
+
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
 
 
-class SamplingParams:
+def raise_if_tokenizer_required(
+    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
+):
+    """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
+
+    String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()
+    to convert output token IDs to text for matching. min_new_tokens requires the
+    tokenizer's eos_token_id to penalize. When skip_tokenizer_init=True, these cannot
+    be used.
+    """
+    if tokenizer is not None:
+        return
+
+    if stop_strs:
+        raise ValueError(
+            f"stop={stop_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if stop_regex_strs:
+        raise ValueError(
+            f"stop_regex={stop_regex_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if min_new_tokens > 0:
+        raise ValueError(
+            f"min_new_tokens={min_new_tokens} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer for eos_token_id)."
+        )
+
+
+class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     """
     The sampling parameters.
 
@@ -37,77 +81,89 @@ class SamplingParams:
     for the documentation.
     """
 
-    def __init__(
-        self,
-        max_new_tokens: int = 128,
-        stop: Optional[Union[str, List[str]]] = None,
-        stop_token_ids: Optional[List[int]] = None,
-        stop_regex: Optional[Union[str, List[str]]] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = -1,
-        min_p: float = 0.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        repetition_penalty: float = 1.0,
-        min_new_tokens: int = 0,
-        n: int = 1,
-        json_schema: Optional[str] = None,
-        regex: Optional[str] = None,
-        ebnf: Optional[str] = None,
-        structural_tag: Optional[str] = None,
-        ignore_eos: bool = False,
-        skip_special_tokens: bool = True,
-        spaces_between_special_tokens: bool = True,
-        no_stop_trim: bool = False,
-        custom_params: Optional[Dict[str, Any]] = None,
-        stream_interval: Optional[int] = None,
-        logit_bias: Optional[Dict[str, float]] = None,
-        sampling_seed: Optional[int] = None,
-    ) -> None:
+    # --- API parameters (set by callers) ---
+    max_new_tokens: Optional[int] = 128
+    stop: Optional[Union[str, List[str]]] = (
+        None  # API input alias, copied to stop_strs then cleared in normalize()
+    )
+    stop_token_ids: Optional[Set[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = (
+        None  # API input alias, copied to stop_regex_strs then cleared in normalize()
+    )
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = TOP_K_ALL
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_new_tokens: int = 0
+    n: int = 1
+    json_schema: Optional[str] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    structural_tag: Optional[str] = None
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    no_stop_trim: bool = False
+    custom_params: Optional[Dict[str, CustomParamValue]] = None
+    stream_interval: Optional[int] = None
+    logit_bias: Optional[Dict[str, float]] = None
+    sampling_seed: Optional[int] = None
+
+    # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
+    stop_strs: Optional[Union[str, List[str]]] = None  # from stop
+    stop_regex_strs: Optional[Union[str, List[str]]] = None  # from stop_regex
+    stop_str_max_len: int = 0  # set by normalize()
+    stop_regex_max_len: int = 0  # set by normalize()
+    is_normalized: bool = False  # set by normalize()
+
+    def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
-        self.max_new_tokens = max_new_tokens
-        self.stop_strs = stop
-        if stop_token_ids:
-            filtered = {int(t) for t in stop_token_ids if t is not None}
+
+        # msgspec calls __post_init__ after deserialization. Once normalize()
+        # has populated tokenizer-derived fields, avoid resetting them.
+        if self.is_normalized:
+            return
+
+        self.stop_strs = self.stop
+        if self.stop_token_ids:
+            filtered = {int(t) for t in self.stop_token_ids if t is not None}
             self.stop_token_ids = filtered or None
         else:
             self.stop_token_ids = None
-        self.stop_regex_strs = stop_regex
-        self.temperature = temperature if temperature is not None else 1.0
-        self.top_p = top_p if top_p is not None else 1.0
-        self.top_k = top_k if top_k is not None else -1
-        self.min_p = min_p if min_p is not None else 0.0
+        self.stop_regex_strs = self.stop_regex
+        self.temperature = self.temperature if self.temperature is not None else 1.0
+        self.top_p = self.top_p if self.top_p is not None else 1.0
+        self.top_k = self.top_k if self.top_k is not None else -1
+        self.min_p = self.min_p if self.min_p is not None else 0.0
         self.frequency_penalty = (
-            frequency_penalty if frequency_penalty is not None else 0.0
+            self.frequency_penalty if self.frequency_penalty is not None else 0.0
         )
         self.presence_penalty = (
-            presence_penalty if presence_penalty is not None else 0.0
+            self.presence_penalty if self.presence_penalty is not None else 0.0
         )
         self.repetition_penalty = (
-            repetition_penalty if repetition_penalty is not None else 1.0
+            self.repetition_penalty if self.repetition_penalty is not None else 1.0
         )
-        self.min_new_tokens = min_new_tokens if min_new_tokens is not None else 0
-        self.regex = regex
-        self.n = n if n is not None else 1
-        self.json_schema = json_schema
-        self.ebnf = ebnf
-        self.structural_tag = structural_tag
-        self.ignore_eos = ignore_eos if ignore_eos is not None else False
+        self.min_new_tokens = (
+            self.min_new_tokens if self.min_new_tokens is not None else 0
+        )
+        self.n = self.n if self.n is not None else 1
+        self.ignore_eos = self.ignore_eos if self.ignore_eos is not None else False
         self.skip_special_tokens = (
-            skip_special_tokens if skip_special_tokens is not None else True
+            self.skip_special_tokens if self.skip_special_tokens is not None else True
         )
         self.spaces_between_special_tokens = (
-            spaces_between_special_tokens
-            if spaces_between_special_tokens is not None
+            self.spaces_between_special_tokens
+            if self.spaces_between_special_tokens is not None
             else True
         )
-        self.no_stop_trim = no_stop_trim if no_stop_trim is not None else False
-        self.custom_params = custom_params
-        self.stream_interval = stream_interval
-        self.logit_bias = logit_bias
-        self.sampling_seed = sampling_seed
+        self.no_stop_trim = (
+            self.no_stop_trim if self.no_stop_trim is not None else False
+        )
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -118,9 +174,9 @@ class SamplingParams:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
-        if self.temperature < 0.0:
+        if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}."
+                f"temperature must be a non-negative finite number, got {self.temperature}."
             )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
@@ -208,6 +264,16 @@ class SamplingParams:
                 )
 
             self.stop_regex_max_len = stop_regex_max_len
+
+        # Validate tokenizer is available for tokenizer-dependent features
+        raise_if_tokenizer_required(
+            tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
+        )
+
+        # Clear API input aliases so omit_defaults=True drops them from the wire.
+        self.stop = None
+        self.stop_regex = None
+        self.is_normalized = True
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need

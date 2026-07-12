@@ -91,15 +91,18 @@ jobs:
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
+              - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
+              - "python/sglang/srt/observability/**"
               - "python/sglang/jit_kernel/**"
-              - "python/sglang/jit_kernel/tests/diffusion/**"
-              - "python/sglang/jit_kernel/benchmark/diffusion/**"
+              - "test/registered/jit/diffusion/**"
+              - "test/registered/jit/benchmark/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
               - "python/sglang/jit_kernel/**"
+              - "test/registered/jit/**"
             sgl_kernel:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.

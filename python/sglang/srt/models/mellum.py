@@ -25,8 +25,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,7 +51,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda
 
 _is_cuda = is_cuda()
@@ -152,8 +152,8 @@ class MellumAttention(Qwen3MoeAttention):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.config = config
         self.total_num_heads = num_heads
@@ -176,9 +176,7 @@ class MellumAttention(Qwen3MoeAttention):
         rope_type = rope_params.get("rope_type") or "default"
         rope_scaling = rope_params if rope_type != "default" else None
 
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -225,7 +223,7 @@ class MellumAttention(Qwen3MoeAttention):
         _yarn_factor = self._yarn_params["factor"]
 
         self.use_fused_qk_norm_rope = (
-            get_global_server_args().enable_fused_qk_norm_rope
+            get_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
@@ -378,8 +376,8 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             alt_stream=alt_stream,
         )
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         mlp_layer_types = cfg.mlp_layer_types
         num_experts = cfg.num_experts
@@ -475,12 +473,6 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
 
-        from sglang.srt.distributed import (
-            get_attn_context_model_parallel_rank,
-            get_attn_context_model_parallel_world_size,
-            get_moe_data_parallel_world_size,
-            get_pp_group,
-        )
         from sglang.srt.layers.logits_processor import LogitsProcessor
 
         self.pp_group = get_pp_group()
@@ -508,14 +500,14 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             cfg.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(cfg)
         self.capture_aux_hidden_states = False
 
-        self.attn_cp_size = get_attn_context_model_parallel_world_size()
-        self.attn_cp_rank = get_attn_context_model_parallel_rank()
-        self.moe_dp_size = get_moe_data_parallel_world_size()
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.attn_cp_rank = get_parallel().attn_cp_rank
+        self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (
             f"attn_cp_size ({self.attn_cp_size}) must be divisible by "

@@ -24,9 +24,16 @@ on:
           - 'nightly-test-perf-4-gpu-b200'
           - 'nightly-test-perf-8-gpu-b200'
           - 'nightly-test-specialized-8-gpu-b200'
+          - 'nightly-test-perf-4-gpu-gb300'
           - 'nightly-test-kernel-1-gpu-h100'
-          - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-diffusion'
           - 'nightly-test-kernel-8-gpu-h200'
+          - 'nightly-test-precision-8-gpu-h200'
+      force_baseline_update:
+        description: 'precision job only: refresh the rolling baseline instead of comparing (sets SGLANG_PRECISION_FORCE_UPDATE=1). Dispatch once after an intentional forward-path dtype/precision change stales the baseline; later scheduled runs compare against it and go green.'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -46,6 +53,7 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
@@ -227,7 +235,7 @@ jobs:
           GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
       - name: Collect performance metrics
         if: always()
@@ -503,9 +511,95 @@ jobs:
 
       - name: Run test
         timeout-minutes: 200
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "4-gpu-b200"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
+
+      - name: Publish traces to storage repo
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TRACE_ARGS=""
+          for dir in test/performance_profiles_*/; do
+            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
+          done
+          if [ -n "$TRACE_ARGS" ]; then
+            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
+            find test/performance_profiles_*/ -name '*.json.gz' -delete
+          else
+            echo "No trace directories found, skipping publish"
+          fi
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  # GB300 (Grace-Blackwell NVL4) performance tests - 4 GPU (ARM64)
+  nightly-test-perf-4-gpu-gb300:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-4-gpu-gb300')
+    name: nightly-test-perf-4-gpu-gb300 (${{ matrix.model }})
+    runs-on: 4-gpu-gb300-nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: glm5-nvfp4
+            suite: nightly-4-gpu-gb300-glm5-nvfp4
+          - model: qwen35-fp8
+            suite: nightly-4-gpu-gb300-qwen35-fp8
+          - model: deepseek-v4-pro-fp4
+            suite: nightly-4-gpu-gb300-deepseek-v4-pro-fp4
+          - model: kimi-k25-nvfp4
+            suite: nightly-4-gpu-gb300-kimi-k25-nvfp4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        env:
+          GRACE_BLACKWELL: "1"
+        run: |
+          bash scripts/ci/cuda/ci_install_deepep.sh
+
+      - name: Run test
+        timeout-minutes: 600
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "4-gpu-gb300"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite ${{ matrix.suite }} --nightly --continue-on-error --timeout-per-file 7200
+
+      - name: Publish traces to storage repo
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TRACE_ARGS=""
+          for dir in test/performance_profiles_*/; do
+            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
+          done
+          if [ -n "$TRACE_ARGS" ]; then
+            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
+            find test/performance_profiles_*/ -name '*.json.gz' -delete
+          else
+            echo "No trace directories found, skipping publish"
+          fi
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -539,9 +633,9 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
 
-  # Diffusion cross-framework comparison
-  nightly-test-diffusion-comparison:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
+  # SGLang-Diffusion nightly benchmark
+  nightly-test-diffusion:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion')
     runs-on: 4-gpu-h100
     timeout-minutes: 300
     steps:
@@ -554,7 +648,7 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run cross-framework comparison
+      - name: Run diffusion benchmark
         env:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -587,11 +681,11 @@ jobs:
             --dashboard dashboard.md \
             --charts-dir comparison-charts
 
-      - name: Upload comparison artifacts
+      - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-comparison-${{ github.run_id }}
+          name: diffusion-benchmark-${{ github.run_id }}
           path: |
             comparison-results.json
             dashboard.md
@@ -599,6 +693,41 @@ jobs:
             comparison-logs/
           retention-days: 90
           if-no-files-found: ignore
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  # Nightly precision regression - per-layer hidden state comparison
+  nightly-test-precision-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-precision-8-gpu-h200')
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run precision regression test
+        timeout-minutes: 120
+        env:
+          SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
+          # Required: the test errors if SGLANG_PRECISION_HF_REPO is unset (no
+          # local-only mode). Set the var + the HF_TOKEN_PRECISION_STORE secret.
+          SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+          SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+          SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+          # '0' on scheduled runs (input unset); '1' only on a manual baseline-refresh dispatch.
+          SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.force_baseline_update && '1' || '0' }}
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -660,7 +789,9 @@ jobs:
       - nightly-test-vlm-perf-2-gpu-h100
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
-      - nightly-test-diffusion-comparison
+      - nightly-test-perf-4-gpu-gb300
+      - nightly-test-diffusion
+      - nightly-test-precision-8-gpu-h200
       - consolidate-metrics
     runs-on: ubuntu-latest
     steps:

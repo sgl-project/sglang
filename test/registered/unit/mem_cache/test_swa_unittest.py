@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -16,7 +17,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -24,6 +25,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
 
 
 class _DummyReq:
@@ -72,7 +77,6 @@ def _build_swa_tree(
         head_dim=head_dim,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
-        enable_kvcache_transpose=False,
         device=device,
     )
     allocator = SWATokenToKVPoolAllocator(
@@ -171,9 +175,9 @@ class TestSWA(unittest.TestCase):
 
         result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
-        removed_hashes = [
-            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
-        ]
+        removed_hashes = _event_hashes(
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)]
+        )
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_swa_radix_cache_kv_events_split_hash(self):
@@ -197,53 +201,29 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
-    def test_swa_memory_pool(self):
-        size = 16
-        size_swa = 16
-        page_size = 1
-        head_num = 8
-        head_dim = 128
-        num_layers = 48
-        global_interval = 4
-        dtype = torch.bfloat16
-        device = get_device()
-        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
-        full_attention_layer_ids_set = set(full_attention_layer_ids)
-        swa_attention_layer_ids = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids_set
-        ]
-        pool = SWAKVPool(
-            size=size,
-            size_swa=size_swa,
+    def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
             page_size=page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            swa_attention_layer_ids=swa_attention_layer_ids,
-            full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
-            device=device,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
         )
-        alloc = SWATokenToKVPoolAllocator(
-            size=size,
-            size_swa=size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
+
+        full_indices = _swa_alloc(allocator, page_size)
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] == 0
+            )
         )
-        self.assertEqual(
-            alloc.full_available_size() + alloc.swa_available_size(), size + size_swa
-        )
-        index = alloc.alloc(1)
-        self.assertEqual(
-            alloc.full_available_size() + alloc.swa_available_size(),
-            size_swa + size_swa - 2,
-        )
-        alloc.free_swa(index)
-        result = alloc.translate_loc_from_full_to_swa(index)
-        print(result)
+
+        allocator.free_swa(full_indices[1:2])
+        self.assertEqual(allocator.swa_available_size(), 16)
 
     def test_swa_radix_cache_1(self):
         # args
@@ -281,7 +261,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator
@@ -439,7 +418,6 @@ class TestSWA(unittest.TestCase):
             head_dim=head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         # setup token to kv pool allocator

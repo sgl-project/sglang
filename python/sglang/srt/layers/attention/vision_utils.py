@@ -2,12 +2,12 @@
 
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.runtime_context import get_parallel
 
 
 def update_vit_attn_dummy_heads_config(config):
     """Update HF config to ensure vision attention num_attention_heads is divisible by tp_size"""
-    tp_size = get_attention_tp_size()
+    tp_size = get_parallel().attn_tp_size
     num_heads = getattr(
         config.vision_config,
         "num_heads",
