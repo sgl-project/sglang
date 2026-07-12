@@ -1127,9 +1127,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
-        # Padded tokens aren't read, so skip zeroing them. Ragged batches need
-        # no zeroing either: input_ids arrive from the planner already padded
-        # to the graph tier, with invalid slots zero-filled.
+        # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
+        # from the planner already padded to the tier, invalid slots zeroed.
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -1199,9 +1198,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.forward_mode.is_target_verify()
             and self.model_runner.spec_algorithm.is_dflash_family()
         )
-        # Exception: verify replays on backends whose breakable graphs use the
-        # captured forward metadata re-read req_to_token *during* replay, so
-        # the pre-replay snapshot would be too early -- record after replay.
+        # Exception: breakable-graph verify replays (captured forward metadata)
+        # re-read req_to_token *during* replay, so the pre-replay snapshot is
+        # too early -- record the event after replay instead.
         read_done_post_replay = (
             publish_read_done
             and forward_batch.forward_mode.is_target_verify()

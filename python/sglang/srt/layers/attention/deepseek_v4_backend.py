@@ -593,9 +593,9 @@ class DeepseekV4AttnBackend(
                 "DSV4 ragged verify does not support online c128 MTP; "
                 "set SGLANG_RAGGED_VERIFY_MODE off or disable online compress."
             )
-        # Layout invariants (verify_lens >= 1, total == sum) are enforced at
-        # construction in RaggedVerifyLayout.__post_init__; re-checking the
-        # device tensor here would cost two D2H syncs per verify prep.
+        # Layout invariants (verify_lens >= 1, total == sum) are enforced in
+        # RaggedVerifyLayout.__post_init__; don't re-check the device tensor
+        # here -- that would D2H-sync the host-free verify prep path.
         layout = layout.padded_to_bucket(padded_bs=bs)
         return layout
 

@@ -288,13 +288,11 @@ class SpecInputType(IntEnum):
 
 class SpecInput(ABC):
     # Per-request verify lengths for the ragged-verify graphs (see
-    # sglang.srt.speculative.ragged_verify). Class-level default so every
-    # spec input exposes the attribute; verify inputs of algorithms with
-    # supports_ragged_verify() override it per step. Must stay a class
-    # default, NOT an __init__ assignment: dataclass subclasses declare it
-    # as a field and call super().__init__ from __post_init__ *after* field
-    # assignment, so an init-time default would clobber the constructor-
-    # passed layout.
+    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
+    # supports_ragged_verify() override it per step. Must stay a class-level
+    # default, not an __init__ assignment: dataclass subclasses declare it as
+    # a field and run __post_init__ -> super().__init__ *after* field
+    # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     def __init__(self, spec_input_type: SpecInputType):
