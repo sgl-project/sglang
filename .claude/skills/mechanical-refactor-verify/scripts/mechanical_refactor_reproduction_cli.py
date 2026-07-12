@@ -19,8 +19,11 @@ import argparse
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_DEFAULT_JOBS = 3
 
 KIND_MECHANICAL = "mechanical_provable"
 KIND_NON_MECHANICAL = "non_mechanical_provable"
@@ -67,6 +70,14 @@ class CommitVerdict:
 
 
 @dataclass(frozen=True)
+class _PendingProof:
+    sha: str
+    subject: str
+    kind: str
+    script: Path
+
+
+@dataclass(frozen=True)
 class ChainResult:
     base: str
     branch: str
@@ -93,6 +104,12 @@ def main(argv: "list[str]") -> int:
         default=None,
         help=f"report file path (default: <proof>/{_REPORT_FILENAME})",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=_DEFAULT_JOBS,
+        help=f"max concurrent proof runs (default {_DEFAULT_JOBS})",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -101,6 +118,7 @@ def main(argv: "list[str]") -> int:
             branch=args.branch,
             proof=Path(args.proof),
             repo_root=args.repo_root,
+            jobs=args.jobs,
         )
     except ChainVerificationError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -122,8 +140,13 @@ def verify_chain(
     branch: str,
     proof: Path,
     repo_root: "str | None" = None,
+    jobs: int = _DEFAULT_JOBS,
 ) -> ChainResult:
-    """Classify every commit in ``base..branch`` and run every provable commit's proof."""
+    """Classify every commit in ``base..branch`` and run every provable commit's proof.
+
+    Classification and proof resolution are sequential (cheap); the proof runs execute
+    concurrently, up to ``jobs`` at a time — safe because each proof works in its own
+    throwaway worktree. The verdict list keeps chain order."""
     root = repo_root or _repo_root()
     if not proof.is_dir():
         raise ChainVerificationError(f"proof folder does not exist: {proof}")
@@ -131,15 +154,17 @@ def verify_chain(
     branch_sha = _rev_parse(branch, root)
     commits = _linear_commits(base_sha=base_sha, branch_sha=branch_sha, root=root)
 
-    verdicts: "list[CommitVerdict]" = []
+    resolved: "list[CommitVerdict | _PendingProof]" = []
     for sha in commits:
         subject = _git_output(["log", "-1", "--format=%s", sha], root).strip()
         message = _git_output(["log", "-1", "--format=%B", sha], root)
-        verdicts.append(
-            _verdict_for_commit(
-                sha=sha, subject=subject, message=message, proof=proof, root=root
-            )
+        resolved.append(
+            _resolve_commit(sha=sha, subject=subject, message=message, proof=proof)
         )
+
+    verdicts: "list[CommitVerdict]" = _run_pending_proofs(
+        resolved=resolved, root=root, jobs=jobs
+    )
     return ChainResult(
         base=base,
         branch=branch,
@@ -189,9 +214,56 @@ def render_report(result: ChainResult) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _verdict_for_commit(
-    *, sha: str, subject: str, message: str, proof: Path, root: str
-) -> CommitVerdict:
+def _run_pending_proofs(
+    *, resolved: "list[CommitVerdict | _PendingProof]", root: str, jobs: int
+) -> "list[CommitVerdict]":
+    """Execute the pending proofs on a bounded thread pool; keep chain order."""
+    pending = [
+        (i, item) for i, item in enumerate(resolved) if isinstance(item, _PendingProof)
+    ]
+    finished: "dict[int, CommitVerdict]" = {}
+    if pending:
+        with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            futures = {
+                i: pool.submit(_proof_verdict, item, root=root) for i, item in pending
+            }
+            for i, future in futures.items():
+                finished[i] = future.result()
+    return [
+        finished[i] if isinstance(item, _PendingProof) else item
+        for i, item in enumerate(resolved)
+    ]
+
+
+def _proof_verdict(pending: _PendingProof, *, root: str) -> CommitVerdict:
+    passed, output = _run_proof(script=pending.script, root=root)
+    if passed:
+        verdict = CommitVerdict(
+            sha=pending.sha,
+            subject=pending.subject,
+            kind=pending.kind,
+            verdict=VERDICT_PASS,
+            detail="",
+        )
+    else:
+        tail = "\n".join(output.splitlines()[-_FAIL_OUTPUT_TAIL_LINES:])
+        verdict = CommitVerdict(
+            sha=pending.sha,
+            subject=pending.subject,
+            kind=pending.kind,
+            verdict=VERDICT_FAIL,
+            detail=(
+                f"proof `{pending.script}` did not PASS; output tail:\n\n"
+                f"```\n{tail}\n```"
+            ),
+        )
+    print(f"proof {pending.sha[:9]}  {verdict.verdict}", flush=True)
+    return verdict
+
+
+def _resolve_commit(
+    *, sha: str, subject: str, message: str, proof: Path
+) -> "CommitVerdict | _PendingProof":
     kind, classification_error = _classify(message)
     if kind is None:
         return CommitVerdict(
@@ -235,19 +307,7 @@ def _verdict_for_commit(
             detail=f"multiple proof scripts match this commit: {listing}",
         )
 
-    passed, output = _run_proof(script=scripts[0], root=root)
-    if passed:
-        return CommitVerdict(
-            sha=sha, subject=subject, kind=kind, verdict=VERDICT_PASS, detail=""
-        )
-    tail = "\n".join(output.splitlines()[-_FAIL_OUTPUT_TAIL_LINES:])
-    return CommitVerdict(
-        sha=sha,
-        subject=subject,
-        kind=kind,
-        verdict=VERDICT_FAIL,
-        detail=f"proof `{scripts[0]}` did not PASS; output tail:\n\n```\n{tail}\n```",
-    )
+    return _PendingProof(sha=sha, subject=subject, kind=kind, script=scripts[0])
 
 
 def _classify(message: str) -> "tuple[str | None, str]":

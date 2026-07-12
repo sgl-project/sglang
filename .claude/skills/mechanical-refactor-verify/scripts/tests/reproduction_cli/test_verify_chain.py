@@ -153,6 +153,41 @@ def test_merge_commit_in_the_chain_is_a_setup_error(repo: Path, tmp_path: Path) 
         verify_chain(base=base, branch="chain", proof=proof, repo_root=str(repo))
 
 
+def test_proofs_run_concurrently_up_to_jobs(repo: Path, tmp_path: Path) -> None:
+    """With jobs>=2 a proof that waits on a sibling proof's sentinel still completes."""
+    proof = tmp_path / "proof"
+    sentinel = tmp_path / "sentinel"
+    base, shas = _chain(
+        repo, ["mechanical_provable: move a", "mechanical_provable: move b"]
+    )
+    waiter = _write_stub_proof(proof, shas[0])
+    waiter.write_text(
+        "import sys, time\n"
+        f"deadline = time.monotonic() + 30\n"
+        f"while not __import__('pathlib').Path({str(sentinel)!r}).exists():\n"
+        "    if time.monotonic() > deadline:\n"
+        "        sys.exit(1)\n"
+        "    time.sleep(0.05)\n"
+        'print("PASS: reproduces the commit byte-for-byte.")\n'
+        "sys.exit(0)\n"
+    )
+    creator = _write_stub_proof(proof, shas[1])
+    creator.write_text(
+        "import sys\n"
+        f"__import__('pathlib').Path({str(sentinel)!r}).write_text('go')\n"
+        'print("PASS: reproduces the commit byte-for-byte.")\n'
+        "sys.exit(0)\n"
+    )
+
+    result = verify_chain(
+        base=base, branch="chain", proof=proof, repo_root=str(repo), jobs=2
+    )
+
+    assert [v.verdict for v in result.verdicts] == [VERDICT_PASS, VERDICT_PASS]
+    assert [v.sha for v in result.verdicts] == shas
+    assert result.passed
+
+
 def test_end_to_end_with_a_generated_proof_folder(repo: Path, tmp_path: Path) -> None:
     """A real move commit proved by generate_range verifies through the CLI end-to-end."""
     _write(

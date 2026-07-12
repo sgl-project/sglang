@@ -28,6 +28,8 @@
 - It checks every commit declares `mechanical_provable` or `non_mechanical_provable`,
   runs every provable commit's proof, and prints + writes a full report
   (`<folder>/chain_report.md`); exit 0 iff the chain verifies.
+- Proofs run up to `--jobs` at a time (default 3; each proof works in its own throwaway
+  worktree, so this is safe) — raise it to shorten a long chain's wall clock.
 - The contract (word rule, proof resolution, PASS criterion, exit codes):
   `spec-reproduction-cli.md`.
 - The `HUMAN_REVIEW` rows in the report are your remaining manual surface — the declared

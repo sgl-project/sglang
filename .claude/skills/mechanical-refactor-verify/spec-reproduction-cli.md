@@ -68,6 +68,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
   (`guide-construct-proof.md` §1.2).
 - `--repo-root DIR`: run against that repo instead of the cwd's.
 - `--report PATH`: write the report there instead of `<proof>/chain_report.md`.
+- `--jobs N`: run up to N proofs concurrently (default 3).
 
 ### 3.2 The chain
 
@@ -94,6 +95,12 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
   stdout. Requiring the line keeps an old-style script that exits 0 while printing a
   residual from false-passing; requiring the exit code keeps a crash before any verdict
   from passing.
+- Proofs run **concurrently**, up to `--jobs` at a time (default 3). This is safe because
+  each proof works in its own throwaway worktree with a unique branch name and never
+  touches the checked-out tree; per-proof verdicts are independent. Classification and
+  proof resolution stay sequential (they are cheap), and the report keeps chain order
+  regardless of completion order. A completion line (`sha  PASS/FAIL`) is printed as each
+  proof finishes, so a long chain shows progress.
 
 ## 4. The report
 
