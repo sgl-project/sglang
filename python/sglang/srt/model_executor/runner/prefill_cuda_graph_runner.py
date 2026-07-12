@@ -996,6 +996,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 
+            if self.model_runner.attn_backend.war_reads_done_at_snapshot:
+                read_done = self.device_module.Event()
+                read_done.record()
+                self.model_runner.war_fastpath_read_done_event = read_done
+
             if self.layer_model is not None:
                 # BCG / Full: replay the captured body, run the LM head +
                 # logits_processor eagerly. For Full, slice hidden_states to
@@ -1025,6 +1030,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             ).copy_(ie[:static_n])
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
                     return hs[:raw_num_tokens] if full_path else hs
+
+                static_forward_batch.global_num_tokens_for_logprob_cpu = (
+                    forward_batch.global_num_tokens_for_logprob_cpu
+                )
+                static_forward_batch.global_num_tokens_for_logprob_gpu = (
+                    forward_batch.global_num_tokens_for_logprob_gpu
+                )
 
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward

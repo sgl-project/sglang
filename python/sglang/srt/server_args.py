@@ -3552,6 +3552,13 @@ class ServerArgs:
         """
         from sglang.srt.configs.model_config import is_deepseek_v4
 
+        if envs.SGLANG_EXPERIMENTAL_FORCE_BCG.get():
+            logger.warning(
+                "SGLANG_EXPERIMENTAL_FORCE_BCG=1: skipping breakable-CG "
+                "incompatibility rules"
+            )
+            return
+
         rules = [
             # MLA prefill takes a different attn-forward path under BCG.
             ("MLA attention", lambda: self.use_mla_backend()),
