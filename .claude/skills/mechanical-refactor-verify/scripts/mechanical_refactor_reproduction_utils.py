@@ -812,7 +812,9 @@ class Repro:
                 for node in tree.body
                 if isinstance(node, (ast.Import, ast.ImportFrom))
             ]
-            assert imports, f"no imports to anchor a new `if TYPE_CHECKING:` block in {rel}"
+            assert (
+                imports
+            ), f"no imports to anchor a new `if TYPE_CHECKING:` block in {rel}"
             insert_at = imports[-1].end_lineno
             lines[insert_at:insert_at] = [
                 nl,
