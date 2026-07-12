@@ -91,15 +91,6 @@ class TestSpsCostTableLookup(CustomTestCase):
         self.assertEqual(table.lookup(10_000), 480.0)
 
 
-class TestSpsCostTableJsonRoundTrip(CustomTestCase):
-    def test_json_round_trip_preserves_table(self):
-        table = _make_table()
-        restored = SpsCostTable.from_json(table.to_json())
-        self.assertEqual(restored.sample_batch_tokens, table.sample_batch_tokens)
-        self.assertEqual(restored.sample_steps_per_sec, table.sample_steps_per_sec)
-        self.assertEqual(restored.max_batch_tokens, table.max_batch_tokens)
-
-
 class TestLoadSpsTableFromPath(CustomTestCase):
     def test_load_from_path_round_trips_table_and_lookup(self):
         table = _make_table()
