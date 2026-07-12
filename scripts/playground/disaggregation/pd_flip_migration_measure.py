@@ -486,8 +486,31 @@ def flatten_migration_samples(events: Sequence[JsonDict]) -> List[JsonDict]:
             "timing_debug": json.dumps(
                 status.get("timing_debug") or {}, sort_keys=True
             ),
+            "request_measurements": json.dumps(
+                status.get("request_measurements") or [], sort_keys=True
+            ),
         }
         rows.append(row)
+    return rows
+
+
+def flatten_migration_request_samples(events: Sequence[JsonDict]) -> List[JsonDict]:
+    rows = []
+    request_fields = migration_request_fields()[4:]
+    for event in events:
+        if event.get("event_type") != "migration_status":
+            continue
+        status = event.get("status") or {}
+        for measurement in status.get("request_measurements") or []:
+            row = {
+                "ts_wall": event.get("ts_wall"),
+                "ts_mono": event.get("ts_mono"),
+                "node": event.get("node"),
+                "session_id": status.get("session_id"),
+            }
+            for field in request_fields:
+                row[field] = measurement.get(field)
+            rows.append(row)
     return rows
 
 
@@ -630,6 +653,7 @@ def write_outputs(
     timeline = build_timeline(events)
     durations = build_stage_durations(timeline)
     migration_samples = flatten_migration_samples(events)
+    migration_request_samples = flatten_migration_request_samples(events)
     router_samples = flatten_router_samples(events)
     pd_flip_samples = flatten_pd_flip_samples(events)
     worker_load_samples = flatten_worker_load_samples(events)
@@ -644,6 +668,14 @@ def write_outputs(
     write_csv(output_dir / "migration_timeline.csv", timeline, timeline_fields())
     write_csv(output_dir / "migration_stage_durations.csv", durations, duration_fields())
     write_csv(output_dir / "migration_status_samples.csv", migration_samples, migration_status_fields())
+    write_jsonl(
+        output_dir / "migration_request_samples.jsonl", migration_request_samples
+    )
+    write_csv(
+        output_dir / "migration_request_samples.csv",
+        migration_request_samples,
+        migration_request_fields(),
+    )
     write_csv(output_dir / "router_worker_samples.csv", router_samples, router_fields())
     write_csv(output_dir / "worker_pd_flip_samples.csv", pd_flip_samples, pd_flip_fields())
     write_csv(output_dir / "worker_load_samples.csv", worker_load_samples, worker_load_fields())
@@ -657,6 +689,7 @@ def write_outputs(
         "timeline_stage_count": len(timeline),
         "timeline_stages": [row.get("stage") for row in timeline],
         "worker_load_sample_count": len(worker_load_samples),
+        "migration_request_sample_count": len(migration_request_samples),
         "migration_outcome": migration_outcome(timeline),
         "controller_message": controller.get("message"),
         "controller_success": controller.get("success"),
@@ -753,6 +786,36 @@ def migration_status_fields() -> List[str]:
         "waiting_skipped",
         "index_debug",
         "timing_debug",
+        "request_measurements",
+    ]
+
+
+def migration_request_fields() -> List[str]:
+    return [
+        "ts_wall",
+        "ts_mono",
+        "node",
+        "session_id",
+        "rid",
+        "p_tokens",
+        "h_tokens",
+        "c0_tokens",
+        "c1_tokens",
+        "stitch_mode",
+        "mooncake_bytes",
+        "source_bytes",
+        "delta_bytes",
+        "mooncake_duration_seconds",
+        "source_duration_seconds",
+        "delta_duration_seconds",
+        "held_at_mono",
+        "freeze_at_mono",
+        "commit_at_mono",
+        "activate_at_mono",
+        "source_queue",
+        "final_owner",
+        "output_boundary",
+        "rollback_reason",
     ]
 
 
@@ -839,6 +902,13 @@ def controller_state_fields() -> List[str]:
         "direction",
         "role_before",
         "role_after",
+        "configured_ratio",
+        "effective_ratio",
+        "capacity_fallback_count",
+        "prefill_slo_good",
+        "prefill_slo_total",
+        "decode_slo_good",
+        "decode_slo_total",
     ]
 
 

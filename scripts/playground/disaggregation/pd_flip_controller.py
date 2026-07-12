@@ -228,6 +228,28 @@ class PDClusterConfig:
         )
 
 
+class PDFlipSessionJournal:
+    """Durable single-session ownership journal for controller recovery."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def write(self, record: JsonDict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def read(self) -> Optional[JsonDict]:
+        if not self.path.exists():
+            return None
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def clear(self) -> None:
+        if self.path.exists():
+            self.path.unlink()
+
+
 @dataclass
 class NodeMetrics:
     name: str
@@ -357,6 +379,194 @@ class PDFlipController:
             raise ValueError("PDClusterConfig.nodes must not be empty")
         self.config = config
         self.client = client
+        self.session_journal = PDFlipSessionJournal(Path(config.session_journal_path))
+
+    @staticmethod
+    def _journal_record(
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        batch_rids: Sequence[str],
+        phase: str,
+        source_finished: bool,
+    ) -> JsonDict:
+        return {
+            "source_name": source.name,
+            "source_url": source.worker_url,
+            "target_name": target.name,
+            "target_url": target.worker_url,
+            "session_id": session_id,
+            "batch_rids": [str(rid) for rid in batch_rids],
+            "phase": phase,
+            "source_finished": source_finished,
+        }
+
+    def _write_journal_phase(
+        self,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        batch_rids: Sequence[str],
+        phase: str,
+        source_finished: bool = False,
+    ) -> None:
+        self.session_journal.write(
+            self._journal_record(
+                source,
+                target,
+                session_id,
+                batch_rids,
+                phase,
+                source_finished,
+            )
+        )
+
+    def reconcile_session(self, session_id: str) -> FlipExecutionResult:
+        record = self.session_journal.read()
+        if record is None or str(record.get("session_id")) != str(session_id):
+            return FlipExecutionResult(
+                False, "session journal not found", "d_to_p", None, None, None
+            )
+
+        source_name = record.get("source_name")
+        target_name = record.get("target_name")
+        source_url = record.get("source_url")
+        target_url = record.get("target_url")
+        batch_rids = [str(rid) for rid in record.get("batch_rids") or []]
+        if (
+            not all((source_name, target_name, source_url, target_url))
+            or not batch_rids
+        ):
+            return FlipExecutionResult(
+                False,
+                "session state requires operator recovery: incomplete journal",
+                "d_to_p",
+                source_name,
+                None,
+                target_name,
+            )
+
+        source_response = self.client.get_json(source_url, "/pd_flip/migration/status")
+        target_response = self.client.get_json(target_url, "/pd_flip/migration/status")
+        source_status = source_response.get("status", source_response)
+        target_status = target_response.get("status", target_response)
+        if str(source_status.get("session_id")) != str(session_id) or str(
+            target_status.get("session_id")
+        ) != str(session_id):
+            return FlipExecutionResult(
+                False,
+                "session state requires operator recovery: worker session mismatch",
+                "d_to_p",
+                source_name,
+                None,
+                target_name,
+            )
+
+        source_state = source_status.get("state")
+        target_state = target_status.get("state")
+        records: List[ActionRecord] = []
+        source = NodeMetrics(str(source_name), str(source_url), str(source_name))
+        target = NodeMetrics(str(target_name), str(target_url), str(target_name))
+        if target_state == "active":
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_active", True
+            )
+            return FlipExecutionResult(
+                True,
+                "session already active",
+                "d_to_p",
+                source.name,
+                "decode",
+                target.name,
+                actions=records,
+            )
+        if source_state == "source_aborted" and target_state == "target_aborted":
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "aborted", False
+            )
+            return FlipExecutionResult(
+                True,
+                "session already aborted",
+                "d_to_p",
+                source.name,
+                None,
+                target.name,
+                actions=records,
+            )
+        if (
+            source_state in {"released", "source_released"}
+            and target_state == "ready_to_activate"
+        ):
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_activate_intent", True
+            )
+            self._post_worker(
+                records,
+                "activate_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/activate",
+                {"session_id": session_id, "rids": batch_rids},
+            )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_active", True
+            )
+            return FlipExecutionResult(
+                True,
+                "target activated during reconciliation",
+                "d_to_p",
+                source.name,
+                "decode",
+                target.name,
+                actions=records,
+            )
+        if source_state not in {"released", "source_released"} and target_state in {
+            "prepared",
+            "target_prepared",
+            "transferred_held",
+            "ready_to_activate",
+        }:
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "abort_intent", False
+            )
+            abort_complete = self._abort_two_phase_migration(
+                source, target, session_id, records
+            )
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                batch_rids,
+                "aborted" if abort_complete else "abort_incomplete",
+                False,
+            )
+            if not abort_complete:
+                return FlipExecutionResult(
+                    False,
+                    "session state requires operator recovery: abort incomplete",
+                    "d_to_p",
+                    source.name,
+                    None,
+                    target.name,
+                    actions=records,
+                )
+            return FlipExecutionResult(
+                True,
+                "session aborted during reconciliation",
+                "d_to_p",
+                source.name,
+                None,
+                target.name,
+                actions=records,
+            )
+        return FlipExecutionResult(
+            False,
+            "session state requires operator recovery",
+            "d_to_p",
+            source.name,
+            None,
+            target.name,
+            actions=records,
+        )
 
     def _select_progressive_first_batch(
         self, source: NodeMetrics, target: NodeMetrics
@@ -712,6 +922,9 @@ class PDFlipController:
                         snapshot_index=len(snapshots) - 1,
                     )
                 )
+                state_trace[-1].update(
+                    self._progressive_observability_fields(snapshot, None)
+                )
             decision = self._evaluate_progressive_snapshot(snapshot, observing=False)
             if decision is ProgressiveDecision.START:
                 source = self._select_source(
@@ -767,6 +980,9 @@ class PDFlipController:
                 records,
             )
             selection = self._select_progressive_first_batch(source, target)
+            state_trace[-1].update(
+                self._progressive_observability_fields(snapshots[-1], selection)
+            )
             if selection is None:
                 self._append_progressive_state(
                     state_trace,
@@ -830,6 +1046,9 @@ class PDFlipController:
                 slo_monitor, monitor_nodes
             )
             snapshots.append(observation.to_dict())
+            state_trace[-1].update(
+                self._progressive_observability_fields(observation, selection)
+            )
             decision = self._evaluate_progressive_snapshot(observation, observing=True)
             if decision in (
                 ProgressiveDecision.RECOVER,
@@ -950,6 +1169,13 @@ class PDFlipController:
             raise ValueError("atomic migration batch must not have empty rids")
         source_finished = False
         try:
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                requested_rids,
+                "source_start_intent",
+            )
             source_start = self._post_worker(
                 records,
                 "start_decode_migration_source",
@@ -978,6 +1204,12 @@ class PDFlipController:
                     "selected first-batch RIDs do not match"
                 )
 
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "source_started"
+            )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_prepare_intent"
+            )
             self._post_worker(
                 records,
                 "prepare_decode_migration_target",
@@ -991,6 +1223,9 @@ class PDFlipController:
                     "adopt_on_commit": False,
                 },
             )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_prepared"
+            )
             self._wait_migration(records, "wait_decode_migration_source", source)
             self._wait_migration(records, "wait_decode_migration_target", target)
             delta_manifests = self._poll_source_delta_manifests(
@@ -1001,6 +1236,9 @@ class PDFlipController:
                 raise RuntimeError(
                     "source delta manifests do not match atomic batch RIDs"
                 )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_delta_prepare_intent"
+            )
             self._post_worker(
                 records,
                 "prepare_decode_migration_target_delta",
@@ -1014,12 +1252,24 @@ class PDFlipController:
             )
             self._wait_migration(records, "wait_decode_migration_source_delta", source)
             self._wait_migration(records, "wait_decode_migration_target_delta", target)
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_delta_ready"
+            )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_commit_intent"
+            )
             self._post_worker(
                 records,
                 "commit_decode_migration_target",
                 target,
                 "/pd_flip/migration/target/commit",
                 {"session_id": session_id, "rids": list(batch_rids)},
+            )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_ready"
+            )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "source_finish_intent"
             )
             self._post_worker(
                 records,
@@ -1029,6 +1279,22 @@ class PDFlipController:
                 {"session_id": session_id, "released_rids": list(batch_rids)},
             )
             source_finished = True
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                batch_rids,
+                "source_finish_complete",
+                True,
+            )
+            self._write_journal_phase(
+                source,
+                target,
+                session_id,
+                batch_rids,
+                "target_activate_intent",
+                True,
+            )
             self._post_worker(
                 records,
                 "activate_decode_migration_target",
@@ -1036,10 +1302,29 @@ class PDFlipController:
                 "/pd_flip/migration/target/activate",
                 {"session_id": session_id, "rids": list(batch_rids)},
             )
+            self._write_journal_phase(
+                source, target, session_id, batch_rids, "target_active", True
+            )
             return batch_rids
         except Exception as exc:
             if not source_finished:
-                self._abort_two_phase_migration(source, target, session_id, records)
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    requested_rids,
+                    "abort_intent",
+                )
+                abort_complete = self._abort_two_phase_migration(
+                    source, target, session_id, records
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    session_id,
+                    requested_rids,
+                    "aborted" if abort_complete else "abort_incomplete",
+                )
             raise ProgressiveAtomicBatchError(
                 str(exc), source_finished=source_finished
             ) from exc
@@ -1324,6 +1609,27 @@ class PDFlipController:
                 action_index=len(records),
             )
         )
+
+    @staticmethod
+    def _progressive_observability_fields(
+        snapshot: Any, selection: Optional[RatioSelection]
+    ) -> JsonDict:
+        def value(container: Any, name: str) -> Any:
+            if isinstance(container, dict):
+                return container.get(name)
+            return getattr(container, name, None)
+
+        prefill = value(snapshot, "prefill_counts")
+        decode = value(snapshot, "decode_counts")
+        return {
+            "configured_ratio": value(selection, "configured_ratio"),
+            "effective_ratio": value(selection, "effective_ratio"),
+            "capacity_fallback_count": value(selection, "fallback_count") or 0,
+            "prefill_slo_good": value(prefill, "good") or 0,
+            "prefill_slo_total": value(prefill, "total") or 0,
+            "decode_slo_good": value(decode, "good") or 0,
+            "decode_slo_total": value(decode, "total") or 0,
+        }
 
     @staticmethod
     def _progressive_result(
@@ -1915,7 +2221,8 @@ class PDFlipController:
         target: NodeMetrics,
         session_id: str,
         records: List[ActionRecord],
-    ) -> None:
+    ) -> bool:
+        success = True
         for node, path, payload in (
             (
                 target,
@@ -1937,7 +2244,8 @@ class PDFlipController:
                     payload,
                 )
             except Exception:
-                pass
+                success = False
+        return success
 
     def _execute_p_to_d(
         self,
@@ -3050,8 +3358,13 @@ def _prefill_recovered(snapshot: ClusterSLOSnapshot, threshold: float) -> bool:
 
 
 def load_config(path: str) -> PDClusterConfig:
-    with open(path, "r", encoding="utf-8") as f:
-        return PDClusterConfig.from_dict(json.load(f))
+    config_path = Path(path).resolve()
+    with config_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    journal_path = Path(str(data.get("session_journal_path", "pd_flip_session.json")))
+    if not journal_path.is_absolute():
+        data["session_journal_path"] = str(config_path.parent / journal_path)
+    return PDClusterConfig.from_dict(data)
 
 
 def _parse_node_spec(value: str) -> PDNode:

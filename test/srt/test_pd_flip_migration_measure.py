@@ -2,6 +2,83 @@ import unittest
 
 
 class PDFlipMigrationMeasureTest(unittest.TestCase):
+    def test_flattens_per_request_measurements_with_stable_schema(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import (
+            flatten_migration_request_samples,
+            migration_request_fields,
+        )
+
+        events = [
+            {
+                "event_type": "migration_status",
+                "ts_wall": "now",
+                "ts_mono": 1.0,
+                "node": "target",
+                "status": {
+                    "session_id": "s",
+                    "request_measurements": [
+                        {
+                            "rid": "r0",
+                            "p_tokens": 4,
+                            "h_tokens": 3,
+                            "c0_tokens": 7,
+                            "c1_tokens": 9,
+                            "stitch_mode": "partial_prefix_stitch",
+                            "source_queue": "running",
+                            "final_owner": "target",
+                        }
+                    ],
+                },
+            },
+            {
+                "event_type": "migration_status",
+                "ts_wall": "later",
+                "ts_mono": 2.0,
+                "node": "source",
+                "status": {"session_id": "empty"},
+            },
+        ]
+
+        rows = flatten_migration_request_samples(events)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], "s")
+        self.assertEqual(rows[0]["rid"], "r0")
+        self.assertIsNone(rows[0]["source_bytes"])
+        self.assertTrue(
+            {
+                "p_tokens",
+                "h_tokens",
+                "c0_tokens",
+                "c1_tokens",
+                "mooncake_bytes",
+                "source_bytes",
+                "delta_bytes",
+                "held_at_mono",
+                "freeze_at_mono",
+                "commit_at_mono",
+                "activate_at_mono",
+                "output_boundary",
+            }.issubset(migration_request_fields())
+        )
+
+    def test_controller_state_csv_keeps_policy_and_raw_slo_fields(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import (
+            controller_state_fields,
+        )
+
+        self.assertTrue(
+            {
+                "configured_ratio",
+                "effective_ratio",
+                "capacity_fallback_count",
+                "prefill_slo_good",
+                "prefill_slo_total",
+                "decode_slo_good",
+                "decode_slo_total",
+            }.issubset(controller_state_fields())
+        )
+
     def test_build_timeline_detects_migration_link_stages(self):
         from scripts.playground.disaggregation.pd_flip_migration_measure import (
             build_timeline,

@@ -1771,6 +1771,23 @@ class Scheduler(
     def start_pd_flip_migration_source(
         self, recv_req: PDFlipMigrationSourceStartReq
     ) -> PDFlipMigrationReqOutput:
+        existing = getattr(self, "pd_flip_migration_session", None)
+        if existing:
+            matches = (
+                recv_req.session_id is not None
+                and str(recv_req.session_id) == str(existing.get("session_id"))
+                and existing.get("role") == "source"
+            )
+            return PDFlipMigrationReqOutput(
+                success=matches,
+                message=(
+                    "source migration session already exists"
+                    if matches
+                    else "conflicting migration session already exists"
+                ),
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(existing.get("manifests", [])),
+            )
         timing_debug = {}
         role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
         if role != "decode":
@@ -1913,6 +1930,23 @@ class Scheduler(
     def prepare_pd_flip_migration_target(
         self, recv_req: PDFlipMigrationTargetPrepareReq
     ) -> PDFlipMigrationReqOutput:
+        existing = getattr(self, "pd_flip_migration_session", None)
+        if existing:
+            matches = (
+                recv_req.session_id is not None
+                and str(recv_req.session_id) == str(existing.get("session_id"))
+                and existing.get("role") == "target"
+            )
+            return PDFlipMigrationReqOutput(
+                success=matches,
+                message=(
+                    "target migration session already exists"
+                    if matches
+                    else "conflicting migration session already exists"
+                ),
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(existing.get("manifests", [])),
+            )
         role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
         if role != "decode":
             return PDFlipMigrationReqOutput(
@@ -2075,6 +2109,20 @@ class Scheduler(
                 message="target migration session id does not match",
                 status=self._pd_flip_migration_status_dict(),
             )
+        if session.get("state") in {"ready_to_activate", "active"}:
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target migration commit already complete",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"target_aborted", "target_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
 
         self._pd_flip_note_timing(session, "commit_received")
         self._pd_flip_target_pump_transfer(session)
@@ -2116,6 +2164,7 @@ class Scheduler(
 
         for rid in requested_rids:
             entries[rid]["phase"] = "ready_to_activate"
+            self._pd_flip_note_timing(entries[rid], "target_commit_ready")
         session["state"] = "ready_to_activate"
         return PDFlipMigrationReqOutput(
             success=True,
@@ -2139,6 +2188,20 @@ class Scheduler(
                 success=False,
                 message="target migration session id does not match",
                 status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("state") == "active":
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target migration session already active",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"target_aborted", "target_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
             )
 
         entries = session.get("target_entries") or {}
@@ -2200,6 +2263,7 @@ class Scheduler(
                     self._pd_flip_note_timing(entry, "target_adopted")
                 entry["held"] = False
                 entry["phase"] = "active"
+                entry["final_owner"] = "target"
         except Exception as exc:
             self.waiting_queue = previous_waiting_queue
             for rid, (phase, held, request_adopted) in previous_entry_state.items():
@@ -2256,6 +2320,29 @@ class Scheduler(
                 message=f"local migration role is {session.get('role')}, not target",
                 status=self._pd_flip_migration_status_dict(),
             )
+        if recv_req.session_id is None or str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") == "target_aborted":
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target migration session already aborted",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"active", "target_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
 
         self._pd_flip_abort_target_session(
             session, recv_req.reason or "target migration aborted"
@@ -2271,6 +2358,16 @@ class Scheduler(
         self, recv_req: PDFlipMigrationStatusReq
     ) -> PDFlipMigrationReqOutput:
         session = getattr(self, "pd_flip_migration_session", None) or {}
+        if session and (
+            recv_req.session_id is not None
+            and str(recv_req.session_id) != str(session.get("session_id"))
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
         if session.get("role") == "source":
             self._pd_flip_source_pump_transfer(session)
         elif session.get("role") == "target":
@@ -2303,6 +2400,20 @@ class Scheduler(
                 success=False,
                 message="source migration session id does not match",
                 status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("state") == "source_released":
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="source migration session already released",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"source_aborted", "source_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
             )
 
         self._pd_flip_note_timing(session, "finish_received")
@@ -2559,6 +2670,29 @@ class Scheduler(
     ) -> PDFlipMigrationReqOutput:
         session = getattr(self, "pd_flip_migration_session", None)
         if session:
+            if recv_req.session_id is None or str(recv_req.session_id) != str(
+                session.get("session_id")
+            ):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="migration session id does not match",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(session.get("manifests", [])),
+                )
+            if session.get("state") in {"source_aborted", "target_aborted"}:
+                return PDFlipMigrationReqOutput(
+                    success=True,
+                    message="migration session already aborted",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(session.get("manifests", [])),
+                )
+            if session.get("state") in {"source_released", "active"}:
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="migration session ownership is already terminal",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(session.get("manifests", [])),
+                )
             reason = recv_req.reason or "migration aborted"
             if session.get("role") == "target":
                 self._pd_flip_abort_target_session(session, reason)
@@ -2596,6 +2730,8 @@ class Scheduler(
                 self._pd_flip_free_source_delta_metadata(delta)
             self._pd_flip_finish_source_kv_release_defer(entry)
             self._pd_flip_free_source_metadata(entry)
+            entry["final_owner"] = "source"
+            entry["rollback_reason"] = reason
         restore_started = time.monotonic()
         self._pd_flip_restore_waiting_source_requests(session)
         self._pd_flip_resume_batch_after_cutover()
@@ -2625,6 +2761,8 @@ class Scheduler(
             self._pd_flip_free_target_metadata(entry)
             entry["phase"] = "aborted"
             entry["held"] = False
+            entry["final_owner"] = "source"
+            entry["rollback_reason"] = reason
         session["state"] = "target_aborted"
         session["last_error"] = reason
         session["pending_reqs"] = 0
@@ -3452,6 +3590,7 @@ class Scheduler(
                     req.pd_flip_kv_release_deferred = False
                     req.pd_flip_deferred_kv_release_is_insert = False
                 entry["request_released"] = True
+                entry["final_owner"] = "target"
                 self._pd_flip_note_timing(entry, "source_waiting_released")
                 self._pd_flip_free_source_metadata(entry)
                 continue
@@ -3464,6 +3603,7 @@ class Scheduler(
             else:
                 self._pd_flip_finish_source_kv_release_defer(entry)
                 self._pd_flip_note_timing(entry, "source_finish_released")
+            entry["final_owner"] = "target"
             self._pd_flip_free_source_metadata(entry)
 
     def _pd_flip_prepare_target_entries(
@@ -4331,6 +4471,7 @@ class Scheduler(
                 "delta_pending_reqs": 0,
                 "delta_transferred_reqs": 0,
                 "delta_failed_reqs": 0,
+                "request_measurements": [],
             }
         session_timing = session.get("timing_debug") or {}
         return {
@@ -4361,7 +4502,61 @@ class Scheduler(
             "delta_failed_reqs": int(session.get("delta_failed_reqs", 0) or 0),
             "index_debug": self._pd_flip_migration_index_debug(session),
             "timing_debug": self._pd_flip_migration_timing_debug(session),
+            "request_measurements": self._pd_flip_migration_request_measurements(
+                session
+            ),
         }
+
+    @staticmethod
+    def _pd_flip_migration_request_measurements(
+        session: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        entries = session.get("source_entries") or session.get("target_entries") or {}
+        session_timing = session.get("timing_debug") or {}
+        rows = []
+        for rid, entry in entries.items():
+            manifest = entry.get("manifest") or {}
+            timing = entry.get("timing_debug") or {}
+            delta_started = timing.get("source_delta_sent_mono")
+            delta_finished = timing.get("source_delta_transferred_mono")
+            delta_duration = None
+            if isinstance(delta_started, (int, float)) and isinstance(
+                delta_finished, (int, float)
+            ):
+                delta_duration = max(0.0, delta_finished - delta_started)
+            c0 = manifest.get("kv_committed_len")
+            c1 = entry.get("committed_len")
+            if c1 is None:
+                c1 = entry.get("target_committed_len", c0)
+            rows.append(
+                {
+                    "rid": str(rid),
+                    "p_tokens": len(manifest.get("origin_input_ids") or []),
+                    "h_tokens": entry.get("mooncake_hit_len"),
+                    "c0_tokens": int(c0 or 0),
+                    "c1_tokens": int(c1 or 0),
+                    "stitch_mode": entry.get("stitch_mode"),
+                    "mooncake_bytes": entry.get("mooncake_bytes"),
+                    "source_bytes": entry.get("source_transfer_bytes"),
+                    "delta_bytes": entry.get("delta_transfer_bytes"),
+                    "mooncake_duration_seconds": entry.get(
+                        "target_hicache_prefix_match_s"
+                    ),
+                    "source_duration_seconds": timing.get("source_send_s"),
+                    "delta_duration_seconds": delta_duration,
+                    "held_at_mono": timing.get("target_held_mono"),
+                    "freeze_at_mono": timing.get("source_waiting_frozen_mono"),
+                    "commit_at_mono": timing.get("target_commit_ready_mono")
+                    or session_timing.get("commit_received_mono"),
+                    "activate_at_mono": timing.get("target_adopted_mono"),
+                    "source_queue": entry.get("source_queue")
+                    or manifest.get("pd_flip_source_queue"),
+                    "final_owner": entry.get("final_owner"),
+                    "output_boundary": manifest.get("last_emitted_output_seq"),
+                    "rollback_reason": entry.get("rollback_reason"),
+                }
+            )
+        return rows
 
     @staticmethod
     def _pd_flip_note_timing(
