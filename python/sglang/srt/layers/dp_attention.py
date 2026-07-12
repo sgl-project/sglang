@@ -544,11 +544,16 @@ def _dequant_per_token_group_fp8_kernel(
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
+    # HIDDEN may not be a multiple of BLOCK (e.g. DeepSeek 7168 vs BLOCK
+    # 2048): the tail iteration must be masked or it reads/writes up to
+    # BLOCK-1 elements past the row (cross-row corruption + OOB on the last
+    # row).  HIDDEN is constexpr, so the mask folds away when it divides.
     for start in tl.static_range(0, HIDDEN, BLOCK):
         offs = start + tl.arange(0, BLOCK)
-        qv = tl.load(q_ptr + row * HIDDEN + offs).to(tl.float32)
-        sv = tl.load(s_ptr + row * NGROUPS + offs // GROUP)
-        tl.store(out_ptr + row * HIDDEN + offs, (qv * sv).to(tl.bfloat16))
+        mask = offs < HIDDEN
+        qv = tl.load(q_ptr + row * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
+        sv = tl.load(s_ptr + row * NGROUPS + offs // GROUP, mask=mask, other=0.0)
+        tl.store(out_ptr + row * HIDDEN + offs, (qv * sv).to(tl.bfloat16), mask=mask)
 
 
 def _dp_gather_via_all_gatherv_fp8(
