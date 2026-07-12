@@ -20,7 +20,8 @@ source, so the move cuts that tail into the new file (extract_to_new_module). A 
 statement-level reorder relocates no def and is reported unsupported. Runnable directly:
 
     python3 mechanical_refactor_proof_generator.py <commit>
-    python3 mechanical_refactor_proof_generator.py <base>..<tip> --match -move: --out DIR
+    python3 mechanical_refactor_proof_generator.py <base>..<tip> \
+        --match '(?<!_)mechanical_provable' --out DIR
 """
 
 import ast

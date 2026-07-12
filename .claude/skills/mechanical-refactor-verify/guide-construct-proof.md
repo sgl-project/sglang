@@ -11,9 +11,9 @@
 ### 1.1 Generate the proof folder
 
 ```bash
-# a range: write a self-contained folder
+# a range: write a self-contained folder for every mechanical_provable commit
 python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py \
-    <base>..<tip> --match -move: --out repro_out
+    <base>..<tip> --match '(?<!_)mechanical_provable' --out repro_out
 ```
 
 - `mechanical_refactor_proof_generator.py` infers each recipe from a commit's diff and

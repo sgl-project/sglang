@@ -43,20 +43,15 @@ following must hold over `base..branch`; run the chain verifier
 
 ### 1.2 Commit naming and classification
 
-- Consecutive commits with reserved suffixes; short kebab `<id>`:
-
-```
-<id>-prepare: <subject>    # optional: minimal in-place reshape (de-self, or retype-self)
-<id>-move: <subject>       # pure relocation, certified by the reproduce proof
-<id>-postpare: <subject>   # optional: minimal tail fixup (e.g. a string-literal path)
-```
-
-- The `<phase>:` form is what the range command's `--match -move:` regex keys on.
-- A chain-verified branch (`spec-reproduction-cli.md` §2.1) additionally carries the
-  classification word in every commit message — the phases map onto it directly:
-  **move** commits declare `mechanical_provable`; **prepare**, **postpare**, and
-  standalone semantic commits declare `non_mechanical_provable`. The full subject format:
-  §1.1 item 1.
+- The subject format is exactly §1.1 item 1 — no reserved phase suffixes are required.
+  The `<commit-id>` is free (naming it after the phase, e.g. `foo-prepare` / `foo-move`,
+  is fine but optional).
+- The phases map onto the classification word directly: **move** commits declare
+  `mechanical_provable`; **prepare**, **postpare**, and standalone semantic commits
+  declare `non_mechanical_provable`.
+- The generator's range command selects the provable commits by the word itself:
+  `--match '(?<!_)mechanical_provable'` (the lookbehind keeps `non_mechanical_provable`
+  from matching).
 
 ## 2. Split one piece into prepare + move + postpare
 
