@@ -13,6 +13,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Deserialize)]
 pub struct RouterWorkerDrainReq {
@@ -92,14 +93,10 @@ fn require_admin(headers: &HeaderMap, ctx: &AppContext) -> Result<(), ApiError> 
 }
 
 fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
-    let max_len = actual.len().max(expected.len());
-    let mut difference = actual.len() ^ expected.len();
-    for index in 0..max_len {
-        let left = actual.get(index).copied().unwrap_or(0);
-        let right = expected.get(index).copied().unwrap_or(0);
-        difference |= usize::from(left ^ right);
+    if actual.len() != expected.len() {
+        return false;
     }
-    difference == 0
+    bool::from(actual.ct_eq(expected))
 }
 
 pub async fn list_workers(

@@ -269,14 +269,36 @@ Execute all six input/path combinations with the checked-in matrix driver. It
 refuses an empty reset command, waits for the dedicated store health endpoint,
 starts measurement and workload in the background, waits for the workload RID
 ready marker, runs the controller, releases the workload with the done marker,
-and summarizes every case. The three command arguments may use `MODE`,
+and summarizes every case. The five command/endpoint variables may use `MODE`,
 `DECISION_PATH`, and `OUTPUT_DIR` from the driver's environment:
 
 ```bash
+STORE_HOST=cloud-099
+REMOTE_ENV_FILE=/root/sglang/scripts/playground/disaggregation/pd_flip_docker/env.local
+PD_FLIP_STORE_READY_URL=http://10.0.0.10:18081/generation
+PD_FLIP_RESET_STORE_CMD='"$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/reset_store_remote.sh"'
+PD_FLIP_MEASURE_COMMAND='python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_migration_measure.py" sample \
+  --router-url "http://${ROUTER_HOST}:${ROUTER_PORT}" \
+  --node "name=node0,worker_url=$NODE0" --node "name=node1,worker_url=$NODE1" \
+  --node "name=node2,worker_url=$NODE2" --node "name=node3,worker_url=$NODE3" \
+  --api-key-env ADMIN_API_KEY --router-api-key-env PD_FLIP_ROUTER_ADMIN_API_KEY \
+  --duration-seconds 3600 --output-events "$MIGRATION_EVENTS"'
+PD_FLIP_CONTROLLER_COMMAND='PD_FLIP_ARTIFACT_DIR="$OUTPUT_DIR" \
+  PD_FLIP_SESSION_JOURNAL_PATH="$PD_FLIP_SESSION_JOURNAL_PATH" \
+  "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" monitor'
+PD_FLIP_SUMMARIZE_COMMAND='python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_migration_measure.py" summarize \
+  --events-jsonl "$MIGRATION_EVENTS" --controller-log "$OUTPUT_DIR/controller.log" \
+  --request-metrics-jsonl "$OUTPUT_DIR/request_metrics.jsonl" \
+  --errors-jsonl "$OUTPUT_DIR/errors.jsonl" --output-dir "$OUTPUT_DIR/summary"'
+export STORE_HOST REMOTE_ENV_FILE PD_FLIP_STORE_READY_URL PD_FLIP_RESET_STORE_CMD
+export PD_FLIP_MEASURE_COMMAND PD_FLIP_CONTROLLER_COMMAND PD_FLIP_SUMMARIZE_COMMAND
+
 python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_progressive_matrix.py" \
   --base-url "http://${ROUTER_HOST}:${ROUTER_PORT}" \
+  --router-url "http://${ROUTER_HOST}:${ROUTER_PORT}" --other-decode-url "$NODE1" \
   --source-url "$NODE2" --target-url "$NODE3" --model "$MODEL_ID" \
   --admin-api-key-env ADMIN_API_KEY \
+  --router-admin-api-key-env PD_FLIP_ROUTER_ADMIN_API_KEY \
   --output-root "$SGLANG_REPO/pd-flip-artifacts/progressive-matrix" \
   --reset-store-cmd "$PD_FLIP_RESET_STORE_CMD" \
   --store-ready-url "$PD_FLIP_STORE_READY_URL" \

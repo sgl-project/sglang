@@ -103,6 +103,21 @@ class IncompleteSSEHandler(BaseHTTPRequestHandler):
         return
 
 
+class AuthGetHandler(BaseHTTPRequestHandler):
+    authorization = None
+
+    def do_GET(self):
+        self.__class__.authorization = self.headers.get("authorization")
+        body = b"{}"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        return
+
+
 def test_mode_prompt_strategies_are_distinct_and_do_not_claim_hits():
     module = load_module()
     full = module.build_prompt_plan("full", seed=7)
@@ -135,6 +150,22 @@ def test_incomplete_sse_is_a_hard_error():
         thread.join(timeout=5)
 
 
+def test_measurement_client_sends_bearer_auth():
+    from scripts.playground.disaggregation.pd_flip_migration_measure import HttpClient
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AuthGetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        HttpClient(timeout_seconds=2, api_key="secret").get_json(
+            f"http://127.0.0.1:{server.server_port}/status"
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert AuthGetHandler.authorization == "Bearer secret"
+
+
 def test_matrix_enumerates_all_modes_and_paths_and_rejects_empty_reset(monkeypatch):
     module = load_matrix_module()
     calls = []
@@ -156,6 +187,127 @@ def test_matrix_enumerates_all_modes_and_paths_and_rejects_empty_reset(monkeypat
         module.run(args)
 
 
+def test_router_placement_drains_non_source_then_restores(monkeypatch):
+    module = load_matrix_module()
+    calls = []
+    workers = [
+        {"worker_id": "w1", "url": "http://node1", "role": "decode", "draining": False},
+        {"worker_id": "w2", "url": "http://node2", "role": "decode", "draining": False},
+        {"worker_id": "w3", "url": "http://node3", "role": "decode", "draining": True},
+    ]
+    monkeypatch.setattr(module, "router_get_workers", lambda *_: workers)
+    monkeypatch.setattr(
+        module,
+        "router_set_drain",
+        lambda *args: calls.append((args[-2], args[-1])),
+    )
+    placement = module.prepare_router_placement(
+        "http://router", "secret", "http://node1", "http://node2", "http://node3", 2
+    )
+    assert calls == [("w1", True), ("w3", True), ("w2", False)]
+    module.release_targets(placement)
+    assert calls[-2:] == [("w1", False), ("w3", False)]
+    module.restore_router_placement(placement)
+    assert calls[-3:] == [("w1", False), ("w2", False), ("w3", True)]
+
+
+def test_router_placement_rolls_back_partial_failure(monkeypatch):
+    module = load_matrix_module()
+    workers = [
+        {"worker_id": "w1", "url": "http://node1", "role": "decode", "draining": False},
+        {"worker_id": "w2", "url": "http://node2", "role": "decode", "draining": False},
+        {"worker_id": "w3", "url": "http://node3", "role": "decode", "draining": False},
+    ]
+    calls = []
+    monkeypatch.setattr(module, "router_get_workers", lambda *_: workers)
+
+    def mutate(*args):
+        calls.append((args[-2], args[-1]))
+        if len(calls) == 2:
+            raise RuntimeError("target drain failed")
+
+    monkeypatch.setattr(module, "router_set_drain", mutate)
+    with pytest.raises(RuntimeError, match="target drain failed"):
+        module.prepare_router_placement(
+            "http://router", "secret", "http://node1", "http://node2", "http://node3", 2
+        )
+    assert calls[-1] == ("w1", False)
+
+
+def test_pressure_timeline_contracts():
+    module = load_matrix_module()
+    module.validate_pressure_timeline(
+        {
+            "pressure_start": 1.0,
+            "controller_start": 2.0,
+            "first_batch_target_active": 3.0,
+            "pressure_end": 4.0,
+            "controller_end": 5.0,
+        },
+        "recovery",
+    )
+    module.validate_pressure_timeline(
+        {
+            "pressure_start": 1.0,
+            "controller_start": 2.0,
+            "controller_end": 3.0,
+            "pressure_end": 3.0,
+        },
+        "commit",
+    )
+    with pytest.raises(RuntimeError, match="first activation"):
+        module.validate_pressure_timeline(
+            {
+                "pressure_start": 1.0,
+                "controller_start": 2.0,
+                "pressure_end": 2.5,
+                "first_batch_target_active": 3.0,
+                "controller_end": 4.0,
+            },
+            "recovery",
+        )
+
+
+def test_controller_wait_fails_if_sidecar_exits_early(tmp_path):
+    module = load_matrix_module()
+
+    class Process:
+        def __init__(self, return_code):
+            self.return_code = return_code
+
+        def poll(self):
+            return self.return_code
+
+    log = tmp_path / "measurement.log"
+    log.write_text("collector crashed", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="collector crashed"):
+        module.wait_for_process(
+            Process(None),
+            1,
+            0,
+            [("measurement", Process(7), log)],
+        )
+
+
+def test_join_uses_session_and_rid_and_rejects_competing_targets():
+    from scripts.playground.disaggregation.pd_flip_migration_measure import (
+        join_request_migration,
+    )
+
+    request = {"request_id": "rid-1", "migration_session_id": "s1"}
+    source = {"rid": "rid-1", "session_id": "s1", "final_owner": "source"}
+    target = {"rid": "rid-1", "session_id": "s1", "final_owner": "target"}
+    joined = join_request_migration([request], [source, target])
+    assert joined[0]["worker_final_owner"] == "target"
+    with pytest.raises(RuntimeError, match="competing target"):
+        join_request_migration([request], [target, dict(target, node="duplicate")])
+    with pytest.raises(RuntimeError, match="ambiguous migration session"):
+        join_request_migration(
+            [{"request_id": "rid-1"}],
+            [target, dict(target, session_id="s2")],
+        )
+
+
 def test_workload_proves_rid_migration_and_control_output(tmp_path, monkeypatch):
     module = load_module()
     FakeOpenAIHandler.requests = []
@@ -165,6 +317,9 @@ def test_workload_proves_rid_migration_and_control_output(tmp_path, monkeypatch)
     output_dir = tmp_path / "workload"
     done_marker = tmp_path / "controller.done"
     ready_marker = tmp_path / "workload.ready"
+    pressure_stop = tmp_path / "pressure.stop"
+    pressure_started = tmp_path / "pressure.started"
+    pressure_ended = tmp_path / "pressure.ended"
     done_marker.touch()
     monkeypatch.setenv("PD_FLIP_TEST_KEY", "secret")
     try:
@@ -182,6 +337,12 @@ def test_workload_proves_rid_migration_and_control_output(tmp_path, monkeypatch)
                 str(ready_marker),
                 "--controller-done-marker",
                 str(done_marker),
+                "--pressure-stop-marker",
+                str(pressure_stop),
+                "--pressure-started-marker",
+                str(pressure_started),
+                "--pressure-ended-marker",
+                str(pressure_ended),
                 "--model",
                 "test-model",
                 "--mode",

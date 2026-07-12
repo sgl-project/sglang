@@ -3,6 +3,7 @@
 
 The selected mode controls only prompt warm-up/input strategy. Actual HiCache
 mode acceptance must come from worker ``request_measurements.stitch_mode``.
+Local/fake execution does not constitute the externally blocked four-node E2E.
 """
 
 import argparse
@@ -214,7 +215,9 @@ def validate_target_measurement(
         raise RuntimeError("target did not become final owner")
     if measurement.get("output_boundary") is None:
         raise RuntimeError("target measurement is missing output_boundary")
-    return measurement
+    proof = dict(measurement)
+    proof["session_id"] = next(iter(shared_sessions))
+    return proof
 
 
 def run(args: argparse.Namespace) -> int:
@@ -342,6 +345,8 @@ def run(args: argparse.Namespace) -> int:
                     return payload
         return None
 
+    pressure_state = {"count": 0}
+    pressure_count = args.pressure_requests
     try:
         ready_snapshot = wait_for(
             active_is_running,
@@ -353,25 +358,52 @@ def run(args: argparse.Namespace) -> int:
             Path(args.ready_marker),
             {"rid": active_request_id, "source_snapshot": ready_snapshot},
         )
+        pressure_state = {"count": 0, "start_monotonic": time.monotonic()}
+        atomic_write_json(
+            Path(args.pressure_started_marker),
+            {"pressure_start": pressure_state["start_monotonic"]},
+        )
+
+        def run_pressure():
+            index = 0
+            while not Path(args.pressure_stop_marker).exists() and not Path(
+                args.controller_done_marker
+            ).exists():
+                run_nonstream(
+                    "pressure_short",
+                    "short prefill pressure %d %s"
+                    % (index, plan.active_prompt[:128]),
+                    args.pressure_max_tokens,
+                )
+                index += 1
+                pressure_state["count"] = index
+                if pressure_count is not None and index >= pressure_count:
+                    break
+                if args.pressure_interval_seconds > 0:
+                    time.sleep(args.pressure_interval_seconds)
+            pressure_state["end_monotonic"] = time.monotonic()
+            atomic_write_json(
+                Path(args.pressure_ended_marker),
+                {
+                    "pressure_start": pressure_state["start_monotonic"],
+                    "pressure_end": pressure_state["end_monotonic"],
+                    "pressure_requests": pressure_state["count"],
+                },
+            )
+
+        pressure = threading.Thread(target=run_pressure, name="pd-flip-pressure")
+        pressure.start()
         wait_for(
             lambda: Path(args.controller_done_marker).exists(),
             args.coordination_timeout_seconds,
             args.poll_interval_seconds,
             "controller done marker",
         )
+        pressure.join(timeout=args.timeout_seconds)
+        if pressure.is_alive():
+            raise TimeoutError("pressure thread did not stop")
     except Exception as exc:
         record_error(active_request_id, "coordination", exc)
-    pressure_count = args.pressure_requests
-    if pressure_count is None:
-        pressure_count = 8 if args.decision_path == "recovery" else 80
-    for index in range(pressure_count):
-        run_nonstream(
-            "pressure_short",
-            "short prefill pressure %d %s" % (index, plan.active_prompt[:128]),
-            args.pressure_max_tokens,
-        )
-        if args.pressure_interval_seconds > 0:
-            time.sleep(args.pressure_interval_seconds)
     active.join(timeout=args.timeout_seconds + 30)
     if active.is_alive():
         errors.append(
@@ -417,6 +449,7 @@ def run(args: argparse.Namespace) -> int:
             raise RuntimeError("active output differs from post-migration control")
         active_row["control_request_id"] = control_id
         active_row["control_exact_match"] = True
+        active_row["migration_session_id"] = migration_measurement["session_id"]
         active_row["migration_measurement"] = migration_measurement
     except Exception as exc:
         record_error(active_request_id, "post_migration_validation", exc)
@@ -434,7 +467,7 @@ def run(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "zero_trial_nonce": plan.trial_nonce,
         "active_request_id": active_request_id,
-        "pressure_requests": pressure_count,
+        "pressure_requests": pressure_state.get("count", 0),
         "pressure_interval_seconds": args.pressure_interval_seconds,
         "long_max_tokens": args.long_max_tokens,
         "note": "mode is an input strategy; accept actual stitch_mode from worker request_measurements",
@@ -453,6 +486,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--admin-api-key-env", default="ADMIN_API_KEY")
     parser.add_argument("--ready-marker", required=True)
     parser.add_argument("--controller-done-marker", required=True)
+    parser.add_argument("--pressure-stop-marker", required=True)
+    parser.add_argument("--pressure-started-marker", required=True)
+    parser.add_argument("--pressure-ended-marker", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", choices=("full", "partial", "zero"), required=True)
     parser.add_argument(

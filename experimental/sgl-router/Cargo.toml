@@ -68,6 +68,7 @@ kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
+subtle = "2"
 
 # KV-event subsystem — msgpack-encoded events over ZMQ and sha256-based
 # block hashing matching SGLang's `radix_cache`.  Wire format authority is

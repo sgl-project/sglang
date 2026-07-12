@@ -7,6 +7,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "scripts" / "playground" / "disaggregation" / "pd_flip_docker"
@@ -27,6 +29,12 @@ def bash_path(path: Path) -> str:
     return subprocess.check_output(
         ["bash", "-lc", f"wslpath -a -u {shlex.quote(str(path))}"], text=True
     ).strip()
+
+
+def powershell_path(path: Path) -> str:
+    if os.name == "nt":
+        return str(path)
+    return subprocess.check_output(["wslpath", "-w", str(path)], text=True).strip()
 
 
 def env_values() -> dict[str, str]:
@@ -291,6 +299,9 @@ def test_router_auth_contract_is_fail_closed_in_rust_source():
     assert "load_pd_flip_router_admin_key" in cli_source
     assert '"PD_FLIP_ROUTER_ADMIN_API_KEY"' in cli_source
     assert "pub pd_flip_router_admin_api_key" not in cli_source
+    cargo = read(ROOT / "experimental/sgl-router/Cargo.toml")
+    assert 'subtle = "2"' in cargo
+    assert "ConstantTimeEq" in source
 
 
 def test_windows_helper_uses_1p3d_secrets_and_authenticated_status():
@@ -307,7 +318,7 @@ def test_windows_helper_uses_1p3d_secrets_and_authenticated_status():
 def test_windows_helper_round_trips_shell_metacharacter_secret(tmp_path):
     powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
     if not powershell:
-        return
+        pytest.skip("PowerShell is unavailable")
     secret = "p@$$&'quoted"
     env_file = tmp_path / "windows.env"
     result = subprocess.run(
@@ -317,29 +328,27 @@ def test_windows_helper_round_trips_shell_metacharacter_secret(tmp_path):
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            str(WINDOWS_HELPER),
+            powershell_path(WINDOWS_HELPER),
             "-Action",
             "write-env",
             "-AdminApiKey",
             secret,
             "-EnvFile",
-            str(env_file),
+            powershell_path(env_file),
         ],
         text=True,
         capture_output=True,
     )
     assert result.returncode == 0, result.stderr
+    verify_script = tmp_path / "verify-secret.sh"
+    verify_script.write_text(
+        "set -eu\nset -a\nsource %s\nprintf '%%s\\n%%s' \"$ADMIN_API_KEY\" "
+        '"$PD_FLIP_ROUTER_ADMIN_API_KEY"\n' % shlex.quote(bash_path(env_file)),
+        encoding="utf-8",
+        newline="\n",
+    )
     sourced = subprocess.run(
-        [
-            "bash",
-            "-c",
-            'set -a; source "$1"; printf "%s\\n%s" "$ADMIN_API_KEY" '
-            '"$PD_FLIP_ROUTER_ADMIN_API_KEY"',
-            "bash",
-            bash_path(env_file),
-        ],
-        text=True,
-        capture_output=True,
+        ["bash", bash_path(verify_script)], text=True, capture_output=True
     )
     assert sourced.returncode == 0, sourced.stderr
     assert sourced.stdout.splitlines() == [secret, secret]

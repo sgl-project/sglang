@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 import time
 import urllib.error
@@ -21,11 +22,16 @@ JsonDict = Dict[str, Any]
 
 
 class HttpClient:
-    def __init__(self, timeout_seconds: float = 5.0):
+    def __init__(self, timeout_seconds: float = 5.0, api_key: Optional[str] = None):
         self.timeout_seconds = timeout_seconds
+        self.api_key = api_key
 
     def get_json(self, url: str) -> Any:
-        with urllib.request.urlopen(url, timeout=self.timeout_seconds) as response:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             raw = response.read().decode("utf-8", errors="replace")
         return json.loads(raw)
 
@@ -55,16 +61,21 @@ def sample_loop(
     interval_seconds: float,
     duration_seconds: float,
     http_timeout_seconds: float,
+    api_key: Optional[str] = None,
+    router_api_key: Optional[str] = None,
 ) -> None:
     output_events.parent.mkdir(parents=True, exist_ok=True)
-    client = HttpClient(timeout_seconds=http_timeout_seconds)
+    client = HttpClient(timeout_seconds=http_timeout_seconds, api_key=api_key)
+    router_client = HttpClient(
+        timeout_seconds=http_timeout_seconds, api_key=router_api_key or api_key
+    )
     deadline = time.monotonic() + duration_seconds
     url_to_name = {node["worker_url"].rstrip("/"): node["name"] for node in nodes}
 
     with output_events.open("w", encoding="utf-8") as f:
         while time.monotonic() < deadline:
             sample_started = time.monotonic()
-            write_event(f, collect_router_event(client, router_url, url_to_name))
+            write_event(f, collect_router_event(router_client, router_url, url_to_name))
             for node in nodes:
                 for event in collect_worker_events(client, node):
                     write_event(f, event)
@@ -397,20 +408,34 @@ def label_request_impact(metrics: Sequence[JsonDict], timeline: Sequence[JsonDic
 def join_request_migration(
     request_rows: Sequence[JsonDict], migration_rows: Sequence[JsonDict]
 ) -> List[JsonDict]:
-    """Join the request ledger to the latest worker proof for the same RID."""
-    latest = {}
+    """Join only unambiguous target-owner proof by ``(session_id, rid)``."""
+    candidates = {}
     for migration in migration_rows:
         rid = migration.get("rid")
-        if rid:
-            previous = latest.get(rid)
-            if previous is None or float(migration.get("ts_mono") or 0) >= float(
-                previous.get("ts_mono") or 0
-            ):
-                latest[rid] = migration
+        session_id = migration.get("session_id")
+        if rid and session_id and migration.get("final_owner") == "target":
+            candidates.setdefault((session_id, rid), []).append(migration)
     joined = []
     for request in request_rows:
         row = dict(request)
-        measurement = latest.get(request.get("request_id"))
+        rid = request.get("request_id")
+        session_id = request.get("migration_session_id")
+        if session_id is None:
+            sessions = {
+                candidate_session
+                for candidate_session, candidate_rid in candidates
+                if candidate_rid == rid
+            }
+            if len(sessions) > 1:
+                raise RuntimeError("ambiguous migration session for RID %s" % rid)
+            session_id = next(iter(sessions), None)
+        matches = candidates.get((session_id, rid), []) if session_id else []
+        if len(matches) > 1:
+            raise RuntimeError(
+                "competing target measurements for session/RID %s/%s"
+                % (session_id, rid)
+            )
+        measurement = matches[0] if matches else None
         row["migration_measurement_found"] = measurement is not None
         if measurement:
             for key, value in measurement.items():
@@ -994,6 +1019,10 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--interval-seconds", type=float, default=0.2)
     sample.add_argument("--duration-seconds", type=float, default=420.0)
     sample.add_argument("--http-timeout-seconds", type=float, default=3.0)
+    sample.add_argument("--api-key-env", default="ADMIN_API_KEY")
+    sample.add_argument(
+        "--router-api-key-env", default="PD_FLIP_ROUTER_ADMIN_API_KEY"
+    )
 
     summarize = subparsers.add_parser("summarize")
     summarize.add_argument("--events-jsonl", required=True)
@@ -1012,6 +1041,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.print_help()
         return 2
     if args.command == "sample":
+        api_key = os.environ.get(args.api_key_env)
+        if not api_key:
+            raise ValueError("measurement API key environment variable is empty")
         sample_loop(
             router_url=args.router_url,
             nodes=parse_node_specs(args.node),
@@ -1019,6 +1051,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             interval_seconds=args.interval_seconds,
             duration_seconds=args.duration_seconds,
             http_timeout_seconds=args.http_timeout_seconds,
+            api_key=api_key,
+            router_api_key=os.environ.get(args.router_api_key_env)
+            or api_key,
         )
         return 0
     if args.command == "summarize":
