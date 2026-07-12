@@ -17,6 +17,10 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.pynccl import (
+    resume_pynccl_comms,
+    suspend_pynccl_comms,
+)
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -222,7 +226,10 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+        # ncclCommSuspend requires all communicator operations to be complete.
         torch.get_device_module().synchronize()
+        if any(tag in tags for tag in GPU_MEMORY_ALL_TYPES):
+            suspend_pynccl_comms()
 
         return ReleaseMemoryOccupationReqOutput()
 
@@ -249,6 +256,13 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+        # Restore communicator allocations after memory-saver regions but
+        # before any subsystem can communicate again.
+        if any(tag in tags for tag in GPU_MEMORY_ALL_TYPES):
+            resume_pynccl_comms()
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:

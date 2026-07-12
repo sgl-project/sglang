@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import weakref
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -25,6 +26,26 @@ from sglang.srt.utils.common import get_current_device_stream_fast
 
 logger = logging.getLogger(__name__)
 
+_NCCL_SUSPEND_MEM = 0x01
+_NCCL_SUSPEND_MIN_VERSION = 22907
+
+# Includes the standalone communicator used by DSA layer sharding.
+_pynccl_communicators: list[weakref.ReferenceType] = []
+
+
+def get_pynccl_communicators() -> list["PyNcclCommunicator"]:
+    return [comm for ref in _pynccl_communicators if (comm := ref()) is not None]
+
+
+def suspend_pynccl_comms() -> None:
+    for comm in get_pynccl_communicators():
+        comm.suspend()
+
+
+def resume_pynccl_comms() -> None:
+    for comm in get_pynccl_communicators():
+        comm.resume()
+
 
 class PyNcclCommunicator:
 
@@ -45,6 +66,7 @@ class PyNcclCommunicator:
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
+        self._is_suspended = False
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
             assert (
@@ -124,6 +146,7 @@ class PyNcclCommunicator:
         # to use it, use under `with obj.change_state(enable=True)`, usually
         # when we are using CUDA graph.
         self.disabled = True
+        _pynccl_communicators.append(weakref.ref(self))
 
     def _resolve_stream(self) -> torch.cuda.Stream:
         """Return the current device stream used for NCCL calls."""
@@ -361,6 +384,30 @@ class PyNcclCommunicator:
 
     def deregister_comm_window(self, window):
         return self.nccl.ncclCommWindowDeregister(self.comm, window)
+
+    def suspend(self) -> None:
+        """Release dynamic GPU memory while preserving communicator state."""
+        if (
+            not self.available
+            or self.nccl_version < _NCCL_SUSPEND_MIN_VERSION
+            or not self.nccl.supports_comm_suspend
+            or self._is_suspended
+        ):
+            return
+        self.nccl.ncclCommSuspend(self.comm, _NCCL_SUSPEND_MEM)
+        self._is_suspended = True
+
+    def resume(self) -> None:
+        """Restore dynamic GPU memory released by :meth:`suspend`."""
+        if (
+            not self.available
+            or self.nccl_version < _NCCL_SUSPEND_MIN_VERSION
+            or not self.nccl.supports_comm_suspend
+            or not self._is_suspended
+        ):
+            return
+        self.nccl.ncclCommResume(self.comm)
+        self._is_suspended = False
 
     def group_start(self):
         self.nccl.ncclGroupStart()
