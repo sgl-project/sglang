@@ -662,7 +662,7 @@ class FlashInferAttnBackend(AttentionBackend):
             and forward_mode.is_target_verify()
         ):
             raise NotImplementedError(
-                "FlashInfer does not support DSV4 ragged verify in cuda graph; "
+                "FlashInfer does not support ragged verify in cuda graph; "
                 "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
             )
 

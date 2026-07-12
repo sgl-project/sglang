@@ -286,7 +286,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.enable_two_batch_overlap or model_runner.server_args.enable_lora
         ):
             raise ValueError(
-                "DSpark compact ragged verify does not support "
+                "Compact ragged verify does not support "
                 "two-batch-overlap or LoRA; disable SGLANG_RAGGED_VERIFY_MODE "
                 "or the conflicting feature."
             )
@@ -575,7 +575,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
         )
         assert not self.disable_padding, (
-            "DSpark compact ragged verify pads bs to the captured tier, which is "
+            "Compact ragged verify pads bs to the captured tier, which is "
             "incompatible with disable_cuda_graph_padding; disable "
             "SGLANG_RAGGED_VERIFY_MODE or enable cuda-graph padding."
         )

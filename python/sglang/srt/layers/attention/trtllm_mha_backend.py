@@ -559,7 +559,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
             if getattr(spec_info, "ragged_verify_layout", None) is not None:
-                # DSpark ragged verify: the per-request k-extension is not a
+                # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
                 # rebuild this metadata. It is written eagerly on every
                 # capture/replay-prep in init_forward_metadata_out_graph;
@@ -688,7 +688,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _assert_ragged_verify_supported(self) -> None:
         if self.is_xqa_impl:
             raise NotImplementedError(
-                "DSpark compact ragged verify (variable-length cum_seq_lens_q) "
+                "Compact ragged verify (variable-length cum_seq_lens_q) "
                 "requires the trtllm-gen decode kernel; the xqa impl (sm90 / sm120) "
                 "rejects it. Disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
             )
