@@ -2039,6 +2039,9 @@ class DeepseekV4Model(nn.Module):
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
     def hc_head(
         self,
         x: torch.Tensor,
@@ -2349,6 +2352,9 @@ class DeepseekV4ForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
