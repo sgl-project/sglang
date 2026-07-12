@@ -1542,7 +1542,13 @@ def moe_ep_deepgemm_preprocess(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
-    if envs.SGLANG_OPT_DG_MASKED_M_CAP.get():
+    if (
+        envs.SGLANG_OPT_DG_MASKED_M_CAP.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # (capture guard: decode CUDA-graph capture also routes through this
+        # preprocess; the D2H sync is illegal mid-capture, and decode batches
+        # are small enough that the uncapped m_max is harmless there.)
         # m_max reserves capacity for ALL rank tokens in EVERY local expert:
         # the [num_local_experts, m_max, *] masked-GEMM intermediates reach
         # 7+ GiB per 32k-token chunk and OOM saturated serving.  The hottest
