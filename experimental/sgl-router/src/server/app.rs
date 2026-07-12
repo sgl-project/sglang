@@ -12,7 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method
@@ -65,6 +65,23 @@ fn normalize_method(method: &axum::http::Method) -> &'static str {
     }
 }
 
+/// Router pod identity stamped on every request-status access-log line, so a
+/// multi-replica router fleet's aggregated logs show which pod handled each
+/// request. Resolved once, lazily, from the environment: `POD_NAME` (a
+/// downward-API env var an operator opts into) wins, else `HOSTNAME`
+/// (Kubernetes defaults a pod's hostname to its `metadata.name`, which the
+/// runtime exposes here), else `"unknown"` (running outside a container with
+/// neither set).
+static POD_ID: OnceLock<String> = OnceLock::new();
+
+fn pod_id() -> &'static str {
+    POD_ID.get_or_init(|| {
+        std::env::var("POD_NAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "unknown".to_string())
+    })
+}
+
 /// Guards `access_log_and_record`'s normal access-log line, which is only
 /// reached after `next.run(req).await` resolves. If the client disconnects
 /// while that await is still pending, axum drops that function's future
@@ -101,6 +118,7 @@ impl Drop for AccessLogFallbackGuard {
             return;
         }
         tracing::warn!(
+            pod_id = %pod_id(),
             request_id = %self.request_id,
             method = %self.method_label,
             path = %self.path,
@@ -213,6 +231,7 @@ async fn access_log_and_record(
 
     metrics.record_worker_request(worker, model, mode, outcome);
     tracing::info!(
+        pod_id = %pod_id(),
         request_id = %request_id,
         method = %method,
         path = %path,
