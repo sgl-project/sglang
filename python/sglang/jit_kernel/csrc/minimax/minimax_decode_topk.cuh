@@ -30,7 +30,9 @@ namespace {
 // The trivial case num_blocks <= topk (every block selected) is handled by the
 // kernels below, outside the Trait.
 struct TopKTrait {
-  static constexpr uint32_t kMaxTopK = 32;
+  // Also sizes the kernels' smem staging for the ascending-order emit; the
+  // block-id path's test contract goes up to topk == 64.
+  static constexpr uint32_t kMaxTopK = 64;
   static constexpr uint32_t kCTASize = 512;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
   static constexpr uint32_t kMaxNumBlocks = 4096;  // block topk
@@ -264,8 +266,10 @@ struct TopKTrait {
 // Trait; otherwise the Trait selects the top-k block ids.
 // -------------------------------------------------------------------------
 
-// Block-id output: topk_idx[h, b, 0:k_eff) = selected block ids (front-packed,
-// unordered), [k_eff:topk) = -1.
+// Block-id output: topk_idx[h, b, 0:k_eff) = selected block ids (sorted
+// ascending), [k_eff:topk) = -1. Ascending order is a hard requirement of the
+// MSA fmha_sm100 consumer (kv_block_indexes must be strictly ascending; its
+// sorted-order early-exit otherwise mis-masks the partial last block).
 template <typename SeqLenT, bool kUsePDL>
 __global__ void minimax_decode_topk_block_kernel(
     const float* __restrict__ score,
@@ -297,7 +301,19 @@ __global__ void minimax_decode_topk_block_kernel(
 
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;
   __shared__ TopKTrait::Smem smem;
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), out, static_cast<uint32_t>(topk), &smem);
+  __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
+  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  __syncthreads();  // s_topk fully written before the sort reads it
+
+  // Emit ascending: num_blocks > topk here, so all topk slots hold distinct
+  // ids and the O(k^2) rank (k <= kMaxTopK) is a permutation.
+  for (int slot = tx; slot < topk; slot += TopKTrait::kCTASize) {
+    const int32_t v = s_topk[slot];
+    int rank = 0;
+    for (int j = 0; j < topk; ++j)
+      rank += (s_topk[j] < v);
+    out[rank] = v;
+  }
 }
 
 // Page-table output: for each (batch b, kv-head h) pseudo-request emit the
@@ -436,6 +452,7 @@ void minimax_decode_topk(
       topk_i,
       ")");
   RuntimeCheck(block_size > 0, "block_size must be > 0, got ", block_size);
+  RuntimeCheck(topk <= static_cast<int64_t>(TopKTrait::kMaxTopK), "topk exceeds kMaxTopK (ascending-sort smem buffer)");
   if (batch == 0 || num_heads == 0) return;
 
   const dim3 grid(static_cast<unsigned>(batch), static_cast<unsigned>(num_heads));
