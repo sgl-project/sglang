@@ -764,10 +764,8 @@ class TokenizerControlMixin:
 
             async with self.lora_update_lock:
                 if obj.upsert:
-                    # Upsert: if the adapter is already registered, refresh its
-                    # weights in place reusing the existing lora_id (no
-                    # register/eviction). If not registered, fall through to the
-                    # normal register path below to insert it.
+                    # Refresh an already-registered adapter in place; if not
+                    # registered, fall through to the normal register path.
                     existing_id = await self.lora_registry.get_lora_id(obj.lora_name)
                     if existing_id is not None:
                         obj.lora_id = existing_id
@@ -780,7 +778,6 @@ class TokenizerControlMixin:
                                 pinned=obj.pinned,
                             )
                         return result
-                    # Not registered yet: fall through to the register path.
 
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,

@@ -215,8 +215,7 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
-        # Check if this LoRA adapter is already loaded. Skip when refreshing an
-        # already-registered adapter in place (upsert update case).
+        # Reject duplicates unless refreshing an existing adapter in place.
         if not is_update:
             for existing_lora_ref in self.lora_refs.values():
                 if lora_ref.lora_name == existing_lora_ref.lora_name:
@@ -749,14 +748,8 @@ class LoRAManager:
         """
         Load a single LoRA adapter from tensors and config dict.
 
-        When ``upsert`` is True, this behaves as an upsert: if the adapter is
-        already loaded, only its weights are refreshed in place (reusing the
-        existing id, no register/eviction/name-duplicate checks, no pinned-slot
-        recount); if it is not loaded, it is registered via the normal path.
-        When ``upsert`` is False (default), the adapter must not already be
-        loaded (original strict-register behavior). This mirrors
-        ``update_weights_from_distributed`` for the base model and avoids the
-        unload -> wait_for_unload cycle.
+        With ``upsert``, an already-loaded adapter has its weights refreshed in
+        place (reusing its lora_id); otherwise the adapter must not be loaded yet.
         """
         assert (
             lora_ref.lora_name is not None and lora_ref.lora_path is not None

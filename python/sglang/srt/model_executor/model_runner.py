@@ -2284,7 +2284,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
         result = self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config,
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
             upsert=upsert,
         )
         logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
@@ -2335,7 +2338,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return LoRAUpdateOutput(success=False, error_message=error_msg)
 
         result = self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config,
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
             upsert=upsert,
         )
         logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")

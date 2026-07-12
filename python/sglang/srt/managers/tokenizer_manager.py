@@ -1651,7 +1651,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     except StopAsyncIteration:
                         pass
 
-    def abort_request(self, rid: str = "", abort_all: bool = False, prefix: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
