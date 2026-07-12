@@ -15,7 +15,7 @@ from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
