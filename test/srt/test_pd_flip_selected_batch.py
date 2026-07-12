@@ -64,6 +64,7 @@ def _load_scheduler_method(name):
         "Any": Any,
         "Dict": Dict,
         "List": List,
+        "Optional": Optional,
         "Tuple": Tuple,
         "Req": object,
         "PDFlipMigrationSourceStartReq": object,
@@ -139,8 +140,8 @@ def test_source_start_selects_exact_unfinished_running_prefix():
     request = PDFlipMigrationSourceStartReq(rids=["r0", "r1"], include_waiting=False)
     scheduler = make_scheduler(
         running=[
-            FakeReq("finished", finished=True),
             FakeReq("r0"),
+            FakeReq("finished", finished=True),
             FakeReq("r1"),
             FakeReq("r2"),
         ]
@@ -149,6 +150,20 @@ def test_source_start_selects_exact_unfinished_running_prefix():
     selected = scheduler._pd_flip_select_source_batch(request)
 
     assert [req.rid for req in selected] == ["r0", "r1"]
+
+
+def test_source_start_distinguishes_empty_rids_from_all_running_compatibility():
+    scheduler = make_scheduler(running=[FakeReq("r0"), FakeReq("r1")])
+
+    empty = scheduler._pd_flip_select_source_batch(
+        PDFlipMigrationSourceStartReq(rids=[])
+    )
+    all_running = scheduler._pd_flip_select_source_batch(
+        PDFlipMigrationSourceStartReq(rids=None)
+    )
+
+    assert empty == []
+    assert [req.rid for req in all_running] == ["r0", "r1"]
 
 
 def test_source_start_builds_manifests_for_only_the_selected_running_prefix():
@@ -192,6 +207,15 @@ def test_source_start_rejects_non_prefix_or_out_of_order_selection():
             )
 
 
+def test_source_start_rejects_duplicate_requested_running_rid():
+    scheduler = make_scheduler(running=[FakeReq("r0"), FakeReq("r1")])
+
+    with pytest.raises(ValueError, match="duplicate rid.*r0"):
+        scheduler._pd_flip_select_source_batch(
+            PDFlipMigrationSourceStartReq(rids=["r0", "r0"])
+        )
+
+
 def test_source_start_with_none_selects_all_unfinished_running_requests():
     scheduler = make_scheduler(
         running=[FakeReq("r0"), FakeReq("done", finished=True), FakeReq(2)]
@@ -227,6 +251,37 @@ def test_source_start_includes_migratable_waiting_and_ignores_finished_waiting()
     assert [req.rid for req in selected] == ["r0", "waiting"]
 
 
+@pytest.mark.parametrize(
+    "running, waiting",
+    [
+        ([FakeReq("same")], [FakeReq("same")]),
+        ([], [FakeReq("same"), FakeReq("same")]),
+    ],
+    ids=["running-waiting", "within-waiting"],
+)
+def test_source_start_rejects_duplicate_rid_in_combined_selection(running, waiting):
+    scheduler = make_scheduler(running=running, waiting=waiting)
+
+    with pytest.raises(ValueError, match="duplicate rid.*same"):
+        scheduler._pd_flip_select_source_batch(
+            PDFlipMigrationSourceStartReq(rids=None, include_waiting=True)
+        )
+
+
+def test_source_selection_does_not_modify_waiting_queue():
+    waiting = [FakeReq("waiting"), FakeReq("finished", finished=True)]
+    scheduler = make_scheduler(running=[FakeReq("r0")], waiting=waiting)
+
+    scheduler._pd_flip_select_source_batch(
+        PDFlipMigrationSourceStartReq(rids=["r0"], include_waiting=True)
+    )
+
+    assert len(scheduler.waiting_queue) == 2
+    assert all(
+        actual is expected for actual, expected in zip(scheduler.waiting_queue, waiting)
+    )
+
+
 def test_source_start_rejects_nonfinished_skipped_waiting_request():
     scheduler = make_scheduler(
         running=[FakeReq("r0")],
@@ -237,6 +292,73 @@ def test_source_start_rejects_nonfinished_skipped_waiting_request():
         scheduler._pd_flip_select_source_batch(
             PDFlipMigrationSourceStartReq(rids=["r0"], include_waiting=True)
         )
+
+
+def test_source_start_rejects_duplicate_rids_before_manifest_or_sender_state():
+    scheduler = make_scheduler(running=[FakeReq("r0"), FakeReq("r1")])
+    scheduler.disaggregation_mode = types.SimpleNamespace(value="decode")
+    scheduler._pd_flip_migration_status_dict = lambda: {}
+    scheduler._pd_flip_build_migration_manifest = lambda req: pytest.fail(
+        "duplicate selection must fail before manifest creation"
+    )
+    scheduler._pd_flip_start_source_entries = lambda reqs, manifests: pytest.fail(
+        "duplicate selection must fail before sender creation"
+    )
+    start = types.MethodType(
+        _load_scheduler_method("start_pd_flip_migration_source"), scheduler
+    )
+
+    output = start(PDFlipMigrationSourceStartReq(rids=["r0", "r0"]))
+
+    assert not output.success
+    assert "duplicate rid" in output.message
+    assert not hasattr(scheduler, "pd_flip_migration_session")
+
+
+def test_source_start_classifies_waiting_once_and_uses_same_identity_snapshot():
+    finished = FakeReq("finished", finished=True)
+    selected_waiting = FakeReq("waiting")
+    drift = FakeReq("drift")
+    scheduler = make_scheduler(running=[], waiting=[finished, selected_waiting])
+    scheduler.disaggregation_mode = types.SimpleNamespace(value="decode")
+    scheduler.server_args = types.SimpleNamespace(disaggregation_bootstrap_port=8998)
+    scheduler.ps = types.SimpleNamespace(attn_dp_rank=0, dp_rank=0)
+    scheduler._pd_flip_migration_status_dict = lambda: {}
+    scheduler._pd_flip_build_migration_manifest = lambda req: {"rid": req.rid}
+    scheduler._pd_flip_migration_room_for_req = lambda req: f"room-{req.rid}"
+    classify_inputs = []
+
+    def classify(waiting_snapshot):
+        classify_inputs.append(list(waiting_snapshot))
+        if len(classify_inputs) > 1:
+            return [(0, drift)], []
+        scheduler.waiting_queue[:] = [drift]
+        return [(1, selected_waiting)], [
+            {"rid": "finished", "queue_index": 0, "reason": "finished"}
+        ]
+
+    scheduler._pd_flip_classify_waiting_reqs = classify
+    captured = {}
+
+    def start_entries(reqs, manifests):
+        captured["reqs"] = reqs
+        captured["manifests"] = manifests
+        return {}, ""
+
+    scheduler._pd_flip_start_source_entries = start_entries
+    start = types.MethodType(
+        _load_scheduler_method("start_pd_flip_migration_source"), scheduler
+    )
+
+    output = start(PDFlipMigrationSourceStartReq(rids=[], include_waiting=True))
+
+    assert output.success
+    assert len(classify_inputs) == 1
+    assert classify_inputs[0][0] is finished
+    assert classify_inputs[0][1] is selected_waiting
+    assert captured["reqs"] == [selected_waiting]
+    assert captured["manifests"][0]["rid"] == "waiting"
+    assert captured["manifests"][0]["pd_flip_waiting_queue_index"] == 1
 
 
 def test_controller_source_start_payload_sends_exact_rids():

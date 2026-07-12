@@ -1705,8 +1705,18 @@ class Scheduler(
         return selected, skipped
 
     def _pd_flip_select_source_batch(
-        self, recv_req: PDFlipMigrationSourceStartReq
+        self,
+        recv_req: PDFlipMigrationSourceStartReq,
+        waiting_reqs: Optional[List[Req]] = None,
+        waiting_skipped_out: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Req]:
+        def raise_for_duplicate_rid(rids: List[str]) -> None:
+            seen = set()
+            for rid in rids:
+                if rid in seen:
+                    raise ValueError(f"duplicate rid in source selection: {rid}")
+                seen.add(rid)
+
         running_reqs = [
             req
             for req in getattr(getattr(self, "running_batch", None), "reqs", [])
@@ -1716,14 +1726,19 @@ class Scheduler(
             selected = list(running_reqs)
         else:
             requested_rids = [str(rid) for rid in recv_req.rids]
+            raise_for_duplicate_rid(requested_rids)
             selected = running_reqs[: len(requested_rids)]
             if [str(req.rid) for req in selected] != requested_rids:
                 raise ValueError("selected rids must be a running-batch prefix")
 
         if recv_req.include_waiting:
+            if waiting_reqs is None:
+                waiting_reqs = list(getattr(self, "waiting_queue", []))
             waiting_selected, waiting_skipped = self._pd_flip_classify_waiting_reqs(
-                list(getattr(self, "waiting_queue", []))
+                waiting_reqs
             )
+            if waiting_skipped_out is not None:
+                waiting_skipped_out.extend(waiting_skipped)
             live_waiting_skipped = [
                 item for item in waiting_skipped if item.get("reason") != "finished"
             ]
@@ -1737,6 +1752,8 @@ class Scheduler(
                     f"{skipped_summary}"
                 )
             selected.extend(req for _, req in waiting_selected)
+
+        raise_for_duplicate_rid([str(req.rid) for req in selected])
         return selected
 
     def start_pd_flip_migration_source(
@@ -1751,9 +1768,16 @@ class Scheduler(
                 status=self._pd_flip_migration_status_dict(),
             )
 
+        waiting_scan_started = time.monotonic()
+        waiting_reqs = list(getattr(self, "waiting_queue", []))
+        waiting_skipped = []
         scan_started = time.monotonic()
         try:
-            selected_reqs = self._pd_flip_select_source_batch(recv_req)
+            selected_reqs = self._pd_flip_select_source_batch(
+                recv_req,
+                waiting_reqs=waiting_reqs,
+                waiting_skipped_out=waiting_skipped,
+            )
         except ValueError as exc:
             return PDFlipMigrationReqOutput(
                 success=False,
@@ -1774,14 +1798,14 @@ class Scheduler(
         timing_debug["scan_running_reqs_s"] = time.monotonic() - scan_started
         timing_debug["running_reqs"] = len(running_reqs)
 
-        waiting_scan_started = time.monotonic()
-        waiting_reqs = list(getattr(self, "waiting_queue", []))
         if recv_req.include_waiting:
-            waiting_selected, waiting_skipped = self._pd_flip_classify_waiting_reqs(
-                waiting_reqs
-            )
+            waiting_indexes = {id(req): index for index, req in enumerate(waiting_reqs)}
+            waiting_selected = [
+                (waiting_indexes[id(req)], req)
+                for req in selected_reqs[running_count:]
+            ]
         else:
-            waiting_selected, waiting_skipped = [], []
+            waiting_selected = []
         timing_debug["scan_waiting_reqs_s"] = time.monotonic() - waiting_scan_started
         timing_debug["waiting_reqs"] = len(waiting_reqs)
         timing_debug["waiting_skipped_count"] = len(waiting_skipped)
