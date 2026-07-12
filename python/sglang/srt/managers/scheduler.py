@@ -241,6 +241,7 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -3789,8 +3790,20 @@ class Scheduler(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
             "token_capacity": int(self.max_total_num_tokens),
-            "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
+            # Decode graphs plus prefill (breakable) graphs.
+            "graph": round(
+                self.tp_worker.model_runner.graph_mem_usage
+                + self.tp_worker.model_runner.prefill_graph_mem_usage,
+                2,
+            ),
         }
+        # NGRAM draft workers have no draft model, hence no draft graphs.
+        if isinstance(self.draft_worker, BaseSpecWorker):
+            draft_runner = self.draft_worker.draft_worker.draft_runner
+            ret["memory_usage"]["draft_graph"] = round(
+                draft_runner.graph_mem_usage + draft_runner.prefill_graph_mem_usage,
+                2,
+            )
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if (

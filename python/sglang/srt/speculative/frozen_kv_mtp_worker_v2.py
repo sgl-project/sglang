@@ -73,6 +73,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+from sglang.srt.utils.common import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -359,7 +360,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
 
         logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.draft_runner.graph_mem_usage += before_mem - after_mem
         logger.info("Capture Frozen-KV MTP draft cuda graph end.")
 
     def _select_last_extend_hidden(

@@ -74,7 +74,11 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import (
+    empty_context,
+    fast_topk,
+    get_available_gpu_memory,
+)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -237,6 +241,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         if not _is_npu:
             self.cuda_graph_runner_for_draft_extend = (
                 MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
@@ -245,6 +250,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend = (
                 MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
             )
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.draft_runner.graph_mem_usage += before_mem - after_mem
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
