@@ -284,10 +284,22 @@ def test_progressive_policy_symbols_are_the_production_helpers():
 
 
 class ProgressiveScenarioClient:
-    def __init__(self, *, running_rids=None, waiting_rids=None, fail_path=None):
+    def __init__(
+        self,
+        *,
+        running_rids=None,
+        waiting_rids=None,
+        fail_path=None,
+        fail_session_id=None,
+        source_start_response=None,
+        delta_pending_once=True,
+    ):
         self.running_rids = list(running_rids or ["r0", "r1"])
         self.waiting_rids = list(waiting_rids or [])
         self.fail_path = fail_path
+        self.fail_session_id = fail_session_id
+        self.source_start_response = source_start_response
+        self.delta_pending_once = delta_pending_once
         self.steps = []
         self.posts = []
         self.source_starts = []
@@ -354,7 +366,10 @@ class ProgressiveScenarioClient:
 
     def post_json(self, base_url, path, payload):
         self.posts.append((base_url, path, dict(payload)))
-        if path == self.fail_path:
+        if path == self.fail_path and (
+            self.fail_session_id is None
+            or payload.get("session_id") == self.fail_session_id
+        ):
             return {"success": False, "message": f"forced failure at {path}"}
         if path == "/pd_flip/router/worker/drain":
             self.steps.append(
@@ -380,6 +395,8 @@ class ProgressiveScenarioClient:
         if path == "/pd_flip/migration/source/start":
             self.steps.append("source_start")
             self.source_starts.append(dict(payload))
+            if self.source_start_response is not None:
+                return self.source_start_response
             rids = list(payload["rids"])
             if payload["include_waiting"]:
                 rids.extend(self.waiting_rids)
@@ -394,10 +411,12 @@ class ProgressiveScenarioClient:
             attempts = self.delta_attempts.get(session_id, 0) + 1
             self.delta_attempts[session_id] = attempts
             self.steps.append("source_delta")
-            if attempts == 1:
+            if self.delta_pending_once and attempts == 1:
                 return {
                     "success": False,
-                    "message": "quiesce pending",
+                    "message": (
+                        "source batch quiesce pending; retry delta after quiesce"
+                    ),
                     "manifests": [],
                 }
             return {"success": True, "manifests": self.sessions[session_id]}
@@ -434,10 +453,12 @@ class ProgressiveScenarioMonitor:
         self.observation = observation
         self.reset_calls = 0
         self.collect_calls = 0
+        self.events = []
 
     def collect_cluster(self, nodes):
         list(nodes)
         self.collect_calls += 1
+        self.events.append("collect")
         counts = (14, 20, 19, 20) if self.reset_calls == 0 else self.observation
         prefill_good, prefill_total, decode_good, decode_total = counts
         return controller_module.ClusterSLOSnapshot(
@@ -453,9 +474,16 @@ class ProgressiveScenarioMonitor:
 
     def reset_window(self):
         self.reset_calls += 1
+        self.events.append("reset")
 
 
-def progressive_scenario(observation, *, client=None):
+def progressive_scenario(
+    observation,
+    *,
+    client=None,
+    observation_seconds=0.0,
+    migration_poll_interval_seconds=0.0,
+):
     client = client or ProgressiveScenarioClient()
     config = controller_module.PDClusterConfig(
         router_url="http://router",
@@ -463,8 +491,8 @@ def progressive_scenario(observation, *, client=None):
             controller_module.PDNode("source", "http://source", "source"),
             controller_module.PDNode("target", "http://target", "target"),
         ],
-        migration_poll_interval_seconds=0.0,
-        observation_seconds=0.0,
+        migration_poll_interval_seconds=migration_poll_interval_seconds,
+        observation_seconds=observation_seconds,
         post_migration_idle_timeout_seconds=0.0,
         min_prefill_slo_samples=20,
         min_decode_slo_samples=20,
@@ -511,10 +539,11 @@ def test_progressive_flow_commits_when_prefill_stays_risky():
     assert client.source_starts[0]["include_waiting"] is False
     assert client.source_starts[1]["rids"] == ["r1"]
     assert client.source_starts[1]["include_waiting"] is True
-    assert client.steps[-4:] == [
+    assert client.steps[-5:] == [
         "set_source_runtime_role",
         "wait_source_prefill_loop",
         "refresh_router_source_role",
+        "resume_source_admission",
         "router_undrain_source",
     ]
 
@@ -584,3 +613,139 @@ def test_progressive_failure_after_source_finish_does_not_abort_ownership():
         record for record in result.actions if record.step == "abort_decode_migration"
     ]
     assert client.running_rids == ["r1"]
+    assert result.state_trace[-1]["reason"] == "post_finish_error"
+
+
+def test_progressive_final_batch_activate_failure_reports_post_finish_phase():
+    client = ProgressiveScenarioClient(
+        fail_path="/pd_flip/migration/target/activate",
+        fail_session_id="pd-flip-source-to-target-final",
+    )
+    controller, client, monitor = progressive_scenario((14, 20, 19, 20), client=client)
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert not result.success
+    assert len(client.source_starts) == 2
+    assert result.state_trace[-1]["reason"] == "post_finish_error"
+    assert not [
+        record for record in result.actions if record.step == "abort_decode_migration"
+    ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"success": True, "manifests": [{"rid": "r0"}, {"rid": "r0"}]},
+        {"success": True, "manifests": [{}]},
+        {"success": True, "manifests": ["not-a-manifest"]},
+        {"success": True, "manifests": [{"rid": "r0"}, {"rid": "extra"}]},
+        {"success": True, "manifests": "not-a-list"},
+        ["not-a-response-item"],
+    ],
+)
+def test_atomic_batch_rejects_malformed_source_start_manifests(response):
+    client = ProgressiveScenarioClient(source_start_response=response)
+    controller, _, _ = progressive_scenario((18, 20, 19, 20), client=client)
+    source = metric("source", running_requests=[])
+    target = metric("target", running_requests=[])
+    records = []
+
+    with pytest.raises(RuntimeError, match="invalid source start response manifests"):
+        controller._execute_atomic_batch(
+            source,
+            target,
+            "strict-source-start",
+            ("r0",),
+            False,
+            records=records,
+        )
+
+    assert "target_prepare" not in client.steps
+    assert [
+        record.target for record in records if record.step == "abort_decode_migration"
+    ] == [
+        "target",
+        "source",
+    ]
+
+
+def test_delta_pending_accepts_only_exact_task7_response():
+    exact = {
+        "success": False,
+        "message": "source batch quiesce pending; retry delta after quiesce",
+        "manifests": [],
+    }
+
+    assert controller_module._delta_quiesce_pending(exact)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"success": False, "message": "quiesce pending", "manifests": []},
+        {
+            "success": True,
+            "message": "source batch quiesce pending; retry delta after quiesce",
+            "manifests": [],
+        },
+        [
+            {
+                "success": False,
+                "message": "source batch quiesce pending; retry delta after quiesce",
+                "manifests": [],
+            },
+            {"success": True, "message": "ok", "manifests": []},
+        ],
+        {
+            "success": False,
+            "message": "source batch quiesce pending; retry delta after quiesce",
+        },
+        {
+            "success": False,
+            "message": "source batch quiesce pending; retry delta after quiesce",
+            "manifests": (),
+        },
+    ],
+)
+def test_delta_pending_rejects_ambiguous_or_malformed_responses(response):
+    assert not controller_module._delta_quiesce_pending(response)
+
+
+@pytest.mark.parametrize(
+    ("poll_interval", "expected_sleeps"),
+    [(1.0, [1.0, 1.0, 0.5]), (0.0, [2.5])],
+)
+def test_progressive_observation_uses_exact_fresh_deadline_without_busy_loop(
+    monkeypatch, poll_interval, expected_sleeps
+):
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            assert seconds > 0, "observation must not busy-loop with zero sleeps"
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    clock = FakeClock()
+    monkeypatch.setattr(controller_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(controller_module.time, "sleep", clock.sleep)
+    client = ProgressiveScenarioClient(delta_pending_once=False)
+    controller, _, monitor = progressive_scenario(
+        (18, 20, 19, 20),
+        client=client,
+        observation_seconds=2.5,
+        migration_poll_interval_seconds=poll_interval,
+    )
+
+    result = controller.monitor_progressive(monitor, iterations=1)
+
+    assert result.success
+    assert monitor.events[0:3] == ["collect", "reset", "collect"]
+    assert clock.now == 2.5
+    assert clock.sleeps == expected_sleeps

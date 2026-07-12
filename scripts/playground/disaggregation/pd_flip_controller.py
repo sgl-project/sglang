@@ -86,6 +86,9 @@ def _migration_source_start_payload(
 
 
 JsonDict = Dict[str, Any]
+SOURCE_DELTA_QUIESCE_PENDING_MESSAGE = (
+    "source batch quiesce pending; retry delta after quiesce"
+)
 
 
 class HttpLike:
@@ -323,6 +326,12 @@ class ProgressiveMonitorState:
     RECOVERING = "recovering"
     SECOND_MIGRATING = "second_migrating"
     FLIPPING_ROLE = "flipping_role"
+
+
+class ProgressiveAtomicBatchError(RuntimeError):
+    def __init__(self, message: str, *, source_finished: bool):
+        super().__init__(message)
+        self.source_finished = source_finished
 
 
 class ForcedRiskSnapshot:
@@ -904,13 +913,16 @@ class PDFlipController:
         except Exception as exc:
             # An atomic batch owns its pre-finish abort. Once source finish has
             # succeeded, ownership must never be rolled back by the controller.
+            post_finish_error = source_finished or (
+                isinstance(exc, ProgressiveAtomicBatchError) and exc.source_finished
+            )
             self._cleanup_source_after_failure(source, records)
             self._append_progressive_state(
                 state_trace,
                 ProgressiveMonitorState.SAFE,
                 source,
                 target,
-                "error_recovered" if not source_finished else "post_finish_error",
+                "post_finish_error" if post_finish_error else "error_recovered",
                 records,
             )
             return self._progressive_result(
@@ -950,18 +962,20 @@ class PDFlipController:
                     include_waiting=include_waiting,
                 ),
             )
-            manifests = _all_response_manifests(source_start)
+            manifests = _strict_response_manifests(
+                source_start, "invalid source start response manifests"
+            )
             batch_rids = tuple(_manifest_rids(manifests))
-            if not batch_rids or len(set(batch_rids)) != len(batch_rids):
-                raise RuntimeError("source start returned an invalid manifest RID set")
             if include_waiting:
                 if batch_rids[: len(requested_rids)] != requested_rids:
                     raise RuntimeError(
-                        "source start did not preserve requested running RID prefix"
+                        "invalid source start response manifests: "
+                        "requested running RID prefix was not preserved"
                     )
             elif batch_rids != requested_rids:
                 raise RuntimeError(
-                    "source start manifests do not match selected first-batch RIDs"
+                    "invalid source start response manifests: "
+                    "selected first-batch RIDs do not match"
                 )
 
             self._post_worker(
@@ -1023,10 +1037,12 @@ class PDFlipController:
                 {"session_id": session_id, "rids": list(batch_rids)},
             )
             return batch_rids
-        except Exception:
+        except Exception as exc:
             if not source_finished:
                 self._abort_two_phase_migration(source, target, session_id, records)
-            raise
+            raise ProgressiveAtomicBatchError(
+                str(exc), source_finished=source_finished
+            ) from exc
 
     def _poll_source_delta_manifests(
         self,
@@ -1045,7 +1061,6 @@ class PDFlipController:
             try:
                 response = self.client.post_json(source.worker_url, path, payload)
                 last_response = response
-                manifests = _all_response_manifests(response)
                 if _delta_quiesce_pending(response):
                     records.append(
                         ActionRecord(
@@ -1063,10 +1078,9 @@ class PDFlipController:
                     _raise_if_unsuccessful(
                         response, "start_decode_migration_source_delta"
                     )
-                    if not manifests:
-                        raise RuntimeError(
-                            "source delta completed without migration manifests"
-                        )
+                    manifests = _strict_response_manifests(
+                        response, "invalid source delta response manifests"
+                    )
                     records.append(
                         ActionRecord(
                             step="start_decode_migration_source_delta",
@@ -1118,11 +1132,10 @@ class PDFlipController:
             now = time.monotonic()
             if now >= deadline:
                 return snapshot
+            remaining = max(0.0, deadline - now)
+            poll_interval = self.config.migration_poll_interval_seconds
             time.sleep(
-                min(
-                    self.config.migration_poll_interval_seconds,
-                    max(0.0, deadline - now),
-                )
+                min(poll_interval, remaining) if poll_interval > 0 else remaining
             )
 
     def _evaluate_progressive_snapshot(
@@ -1193,13 +1206,6 @@ class PDFlipController:
     ) -> None:
         self._post_worker(
             records,
-            "resume_source_admission",
-            source,
-            "/pd_flip/runtime_role/admission",
-            {"paused": False},
-        )
-        self._post_worker(
-            records,
             "set_source_runtime_role",
             source,
             "/pd_flip/runtime_role/set",
@@ -1217,6 +1223,13 @@ class PDFlipController:
                 "bootstrap_port": source.bootstrap_port,
                 "draining": True,
             },
+        )
+        self._post_worker(
+            records,
+            "resume_source_admission",
+            source,
+            "/pd_flip/runtime_role/admission",
+            {"paused": False},
         )
         self._post_router(
             records,
@@ -2823,41 +2836,46 @@ def _response_manifests(response: Any) -> List[JsonDict]:
     return [manifest for manifest in manifests if isinstance(manifest, dict)]
 
 
-def _all_response_manifests(response: Any) -> List[JsonDict]:
+def _strict_response_manifests(response: Any, error_prefix: str) -> List[JsonDict]:
     responses = response if isinstance(response, list) else [response]
+    if not responses:
+        raise RuntimeError(f"{error_prefix}: response is empty")
     manifests: List[JsonDict] = []
     seen_rids = set()
     for item in responses:
         if not isinstance(item, dict):
-            continue
-        for manifest in item.get("manifests", []):
+            raise RuntimeError(f"{error_prefix}: response item is not an object")
+        item_manifests = item.get("manifests")
+        if not isinstance(item_manifests, list):
+            raise RuntimeError(f"{error_prefix}: manifests is not a list")
+        for manifest in item_manifests:
             if not isinstance(manifest, dict):
-                continue
+                raise RuntimeError(f"{error_prefix}: manifest is not an object")
             rid = manifest.get("rid")
-            rid_key = None if rid is None else str(rid)
-            if rid_key is not None and rid_key in seen_rids:
-                continue
-            if rid_key is not None:
-                seen_rids.add(rid_key)
+            rid_text = "" if rid is None else str(rid).strip()
+            if not rid_text:
+                raise RuntimeError(f"{error_prefix}: manifest RID is missing or empty")
+            if rid_text in seen_rids:
+                raise RuntimeError(f"{error_prefix}: duplicate manifest RID {rid_text}")
+            seen_rids.add(rid_text)
             manifests.append(manifest)
+    if not manifests:
+        raise RuntimeError(f"{error_prefix}: manifests is empty")
     return manifests
 
 
 def _delta_quiesce_pending(response: Any) -> bool:
     responses = response if isinstance(response, list) else [response]
-    if not responses or _all_response_manifests(response):
+    if not responses:
         return False
-    saw_pending = False
-    for item in responses:
-        if not isinstance(item, dict):
-            return False
-        if item.get("success", True):
-            continue
-        message = str(item.get("message") or "").lower()
-        if "quiesce" not in message or "pending" not in message:
-            return False
-        saw_pending = True
-    return saw_pending
+    return all(
+        isinstance(item, dict)
+        and item.get("success") is False
+        and item.get("manifests") == []
+        and isinstance(item.get("manifests"), list)
+        and item.get("message") == SOURCE_DELTA_QUIESCE_PENDING_MESSAGE
+        for item in responses
+    )
 
 
 def _manifest_rids(manifests: List[JsonDict]) -> List[str]:
