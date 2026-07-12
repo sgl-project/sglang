@@ -646,12 +646,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.server_args.speculative_use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
-        # A topk=1 draft tree is a chain. Materialize its token matrix directly
-        # instead of collecting per-step tensors and concatenating after the loop.
-        draft_tokens_topk1 = None
-        if (
+        topk1_chain_fits = (
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
+        )
+        # Materialize the chain directly only when the CUDA kernel can write
+        # every subsequent column. Other topk=1 paths retain the token list and
+        # assemble it with one final cat instead of launching a copy per step.
+        draft_tokens_topk1 = None
+        if (
+            topk1_chain_fits
+            and _is_cuda
+            and self.hot_token_id is None
+            and not self.server_args.speculative_use_rejection_sampling
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -659,15 +666,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
-        # On the CUDA argmax branch the finalize kernel stores the token column
-        # itself; every other branch stores the post-hot-map index with a plain
-        # column copy after sampling.
-        fuse_topk1_token_store = (
-            draft_tokens_topk1 is not None
-            and _is_cuda
-            and self.hot_token_id is None
-            and not self.server_args.speculative_use_rejection_sampling
-        )
 
         # Forward multiple steps
         scores = None
@@ -738,7 +736,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_p, topk_index = draft_topk1_postprocess(
                         logits_output.next_token_logits,
                         forward_batch.positions,
-                        draft_tokens_topk1 if fuse_topk1_token_store else None,
+                        draft_tokens_topk1,
                         i + 1,
                     )
                 else:
@@ -763,8 +761,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
-            if draft_tokens_topk1 is not None and not fuse_topk1_token_store:
-                draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
             hidden_states = logits_output.hidden_states
 
         if self.index_share_for_mtp_iteration:
@@ -783,6 +779,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
             return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
+
+        if topk1_chain_fits:
+            bs = token_list[0].shape[0]
+            draft_tokens = torch.cat(token_list, dim=1)
+            top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            parent_list = self._topk1_parents_prealloc[:bs]
+            return parent_list, top_scores_index, draft_tokens, draft_probs
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
