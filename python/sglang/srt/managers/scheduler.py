@@ -1264,6 +1264,31 @@ class Scheduler(
         server_args = getattr(self, "server_args", None)
         return bool(getattr(server_args, "enable_pd_runtime_role_switch", False))
 
+    def _pd_flip_capacity_status(self) -> Dict[str, Any]:
+        running = list(getattr(getattr(self, "running_batch", None), "reqs", []))
+        free_slots = min(
+            max(0, self.max_running_requests - len(running)),
+            int(self.req_to_token_pool.available_size()),
+        )
+        return {
+            "free_request_slots": free_slots,
+            "available_kv_tokens": int(
+                self.token_to_kv_pool_allocator.available_size()
+            ),
+            "max_running_requests_per_dp": int(self.max_running_requests),
+            "reserved_decode_tokens_per_req": int(
+                self.server_args.num_reserved_decode_tokens
+            ),
+            "running_requests": [
+                {
+                    "rid": str(req.rid),
+                    "kv_committed_len": int(req.kv_committed_len),
+                }
+                for req in running
+                if not req.finished()
+            ],
+        }
+
     def _pd_runtime_role_status_dict(self) -> Dict[str, Any]:
         is_idle = False
         try:
@@ -1271,7 +1296,7 @@ class Scheduler(
         except Exception:
             logger.exception("Failed to compute PD runtime role idle status.")
 
-        return {
+        status = {
             "dp_rank": self.ps.dp_rank,
             "tp_rank": self.ps.tp_rank,
             "role": self.pd_runtime_role(),
@@ -1288,6 +1313,8 @@ class Scheduler(
             ),
             "event_loop_dynamic": True,
         }
+        status.update(self._pd_flip_capacity_status())
+        return status
 
     def get_pd_runtime_role_status(
         self, recv_req: PDRuntimeRoleStatusReq
