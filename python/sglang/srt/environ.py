@@ -660,6 +660,12 @@ class Envs:
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
+    # round_up(max(masked_m), 256) instead of round_up(rank_tokens, 256):
+    # shrinks the [num_local_experts, m, *] MoE intermediates ~4x under
+    # load imbalance (they otherwise OOM saturated --moe-runner-backend
+    # deep_gemm serving).  Costs one D2H sync per MoE layer.
+    SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
