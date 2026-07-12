@@ -39,6 +39,12 @@ def create_remote_connector(url, device=None, **kwargs) -> BaseConnector:
         return RedisConnector(url)
     elif connector_type == "s3":
         return S3Connector(url)
+    elif connector_type == "mooncake":
+        from sglang.srt.connector.mooncake_store_file import (
+            MooncakeStoreFileConnector,
+        )
+
+        return MooncakeStoreFileConnector(url, device=device, **kwargs)
     elif connector_type == "instance":
         return RemoteInstanceConnector(url, device)
     elif _is_azure_blob_url(url, connector_type):

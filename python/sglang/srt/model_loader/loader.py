@@ -2558,7 +2558,9 @@ class RemoteModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
             with create_remote_connector(
-                model_weights, device=device_config.device
+                model_weights,
+                device=device_config.device,
+                **(load_config.model_loader_extra_config or {}),
             ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:

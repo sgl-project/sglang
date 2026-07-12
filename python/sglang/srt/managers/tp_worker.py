@@ -283,13 +283,19 @@ class TpModelWorker(BaseTpWorker):
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
+                from sglang.srt.utils import is_remote_url
+
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     tokenizer_backend=server_args.tokenizer_backend,
-                    model_name=server_args.model_path,
+                    model_name=(
+                        self.model_config.model_path
+                        if is_remote_url(server_args.model_path)
+                        else server_args.model_path
+                    ),
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -378,6 +384,10 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=self.is_draft_worker,
             context_length=self.context_length,
         )
+        if not self.is_draft_worker:
+            from sglang.srt.configs.model_config import resolve_remote_tokenizer_path
+
+            resolve_remote_tokenizer_path(self.server_args, self.model_config)
 
     def _init_model_runner(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
