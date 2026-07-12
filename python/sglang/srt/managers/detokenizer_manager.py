@@ -451,6 +451,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
+            disagg_prefill_prefix_len=recv_obj.disagg_prefill_prefix_len,
             time_stats=recv_obj.time_stats,
         )
 

@@ -1220,6 +1220,40 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        # D2P KV cache replication
+        self.d2p_replicator = None
+        self.d2p_receiver = None
+        if (
+            self.server_args.disaggregation_enable_d2p_kv_replication
+            and self.transfer_backend == TransferBackend.MOONCAKE
+        ):
+            from sglang.srt.disaggregation.mooncake.d2p import (
+                D2PKVManager,
+                _build_reverse_kv_args,
+            )
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
+                kv_args = _build_reverse_kv_args(self, kv_mgr)
+                d2p_mgr = D2PKVManager(
+                    kv_args, DisaggregationMode.PREFILL,
+                    self.server_args, kv_mgr.is_mla_backend,
+                )
+                d2p_mgr.init_d2p_sender(self, kv_mgr)
+                self.d2p_replicator = d2p_mgr
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+                kv_args = _build_reverse_kv_args(self, kv_mgr)
+                d2p_mgr = D2PKVManager(
+                    kv_args, DisaggregationMode.DECODE,
+                    self.server_args, kv_mgr.is_mla_backend,
+                )
+                d2p_mgr.init_d2p_receiver(self, kv_mgr)
+                kv_mgr._d2p_receiver = d2p_mgr
+                self.d2p_receiver = d2p_mgr
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -1897,6 +1931,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            d2p_replicator=getattr(self, "d2p_replicator", None),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3616,6 +3651,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                if self.d2p_receiver is not None:
+                    idle &= len(self.d2p_receiver._allocated_rooms) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

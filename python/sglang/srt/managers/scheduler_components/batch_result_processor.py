@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     List,
     Optional,
@@ -78,6 +79,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    d2p_replicator: Optional[Any] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -839,6 +841,14 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
+                d2p_replicator = self.d2p_replicator
+                if d2p_replicator is not None and req.req_pool_idx is not None:
+                    req.kv_committed_len_saved = req._cache_commit_len()
+                    logger.info(
+                        f"D2P: saved kv_committed_len={req.kv_committed_len_saved} "
+                        f"for req {req.rid}"
+                    )
+
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(
@@ -852,6 +862,12 @@ class SchedulerBatchResultProcessor:
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+
+                if d2p_replicator is not None and hasattr(req, "kv_committed_len_saved"):
+                    logger.info(f"D2P: calling capture_and_enqueue for req {req.rid}")
+                    d2p_replicator.capture_and_enqueue(req)
+                elif d2p_replicator is not None:
+                    logger.info(f"D2P: skipped, no kv_committed_len_saved for req {req.rid}")
 
             req.time_stats.set_completion_time()
 

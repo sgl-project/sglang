@@ -2414,6 +2414,10 @@ class ServerArgs:
         int,
         "Number of optimistic prefill retries that will skip the bootstrap wait. ",
     ] = 0
+    disaggregation_enable_d2p_kv_replication: A[
+        bool,
+        "After decode finishes a request, fire-and-forget replicate its KV cache back to the prefill server's radix cache for higher multi-turn cache hit rates.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -6700,8 +6704,368 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
-            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+            help="Enable fused qk normalization and rope rotary embedding.",
+        )
+        parser.add_argument(
+            "--enable-precise-embedding-interpolation",
+            action="store_true",
+            help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
+        )
+        parser.add_argument(
+            "--enable-fused-moe-sum-all-reduce",
+            action="store_true",
+            help="Enable fused moe triton and sum all reduce.",
+        )
+        parser.add_argument(
+            "--gc-threshold",
+            type=int,
+            nargs="+",
+            help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
+        )
+
+        # Dynamic batch tokenizer
+        parser.add_argument(
+            "--enable-dynamic-batch-tokenizer",
+            action="store_true",
+            help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-size",
+            type=int,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_size,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-timeout",
+            type=float,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+        )
+
+        # Debug tensor dumps
+        parser.add_argument(
+            "--debug-tensor-dump-output-folder",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_output_folder,
+            help=(
+                "The output folder for dumping tensors. "
+                "In Eagle mode, tensor outputs from draft and target models "
+                "are stored in separate subdirectories ('draft' and 'target')."
+            ),
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-layers",
+            type=int,
+            nargs="+",
+            help="The layer ids to dump. Dump all layers if not specified.",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-input-file",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_input_file,
+            help="The input filename for dumping tensors",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-inject",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_inject,
+            help="Inject the outputs from jax as the input of every layer.",
+        )
+
+        # PD disaggregation
+        parser.add_argument(
+            "--disaggregation-mode",
+            type=str,
+            default=ServerArgs.disaggregation_mode,
+            choices=["null", "prefill", "decode"],
+            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            choices=DISAGG_TRANSFER_BACKEND_CHOICES,
+            help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-port",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_port,
+            help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-ib-device",
+            type=str,
+            default=ServerArgs.disaggregation_ib_device,
+            help="The InfiniBand devices for disaggregation transfer. Supports a single device "
+            "(e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list "
+            "(e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping "
+            '(e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), '
+            "or a path to a JSON file containing that mapping. Default is None, which triggers "
+            "automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-radix-cache",
+            action="store_true",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-offload-kvcache",
+            action="store_true",
+            help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-d2p-kv-replication",
+            action="store_true",
+            help="After decode finishes a request, fire-and-forget replicate its KV cache back to the prefill server's radix cache for higher multi-turn cache hit rates.",
+        )
+        parser.add_argument(
+            "--num-reserved-decode-tokens",
+            type=int,
+            default=ServerArgs.num_reserved_decode_tokens,
+            help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-polling-interval",
+            type=int,
+            default=ServerArgs.disaggregation_decode_polling_interval,
+            help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+
+        parser.add_argument(
+            "--optimistic-prefill-retries",
+            type=int,
+            default=ServerArgs.optimistic_prefill_retries,
+            help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        )
+
+        # Encode prefill disaggregation
+        parser.add_argument(
+            "--encoder-only",
+            action="store_true",
+            help="For MLLM with an encoder, launch an encoder-only server",
+        )
+        parser.add_argument(
+            "--language-only",
+            action="store_true",
+            help="For VLM, load weights for the language model only.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-backend",
+            type=str,
+            default=ServerArgs.encoder_transfer_backend,
+            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+            help="The backend for encoder disaggregation transfer. Default is zmq_to_scheduler.",
+        )
+        parser.add_argument(
+            "--encoder-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="List of encoder server urls.",
+        )
+        parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the EncoderBootstrapServer that runs in the "
+            "language-only tokenizer manager process. Encoders register here, "
+            "and language-only receivers fetch the current URL list from here.",
+        )
+        parser.add_argument(
+            "--encoder-register-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="One or more EncoderBootstrapServer URLs to register this encoder "
+            "with on startup, for dynamic encoder discovery. "
+            "Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. "
+            "Used with --encoder-only servers.",
+        )
+        parser.add_argument(
+            "--enable-adaptive-dispatch-to-encoder",
+            default=ServerArgs.enable_adaptive_dispatch_to_encoder,
+            action="store_true",
+            help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
+        )
+
+        # Custom weight loader
+        parser.add_argument(
+            "--custom-weight-loader",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
+        parser.add_argument(
+            "--weight-loader-prefetch-checkpoints",
+            action="store_true",
+            help="Prefetch checkpoint files into OS page cache before loading. "
+            "Each rank prefetches a fraction of the shards, reducing total "
+            "network I/O on shared filesystems (NFS/Lustre) from N*checkpoint "
+            "to 1*checkpoint. Recommended for models on network storage.",
+        )
+        parser.add_argument(
+            "--weight-loader-prefetch-num-threads",
+            type=int,
+            default=ServerArgs.weight_loader_prefetch_num_threads,
+            help="Number of threads per rank for checkpoint prefetching (default: 4).",
+        )
+        parser.add_argument(
+            "--weight-loader-drop-cache-after-load",
+            action="store_true",
+            help="Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-seed-instance-ip",
+            type=str,
+            default=ServerArgs.remote_instance_weight_loader_seed_instance_ip,
+            help="The ip of the seed instance for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-seed-instance-service-port",
+            type=int,
+            default=ServerArgs.remote_instance_weight_loader_seed_instance_service_port,
+            help="The service port of the seed instance for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-send-weights-group-ports",
+            type=json_list_type,
+            default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
+            help="The communication group ports for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-backend",
+            type=str,
+            choices=["transfer_engine", "nccl", "modelexpress"],
+            default=ServerArgs.remote_instance_weight_loader_backend,
+            help="The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+            action="store_true",
+            help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--engine-info-bootstrap-port",
+            type=int,
+            default=ServerArgs.engine_info_bootstrap_port,
+            help="Port for the engine info bootstrap server. Default is 6789. "
+            "Must be set explicitly when running multiple instances on the same node.",
+        )
+        parser.add_argument(
+            "--modelexpress-config",
+            type=str,
+            default=ServerArgs.modelexpress_config,
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (optional gRPC host:port override), "transport" ("nixl" or "transfer_engine"). Example: \'{"url": "localhost:8001", "transport": "nixl"}\'',
+        )
+
+        # For PD-Multiplexing
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+        parser.add_argument(
+            "--pdmux-config-path",
+            type=str,
+            default=None,
+            help="The path of the PD-Multiplexing config file.",
+        )
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
+        )
+
+        # Configuration file support
+        parser.add_argument(
+            "--config",
+            type=str,
+            help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
+        # For Multi-Modal
+        parser.add_argument(
+            "--enable-broadcast-mm-inputs-process",
+            action="store_true",
+            default=ServerArgs.enable_broadcast_mm_inputs_process,
+            help="Enable broadcast mm-inputs process in scheduler.",
+        )
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="Limit the number of multimodal inputs per request. "
+            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
+        )
+
+        # For checkpoint decryption
+        parser.add_argument(
+            "--decrypted-config-file",
+            type=str,
+            default=ServerArgs.decrypted_config_file,
+            help="The path of the decrypted config file.",
+        )
+        parser.add_argument(
+            "--decrypted-draft-config-file",
+            type=str,
+            default=ServerArgs.decrypted_draft_config_file,
+            help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--enable-prefix-mm-cache",
+            action="store_true",
+            default=ServerArgs.enable_prefix_mm_cache,
+            help="Enable prefix multimodal cache. Currently only supports mm-only.",
+        )
+
+        parser.add_argument(
+            "--enable-mm-global-cache",
+            action="store_true",
+            default=ServerArgs.enable_mm_global_cache,
+            help="Enable global multimodal embedding cache to skip redundant ViT inference.",
+        )
+
+        # For registering hooks
+        parser.add_argument(
+            "--forward-hooks",
+            type=json_list_type,
+            default=ServerArgs.forward_hooks,
+            help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        parser.add_argument(
+            "--enable-quant-communications",
+            action="store_true",
+            default=False,
+            help="Enable INT8 quantization of TP communications (limited support).",
+        )
+
+        # For msProbe
+        parser.add_argument(
+            "--msprobe-dump-config",
+            type=str,
+            default=ServerArgs.msprobe_dump_config,
+            help="The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         )
 
     @classmethod

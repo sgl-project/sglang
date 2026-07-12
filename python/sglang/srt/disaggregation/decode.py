@@ -1705,6 +1705,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        decode_req.req.disagg_prefill_prefix_len = decode_req.req.cached_tokens
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
         # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`

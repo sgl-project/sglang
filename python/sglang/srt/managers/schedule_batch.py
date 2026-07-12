@@ -959,6 +959,9 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
 
+        # PD disaggregation: prefill-side radix cache prefix length
+        self.disagg_prefill_prefix_len = 0
+
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
 

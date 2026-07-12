@@ -273,6 +273,7 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    disagg_prefill_prefix_len: list = field(default_factory=list)
     image_tokens: list = field(default_factory=list)
     audio_tokens: list = field(default_factory=list)
     video_tokens: list = field(default_factory=list)
@@ -383,6 +384,7 @@ class _GenerationStreamAccumulator:
         # Collect detailed cache breakdown if available
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
+        self.disagg_prefill_prefix_len.append(req.disagg_prefill_prefix_len)
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
         # (req.mm_*), so prefer the pre-stored values; otherwise compute them
@@ -543,6 +545,7 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            disagg_prefill_prefix_len=self.disagg_prefill_prefix_len or None,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,

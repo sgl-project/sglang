@@ -1936,6 +1936,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             state.customized_info_accumulated[k] = []
                         state.customized_info_accumulated[k].extend(v[i])
                         meta_info[k] = state.customized_info_accumulated[k]
+                if getattr(recv_obj, "disagg_prefill_prefix_len", None):
+                    meta_info["disagg_prefill_prefix_len"] = recv_obj.disagg_prefill_prefix_len[i]
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.

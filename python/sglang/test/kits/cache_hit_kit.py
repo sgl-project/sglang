@@ -35,6 +35,7 @@ async def async_request_sglang_generate(
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
+                    disagg_prefill_prefix_len = 0
 
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -58,11 +59,15 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
-                                    prompt_tokens = (data.get("meta_info") or {}).get(
+                                    meta = data.get("meta_info") or {}
+                                    prompt_tokens = meta.get(
                                         "prompt_tokens", 0
                                     )
-                                    cached_tokens = (data.get("meta_info") or {}).get(
+                                    cached_tokens = meta.get(
                                         "cached_tokens", 0
+                                    )
+                                    disagg_prefill_prefix_len = meta.get(
+                                        "disagg_prefill_prefix_len", 0
                                     )
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
@@ -75,6 +80,7 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
+                    output.disagg_prefill_prefix_len = disagg_prefill_prefix_len
                     output.generated_len = len(output.itl) + 1
                 else:
                     output.error = response.reason or ""
