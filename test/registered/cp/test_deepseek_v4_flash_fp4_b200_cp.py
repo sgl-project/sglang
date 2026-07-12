@@ -30,6 +30,11 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 _DEEPEP_ENV = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+    # The draft-extend graph pool costs ~4.5 GB here (DeepEP MoE workspace is
+    # captured at full dispatch capacity), which starves the eager prefill
+    # draft extend and OOMs. Run draft extend eager until the capture-time
+    # footprint is fixed.
+    "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH": "1",
 }
 
 
