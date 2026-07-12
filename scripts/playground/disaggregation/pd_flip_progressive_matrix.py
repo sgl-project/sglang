@@ -69,6 +69,166 @@ def router_set_drain(router_url, api_key, timeout, worker_id, draining):
         raise RuntimeError("router did not confirm drain mutation for %s" % worker_id)
 
 
+def router_set_role(router_url, api_key, timeout, worker_id, role, draining):
+    payload = _router_request(
+        router_url.rstrip("/") + "/pd_flip/router/worker/role",
+        api_key,
+        timeout,
+        {"worker_id": worker_id, "role": role, "draining": draining},
+    )
+    worker = payload.get("worker") if isinstance(payload, dict) else None
+    if (
+        not payload.get("success")
+        or not worker
+        or worker.get("role") != role
+        or worker.get("draining") is not draining
+    ):
+        raise RuntimeError("router did not confirm role mutation for %s" % worker_id)
+
+
+def _worker_request(base_url, path, api_key, timeout, payload=None):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": "Bearer " + api_key}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base_url.rstrip("/") + path, data=data, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _worker_statuses(payload):
+    rows = payload if isinstance(payload, list) else [payload]
+    statuses = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = row.get("status", row)
+        if isinstance(status, dict):
+            statuses.append(status)
+    if not statuses:
+        raise RuntimeError("worker status response is malformed")
+    return statuses
+
+
+def worker_runtime_status(url, api_key, timeout):
+    statuses = _worker_statuses(
+        _worker_request(url, "/pd_flip/runtime_role/status", api_key, timeout)
+    )
+    roles = {status.get("role") for status in statuses}
+    loops = {status.get("active_event_loop_role") for status in statuses}
+    if len(roles) != 1 or len(loops) != 1:
+        raise RuntimeError("worker DP ranks disagree on runtime role")
+    merged = dict(statuses[0])
+    merged["running_requests"] = [
+        request
+        for status in statuses
+        for request in (status.get("running_requests") or [])
+    ]
+    return merged
+
+
+def worker_set_admission(url, api_key, timeout, paused):
+    payload = _worker_request(
+        url, "/pd_flip/runtime_role/admission", api_key, timeout, {"paused": paused}
+    )
+    if any(not row.get("success", False) for row in (payload if isinstance(payload, list) else [payload])):
+        raise RuntimeError("worker admission mutation failed for %s" % url)
+
+
+def worker_set_role(url, api_key, timeout, role):
+    payload = _worker_request(
+        url, "/pd_flip/runtime_role/set", api_key, timeout, {"role": role, "force": False}
+    )
+    if any(not row.get("success", False) for row in (payload if isinstance(payload, list) else [payload])):
+        raise RuntimeError("worker role mutation failed for %s" % url)
+
+
+def wait_worker_idle(url, api_key, timeout, interval=0.1):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = worker_runtime_status(url, api_key, timeout)
+        loads = _worker_request(url, "/v1/loads?include=all", api_key, timeout)
+        load_rows = loads.get("loads", []) if isinstance(loads, dict) else loads
+        if not status.get("running_requests") and all(
+            int(row.get("num_running_reqs", 0) or 0) == 0
+            and int(row.get("num_waiting_reqs", 0) or 0) == 0
+            for row in (load_rows or [])
+            if isinstance(row, dict)
+        ):
+            return
+        time.sleep(interval)
+    raise TimeoutError("worker did not become idle: %s" % url)
+
+
+def assert_initial_topology(prefill_url, decode_urls, api_key, timeout):
+    expected = [(prefill_url, "prefill"), *[(url, "decode") for url in decode_urls]]
+    for url, role in expected:
+        status = worker_runtime_status(url, api_key, timeout)
+        if status.get("role") != role or status.get("active_event_loop_role") != role:
+            raise RuntimeError("matrix case does not start from 1P3D: %s" % url)
+
+
+def matrix_session_prefix(mode, decision_path, case_token):
+    return "pd-matrix-%s-%s-%s" % (mode, decision_path, case_token)
+
+
+def restore_case_topology(placement, api_key, timeout):
+    errors = []
+    for worker in placement["workers"]:
+        url = worker["url"]
+        worker_id = worker["worker_id"]
+        operations = (
+            lambda: router_set_drain(
+                placement["router_url"], placement["api_key"], timeout, worker_id, True
+            ),
+            lambda: worker_set_admission(url, api_key, timeout, True),
+            lambda: wait_worker_idle(url, api_key, timeout),
+        )
+        for operation in operations:
+            try:
+                operation()
+            except Exception as exc:
+                errors.append("%s: %s" % (worker_id, exc))
+        try:
+            status = worker_runtime_status(url, api_key, timeout)
+            if status.get("role") != "decode" or status.get("active_event_loop_role") != "decode":
+                worker_set_role(url, api_key, timeout, "decode")
+                deadline = time.monotonic() + timeout
+                while True:
+                    status = worker_runtime_status(url, api_key, timeout)
+                    if status.get("role") == status.get("active_event_loop_role") == "decode":
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("decode event loop did not become active")
+                    time.sleep(0.1)
+            router_set_role(
+                placement["router_url"], placement["api_key"], timeout, worker_id, "decode", True
+            )
+        except Exception as exc:
+            errors.append("%s: %s" % (worker_id, exc))
+        try:
+            worker_set_admission(url, api_key, timeout, False)
+        except Exception as exc:
+            errors.append("%s: %s" % (worker_id, exc))
+    try:
+        restore_router_placement(placement)
+    except Exception as exc:
+        errors.append(str(exc))
+    if errors:
+        raise RuntimeError("case topology restore failures: " + "; ".join(errors))
+
+
+def restore_case_topology_preserving(
+    placement, api_key, timeout, original_error=None
+):
+    try:
+        restore_case_topology(placement, api_key, timeout)
+    except Exception as restore_error:
+        if original_error is None:
+            raise
+        original_error.add_note(str(restore_error))
+
+
 def prepare_router_placement(
     router_url, api_key, other_decode_url, source_url, target_url, timeout
 ):
@@ -266,7 +426,9 @@ def validate_measurement_exit(return_code, matrix_sent_sigterm):
     raise RuntimeError("measurement sidecar termination rc=%s" % return_code)
 
 
-def wait_for_target_active(journal_path, timeout, interval, processes):
+def wait_for_target_active(
+    journal_path, timeout, interval, processes, expected_session_prefix=None
+):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -277,6 +439,10 @@ def wait_for_target_active(journal_path, timeout, interval, processes):
             except (OSError, json.JSONDecodeError):
                 last = None
             if isinstance(last, dict) and last.get("phase") == "target_active":
+                if expected_session_prefix and not str(last.get("session_id", "")).startswith(
+                    expected_session_prefix + "-"
+                ):
+                    raise RuntimeError("journal session does not match matrix case prefix")
                 return last
         time.sleep(interval)
     raise TimeoutError("target_active was not observed in journal: %r" % last)
@@ -313,6 +479,7 @@ def run_case(args, mode, decision_path):
         path.unlink(missing_ok=True)
 
     generation_token = uuid.uuid4().hex
+    session_id_prefix = matrix_session_prefix(mode, decision_path, generation_token)
     env = os.environ.copy()
     env.update(
         {
@@ -331,6 +498,7 @@ def run_case(args, mode, decision_path):
             "PD_FLIP_SESSION_JOURNAL_PATH": str(
                 container_case_dir / "pd_flip_session.json"
             ),
+            "PD_FLIP_SESSION_ID_PREFIX": session_id_prefix,
             "STORE_GENERATION_TOKEN": generation_token,
             "STORE_GENERATION_FILE": str(generation_file.resolve()),
         }
@@ -351,6 +519,13 @@ def run_case(args, mode, decision_path):
         ready_generation,
         args._seen_store_tokens,
         args._seen_store_generations,
+    )
+    admin_key = os.environ[args.admin_api_key_env]
+    assert_initial_topology(
+        args.prefill_url,
+        (args.other_decode_url, args.source_url, args.target_url),
+        admin_key,
+        args.timeout_seconds,
     )
 
     measure_log_path = case_dir / "measurement.log"
@@ -453,6 +628,7 @@ def run_case(args, mode, decision_path):
                 args.poll_interval_seconds,
                 watched
                 + [("controller", controller, controller_log_path)],
+                session_id_prefix,
             )
             timeline["first_batch_target_active"] = time.monotonic()
             pressure_stop.touch()
@@ -503,7 +679,9 @@ def run_case(args, mode, decision_path):
         measurement_sent_sigterm = measurement.poll() is None
         measurement_rc = terminate(measurement)
         if placement is not None:
-            restore_router_placement_preserving(placement, original_error)
+            restore_case_topology_preserving(
+                placement, admin_key, args.timeout_seconds, original_error
+            )
         if controller_log is not None:
             controller_log.close()
         workload_log.close()
@@ -545,6 +723,7 @@ def build_parser():
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--router-url", required=True)
     parser.add_argument("--other-decode-url", required=True)
+    parser.add_argument("--prefill-url", required=True)
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--target-url", required=True)
     parser.add_argument("--model", required=True)

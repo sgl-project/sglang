@@ -33,6 +33,21 @@ def make_controller(*, first_migration_ratio=0.5):
     return controller_module.PDFlipController(config, client=object())
 
 
+def test_progressive_session_prefix_is_unique_by_default_and_explicitly_controllable():
+    source, target = metric("source"), metric("target")
+    first = make_controller()._progressive_session_prefix(source, target)
+    second = make_controller()._progressive_session_prefix(source, target)
+    assert first != second
+    assert first.startswith("pd-flip-source-to-target-")
+    config = controller_module.PDClusterConfig(
+        router_url="http://router",
+        nodes=[controller_module.PDNode("d0", "http://d0", "d0")],
+        session_id_prefix="controlled",
+    )
+    controlled = controller_module.PDFlipController(config, client=object())
+    assert controlled._progressive_session_prefix(source, target) == "controlled"
+
+
 def test_controller_uses_status_capacity_and_halves_ratio():
     controller = make_controller(first_migration_ratio=0.75)
     source = metric(
@@ -214,6 +229,8 @@ def test_progressive_cli_values_reach_config_from_args():
             "28",
             "--session-journal-path",
             "state/cli-session.json",
+            "--session-id-prefix",
+            "controlled-case",
             "metrics",
         ]
     )
@@ -226,6 +243,7 @@ def test_progressive_cli_values_reach_config_from_args():
     assert config.min_prefill_slo_samples == 24
     assert config.min_decode_slo_samples == 28
     assert config.session_journal_path == "state/cli-session.json"
+    assert config.session_id_prefix == "controlled-case"
 
 
 def test_progressive_cli_config_rejects_invalid_policy_values():
@@ -497,6 +515,7 @@ def progressive_scenario(
         post_migration_idle_timeout_seconds=0.0,
         min_prefill_slo_samples=20,
         min_decode_slo_samples=20,
+        session_id_prefix="pd-flip-source-to-target",
     )
     controller = controller_module.PDFlipController(config, client)
     return controller, client, ProgressiveScenarioMonitor(observation)

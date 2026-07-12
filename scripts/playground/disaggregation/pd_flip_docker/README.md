@@ -285,6 +285,7 @@ PD_FLIP_MEASURE_COMMAND='python3 "$SGLANG_REPO/scripts/playground/disaggregation
   --duration-seconds 3600 --output-events "$MIGRATION_EVENTS"'
 PD_FLIP_CONTROLLER_COMMAND='PD_FLIP_ARTIFACT_DIR="$CONTAINER_CASE_DIR" \
   PD_FLIP_SESSION_JOURNAL_PATH="$CONTAINER_CASE_DIR/pd_flip_session.json" \
+  PD_FLIP_SESSION_ID_PREFIX="$PD_FLIP_SESSION_ID_PREFIX" \
   "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" monitor'
 PD_FLIP_SUMMARIZE_COMMAND='python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_migration_measure.py" summarize \
   --events-jsonl "$MIGRATION_EVENTS" --controller-log "$HOST_CASE_DIR/controller.log" \
@@ -295,7 +296,8 @@ export PD_FLIP_MEASURE_COMMAND PD_FLIP_CONTROLLER_COMMAND PD_FLIP_SUMMARIZE_COMM
 
 python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_progressive_matrix.py" \
   --base-url "http://${ROUTER_HOST}:${ROUTER_PORT}" \
-  --router-url "http://${ROUTER_HOST}:${ROUTER_PORT}" --other-decode-url "$NODE1" \
+  --router-url "http://${ROUTER_HOST}:${ROUTER_PORT}" --prefill-url "$NODE0" \
+  --other-decode-url "$NODE1" \
   --source-url "$NODE2" --target-url "$NODE3" --model "$MODEL_ID" \
   --admin-api-key-env ADMIN_API_KEY \
   --router-admin-api-key-env PD_FLIP_ROUTER_ADMIN_API_KEY \
@@ -306,6 +308,12 @@ python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_progressive_matr
   --controller-command "$PD_FLIP_CONTROLLER_COMMAND" \
   --summarize-command "$PD_FLIP_SUMMARIZE_COMMAND"
 ```
+
+Each case uses `pd-matrix-<mode>-<path>-<case-token>` as its controller session
+prefix; `-first` and `-final` sessions therefore cannot reuse manifests from a
+previous case. After workload completion the matrix drains and idles all decode
+workers, restores node1/node2/node3 to active-loop `decode`, restores router
+roles/drain state and admission, then requires the next case to start at 1P3D.
 
 For **SLO recovery without role flip**, accept only when prefill pressure first
 causes a first migration, post-first-migration samples recover, and:

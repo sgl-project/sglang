@@ -296,6 +296,7 @@ def exercise_run_case_cleanup(monkeypatch, tmp_path, body_error=None, restore_er
         source_url="http://node2",
         target_url="http://node3",
         other_decode_url="http://node1",
+        prefill_url="http://node0",
         admin_api_key_env="ADMIN_API_KEY",
         router_admin_api_key_env="ROUTER_KEY",
         model="model",
@@ -345,6 +346,7 @@ def exercise_run_case_cleanup(monkeypatch, tmp_path, body_error=None, restore_er
     monkeypatch.setattr(module, "wait_for_process", lambda *_: 0)
     monkeypatch.setattr(module, "validate_pressure_timeline", lambda *_: None)
     monkeypatch.setattr(module, "validate_measurement_exit", lambda *_: None)
+    monkeypatch.setattr(module, "assert_initial_topology", lambda *_: None)
 
     calls = {"wait": 0}
 
@@ -366,7 +368,11 @@ def exercise_run_case_cleanup(monkeypatch, tmp_path, body_error=None, restore_er
         if restore_error is not None:
             raise restore_error
 
-    monkeypatch.setattr(module, "restore_router_placement", restore)
+    monkeypatch.setattr(
+        module,
+        "restore_case_topology",
+        lambda placement, *_: restore(placement),
+    )
     return module.run_case(args, "full", "commit")
 
 
@@ -431,6 +437,66 @@ def test_store_generation_requires_remote_identity_and_uniqueness():
         module.validate_store_generation(
             dict(proof, token="case-2"), dict(ready, pid="99"), set(), set()
         )
+
+
+def test_stateful_cases_restore_1p3d_and_use_unique_sessions(monkeypatch):
+    module = load_matrix_module()
+    states = {
+        "http://node0": {"role": "prefill", "active_event_loop_role": "prefill"},
+        "http://node1": {"role": "decode", "active_event_loop_role": "decode"},
+        "http://node2": {"role": "decode", "active_event_loop_role": "decode"},
+        "http://node3": {"role": "decode", "active_event_loop_role": "decode"},
+    }
+    admissions = []
+    monkeypatch.setattr(module, "worker_runtime_status", lambda url, *_: states[url])
+    monkeypatch.setattr(module, "wait_worker_idle", lambda *_: None)
+    monkeypatch.setattr(
+        module,
+        "worker_set_admission",
+        lambda url, _key, _timeout, paused: admissions.append((url, paused)),
+    )
+
+    def set_role(url, _key, _timeout, role):
+        states[url].update(role=role, active_event_loop_role=role)
+
+    monkeypatch.setattr(module, "worker_set_role", set_role)
+    monkeypatch.setattr(module, "router_set_role", lambda *_: None)
+    monkeypatch.setattr(module, "router_set_drain", lambda *_: None)
+    placement = {
+        "router_url": "http://router",
+        "api_key": "secret",
+        "timeout": 1,
+        "workers": [
+            {"worker_id": "w1", "url": "http://node1", "draining": False},
+            {"worker_id": "w2", "url": "http://node2", "draining": False},
+            {"worker_id": "w3", "url": "http://node3", "draining": False},
+        ],
+    }
+    sessions = []
+    for index, (mode, path) in enumerate(
+        (("full", "recovery"), ("partial", "commit"), ("zero", "commit"))
+    ):
+        module.assert_initial_topology(
+            "http://node0",
+            ("http://node1", "http://node2", "http://node3"),
+            "secret",
+            1,
+        )
+        session = module.matrix_session_prefix(mode, path, "token-%d" % index)
+        assert session not in sessions
+        sessions.append(session)
+        if path == "commit":
+            states["http://node2"].update(
+                role="prefill", active_event_loop_role="prefill"
+            )
+        module.restore_case_topology(placement, "secret", 1)
+    assert all(
+        states[url]["role"] == states[url]["active_event_loop_role"] == "decode"
+        for url in ("http://node1", "http://node2", "http://node3")
+    )
+    assert len(set(sessions)) == 3
+    assert ("http://node2", True) in admissions
+    assert ("http://node2", False) in admissions
 
 
 def test_pressure_timeline_contracts():

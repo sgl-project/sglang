@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -169,6 +170,7 @@ class PDClusterConfig:
     min_prefill_slo_samples: int = 20
     min_decode_slo_samples: int = 20
     session_journal_path: str = "pd_flip_session.json"
+    session_id_prefix: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not 0 < self.first_migration_ratio < 1:
@@ -224,6 +226,9 @@ class PDClusterConfig:
             min_decode_slo_samples=int(data.get("min_decode_slo_samples", 20)),
             session_journal_path=str(
                 data.get("session_journal_path", "pd_flip_session.json")
+            ),
+            session_id_prefix=(
+                str(data["session_id_prefix"]) if data.get("session_id_prefix") else None
             ),
         )
 
@@ -383,6 +388,13 @@ class PDFlipController:
         self.config = config
         self.client = client
         self.session_journal = PDFlipSessionJournal(Path(config.session_journal_path))
+
+    def _progressive_session_prefix(
+        self, source: NodeMetrics, target: NodeMetrics
+    ) -> str:
+        if self.config.session_id_prefix:
+            return self.config.session_id_prefix
+        return f"pd-flip-{source.name}-to-{target.name}-{uuid.uuid4().hex}"
 
     @staticmethod
     def _journal_record(
@@ -1001,7 +1013,7 @@ class PDFlipController:
         state_trace: List[JsonDict],
         iterations: int,
     ) -> MonitorLoopResult:
-        session_prefix = f"pd-flip-{source.name}-to-{target.name}"
+        session_prefix = self._progressive_session_prefix(source, target)
         source_finished = False
         try:
             self._append_progressive_state(
@@ -3571,6 +3583,7 @@ def config_from_args(args: argparse.Namespace) -> PDClusterConfig:
         min_prefill_slo_samples=args.min_prefill_slo_samples,
         min_decode_slo_samples=args.min_decode_slo_samples,
         session_journal_path=args.session_journal_path,
+        session_id_prefix=getattr(args, "session_id_prefix", None),
     )
 
 
@@ -3602,6 +3615,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-prefill-slo-samples", type=int, default=20)
     parser.add_argument("--min-decode-slo-samples", type=int, default=20)
     parser.add_argument("--session-journal-path", default="pd_flip_session.json")
+    parser.add_argument("--session-id-prefix", default=None)
 
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("metrics", help="Collect router/worker metrics")
