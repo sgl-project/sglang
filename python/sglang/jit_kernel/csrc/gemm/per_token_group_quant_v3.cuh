@@ -30,6 +30,16 @@ SGL_DEVICE float silu(const float val) {
 #endif
 }
 
+SGL_DEVICE float2 mul2(const float2 a, const float2 b) {
+  // Packed fp32x2 multiply: one FMUL2 on SM100+ (nvcc does not auto-vectorize
+  // the scalar form). Same round-to-nearest results as two scalar FMULs.
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  return __fmul2_rn(a, b);
+#else
+  return float2{a.x * b.x, a.y * b.y};
+#endif
+}
+
 template <typename T>
 struct WeightTrait {};
 
@@ -282,10 +292,10 @@ struct QuantTrait {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
       const float quant_scale = kMaxValue * __frcp_rn(amax);
+      const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        const auto v = cast<float2>(in[i]);
-        out[i] = WTrait::quant(float2{v.x * quant_scale, v.y * quant_scale});
+        out[i] = WTrait::quant(details::mul2(cast<float2>(in[i]), quant_scale2));
       }
     }
 

@@ -54,15 +54,20 @@ del _name
 
 register_kernel(
     KernelSpec(
-        op="quantization.sgl_per_token_group_quant_8bit",
+        op="quantization.per_token_group_quant_v3",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
+        target="sglang.jit_kernel.per_token_group_quant_v3:per_token_group_quant_v3",
         capabilities=_CUDA,
         format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn", "int8"),
             in_place=True,
-            description="per-token-group 8-bit quantization (JIT variant)",
+            description=(
+                "trait-driven per-token-group quantization: bf16/fp16 input, "
+                "group size 16..256, fp32 or packed-UE8M0 scales in row/col-major "
+                "layouts, optional fused silu_and_mul and masked EP-MoE schedule"
+            ),
         ),
-        description="Per-token-group 8-bit quantization (sglang.jit_kernel).",
+        description="Unified per-token-group quantization (sglang.jit_kernel v3).",
     )
 )
 
@@ -112,11 +117,48 @@ sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
 sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
+def per_token_group_quant_v3(
+    input: torch.Tensor,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    expected_m: Optional[int] = None,
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+    column_major_scales: bool = False,
+):
+    """Unified per-token-group quantization (JIT v3). Returns ``(x_q, x_s)``.
+
+    bf16/fp16 input, fp8_e4m3/int8 output, group size 16..256, fp32 or
+    packed-UE8M0 scales in row-/col-major layouts, optional fused
+    ``silu_and_mul`` and masked EP-MoE schedule (``masked_m`` +
+    ``expected_m`` grid hint). Pass ``output_q``/``output_s`` to quantize into
+    caller-owned buffers (layout inferred from their dtype/strides), or omit
+    both to have them allocated.
+    """
+    return get_kernel("quantization.per_token_group_quant_v3", KernelBackend.CUDA_JIT)(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
+        expected_m,
+        out_dtype=out_dtype,
+        column_major_scales=column_major_scales,
+    )
+
+
 __all__ = [
     "sgl_per_token_quant_fp8",
     "sgl_per_token_group_quant_8bit",
     "sgl_per_token_group_quant_fp8",
     "sgl_per_token_group_quant_int8",
+    "per_token_group_quant_v3",
 ]
 
 
