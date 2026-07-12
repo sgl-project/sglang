@@ -122,8 +122,15 @@ logger = logging.getLogger(__name__)
 @lru_cache()
 def is_fp8_fnuz() -> bool:
     if _is_hip:
+        if not torch.cuda.is_available():
+            return False
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
-        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+        try:
+            return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+        except RuntimeError as err:
+            if "No HIP GPUs are available" in str(err):
+                return False
+            raise
     return False
 
 
