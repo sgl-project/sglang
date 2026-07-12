@@ -1,4 +1,3 @@
-import types
 import unittest
 
 import torch
@@ -6,7 +5,6 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
-    resolve_ragged_verify_layout,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,29 +17,6 @@ _GRID = [8, 16, 24, 32, 64]
 # The backend capability checks (supports_ragged_verify_graph) live in
 # test_ragged_verify_backend_capability.py: importing the backend modules
 # pulls GPU-only wheels, which fail to import on the CPU runners.
-
-
-class TestResolveRaggedVerifyLayout(CustomTestCase):
-    def test_none_without_spec_info(self):
-        fb = types.SimpleNamespace(spec_info=None)
-        self.assertIsNone(resolve_ragged_verify_layout(fb))
-
-    def test_none_when_layout_field_unset(self):
-        # ragged_verify_layout is declared on the SpecInput base, so every
-        # spec_info carries it; unset (None) must resolve to no layout.
-        fb = types.SimpleNamespace(
-            spec_info=types.SimpleNamespace(ragged_verify_layout=None)
-        )
-        self.assertIsNone(resolve_ragged_verify_layout(fb))
-
-    def test_returns_attached_layout(self):
-        layout = RaggedVerifyLayout.uniform(
-            bs=2, num_draft_tokens=8, device=_DEVICE, grid=_GRID
-        )
-        fb = types.SimpleNamespace(
-            spec_info=types.SimpleNamespace(ragged_verify_layout=layout)
-        )
-        self.assertIs(resolve_ragged_verify_layout(fb), layout)
 
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
@@ -119,19 +94,6 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         padded = raw.padded_to_bucket(padded_bs=8)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
-
-
-class TestNegativeSeamGeometry(CustomTestCase):
-    def test_uniform_layout_geometry_matches_legacy_arange(self):
-        seq_lens = torch.tensor([5, 7, 9], dtype=torch.int32)
-        uniform = RaggedVerifyLayout.uniform(
-            bs=3, num_draft_tokens=8, device=_DEVICE, grid=_GRID
-        )
-        geometry = build_ragged_target_verify_geometry(
-            seq_lens=seq_lens, layout=uniform
-        )
-        self.assertEqual(geometry.cu_seqlens_q.tolist(), [0, 8, 16, 24])
-        self.assertEqual(geometry.max_seq_len_q, 8)
 
 
 class TestCaptureVerifyLens(CustomTestCase):

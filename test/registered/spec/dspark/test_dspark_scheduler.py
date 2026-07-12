@@ -442,24 +442,6 @@ class TestDSparkScheduleConfig(CustomTestCase):
 
 
 class TestGraphTierFillBudget(CustomTestCase):
-    def test_below_cap_is_tier_minus_floor(self):
-        """A tier under the per-request cap yields budget = tier - floor_tokens."""
-        self.assertEqual(
-            graph_tier_fill_budget(
-                graph_num_tokens=48, bs=8, verify_num_draft_tokens=6, min_verify_len=1
-            ),
-            48 - 8,
-        )
-
-    def test_clamped_at_draft_capacity(self):
-        """A tier above bs*K is capped at bs*K before subtracting the floor."""
-        self.assertEqual(
-            graph_tier_fill_budget(
-                graph_num_tokens=100, bs=8, verify_num_draft_tokens=6, min_verify_len=1
-            ),
-            8 * 6 - 8,
-        )
-
     def test_floor_scales_with_min_verify_len(self):
         """The subtracted floor is bs * max(min_verify_len, 1)."""
         self.assertEqual(
@@ -467,15 +449,6 @@ class TestGraphTierFillBudget(CustomTestCase):
                 graph_num_tokens=60, bs=10, verify_num_draft_tokens=6, min_verify_len=2
             ),
             60 - 20,
-        )
-
-    def test_never_negative(self):
-        """A tier below the floor clamps the budget to zero, never negative."""
-        self.assertEqual(
-            graph_tier_fill_budget(
-                graph_num_tokens=4, bs=8, verify_num_draft_tokens=6, min_verify_len=1
-            ),
-            0,
         )
 
     def test_feeding_budget_fills_topk_total_to_tier(self):

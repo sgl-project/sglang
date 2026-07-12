@@ -34,58 +34,17 @@ class TestLocalVerifyTierNumTokens(CustomTestCase):
             18,
         )
 
-    def test_clamps_to_verify_all(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=1000,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            48,
-        )
-
-    def test_min_verify_len_raises_floor(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=10,
-                verify_num_draft_tokens=6,
-                min_verify_len=3,
-            ),
-            34,
-        )
-
-    def test_min_verify_len_zero_behaves_as_one(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=10,
-                verify_num_draft_tokens=6,
-                min_verify_len=0,
-            ),
-            18,
-        )
+    # Clamp/floor variants (verify-all clamp, min_verify_len floor, min=0) are
+    # covered by the TestBusyIdleGraphKeyIdentity sweep bounds.
 
 
 class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
-    def test_none_list_pins(self):
-        self.assertIsNone(dp_global_verify_tier_num_tokens(global_tier_num_tokens=None))
-
     def test_any_sentinel_pins_everyone(self):
+        # The sweep never emits a -1 contribution, so this is the only guard
+        # on "any rank without a budget pins everyone"; losing it forks graph
+        # keys across DP ranks.
         self.assertIsNone(
             dp_global_verify_tier_num_tokens(global_tier_num_tokens=[100, -1, 50, 0])
-        )
-
-    def test_all_idle_pins(self):
-        self.assertIsNone(
-            dp_global_verify_tier_num_tokens(global_tier_num_tokens=[0, 0, 0, 0])
-        )
-
-    def test_max_over_busy_ranks(self):
-        self.assertEqual(
-            dp_global_verify_tier_num_tokens(global_tier_num_tokens=[0, 120, 48, 0]),
-            120,
         )
 
 

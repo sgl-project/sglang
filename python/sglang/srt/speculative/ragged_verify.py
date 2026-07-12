@@ -154,21 +154,6 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             device=device,
         )
 
-    @classmethod
-    def uniform(
-        cls,
-        *,
-        bs: int,
-        num_draft_tokens: int,
-        device: torch.device,
-        grid: Sequence[int],
-    ) -> RaggedVerifyLayout:
-        return cls.from_verify_lens(
-            verify_lens_cpu=[num_draft_tokens] * bs,
-            device=device,
-            grid=grid,
-        )
-
     def padded_to_bucket(self, *, padded_bs: int) -> RaggedVerifyLayout:
         from sglang.srt.speculative.ragged_verify_kernels import (
             PaddedToBucket,
