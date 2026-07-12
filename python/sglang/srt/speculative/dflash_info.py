@@ -38,8 +38,23 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # EAGLE-style tree verify metadata (only set when --speculative-dflash-tree-verify
+    # and topk > 1). When present and `positions is None`, prepare_for_verify
+    # builds the tree mask / positions / retrieve buffers via the EAGLE kernel.
+    tree_parent_list: Optional[torch.Tensor] = None  # Full topk-tree parent list
+    tree_selected_index: Optional[torch.Tensor] = None  # Selected indices in full tree
+    retrieve_index: Optional[torch.Tensor] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_req: int = -1
+
+    # Reusable tree-mask / position buffers (EAGLE-style buffer reuse). When set,
+    # build_tree_kernel_efficient fills these in place instead of allocating fresh
+    # per-step buffers.
+    tree_mask_buf: Optional[torch.Tensor] = None
+    position_buf: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -62,6 +77,65 @@ class DFlashVerifyInput(SpecInput):
         `skip_attn_backend_init=True`.
         """
         batch.input_ids = self.draft_token
+
+        # EAGLE-style tree verify: build the tree mask / positions / retrieve
+        # buffers from the pruned-tree metadata before constructing the forward
+        # batch. `generate_attn_arg_prefill` consumes `self.custom_mask`, so the
+        # verify forward picks up the tree mask automatically.
+        is_tree_verify = (
+            self.positions is None
+            and self.tree_parent_list is not None
+            and self.tree_parent_list.numel() > 0
+            and self.tree_selected_index is not None
+            and self.tree_selected_index.numel() > 0
+        )
+        if is_tree_verify and not batch.forward_mode.is_idle():
+            from sglang.srt.speculative.eagle_utils import (
+                TreeMaskMode,
+                build_tree_kernel_efficient,
+            )
+
+            bs = batch.batch_size()
+            depth = int((self.tree_parent_list.size(1) - 1) / int(self.topk)) + 1
+            # The tree mask buffer is sized from sum(seq_lens); the caller may have
+            # temporarily set batch.seq_lens_sum to an over-allocated planning value,
+            # so recompute the true sum here for a correctly sized FULL_MASK.
+            # When a preallocated tree_mask_buf is supplied (EAGLE-style reuse),
+            # the kernel ignores seq_lens_sum and writes into the (over-sized)
+            # buffer directly, saving a per-step alloc + memset (and the D2H sync).
+            if self.tree_mask_buf is not None:
+                true_seq_lens_sum = 0
+            else:
+                true_seq_lens_sum = int(batch.seq_lens.sum().item())
+            (
+                tree_mask,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                bonus_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 0],
+                parent_list=self.tree_parent_list,
+                top_scores_index=self.tree_selected_index,
+                draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
+                seq_lens=batch.seq_lens,
+                seq_lens_sum=true_seq_lens_sum,
+                topk=int(self.topk),
+                spec_steps=depth,
+                num_verify_tokens=self.draft_token_num,
+                tree_mask_mode=TreeMaskMode.FULL_MASK,
+                tree_mask_buf=self.tree_mask_buf,
+                position_buf=self.position_buf,
+            )
+            batch.input_ids = draft_tokens
+            self.draft_token = draft_tokens
+            self.custom_mask = tree_mask
+            self.positions = positions
+            self.retrieve_index = retrieve_index
+            self.retrieve_next_token = retrieve_next_token
+            self.retrieve_next_sibling = retrieve_next_sibling
+
         batch.spec_info = self
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -71,6 +145,9 @@ class DFlashVerifyInput(SpecInput):
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
+        # The DFLASH verify graph is captured mask-capable for tree verify (see the
+        # get_spec_info mask patch / v1 fork), so tree verify replays the graph with
+        # its per-step custom mask. No eager fallback needed.
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(

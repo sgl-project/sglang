@@ -889,7 +889,7 @@ def build_tree_verify_tokens(
     use_fused_triton = topk in (4, 8, 16) and is_cuda() and topk_probs.is_cuda
 
     if use_fused_triton:
-        from sglang.srt.speculative.triton_ops.dflash_tree_expand_topk import (
+        from sglang.kernels.ops.speculative.dflash_tree_expand_topk import (
             dflash_tree_verify_select_topk4_fused,
         )
 

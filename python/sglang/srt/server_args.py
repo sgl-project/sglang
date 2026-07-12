@@ -1680,6 +1680,13 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_tree_verify: A[
+        bool,
+        "DFLASH only. Enable EAGLE-style draft-tree verification (fused GPU tree builder). "
+        "Requires --speculative-eagle-topk > 1 (tree branching factor); the verify node "
+        "budget is --speculative-num-draft-tokens and may exceed the draft block size. "
+        "Default False = chain verify.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
