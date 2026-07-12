@@ -1,6 +1,7 @@
+"""JIT compilation: load_jit, the build cache, and C++ template arguments."""
+
 from __future__ import annotations
 
-import functools
 import hashlib
 import importlib.util
 import logging
@@ -8,58 +9,18 @@ import os
 import pathlib
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-    TypeAlias,
-    TypeVar,
-    Union,
-)
+from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
 import torch
 
-from sglang.utils import is_in_ci
+from sglang.jit_kernel.utils.arch import _get_default_target_flags, get_jit_cuda_arch
+from sglang.jit_kernel.utils.common import cache_once, is_hip_runtime
+from sglang.jit_kernel.utils.deps import _REGISTERED_DEPENDENCIES
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
-F = TypeVar("F", bound=Callable[..., Any])
-_FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
-
 logger = logging.getLogger(__name__)
-
-
-def should_run_full_tests() -> bool:
-    return os.getenv(_FULL_TEST_ENV_VAR, "false").lower() == "true"
-
-
-def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
-    if should_run_full_tests():
-        return full_range
-    return ci_range if is_in_ci() else full_range
-
-
-def cache_once(fn: F) -> F:
-    """
-    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
-    So we manually implement a simple cache_once decorator to replace it.
-    """
-    result_map = {}
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items())))
-        if key not in result_map:
-            result_map[key] = fn(*args, **kwargs)
-        return result_map[key]
-
-    return wrapper  # type: ignore
 
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:
@@ -155,18 +116,6 @@ CPP_DTYPE_MAP = {
     torch.int32: "int32_t",
     torch.int64: "int64_t",
 }
-
-
-# AMD/ROCm note:
-@cache_once
-def is_hip_runtime() -> bool:
-    return bool(torch.version.hip)
-
-
-# MThreads/MUSA note:
-@cache_once
-def is_musa_runtime() -> bool:
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -333,33 +282,6 @@ def load_jit(
             )
 
 
-@dataclass
-class ArchInfo:
-    major: int
-    minor: int
-    suffix: str
-
-    @property
-    def target_name(self) -> str:
-        return f"{self.major}.{self.minor}{self.suffix}"
-
-    @property
-    def jit_flag(self) -> str:
-        return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
-
-
-@cache_once
-def _init_jit_cuda_arch_once():
-    global _CUDA_ARCH
-    try:
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
-    except Exception:
-        logger.warning("Cannot detect CUDA architecture.")
-        major, minor = 0, 0  # invalid value to trigger compile error if used
-    _CUDA_ARCH = ArchInfo(major, minor, "")
-
-
 @contextmanager
 def _jit_compile_context():
     if is_hip_runtime():
@@ -375,200 +297,3 @@ def _jit_compile_context():
             os.environ.pop(env_key, None)
         else:
             os.environ[env_key] = old_value
-
-
-# NOTE: this might also be used in __main__.py for compile flags export
-def _get_default_target_flags() -> List[str]:
-    if is_hip_runtime():
-        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
-        # Detect FP8 type based on GPU architecture
-        try:
-            device = torch.cuda.current_device()
-            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
-            if "gfx942" in gcn_arch:
-                flags.append("-DHIP_FP8_TYPE_FNUZ=1")
-            else:
-                flags.append("-DHIP_FP8_TYPE_E4M3=1")
-        except Exception:
-            flags.append("-DHIP_FP8_TYPE_E4M3=1")
-        return flags
-    else:
-        return [
-            get_jit_cuda_arch().jit_flag,
-            "-std=c++20",
-            "-O3",
-            "--expt-relaxed-constexpr",
-        ]
-
-
-@contextmanager
-def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
-    """A context manager to temporarily override CUDA architecture."""
-    global _CUDA_ARCH
-    old_value = get_jit_cuda_arch()
-    _CUDA_ARCH = ArchInfo(major, minor, suffix)
-    try:
-        yield
-    finally:
-        _CUDA_ARCH = old_value
-
-
-def get_jit_cuda_arch() -> ArchInfo:
-    """Get the current CUDA architecture info."""
-    _init_jit_cuda_arch_once()
-    return _CUDA_ARCH
-
-
-@cache_once
-def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
-        return False
-    return get_jit_cuda_arch().major >= 9
-
-
-def _find_package_root(package: str) -> Optional[pathlib.Path]:
-    spec = importlib.util.find_spec(package)
-    if spec is None or spec.origin is None:
-        return None
-    return pathlib.Path(spec.origin).resolve().parent
-
-
-# NOTE: this might also be used in __main__.py for compile flags export
-_REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
-
-
-def register_dependency(name: str):
-    def decorator(f: Callable[[], List[str]]) -> Callable[[], List[str]]:
-        if name in _REGISTERED_DEPENDENCIES:
-            raise ValueError(f"Dependency {name} already registered")
-        _REGISTERED_DEPENDENCIES[name] = f
-        return f
-
-    return decorator
-
-
-@register_dependency("flashinfer")
-def get_flashinfer_include_paths() -> List[str]:
-    include_paths: List[str] = []
-    flashinfer_root = _find_package_root("flashinfer")
-    if flashinfer_root is None:
-        raise RuntimeError(
-            "Cannot find flashinfer package. Please install flashinfer to get"
-            "the required headers for JIT compilation."
-        )
-
-    flashinfer_data = flashinfer_root / "data"
-    candidates = [
-        flashinfer_data / "include",
-        flashinfer_data / "csrc",
-        flashinfer_data / "cutlass" / "include",
-        flashinfer_data / "cutlass" / "tools" / "util" / "include",
-        flashinfer_data / "spdlog" / "include",
-    ]
-
-    for path in candidates:
-        if not path.exists():
-            raise RuntimeError(
-                f"Required header path {path} for flashinfer dependency not found."
-                " Please check your flashinfer installation."
-            )
-        include_paths.append(str(path))
-    return include_paths
-
-
-def get_mathdx_root() -> Optional[pathlib.Path]:
-    """Locate the NVIDIA Math-DX install (cuBLASDx headers).
-
-    Searches in order:
-      1. ``$MATHDX_HOME`` env var (extracted Math-DX archive root).
-      2. The ``nvidia-mathdx`` PyPI package, if installed.
-    """
-    env_home = os.environ.get("MATHDX_HOME")
-    if env_home:
-        candidate = pathlib.Path(env_home).expanduser().resolve()
-        if (candidate / "include").exists():
-            return candidate
-
-    # The ``nvidia-mathdx`` wheel installs as the namespace package
-    # ``nvidia.mathdx`` (no __init__, so spec.origin is None); resolve it via
-    # submodule_search_locations rather than _find_package_root, which only
-    # handles regular packages.
-    spec = importlib.util.find_spec("nvidia.mathdx")
-    if spec is not None:
-        roots = list(spec.submodule_search_locations or [])
-        if spec.origin is not None:
-            roots.append(str(pathlib.Path(spec.origin).parent))
-        for root in roots:
-            candidate = pathlib.Path(root).resolve()
-            if (candidate / "include").exists():
-                return candidate
-
-    return None
-
-
-@register_dependency("mathdx")
-def get_mathdx_include_paths() -> List[str]:
-    root = get_mathdx_root()
-    if root is None:
-        raise RuntimeError(
-            "Cannot find NVIDIA Math-DX (cuBLASDx) headers. "
-            "Install the `nvidia-mathdx` package "
-            "(`pip install nvidia-mathdx`) or set MATHDX_HOME to an "
-            "extracted Math-DX archive root."
-        )
-    candidates = [root / "include"]
-    cutlass = root / "external" / "cutlass" / "include"
-    if cutlass.exists():
-        candidates.append(cutlass)
-    return [str(p) for p in candidates]
-
-
-@register_dependency("cutlass")
-def get_cutlass_include_paths() -> List[str]:
-    include_paths: List[str] = []
-
-    flashinfer_root = _find_package_root("flashinfer")
-    if flashinfer_root is not None:
-        candidates = [
-            flashinfer_root / "data" / "cutlass" / "include",
-            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
-        ]
-        for path in candidates:
-            if path.exists():
-                include_paths.append(str(path))
-
-    deep_gemm_root = _find_package_root("deep_gemm")
-    if deep_gemm_root is not None:
-        candidate = deep_gemm_root / "include"
-        if candidate.exists():
-            include_paths.append(str(candidate))
-
-    # De-duplicate while preserving order.
-    unique_paths = []
-    seen = set()
-    for path in include_paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        unique_paths.append(path)
-
-    if not unique_paths:
-        raise RuntimeError(
-            "Cannot find CUTLASS headers required for JIT compilation. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
-        )
-    return unique_paths
-
-
-__all__ = [
-    "should_run_full_tests",
-    "get_ci_test_range",
-    "cache_once",
-    "is_hip_runtime",
-    "make_cpp_args",
-    "load_jit",
-    "override_jit_cuda_arch",
-    "get_jit_cuda_arch",
-    "is_arch_support_pdl",
-    "register_dependency",
-]
