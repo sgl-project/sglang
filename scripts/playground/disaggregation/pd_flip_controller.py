@@ -47,6 +47,7 @@ except ModuleNotFoundError:
 try:
     from pd_flip_progressive_policy import (
         ProgressiveDecision,
+        RatioSelection,
         RequestCapacity,
         evaluate_slo_decision,
         select_first_batch,
@@ -64,6 +65,7 @@ except ModuleNotFoundError:
     sys.modules[_PROGRESSIVE_POLICY_SPEC.name] = _PROGRESSIVE_POLICY_MODULE
     _PROGRESSIVE_POLICY_SPEC.loader.exec_module(_PROGRESSIVE_POLICY_MODULE)
     ProgressiveDecision = _PROGRESSIVE_POLICY_MODULE.ProgressiveDecision
+    RatioSelection = _PROGRESSIVE_POLICY_MODULE.RatioSelection
     RequestCapacity = _PROGRESSIVE_POLICY_MODULE.RequestCapacity
     evaluate_slo_decision = _PROGRESSIVE_POLICY_MODULE.evaluate_slo_decision
     select_first_batch = _PROGRESSIVE_POLICY_MODULE.select_first_batch
@@ -164,6 +166,20 @@ class PDClusterConfig:
     min_prefill_slo_samples: int = 20
     min_decode_slo_samples: int = 20
     session_journal_path: str = "pd_flip_session.json"
+
+    def __post_init__(self) -> None:
+        if not 0 < self.first_migration_ratio < 1:
+            raise ValueError(
+                "first_migration_ratio must be greater than 0 and less than 1"
+            )
+        if not self.observation_seconds >= 0:
+            raise ValueError("observation_seconds must be greater than or equal to 0")
+        if not 0 <= self.slo_threshold <= 1:
+            raise ValueError("slo_threshold must be between 0 and 1 inclusive")
+        if self.min_prefill_slo_samples <= 0:
+            raise ValueError("min_prefill_slo_samples must be greater than 0")
+        if self.min_decode_slo_samples <= 0:
+            raise ValueError("min_decode_slo_samples must be greater than 0")
 
     @staticmethod
     def from_dict(data: JsonDict) -> "PDClusterConfig":
@@ -327,16 +343,33 @@ class PDFlipController:
 
     def _select_progressive_first_batch(
         self, source: NodeMetrics, target: NodeMetrics
-    ) -> Any:
+    ) -> Optional[RatioSelection]:
         source_status = source.raw_status.get("status", source.raw_status)
         target_status = target.raw_status.get("status", target.raw_status)
-        requests = [
-            RequestCapacity(
-                rid=str(item["rid"]),
-                committed_tokens=int(item["kv_committed_len"]),
+        if not isinstance(source_status, dict):
+            return None
+        running_requests = source_status.get("running_requests", [])
+        if not isinstance(running_requests, list) or not running_requests:
+            return None
+
+        requests = []
+        for item in running_requests:
+            if not isinstance(item, dict) or item.get("rid") is None:
+                return None
+            committed_value = item.get("kv_committed_len")
+            if committed_value is None:
+                return None
+            try:
+                committed_tokens = int(committed_value)
+            except (TypeError, ValueError):
+                return None
+            if committed_tokens < 0:
+                return None
+            requests.append(
+                RequestCapacity(
+                    rid=str(item["rid"]), committed_tokens=committed_tokens
+                )
             )
-            for item in source_status.get("running_requests", [])
-        ]
         return select_first_batch(
             requests,
             self.config.first_migration_ratio,

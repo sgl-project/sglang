@@ -15,11 +15,11 @@ base_args=(
   --node "name=node1,worker_url=${NODE1},router_worker_id=${NODE1},bootstrap_port=${BOOTSTRAP_PORT}"
   --node "name=node2,worker_url=${NODE2},router_worker_id=${NODE2},bootstrap_port=${BOOTSTRAP_PORT}"
   --node "name=node3,worker_url=${NODE3},router_worker_id=${NODE3},bootstrap_port=${BOOTSTRAP_PORT}"
-  --first-migration-ratio "${PD_FLIP_FIRST_MIGRATION_RATIO}"
-  --observation-seconds "${PD_FLIP_OBSERVATION_SECONDS}"
-  --slo-threshold "${PD_FLIP_SLO_THRESHOLD}"
-  --min-prefill-slo-samples "${PD_FLIP_MIN_PREFILL_SLO_SAMPLES}"
-  --min-decode-slo-samples "${PD_FLIP_MIN_DECODE_SLO_SAMPLES}"
+  --first-migration-ratio "${PD_FLIP_FIRST_MIGRATION_RATIO:-0.5}"
+  --observation-seconds "${PD_FLIP_OBSERVATION_SECONDS:-10}"
+  --slo-threshold "${PD_FLIP_SLO_THRESHOLD:-0.9}"
+  --min-prefill-slo-samples "${PD_FLIP_MIN_PREFILL_SLO_SAMPLES:-20}"
+  --min-decode-slo-samples "${PD_FLIP_MIN_DECODE_SLO_SAMPLES:-20}"
 )
 
 run_controller() {
