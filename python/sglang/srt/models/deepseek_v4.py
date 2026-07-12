@@ -479,16 +479,20 @@ class MqaAttentionBase(nn.Module):
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
-        self.rope_scaling = rope_scaling
-        scaling = rope_scaling or {}
+        # Pure sliding-window layers use base RoPE without YaRN.
+        self.rope_scaling = rope_scaling if self.compress_ratio else None
+        scaling = self.rope_scaling or {}
         self.rope_base = (
             config.compress_rope_theta if self.compress_ratio else rope_theta
         )
-        original_seq_len: int = (
-            rope_original_seq_len
-            if rope_original_seq_len is not None
-            else scaling["original_max_position_embeddings"]
-        )
+        if self.compress_ratio:
+            original_seq_len = (
+                rope_original_seq_len
+                if rope_original_seq_len is not None
+                else scaling["original_max_position_embeddings"]
+            )
+        else:
+            original_seq_len = 0
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
             seqlen=config.max_position_embeddings,
