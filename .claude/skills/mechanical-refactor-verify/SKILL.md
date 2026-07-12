@@ -24,12 +24,11 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 - **Construct the proof for a move commit** → `guide-construct-proof.md`: run
   `scripts/mechanical_refactor_proof_generator.py`, or hand-write a `Repro` when the
   generator reports `UNSUPPORTED`.
-- **Verify someone's proof** → `guide-verify-proof.md`: re-run it, read the verdict, audit
-  the authored surfaces.
-- **Verify a whole chain / PR branch** → `spec-reproduction-cli.md` +
-  `scripts/mechanical_refactor_reproduction_cli.py`: every commit declares
+- **Verify someone's proof — a whole chain / PR branch, or a single commit** →
+  `guide-verify-proof.md`: run the chain verifier (every commit declares
   `mechanical_provable` or `non_mechanical_provable`, every provable commit's proof
-  exists and PASSes, one full report at the end.
+  exists and PASSes, one full report), or re-run one commit's script, read the verdict,
+  audit the authored surfaces.
 - **Decide whether a change counts as a clean move** → `spec-reproduction-utils.md`: the
   property, the whole whitelist / not-allowed list, and each primitive's contract. The
   source of truth for the reproduction module; if any other file disagrees, it wins.
@@ -43,8 +42,9 @@ description: Make mechanical refactoring (file splits, function moves, module ex
   case recipes, what stays mechanical, and the anti-patterns.
 - [`guide-construct-proof.md`](guide-construct-proof.md) — produce the proof: the
   generator, the hand-written `Repro`, and publishing the proof with the PR.
-- [`guide-verify-proof.md`](guide-verify-proof.md) — consume the proof: re-run, verdicts,
-  and the audit checklist for authored surfaces.
+- [`guide-verify-proof.md`](guide-verify-proof.md) — consume the proof: the whole-chain
+  verifier, single-commit re-runs, verdicts, and the audit checklist for authored
+  surfaces.
 - [`spec-reproduction-utils.md`](spec-reproduction-utils.md) — the normative spec of the
   clean-move property and the reproduction primitives.
 - [`spec-reproduction-cli.md`](spec-reproduction-cli.md) — the normative spec of the

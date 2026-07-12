@@ -78,7 +78,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_re
 ### 3.4 Proof execution and the PASS criterion
 
 - Each proof runs as `python3 <script>` with the repo root as cwd (the run resolves the
-  repo from the cwd, `guide-verify-proof.md` §1).
+  repo from the cwd, `guide-verify-proof.md` §2.1).
 - A proof PASSes iff **both**: exit code 0, **and** the arbiter's `PASS:` verdict line on
   stdout. Requiring the line keeps an old-style script that exits 0 while printing a
   residual from false-passing; requiring the exit code keeps a crash before any verdict
