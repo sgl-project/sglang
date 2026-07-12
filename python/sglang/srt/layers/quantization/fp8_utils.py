@@ -70,13 +70,16 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
 # fallback ck_gemm_a8w8_blockscale returns NaN above a per-shape M for some shapes
-# (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192), corrupting prefill.
+# (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192 at TP8; at TP4 the
+# attn proj (4608,4096)@M>=2048 and o_proj (4096,2048)@M>=4096), corrupting prefill.
 # Map each affected (n, k) to the largest M for which CK is confirmed correct
 # (conservative = last verified-safe M). Keep the faster CK path at/below that M and
 # fall back to the numerically-correct Triton FP8 GEMM above it. Fixed in ROCm 7.2.
 _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
     (2560, 4096): 2048,
     (4096, 1024): 4096,
+    (4096, 2048): 2048,  # TP4 o_proj (TP8 shape was (4096, 1024))
+    (4608, 4096): 512,  # TP4 attn qkv/gate proj: CK NaN at M>=2048 on ROCm 7.0
 }
 
 
