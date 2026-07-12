@@ -284,7 +284,10 @@ def _per_token_group_quant_8bit_raw(
         if dtype == torch.int8:
             bit8_max = 127.0
         else:
-            bit8_max = 224.0
+            # fp8 range is device-dependent on ROCm: e4m3fnuz (max 224.0) on
+            # gfx94x vs e4m3fn (max 448.0) on gfx95x. Use the device-resolved
+            # module constant instead of hardcoding the gfx94x value.
+            bit8_max = fp8_max
         bit8_min = -bit8_max  # TODO incorrect for int8
     else:
         if dtype == torch.int8:
