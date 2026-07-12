@@ -78,14 +78,15 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
-/// long context — a ~1 M-token context tokenized as JSON fits under this —
-/// while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
+/// Per-route body-size cap on `/v1/chat/completions`. 100 MiB accommodates a
+/// long text context AND multimodal requests, whose base64-encoded image or
+/// audio payloads dwarf any text body — a handful of high-resolution images
+/// alone runs to several MiB — while still bounding the heap a hostile client
+/// can force the router to allocate before forwarding. The cap is wired in
 /// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
 /// layer; axum's `Bytes` extractor enforces it and returns 413
 /// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+pub const MAX_CHAT_BODY_BYTES: usize = 100 << 20;
 
 /// Minimal probe over the request body — we only need the `stream` field,
 /// the `model` field, and a client-supplied `rid` to decide between buffered
