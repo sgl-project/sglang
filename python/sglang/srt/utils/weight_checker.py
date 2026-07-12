@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, NamedTuple, Optional, Set
+from typing import Any, Callable, Dict, Iterable, NamedTuple, Optional, Set
 
 import torch
 import torch.distributed as dist
@@ -64,8 +64,9 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 
 
 class WeightChecker:
-    def __init__(self, model_runner):
-        self._model_runner = model_runner
+    def __init__(self, *, get_model: Callable[[], Any], ps: Any):
+        self._get_model = get_model
+        self._ps = ps
         self._snapshot_tensors = None
 
     def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
@@ -101,7 +102,7 @@ class WeightChecker:
     def _compare(self, allow_quant_error: bool = False):
         assert self._snapshot_tensors is not None
 
-        quantized_set = _build_quantized_set(self._model_runner.model)
+        quantized_set = _build_quantized_set(self._get_model())
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -121,7 +122,7 @@ class WeightChecker:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
-        quantized_set = _build_quantized_set(self._model_runner.model)
+        quantized_set = _build_quantized_set(self._get_model())
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -157,7 +158,7 @@ class WeightChecker:
         return info.model_dump()
 
     def _parallelism_info(self) -> ParallelismInfo:
-        ps = self._model_runner.ps
+        ps = self._ps
         return ParallelismInfo(
             tp_rank=ps.tp_rank,
             tp_size=ps.tp_size,
@@ -170,8 +171,9 @@ class WeightChecker:
         )
 
     def _model_state(self):
-        yield from self._model_runner.model.named_parameters()
-        yield from self._model_runner.model.named_buffers()
+        model = self._get_model()
+        yield from model.named_parameters()
+        yield from model.named_buffers()
 
 
 def _hash_tensor(t: torch.Tensor) -> str:

@@ -344,7 +344,7 @@ class ModelRunner:
             create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
         )
 
-        self._weight_checker = WeightChecker(model_runner=self)
+        self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
         if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()
