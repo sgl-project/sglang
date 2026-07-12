@@ -119,12 +119,8 @@ if TYPE_CHECKING:
 def ragged_verify_full_mode_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
-    try:
-        from sglang.srt.speculative.ragged_verify import (
-            ragged_verify_compact_enabled,
-        )
-    except ImportError:
-        return False
+    from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
+
     return ragged_verify_compact_enabled()
 
 
@@ -283,12 +279,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._ragged_graph_size = 0
         if self.ragged_verify_mode and (
-            self.enable_two_batch_overlap or model_runner.server_args.enable_lora
+            self.enable_two_batch_overlap
+            or model_runner.server_args.enable_lora
+            or self.disable_padding
         ):
             raise ValueError(
-                "Compact ragged verify does not support "
-                "two-batch-overlap or LoRA; disable SGLANG_RAGGED_VERIFY_MODE "
-                "or the conflicting feature."
+                "Compact ragged verify does not support two-batch-overlap, "
+                "LoRA, or disable-cuda-graph-padding (bs pads to the captured "
+                "tier); disable SGLANG_RAGGED_VERIFY_MODE or the conflicting "
+                "feature."
             )
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
@@ -457,8 +456,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
             return None
-        if self.model_runner.is_draft_worker:
-            return None
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
         from sglang.srt.speculative.ragged_verify import (
@@ -574,11 +571,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         is_dp_supported = (
             forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
         )
-        assert not self.disable_padding, (
-            "Compact ragged verify pads bs to the captured tier, which is "
-            "incompatible with disable_cuda_graph_padding; disable "
-            "SGLANG_RAGGED_VERIFY_MODE or enable cuda-graph padding."
-        )
 
         is_encoder_lens_supported = (
             torch.all(forward_batch.encoder_lens > 0)
@@ -599,15 +591,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             requested_capture_hidden_mode == CaptureHiddenMode.NULL
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
-        is_tbo_supported = (
-            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
-        )
 
         return (
             is_tokens_supported
             and is_dp_supported
             and is_encoder_lens_supported
-            and is_tbo_supported
             and capture_hidden_mode_matches
         )
 
@@ -1067,8 +1055,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if is_ragged and graph_size_key > self.raw_num_token:
-                self.buffers.input_ids[self.raw_num_token : graph_size_key].zero_()
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1141,8 +1127,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
-        if is_ragged and padded_num_tokens > raw_num_token:
-            self.buffers.input_ids[raw_num_token:padded_num_tokens].zero_()
+        # Padded tokens aren't read, so skip zeroing them. Ragged batches need
+        # no zeroing either: input_ids arrive from the planner already padded
+        # to the graph tier, with invalid slots zero-filled.
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -1205,10 +1192,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
+        # Publish a read-done event for the WAR barrier: a cuda-graph forward
+        # finishes its shared req_to_token / SWA reads at this pre-replay
+        # snapshot, so plain DECODE and block-draft TARGET_VERIFY qualify.
         publish_read_done = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
             and self.model_runner.spec_algorithm.is_dflash_family()
         )
+        # Exception: verify replays on backends whose breakable graphs use the
+        # captured forward metadata re-read req_to_token *during* replay, so
+        # the pre-replay snapshot would be too early -- record after replay.
         read_done_post_replay = (
             publish_read_done
             and forward_batch.forward_mode.is_target_verify()
