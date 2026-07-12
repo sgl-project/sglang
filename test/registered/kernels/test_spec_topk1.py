@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.test.test_utils import CustomTestCase
 
 

@@ -19,6 +19,7 @@ _TRITON_KERNELS = [
     ("multi_layer_eagle", "rotate_input_ids_triton"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
+    ("topk1", "draft_topk1_postprocess"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
