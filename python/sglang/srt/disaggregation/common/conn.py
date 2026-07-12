@@ -118,6 +118,11 @@ class CommonKVManager(BaseKVManager):
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
+        # Per-sender fan-out of a KV copy onto N decode destinations
+        # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
+        # MLA is resolved lazily at bootstrap (see resolve_kv_replica_factor);
+        # MHA never replicates, so it stays pinned at 1.
+        self._kv_replica_factor: Optional[int] = None if is_mla_backend else 1
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         # for p/d multi node infer
@@ -177,11 +182,6 @@ class CommonKVManager(BaseKVManager):
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
-            # Per-sender fan-out of a KV copy onto N decode destinations
-            # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
-            # MLA is resolved lazily at bootstrap (see resolve_kv_replica_factor);
-            # MHA never replicates, so it stays pinned at 1.
-            self._kv_replica_factor: Optional[int] = None if is_mla_backend else 1
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
