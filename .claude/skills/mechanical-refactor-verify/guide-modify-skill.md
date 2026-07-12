@@ -17,6 +17,7 @@
 | `mechanical_refactor_reproduction_utils.py` | **trusted engine**: the relocation primitives + the arbiter | highest — byte-faithfulness proven by tests |
 | `mechanical_refactor_proof_generator.py` | **convenience**: infers a recipe from a diff | lower — may report `RESIDUAL`/`UNSUPPORTED` without compromising trust, but still tested |
 | `mechanical_refactor_reproduction_cli.py` | **gatekeeper**: walks a chain, runs the proofs, reports | high — a false chain PASS certifies an unproven commit; classification, resolution, and PASS-criterion behavior proven by tests |
+| `mechanical_refactor.py` | **unified entry**: `split` / `construct` / `verify` dispatch to the two modules above | pure dispatch, no behavior of its own — but the dispatch is tested so a subcommand cannot silently drop an argument |
 | `guide-*.md`, `SKILL.md` | workflow + file map | kept in sync, never describe behavior the code lacks |
 
 ## 2. Cardinal rule — the spec leads, code follows
@@ -67,6 +68,8 @@
     - `tests/proof_generator/` — the inference layer (`test_infer_*`, `test_script_and_diff`).
     - `tests/reproduction_cli/` — the chain verifier (classification, proof discovery,
       chain walking, the report).
+    - `tests/unified_cli/` — the unified entry point (each subcommand's dispatch and
+      exit codes).
 - A new or changed **primitive** requires, in its `test_<primitive>.py`:
     - a **byte-exact** assertion on the resulting file (compare full bytes, not "contains");
     - at least one **adversarial** case where a regenerating implementation would differ

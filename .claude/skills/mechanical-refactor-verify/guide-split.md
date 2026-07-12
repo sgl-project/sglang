@@ -150,7 +150,7 @@ any destination scaffolding seeded above; nothing moved.
 - Source file: import the moved symbol; drop now-unused imports.
 - Call site: `TheClass.foo(args)` → `foo(args)` (args untouched).
 
-**Check:** `mechanical_refactor_proof_generator.py <commit>` reports `PASS`. Cross-check:
+**Check:** `mechanical_refactor.py split <commit>` reports `PASS`. Cross-check:
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
 marks the whole block as moved.
 
@@ -229,7 +229,7 @@ instance the caller passes).
 - Caller: `Source.foo(self.component, ...)` → `self.component.foo(...)` — the receiver
   moves out of the argument list (replayed by `lower_call_sites`).
 
-**Check:** `mechanical_refactor_proof_generator.py <commit>` reports `PASS`. The split
+**Check:** `mechanical_refactor.py split <commit>` reports `PASS`. The split
 paid off: prep left the body untouched, so the move is a clean cut/paste.
 
 ### 2.5 Case 3: extract to a new module — one move commit, no prep

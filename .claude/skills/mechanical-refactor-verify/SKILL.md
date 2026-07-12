@@ -16,6 +16,18 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 - Empty diff = the proof. Any residual = a bundled non-move change, surfaced for review.
 - A reshape must not ride along: split into optional **prepare** + certified **move** +
   optional **postpare** (`guide-split.md`).
+- One entry point, three commands — `scripts/mechanical_refactor.py`:
+
+  ```bash
+  # split: analyze one commit — inferred relocation script + PASS/RESIDUAL/UNSUPPORTED
+  python3 scripts/mechanical_refactor.py split <commit> [--repo-root DIR]
+  # construct: the chain's proof folder — one auditable script per matching commit
+  python3 scripts/mechanical_refactor.py construct <base>..<tip> \
+      [--match REGEX] --out DIR [--repo-root DIR]
+  # verify: run EVERY provable commit's proof (never a sample) + the full chain report
+  python3 scripts/mechanical_refactor.py verify --base <base> --branch <branch> \
+      --proof DIR [--repo-root DIR] [--report PATH] [--jobs N] [--skip-passed]
+  ```
 
 ## 2. What do you want to do?
 
@@ -41,6 +53,9 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 
 ## 3. Files
 
+- [`scripts/mechanical_refactor.py`](scripts/mechanical_refactor.py) — the **unified
+  entry point**: the `split` / `construct` / `verify` subcommands (§1), pure dispatch to
+  the three modules below.
 - [`guide-split.md`](guide-split.md) — split the PR into classified pieces (§1, the
   chain contract) and each piece into prepare + move + postpare (§2: case recipes, what
   stays mechanical, anti-patterns).
