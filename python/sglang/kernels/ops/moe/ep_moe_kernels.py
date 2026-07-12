@@ -9,6 +9,8 @@ from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
 logger = logging.getLogger(__name__)
 
+_M_CAP_LOG_COUNT = 0
+
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 
@@ -1558,6 +1560,17 @@ def moe_ep_deepgemm_preprocess(
         # (m_cap >= max(masked_m) by construction, and src2dst below is
         # built with the same stride).
         m_cap = (int(masked_m.max().item()) + 255) // 256 * 256
+        global _M_CAP_LOG_COUNT
+        if _M_CAP_LOG_COUNT < 8 and m_max > 8192:
+            _M_CAP_LOG_COUNT += 1
+            logger.info(
+                "[DG m-cap] tokens=%d m_max=%d m_cap=%d G=%d masked_m_top3=%s",
+                hidden_states.size(0),
+                m_max,
+                m_cap,
+                num_local_experts,
+                torch.topk(masked_m, min(3, num_local_experts)).values.tolist(),
+            )
         m_max = min(m_max, max(m_cap, 256))
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 

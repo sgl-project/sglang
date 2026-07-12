@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.distributed import get_tp_group
@@ -445,9 +448,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        try:
+            gateup_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+        except torch.OutOfMemoryError:
+            logger.error(
+                "[DG masked OOM] G=%d m=%d n=%d masked_m(sum=%d max=%d top5=%s) expected_m=%d",
+                num_groups,
+                m,
+                n,
+                int(masked_m.sum().item()),
+                int(masked_m.max().item()),
+                torch.topk(masked_m, min(5, num_groups)).values.tolist(),
+                expected_m,
+            )
+            raise
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
