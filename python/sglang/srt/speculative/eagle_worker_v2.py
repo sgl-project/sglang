@@ -91,9 +91,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens_func
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
