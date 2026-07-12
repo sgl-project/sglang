@@ -6,12 +6,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.linear import set_weight_attrs
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 
 from .awq_scheme import AWQMoESchemeBase
 

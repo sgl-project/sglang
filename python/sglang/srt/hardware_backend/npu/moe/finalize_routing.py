@@ -14,9 +14,7 @@ import torch
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.runtime_context import get_parallel
 
 
 class BaseFinalizeRouting(ABC):
@@ -96,6 +94,6 @@ class AllGatherFinalizeRoutingWrapper(BaseFinalizeRouting):
         out = self.inner._finalize_routing(
             hidden_states, topk_weights, expanded_row_idx, topk_ids
         )
-        if get_tensor_model_parallel_world_size() > 1:
+        if get_parallel().tp_size > 1:
             out = tensor_model_parallel_all_gather(out, dim=self.dim)
         return out
