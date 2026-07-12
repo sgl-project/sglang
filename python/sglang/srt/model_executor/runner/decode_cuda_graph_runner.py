@@ -92,6 +92,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -460,12 +461,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return not draft_is_deepseek_v4(server_args=model_runner.server_args)
 
-    def _ragged_verify_layout(self, forward_batch: ForwardBatch):
-        spec_info = forward_batch.spec_info
-        if spec_info is None:
-            return None
-        return spec_info.ragged_verify_layout
-
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return num_tokens // self.num_tokens_per_bs
@@ -498,7 +493,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         ragged_layout = (
-            self._ragged_verify_layout(forward_batch)
+            resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
             else None
         )
@@ -1045,7 +1040,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         ragged_layout = (
-            self._ragged_verify_layout(forward_batch)
+            resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
             else None
         )
