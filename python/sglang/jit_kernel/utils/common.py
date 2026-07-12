@@ -41,13 +41,11 @@ def cache_once(fn: F) -> F:
     return wrapper  # type: ignore
 
 
-# AMD/ROCm note:
 @cache_once
 def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
 
 
-# MThreads/MUSA note:
 @cache_once
 def is_musa_runtime() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None

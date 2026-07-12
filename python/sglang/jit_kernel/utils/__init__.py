@@ -1,15 +1,4 @@
-"""Public interface of sglang.jit_kernel.utils.
-
-The implementation lives in the submodules:
-- common: caching decorator, CI test gating, and runtime detection
-- arch: CUDA/ROCm architecture detection and default compile target flags
-- compile: load_jit, the build cache, and C++ template arguments
-- deps: header-only dependency registration (flashinfer, cutlass, mathdx, ...)
-
-Only the names below are public. Internal helpers (DEFAULT_* flag lists,
-ArchInfo, the dependency registry, ...) stay in their submodule; the rare
-internal consumer imports them from there directly.
-"""
+"""Public interface of sglang.jit_kernel.utils."""
 
 from sglang.jit_kernel.utils.arch import (
     get_jit_cuda_arch,

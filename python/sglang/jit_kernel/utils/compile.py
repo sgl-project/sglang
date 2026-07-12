@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
 import torch
 
-from sglang.jit_kernel.utils.arch import _get_default_target_flags, get_jit_cuda_arch
+from sglang.jit_kernel.utils.arch import get_default_target_flags, get_jit_cuda_arch
 from sglang.jit_kernel.utils.common import cache_once, is_hip_runtime
-from sglang.jit_kernel.utils.deps import _REGISTERED_DEPENDENCIES
+from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -72,8 +72,7 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
 
 @cache_once
 def _resolve_kernel_path() -> pathlib.Path:
-    # Resolve via the package spec instead of __file__ so the lookup is
-    # independent of where this function lives inside the package.
+    # Resolve via the package spec so the lookup is location-independent.
     spec = importlib.util.find_spec("sglang.jit_kernel")
     assert spec is not None and spec.origin is not None
     cur_dir = pathlib.Path(spec.origin).parent.resolve()
@@ -218,9 +217,9 @@ def load_jit(
     cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
 
     for dep in set(extra_dependencies or []):
-        if dep not in _REGISTERED_DEPENDENCIES:
+        if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
-        extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
+        extra_include_paths += REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
     if cpp_files or cuda_files:
@@ -262,7 +261,7 @@ def load_jit(
                 cpp_sources=cpp_sources,
                 cuda_sources=cuda_sources,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
@@ -275,7 +274,7 @@ def load_jit(
                 cpp_files=cpp_files,
                 cuda_files=cuda_files,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,

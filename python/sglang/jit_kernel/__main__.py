@@ -5,9 +5,9 @@ import os
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
 from sglang.jit_kernel.utils import get_jit_cuda_arch, override_jit_cuda_arch
-from sglang.jit_kernel.utils.arch import _get_default_target_flags
+from sglang.jit_kernel.utils.arch import get_default_target_flags
 from sglang.jit_kernel.utils.compile import DEFAULT_INCLUDE
-from sglang.jit_kernel.utils.deps import _REGISTERED_DEPENDENCIES
+from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
 
 
 def generate_clangd():
@@ -25,7 +25,7 @@ def generate_clangd():
         "--dep",
         nargs="*",
         default=[],
-        choices=_REGISTERED_DEPENDENCIES.keys(),
+        choices=REGISTERED_DEPENDENCIES.keys(),
         help="Extra dependency libraries to include.",
     )
     parser.add_argument(
@@ -39,9 +39,9 @@ def generate_clangd():
 
     dep_include_paths = []
     for dep in args.dependencies:
-        if dep not in _REGISTERED_DEPENDENCIES:
+        if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
-        dep_include_paths += _REGISTERED_DEPENDENCIES[dep]()
+        dep_include_paths += REGISTERED_DEPENDENCIES[dep]()
 
     include_paths = [
         *DEFAULT_INCLUDE,
@@ -67,7 +67,7 @@ def generate_clangd():
         f"--cuda-gpu-arch=sm_{major}{minor}",
         "-Wall",
         "-Wextra",
-        *_get_default_target_flags(),
+        *get_default_target_flags(),
         *[f"-isystem{path}" for path in include_paths],
     ]
     # NOTE: skip these flags because clangd don't recognize them

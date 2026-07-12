@@ -42,17 +42,13 @@ def _init_jit_cuda_arch_once():
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
-    # The JIT cache is per-machine and compiles for the exact GPU present, so
-    # prefer the arch-specific target (sm_XXa, stronger than the family-level
-    # sm_XXf): it unlocks arch-only instructions such as redux.sync.f32 on
-    # datacenter Blackwell at no portability cost. nvcc only defines the "a"
-    # variant for sm_90 and newer.
+    # JIT builds target the exact local GPU, so use the arch-specific "a"
+    # variant (sm_90+ only) to unlock arch-only instructions like redux.f32.
     suffix = "a" if major >= 9 else ""
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
-# NOTE: this might also be used in __main__.py for compile flags export
-def _get_default_target_flags() -> List[str]:
+def get_default_target_flags() -> List[str]:
     if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture

@@ -15,15 +15,14 @@ def _find_package_root(package: str) -> Optional[pathlib.Path]:
     return pathlib.Path(spec.origin).resolve().parent
 
 
-# NOTE: this might also be used in __main__.py for compile flags export
-_REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
+REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
 
 
 def register_dependency(name: str):
     def decorator(f: Callable[[], List[str]]) -> Callable[[], List[str]]:
-        if name in _REGISTERED_DEPENDENCIES:
+        if name in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {name} already registered")
-        _REGISTERED_DEPENDENCIES[name] = f
+        REGISTERED_DEPENDENCIES[name] = f
         return f
 
     return decorator
