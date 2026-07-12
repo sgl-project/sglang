@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, Callable, ContextManager, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -816,43 +815,6 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     return None
 
 
-def _select_top_k_tokens_no_hidden(
-    i: int,
-    topk_p: torch.Tensor,
-    topk_index: torch.Tensor,
-    scores: Optional[torch.Tensor],
-    topk: int,
-) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    if i == 0:
-        scores = topk_p
-        tree_info = (
-            topk_p.unsqueeze(1),
-            topk_index,
-            torch.arange(-1, topk, dtype=torch.long, device=topk_p.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),
-        )
-    else:
-        if scores is None:
-            raise ValueError("scores must be initialized before expanding scores")
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )
-        scores = topk_cs_p
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        tree_info = (
-            expand_scores,
-            topk_index,
-            topk_cs_index + (topk**2 * (i - 1) + topk),
-        )
-
-    return scores, tree_info
-
-
 def build_tree_verify_tokens(
     *,
     verified_id: torch.Tensor,
@@ -860,100 +822,43 @@ def build_tree_verify_tokens(
     topk_ids: torch.Tensor,
     topk: int,
     num_draft_tokens: int,
-    timing_ctx_factory: Optional[Callable[[str], ContextManager[Any]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build tree verify tokens for DFlash eagle-style tree verify (TARGET_VERIFY mode).
+    """Build the pruned draft tree for DFlash EAGLE-style tree verify.
 
-    This function constructs a pruned tree of draft tokens and returns:
-      - The pruned tokens (including the root verified_id)
-      - A full topk-tree parent list compatible with the EAGLE kernel
-      - A selected_index list that encodes the pruned tree inside the full tree
+    Runs the fused single-pass GPU kernel to expand + top-``topk`` the draft block,
+    then selects the top ``num_draft_tokens - 1`` nodes by score. Requires the fused
+    path: CUDA + power-of-2 ``topk`` in {4, 8, 16} (the kernel indexes ``topk**2``).
 
     Args:
-        verified_id: Current token per request, shape [bs]
-        topk_probs: Draft topk probabilities, shape [bs, num_steps, topk]
-        topk_ids: Draft topk token ids, shape [bs, num_steps, topk]
-        topk: Number of top candidates to select at each node
-        num_draft_tokens: Total number of tokens in the pruned tree (including root)
+        verified_id: Current token per request, [bs].
+        topk_probs / topk_ids: Draft top-k probs / ids, [bs, num_steps, topk].
+        num_draft_tokens: Tree node budget (including the root).
 
     Returns:
-        draft_tokens: Flattened pruned tokens, shape [bs * num_draft_tokens]
-        parent_list: Full topk-tree parent list, shape [bs, topk * (depth - 1) + 1]
-        selected_index: Selected indices encoding the pruned tree, shape [bs, num_draft_tokens - 1]
+        draft_tokens [bs * num_draft_tokens], parent_list [bs, topk*(depth-1)+1],
+        selected_index [bs, num_draft_tokens - 1] (all EAGLE-kernel layout).
     """
-    bs = topk_probs.shape[0]
-    num_steps = topk_probs.shape[1]
-    device = topk_probs.device
-
-    timer = timing_ctx_factory or (lambda _key: nullcontext())
-    use_fused_triton = topk in (4, 8, 16) and is_cuda() and topk_probs.is_cuda
-
-    if use_fused_triton:
-        from sglang.kernels.ops.speculative.dflash_tree_expand_topk import (
-            dflash_tree_verify_select_topk4_fused,
+    if not (is_cuda() and topk_probs.is_cuda and topk in (4, 8, 16)):
+        raise ValueError(
+            "DFLASH tree verify requires CUDA and --speculative-eagle-topk in "
+            f"{{4, 8, 16}} (fused tree kernel is power-of-2 only); got topk={topk}."
         )
+    from sglang.kernels.ops.speculative.dflash_tree_expand_topk import (
+        dflash_tree_verify_select_topk4_fused,
+    )
 
-        with timer("tree_verify_build_tokens_expand"):
-            pass
-        with timer("tree_verify_build_tokens_select_loop"):
-            score_list_cat, ss_token_list, parent_list = (
-                dflash_tree_verify_select_topk4_fused(topk_probs, topk_ids)
-            )
-    else:
-        score_list: list[torch.Tensor] = []
-        token_list: list[torch.Tensor] = []
-        parents_list: list[torch.Tensor] = []
-        scores = None
-
-        with timer("tree_verify_build_tokens_expand"):
-            expanded_topk_probs = topk_probs[:, 1:].repeat_interleave(topk, dim=0)
-            expanded_topk_ids = topk_ids[:, 1:].repeat_interleave(topk, dim=0)
-
-        with timer("tree_verify_build_tokens_select_loop"):
-            for i in range(num_steps):
-                if i == 0:
-                    step_topk_p = topk_probs[:, 0]
-                    step_topk_ids = topk_ids[:, 0]
-                else:
-                    step_topk_p = expanded_topk_probs[:, i - 1]
-                    step_topk_ids = expanded_topk_ids[:, i - 1]
-
-                scores, tree_info = _select_top_k_tokens_no_hidden(
-                    i,
-                    step_topk_p,
-                    step_topk_ids,
-                    scores,
-                    topk,
-                )
-
-                score_list.append(tree_info[0])
-                token_list.append(tree_info[1])
-                parents_list.append(tree_info[2])
-
-        with timer("tree_verify_build_tokens_pack_scores"):
-            score_list_cat = torch.cat(score_list, dim=1).flatten(1)
-        ss_token_list = torch.cat(token_list, dim=1)
-        with timer("tree_verify_build_tokens_parent_list"):
-            if len(parents_list) > 1:
-                parent_list = torch.cat(parents_list[:-1], dim=1)
-            else:
-                parent_list = torch.empty((bs, 0), dtype=torch.long, device=device)
+    score_list_cat, ss_token_list, parent_list = dflash_tree_verify_select_topk4_fused(
+        topk_probs, topk_ids
+    )
     max_candidates = score_list_cat.shape[1]
     if num_draft_tokens - 1 > max_candidates:
         raise ValueError(
             "num_draft_tokens exceeds available candidates: "
             f"requested={num_draft_tokens - 1}, available={max_candidates}."
         )
-
-    with timer("tree_verify_build_tokens_topk_sort"):
-        top_scores = fast_topk(score_list_cat, num_draft_tokens - 1, dim=-1)
-        top_scores_index = torch.sort(top_scores.indices).values
-
-    with timer("tree_verify_build_tokens_gather_tokens"):
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-        draft_tokens = torch.cat([verified_id[:, None], draft_tokens], dim=1).flatten()
-
-    if use_fused_triton:
-        with timer("tree_verify_build_tokens_parent_list"):
-            pass
+    top_scores_index = torch.sort(
+        fast_topk(score_list_cat, num_draft_tokens - 1, dim=-1).indices
+    ).values
+    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+    draft_tokens = torch.cat([verified_id[:, None], draft_tokens], dim=1).flatten()
     return draft_tokens, parent_list, top_scores_index

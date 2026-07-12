@@ -11,11 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Triton kernels for DFlash tree verify with topk == 4.
+"""Triton kernel for DFlash tree verify (power-of-2 topk in {4, 8, 16}).
 
-- ``dflash_expand_topk4``: one expand + top-4 (scores ⊗ step probs).
-- ``dflash_tree_verify_select_topk4_fused``: full ``num_steps`` recurrence in one kernel
-  (the Python step loop runs inside Triton to cut launch / sync overhead).
+``dflash_tree_verify_select_topk4_fused`` runs the full ``num_steps`` expand +
+top-``topk`` recurrence in one kernel (the Python step loop runs inside Triton to
+cut launch / sync overhead).
 """
 
 from __future__ import annotations
@@ -25,109 +25,6 @@ from typing import Tuple
 import torch
 import triton
 import triton.language as tl
-
-# Host Python uses ints; Triton requires constexpr globals as tl.constexpr(...).
-_DFLASH_EXPAND_TOPK = 4
-_DFLASH_EXPAND_TOPK_SQ = 16
-TOPK = tl.constexpr(4)
-TOPK_SQ = tl.constexpr(16)
-
-
-@triton.jit
-def _dflash_expand_topk4_kernel(
-    scores_ptr,
-    topk_p_ptr,
-    out_expand_ptr,
-    out_topv_ptr,
-    out_topi_ptr,
-    stride_scores_b,
-    stride_topk_p_r,
-    stride_topk_p_k,
-    stride_expand_b,
-    stride_topv_b,
-    stride_topi_b,
-    bs,
-):
-    """Grid x: batch index. Computes [bs, 4] x [bs*4, 4] -> expand [bs, 16], top-4 by value."""
-    b = tl.program_id(0)
-    if b >= bs:
-        return
-
-    offs = tl.arange(0, TOPK_SQ)
-    p = offs // TOPK
-    c = offs % TOPK
-
-    sc = tl.load(
-        scores_ptr + b * stride_scores_b + p,
-    ).to(tl.float32)
-    tp = tl.load(
-        topk_p_ptr
-        + (b * TOPK + p) * stride_topk_p_r
-        + c * stride_topk_p_k,
-    ).to(tl.float32)
-    expand_prod = sc * tp
-    tl.store(out_expand_ptr + b * stride_expand_b + offs, expand_prod)
-
-    vals = expand_prod
-    ids = offs.to(tl.int64)
-    remaining = offs == offs
-    neg_inf = -3.4e38
-    for r in tl.static_range(TOPK):
-        masked = tl.where(remaining, vals, neg_inf)
-        mx = tl.max(masked)
-        is_elig = remaining & (masked == mx)
-        pick = tl.min(tl.where(is_elig, offs, TOPK_SQ))
-        remaining = remaining & (offs != pick)
-        vk = tl.sum(tl.where(offs == pick, vals, 0.0))
-        ik = tl.sum(tl.where(offs == pick, ids, 0))
-        tl.store(out_topv_ptr + b * stride_topv_b + r, vk)
-        tl.store(out_topi_ptr + b * stride_topi_b + r, ik)
-
-
-def dflash_expand_topk4(
-    scores: torch.Tensor,
-    topk_p: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused expand + top-4 for DFlash tree step (topk must be 4).
-
-    Args:
-        scores: [bs, 4] draft path scores so far.
-        topk_p: [bs * 4, 4] step probabilities (repeat_interleave layout on batch).
-
-    Returns:
-        expand_scores: [bs, 4, 4] same as ``scores.unsqueeze(2) * topk_p.view(bs, 4, 4)``.
-        topk_cs_p: [bs, 4] largest four products (descending).
-        topk_cs_index: [bs, 4] int64 flat indices in [0, 15].
-    """
-    assert scores.dim() == 2 and scores.shape[1] == _DFLASH_EXPAND_TOPK
-    assert topk_p.shape == (scores.shape[0] * _DFLASH_EXPAND_TOPK, _DFLASH_EXPAND_TOPK)
-    bs = scores.shape[0]
-    device = scores.device
-
-    out_expand = torch.empty(
-        (bs, _DFLASH_EXPAND_TOPK_SQ), device=device, dtype=scores.dtype
-    )
-    out_topv = torch.empty((bs, _DFLASH_EXPAND_TOPK), device=device, dtype=torch.float32)
-    out_topi = torch.empty((bs, _DFLASH_EXPAND_TOPK), device=device, dtype=torch.int64)
-
-    _dflash_expand_topk4_kernel[(bs,)](
-        scores,
-        topk_p,
-        out_expand,
-        out_topv,
-        out_topi,
-        scores.stride(0),
-        topk_p.stride(0),
-        topk_p.stride(1),
-        out_expand.stride(0),
-        out_topv.stride(0),
-        out_topi.stride(0),
-        bs,
-        num_warps=1,
-    )
-
-    expand_scores = out_expand.view(bs, _DFLASH_EXPAND_TOPK, _DFLASH_EXPAND_TOPK)
-    return expand_scores, out_topv, out_topi
 
 
 @triton.jit
@@ -304,7 +201,3 @@ def dflash_tree_verify_select_topk4_fused(
 
     score_list_cat = out_scores.flatten(1, 2)
     return score_list_cat, out_tokens, out_parents
-
-
-def is_dflash_expand_topk4_available() -> bool:
-    return torch.cuda.is_available()
