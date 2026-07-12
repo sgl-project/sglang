@@ -1637,26 +1637,6 @@ class DeepseekV2AttentionMLA(
         self.skip_topk = None
         self.next_skip_topk = None
         if self.use_dsa:
-            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-                config=config,
-            )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1671,6 +1651,35 @@ class DeepseekV2AttentionMLA(
                 else:
                     self.skip_topk = dsa_layer_skips_topk(config, layer_id)
                     self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+            # skip_topk (shared) layers carry no indexer weights in the
+            # checkpoint and never run the indexer (see should_run_indexer),
+            # so skip building it to avoid holding uninitialized weights
+            # (mirrors DeepSeek-V4, where self.indexer is None on non-C4
+            # layers). The NextN layer keeps its indexer: it has checkpoint
+            # weights and runs them when no carried top-k is available.
+            if is_nextn or not self.skip_topk:
+                is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+                self.indexer = Indexer(
+                    hidden_size=hidden_size,
+                    index_n_heads=get_dsa_index_n_heads(config),
+                    index_head_dim=get_dsa_index_head_dim(config),
+                    rope_head_dim=qk_rope_head_dim,
+                    index_topk=get_dsa_index_topk(config),
+                    q_lora_rank=q_lora_rank,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    scale_fmt="ue8m0",
+                    block_size=128,
+                    rope_scaling=rope_scaling,
+                    is_neox_style=is_neox_style,
+                    prefix=add_prefix("indexer", prefix),
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    alt_stream=alt_stream,
+                    config=config,
+                )
+            else:
+                self.indexer = None
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,

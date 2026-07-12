@@ -49,14 +49,15 @@ def forward_mha_prepare_npu(
         if m.use_dsa:
             q_lora = m.q_a_layernorm(q)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
-            _ = m.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=m.layer_id,
-                return_indices=False,
-            )
+            if m.should_run_indexer():
+                _ = m.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=m.layer_id,
+                    return_indices=False,
+                )
 
         else:
             q = m.q_a_layernorm(q)
@@ -253,7 +254,7 @@ def forward_mla_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
         topk_indices = None
-        if q_lora is not None:
+        if q_lora is not None and m.should_run_indexer():
             topk_indices = m.indexer(
                 x=hidden_states,
                 q_lora=q_lora,
