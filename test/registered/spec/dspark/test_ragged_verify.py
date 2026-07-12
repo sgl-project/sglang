@@ -17,8 +17,8 @@ _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
 
 # The backend capability checks (supports_ragged_verify_graph) live in
-# test_dspark_gpu_ut.py: importing the backend modules pulls GPU-only
-# wheels, which fail to import on the CPU runners.
+# test_ragged_verify_backend_capability.py: importing the backend modules
+# pulls GPU-only wheels, which fail to import on the CPU runners.
 
 
 class TestResolveRaggedVerifyLayout(CustomTestCase):
