@@ -117,6 +117,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
@@ -133,9 +134,6 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
     resolve_sliding_window_size,
-)
-from sglang.srt.model_executor.model_runner_components.misc_utils import (
-    create_msprobe_debugger,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
@@ -427,7 +425,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_weight_exporter()
 
     def init_msprobe(self):
-        self.msprobe_debugger = create_msprobe_debugger(self.server_args)
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
