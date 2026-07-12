@@ -30,7 +30,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
 
 
