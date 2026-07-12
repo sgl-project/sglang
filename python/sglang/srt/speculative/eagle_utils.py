@@ -153,6 +153,13 @@ def default_tree_mask_mode() -> TreeMaskMode:
     return TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
 
 
+def resolve_tree_mask_mode(target_attn_backend) -> TreeMaskMode:
+    """The verify tree-mask layout is a property of the target attention
+    backend (e.g. trtllm_mha consumes the draft-only QLEN_ONLY layout for
+    tree verify); otherwise fall back to the platform default."""
+    return getattr(target_attn_backend, "tree_mask_mode", default_tree_mask_mode())
+
+
 def build_tree_kernel_efficient(
     bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],

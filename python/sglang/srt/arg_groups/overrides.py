@@ -893,8 +893,9 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     if not is_sm100_supported() or server_args.attention_backend is not None:
         return {}
     sm100_default_attn_backend = "triton"
-    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
-    # _get_default_attn_backend handles the eagle_topk check.
+    # trtllm_mha requires page_size > 1; topk > 1 (tree spec decoding) is
+    # supported but not yet default-selected. _get_default_attn_backend
+    # handles the eagle_topk check.
     # There is only one case where page_size=1 is required,
     # which is when radix cache is enabled and both extra_buffer
     # and spec decoding are disabled.

@@ -402,12 +402,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             server_args.speculative_num_draft_tokens,
         ) = _auto_choose_speculative_params(server_args, model_arch)
 
-    if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
-        if server_args.speculative_eagle_topk > 1:
-            raise ValueError(
-                "trtllm_mha backend only supports topk = 1 for speculative decoding."
-            )
-
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
@@ -466,10 +460,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
-    # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
-    # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
-    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
-    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
+    # topk > 1 + page_size > 1 needs the page-aligned per-branch draft layout
+    # (per-branch pages with prefix-tail dup). Only these backends implement it;
+    # flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton", "trtllm_mha")
     view = resolved_view(server_args)
     if (
         server_args.speculative_eagle_topk > 1

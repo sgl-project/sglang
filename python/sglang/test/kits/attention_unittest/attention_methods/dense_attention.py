@@ -78,6 +78,9 @@ class DenseAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     sliding_window_size: int | None = None
+    # Tree spec decoding: backends read this at construction time (e.g. the
+    # trtllm_mha verify path keys its tree-mask handling on topk > 1).
+    speculative_eagle_topk: int = 0
 
     @property
     def batch_size(self) -> int:
@@ -363,7 +366,7 @@ class MockModelRunner(ModelRunner):
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=0,
+            speculative_eagle_topk=case.speculative_eagle_topk,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             tp_size=1,
