@@ -62,11 +62,11 @@ class TestPDFlipCapacityStatus(unittest.TestCase):
     def test_reports_capacity_and_unfinished_requests_in_running_order(self):
         scheduler = make_scheduler(
             running=[
-                FakeReq("r0", 100),
+                FakeReq(17, "100"),
                 FakeReq("done", 175, finished=True),
                 FakeReq("r1", 250),
             ],
-            request_slots=5,
+            request_slots=99,
         )
 
         out = scheduler._pd_flip_capacity_status()
@@ -78,7 +78,7 @@ class TestPDFlipCapacityStatus(unittest.TestCase):
         self.assertEqual(
             out["running_requests"],
             [
-                {"rid": "r0", "kv_committed_len": 100},
+                {"rid": "17", "kv_committed_len": 100},
                 {"rid": "r1", "kv_committed_len": 250},
             ],
         )
