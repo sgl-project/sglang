@@ -4,16 +4,35 @@
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 import urllib.request
 import uuid
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 MODES = ("full", "partial", "zero")
 PATHS = ("recovery", "commit")
+
+
+def resolve_case_paths(output_root, decision_path, mode, repo_root=None):
+    repo = Path(repo_root or os.environ["SGLANG_REPO"]).resolve()
+    output = Path(output_root).resolve()
+    try:
+        relative = output.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError("--output-root must be inside SGLANG_REPO") from exc
+    host_case = output / decision_path / mode
+    container_case = (
+        PurePosixPath("/sgl-workspace/sglang")
+        / PurePosixPath(relative.as_posix())
+        / decision_path
+        / mode
+    )
+    return host_case, container_case
 
 
 def _router_request(url, api_key, timeout, payload=None):
@@ -102,14 +121,29 @@ def release_targets(placement):
 
 
 def restore_router_placement(placement):
+    errors = []
     for worker in placement["workers"]:
-        router_set_drain(
-            placement["router_url"],
-            placement["api_key"],
-            placement["timeout"],
-            worker["worker_id"],
-            bool(worker.get("draining")),
-        )
+        try:
+            router_set_drain(
+                placement["router_url"],
+                placement["api_key"],
+                placement["timeout"],
+                worker["worker_id"],
+                bool(worker.get("draining")),
+            )
+        except Exception as exc:
+            errors.append("%s: %s" % (worker["worker_id"], exc))
+    if errors:
+        raise RuntimeError("router drain restore failures: " + "; ".join(errors))
+
+
+def restore_router_placement_preserving(placement, original_error=None):
+    try:
+        restore_router_placement(placement)
+    except Exception as restore_error:
+        if original_error is None:
+            raise
+        original_error.add_note(str(restore_error))
 
 
 def validate_pressure_timeline(timeline, decision_path):
@@ -141,6 +175,7 @@ def run_shell(command, *, env, log_path=None):
             check=False,
         ).returncode
     finally:
+        original_error = sys.exc_info()[1]
         if output:
             output.close()
 
@@ -189,11 +224,25 @@ def wait_for_store(url, timeout, interval):
         try:
             with urllib.request.urlopen(url, timeout=min(timeout, 3.0)) as response:
                 if 200 <= response.status < 300:
-                    return
+                    payload = json.loads(response.read().decode("utf-8"))
+                    if isinstance(payload, dict):
+                        return payload
         except Exception as exc:
             last_error = exc
         time.sleep(interval)
     raise TimeoutError("dedicated store did not become ready: %r" % last_error)
+
+
+def validate_store_generation(proof, ready, seen_tokens, seen_generations):
+    required = ("token", "pid", "starttime", "generation")
+    if any(not proof.get(field) for field in required):
+        raise RuntimeError("store generation proof is incomplete")
+    if any(str(proof[field]) != str(ready.get(field)) for field in required[1:]):
+        raise RuntimeError("store ready identity does not match reset proof")
+    if proof["token"] in seen_tokens or proof["generation"] in seen_generations:
+        raise RuntimeError("store generation/token was reused across cases")
+    seen_tokens.add(proof["token"])
+    seen_generations.add(proof["generation"])
 
 
 def terminate(process):
@@ -205,6 +254,17 @@ def terminate(process):
             process.kill()
             process.wait(timeout=10)
     return process.returncode
+
+
+def validate_measurement_exit(return_code, matrix_sent_sigterm):
+    if return_code == 0:
+        return
+    expected_signal = -int(signal.SIGTERM)
+    if matrix_sent_sigterm and return_code == expected_signal:
+        return
+    if return_code == expected_signal:
+        raise RuntimeError("measurement exited from unexpected signal rc=%s" % return_code)
+    raise RuntimeError("measurement sidecar termination rc=%s" % return_code)
 
 
 def wait_for_target_active(journal_path, timeout, interval, processes):
@@ -224,7 +284,9 @@ def wait_for_target_active(journal_path, timeout, interval, processes):
 
 
 def run_case(args, mode, decision_path):
-    case_dir = Path(args.output_root) / decision_path / mode
+    case_dir, container_case_dir = resolve_case_paths(
+        args.output_root, decision_path, mode
+    )
     case_dir.mkdir(parents=True, exist_ok=True)
     ready = case_dir / "workload.ready.json"
     done = case_dir / "controller.done"
@@ -258,13 +320,18 @@ def run_case(args, mode, decision_path):
             "MODE": mode,
             "DECISION_PATH": decision_path,
             "OUTPUT_DIR": str(case_dir.resolve()),
+            "HOST_CASE_DIR": str(case_dir.resolve()),
+            "CONTAINER_CASE_DIR": str(container_case_dir),
             "READY_MARKER": str(ready.resolve()),
             "CONTROLLER_DONE_MARKER": str(done.resolve()),
             "PRESSURE_STOP_MARKER": str(pressure_stop.resolve()),
             "PRESSURE_STARTED_MARKER": str(pressure_started.resolve()),
             "PRESSURE_ENDED_MARKER": str(pressure_ended.resolve()),
             "MIGRATION_EVENTS": str(events.resolve()),
-            "PD_FLIP_SESSION_JOURNAL_PATH": str(journal.resolve()),
+            "PD_FLIP_ARTIFACT_DIR": str(container_case_dir),
+            "PD_FLIP_SESSION_JOURNAL_PATH": str(
+                container_case_dir / "pd_flip_session.json"
+            ),
             "STORE_GENERATION_TOKEN": generation_token,
             "STORE_GENERATION_FILE": str(generation_file.resolve()),
         }
@@ -272,12 +339,20 @@ def run_case(args, mode, decision_path):
     case_started = time.time()
     if run_shell(args.reset_store_cmd, env=env) != 0:
         raise RuntimeError("store reset command failed")
-    wait_for_store(args.store_ready_url, args.timeout_seconds, args.poll_interval_seconds)
+    ready_generation = wait_for_store(
+        args.store_ready_url, args.timeout_seconds, args.poll_interval_seconds
+    )
     if not generation_file.exists():
         raise RuntimeError("store reset did not write fresh generation proof")
     generation = json.loads(generation_file.read_text(encoding="utf-8"))
-    if generation.get("token") != generation_token or not generation.get("pid"):
+    if generation.get("token") != generation_token:
         raise RuntimeError("store generation proof is invalid")
+    validate_store_generation(
+        generation,
+        ready_generation,
+        args._seen_store_tokens,
+        args._seen_store_generations,
+    )
 
     measure_log_path = case_dir / "measurement.log"
     workload_log_path = case_dir / "workload.log"
@@ -329,6 +404,7 @@ def run_case(args, mode, decision_path):
     controller_log = None
     workload_rc = 1
     measurement_rc = None
+    measurement_sent_sigterm = False
     timeline = {}
     try:
         placement = prepare_router_placement(
@@ -421,9 +497,10 @@ def run_case(args, mode, decision_path):
             terminate(controller)
         if workload is not None:
             terminate(workload)
+        measurement_sent_sigterm = measurement.poll() is None
         measurement_rc = terminate(measurement)
         if placement is not None:
-            restore_router_placement(placement)
+            restore_router_placement_preserving(placement, original_error)
         if controller_log is not None:
             controller_log.close()
         workload_log.close()
@@ -433,10 +510,9 @@ def run_case(args, mode, decision_path):
             "case %s/%s workload failed: %s"
             % (decision_path, mode, log_tail(workload_log_path))
         )
-    if measurement_rc not in (0, -15, 1):
-        raise RuntimeError("measurement sidecar termination rc=%s" % measurement_rc)
     if not events.exists() or not events.stat().st_size or events.stat().st_mtime < case_started:
         raise RuntimeError("measurement sidecar did not produce fresh non-empty events")
+    validate_measurement_exit(measurement_rc, measurement_sent_sigterm)
     (case_dir / "orchestration_timeline.json").write_text(
         json.dumps(timeline, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -453,6 +529,8 @@ def run(args):
         raise ValueError("--reset-store-cmd must be non-empty")
     if not os.environ.get(args.admin_api_key_env):
         raise ValueError("admin key environment variable is empty")
+    args._seen_store_tokens = set()
+    args._seen_store_generations = set()
     for decision_path in PATHS:
         for mode in MODES:
             run_case(args, mode, decision_path)

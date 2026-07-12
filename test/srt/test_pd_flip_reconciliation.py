@@ -38,6 +38,8 @@ def load_scheduler_methods():
         "_pd_flip_migration_timing_debug",
         "_pd_flip_migration_index_debug",
         "_pd_flip_json_safe_timing",
+        "_pd_flip_can_rollover_session",
+        "_pd_flip_archive_rollover_session",
     }
     methods = [
         node
@@ -73,7 +75,7 @@ def load_scheduler_methods():
 
         @staticmethod
         def to_engine_type(_):
-            pytest.fail("matching/conflicting session must return before role checks")
+            return "decode"
 
     namespace = {
         "PDFlipMigrationReqOutput": Output,
@@ -376,6 +378,67 @@ def test_worker_conflicting_source_start_does_not_replace_session():
 
     assert not output.success
     assert worker.pd_flip_migration_session["session_id"] == "s"
+
+
+def test_worker_released_source_rolls_over_to_second_session():
+    worker = worker_with_session("source", "source_released")
+    worker.disaggregation_mode = SimpleNamespace(value="decode")
+    worker.running_batch = SimpleNamespace(reqs=[])
+    worker.waiting_queue = []
+    worker._pd_flip_select_source_batch = lambda *_args, **_kwargs: []
+    worker._pd_flip_start_source_entries = lambda *_args: ({}, "")
+
+    output = Scheduler.start_pd_flip_migration_source(
+        worker,
+        Req(session_id="s2", rids=[], target_url="http://target", include_waiting=False),
+    )
+
+    assert output.success
+    assert worker.pd_flip_migration_session["session_id"] == "s2"
+    assert worker.pd_flip_migration_session_archive[-1]["session_id"] == "s"
+    assert output.status["session_archive"][-1]["session_id"] == "s"
+
+
+def test_worker_active_target_rolls_over_without_releasing_active_request():
+    active_request = object()
+    worker = worker_with_session("target", "active")
+    worker.pd_flip_migration_session["target_entries"] = {
+        "r0": {
+            "phase": "active",
+            "held": False,
+            "request_adopted": True,
+            "final_owner": "target",
+        }
+    }
+    worker.disaggregation_mode = SimpleNamespace(value="decode")
+    worker.waiting_queue = [active_request]
+    worker._pd_flip_prepare_target_entries = lambda *_args: ({}, "")
+
+    output = Scheduler.prepare_pd_flip_migration_target(
+        worker,
+        Req(
+            session_id="s2",
+            source_url="http://source",
+            manifests=[],
+            adopt_on_success=False,
+            prepare_only=True,
+            adopt_on_commit=False,
+        ),
+    )
+
+    assert output.success
+    assert worker.pd_flip_migration_session["session_id"] == "s2"
+    assert worker.waiting_queue == [active_request]
+
+
+def test_worker_rollover_predicate_defaults_missing_entry_fields_to_unsafe():
+    source = worker_with_session("source", "source_released").pd_flip_migration_session
+    source["source_entries"] = {"r0": {}}
+    target = worker_with_session("target", "active").pd_flip_migration_session
+    target["target_entries"] = {"r0": {"phase": "active"}}
+
+    assert not Scheduler._pd_flip_can_rollover_session(source, "source")
+    assert not Scheduler._pd_flip_can_rollover_session(target, "target")
 
 
 def test_worker_repeated_target_prepare_returns_existing_session_without_allocating():

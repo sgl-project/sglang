@@ -430,12 +430,35 @@ def join_request_migration(
                 raise RuntimeError("ambiguous migration session for RID %s" % rid)
             session_id = next(iter(sessions), None)
         matches = candidates.get((session_id, rid), []) if session_id else []
-        if len(matches) > 1:
+        proof_fields = (
+            "p_tokens",
+            "h_tokens",
+            "c0_tokens",
+            "c1_tokens",
+            "stitch_mode",
+            "mooncake_bytes",
+            "mooncake_bytes_available",
+            "source_bytes",
+            "delta_bytes",
+            "source_queue",
+            "final_owner",
+            "output_boundary",
+            "rollback_reason",
+        )
+        signatures = {
+            tuple(measurement.get(field) for field in proof_fields)
+            for measurement in matches
+        }
+        if len(signatures) > 1:
             raise RuntimeError(
-                "competing target measurements for session/RID %s/%s"
+                "conflicting target proofs for session/RID %s/%s"
                 % (session_id, rid)
             )
-        measurement = matches[0] if matches else None
+        measurement = (
+            max(matches, key=lambda item: float(item.get("ts_mono") or 0))
+            if matches
+            else None
+        )
         row["migration_measurement_found"] = measurement is not None
         if measurement:
             for key, value in measurement.items():
@@ -551,16 +574,18 @@ def flatten_migration_request_samples(events: Sequence[JsonDict]) -> List[JsonDi
         if event.get("event_type") != "migration_status":
             continue
         status = event.get("status") or {}
-        for measurement in status.get("request_measurements") or []:
-            row = {
-                "ts_wall": event.get("ts_wall"),
-                "ts_mono": event.get("ts_mono"),
-                "node": event.get("node"),
-                "session_id": status.get("session_id"),
-            }
-            for field in request_fields:
-                row[field] = measurement.get(field)
-            rows.append(row)
+        sessions = [status, *(status.get("session_archive") or [])]
+        for session in sessions:
+            for measurement in session.get("request_measurements") or []:
+                row = {
+                    "ts_wall": event.get("ts_wall"),
+                    "ts_mono": event.get("ts_mono"),
+                    "node": event.get("node"),
+                    "session_id": session.get("session_id"),
+                }
+                for field in request_fields:
+                    row[field] = measurement.get(field)
+                rows.append(row)
     return rows
 
 

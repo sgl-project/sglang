@@ -1768,6 +1768,76 @@ class Scheduler(
         raise_for_duplicate_rid([str(req.rid) for req in selected])
         return selected
 
+    @staticmethod
+    def _pd_flip_can_rollover_session(
+        session: Dict[str, Any], next_role: str
+    ) -> bool:
+        if session.get("role") != next_role:
+            return False
+        if session.get("pending_reqs") != 0:
+            return False
+        if session.get("failed_reqs") != 0:
+            return False
+        if next_role == "source":
+            state = session.get("state")
+            if state not in {"source_released", "source_aborted"}:
+                return False
+            for entry in (session.get("source_entries") or {}).values():
+                if not entry.get("metadata_freed"):
+                    return False
+                if state == "source_released":
+                    if not entry.get("transferred") or entry.get("final_owner") != "target":
+                        return False
+                elif entry.get("final_owner") != "source":
+                    return False
+                delta = entry.get("delta")
+                if isinstance(delta, dict) and not delta.get("noop"):
+                    if not delta.get("transferred") or not delta.get("metadata_freed"):
+                        return False
+            return True
+        if next_role == "target":
+            state = session.get("state")
+            if state not in {"active", "target_aborted"}:
+                return False
+            if session.get("held_reqs") != 0:
+                return False
+            for entry in (session.get("target_entries") or {}).values():
+                if entry.get("held") is not False:
+                    return False
+                if state == "active":
+                    owned = entry.get("request_adopted") or entry.get(
+                        "request_released"
+                    ) or entry.get("drop_on_commit")
+                    if (
+                        entry.get("phase") != "active"
+                        or not owned
+                        or entry.get("final_owner") != "target"
+                    ):
+                        return False
+                elif (
+                    entry.get("phase") != "aborted"
+                    or not entry.get("request_released")
+                    or entry.get("final_owner") != "source"
+                ):
+                    return False
+            return True
+        return False
+
+    def _pd_flip_archive_rollover_session(self, session: Dict[str, Any]) -> None:
+        archive = list(getattr(self, "pd_flip_migration_session_archive", []))
+        archive.append(
+            {
+                "session_id": session.get("session_id"),
+                "role": session.get("role"),
+                "state": session.get("state"),
+                "timing_debug": self._pd_flip_migration_timing_debug(session),
+                "request_measurements": self._pd_flip_migration_request_measurements(
+                    session
+                ),
+            }
+        )
+        self.pd_flip_migration_session_archive = archive[-16:]
+
     def start_pd_flip_migration_source(
         self, recv_req: PDFlipMigrationSourceStartReq
     ) -> PDFlipMigrationReqOutput:
@@ -1778,16 +1848,21 @@ class Scheduler(
                 and str(recv_req.session_id) == str(existing.get("session_id"))
                 and existing.get("role") == "source"
             )
-            return PDFlipMigrationReqOutput(
-                success=matches,
-                message=(
-                    "source migration session already exists"
-                    if matches
-                    else "conflicting migration session already exists"
-                ),
-                status=self._pd_flip_migration_status_dict(),
-                manifests=list(existing.get("manifests", [])),
-            )
+            if matches:
+                return PDFlipMigrationReqOutput(
+                    success=True,
+                    message="source migration session already exists",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            if not self._pd_flip_can_rollover_session(existing, "source"):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="conflicting migration session already exists",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            self._pd_flip_archive_rollover_session(existing)
         timing_debug = {}
         role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
         if role != "decode":
@@ -1937,16 +2012,21 @@ class Scheduler(
                 and str(recv_req.session_id) == str(existing.get("session_id"))
                 and existing.get("role") == "target"
             )
-            return PDFlipMigrationReqOutput(
-                success=matches,
-                message=(
-                    "target migration session already exists"
-                    if matches
-                    else "conflicting migration session already exists"
-                ),
-                status=self._pd_flip_migration_status_dict(),
-                manifests=list(existing.get("manifests", [])),
-            )
+            if matches:
+                return PDFlipMigrationReqOutput(
+                    success=True,
+                    message="target migration session already exists",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            if not self._pd_flip_can_rollover_session(existing, "target"):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="conflicting migration session already exists",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            self._pd_flip_archive_rollover_session(existing)
         role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
         if role != "decode":
             return PDFlipMigrationReqOutput(
@@ -4550,6 +4630,9 @@ class Scheduler(
                 "delta_transferred_reqs": 0,
                 "delta_failed_reqs": 0,
                 "request_measurements": [],
+                "session_archive": list(
+                    getattr(self, "pd_flip_migration_session_archive", [])
+                ),
             }
         session_timing = session.get("timing_debug") or {}
         return {
@@ -4582,6 +4665,9 @@ class Scheduler(
             "timing_debug": self._pd_flip_migration_timing_debug(session),
             "request_measurements": self._pd_flip_migration_request_measurements(
                 session
+            ),
+            "session_archive": list(
+                getattr(self, "pd_flip_migration_session_archive", [])
             ),
         }
 

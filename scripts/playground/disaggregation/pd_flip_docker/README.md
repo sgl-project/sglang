@@ -35,9 +35,8 @@ requests and remains decode. A recovery run keeps the initial `1P3D` topology.
 The progressive controller migrates a capacity-safe first batch, observes only
 post-first-migration SLO samples for 10 seconds, then takes one of two paths:
 
-- **SLO recovery without role flip:** abort both sides of the session, keep the
-  first-batch requests on node3, resume node2 decode admission, and leave all
-  roles unchanged.
+- **SLO recovery without role flip:** keep the activated first batch on node3,
+  resume node2 decode admission, and leave all runtime/router roles unchanged.
 - **persistent prefill risk with successful D-to-P:** migrate the remaining
   atomic batch, activate it on node3, change node2's worker role and active
   event loop to prefill, then update the router and resume admission.
@@ -270,7 +269,8 @@ refuses an empty reset command, waits for the dedicated store health endpoint,
 starts measurement and workload in the background, waits for the workload RID
 ready marker, runs the controller, releases the workload with the done marker,
 and summarizes every case. The five command/endpoint variables may use `MODE`,
-`DECISION_PATH`, and `OUTPUT_DIR` from the driver's environment:
+`DECISION_PATH`, `HOST_CASE_DIR`, and `CONTAINER_CASE_DIR` from the driver;
+controller paths are container-visible while collection/summary paths are host-visible:
 
 ```bash
 STORE_HOST=cloud-099
@@ -283,13 +283,13 @@ PD_FLIP_MEASURE_COMMAND='python3 "$SGLANG_REPO/scripts/playground/disaggregation
   --node "name=node2,worker_url=$NODE2" --node "name=node3,worker_url=$NODE3" \
   --api-key-env ADMIN_API_KEY --router-api-key-env PD_FLIP_ROUTER_ADMIN_API_KEY \
   --duration-seconds 3600 --output-events "$MIGRATION_EVENTS"'
-PD_FLIP_CONTROLLER_COMMAND='PD_FLIP_ARTIFACT_DIR="$OUTPUT_DIR" \
-  PD_FLIP_SESSION_JOURNAL_PATH="$PD_FLIP_SESSION_JOURNAL_PATH" \
+PD_FLIP_CONTROLLER_COMMAND='PD_FLIP_ARTIFACT_DIR="$CONTAINER_CASE_DIR" \
+  PD_FLIP_SESSION_JOURNAL_PATH="$CONTAINER_CASE_DIR/pd_flip_session.json" \
   "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" monitor'
 PD_FLIP_SUMMARIZE_COMMAND='python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_migration_measure.py" summarize \
-  --events-jsonl "$MIGRATION_EVENTS" --controller-log "$OUTPUT_DIR/controller.log" \
-  --request-metrics-jsonl "$OUTPUT_DIR/request_metrics.jsonl" \
-  --errors-jsonl "$OUTPUT_DIR/errors.jsonl" --output-dir "$OUTPUT_DIR/summary"'
+  --events-jsonl "$MIGRATION_EVENTS" --controller-log "$HOST_CASE_DIR/controller.log" \
+  --request-metrics-jsonl "$HOST_CASE_DIR/request_metrics.jsonl" \
+  --errors-jsonl "$HOST_CASE_DIR/errors.jsonl" --output-dir "$HOST_CASE_DIR/summary"'
 export STORE_HOST REMOTE_ENV_FILE PD_FLIP_STORE_READY_URL PD_FLIP_RESET_STORE_CMD
 export PD_FLIP_MEASURE_COMMAND PD_FLIP_CONTROLLER_COMMAND PD_FLIP_SUMMARIZE_COMMAND
 
@@ -310,9 +310,10 @@ python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_progressive_matr
 For **SLO recovery without role flip**, accept only when prefill pressure first
 causes a first migration, post-first-migration samples recover, and:
 
-Accept recovery only if the journal ends `aborted`, node2 admission is resumed,
-the first batch remains owned/active on node3, no runtime/router role changes,
-and all four `role == active_event_loop_role` checks still match `1P3D`.
+Accept recovery only if the first-batch journal reaches `target_active`, node2
+remains decode with admission resumed, the first batch remains owned/active on
+node3, no runtime/router role changes occur, and all four
+`role == active_event_loop_role` checks still match `1P3D`.
 
 For **persistent prefill risk with successful D-to-P**, use
 `PATH_KIND=commit`; accept only when the post-first-migration samples remain

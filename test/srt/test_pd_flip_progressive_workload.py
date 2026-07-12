@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -234,6 +235,92 @@ def test_router_placement_rolls_back_partial_failure(monkeypatch):
     assert calls[-1] == ("w1", False)
 
 
+def test_router_restore_attempts_every_worker_and_aggregates(monkeypatch):
+    module = load_matrix_module()
+    calls = []
+    placement = {
+        "router_url": "http://router",
+        "api_key": "secret",
+        "timeout": 2,
+        "workers": [
+            {"worker_id": "w1", "draining": False},
+            {"worker_id": "w2", "draining": True},
+            {"worker_id": "w3", "draining": False},
+        ],
+    }
+
+    def fail(*args):
+        calls.append(args[-2])
+        if args[-2] in {"w1", "w2"}:
+            raise RuntimeError("restore " + args[-2])
+
+    monkeypatch.setattr(module, "router_set_drain", fail)
+    with pytest.raises(RuntimeError, match="w1.*w2"):
+        module.restore_router_placement(placement)
+    assert calls == ["w1", "w2", "w3"]
+
+
+def test_router_restore_preserves_original_exception(monkeypatch):
+    module = load_matrix_module()
+    placement = {
+        "router_url": "http://router",
+        "api_key": "secret",
+        "timeout": 2,
+        "workers": [{"worker_id": "w1", "draining": False}],
+    }
+    monkeypatch.setattr(
+        module,
+        "router_set_drain",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("restore failed")),
+    )
+    original = ValueError("controller failed")
+    module.restore_router_placement_preserving(placement, original)
+    assert "restore failed" in " ".join(original.__notes__)
+
+
+def test_host_container_case_mapping_and_fake_docker_journal(tmp_path):
+    module = load_matrix_module()
+    repo = tmp_path / "repo"
+    output = repo / "artifacts"
+    repo.mkdir()
+    host_case, container_case = module.resolve_case_paths(
+        output, "recovery", "full", repo
+    )
+    host_case.mkdir(parents=True)
+    container_journal = container_case / "pd_flip_session.json"
+    code = (
+        "import json, pathlib, sys; "
+        "container=pathlib.PurePosixPath(sys.argv[1]); "
+        "rel=container.relative_to('/sgl-workspace/sglang'); "
+        "host=pathlib.Path(sys.argv[2], *rel.parts); "
+        "host.write_text(json.dumps({'phase':'target_active'}))"
+    )
+    subprocess.run(
+        [sys.executable, "-c", code, str(container_journal), str(repo)], check=True
+    )
+    observed = module.wait_for_target_active(
+        host_case / "pd_flip_session.json", 1, 0.01, []
+    )
+    assert observed["phase"] == "target_active"
+    with pytest.raises(ValueError, match="inside SGLANG_REPO"):
+        module.resolve_case_paths(tmp_path / "outside", "recovery", "full", repo)
+
+
+def test_store_generation_requires_remote_identity_and_uniqueness():
+    module = load_matrix_module()
+    proof = {"token": "case-1", "pid": "12", "starttime": "34", "generation": "abc"}
+    ready = {"pid": "12", "starttime": "34", "generation": "abc"}
+    tokens, generations = set(), set()
+    module.validate_store_generation(proof, ready, tokens, generations)
+    assert tokens == {"case-1"} and generations == {"abc"}
+    with pytest.raises(RuntimeError, match="reused"):
+        module.validate_store_generation(proof, ready, tokens, generations)
+    with pytest.raises(RuntimeError, match="does not match"):
+        module.validate_store_generation(
+            dict(proof, token="case-2"), dict(ready, pid="99"), set(), set()
+        )
+
+
 def test_pressure_timeline_contracts():
     module = load_matrix_module()
     module.validate_pressure_timeline(
@@ -289,6 +376,16 @@ def test_controller_wait_fails_if_sidecar_exits_early(tmp_path):
         )
 
 
+def test_measurement_exit_accepts_only_natural_zero_or_matrix_sigterm():
+    module = load_matrix_module()
+    module.validate_measurement_exit(0, matrix_sent_sigterm=False)
+    module.validate_measurement_exit(-15, matrix_sent_sigterm=True)
+    with pytest.raises(RuntimeError, match="rc=1"):
+        module.validate_measurement_exit(1, matrix_sent_sigterm=True)
+    with pytest.raises(RuntimeError, match="unexpected signal"):
+        module.validate_measurement_exit(-15, matrix_sent_sigterm=False)
+
+
 def test_join_uses_session_and_rid_and_rejects_competing_targets():
     from scripts.playground.disaggregation.pd_flip_migration_measure import (
         join_request_migration,
@@ -299,13 +396,48 @@ def test_join_uses_session_and_rid_and_rejects_competing_targets():
     target = {"rid": "rid-1", "session_id": "s1", "final_owner": "target"}
     joined = join_request_migration([request], [source, target])
     assert joined[0]["worker_final_owner"] == "target"
-    with pytest.raises(RuntimeError, match="competing target"):
-        join_request_migration([request], [target, dict(target, node="duplicate")])
+    repeated = join_request_migration(
+        [request], [dict(target, ts_mono=1), dict(target, ts_mono=2)]
+    )
+    assert repeated[0]["worker_ts_mono"] == 2
+    with pytest.raises(RuntimeError, match="conflicting target"):
+        join_request_migration(
+            [request], [target, dict(target, stitch_mode="different")]
+        )
     with pytest.raises(RuntimeError, match="ambiguous migration session"):
         join_request_migration(
             [{"request_id": "rid-1"}],
             [target, dict(target, session_id="s2")],
         )
+
+
+def test_measurement_flattens_archived_session_proofs():
+    from scripts.playground.disaggregation.pd_flip_migration_measure import (
+        flatten_migration_request_samples,
+    )
+
+    rows = flatten_migration_request_samples(
+        [
+            {
+                "event_type": "migration_status",
+                "ts_mono": 2,
+                "node": "node2",
+                "status": {
+                    "session_id": "s2",
+                    "request_measurements": [],
+                    "session_archive": [
+                        {
+                            "session_id": "s1",
+                            "request_measurements": [
+                                {"rid": "r1", "final_owner": "target"}
+                            ],
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+    assert [(row["session_id"], row["rid"]) for row in rows] == [("s1", "r1")]
 
 
 def test_workload_proves_rid_migration_and_control_output(tmp_path, monkeypatch):

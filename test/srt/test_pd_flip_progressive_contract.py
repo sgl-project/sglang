@@ -315,6 +315,16 @@ def test_windows_helper_uses_1p3d_secrets_and_authenticated_status():
     assert "PD_FLIP_ROUTER_ADMIN_API_KEY" in source
 
 
+def test_store_reset_uses_private_pid_state_and_process_identity():
+    source = read(HARNESS / "reset_store_remote.sh")
+    assert "chmod 700" in source
+    assert "ps -o uid=" in source and "ps -o args=" in source
+    assert "mooncake_store_service" in source
+    assert "ss -ltnp" in source or "lsof -Pan" in source
+    assert "/proc/$store_pid/stat" in source
+    assert "secrets.token_hex" in source
+
+
 def test_windows_helper_round_trips_shell_metacharacter_secret(tmp_path):
     powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
     if not powershell:
