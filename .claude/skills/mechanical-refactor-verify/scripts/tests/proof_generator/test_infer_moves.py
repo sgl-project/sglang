@@ -388,9 +388,7 @@ def test_infer_recipe_move_leaving_a_forwarding_delegate(repo: Path) -> None:
         repo,
         **{
             "model.py": (
-                "class M:\n"
-                "    def work(self, x):\n"
-                "        return x + 1\n"
+                "class M:\n" "    def work(self, x):\n" "        return x + 1\n"
             ),
             "comp.py": "class C:\n    def keep(self):\n        return 1\n",
         },

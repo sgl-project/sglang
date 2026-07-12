@@ -123,7 +123,8 @@ def _enclosing_class_of_def(tree: ast.AST, name: str) -> str | None:
 
 def _delegate_stub_attr(tree: ast.AST, name: str) -> tuple[str, str] | None:
     """The component attribute a forwarding stub ``def name``: ``return self.<attr>.<m>(...)``
-    delegates through, with the forwarded method name -- None when no such stub exists."""
+    delegates through, with the forwarded method name -- None when no such stub exists.
+    """
     for node in ast.walk(tree):
         if not (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -669,11 +670,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             (p for p, f in files.items() if name in def_names(f["removed"])), None
         )
         dst = next(
-            (
-                p
-                for p, f in files.items()
-                if name in def_names(f["added"]) and p != src
-            ),
+            (p for p, f in files.items() if name in def_names(f["added"]) and p != src),
             None,
         )
         if src is None or dst is None or dst in new_files:
@@ -756,9 +753,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
     # another file. Detect it from the destination's added def + the source's after-state
     # delegate stub.
     for name in sorted(def_names(all_added) - def_names(all_removed)):
-        dst = next(
-            (p for p, f in files.items() if name in def_names(f["added"])), None
-        )
+        dst = next((p for p, f in files.items() if name in def_names(f["added"])), None)
         if dst is None or dst in new_files:
             continue
         src = None
