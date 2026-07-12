@@ -281,12 +281,15 @@ class ModelOptQuantConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                if isinstance(layer, LinearBase):
+                    return UnquantizedLinearMethod()
+                return None
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -604,11 +607,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
         nvfp4_config: ModelOptFp4Config,
+        w4a16_nvfp4_config: ModelOptFp4Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
+        self.w4a16_nvfp4_config = w4a16_nvfp4_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -672,7 +677,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
         group_size = None
         for layer_info in quantized_layers.values():
-            if layer_info.get("quant_algo", "").upper() == "NVFP4":
+            if "NVFP4" in layer_info.get("quant_algo", "").upper():
                 group_size = layer_info.get("group_size", 16)
                 break
         if group_size is None:
@@ -686,6 +691,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
         )
         nvfp4_config = ModelOptFp4Config(
+            quant_method="NVFP4",
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+            group_size=group_size,
+        )
+        w4a16_nvfp4_config = ModelOptFp4Config(
+            quant_method="W4A16_NVFP4",
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
             exclude_modules=[],
@@ -700,6 +714,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
             nvfp4_config=nvfp4_config,
+            w4a16_nvfp4_config=w4a16_nvfp4_config,
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
@@ -741,8 +756,22 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if isinstance(layer, ParallelLMHead):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return None
+            if quant_algo == "FP8":
+                return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "NVFP4":
+                return ModelOptFp4LinearMethod(self.nvfp4_config)
+            if quant_algo == "W4A16_NVFP4":
+                return ModelOptFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
+            return None
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
@@ -753,6 +782,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
+            if quant_algo == "W4A16_NVFP4":
+                return ModelOptFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
             return UnquantizedLinearMethod()
 
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
@@ -765,6 +796,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            if quant_algo == "W4A16_NVFP4":
+                return ModelOptNvFp4FusedMoEMethod(self.w4a16_nvfp4_config)
             return None
 
         return None
@@ -1123,6 +1156,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     def __init__(
         self,
+        quant_method: str = "NVFP4",
         is_checkpoint_nvfp4_serialized: bool = False,
         kv_cache_quant_algo: str = None,
         group_size: int = None,
@@ -1131,11 +1165,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         use_per_token_activation: Optional[bool] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+        self.quant_method = quant_method
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
-                "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
+                "Detected nvfp4 checkpoint (quant_algo=%s). Please note that the "
+                "format is experimental and subject to change.",
+                quant_method,
             )
         self.group_size = group_size
         self.use_per_token_activation = (
@@ -1258,9 +1294,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if quant_method not in ["FP8", "NVFP4"]:
+        if quant_method != "FP8" and "NVFP4" not in quant_method:
             raise ValueError(
-                "ModelOpt currently only supports: FP8, NVFP4"
+                "ModelOpt currently only supports: FP8, NVFP4, W4A16_NVFP4"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1277,11 +1313,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "specified in the quantization config"
             )
         return cls(
-            is_checkpoint_nvfp4_serialized,
-            kv_cache_quant_algo,
-            group_size,
-            exclude_modules,
-            config.get("packed_modules_mapping"),
+            quant_method=quant_method,
+            is_checkpoint_nvfp4_serialized=is_checkpoint_nvfp4_serialized,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=group_size,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -1668,6 +1705,79 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         return out.view(*output_shape)
 
 
+class ModelOptFp4W4A16LinearMethod(ModelOptFp4LinearMethod):
+    """Linear method for ModelOpt W4A16_NVFP4 checkpoints.
+
+    W4A16_NVFP4 uses packed NVFP4 weights with fp16/bf16 activations. Unlike
+    W4A4 NVFP4, these checkpoints do not carry activation input scales, so the
+    layer must bypass runtime activation quantization and run through Marlin.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if isinstance(layer, ParallelLMHead):
+            weight_scale_2 = PerTensorScaleParameter(
+                data=torch.empty((), dtype=torch.float32),
+                weight_loader=extra_weight_attrs.get("weight_loader"),
+            )
+            layer.register_parameter("weight_scale_2", weight_scale_2)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.quant_config = self.quant_config
+        if torch.unique(layer.weight_scale_2).numel() != 1:
+            logger.warning_once(
+                "In W4A16_NVFP4 linear, the global weight scale "
+                "(weight_scale_2) differs across fused parallel layers "
+                "(e.g. q/k/v_proj). This will likely reduce accuracy. "
+                "Consider a checkpoint with a shared global scale."
+            )
+
+        # Store original output size before Marlin repacks the weight layout.
+        layer.output_size_per_partition = layer.weight.shape[0]
+        copy_or_rebind_param(
+            layer, "weight_global_scale", layer.weight_scale_2.max().to(torch.float32)
+        )
+        prepare_nvfp4_layer_for_marlin(layer)
+        layer.weights_padding_cols = 0
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return apply_fp4_marlin_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            weight_global_scale=layer.weight_global_scale,
+            workspace=layer.workspace,
+            size_n=layer.output_size_per_partition,
+            size_k=layer.input_size_per_partition,
+            bias=bias,
+        )
+
+
 def _compute_gemm1_alphas(
     w13_weight_scale_2: torch.Tensor,
     w13_input_scale: torch.Tensor,
@@ -1703,8 +1813,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        if self.use_a16:
+            use_marlin_fallback = True
+        elif moe_runner_backend.is_auto() and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -2252,7 +2365,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
-        if moe_runner_backend.is_auto():
+        if self.use_a16:
+            if not moe_runner_backend.is_marlin():
+                logger.warning_once(
+                    "ModelOpt W4A16_NVFP4 MoE requires weight-only Marlin kernels; "
+                    "overriding MoE runner backend %s to marlin.",
+                    moe_runner_backend.value,
+                )
+            moe_runner_backend = MoeRunnerBackend.MARLIN
+        elif moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
             else:
@@ -2297,6 +2418,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_marlin():
             from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+            topk_output = dispatch_output.topk_output
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                dispatch_output = dispatch_output._replace(
+                    topk_output=topk_output.to_standard(
+                        layer_id=getattr(layer, "layer_id", None)
+                    )
+                )
 
             expert_map = None
             global_num_experts = -1

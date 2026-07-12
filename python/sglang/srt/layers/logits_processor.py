@@ -23,6 +23,7 @@ from torch import nn
 
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
+from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -33,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
@@ -886,6 +888,20 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
+        elif (
+            getattr(lm_head, "quant_method", None) is not None
+            and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
+            and not isinstance(lm_head.quant_method, PackWeightMethod)
+        ):
+            if self.use_fp32_lm_head:
+                with torch.cuda.amp.autocast(enabled=False):
+                    logits = lm_head.quant_method.apply(
+                        lm_head, hidden_states.to(torch.float32), embedding_bias
+                    )
+            else:
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, embedding_bias
+                )
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:
