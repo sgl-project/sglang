@@ -216,9 +216,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
@@ -328,6 +328,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_swa(self) -> bool:
         return False
+
+    def swa_reprefill_tail_tokens(self) -> int:
+        # Only the unified_kv compress-only HiCache layout needs to hold back a
+        # trailing sliding window for re-prefill; every other cache keeps SWA
+        # content-stable and overrides this where relevant.
+        return 0
 
     def supports_mamba(self) -> bool:
         return False

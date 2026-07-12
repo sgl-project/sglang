@@ -11,6 +11,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
+    if server_args.device != "cpu" or server_args.disable_overlap_schedule:
+        return
+
+    server_args.disable_overlap_schedule = True
+    logger.warning(
+        "Overlap schedule is not implemented for speculative decoding on CPU."
+    )
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -136,6 +146,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
+
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("DFLASH speculative decoding only supports CUDA device.")
 
     if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
@@ -332,6 +345,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
+    _disable_overlap_schedule_for_cpu(server_args)
+
     if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
             "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
@@ -424,12 +439,17 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--enable-deterministic-inference; the sampling kernel draws "
                 "coins from the global RNG and is not batch-invariant."
             )
+
         from sglang.srt.arg_groups.overrides import resolved_view
 
-        if resolved_view(server_args).enable_multi_layer_eagle:
-            raise NotImplementedError(
-                "--speculative-use-rejection-sampling is not supported with "
-                "multi-layer EAGLE (--enable-multi-layer-eagle)."
+        if (
+            resolved_view(server_args).enable_multi_layer_eagle
+            and server_args.speculative_eagle_topk != 1
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling with multi-layer EAGLE "
+                "(--enable-multi-layer-eagle) requires --speculative-eagle-topk 1; "
+                "rejection sampling is only implemented for the linear (topk=1) chain."
             )
         logger.info(
             "Rejection sampling is enabled for speculative decoding "
@@ -464,8 +484,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("Ngram speculative decoding only supports CUDA device.")
+    if server_args.device not in ("cuda", "cpu"):
+        raise ValueError(
+            "Ngram speculative decoding only supports CUDA or CPU devices."
+        )
+
+    _disable_overlap_schedule_for_cpu(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
