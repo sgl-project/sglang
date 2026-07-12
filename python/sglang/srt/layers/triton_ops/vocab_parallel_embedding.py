@@ -42,6 +42,7 @@ def _vocab_parallel_embedding_kernel(
     local_id = tl.where(
         org_vocab_mask, token - org_vocab_start_index, token - added_offset
     )
+    local_id = tl.where(valid, local_id, 0)
     vals = tl.load(
         weight_ptr + local_id * weight_stride0 + cols,
         mask=col_mask & valid,

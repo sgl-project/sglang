@@ -56,7 +56,7 @@ def test_vocab_parallel_embedding_no_added_vocab(dtype, input_dtype, hidden_dim)
     # them when the OOB probe is disabled, so they must produce zero rows.
     token_ids = [-100, -1, 0, 16, 17, 31, 32, 63, 2**30]
     if input_dtype == torch.int64:
-        token_ids += [2**62, -(2**62)]
+        token_ids += [torch.iinfo(torch.int64).min, torch.iinfo(torch.int64).max]
     input_ids = torch.tensor(token_ids, dtype=input_dtype, device="cuda")
     _run_case(input_ids, weight, cfg)
 
