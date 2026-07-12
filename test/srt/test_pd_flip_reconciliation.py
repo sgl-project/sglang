@@ -1,5 +1,6 @@
 import ast
 import json
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,9 @@ def load_scheduler_methods():
         "_pd_flip_migration_request_measurements",
         "_pd_flip_delta_manifest_signature",
         "_pd_flip_record_sender_metric",
+        "_pd_flip_mark_source_delta_applied",
+        "_pd_flip_apply_delta_manifest_to_target",
+        "_pd_flip_preserve_base_measurement",
         "_pd_flip_migration_timing_debug",
         "_pd_flip_migration_index_debug",
         "_pd_flip_json_safe_timing",
@@ -75,6 +79,7 @@ def load_scheduler_methods():
         "PDFlipMigrationReqOutput": Output,
         "DisaggregationMode": ForbiddenMode,
         "json": json,
+        "array": array,
         "time": __import__("time"),
     }
     exec(compile(extracted, str(scheduler_path), "exec"), namespace)
@@ -634,6 +639,87 @@ def test_worker_sender_without_metric_api_keeps_bytes_unknown():
 
     assert entry["source_transfer_bytes"] is None
     assert entry["source_transfer_duration_s"] == 0.5
+
+
+def test_source_delta_measurement_preserves_base_boundary_across_generations():
+    worker = Scheduler()
+    entry = {
+        "committed_len": 4,
+        "manifest": {
+            "rid": "r0",
+            "origin_input_ids": [1, 2, 3],
+            "kv_committed_len": 4,
+            "pd_flip_source_queue": "running",
+        },
+    }
+
+    worker._pd_flip_mark_source_delta_applied(
+        entry,
+        {
+            "rid": "r0",
+            "origin_input_ids": [1, 2, 3],
+            "kv_committed_len": 6,
+            "delta_from_len": 4,
+            "delta_noop": True,
+        },
+    )
+    worker._pd_flip_mark_source_delta_applied(
+        entry,
+        {
+            "rid": "r0",
+            "origin_input_ids": [1, 2, 3],
+            "kv_committed_len": 8,
+            "delta_from_len": 6,
+            "delta_noop": True,
+        },
+    )
+
+    row = worker._pd_flip_migration_request_measurements(
+        {"source_entries": {"r0": entry}}
+    )[0]
+    assert row["p_tokens"] == 3
+    assert row["c0_tokens"] == 4
+    assert row["c1_tokens"] == 8
+
+
+def test_target_delta_measurement_preserves_base_boundary_across_generations():
+    worker = Scheduler()
+    worker._pd_flip_note_timing = lambda *args, **kwargs: None
+    req = Req(
+        origin_input_ids=[1, 2, 3],
+        output_ids=[],
+        kv_committed_len=4,
+        kv_allocated_len=4,
+    )
+    entry = {
+        "decode_req": Req(req=req),
+        "committed_len": 4,
+        "manifest": {
+            "rid": "r0",
+            "origin_input_ids": [1, 2, 3],
+            "kv_committed_len": 4,
+            "pd_flip_source_queue": "running",
+        },
+    }
+
+    for from_len, to_len in [(4, 6), (6, 8)]:
+        worker._pd_flip_apply_delta_manifest_to_target(
+            entry,
+            {
+                "rid": "r0",
+                "origin_input_ids": [1, 2, 3],
+                "output_ids": list(range(to_len - 3 + 1)),
+                "kv_committed_len": to_len,
+                "delta_from_len": from_len,
+            },
+        )
+
+    row = worker._pd_flip_migration_request_measurements(
+        {"target_entries": {"r0": entry}}
+    )[0]
+    assert row["p_tokens"] == 3
+    assert row["c0_tokens"] == 4
+    assert row["c1_tokens"] == 8
 
 
 def test_controller_progressive_observability_uses_raw_policy_and_slo_counts(tmp_path):

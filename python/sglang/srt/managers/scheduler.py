@@ -2957,6 +2957,7 @@ class Scheduler(
     def _pd_flip_mark_source_delta_applied(
         self, entry: Dict[str, Any], manifest: Dict[str, Any]
     ) -> None:
+        self._pd_flip_preserve_base_measurement(entry)
         entry["committed_len"] = int(
             manifest.get("kv_committed_len") or entry.get("committed_len") or 0
         )
@@ -2968,6 +2969,23 @@ class Scheduler(
             "noop": True,
             "drop_target": bool(manifest.get("pd_flip_drop_target")),
         }
+
+    @staticmethod
+    def _pd_flip_preserve_base_measurement(entry: Dict[str, Any]) -> None:
+        if "base_manifest" in entry and "base_committed_len" in entry:
+            return
+        manifest = entry.get("manifest") or {}
+        if "base_manifest" not in entry:
+            entry["base_manifest"] = {
+                "origin_input_ids": list(manifest.get("origin_input_ids") or []),
+                "kv_committed_len": manifest.get("kv_committed_len"),
+                "pd_flip_source_queue": manifest.get("pd_flip_source_queue"),
+            }
+        if "base_committed_len" not in entry:
+            committed_len = manifest.get("kv_committed_len")
+            if committed_len is None:
+                committed_len = entry.get("committed_len")
+            entry["base_committed_len"] = int(committed_len or 0)
 
     def _pd_flip_start_source_entries(
         self, running_reqs: List[Req], manifests: List[Dict[str, Any]]
@@ -3552,6 +3570,7 @@ class Scheduler(
                 transferred.add(rid)
                 self._pd_flip_note_timing(entry, "delta_transfer_completed")
                 self._pd_flip_record_sender_metric(entry, sender, "delta")
+                self._pd_flip_preserve_base_measurement(entry)
                 entry["committed_len"] = int(delta["to_len"])
                 entry["manifest"] = delta.get("manifest") or entry.get("manifest")
                 self._pd_flip_note_timing(entry, "source_delta_transferred")
@@ -3798,6 +3817,7 @@ class Scheduler(
     def _pd_flip_apply_delta_manifest_to_target(
         self, entry: Dict[str, Any], manifest: Dict[str, Any]
     ) -> None:
+        self._pd_flip_preserve_base_measurement(entry)
         decode_req = entry.get("decode_req")
         req = getattr(decode_req, "req", None)
         if req is None:
@@ -4574,15 +4594,18 @@ class Scheduler(
         rows = []
         for rid, entry in entries.items():
             manifest = entry.get("manifest") or {}
+            base_manifest = entry.get("base_manifest") or manifest
             timing = entry.get("timing_debug") or {}
-            c0 = manifest.get("kv_committed_len")
+            c0 = entry.get("base_committed_len")
+            if c0 is None:
+                c0 = base_manifest.get("kv_committed_len")
             c1 = entry.get("committed_len")
             if c1 is None:
                 c1 = entry.get("target_committed_len", c0)
             rows.append(
                 {
                     "rid": str(rid),
-                    "p_tokens": len(manifest.get("origin_input_ids") or []),
+                    "p_tokens": len(base_manifest.get("origin_input_ids") or []),
                     "h_tokens": entry.get("mooncake_hit_len"),
                     "c0_tokens": int(c0 or 0),
                     "c1_tokens": int(c1 or 0),
@@ -4610,7 +4633,7 @@ class Scheduler(
                     or session_timing.get("commit_received_mono"),
                     "activate_at_mono": timing.get("target_adopted_mono"),
                     "source_queue": entry.get("source_queue")
-                    or manifest.get("pd_flip_source_queue"),
+                    or base_manifest.get("pd_flip_source_queue"),
                     "final_owner": entry.get("final_owner"),
                     "output_boundary": manifest.get("last_emitted_output_seq"),
                     "rollback_reason": entry.get("rollback_reason"),
