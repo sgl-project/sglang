@@ -135,20 +135,20 @@ Start workers in this exact order, one command on each host:
 
 ```bash
 # node0
-ENV_FILE=$PWD/env.local ./run_worker.sh prefill 0.0.0.0 |& tee node0-worker.log
+ENV_FILE=$PWD/env.local "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh" prefill 0.0.0.0 |& tee node0-worker.log
 # node1
-ENV_FILE=$PWD/env.local ./run_worker.sh decode 0.0.0.0 |& tee node1-worker.log
+ENV_FILE=$PWD/env.local "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh" decode 0.0.0.0 |& tee node1-worker.log
 # node2 (D-to-P source)
-ENV_FILE=$PWD/env.local ./run_worker.sh decode 0.0.0.0 |& tee node2-worker.log
+ENV_FILE=$PWD/env.local "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh" decode 0.0.0.0 |& tee node2-worker.log
 # node3 (migration target)
-ENV_FILE=$PWD/env.local ./run_worker.sh decode 0.0.0.0 |& tee node3-worker.log
+ENV_FILE=$PWD/env.local "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh" decode 0.0.0.0 |& tee node3-worker.log
 ```
 
 Then start the router and controller-side monitor:
 
 ```bash
-ENV_FILE=$PWD/env.local ./run_router.sh |& tee router.log
-ENV_FILE=$PWD/env.local ./run_controller.sh metrics | tee controller-metrics.json
+ENV_FILE=$PWD/env.local "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_router.sh" |& tee router.log
+ENV_FILE=$PWD/env.local "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" metrics | tee controller-metrics.json
 ```
 
 Use the admin credential on every worker control/status call:
@@ -178,7 +178,7 @@ for item in "$NODE0 prefill" "$NODE1 decode" "$NODE2 decode" "$NODE3 decode"; do
     jq -e --arg role "$2" 'all((if type == "array" then .[] else . end);
       .status.role == $role and .status.active_event_loop_role == $role)'
 done
-DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh dry-run |
+DIRECTION=d_to_p SOURCE_NAME=node2 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" dry-run |
   tee "${SGLANG_REPO}/pd-flip-artifacts/dry-run.json"
 ```
 
@@ -194,6 +194,7 @@ TTFT, per-token latency, complete token/text output, and output sequence. Start
 the measurement sidecar before the controller:
 
 ```bash
+cd "$SGLANG_REPO"
 PATH_KIND=${PATH_KIND:-recovery} # recovery or commit
 MODE=${MODE:-full}               # full, partial, or zero
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${PATH_KIND}"
@@ -234,14 +235,19 @@ with open(os.environ["EVENTS"], "w", encoding="utf-8") as output:
         time.sleep(max(0, 0.25 - (time.monotonic() - started)))
 PY
 MEASURE_PID=$!
-python3 scripts/playground/disaggregation/pd_flip_progressive_workload.py \
+READY_MARKER="$HOST_ARTIFACT_DIR/workload.ready.json"
+CONTROLLER_DONE_MARKER="$HOST_ARTIFACT_DIR/controller.done"
+python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_progressive_workload.py" \
   --base-url "http://${ROUTER_HOST}:${ROUTER_PORT}" \
-  --api-key "$ADMIN_API_KEY" --model "$MODEL_ID" \
+  --source-url "$NODE2" --target-url "$NODE3" \
+  --admin-api-key-env ADMIN_API_KEY --model "$MODEL_ID" \
+  --ready-marker "$READY_MARKER" \
+  --controller-done-marker "$CONTROLLER_DONE_MARKER" \
   --mode "$MODE" --decision-path "$PATH_KIND" \
   --output-dir "$HOST_ARTIFACT_DIR" \
   --ttft-slo-seconds "$TTFT_SLO_SECONDS" --tpot-slo-seconds "$TPOT_SLO_SECONDS" &
 WORKLOAD_PID=$!
-sleep 1
+until test -s "$READY_MARKER"; do sleep 0.1; done
 ```
 
 The producer's `recovery` profile stops short-request pressure early; its
@@ -250,23 +256,33 @@ inputs, not proof of the decision. Run the controller and retain stderr/stdout:
 
 ```bash
 PD_FLIP_ARTIFACT_DIR="$CONTAINER_ARTIFACT_DIR" \
-PD_FLIP_MONITOR_ITERATIONS=120 ./run_controller.sh monitor |& \
+PD_FLIP_MONITOR_ITERATIONS=120 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" monitor |& \
   tee "$HOST_ARTIFACT_DIR/controller-monitor.log"
 CONTROLLER_EXIT=${PIPESTATUS[0]}
+touch "$CONTROLLER_DONE_MARKER"
 wait "$WORKLOAD_PID"; WORKLOAD_EXIT=$?
 test "$CONTROLLER_EXIT" -eq 0
 test "$WORKLOAD_EXIT" -eq 0
 ```
 
-Execute all six input/path combinations in fresh stores/namespaces by setting
-the two variables before repeating the complete block above:
+Execute all six input/path combinations with the checked-in matrix driver. It
+refuses an empty reset command, waits for the dedicated store health endpoint,
+starts measurement and workload in the background, waits for the workload RID
+ready marker, runs the controller, releases the workload with the done marker,
+and summarizes every case. The three command arguments may use `MODE`,
+`DECISION_PATH`, and `OUTPUT_DIR` from the driver's environment:
 
 ```bash
-for PATH_KIND in recovery commit; do
-  for MODE in full partial zero; do
-    printf 'run fresh case: PATH_KIND=%s MODE=%s\n' "$PATH_KIND" "$MODE"
-  done
-done
+python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_progressive_matrix.py" \
+  --base-url "http://${ROUTER_HOST}:${ROUTER_PORT}" \
+  --source-url "$NODE2" --target-url "$NODE3" --model "$MODEL_ID" \
+  --admin-api-key-env ADMIN_API_KEY \
+  --output-root "$SGLANG_REPO/pd-flip-artifacts/progressive-matrix" \
+  --reset-store-cmd "$PD_FLIP_RESET_STORE_CMD" \
+  --store-ready-url "$PD_FLIP_STORE_READY_URL" \
+  --measure-command "$PD_FLIP_MEASURE_COMMAND" \
+  --controller-command "$PD_FLIP_CONTROLLER_COMMAND" \
+  --summarize-command "$PD_FLIP_SUMMARIZE_COMMAND"
 ```
 
 For **SLO recovery without role flip**, accept only when prefill pressure first
@@ -290,7 +306,7 @@ for item in "$NODE0 prefill" "$NODE1 decode" "$NODE2 prefill" "$NODE3 decode"; d
     jq -e --arg role "$2" 'all((if type == "array" then .[] else . end);
       .status.role == $role and .status.active_event_loop_role == $role)'
 done
-./run_controller.sh metrics | jq -e \
+"$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/run_controller.sh" metrics | jq -e \
   '[.[] | {name, worker_role, router_role}] | length == 4'
 ```
 
@@ -357,7 +373,7 @@ For a controller interruption, run durable journal reconciliation from the
 repo root. The command calls `reconcile_session` and uses the archived journal:
 
 ```bash
-set -a; source scripts/playground/disaggregation/pd_flip_docker/env.local; set +a
+set -a; source "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_docker/env.local"; set +a
 SESSION_ID="$SESSION_ID" JOURNAL="$HOST_ARTIFACT_DIR/pd_flip_session.json" python3 - <<'PY'
 import json, os
 from scripts.playground.disaggregation.pd_flip_controller import (
@@ -384,7 +400,7 @@ Stop the sidecar and summarize only after traffic and final consistency checks:
 
 ```bash
 kill "$MEASURE_PID"; wait "$MEASURE_PID" || true
-python3 scripts/playground/disaggregation/pd_flip_migration_measure.py summarize \
+python3 "$SGLANG_REPO/scripts/playground/disaggregation/pd_flip_migration_measure.py" summarize \
   --events-jsonl "$HOST_ARTIFACT_DIR/migration_events.jsonl" \
   --controller-log "$HOST_ARTIFACT_DIR/controller-monitor.log" \
   --request-metrics-jsonl "$HOST_ARTIFACT_DIR/request_metrics.jsonl" \

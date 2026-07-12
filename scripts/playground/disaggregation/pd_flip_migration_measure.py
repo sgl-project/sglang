@@ -394,6 +394,31 @@ def label_request_impact(metrics: Sequence[JsonDict], timeline: Sequence[JsonDic
     return rows
 
 
+def join_request_migration(
+    request_rows: Sequence[JsonDict], migration_rows: Sequence[JsonDict]
+) -> List[JsonDict]:
+    """Join the request ledger to the latest worker proof for the same RID."""
+    latest = {}
+    for migration in migration_rows:
+        rid = migration.get("rid")
+        if rid:
+            previous = latest.get(rid)
+            if previous is None or float(migration.get("ts_mono") or 0) >= float(
+                previous.get("ts_mono") or 0
+            ):
+                latest[rid] = migration
+    joined = []
+    for request in request_rows:
+        row = dict(request)
+        measurement = latest.get(request.get("request_id"))
+        row["migration_measurement_found"] = measurement is not None
+        if measurement:
+            for key, value in measurement.items():
+                row["worker_" + key] = value
+        joined.append(row)
+    return joined
+
+
 def first_stage_time(
     timeline: Sequence[JsonDict], stages: Sequence[str], after: Optional[float] = None
 ) -> Optional[float]:
@@ -662,6 +687,9 @@ def write_outputs(
     state_trace = controller.get("state_trace") if isinstance(controller.get("state_trace"), list) else []
     request_metrics = load_jsonl(request_metrics_path) if request_metrics_path else []
     request_impact = label_request_impact(request_metrics, timeline)
+    request_migration_join = join_request_migration(
+        request_impact, migration_request_samples
+    )
     error_rows = load_jsonl(errors_path) if errors_path else []
 
     write_jsonl(output_dir / "migration_timeline.jsonl", timeline)
@@ -682,6 +710,7 @@ def write_outputs(
     write_csv(output_dir / "controller_actions.csv", controller_actions, controller_action_fields())
     write_csv(output_dir / "controller_state_trace.csv", state_trace, controller_state_fields())
     write_csv(output_dir / "request_impact_by_stage.csv", request_impact, request_impact_fields())
+    write_jsonl(output_dir / "request_migration_join.jsonl", request_migration_join)
 
     summary = {
         "events_path": str(events_path),
@@ -694,6 +723,9 @@ def write_outputs(
         "controller_message": controller.get("message"),
         "controller_success": controller.get("success"),
         "request_count": len(request_metrics),
+        "request_migration_join_count": sum(
+            1 for row in request_migration_join if row["migration_measurement_found"]
+        ),
         "request_error_count": len(error_rows),
     }
     with (output_dir / "migration_link_summary.json").open("w", encoding="utf-8") as f:
@@ -731,6 +763,7 @@ Collected raw files:
 - `controller_actions.csv`: controller HTTP actions parsed from the monitor log.
 - `controller_state_trace.csv`: controller high-level state trace.
 - `request_impact_by_stage.csv`: request metrics labeled as before, overlaps, during, or after migration.
+- `request_migration_join.jsonl`: request/SLO rows joined to worker measurements by request ID/RID.
 
 Interpretation:
 - A successful chain should show `router_source_drained`, `source_admission_paused`, `source_migration_started`, `target_migration_prepared`, `kv_transfer_first_progress`, `kv_transfer_complete`, `source_role_committed`, and `cleanup_router_undrain`.

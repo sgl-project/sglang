@@ -1,7 +1,9 @@
 import re
+import shutil
 import os
 import shlex
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -295,10 +297,52 @@ def test_windows_helper_uses_1p3d_secrets_and_authenticated_status():
     source = read(WINDOWS_HELPER)
     assert '@{ Name = "node1"; Host = "cloud-100"; Role = "decode"' in source
     assert "[string]$AdminApiKey" in source
-    assert '"ADMIN_API_KEY=$AdminApiKey"' in source
+    assert '"ADMIN_API_KEY=$(Quote-ShValue $AdminApiKey)"' in source
+    assert '"PD_FLIP_ROUTER_ADMIN_API_KEY=$(Quote-ShValue $AdminApiKey)"' in source
     assert '"MOONCAKE_GLOBAL_SEGMENT_SIZE=0"' in source
     assert "Authorization: Bearer" in source
     assert "PD_FLIP_ROUTER_ADMIN_API_KEY" in source
+
+
+def test_windows_helper_round_trips_shell_metacharacter_secret(tmp_path):
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if not powershell:
+        return
+    secret = "p@$$&'quoted"
+    env_file = tmp_path / "windows.env"
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(WINDOWS_HELPER),
+            "-Action",
+            "write-env",
+            "-AdminApiKey",
+            secret,
+            "-EnvFile",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    sourced = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -a; source "$1"; printf "%s\\n%s" "$ADMIN_API_KEY" '
+            '"$PD_FLIP_ROUTER_ADMIN_API_KEY"',
+            "bash",
+            bash_path(env_file),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert sourced.returncode == 0, sourced.stderr
+    assert sourced.stdout.splitlines() == [secret, secret]
 
 
 def test_readme_has_clean_shell_setup_tracked_workload_and_paired_summary(tmp_path):
@@ -329,9 +373,26 @@ def test_readme_has_clean_shell_setup_tracked_workload_and_paired_summary(tmp_pa
     executed = subprocess.run(command, env=env, text=True, capture_output=True)
     assert executed.returncode == 0, executed.stderr
     assert "pd_flip_progressive_workload.py" in runbook
-    assert "for MODE in full partial zero" in runbook
+    assert "pd_flip_progressive_matrix.py" in runbook
+    matrix_source = read(
+        ROOT / "scripts/playground/disaggregation/pd_flip_progressive_matrix.py"
+    )
+    assert 'MODES = ("full", "partial", "zero")' in matrix_source
+    assert 'PATHS = ("recovery", "commit")' in matrix_source
     assert "--decision-path \"$PATH_KIND\"" in runbook
     assert "--controller-log" in runbook
+    for tool in (
+        ROOT / "scripts/playground/disaggregation/pd_flip_progressive_workload.py",
+        ROOT / "scripts/playground/disaggregation/pd_flip_progressive_matrix.py",
+        ROOT / "scripts/playground/disaggregation/pd_flip_migration_measure.py",
+    ):
+        executed_tool = subprocess.run(
+            [sys.executable, str(tool), "--help"],
+            cwd=HARNESS,
+            text=True,
+            capture_output=True,
+        )
+        assert executed_tool.returncode == 0, (tool, executed_tool.stderr)
     for index, body in enumerate(re.findall(r"```bash\n(.*?)\n```", runbook, re.DOTALL)):
         snippet = tmp_path / f"runbook-{index}.sh"
         snippet.write_bytes(body.encode("utf-8"))
