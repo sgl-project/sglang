@@ -56,19 +56,6 @@ logger = logging.getLogger(__name__)
 _PAD_NUM_HEADS = 64
 
 
-class DSparkV4DraftOutput(msgspec.Struct, frozen=True):
-
-    draft_hidden: torch.Tensor
-
-    @property
-    def hidden_states(self) -> torch.Tensor:
-        return self.draft_hidden
-
-    @property
-    def next_token_logits(self) -> None:
-        return None
-
-
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
