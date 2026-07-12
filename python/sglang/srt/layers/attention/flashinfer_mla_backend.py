@@ -407,6 +407,25 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 and not is_in_tc_piecewise_cuda_graph()
             )
 
+            # With dp-attention (gathered buffers), the batch is padded before
+            # attention: extend_num_tokens / input_ids already include the
+            # padding rows, but the per-request seq_lens do not, so the
+            # qo_indptr built from cumsum(seq_lens - prefix_lens) falls short
+            # of q.shape[0]. Pass the padded target so the updater can cover
+            # the gap with a dummy request.
+            # padded_num_tokens is the padded q length; real_num_tokens is the
+            # true qo total (== qo_indptr[-1] == sum(seq_lens - prefix_lens) ==
+            # sum(extend_seq_lens_cpu)). Both are host-side ints, so the updater
+            # can size the dummy request without a GPU->CPU sync.
+            padded_num_tokens = None
+            real_num_tokens = None
+            if (
+                forward_batch.global_num_tokens_cpu is not None
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                padded_num_tokens = forward_batch.extend_num_tokens
+                real_num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -415,6 +434,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
                 attn_dcp_metadata=forward_batch.attn_dcp_metadata,
+                padded_num_tokens=padded_num_tokens,
+                real_num_tokens=real_num_tokens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -425,7 +446,20 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         max_bs: int,
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
+        q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
+        # Rebind shared indptr buffers (same owner-provided buffers as in
+        # __init__), e.g. after the multi-step draft parent grows them to the
+        # capture bound. The decode indices updater caches references at
+        # construction, so keep it in sync here.
+        if kv_indptr_buf is not None:
+            self.kv_indptr = kv_indptr_buf
+            self.indices_updater_decode.kv_indptr = kv_indptr_buf
+        if q_indptr_decode_buf is not None:
+            self.q_indptr_decode = q_indptr_decode_buf
+            self.indices_updater_decode.q_indptr = q_indptr_decode_buf
+
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len,),
@@ -436,8 +470,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             cuda_graph_kv_indices = kv_indices_buf
 
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
-        self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
-        self.cuda_graph_kv_indptr = self.kv_indptr.clone()
+        # Size the indptr buffers by max_bs (the max capture batch size), not by
+        # cloning the req_to_token_pool.size-shaped q_indptr_decode / kv_indptr:
+        # with dp-attention, get_batch_sizes_to_capture rounds the max capture
+        # bs up to a multiple of attn_tp_size, which can exceed the per-DP-rank
+        # pool size and silently truncate the wrapper's buffer slices.
+        self.cuda_graph_qo_indptr = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
         self.cuda_graph_kv_lens = torch.ones(
             (max_bs,), dtype=torch.int32, device=self.device
         )
@@ -808,6 +851,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
         attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
+        padded_num_tokens: Optional[int] = None,
+        real_num_tokens: Optional[int] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -829,6 +874,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
             use_ragged,
             spec_info,
             attn_dcp_metadata=attn_dcp_metadata,
+            padded_num_tokens=padded_num_tokens,
+            real_num_tokens=real_num_tokens,
         )
 
     def call_begin_forward(
@@ -845,6 +892,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
         attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
+        padded_num_tokens: Optional[int] = None,
+        real_num_tokens: Optional[int] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -870,8 +919,44 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
+
+            # DP-attention pads the per-rank inputs, so q.shape[0] can exceed
+            # qo_indptr[-1] (the real token count) and flashinfer rejects the
+            # extra rows. Append a dummy request covering the padding tokens,
+            # mirroring the piecewise-cuda-graph padding pattern in
+            # flashinfer_backend.py: it satisfies the shape check without
+            # touching the causal masks of real requests. The dummy kv entries
+            # point at slot 0 so its softmax stays non-empty and finite.
+            if padded_num_tokens is not None and real_num_tokens is not None:
+                # real_num_tokens == qo_indptr[-1] and paged_kernel_lens_sum ==
+                # kv_indptr[-1], both host-side ints, so no GPU->CPU sync here.
+                if padded_num_tokens > real_num_tokens:
+                    pad_tokens = padded_num_tokens - real_num_tokens
+                    qo_indptr = torch.cat(
+                        [qo_indptr, qo_indptr.new_tensor([padded_num_tokens])]
+                    )
+                    kv_start = paged_kernel_lens_sum
+                    kv_indices = torch.cat(
+                        [
+                            kv_indices,
+                            torch.zeros(
+                                pad_tokens,
+                                dtype=kv_indices.dtype,
+                                device=kv_indices.device,
+                            ),
+                        ]
+                    )
+                    kv_indptr = torch.cat(
+                        [kv_indptr, kv_indptr.new_tensor([kv_start + pad_tokens])]
+                    )
         else:
             assert isinstance(spec_info, SpecInput)
+            # No dp-attention dummy request is needed here: every caller that
+            # passes spec_info (target-verify, eager and cuda-graph) sets
+            # use_ragged=False, so this branch only ever feeds the MLA paged
+            # wrapper, which has no q.shape == qo_indptr[-1] check. The strict
+            # ragged check that requires the dummy request is exclusive to the
+            # non-spec (spec_info is None) path above.
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -1040,6 +1125,23 @@ class FlashInferMLAMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # Grow the shared indptr buffers to the capture bound: with dp-attention,
+        # get_batch_sizes_to_capture rounds the max capture bs up to a multiple
+        # of attn_tp_size, which can exceed the req_to_token_pool.size bound used
+        # in __init__, so the [: bs + 1] slices in the decode indices updater
+        # would silently truncate and crash flashinfer's plan.
+        max_capture_bs = max_bs * self.topk
+        if self.kv_indptr.shape[1] < max_capture_bs + 1:
+            device = self.kv_indptr.device
+            self.kv_indptr = torch.zeros(
+                (self.speculative_num_steps, max_capture_bs + 1),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.q_indptr_decode = torch.arange(
+                0, max_capture_bs + 1, dtype=torch.int32, device=device
+            )
+
         # Row holds topk per-branch sequences (generate_draft_decode_kv_indices), so
         # it needs the topk factor, matching the eager init_forward_metadata.
         kv_indices_width = draft_kv_indices_buffer_width(
@@ -1053,7 +1155,11 @@ class FlashInferMLAMultiStepDraftBackend:
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs,
+                max_num_tokens,
+                kv_indices_buf=self.cuda_graph_kv_indices[i],
+                kv_indptr_buf=self.kv_indptr[i],
+                q_indptr_decode_buf=self.q_indptr_decode,
             )
 
     def init_forward_metadata_out_graph(
