@@ -41,6 +41,7 @@ def test_compute_n_gram_ids_decode_matches_general(batch_size: int) -> None:
     ne_n = 8
     ne_k = 2
     vocab_size = 32000
+    eos_token_id = vocab_size
     max_context_len = 1024
     max_running_reqs = batch_size + 8
     num_configs = (ne_n - 1) * ne_k
@@ -59,7 +60,9 @@ def test_compute_n_gram_ids_decode_matches_general(batch_size: int) -> None:
     column_starts = torch.randint(
         0, max_context_len, (batch_size,), dtype=torch.int32, device="cuda"
     )
-    tokens = torch.empty(batch_size, dtype=torch.int32, device="cuda")
+    tokens = torch.randint(
+        0, vocab_size, (batch_size,), dtype=torch.int32, device="cuda"
+    )
     exclusive_req_len_sums = torch.arange(
         batch_size + 1, dtype=torch.int32, device="cuda"
     )
@@ -80,6 +83,7 @@ def test_compute_n_gram_ids_decode_matches_general(batch_size: int) -> None:
         row_indices=row_indices,
         column_starts=column_starts,
         n_gram_ids=n_gram_ids_general,
+        eos_token_id=eos_token_id,
     )
     compute_n_gram_ids_decode(
         ne_n=ne_n,
@@ -91,6 +95,7 @@ def test_compute_n_gram_ids_decode_matches_general(batch_size: int) -> None:
         row_indices=row_indices,
         column_starts=column_starts,
         n_gram_ids=n_gram_ids_decode,
+        eos_token_id=eos_token_id,
     )
 
     torch.testing.assert_close(n_gram_ids_decode, n_gram_ids_general, atol=0, rtol=0)

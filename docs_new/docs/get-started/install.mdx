@@ -35,6 +35,23 @@ uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.a
 uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
 ```
 
+### Nightly builds
+
+To pick up the latest features and fixes before the next stable release, install a nightly build. Nightly wheels are built from the latest `main` and published to the SGLang wheel index. Add that index with `--extra-index-url`, and combine `--prerelease=allow` with `--index-strategy unsafe-best-match` so uv considers the nightly (pre-release) version alongside PyPI:
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ sglang
+```
+
+To install a nightly build under Cuda 12, swap the index to `cu129`:
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu129/ sglang
+```
+
 ### Quick fixes to common problems
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
@@ -60,6 +77,10 @@ pip install -e "python"
 
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
+
+<Note>
+`latest` and `dev` are **mutable** tags: `latest` always points at the newest stable release, while `dev` is rebuilt daily from the latest `main` and includes build/development tools. Because they are overwritten over time, pin an immutable version tag for reproducible deployments — e.g. `lmsysorg/sglang:v0.5.12`. Browse all released versions on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
+</Note>
 
 ```bash Command
 docker run --gpus all \

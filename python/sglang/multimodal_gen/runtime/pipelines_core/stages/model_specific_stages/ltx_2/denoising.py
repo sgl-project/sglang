@@ -137,6 +137,12 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         self.sampler_name = sampler_name
 
+    def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
+        return self.prepare_extra_func_kwargs(
+            scheduler.step,
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
+        )
+
     @staticmethod
     def _randn_like_with_batch_generators(
         reference_tensor: torch.Tensor, batch: Req
@@ -1873,9 +1879,19 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                ctx.latents = ctx.scheduler.step(
-                    model_video, step.t_device, ctx.latents, return_dict=False
-                )[0]
+                if batch.rollout:
+                    ctx.scheduler._step_index = step.step_index
+                    ctx.latents = ctx.scheduler.step(
+                        model_video,
+                        step.t_device,
+                        ctx.latents,
+                        return_dict=False,
+                        **self._scheduler_step_kwargs(batch, ctx.scheduler),
+                    )[0]
+                else:
+                    ctx.latents = ctx.scheduler.step(
+                        model_video, step.t_device, ctx.latents, return_dict=False
+                    )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]

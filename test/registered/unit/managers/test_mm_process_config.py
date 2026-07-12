@@ -116,6 +116,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
+        server_args.skip_tokenizer_init = False
 
         mock_processor = MagicMock()
         mock_processor.__class__.__name__ = "TestProcessor"
@@ -133,7 +134,12 @@ class TestProcessMmDataKwargs(unittest.TestCase):
                 proc = BaseMultimodalProcessor()
 
         proc.server_args = server_args
+        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
+        proc._tokenizer = MagicMock()
+        proc._tokenizer_auto_adds_specials = False
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
         proc.audio_config = mm_process_config.get("audio", {})
@@ -213,6 +219,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = False
+        server_args.skip_tokenizer_init = False
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"
@@ -224,6 +231,9 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
             proc = processor_cls()
 
         proc.server_args = server_args
+        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
@@ -286,6 +296,49 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         audio_kw = call_kwargs.kwargs.get("audio_kwargs", {})
         # User config can override truncation if they explicitly set it
         self.assertTrue(audio_kw.get("truncation"))
+
+
+class TestDoubleBosGuard(unittest.TestCase):
+    """Regression test for the multimodal double-BOS bug.
+
+    Repro condition (Cohere2 / Llama3-LLaVA-Next family):
+      - tokenizer.encode("") returns [bos_id]  (auto-adds specials), AND
+      - chat template renders the BOS string as a literal at the start.
+
+    Without the guard in BaseMultimodalProcessor, the inner processor.__call__
+    on the rendered prompt would auto-prepend a second BOS, producing 2 leading
+    BOS tokens vs the HF reference's 1.
+    """
+
+    def test_guard_passes_add_special_tokens_false_on_bug_condition(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        server_args = MagicMock()
+        server_args.mm_process_config = {}
+        server_args.disable_fast_image_processor = True
+        server_args.keep_mm_feature_on_device = True
+
+        mock_hf_processor = MagicMock()
+        mock_hf_processor.__class__.__name__ = "TestProcessor"
+        mock_hf_processor.__call__ = MagicMock(return_value={})
+        mock_hf_processor.tokenizer.encode = MagicMock(return_value=[2])
+        mock_hf_processor.tokenizer.bos_token = "<BOS>"
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            proc = BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=server_args,
+                _processor=mock_hf_processor,
+                transport_mode=None,
+            )
+        proc.FEATURE_NAMES = []
+
+        proc.process_mm_data("<BOS>hello", images=["img1"])
+
+        call_kwargs = mock_hf_processor.__call__.call_args.kwargs
+        self.assertEqual(call_kwargs.get("add_special_tokens"), False)
 
 
 if __name__ == "__main__":

@@ -749,6 +749,7 @@ class TestHiSparseUnit(unittest.TestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = self.req_to_token_pool
         queue.token_to_kv_pool_allocator = self.allocator
+        queue.token_to_kv_pool = self.allocator.get_kvcache()
         queue.tree_cache = SimpleNamespace(
             evictable_size=lambda: 0,
             protected_size=lambda: 0,

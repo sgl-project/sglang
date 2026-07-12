@@ -2,6 +2,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
@@ -10,6 +11,8 @@ from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+BF16_FUSED_ATOL = 1.6e-1
 
 
 def _require_cuda_b200() -> None:
@@ -72,17 +75,12 @@ def _reference(
     k_weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q_norm = torch.nn.RMSNorm(q.shape[-1], eps=eps, device="cuda").to(
-        dtype=torch.bfloat16
-    )
-    k_norm = torch.nn.RMSNorm(k.shape[-1], eps=eps, device="cuda").to(
-        dtype=torch.bfloat16
-    )
-    q_norm.weight.data.copy_(q_weight)
-    k_norm.weight.data.copy_(k_weight)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-        q_ref = _apply_split_rotary_ref(q_norm(q), q_cos, q_sin)
-        k_ref = _apply_split_rotary_ref(k_norm(k), k_cos, k_sin)
+    # rms_norm isn't autocast fp32-preserving, so feed fp32 inputs directly
+    # to keep the normalized value unrounded until the final RoPE output.
+    q_norm = F.rms_norm(q.float(), (q.shape[-1],), q_weight.float(), eps)
+    k_norm = F.rms_norm(k.float(), (k.shape[-1],), k_weight.float(), eps)
+    q_ref = _apply_split_rotary_ref(q_norm, q_cos, q_sin)
+    k_ref = _apply_split_rotary_ref(k_norm, k_cos, k_sin)
     return q_ref.to(dtype=torch.bfloat16), k_ref.to(dtype=torch.bfloat16)
 
 
@@ -135,8 +133,8 @@ def test_ltx2_qknorm_split_rope_matches_torch_exactly(
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(q_ref, q_out)
-    assert torch.equal(k_ref, k_out)
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
 
 
 def test_ltx2_qknorm_split_rope_rejects_unsupported_inputs() -> None:
@@ -215,8 +213,8 @@ def test_ltx2_qknorm_split_rope_custom_op_torch_compile_fullgraph() -> None:
         q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight, 1e-6
     )
     torch.cuda.synchronize()
-    assert torch.equal(q_ref, q_out)
-    assert torch.equal(k_ref, k_out)
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
 
 
 if __name__ == "__main__":

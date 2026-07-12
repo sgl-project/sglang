@@ -110,6 +110,11 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
     tm.enable_metrics = False
+    tm.enable_trace = False
+    tm.enable_lora = False
+    tm.incremental_streaming_output = False
+    tm.allow_auto_truncate = False
+    tm.skip_tokenizer_init = False
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()

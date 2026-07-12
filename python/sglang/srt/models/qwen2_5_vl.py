@@ -72,8 +72,7 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
 
 _is_cuda = is_cuda()
@@ -604,7 +603,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         if not self.config.encoder_only:
             self.model = Qwen2Model(

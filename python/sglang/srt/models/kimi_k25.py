@@ -31,7 +31,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -150,6 +150,7 @@ class MoonViTEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            max_seqlen=max_seqlen,
         )
 
         hidden_states = residual + hidden_states
@@ -469,7 +470,10 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        max_seqlen = lengths.max()
+        # FlashAttention needs a host integer.  Compute it once per MoonViT
+        # forward and pass it to every encoder block instead of synchronizing
+        # once per block inside the attention backend.
+        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         for block in self.blocks:
@@ -633,7 +637,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
             config.vision_config,

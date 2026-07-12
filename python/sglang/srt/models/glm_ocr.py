@@ -50,7 +50,7 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionModel,
     Glm4vVisionPatchEmbed,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -272,7 +272,7 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         self.visual = GlmOcrVisionModel(
             vision_config=config.vision_config,
             text_config=config.text_config,

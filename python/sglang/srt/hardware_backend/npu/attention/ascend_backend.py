@@ -21,7 +21,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -38,6 +37,8 @@ if TYPE_CHECKING:
 import logging
 
 import numpy as np
+
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
@@ -351,7 +352,8 @@ class AscendAttnBackend(AttentionBackend):
         self.q_head_num_padding = None
         if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
             self.tp_q_head_num = (
-                model_runner.model_config.num_attention_heads // get_attention_tp_size()
+                model_runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
             )
             for num in self.padding_size_list:
                 if num >= self.tp_q_head_num:

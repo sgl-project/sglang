@@ -17,11 +17,17 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
+from sgl_kernel import (  # noqa: E402
+    sgl_per_token_group_quant_8bit as aot_per_token_group_quant_8bit,
+)
 from sgl_kernel.test_utils import (  # noqa: E402
     assert_all_close_or_tiny_diff,
     create_per_token_group_quant_test_data,
 )
 
+from sglang.jit_kernel.per_token_group_quant_8bit import (  # noqa: E402
+    per_token_group_quant_8bit as jit_per_token_group_quant_8bit,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
     create_per_token_group_quant_fp8_output_scale,
 )
@@ -222,6 +228,105 @@ def test_per_token_group_quant_with_column_major(
         print(f"{x_s_sglang=}")
 
         raise
+
+
+LAYOUTS = [
+    (False, False, False),
+    (True, False, False),
+    (True, True, False),
+    (True, True, True),
+]
+
+CONFIGS = list(
+    itertools.product(
+        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],
+        [512, 1536, 2048, 4096, 6144, 7168, 16384],
+        [16, 32, 64, 128],
+        LAYOUTS,
+        [fp8_type_],
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, hidden_dim, group_size, layout, dst_dtype", CONFIGS
+)
+def test_jit_matches_aot_v2_byte_identical(
+    num_tokens, hidden_dim, group_size, layout, dst_dtype
+):
+    column_major_scales, scale_tma_aligned, scale_ue8m0 = layout
+
+    arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    if scale_ue8m0 and arch_major <= 9:
+        pytest.skip("UE8M0 fusion is Blackwell-only")
+    if hidden_dim % group_size != 0:
+        pytest.skip("hidden_dim must be divisible by group_size")
+
+    torch.manual_seed(num_tokens * 131 + hidden_dim + group_size)
+    x = (torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)) * 3.0
+
+    fp8_max = torch.finfo(dst_dtype).max
+    fp8_min = -fp8_max
+
+    def _alloc():
+        q = torch.empty_like(x, dtype=dst_dtype)
+        s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=x.shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+        )
+        return q, s
+
+    q_aot, s_aot = _alloc()
+    aot_per_token_group_quant_8bit(
+        x,
+        q_aot,
+        s_aot,
+        group_size,
+        1e-10,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        False,
+        None,
+        enable_v2=True,
+    )
+
+    q_jit, s_jit = _alloc()
+    jit_per_token_group_quant_8bit(
+        x, q_jit, s_jit, group_size, 1e-10, fp8_min, fp8_max, scale_ue8m0=scale_ue8m0
+    )
+
+    # AOT v2 uses -use_fast_math reciprocal; this JIT uses precise division, so an
+    # exact fp8 midpoint can round to an adjacent code (1-ULP, JIT more accurate).
+    qj = q_jit.view(torch.uint8)
+    qa = q_aot.view(torch.uint8)
+    if not torch.equal(qj, qa):
+        mism = qj != qa
+        bj = qj[mism].to(torch.int16)
+        ba = qa[mism].to(torch.int16)
+        same_sign = (bj & 0x80) == (ba & 0x80)
+        one_ulp = (bj - ba).abs() == 1
+        assert bool(
+            (same_sign & one_ulp).all()
+        ), f"q mismatch > 1 fp8 ULP {num_tokens=} {hidden_dim=} {group_size=} {layout=}"
+        assert mism.float().mean() < 0.01, (
+            f"too many fp8 ties ({int(mism.sum())}/{mism.numel()}) "
+            f"{num_tokens=} {hidden_dim=} {group_size=} {layout=}"
+        )
+
+    if scale_ue8m0:
+        assert torch.equal(
+            s_jit[:num_tokens].reshape(num_tokens, -1).view(torch.int32),
+            s_aot[:num_tokens].reshape(num_tokens, -1).view(torch.int32),
+        ), f"ue8m0 scale mismatch {num_tokens=} {hidden_dim=} {group_size=}"
+    else:
+        assert torch.equal(
+            s_jit[:num_tokens].float(), s_aot[:num_tokens].float()
+        ), f"float scale mismatch {num_tokens=} {hidden_dim=} {group_size=}"
 
 
 if __name__ == "__main__":

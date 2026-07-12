@@ -284,9 +284,6 @@ _BYTES_PER_DST_PAGE = (
 
 _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
-# Pre-allocated buffer for page-split output per device (lazily sized).
-_split_buf = {}  # device -> tensor
-
 
 @triton.jit
 def _page_split_kernel(
@@ -344,8 +341,13 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     ratio = src_pbs // _PBS_DST
     num_dst_pages = N * ratio
 
+    from sglang.srt.runtime_context import get_resources
+
+    # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
-    buf = _split_buf.get(dev)
+    buffers = get_resources().buffers
+    key = f"flash_mla_sm120_split:{dev}"
+    buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         buf = torch.empty(
             num_dst_pages,
@@ -353,7 +355,7 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
             dtype=torch.uint8,
             device=dev,
         )
-        _split_buf[dev] = buf
+        buffers[key] = buf
     out = buf[:num_dst_pages]
 
     # Get raw 2D view of source

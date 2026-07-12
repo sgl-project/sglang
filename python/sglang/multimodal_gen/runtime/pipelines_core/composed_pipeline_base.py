@@ -979,7 +979,12 @@ class ComposedPipelineBase(ABC):
 
         # Execute each stage
         if not batch.is_warmup and not batch.suppress_logs:
-            logger.info(
+            stage_logger = (
+                logger.debug
+                if server_args.pipeline_config.task_type.is_action_gen()
+                else logger.info
+            )
+            stage_logger(
                 "Running pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
@@ -1007,7 +1012,12 @@ class ComposedPipelineBase(ABC):
             )
 
         if not batches[0].is_warmup and not batches[0].suppress_logs:
-            logger.info(
+            stage_logger = (
+                logger.debug
+                if server_args.pipeline_config.task_type.is_action_gen()
+                else logger.info
+            )
+            stage_logger(
                 "Running grouped pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,

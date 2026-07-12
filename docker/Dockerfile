@@ -12,14 +12,14 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.3
+ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.12
+ARG FLASHINFER_VERSION=0.6.14
 ARG MOONCAKE_VERSION=0.3.11.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
@@ -332,7 +332,7 @@ ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
 
-# Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
+# Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -342,6 +342,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
+    # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
+    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /flashinfer_jit_output/ \
+    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
@@ -458,7 +462,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer jit-cache package (if installed)
+# Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools

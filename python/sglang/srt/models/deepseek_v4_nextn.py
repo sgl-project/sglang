@@ -14,8 +14,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.dp_attention import (
-    _DpGatheredBufferWrapper,
     dp_gather_partial,
+    get_global_dp_buffer_len,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -38,7 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -158,7 +158,7 @@ class DeepseekV4ModelNextN(nn.Module):
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
-                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
@@ -233,7 +233,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_flags().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

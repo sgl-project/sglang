@@ -16,7 +16,7 @@ cuda_graph_config, and the --cuda-graph-config JSON CLI parser.
 
 Module-level imports are pure stdlib — no torch / sglang.srt deps — so
 ServerArgs can import everything here without pulling in backend
-classes. check_cuda_graph_backend lazy-imports get_global_server_args
+classes. check_cuda_graph_backend lazy-imports get_server_args
 inside the function body to preserve that invariant.
 """
 
@@ -164,10 +164,10 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
     global server args. Returns False if the global server args have not
     been initialized yet (e.g. unit tests, early startup)."""
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     try:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
     except ValueError:
         return False
     cfg = server_args.cuda_graph_config

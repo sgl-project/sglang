@@ -154,9 +154,9 @@ CONFIGS_MOE = list(
 # ---- Final configs ----
 CONFIGS = CONFIGS_GEMM + CONFIGS_MOE
 
-LINE_VALS = ["triton", "sglang"]
-LINE_NAMES = ["Triton (Inaccurate)", "SGL Kernel"]
-STYLES = [("blue", "-"), ("green", "-")]
+LINE_VALS = ["triton", "aot_v2", "sglang"]
+LINE_NAMES = ["Triton (Inaccurate)", "AOT v2 (sgl-kernel)", "JIT (this repo)"]
+STYLES = [("blue", "-"), ("red", "-"), ("green", "-")]
 
 
 def _flatten_to_2d(t: torch.Tensor) -> torch.Tensor:
@@ -171,6 +171,7 @@ def _make_sglang_bench_fn(
     group_size: int,
     dst_dtype: torch.dtype,
     flags: dict,
+    provider: str = "sglang",
 ):
     """
     Adapter that pre-allocates output tensors and returns a zero-arg callable
@@ -213,17 +214,37 @@ def _make_sglang_bench_fn(
         scale_ue8m0=scale_ue8m0,
     )
 
-    def _run():
-        sglang_per_token_group_quant_8bit(
-            input=x_input,
-            output_q=output_q,
-            output_s=output_s,
-            group_size=group_size,
-            eps=1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            scale_ue8m0=scale_ue8m0,
-        )
+    if provider == "aot_v2":
+        from sgl_kernel import sgl_per_token_group_quant_8bit as aot_quant
+
+        def _run():
+            aot_quant(
+                x_input,
+                output_q,
+                output_s,
+                group_size,
+                1e-10,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                False,  # fuse_silu_and_mul (already applied to x_input)
+                None,  # masked_m (flattened to 2D)
+                enable_v2=True,
+            )
+
+    else:
+
+        def _run():
+            sglang_per_token_group_quant_8bit(
+                input=x_input,
+                output_q=output_q,
+                output_s=output_s,
+                group_size=group_size,
+                eps=1e-10,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=scale_ue8m0,
+            )
 
     return _run
 
@@ -270,13 +291,14 @@ def benchmark(
             dst_dtype=dst_dtype,
             **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
         )
-    elif provider == "sglang":
+    elif provider in ("sglang", "aot_v2"):
         kernel_names = "per_token_group_quant_8bit_kernel"
         bench_fn = _make_sglang_bench_fn(
             x=x,
             group_size=group_size,
             dst_dtype=dst_dtype,
             flags=flags,
+            provider=provider,
         )
     else:
         raise ValueError(f"Unknown provider: {provider}")

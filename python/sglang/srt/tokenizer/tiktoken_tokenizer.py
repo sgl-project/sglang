@@ -113,6 +113,10 @@ class TiktokenTokenizer:
     def decode(self, x, *args, **kwargs):
         return self.tokenizer.decode(x)
 
+    def num_special_tokens_to_add(self, *args, **kwargs) -> int:
+        # tiktoken's encode adds no special tokens (add_special_tokens is ignored).
+        return 0
+
     def batch_decode(
         self, batch, skip_special_tokens=True, spaces_between_special_tokens=False
     ):

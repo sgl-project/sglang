@@ -121,12 +121,20 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
+        # unified_kv never caches the SWA ring (per-request, not content-stable),
+        # so SWA bookkeeping must not gate the match here.
+        swa_device_only_hicache = (
+            self._swa_kv_pool_host is None and self.cache.cache_controller is not None
+        )
+
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
+                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                    return True
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
@@ -611,6 +619,10 @@ class SWAComponent(TreeComponent):
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
+
+        # unified_kv keeps SWA as a device-only ring.
+        if self._swa_kv_pool_host is None and self.cache.cache_controller is not None:
+            return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]

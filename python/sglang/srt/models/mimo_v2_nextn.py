@@ -44,7 +44,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2MLP,
     load_mimo_v2_qkv_proj_weight,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 MiMoV2Config = None
@@ -259,7 +259,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_flags().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

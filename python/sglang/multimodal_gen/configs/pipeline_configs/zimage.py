@@ -67,6 +67,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    enable_autocast: bool = False
     vae_precision: str = "bf16"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
@@ -86,6 +87,9 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
+
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return self._prepare_sigmas(sigmas, num_inference_steps)
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         rendered_prompts = [

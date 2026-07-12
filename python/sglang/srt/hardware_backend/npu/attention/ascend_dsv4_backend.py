@@ -10,9 +10,9 @@ import torch.nn.functional as F
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -781,7 +781,6 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         assert (
             not skip_compressor
         ), "skip_compressor=True is not supported by forward_c4_indexer_npu"
-        from sglang.srt.layers.dp_attention import get_attention_tp_group
 
         ratio = c4_indexer.compressor.ratio
         device = x.device
@@ -825,7 +824,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         seqlens_cpu = forward_batch.seq_lens_cpu
         end_pos = forward_batch.seq_lens.cumsum(dim=0)
         page_table = self.forward_metadata.c4_page_table
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
         topk_idxs: list[torch.Tensor] = []
         for i, _end_token in enumerate(end_pos):
             seq_i = int(seqlens_cpu[i])
@@ -847,7 +846,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
                     index_score.relu_() * weights.unsqueeze(-1)[start:end, ...]
                 ).sum(dim=1)
                 if attn_tp_size > 1 and getattr(c4_indexer, "enable_indexer_tp", False):
-                    get_attention_tp_group().all_reduce(index_score)
+                    get_parallel().attn_tp_group.all_reduce(index_score)
                 arange_kv = torch.arange(seq_i // ratio, device=device)
                 arange_q = torch.arange(1, seq_i + 1, device=device).unsqueeze(1)
                 causal = arange_kv.repeat(seq_i, 1) >= (arange_q // ratio)
@@ -972,7 +971,7 @@ class DeepseekV4AscendAttnBackend(
         self.use_graph_swa_mask = False
         cfg = model_runner.model_config
         self._dsv4_config = cfg
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
         self._dsv4_kv_head_num = 1  # V4 MQA / latent
         self._dsv4_head_dim = cfg.head_dim
@@ -1363,9 +1362,9 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            n_draft = get_global_server_args().speculative_num_draft_tokens or 1
+            n_draft = get_server_args().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1410,9 +1409,9 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            max_seqlen_q = get_global_server_args().speculative_num_draft_tokens or 1
+            max_seqlen_q = get_server_args().speculative_num_draft_tokens or 1
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(

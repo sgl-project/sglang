@@ -397,6 +397,7 @@ void norm4d_kernel_impl(
     const scalar_t* __restrict__ input,
     const NormParams& p,
     const scalar_t* __restrict__ gate = nullptr) {
+#if defined(CPU_CAPABILITY_AVX512)
   // fast path only applies to bfloat16 when D in {32, 64, 128, 256, 512}
   if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     switch (p.D) {
@@ -409,6 +410,7 @@ void norm4d_kernel_impl(
         break;
     }
   }
+#endif
 
   // generic path
   LAUNCH_PARALLEL_LOOP(

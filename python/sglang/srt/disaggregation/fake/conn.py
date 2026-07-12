@@ -43,6 +43,7 @@ class FakeKVSender(BaseKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
         self.has_sent = False

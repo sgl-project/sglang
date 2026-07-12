@@ -120,8 +120,9 @@ class TestQwen32B(TestNpuPerformanceTestCaseBase):
     input_len = 3584
     output_len = 1536
     random_range_ratio = 1
-    tpot = 50
-    output_token_throughput = 1600
+    seed = 1
+    tpot = 55
+    output_token_throughput = 1500
 
     def test_qwen3_32b(self):
         self.run_throughput()

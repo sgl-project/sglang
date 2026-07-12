@@ -12,8 +12,10 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
-    dcp_enabled,
     filter_dcp_local_kv_indices,
+)
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -28,7 +30,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
 
 _use_fp8_prefill_attn = (
@@ -112,7 +114,7 @@ class DeepseekMHAForwardMixin:
 
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
+            get_server_args().disable_chunked_prefix_cache
         )
 
         # TODO: Design a finer way to determine the threshold
@@ -159,8 +161,10 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=False,
                     )
+                    if _use_aiter_bpreshuffle_gfx95:
+                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
@@ -202,8 +206,10 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    q = materialize_bpreshuffle_fp8_scale_tuple(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
@@ -232,8 +238,10 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
-                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                transpose_scale=False,
             )
+            if _use_aiter_bpreshuffle_gfx95:
+                kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)
@@ -270,15 +278,15 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_global_server_args().dsa_decode_backend == "trtllm"
-                    or not get_global_server_args().dsa_prefill_backend == "trtllm"
+                    not get_server_args().dsa_decode_backend == "trtllm"
+                    or not get_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if dcp_enabled():
+                if get_parallel().dcp_enabled:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,

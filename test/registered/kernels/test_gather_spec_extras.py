@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.test.test_utils import CustomTestCase
 
 _OUTPUT_NAMES = ("topk_p", "topk_index", "bonus_tokens", "hidden_states")
