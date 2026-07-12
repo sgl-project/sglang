@@ -142,7 +142,7 @@ try:
 except ImportError:
     pass
 
-# Newer transformers versions (>5.9.0) will expose MellumConfig directly,
+# Newer transformers versions (>=5.10.2) expose MellumConfig directly,
 # but fallback to Qwen3MoeConfig for older versions.
 try:
     import transformers as _hf_transformers

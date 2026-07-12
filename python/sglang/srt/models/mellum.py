@@ -13,7 +13,7 @@
 # ==============================================================================
 
 """
-Inference-only Mellum (JetBrains/Mellum2-12B-A2.5B-Base) Qwen3-MoE variant with
+Inference-only Mellum (JetBrains/Mellum2-12B-A2.5B family) Qwen3-MoE variant with
 interleaved sliding-window/full attention, per-layer-type RoPE and mixed dense/MoE
 MLP layers.
 """
@@ -65,6 +65,10 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 
+def _get_rope_type(rope_params: Dict[str, Any]) -> str:
+    return rope_params.get("rope_type") or rope_params.get("type") or "default"
+
+
 def _compute_yarn_from_rope_params(
     rope_params: Dict[str, Any],
     head_dim: int,
@@ -74,8 +78,7 @@ def _compute_yarn_from_rope_params(
     if rope_params is None:
         return _default
 
-    rope_type = rope_params.get("rope_type") or "default"
-    if rope_type == "default":
+    if _get_rope_type(rope_params) == "default":
         return _default
 
     base = rope_params.get("rope_theta", 10000)
@@ -120,6 +123,12 @@ def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]
     if sw is not None:
         return sw - 1
     return None
+
+
+class MellumMLP(Qwen3MoeMLP):
+    # Qwen3MoeDecoderLayer.forward calls self.mlp(x, forward_batch).
+    def forward(self, x, forward_batch=None):
+        return super().forward(x)
 
 
 class MellumAttention(Qwen3MoeAttention):
@@ -173,8 +182,7 @@ class MellumAttention(Qwen3MoeAttention):
 
         rope_params = rope_params or {}
         self.rope_theta = rope_params.get("rope_theta", 10000.0)
-        rope_type = rope_params.get("rope_type") or "default"
-        rope_scaling = rope_params if rope_type != "default" else None
+        rope_scaling = rope_params if _get_rope_type(rope_params) != "default" else None
 
         self.tp_rank = get_parallel().tp_rank
 
@@ -248,6 +256,12 @@ class MellumAttention(Qwen3MoeAttention):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        raise NotImplementedError(
+            "Mellum per-layer RoPE is incompatible with the shared rotary "
+            "cos/sin priming in Qwen3MoeAttention.forward_prepare_npu"
+        )
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         # Overridden to use pre-computed per-layer YaRN params.
@@ -349,7 +363,12 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
         # Mellum routes SWA per-layer via layer_types. Preserve the configured
         # window regardless of legacy use_sliding_window post-init side effects.
         if layer_type == "sliding_attention":
-            sliding_window_size = get_attention_sliding_window_size(config) or -1
+            sliding_window_size = get_attention_sliding_window_size(config)
+            if sliding_window_size is None:
+                raise ValueError(
+                    "Missing config.sliding_window for Mellum "
+                    f"sliding_attention layer {layer_id}"
+                )
         else:
             sliding_window_size = -1
 
@@ -413,7 +432,7 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            self.mlp = Qwen3MoeMLP(
+            self.mlp = MellumMLP(
                 hidden_size=cfg.hidden_size,
                 intermediate_size=cfg.intermediate_size,
                 hidden_act=cfg.hidden_act,
@@ -487,6 +506,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             )
 
         self.model = MellumModel(cfg, quant_config, prefix=add_prefix("model", prefix))
+        # Over-approximation is safe: the non-fused path accepts int32 positions.
         self.use_fused_qk_norm_rope = any(
             getattr(
                 getattr(layer, "self_attn", None),
