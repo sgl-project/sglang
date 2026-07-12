@@ -18,11 +18,20 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
+    # Same convention as the KV pools: the fp8 tensor stores value/scale and
+    # the attention kernels multiply the logits back by the scale (None = unit).
+    if q_scale is not None:
+        q = q / q_scale
+    return q.to(torch.float8_e4m3fn)
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
@@ -31,6 +40,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
         self.max_context_len = int(runner.model_config.context_len)
+        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
+        if self.fp8_attn_gemm:
+            assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
+                "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "
+                f"{self.kv_pool.main_pool.dtype}"
+            )
 
         hf_config = runner.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(hf_config)
@@ -72,11 +87,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             msa_available,
         )
 
-        # MSA (fmha_sm100) is bf16/fp16-only; an fp8 main KV cache must stay on the
-        # Triton sparse path (it dequants fp8 on load).
+        # MSA (fmha_sm100) runs bf16, or uniform fp8_e4m3 under fp8 attn-GEMM mode
+        # (which also casts q to fp8). An fp8 main KV cache WITHOUT the flag
+        # would pair a bf16 q with fp8 K/V — unsupported by fmha_sm100's
+        # uniform-dtype kernels — so it stays on the Triton sparse path (which
+        # dequants fp8 on load). e5m2 is never allowed into MSA (fmha_sm100's
+        # variant lookup would silently dispatch the e4m3 kernel).
         _main_kv_is_fp8 = self.kv_pool.main_pool.dtype in (
             torch.float8_e4m3fn,
             torch.float8_e5m2,
+        )
+        _msa_fp8_ok = (
+            self.fp8_attn_gemm and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
         )
         self.use_msa = (
             not envs.SGLANG_DISABLE_MSA.get()
@@ -84,7 +106,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and self.block_size_k == 128
             and self.kv_pool.page_size == self.block_size_k
             and self.topk_blocks in (4, 8, 16, 32)
-            and not _main_kv_is_fp8
+            and (not _main_kv_is_fp8 or _msa_fp8_ok)
         )
         if (
             not self.use_msa
@@ -96,8 +118,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             logger.warning(
                 "MiniMax-M3 MSA decode disabled: page_size=%d != sparse block size "
                 "%d. Pass --page-size 128 (with an attention backend that allows it, "
-                "e.g. fa4) to enable the faster MSA kernel; falling back to the "
-                "Triton sparse path.",
+                "e.g. fa4 or trtllm_mha) to enable the faster MSA kernel; falling "
+                "back to the Triton sparse path.",
                 self.kv_pool.page_size,
                 self.block_size_k,
             )
@@ -118,11 +140,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.use_dense_sparse_decode = (
             envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
+            # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
+            # unit bmm scales — no fp8 handling yet (follow-up).
+            and not self.fp8_attn_gemm
         )
-        # MSA fmha_sm100 decode is NOT cuda-graph-safe: captured/replayed it returns
-        # wrong results (~14% GSM8K loss on B200). Gate capture via cuda_graph_config,
-        # not legacy disable_* flags — they disagree under config-native flags and would
-        # capture the unsafe MSA decode kernel.
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend,
             Phase,
@@ -158,8 +179,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"msa_decode={self._use_msa_decode}, "
+            f"msa_owns_decode={self._msa_owns_decode}, "
+            f"decode_cuda_graph={_decode_cuda_graph}, "
+            f"fp8_attn_gemm={self.fp8_attn_gemm}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
+        if self.fp8_attn_gemm and self.use_msa:
+            logger.info(
+                "[MiniMaxSparse] fp8 MSA active: the first forward may "
+                "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
+                "take minutes; compiles serialize across TP ranks)."
+            )
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -201,6 +232,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.topk_blocks,
                 bs,
                 device=device,
+                is_fp8=self.fp8_attn_gemm,
             )
             kv_indices_buf = torch.zeros(
                 bs * self._msa_nb_max, dtype=torch.int32, device=device
@@ -288,6 +320,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 v,
                 idx_k,
                 None if disable_value else idx_v,
+                layer.k_scale_float,
+                layer.v_scale_float,
+                layer.idx_k_scale_float,
+                layer.idx_v_scale_float,
             )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
@@ -321,6 +357,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = q[:actual_num_tokens]
             idx_q = idx_q[:actual_num_tokens]
 
+        # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
+        # the bf16 k/v) and the DP trim.
+        if self.fp8_attn_gemm:
+            q = _quant_q_fp8(q, layer.q_scale_float)
+            idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+
         idx_o, o = minimax_sparse_prefill(
             q,
             k_cache,
@@ -346,6 +388,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             use_msa=self.use_msa,
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
         )
 
         if actual_num_tokens < original_num_tokens:
@@ -424,6 +472,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             v,
             idx_k,
             None if disable_value else idx_v,
+            layer.k_scale_float,
+            layer.v_scale_float,
+            layer.idx_k_scale_float,
+            layer.idx_v_scale_float,
         )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
@@ -458,6 +510,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
 
+        # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
+        # the bf16 k/v).
+        if self.fp8_attn_gemm:
+            q = _quant_q_fp8(q, layer.q_scale_float)
+            idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+
         idx_o, o = minimax_sparse_decode(
             q,
             None,
@@ -483,6 +541,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self._use_msa_decode,
             msa_kv_indices=msa_kv_indices,
             msa_plan=msa_plan,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
         )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

@@ -4183,6 +4183,11 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> None:
         self.layer_transfer_counter = layer_transfer_counter
 
+    def get_kv_cache_quant_method(self) -> Any:
+        # The base unwrap chain only knows full_kv_pool/swa_kv_pool; the dense
+        # KV (what attention backends quantize against) lives in main_pool here.
+        return self.main_pool.get_kv_cache_quant_method()
+
     def _wait_for_layer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -4231,10 +4236,14 @@ class MiniMaxSparseKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> None:
-        """Write main K/V at `loc`. Works for any layer (dense or sparse)."""
+        """Write main K/V at `loc`. Works for any layer (dense or sparse).
+
+        Scale semantics follow MHATokenToKVPool: None means unit scale;
+        a non-None scale is applied with an in-place div_ before the fp8 cast.
+        """
         self.main_pool.set_kv_buffer(
             layer,
             loc,
@@ -4250,8 +4259,8 @@ class MiniMaxSparseKVPool(KVCache):
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
         cache_idx_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> None:
         mapped_id = self.index_kv_layer_id_mapping.get(layer.layer_id)
         if mapped_id is None:
@@ -4275,6 +4284,7 @@ class MiniMaxSparseKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
+        k_scale: Optional[float] = None,
     ) -> None:
         mapped_id = self.index_k_layer_id_mapping.get(layer.layer_id)
         if mapped_id is None:
@@ -4285,6 +4295,8 @@ class MiniMaxSparseKVPool(KVCache):
             )
         sub_pool = self.index_k_pool
         if cache_idx_k.dtype != sub_pool.dtype:
+            if k_scale is not None:
+                cache_idx_k = cache_idx_k / k_scale
             cache_idx_k = cache_idx_k.to(sub_pool.dtype)
         if sub_pool.store_dtype != sub_pool.dtype:
             cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
@@ -4323,6 +4335,10 @@ class MiniMaxSparseKVPool(KVCache):
         cache_v: torch.Tensor,
         cache_idx_k: torch.Tensor,
         cache_idx_v: Optional[torch.Tensor],
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        idx_k_scale: Optional[float] = None,
+        idx_v_scale: Optional[float] = None,
     ) -> None:
         """Store main K/V + index K (+ optional index V) for a sparse layer in
         one fused JIT launch, falling back to separate stores when not applicable."""
@@ -4357,12 +4373,24 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics).
-        self.set_kv_buffer(layer, loc, cache_k, cache_v)
+        # Fallback: separate stores (identical semantics; quantizes for fp8
+        # pools — the fused raw-byte path is disqualified there by
+        # _can_fuse_kv_index_store's dtype-equality checks). Scales use the
+        # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
+        # applies any non-None scale with an IN-PLACE div_ (extra kernel +
+        # caller-tensor mutation), which must not fire for unit scale.
+        self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
         if disable_value:
-            self.set_index_k_buffer(layer, loc, cache_idx_k)
+            self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)
         else:
-            self.set_index_kv_buffer(layer, loc, cache_idx_k, cache_idx_v)
+            self.set_index_kv_buffer(
+                layer,
+                loc,
+                cache_idx_k,
+                cache_idx_v,
+                idx_k_scale,
+                idx_v_scale,
+            )
 
     def get_kv_size_bytes(self):
         sub_pools = [self.main_pool, self.index_kv_pool, self.index_k_pool]
