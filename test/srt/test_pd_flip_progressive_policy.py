@@ -27,6 +27,12 @@ def test_slo_decision_requires_prefill_risk_and_decode_headroom():
         is m.ProgressiveDecision.START
     )
     assert (
+        m.evaluate_slo_decision(
+            14, 20, 18, 20, 0.9, 20, 20, observing=True
+        )
+        is m.ProgressiveDecision.COMMIT
+    )
+    assert (
         m.evaluate_slo_decision(18, 20, 19, 20, 0.9, 20, 20)
         is m.ProgressiveDecision.RECOVER
     )
