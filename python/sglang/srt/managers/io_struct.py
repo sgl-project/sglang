@@ -1764,6 +1764,19 @@ class PDFlipMigrationSourceFinishReq(BaseReq):
 
 
 @dataclass
+class PDFlipMigrationSourceDeltaReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationTargetDeltaPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    source_url: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class PDFlipMigrationTargetCommitReq(BaseReq):
     session_id: Optional[str] = None
     rids: Optional[List[str]] = None
@@ -1779,6 +1792,11 @@ class PDFlipMigrationTargetAbortReq(BaseReq):
 class PDFlipMigrationAbortReq(BaseReq):
     session_id: Optional[str] = None
     reason: str = ""
+
+
+@dataclass
+class PDFlipMigrationOutputRelayReq(BaseReq):
+    output: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -8,20 +8,20 @@ The controller keeps orchestration policy outside SGLang workers:
 3. dry-run the HTTP actions before later tasks enable execution.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error, request
 from urllib.parse import urljoin
 
 try:
     from pd_flip_monitor import ClusterSLOSnapshot, PDFlipSLOMonitor
+    from pd_flip_trace_slo import TraceSLOMonitor
 except ModuleNotFoundError:
     import importlib.util
 
@@ -35,11 +35,28 @@ except ModuleNotFoundError:
     ClusterSLOSnapshot = _MONITOR_MODULE.ClusterSLOSnapshot
     PDFlipSLOMonitor = _MONITOR_MODULE.PDFlipSLOMonitor
 
+    _TRACE_SLO_PATH = Path(__file__).with_name("pd_flip_trace_slo.py")
+    _TRACE_SLO_SPEC = importlib.util.spec_from_file_location(
+        "pd_flip_trace_slo", _TRACE_SLO_PATH
+    )
+    _TRACE_SLO_MODULE = importlib.util.module_from_spec(_TRACE_SLO_SPEC)
+    sys.modules[_TRACE_SLO_SPEC.name] = _TRACE_SLO_MODULE
+    _TRACE_SLO_SPEC.loader.exec_module(_TRACE_SLO_MODULE)
+    TraceSLOMonitor = _TRACE_SLO_MODULE.TraceSLOMonitor
+
+
+def _migration_source_start_payload(session_id: str, target_url: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"session_id": session_id, "target_url": target_url}
+    max_reqs = os.environ.get("PD_FLIP_MIGRATION_MAX_REQS")
+    if max_reqs:
+        payload["max_reqs"] = int(max_reqs)
+    return payload
+
 
 JsonDict = Dict[str, Any]
 
 
-class HttpLike(Protocol):
+class HttpLike:
     def get_json(self, base_url: str, path: str) -> Any:
         ...
 
@@ -109,6 +126,8 @@ class PDClusterConfig:
     request_timeout_seconds: float = 10.0
     migration_timeout_seconds: float = 120.0
     migration_poll_interval_seconds: float = 0.5
+    observation_quiesce_seconds: float = 0.0
+    post_migration_idle_timeout_seconds: float = 2.0
 
     @staticmethod
     def from_dict(data: JsonDict) -> "PDClusterConfig":
@@ -130,6 +149,20 @@ class PDClusterConfig:
             ),
             migration_poll_interval_seconds=float(
                 data.get("migration_poll_interval_seconds", 0.5)
+            ),
+            observation_quiesce_seconds=float(
+                data.get(
+                    "observation_quiesce_seconds",
+                    os.environ.get("PD_FLIP_OBSERVE_QUIESCE_SECONDS", 0.0),
+                )
+            ),
+            post_migration_idle_timeout_seconds=float(
+                data.get(
+                    "post_migration_idle_timeout_seconds",
+                    os.environ.get(
+                        "PD_FLIP_POST_MIGRATION_IDLE_TIMEOUT_SECONDS", 2.0
+                    ),
+                )
             ),
         )
 
@@ -213,6 +246,32 @@ class MonitorLoopResult:
     iterations: int
     snapshots: List[JsonDict] = field(default_factory=list)
     actions: List[Any] = field(default_factory=list)
+    state_trace: List[JsonDict] = field(default_factory=list)
+
+
+class MonitorState:
+    SAFE = "safe"
+    PREPARING_KV_TRANSFER = "preparing_kv_transfer"
+    OBSERVING_SOURCE_QUIESCE = "observing_source_quiesce"
+    PREPARING_DRAIN = "preparing_drain"
+    FLIPPING_ROLE = "flipping_role"
+
+
+class ForcedRiskSnapshot:
+    prefill_slo_attainment = 0.0
+    decode_slo_attainment = 1.0
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "prefill_slo_attainment": self.prefill_slo_attainment,
+            "decode_slo_attainment": self.decode_slo_attainment,
+            "forced": True,
+        }
+
+
+class ForcedRiskMonitor:
+    def collect_cluster(self, monitor_nodes: Any) -> ForcedRiskSnapshot:
+        return ForcedRiskSnapshot()
 
 
 class PDFlipController:
@@ -266,6 +325,7 @@ class PDFlipController:
         self,
         direction: str,
         source_name: Optional[str] = None,
+        migration_target_name: Optional[str] = None,
     ) -> FlipPlan:
         metrics = self.collect_metrics()
         direction = direction.strip().lower()
@@ -276,7 +336,9 @@ class PDFlipController:
                 expected_role="decode",
                 prefer_high_load=True,
             )
-            migration_target = self._select_decode_migration_target(metrics, source)
+            migration_target = self._select_decode_migration_target(
+                metrics, source, target_name=migration_target_name
+            )
             target_role = "prefill"
             actions = self._build_d_to_p_actions(source, migration_target)
             reason = (
@@ -312,6 +374,7 @@ class PDFlipController:
         self,
         direction: str,
         source_name: Optional[str] = None,
+        migration_target_name: Optional[str] = None,
     ) -> FlipExecutionResult:
         started = time.monotonic()
         records: List[ActionRecord] = []
@@ -331,7 +394,9 @@ class PDFlipController:
                     expected_role="decode",
                     prefer_high_load=True,
                 )
-                target = self._select_decode_migration_target(metrics, source)
+                target = self._select_decode_migration_target(
+                    metrics, source, target_name=migration_target_name
+                )
                 target_role = "prefill"
                 migration_seconds = self._execute_d_to_p(source, target, records)
             elif direction == "p_to_d":
@@ -374,6 +439,53 @@ class PDFlipController:
                 migration_seconds=migration_seconds,
             )
 
+    def execute_two_phase(
+        self,
+        direction: str,
+        source_name: Optional[str] = None,
+        migration_target_name: Optional[str] = None,
+    ) -> MonitorLoopResult:
+        direction = direction.strip().lower()
+        if direction != "d_to_p":
+            raise ValueError("execute-two-phase currently supports d_to_p only")
+
+        metrics = self.collect_metrics()
+        source = self._select_source(
+            metrics,
+            source_name=source_name,
+            expected_role="decode",
+            prefer_high_load=True,
+        )
+        target = self._select_decode_migration_target(
+            metrics, source, target_name=migration_target_name
+        )
+        state_trace = [
+            _monitor_state_record(
+                state=MonitorState.SAFE,
+                snapshot_index=0,
+                reason="forced_two_phase",
+            )
+        ]
+        result = self._execute_d_to_p_two_phase(
+            source=source,
+            target=target,
+            slo_monitor=ForcedRiskMonitor(),
+            enter_threshold=0.9,
+            exit_threshold=2.0,
+            commit_threshold=0.9,
+            state_trace=state_trace,
+            snapshot_index=0,
+        )
+        result.metrics = metrics
+        return MonitorLoopResult(
+            success=result.success,
+            message=result.message,
+            iterations=1,
+            snapshots=[ForcedRiskSnapshot().to_dict()],
+            actions=[result],
+            state_trace=state_trace,
+        )
+
     def monitor(
         self,
         *,
@@ -386,12 +498,21 @@ class PDFlipController:
     ) -> MonitorLoopResult:
         snapshots: List[JsonDict] = []
         actions: List[Any] = []
+        state_trace: List[JsonDict] = []
         for idx in range(max(1, iterations)):
             metrics = self.collect_metrics()
             snapshot = slo_monitor.collect_cluster(
                 (m.name, m.worker_url, m.effective_role) for m in metrics
             )
             snapshots.append(snapshot.to_dict())
+            if not state_trace:
+                state_trace.append(
+                    _monitor_state_record(
+                        state=MonitorState.SAFE,
+                        snapshot_index=len(snapshots) - 1,
+                        reason="monitor_sampled",
+                    )
+                )
             if _prefill_risk(snapshot, enter_threshold):
                 source = self._select_source(
                     metrics,
@@ -407,6 +528,8 @@ class PDFlipController:
                     enter_threshold=enter_threshold,
                     exit_threshold=exit_threshold,
                     commit_threshold=commit_threshold,
+                    state_trace=state_trace,
+                    snapshot_index=len(snapshots) - 1,
                 )
                 actions.append(result)
                 return MonitorLoopResult(
@@ -415,9 +538,14 @@ class PDFlipController:
                     iterations=idx + 1,
                     snapshots=snapshots,
                     actions=actions,
+                    state_trace=state_trace,
                 )
             if _decode_risk(snapshot, enter_threshold):
-                result = self.execute(direction="p_to_d")
+                result = self._execute_p_to_d_monitor(
+                    metrics=metrics,
+                    state_trace=state_trace,
+                    snapshot_index=len(snapshots) - 1,
+                )
                 actions.append(result)
                 return MonitorLoopResult(
                     success=result.success,
@@ -425,6 +553,7 @@ class PDFlipController:
                     iterations=idx + 1,
                     snapshots=snapshots,
                     actions=actions,
+                    state_trace=state_trace,
                 )
             time.sleep(poll_interval_seconds)
 
@@ -434,6 +563,7 @@ class PDFlipController:
             iterations=max(1, iterations),
             snapshots=snapshots,
             actions=actions,
+            state_trace=state_trace,
         )
 
     def _execute_d_to_p(
@@ -457,6 +587,7 @@ class PDFlipController:
             "/pd_flip/runtime_role/admission",
             {"paused": True},
         )
+        self._observe_source_quiesce(records, source)
 
         migration_started = time.monotonic()
         source_start = self._post_worker(
@@ -464,7 +595,7 @@ class PDFlipController:
             "start_decode_migration_source",
             source,
             "/pd_flip/migration/source/start",
-            {"session_id": session_id, "target_url": target.worker_url},
+            _migration_source_start_payload(session_id, target.worker_url),
         )
         manifests = _response_manifests(source_start)
         self._post_worker(
@@ -493,7 +624,7 @@ class PDFlipController:
             "/pd_flip/migration/source/finish",
             {"session_id": session_id, "released_rids": released_rids},
         )
-        self._wait_source_idle(records, source)
+        self._assert_source_idle_after_migration(records, source)
         self._post_worker(
             records,
             "set_source_runtime_role",
@@ -538,16 +669,32 @@ class PDFlipController:
         enter_threshold: float,
         exit_threshold: float,
         commit_threshold: float,
+        state_trace: Optional[List[JsonDict]] = None,
+        snapshot_index: Optional[int] = None,
     ) -> FlipExecutionResult:
         started = time.monotonic()
         records: List[ActionRecord] = []
         session_id = f"pd-flip-{source.name}-to-{target.name}"
+        migration_seconds = 0.0
         monitor_nodes = [
             (metric.name, metric.worker_url, metric.effective_role)
             for metric in self.collect_metrics()
         ]
+        state_trace = state_trace if state_trace is not None else []
 
         try:
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.PREPARING_KV_TRANSFER,
+                    direction="d_to_p",
+                    source=source.name,
+                    migration_target=target.name,
+                    role_before=source.effective_role,
+                    role_after=source.effective_role,
+                    reason="prefill_slo_risk",
+                    snapshot_index=snapshot_index,
+                )
+            )
             self._post_router(
                 records,
                 "router_drain_source",
@@ -562,6 +709,47 @@ class PDFlipController:
                 "/pd_flip/runtime_role/admission",
                 {"paused": True},
             )
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.OBSERVING_SOURCE_QUIESCE,
+                    direction="d_to_p",
+                    source=source.name,
+                    migration_target=target.name,
+                    role_before=source.effective_role,
+                    role_after=source.effective_role,
+                    reason="source_drained",
+                    snapshot_index=snapshot_index,
+                    action_index=len(records),
+                )
+            )
+            self._observe_source_quiesce_for_duration(records, source, 0.0)
+            snapshot = slo_monitor.collect_cluster(monitor_nodes)
+            if _prefill_recovered(snapshot, exit_threshold):
+                self._cleanup_source_after_failure(source, records)
+                state_trace.append(
+                    _monitor_state_record(
+                        state=MonitorState.SAFE,
+                        direction="d_to_p",
+                        source=source.name,
+                        migration_target=target.name,
+                        role_before=source.effective_role,
+                        role_after=source.effective_role,
+                        reason="slo_recovered_during_source_quiesce",
+                        snapshot_index=snapshot_index,
+                        action_index=len(records),
+                    )
+                )
+                return FlipExecutionResult(
+                    success=True,
+                    message="SLO recovered during source quiesce; migration skipped",
+                    direction="d_to_p",
+                    source=source.name,
+                    target_role="decode",
+                    migration_target=target.name,
+                    actions=records,
+                    total_seconds=time.monotonic() - started,
+                    migration_seconds=0.0,
+                )
 
             migration_started = time.monotonic()
             source_start = self._post_worker(
@@ -569,7 +757,7 @@ class PDFlipController:
                 "start_decode_migration_source",
                 source,
                 "/pd_flip/migration/source/start",
-                {"session_id": session_id, "target_url": target.worker_url},
+                _migration_source_start_payload(session_id, target.worker_url),
             )
             manifests = _response_manifests(source_start)
             self._post_worker(
@@ -598,6 +786,19 @@ class PDFlipController:
             if transfer_result == "recovered":
                 self._abort_two_phase_migration(source, target, session_id, records)
                 self._cleanup_source_after_failure(source, records)
+                state_trace.append(
+                    _monitor_state_record(
+                        state=MonitorState.SAFE,
+                        direction="d_to_p",
+                        source=source.name,
+                        migration_target=target.name,
+                        role_before=source.effective_role,
+                        role_after=source.effective_role,
+                        reason="slo_recovered",
+                        snapshot_index=snapshot_index,
+                        action_index=len(records),
+                    )
+                )
                 return FlipExecutionResult(
                     success=True,
                     message="SLO recovered during preparing; migration aborted",
@@ -614,6 +815,19 @@ class PDFlipController:
             if not _prefill_risk(snapshot, commit_threshold):
                 self._abort_two_phase_migration(source, target, session_id, records)
                 self._cleanup_source_after_failure(source, records)
+                state_trace.append(
+                    _monitor_state_record(
+                        state=MonitorState.SAFE,
+                        direction="d_to_p",
+                        source=source.name,
+                        migration_target=target.name,
+                        role_before=source.effective_role,
+                        role_after=source.effective_role,
+                        reason="slo_recovered",
+                        snapshot_index=snapshot_index,
+                        action_index=len(records),
+                    )
+                )
                 return FlipExecutionResult(
                     success=True,
                     message="SLO recovered before commit; migration aborted",
@@ -626,14 +840,28 @@ class PDFlipController:
                     migration_seconds=migration_seconds,
                 )
 
-            self._post_worker(
-                records,
-                "commit_decode_migration_target",
-                target,
-                "/pd_flip/migration/target/commit",
-                {"session_id": session_id},
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.FLIPPING_ROLE,
+                    direction="d_to_p",
+                    source=source.name,
+                    migration_target=target.name,
+                    role_before=source.effective_role,
+                    role_after="prefill",
+                    reason="kv_pretransfer_complete",
+                    snapshot_index=snapshot_index,
+                    action_index=len(records),
+                )
             )
             released_rids = _manifest_rids(manifests)
+            self._sync_two_phase_delta_before_commit(
+                records=records,
+                source=source,
+                target=target,
+                session_id=session_id,
+                released_rids=released_rids,
+            )
+            migration_seconds = time.monotonic() - migration_started
             self._post_worker(
                 records,
                 "finish_decode_migration_source",
@@ -641,7 +869,14 @@ class PDFlipController:
                 "/pd_flip/migration/source/finish",
                 {"session_id": session_id, "released_rids": released_rids},
             )
-            self._wait_source_idle(records, source)
+            self._assert_source_idle_after_migration(records, source)
+            self._post_worker(
+                records,
+                "commit_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/commit",
+                {"session_id": session_id},
+            )
             self._post_worker(
                 records,
                 "set_source_runtime_role",
@@ -675,6 +910,19 @@ class PDFlipController:
                 "/pd_flip/router/worker/drain",
                 {"worker_id": source.router_worker_id, "draining": False},
             )
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.SAFE,
+                    direction="d_to_p",
+                    source=source.name,
+                    migration_target=target.name,
+                    role_before=source.effective_role,
+                    role_after="prefill",
+                    reason="role_flip_complete",
+                    snapshot_index=snapshot_index,
+                    action_index=len(records),
+                )
+            )
             return FlipExecutionResult(
                 success=True,
                 message="pd flip committed after two-phase migration",
@@ -689,6 +937,19 @@ class PDFlipController:
         except Exception as exc:
             self._abort_two_phase_migration(source, target, session_id, records)
             self._cleanup_source_after_failure(source, records)
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.SAFE,
+                    direction="d_to_p",
+                    source=source.name,
+                    migration_target=target.name,
+                    role_before=source.effective_role,
+                    role_after=source.effective_role,
+                    reason="error_recovered",
+                    snapshot_index=snapshot_index,
+                    action_index=len(records),
+                )
+            )
             return FlipExecutionResult(
                 success=False,
                 message=str(exc),
@@ -698,6 +959,7 @@ class PDFlipController:
                 migration_target=target.name,
                 actions=records,
                 total_seconds=time.monotonic() - started,
+                migration_seconds=migration_seconds,
             )
 
     def _wait_two_phase_migration_or_recovery(
@@ -710,8 +972,22 @@ class PDFlipController:
         monitor_nodes: List[Tuple[str, str, str]],
         exit_threshold: float,
     ) -> str:
-        deadline = time.monotonic() + self.config.migration_timeout_seconds
-        while time.monotonic() <= deadline:
+        started = time.monotonic()
+        transfer_deadline = started + self.config.migration_timeout_seconds
+        observe_until = started + max(0.0, self.config.observation_quiesce_seconds)
+        transfer_complete = False
+        last_source_status: Any = None
+        last_target_status: Any = None
+        while True:
+            now = time.monotonic()
+            if not transfer_complete and now > transfer_deadline:
+                raise TimeoutError(
+                    "two-phase D->P migration timed out: "
+                    f"source={last_source_status}, target={last_target_status}"
+                )
+            if transfer_complete and now >= observe_until:
+                return "transferred"
+
             snapshot = slo_monitor.collect_cluster(monitor_nodes)
             if _prefill_recovered(snapshot, exit_threshold):
                 return "recovered"
@@ -729,12 +1005,122 @@ class PDFlipController:
                 target.worker_url,
                 "/pd_flip/migration/status",
             )
+            last_source_status = source_status
+            last_target_status = target_status
             if _migration_response_complete(source_status) and _migration_response_complete(
                 target_status
             ):
-                return "transferred"
+                transfer_complete = True
+                if time.monotonic() >= observe_until:
+                    return "transferred"
+            failures = []
+            if _migration_response_failed(source_status):
+                failures.append(
+                    f"{source.name}: {_migration_response_error(source_status)}"
+                )
+            if _migration_response_failed(target_status):
+                failures.append(
+                    f"{target.name}: {_migration_response_error(target_status)}"
+                )
+            if failures:
+                raise RuntimeError(
+                    "two-phase D->P migration failed: " + "; ".join(failures)
+                )
+            sleep_until = observe_until if transfer_complete else transfer_deadline
+            time.sleep(
+                min(
+                    self.config.migration_poll_interval_seconds,
+                    max(0.0, sleep_until - time.monotonic()),
+                )
+            )
+
+    def _sync_two_phase_delta_before_commit(
+        self,
+        *,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        released_rids: List[str],
+    ) -> List[JsonDict]:
+        source_delta = self._post_worker(
+            records,
+            "start_decode_migration_source_delta",
+            source,
+            "/pd_flip/migration/source/delta",
+            {"session_id": session_id, "rids": released_rids},
+        )
+        delta_manifests = _response_manifests(source_delta)
+        if not delta_manifests:
+            return []
+
+        self._post_worker(
+            records,
+            "prepare_decode_migration_target_delta",
+            target,
+            "/pd_flip/migration/target/delta/prepare",
+            {
+                "session_id": session_id,
+                "source_url": source.worker_url,
+                "manifests": delta_manifests,
+            },
+        )
+        self._wait_two_phase_delta(
+            records=records,
+            source=source,
+            target=target,
+        )
+        return delta_manifests
+
+    def _wait_two_phase_delta(
+        self,
+        *,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        target: NodeMetrics,
+    ) -> None:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        last_source_status: Any = None
+        last_target_status: Any = None
+        while time.monotonic() <= deadline:
+            source_status = self._record_get(
+                records,
+                "wait_decode_migration_source_delta",
+                source.name,
+                source.worker_url,
+                "/pd_flip/migration/status",
+            )
+            target_status = self._record_get(
+                records,
+                "wait_decode_migration_target_delta",
+                target.name,
+                target.worker_url,
+                "/pd_flip/migration/status",
+            )
+            last_source_status = source_status
+            last_target_status = target_status
+            if _migration_response_complete(source_status) and _migration_response_complete(
+                target_status
+            ):
+                return
+            failures = []
+            if _migration_response_failed(source_status):
+                failures.append(
+                    f"{source.name}: {_migration_response_error(source_status)}"
+                )
+            if _migration_response_failed(target_status):
+                failures.append(
+                    f"{target.name}: {_migration_response_error(target_status)}"
+                )
+            if failures:
+                raise RuntimeError(
+                    "two-phase D->P delta migration failed: " + "; ".join(failures)
+                )
             time.sleep(self.config.migration_poll_interval_seconds)
-        raise TimeoutError("two-phase D->P migration timed out")
+        raise TimeoutError(
+            "two-phase D->P delta migration timed out: "
+            f"source={last_source_status}, target={last_target_status}"
+        )
 
     def _abort_two_phase_migration(
         self,
@@ -771,6 +1157,14 @@ class PDFlipController:
         source: NodeMetrics,
         records: List[ActionRecord],
     ) -> None:
+        self._prepare_p_to_d(source, records)
+        self._finish_p_to_d(source, records)
+
+    def _prepare_p_to_d(
+        self,
+        source: NodeMetrics,
+        records: List[ActionRecord],
+    ) -> None:
         self._post_router(
             records,
             "router_drain_source",
@@ -786,6 +1180,12 @@ class PDFlipController:
             {"paused": True},
         )
         self._wait_source_idle(records, source)
+
+    def _finish_p_to_d(
+        self,
+        source: NodeMetrics,
+        records: List[ActionRecord],
+    ) -> None:
         self._post_worker(
             records,
             "set_source_runtime_role",
@@ -819,6 +1219,98 @@ class PDFlipController:
             "/pd_flip/router/worker/drain",
             {"worker_id": source.router_worker_id, "draining": False},
         )
+
+    def _execute_p_to_d_monitor(
+        self,
+        *,
+        metrics: List[NodeMetrics],
+        state_trace: List[JsonDict],
+        snapshot_index: Optional[int],
+    ) -> FlipExecutionResult:
+        started = time.monotonic()
+        records: List[ActionRecord] = []
+        source: Optional[NodeMetrics] = None
+        try:
+            source = self._select_source(
+                metrics,
+                source_name=None,
+                expected_role="prefill",
+                prefer_high_load=False,
+            )
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.PREPARING_DRAIN,
+                    direction="p_to_d",
+                    source=source.name,
+                    role_before=source.effective_role,
+                    role_after=source.effective_role,
+                    reason="decode_slo_risk",
+                    snapshot_index=snapshot_index,
+                )
+            )
+            self._prepare_p_to_d(source, records)
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.FLIPPING_ROLE,
+                    direction="p_to_d",
+                    source=source.name,
+                    role_before=source.effective_role,
+                    role_after="decode",
+                    reason="source_drained",
+                    snapshot_index=snapshot_index,
+                    action_index=len(records),
+                )
+            )
+            self._finish_p_to_d(source, records)
+            state_trace.append(
+                _monitor_state_record(
+                    state=MonitorState.SAFE,
+                    direction="p_to_d",
+                    source=source.name,
+                    role_before=source.effective_role,
+                    role_after="decode",
+                    reason="role_flip_complete",
+                    snapshot_index=snapshot_index,
+                    action_index=len(records),
+                )
+            )
+            return FlipExecutionResult(
+                success=True,
+                message="pd flip executed",
+                direction="p_to_d",
+                source=source.name,
+                target_role="decode",
+                migration_target=None,
+                actions=records,
+                metrics=metrics,
+                total_seconds=time.monotonic() - started,
+            )
+        except Exception as exc:
+            if source is not None:
+                self._cleanup_source_after_failure(source, records)
+                state_trace.append(
+                    _monitor_state_record(
+                        state=MonitorState.SAFE,
+                        direction="p_to_d",
+                        source=source.name,
+                        role_before=source.effective_role,
+                        role_after=source.effective_role,
+                        reason="error_recovered",
+                        snapshot_index=snapshot_index,
+                        action_index=len(records),
+                    )
+                )
+            return FlipExecutionResult(
+                success=False,
+                message=str(exc),
+                direction="p_to_d",
+                source=source.name if source else None,
+                target_role="decode",
+                migration_target=None,
+                actions=records,
+                metrics=metrics,
+                total_seconds=time.monotonic() - started,
+            )
 
     def _post_worker(
         self,
@@ -944,20 +1436,231 @@ class PDFlipController:
             )
             if _migration_response_complete(last_response):
                 return last_response
+            if _migration_response_failed(last_response):
+                raise RuntimeError(
+                    f"{step} failed for {node.name}: "
+                    f"{_migration_response_error(last_response)}"
+                )
             time.sleep(self.config.migration_poll_interval_seconds)
         raise TimeoutError(f"{step} timed out for {node.name}: {last_response}")
+
+    def _observe_source_quiesce(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+    ) -> JsonDict:
+        return self._observe_source_quiesce_for_duration(
+            records, source, self.config.observation_quiesce_seconds
+        )
+
+    def _observe_source_quiesce_for_duration(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        duration_seconds: float,
+    ) -> JsonDict:
+        started = time.monotonic()
+        url = _join_url(source.worker_url, "/pd_flip/runtime_role/status")
+        requested_duration = duration_seconds
+        deadline = started + max(0.0, requested_duration)
+        samples: List[JsonDict] = []
+        try:
+            while True:
+                samples.append(self._source_residual_snapshot(source))
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                time.sleep(
+                    min(
+                        self.config.migration_poll_interval_seconds,
+                        max(0.0, deadline - now),
+                    )
+                )
+            response = dict(samples[-1]) if samples else {}
+            response.update(
+                {
+                    "samples": samples,
+                    "sample_count": len(samples),
+                    "source_quiesce_elapsed_s": time.monotonic() - started,
+                    "configured_observation_quiesce_seconds": self.config.observation_quiesce_seconds,
+                    "requested_observation_quiesce_seconds": requested_duration,
+                }
+            )
+            records.append(
+                ActionRecord(
+                    step="observe_source_quiesce",
+                    target=source.name,
+                    method="GET",
+                    url=url,
+                    response=response,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            return response
+        except Exception as exc:
+            records.append(
+                ActionRecord(
+                    step="observe_source_quiesce",
+                    target=source.name,
+                    method="GET",
+                    url=url,
+                    success=False,
+                    message=str(exc),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            raise
+
+    def _source_residual_snapshot(self, source: NodeMetrics) -> JsonDict:
+        status_body = self.client.get_json(
+            source.worker_url, "/pd_flip/runtime_role/status"
+        )
+        status = _first_successful_response(status_body)
+        role, is_idle, admission_paused = _parse_runtime_status(status)
+        loads_body = self.client.get_json(source.worker_url, "/v1/loads?include=all")
+        running_reqs, waiting_reqs, total_tokens, token_usage, raw_loads = _parse_loads(
+            loads_body
+        )
+        decode_prealloc_reqs = _sum_load_metric(raw_loads, "decode_prealloc_queue_reqs")
+        decode_transfer_reqs = _sum_load_metric(raw_loads, "decode_transfer_queue_reqs")
+        decode_retracted_reqs = _sum_load_metric(raw_loads, "decode_retracted_queue_reqs")
+        prefill_bootstrap_reqs = _sum_load_metric(
+            raw_loads, "prefill_bootstrap_queue_reqs"
+        )
+        prefill_inflight_reqs = _sum_load_metric(raw_loads, "prefill_inflight_queue_reqs")
+        total_residual_reqs = (
+            running_reqs
+            + waiting_reqs
+            + decode_prealloc_reqs
+            + decode_transfer_reqs
+            + decode_retracted_reqs
+            + prefill_bootstrap_reqs
+            + prefill_inflight_reqs
+        )
+        server_info: JsonDict = {}
+        try:
+            info = self.client.get_json(source.worker_url, "/server_info")
+            server_info = info if isinstance(info, dict) else {"raw": info}
+        except Exception as exc:
+            server_info = {"error": str(exc)}
+        return {
+            "source_role": role,
+            "source_is_idle": is_idle,
+            "source_admission_paused": admission_paused,
+            "source_running_reqs": running_reqs,
+            "source_waiting_queue_reqs": waiting_reqs,
+            "source_decode_prealloc_queue_reqs": decode_prealloc_reqs,
+            "source_decode_transfer_queue_reqs": decode_transfer_reqs,
+            "source_decode_retracted_queue_reqs": decode_retracted_reqs,
+            "source_prefill_bootstrap_queue_reqs": prefill_bootstrap_reqs,
+            "source_prefill_inflight_queue_reqs": prefill_inflight_reqs,
+            "source_total_residual_reqs": total_residual_reqs,
+            "source_total_tokens": total_tokens,
+            "source_token_usage": token_usage,
+            "raw_runtime_status": status_body,
+            "raw_loads": raw_loads,
+            "raw_server_info": server_info,
+        }
+
+    def _assert_source_idle_after_migration(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+    ) -> Any:
+        started = time.monotonic()
+        step = "post_migration_idle_assertion"
+        path = "/pd_flip/runtime_role/status"
+        url = _join_url(source.worker_url, path)
+        deadline = started + max(0.0, self.config.post_migration_idle_timeout_seconds)
+        samples: List[Any] = []
+        last_response: Any = None
+        try:
+            while True:
+                last_response = self.client.get_json(source.worker_url, path)
+                _raise_if_unsuccessful(last_response, step)
+                samples.append(last_response)
+                status = _first_successful_response(last_response)
+                _, is_idle, _ = _parse_runtime_status(status)
+                if is_idle:
+                    response = {
+                        "source_idle": True,
+                        "sample_count": len(samples),
+                        "samples": samples,
+                        "last_response": last_response,
+                    }
+                    records.append(
+                        ActionRecord(
+                            step=step,
+                            target=source.name,
+                            method="GET",
+                            url=url,
+                            response=response,
+                            elapsed_seconds=time.monotonic() - started,
+                        )
+                    )
+                    return last_response
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                time.sleep(
+                    min(
+                        self.config.migration_poll_interval_seconds,
+                        max(0.0, deadline - now),
+                    )
+                )
+            message = f"{step} timed out for {source.name}: {last_response}"
+            records.append(
+                ActionRecord(
+                    step=step,
+                    target=source.name,
+                    method="GET",
+                    url=url,
+                    response={
+                        "source_idle": False,
+                        "sample_count": len(samples),
+                        "samples": samples,
+                        "last_response": last_response,
+                    },
+                    success=False,
+                    message=message,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            )
+            raise TimeoutError(message)
+        except Exception as exc:
+            if not records or records[-1].step != step:
+                records.append(
+                    ActionRecord(
+                        step=step,
+                        target=source.name,
+                        method="GET",
+                        url=url,
+                        success=False,
+                        message=str(exc),
+                        elapsed_seconds=time.monotonic() - started,
+                    )
+                )
+            raise
 
     def _wait_source_idle(
         self,
         records: List[ActionRecord],
         source: NodeMetrics,
+        *,
+        step: str = "wait_source_idle",
+        timeout_seconds: Optional[float] = None,
     ) -> Any:
-        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        timeout = (
+            self.config.migration_timeout_seconds
+            if timeout_seconds is None
+            else max(0.0, timeout_seconds)
+        )
+        deadline = time.monotonic() + timeout
         last_response: Any = None
-        while time.monotonic() <= deadline:
+        while True:
             last_response = self._record_get(
                 records,
-                "wait_source_idle",
+                step,
                 source.name,
                 source.worker_url,
                 "/pd_flip/runtime_role/status",
@@ -966,8 +1669,16 @@ class PDFlipController:
             _, is_idle, _ = _parse_runtime_status(status)
             if is_idle:
                 return last_response
-            time.sleep(self.config.migration_poll_interval_seconds)
-        raise TimeoutError(f"wait_source_idle timed out for {source.name}: {last_response}")
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            time.sleep(
+                min(
+                    self.config.migration_poll_interval_seconds,
+                    max(0.0, deadline - now),
+                )
+            )
+        raise TimeoutError(f"{step} timed out for {source.name}: {last_response}")
 
     def _cleanup_source_after_failure(
         self,
@@ -1034,8 +1745,24 @@ class PDFlipController:
         return candidates[0]
 
     def _select_decode_migration_target(
-        self, metrics: List[NodeMetrics], source: NodeMetrics
+        self,
+        metrics: List[NodeMetrics],
+        source: NodeMetrics,
+        *,
+        target_name: Optional[str] = None,
     ) -> NodeMetrics:
+        if target_name:
+            target = _find_metric(metrics, target_name)
+            if target is None:
+                raise ValueError(f"unknown migration target node: {target_name}")
+            if target.name == source.name:
+                raise ValueError("migration target must be different from source")
+            if target.effective_role != "decode":
+                raise ValueError(
+                    f"migration target {target.name} has role {target.effective_role}, expected decode"
+                )
+            return target
+
         candidates = [
             metric
             for metric in metrics
@@ -1069,6 +1796,17 @@ class PDFlipController:
                 {"paused": True},
             ),
             self._worker_action(
+                "observe_source_quiesce",
+                source,
+                "GET",
+                "/pd_flip/runtime_role/status",
+                {
+                    "duration_seconds": 0.0,
+                    "poll_interval_seconds": self.config.migration_poll_interval_seconds,
+                    "also_samples": ["/v1/loads?include=all", "/server_info"],
+                },
+            ),
+            self._worker_action(
                 "start_decode_migration_source",
                 source,
                 "POST",
@@ -1084,7 +1822,8 @@ class PDFlipController:
                     "session_id": session_id,
                     "source_url": source.worker_url,
                     "manifests": "<from start_decode_migration_source>",
-                    "adopt_on_success": True,
+                    "prepare_only": True,
+                    "adopt_on_commit": True,
                 },
             ),
             self._worker_action(
@@ -1110,6 +1849,49 @@ class PDFlipController:
                 },
             ),
             self._worker_action(
+                "start_decode_migration_source_delta",
+                source,
+                "POST",
+                "/pd_flip/migration/source/delta",
+                {
+                    "session_id": session_id,
+                    "rids": "<from start_decode_migration_source>",
+                },
+            ),
+            self._worker_action(
+                "prepare_decode_migration_target_delta",
+                target,
+                "POST",
+                "/pd_flip/migration/target/delta/prepare",
+                {
+                    "session_id": session_id,
+                    "source_url": source.worker_url,
+                    "manifests": "<from start_decode_migration_source_delta>",
+                },
+            ),
+            self._worker_action(
+                "wait_decode_migration_source_delta",
+                source,
+                "GET",
+                "/pd_flip/migration/status",
+                {
+                    "timeout_seconds": self.config.migration_timeout_seconds,
+                    "poll_interval_seconds": self.config.migration_poll_interval_seconds,
+                    "target_url": target.worker_url,
+                },
+            ),
+            self._worker_action(
+                "wait_decode_migration_target_delta",
+                target,
+                "GET",
+                "/pd_flip/migration/status",
+                {
+                    "timeout_seconds": self.config.migration_timeout_seconds,
+                    "poll_interval_seconds": self.config.migration_poll_interval_seconds,
+                    "source_url": source.worker_url,
+                },
+            ),
+            self._worker_action(
                 "finish_decode_migration_source",
                 source,
                 "POST",
@@ -1120,12 +1902,12 @@ class PDFlipController:
                 },
             ),
             self._worker_action(
-                "wait_source_idle",
+                "post_migration_idle_assertion",
                 source,
                 "GET",
                 "/pd_flip/runtime_role/status",
                 {
-                    "timeout_seconds": self.config.migration_timeout_seconds,
+                    "timeout_seconds": self.config.post_migration_idle_timeout_seconds,
                     "poll_interval_seconds": self.config.migration_poll_interval_seconds,
                 },
             ),
@@ -1302,6 +2084,25 @@ def _migration_response_complete(response: Any) -> bool:
     return failed == 0 and pending == 0
 
 
+def _migration_response_failed(response: Any) -> bool:
+    item = _first_successful_response(response)
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    failed = int(status.get("failed_reqs") or 0)
+    state = str(status.get("state") or item.get("state") or "").lower()
+    return failed > 0 or state.endswith("_failed")
+
+
+def _migration_response_error(response: Any) -> str:
+    item = _first_successful_response(response)
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    return str(
+        status.get("last_error")
+        or item.get("message")
+        or status.get("state")
+        or "migration failed"
+    )
+
+
 def _parse_runtime_status(item: JsonDict) -> Tuple[str, bool, bool]:
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
     role = _normalize_role(
@@ -1334,6 +2135,18 @@ def _parse_loads(body: Any) -> Tuple[int, int, int, Optional[float], List[JsonDi
     return running_reqs, waiting_reqs, total_tokens, token_usage, raw_loads
 
 
+def _sum_load_metric(raw_loads: List[JsonDict], field: str) -> int:
+    total = 0
+    for item in raw_loads:
+        value = item.get(field)
+        if value is None and isinstance(item.get("disaggregation"), dict):
+            value = item["disaggregation"].get(field)
+        if value is None:
+            continue
+        total += int(value)
+    return total
+
+
 def _load_sort_key(metric: NodeMetrics) -> Tuple[int, int, int, float, str]:
     return (
         metric.running_reqs,
@@ -1349,6 +2162,34 @@ def _find_metric(metrics: List[NodeMetrics], name_or_worker_id: str) -> Optional
         if metric.name == name_or_worker_id or metric.router_worker_id == name_or_worker_id:
             return metric
     return None
+
+
+def _monitor_state_record(
+    *,
+    state: str,
+    direction: Optional[str] = None,
+    source: Optional[str] = None,
+    migration_target: Optional[str] = None,
+    role_before: Optional[str] = None,
+    role_after: Optional[str] = None,
+    reason: str = "",
+    snapshot_index: Optional[int] = None,
+    action_index: Optional[int] = None,
+) -> JsonDict:
+    record: JsonDict = {
+        "state": state,
+        "direction": direction,
+        "source": source,
+        "migration_target": migration_target,
+        "role_before": role_before,
+        "role_after": role_after,
+        "reason": reason,
+    }
+    if snapshot_index is not None:
+        record["snapshot_index"] = snapshot_index
+    if action_index is not None:
+        record["action_index"] = action_index
+    return record
 
 
 def _prefill_risk(snapshot: ClusterSLOSnapshot, threshold: float) -> bool:
@@ -1400,6 +2241,12 @@ def config_from_args(args: argparse.Namespace) -> PDClusterConfig:
         router_url=args.router_url,
         nodes=[_parse_node_spec(value) for value in args.node],
         request_timeout_seconds=args.timeout_seconds,
+        observation_quiesce_seconds=float(
+            os.environ.get("PD_FLIP_OBSERVE_QUIESCE_SECONDS", 0.0)
+        ),
+        post_migration_idle_timeout_seconds=float(
+            os.environ.get("PD_FLIP_POST_MIGRATION_IDLE_TIMEOUT_SECONDS", 2.0)
+        ),
     )
 
 
@@ -1426,16 +2273,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("metrics", help="Collect router/worker metrics")
 
     dry_run = subparsers.add_parser("dry-run", help="Build a flip plan without POSTs")
     dry_run.add_argument("--direction", choices=["d_to_p", "p_to_d"], required=True)
     dry_run.add_argument("--source-name", default=None)
+    dry_run.add_argument("--migration-target-name", default=None)
 
     execute = subparsers.add_parser("execute", help="Execute a PD role flip")
     execute.add_argument("--direction", choices=["d_to_p", "p_to_d"], required=True)
     execute.add_argument("--source-name", default=None)
+    execute.add_argument("--migration-target-name", default=None)
+
+    execute_two_phase = subparsers.add_parser(
+        "execute-two-phase",
+        help="Force the monitor-style two-phase D->P path with prepare_only/commit.",
+    )
+    execute_two_phase.add_argument(
+        "--direction", choices=["d_to_p"], default="d_to_p"
+    )
+    execute_two_phase.add_argument("--source-name", default=None)
+    execute_two_phase.add_argument("--migration-target-name", default=None)
 
     monitor = subparsers.add_parser("monitor", help="Run monitor-driven PD flip loop")
     monitor.add_argument("--ttft-slo", type=float, required=True)
@@ -1446,12 +2305,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--commit-threshold", type=float, default=0.9)
     monitor.add_argument("--iterations", type=int, default=1)
     monitor.add_argument("--poll-interval", type=float, default=1.0)
+    monitor.add_argument(
+        "--trace-slo-ledger",
+        default=None,
+        help="Use request-level trace SLO JSONL ledger instead of Prometheus histograms.",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return 2
     try:
         config = config_from_args(args)
         client = HttpClient(api_key=args.api_key, timeout_seconds=args.timeout_seconds)
@@ -1462,19 +2329,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output = controller.dry_run(
                 direction=args.direction,
                 source_name=args.source_name,
+                migration_target_name=args.migration_target_name,
             )
         elif args.command == "execute":
             output = controller.execute(
                 direction=args.direction,
                 source_name=args.source_name,
+                migration_target_name=args.migration_target_name,
+            )
+        elif args.command == "execute-two-phase":
+            output = controller.execute_two_phase(
+                direction=args.direction,
+                source_name=args.source_name,
+                migration_target_name=args.migration_target_name,
             )
         elif args.command == "monitor":
-            slo_monitor = PDFlipSLOMonitor(
-                ttft_slo_seconds=args.ttft_slo,
-                tpot_slo_seconds=args.tpot_slo,
-                window_seconds=args.window_seconds,
-                client=client,
-            )
+            if args.trace_slo_ledger:
+                slo_monitor = TraceSLOMonitor(
+                    ledger_path=args.trace_slo_ledger,
+                    window_seconds=args.window_seconds,
+                    client=client,
+                )
+            else:
+                slo_monitor = PDFlipSLOMonitor(
+                    ttft_slo_seconds=args.ttft_slo,
+                    tpot_slo_seconds=args.tpot_slo,
+                    window_seconds=args.window_seconds,
+                    client=client,
+                )
             output = controller.monitor(
                 slo_monitor=slo_monitor,
                 enter_threshold=args.enter_threshold,
@@ -1486,7 +2368,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             parser.error(f"unknown command {args.command}")
         print(json.dumps(output, default=_json_default, indent=2, sort_keys=True))
-        if args.command == "execute" and isinstance(output, FlipExecutionResult):
+        if args.command in ("execute", "execute-two-phase") and hasattr(
+            output, "success"
+        ):
             return 0 if output.success else 1
         return 0
     except Exception as exc:

@@ -128,11 +128,14 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PDFlipMigrationAbortReq,
+    PDFlipMigrationOutputRelayReq,
+    PDFlipMigrationSourceDeltaReq,
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
+    PDFlipMigrationTargetDeltaPrepareReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleSetReq,
@@ -751,10 +754,38 @@ async def finish_pd_flip_migration_source(
     return await _global_state.tokenizer_manager.finish_pd_flip_migration_source(obj)
 
 
+@app.post("/pd_flip/migration/source/delta")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def start_pd_flip_migration_source_delta(
+    obj: PDFlipMigrationSourceDeltaReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_migration_source_delta(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/target/delta/prepare")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_pd_flip_migration_target_delta(
+    obj: PDFlipMigrationTargetDeltaPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target_delta(
+        obj
+    )
+
+
 @app.post("/pd_flip/migration/abort")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def abort_pd_flip_migration(obj: PDFlipMigrationAbortReq, request: Request):
     return await _global_state.tokenizer_manager.abort_pd_flip_migration(obj)
+
+
+@app.post("/pd_flip/migration/output/relay")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def relay_pd_flip_migration_output(
+    obj: PDFlipMigrationOutputRelayReq, request: Request
+):
+    return await _global_state.tokenizer_manager.relay_pd_flip_migration_output(obj)
 
 
 @app.get("/pd_flip/runtime_role/status")

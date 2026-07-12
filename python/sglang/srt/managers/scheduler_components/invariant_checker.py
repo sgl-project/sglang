@@ -54,6 +54,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_pd_flip_held_reqs: Callable = field(default=lambda: (lambda: ()))
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -150,9 +151,48 @@ class SchedulerInvariantChecker:
             )
         return leak, msg
 
-    def _get_total_uncached_sizes(
-        self,
-    ) -> Tuple[int, int]:
+    def _req_uncached_sizes(self, req) -> Tuple[int, int]:
+        assert req.kv_committed_freed == req.kv_overallocated_freed
+        if req.kv_committed_freed or req.req_pool_idx is None:
+            return 0, 0
+
+        allocated_len = req.kv_allocated_len
+        if self.page_size > 1:
+            allocated_len = ceil_align(allocated_len, self.page_size)
+            assert req.cache_protected_len % self.page_size == 0
+
+        full_uncached = allocated_len - req.cache_protected_len
+        swa_uncached = 0
+        if self.is_hybrid_swa:
+            swa_uncached = allocated_len - max(
+                req.cache_protected_len, req.swa_evicted_seqlen
+            )
+        return full_uncached, swa_uncached
+
+    def _get_pd_flip_held_uncached_sizes(self) -> Tuple[int, int]:
+        full_uncached = 0
+        swa_uncached = 0
+        seen = set()
+        for req in self.get_pd_flip_held_reqs() or ():
+            req_id = id(req)
+            if req_id in seen:
+                continue
+            seen.add(req_id)
+            req_full_uncached, req_swa_uncached = self._req_uncached_sizes(req)
+            full_uncached += req_full_uncached
+            swa_uncached += req_swa_uncached
+        return full_uncached, swa_uncached
+
+    def _get_pd_flip_held_req_count(self) -> int:
+        seen_req_pool_indices = set()
+        for req in self.get_pd_flip_held_reqs() or ():
+            req_pool_idx = getattr(req, "req_pool_idx", None)
+            if req_pool_idx is None:
+                continue
+            seen_req_pool_indices.add(req_pool_idx)
+        return len(seen_req_pool_indices)
+
+    def _get_total_uncached_sizes(self) -> Tuple[int, int]:
         """Sum uncached tokens for full and SWA pools across all active batches.
 
         Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
@@ -176,22 +216,25 @@ class SchedulerInvariantChecker:
 
         full_uncached = 0
         swa_uncached = 0
+        seen = set()
         for batch in batches:
             for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
+                req_id = id(req)
+                if req_id in seen:
                     continue
+                seen.add(req_id)
+                req_full_uncached, req_swa_uncached = self._req_uncached_sizes(req)
+                full_uncached += req_full_uncached
+                swa_uncached += req_swa_uncached
 
-                allocated_len = req.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
-
-                full_uncached += allocated_len - req.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
-                    )
+        for req in self.get_pd_flip_held_reqs() or ():
+            req_id = id(req)
+            if req_id in seen:
+                continue
+            seen.add(req_id)
+            req_full_uncached, req_swa_uncached = self._req_uncached_sizes(req)
+            full_uncached += req_full_uncached
+            swa_uncached += req_swa_uncached
 
         return full_uncached, swa_uncached
 
@@ -238,12 +281,19 @@ class SchedulerInvariantChecker:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self.pool_stats_observer.session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        pd_flip_held_req_count = self._get_pd_flip_held_req_count()
+        if (
+            len(self.req_to_token_pool.free_slots)
+            + session_req_count
+            + pd_flip_held_req_count
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
+                f"pd_flip_held={pd_flip_held_req_count}, "
+                f"total_size={req_total_size}\n"
             )
             raise_error_or_warn(
                 self,
@@ -268,12 +318,19 @@ class SchedulerInvariantChecker:
         has_leak = False
         messages = []
 
-        full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
+        held_full_uncached, held_swa_uncached = (
+            self._get_pd_flip_held_uncached_sizes()
+        )
+        full_leak, full_msg = self._check_full_pool(
+            ps, uncached=uncached + held_full_uncached
+        )
         has_leak |= full_leak
         messages.append(full_msg)
 
         if self.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
+            swa_leak, swa_msg = self._check_swa_pool(
+                ps, uncached=held_swa_uncached
+            )
             has_leak |= swa_leak
             messages.append(swa_msg)
 

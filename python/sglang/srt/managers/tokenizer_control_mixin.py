@@ -56,11 +56,13 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PDFlipMigrationAbortReq,
     PDFlipMigrationReqOutput,
+    PDFlipMigrationSourceDeltaReq,
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
+    PDFlipMigrationTargetDeltaPrepareReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleReqOutput,
@@ -857,7 +859,17 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: PDFlipMigrationTargetPrepareReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
-        return await self.pd_flip_migration_communicator(obj)
+        responses = await self.pd_flip_migration_communicator(obj)
+        if obj.source_url and all(res.success for res in responses):
+            targets = getattr(self, "pd_flip_output_relay_targets", None)
+            if targets is None:
+                targets = {}
+                self.pd_flip_output_relay_targets = targets
+            for manifest in obj.manifests or []:
+                rid = manifest.get("rid") if isinstance(manifest, dict) else None
+                if rid is not None and not bool(manifest.get("stream", False)):
+                    targets[str(rid)] = obj.source_url
+        return responses
 
     async def commit_pd_flip_migration_target(
         self: TokenizerManager, obj: PDFlipMigrationTargetCommitReq
@@ -869,7 +881,9 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: PDFlipMigrationTargetAbortReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
-        return await self.pd_flip_migration_communicator(obj)
+        responses = await self.pd_flip_migration_communicator(obj)
+        getattr(self, "pd_flip_output_relay_targets", {}).clear()
+        return responses
 
     async def get_pd_flip_migration_status(
         self: TokenizerManager, obj: PDFlipMigrationStatusReq
@@ -879,6 +893,19 @@ class TokenizerControlMixin:
 
     async def finish_pd_flip_migration_source(
         self: TokenizerManager, obj: PDFlipMigrationSourceFinishReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def start_pd_flip_migration_source_delta(
+        self: TokenizerManager, obj: PDFlipMigrationSourceDeltaReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def prepare_pd_flip_migration_target_delta(
+        self: TokenizerManager, obj: PDFlipMigrationTargetDeltaPrepareReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         return await self.pd_flip_migration_communicator(obj)

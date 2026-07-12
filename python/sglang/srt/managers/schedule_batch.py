@@ -212,6 +212,14 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class FINISH_MIGRATED(BaseFinishReason):
+    def to_json(self):
+        return {
+            "type": "pd_flip_migrated",
+            "message": "Request migrated during PD role flip.",
+        }
+
+
 class Modality(Enum):
     IMAGE = auto()
     VIDEO = auto()

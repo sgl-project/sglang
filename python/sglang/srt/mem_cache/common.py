@@ -537,6 +537,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    if getattr(req, "pd_flip_defer_kv_release", False) and not getattr(
+        req, "pd_flip_force_kv_release", False
+    ):
+        req.pd_flip_kv_release_deferred = True
+        req.pd_flip_deferred_kv_release_is_insert = bool(is_insert)
+        return
+
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),

@@ -1652,7 +1652,10 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            path = getattr(route, "path", None)
+            if path is not None:
+                return path, True
+            return request.url.path, False
 
     return request.url.path, False
 

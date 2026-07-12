@@ -1,8 +1,11 @@
 import types
 import unittest
 
+import torch
+
 from sglang.srt.managers.io_struct import SetInternalStateReq
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.disaggregation.flip_state_machine import (
     ClusterSnapshot,
     FlipDecision,
@@ -31,6 +34,9 @@ class TestPDFlipInternalStateUpdate(unittest.TestCase):
                 pd_flip_prepare_ack=False,
                 pd_flip_commit_ack=False,
                 pd_flip_abort=False,
+                page_size=1,
+                speculative_algorithm=None,
+                strip_thinking_cache=False,
             )
         )
 
@@ -260,6 +266,96 @@ class TestPDFlipInternalStateUpdate(unittest.TestCase):
         self.assertEqual(output.manifests[0]["origin_input_ids"], [1, 2, 3])
         self.assertEqual(output.manifests[0]["output_ids"], [4, 5])
         self.assertEqual(output.manifests[0]["kv_committed_len"], 4)
+
+    def test_pd_flip_source_page_indices_rejects_released_req_pool_idx(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.arange(40, dtype=torch.int32).reshape(2, 20)
+        )
+        scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(page_size=1)
+        req = types.SimpleNamespace(rid="rid-1", req_pool_idx=None)
+
+        with self.assertRaisesRegex(ValueError, "req_pool_idx was released"):
+            Scheduler._pd_flip_source_page_indices(scheduler, req, committed_len=4)
+
+    def test_pd_flip_source_page_indices_rejects_non_scalar_req_pool_idx(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.arange(40, dtype=torch.int32).reshape(2, 20)
+        )
+        scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(page_size=1)
+        req = types.SimpleNamespace(
+            rid="rid-1", req_pool_idx=torch.tensor([0, 1], dtype=torch.int64)
+        )
+
+        with self.assertRaisesRegex(ValueError, "non-scalar req_pool_idx"):
+            Scheduler._pd_flip_source_page_indices(scheduler, req, committed_len=4)
+
+    def test_pd_flip_deferred_release_keeps_source_req_pool_idx(self):
+        calls = []
+        req = types.SimpleNamespace(
+            req_pool_idx=7,
+            mamba_pool_idx=None,
+            pd_flip_defer_kv_release=True,
+            pop_overallocated_kv_cache=lambda: (0, 0),
+        )
+        tree_cache = types.SimpleNamespace(
+            supports_mamba=lambda: False,
+            cache_finished_req=lambda req, is_insert=True: calls.append(
+                ("cache", is_insert)
+            ),
+            req_to_token_pool=types.SimpleNamespace(
+                free=lambda req: calls.append(("free", req.req_pool_idx))
+            ),
+        )
+
+        release_kv_cache(req, tree_cache, is_insert=False)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(req.req_pool_idx, 7)
+        self.assertTrue(req.pd_flip_kv_release_deferred)
+        self.assertFalse(req.pd_flip_deferred_kv_release_is_insert)
+
+    def test_pd_flip_release_source_requests_frees_deferred_finished_req(self):
+        calls = []
+
+        def cache_finished_req(req, is_insert=True):
+            calls.append(("cache", is_insert))
+            req.req_pool_idx = None
+
+        req = types.SimpleNamespace(
+            rid="rid-1",
+            req_pool_idx=7,
+            mamba_pool_idx=None,
+            pd_flip_defer_kv_release=True,
+            pd_flip_kv_release_deferred=True,
+            pd_flip_deferred_kv_release_is_insert=False,
+            finished=lambda: True,
+            pop_overallocated_kv_cache=lambda: (0, 0),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = types.SimpleNamespace(
+            supports_mamba=lambda: False,
+            cache_finished_req=cache_finished_req,
+            req_to_token_pool=types.SimpleNamespace(
+                free=lambda req: calls.append(("free", req.req_pool_idx))
+            ),
+        )
+        session = {
+            "source_entries": {
+                "rid-1": {
+                    "req": req,
+                    "metadata_index": -1,
+                }
+            }
+        }
+
+        Scheduler._pd_flip_release_source_requests(scheduler, session, {"rid-1"})
+
+        self.assertEqual(calls, [("cache", False)])
+        self.assertIsNone(req.req_pool_idx)
+        self.assertFalse(req.pd_flip_defer_kv_release)
+        self.assertFalse(req.pd_flip_kv_release_deferred)
 
     def test_pd_flip_prepare_waits_for_active_migration_before_ack(self):
         server_args = get_global_server_args()

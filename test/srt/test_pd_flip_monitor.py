@@ -99,6 +99,33 @@ sglang:time_to_first_token_seconds_bucket{le="+Inf"} 10
         self.assertEqual(snapshot.prefill_slo_attainment, 0.8)
         self.assertEqual(snapshot.decode_slo_attainment, 0.9)
 
+    def test_window_uses_cluster_ttft_when_prefill_nodes_have_no_ttft_samples(self):
+        window = self.monitor.SLOWindow(window_seconds=10.0)
+        window.add(
+            self.monitor.NodeSLOSample(
+                timestamp=1.0,
+                name="node0",
+                role="prefill",
+                ttft=self.monitor.SampleCounts(good=0, total=0),
+            )
+        )
+        window.add(
+            self.monitor.NodeSLOSample(
+                timestamp=1.5,
+                name="node1",
+                role="decode",
+                ttft=self.monitor.SampleCounts(good=1, total=4),
+                tpot=self.monitor.SampleCounts(good=18, total=20),
+            )
+        )
+
+        snapshot = window.snapshot(timestamp=2.0)
+
+        self.assertEqual(snapshot.prefill_nodes, 1)
+        self.assertEqual(snapshot.decode_nodes, 1)
+        self.assertEqual(snapshot.prefill_slo_attainment, 0.25)
+        self.assertEqual(snapshot.decode_slo_attainment, 0.9)
+
     def test_monitor_collects_cluster_snapshot_from_workers(self):
         monitor = self.monitor.PDFlipSLOMonitor(
             ttft_slo_seconds=0.2,

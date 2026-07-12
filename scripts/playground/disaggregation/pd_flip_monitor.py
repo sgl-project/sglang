@@ -96,6 +96,8 @@ class SLOWindow:
         prefill_counts = _sum_counts(
             sample.ttft for sample in self.samples if sample.role == "prefill"
         )
+        if prefill_counts.total <= 0 and prefill_nodes:
+            prefill_counts = _sum_counts(sample.ttft for sample in self.samples)
         decode_counts = _sum_counts(
             sample.tpot for sample in self.samples if sample.role == "decode"
         )

@@ -63,16 +63,60 @@ class TestPDFlipActiveDecodeHandoff(unittest.TestCase):
 
     def test_source_release_uses_internal_migration_finish_reason(self):
         scheduler = (REPO_ROOT / "python/sglang/srt/managers/scheduler.py").read_text()
-
-        self.assertIn(
-            "Request migrated during PD role flip; output continues on target decode.",
-            scheduler,
+        release_start = scheduler.index("def _pd_flip_release_source_requests")
+        release_end = scheduler.index(
+            "def _pd_flip_prepare_target_entries", release_start
         )
+        release_body = scheduler[release_start:release_end]
+
+        self.assertNotIn("FINISH_ABORT", release_body)
         self.assertNotIn(
             'FINISH_ABORT(\n                    "Request migrated during PD role flip.",\n                    HTTPStatus.SERVICE_UNAVAILABLE',
             scheduler,
         )
-        self.assertIn("pd_flip_migrated_to_target", scheduler)
+        self.assertIn("pd_flip_migrated_to_target", release_body)
+        self.assertIn("pd_flip_waiting_for_relay_output", release_body)
+
+    def test_pd_flip_output_relay_contract_is_declared(self):
+        io_struct = (REPO_ROOT / "python/sglang/srt/managers/io_struct.py").read_text()
+        tokenizer_control = (
+            REPO_ROOT / "python/sglang/srt/managers/tokenizer_control_mixin.py"
+        ).read_text()
+        tokenizer_manager = (
+            REPO_ROOT / "python/sglang/srt/managers/tokenizer_manager.py"
+        ).read_text()
+        http_server = (
+            REPO_ROOT / "python/sglang/srt/entrypoints/http_server.py"
+        ).read_text()
+
+        self.assertIn("PDFlipMigrationOutputRelayReq", io_struct)
+        self.assertIn("pd_flip_output_relay_targets", tokenizer_control)
+        self.assertIn("pd_flip_output_relay_targets", tokenizer_manager)
+        self.assertIn("relay_pd_flip_migration_output", tokenizer_manager)
+        self.assertIn("/pd_flip/migration/output/relay", http_server)
+
+    def test_pd_flip_delta_migration_contract_is_declared(self):
+        io_struct = (REPO_ROOT / "python/sglang/srt/managers/io_struct.py").read_text()
+        tokenizer_control = (
+            REPO_ROOT / "python/sglang/srt/managers/tokenizer_control_mixin.py"
+        ).read_text()
+        http_server = (
+            REPO_ROOT / "python/sglang/srt/entrypoints/http_server.py"
+        ).read_text()
+        scheduler = (REPO_ROOT / "python/sglang/srt/managers/scheduler.py").read_text()
+        controller = (
+            REPO_ROOT / "scripts/playground/disaggregation/pd_flip_controller.py"
+        ).read_text()
+
+        self.assertIn("class PDFlipMigrationSourceDeltaReq", io_struct)
+        self.assertIn("class PDFlipMigrationTargetDeltaPrepareReq", io_struct)
+        self.assertIn("start_pd_flip_migration_source_delta", tokenizer_control)
+        self.assertIn("prepare_pd_flip_migration_target_delta", tokenizer_control)
+        self.assertIn("/pd_flip/migration/source/delta", http_server)
+        self.assertIn("/pd_flip/migration/target/delta/prepare", http_server)
+        self.assertIn("def start_pd_flip_migration_source_delta", scheduler)
+        self.assertIn("def prepare_pd_flip_migration_target_delta", scheduler)
+        self.assertIn("_sync_two_phase_delta_before_commit", controller)
 
 
 if __name__ == "__main__":

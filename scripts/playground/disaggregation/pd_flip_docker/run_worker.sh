@@ -32,10 +32,16 @@ server_args=(
   --disaggregation-transfer-backend "${TRANSFER_BACKEND}"
   --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
   --disaggregation-ib-device "${IB_DEVICE}"
-  --enable-pd-flip-state-machine
-  --enable-pd-runtime-role-switch
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
 )
+
+if [[ "${ENABLE_PD_FLIP_STATE_MACHINE:-1}" == "1" ]]; then
+  server_args+=(--enable-pd-flip-state-machine)
+fi
+
+if [[ "${ENABLE_PD_RUNTIME_ROLE_SWITCH:-${ENABLE_PD_FLIP_STATE_MACHINE:-1}}" == "1" ]]; then
+  server_args+=(--enable-pd-runtime-role-switch)
+fi
 
 if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
@@ -48,6 +54,12 @@ launch_cmd="cd /sgl-workspace/sglang && PYTHONPATH=python exec ${server_cmd}"
 
 # shellcheck disable=SC2206
 extra_docker_args=(${EXTRA_DOCKER_ARGS:-})
+if [[ "${EXTRA_DOCKER_ARGS:-}" != *"MOONCAKE_LOCAL_HOSTNAME"* ]]; then
+  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [[ -n "${host_ip}" ]]; then
+    extra_docker_args+=(-e "MOONCAKE_LOCAL_HOSTNAME=${host_ip}")
+  fi
+fi
 
 exec docker run --rm \
   --gpus all \

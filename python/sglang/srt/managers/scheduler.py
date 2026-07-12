@@ -17,6 +17,7 @@ import dataclasses
 import faulthandler
 import hashlib
 import logging
+import numbers
 import os
 import signal
 import sys
@@ -144,11 +145,13 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PDFlipMigrationAbortReq,
     PDFlipMigrationReqOutput,
+    PDFlipMigrationSourceDeltaReq,
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
+    PDFlipMigrationTargetDeltaPrepareReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleReqOutput,
@@ -188,6 +191,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_MIGRATED,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -313,6 +317,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+PD_FLIP_MIN_METADATA_BUFFER_SIZE = 1024
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -1121,21 +1126,42 @@ class Scheduler(
     def _init_pd_metadata_buffers(
         self, buffer_size: int, hidden_size: int, hidden_states_dtype
     ) -> None:
-        if hasattr(self, "req_to_metadata_buffer_idx_allocator"):
-            return
+        current_allocator = getattr(self, "req_to_metadata_buffer_idx_allocator", None)
+        current_size = int(getattr(current_allocator, "size", 0) or 0)
+        if current_allocator is not None:
+            if current_size >= buffer_size:
+                return
+            available_size = (
+                current_allocator.available_size()
+                if hasattr(current_allocator, "available_size")
+                else current_size
+            )
+            if available_size != current_size:
+                raise RuntimeError(
+                    "cannot grow PD metadata buffers while metadata entries are allocated"
+                )
 
         self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
             buffer_size
         )
+        custom_mem_pool = None
+        kv_pool_allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if kv_pool_allocator is not None:
+            custom_mem_pool = (
+                kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool()
+            )
         self.disagg_metadata_buffers = MetadataBuffers(
             buffer_size,
             hidden_size=hidden_size,
             hidden_states_dtype=hidden_states_dtype,
-            custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+            custom_mem_pool=custom_mem_pool,
         )
 
     def _init_hybrid_disaggregation_metadata(self, model_config) -> None:
-        buffer_size = max(self.req_to_token_pool.size, self.max_running_requests) * 2
+        buffer_size = max(
+            max(self.req_to_token_pool.size, self.max_running_requests) * 2,
+            PD_FLIP_MIN_METADATA_BUFFER_SIZE,
+        )
         hidden_size = (
             model_config.spec_hidden_size
             if self.spec_algorithm.is_eagle()
@@ -1151,17 +1177,16 @@ class Scheduler(
         self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
 
     def _init_decode_disaggregation(self, draft_token_to_kv_pool, model_config) -> None:
-        if not hasattr(self, "req_to_metadata_buffer_idx_allocator"):
-            buffer_size = self.req_to_token_pool.size * 2
-            hidden_size = (
-                model_config.spec_hidden_size
-                if self.spec_algorithm.is_eagle()
-                else 16  # minimal padding size for RDMA
-            )
-            hidden_states_dtype = (
-                model_config.dtype if self.spec_algorithm.is_eagle() else torch.float32
-            )
-            self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+        buffer_size = self.req_to_token_pool.size * 2
+        hidden_size = (
+            model_config.spec_hidden_size
+            if self.spec_algorithm.is_eagle()
+            else 16  # minimal padding size for RDMA
+        )
+        hidden_states_dtype = (
+            model_config.dtype if self.spec_algorithm.is_eagle() else torch.float32
+        )
+        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
 
         # The decode requests polling kv cache
         self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -1198,21 +1223,20 @@ class Scheduler(
     def _init_prefill_disaggregation(
         self, draft_token_to_kv_pool, model_config
     ) -> None:
-        if not hasattr(self, "req_to_metadata_buffer_idx_allocator"):
-            buffer_size = self.max_running_requests * 2
-            hidden_size = (
-                model_config.spec_hidden_size
-                if self.spec_algorithm.is_eagle()
-                or self.spec_algorithm.is_standalone()
-                else 16  # minimal padding size for RDMA
-            )
-            hidden_states_dtype = (
-                model_config.dtype
-                if self.spec_algorithm.is_eagle()
-                or self.spec_algorithm.is_standalone()
-                else torch.float32
-            )
-            self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+        buffer_size = self.max_running_requests * 2
+        hidden_size = (
+            model_config.spec_hidden_size
+            if self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            else 16  # minimal padding size for RDMA
+        )
+        hidden_states_dtype = (
+            model_config.dtype
+            if self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            else torch.float32
+        )
+        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
 
         self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
             token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1237,7 +1261,8 @@ class Scheduler(
         return DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
 
     def pd_runtime_role_switch_enabled(self) -> bool:
-        return bool(getattr(self.server_args, "enable_pd_runtime_role_switch", False))
+        server_args = getattr(self, "server_args", None)
+        return bool(getattr(server_args, "enable_pd_runtime_role_switch", False))
 
     def _pd_runtime_role_status_dict(self) -> Dict[str, Any]:
         is_idle = False
@@ -1404,6 +1429,8 @@ class Scheduler(
         )
 
     def pd_flip_is_idle_for_commit(self, snapshot: ClusterSnapshot) -> bool:
+        if self._pd_flip_source_migration_blocks_idle():
+            return False
         snapshot_idle = (
             snapshot.waiting_reqs == 0
             and snapshot.running_reqs == 0
@@ -1612,9 +1639,48 @@ class Scheduler(
         except TypeError:
             return 0
 
+    def _pd_flip_waiting_req_skip_reason(self, req: Req) -> str:
+        finished = getattr(req, "finished", None)
+        if callable(finished) and finished():
+            return "finished"
+        if getattr(req, "req_pool_idx", None) is None:
+            return "missing_req_pool_idx"
+        kv_committed_len = getattr(req, "kv_committed_len", None)
+        if kv_committed_len is None:
+            kv_committed_len = len(getattr(req, "origin_input_ids", []) or []) + max(
+                0, len(getattr(req, "output_ids", []) or []) - 1
+            )
+        try:
+            committed_len = int(kv_committed_len or 0)
+        except (TypeError, ValueError):
+            committed_len = 0
+        if committed_len <= 0:
+            return "missing_committed_kv"
+        return ""
+
+    def _pd_flip_classify_waiting_reqs(
+        self, waiting_reqs: List[Req]
+    ) -> Tuple[List[Tuple[int, Req]], List[Dict[str, Any]]]:
+        selected: List[Tuple[int, Req]] = []
+        skipped: List[Dict[str, Any]] = []
+        for index, req in enumerate(waiting_reqs):
+            reason = self._pd_flip_waiting_req_skip_reason(req)
+            if reason:
+                skipped.append(
+                    {
+                        "rid": getattr(req, "rid", ""),
+                        "queue_index": index,
+                        "reason": reason,
+                    }
+                )
+                continue
+            selected.append((index, req))
+        return selected, skipped
+
     def start_pd_flip_migration_source(
         self, recv_req: PDFlipMigrationSourceStartReq
     ) -> PDFlipMigrationReqOutput:
+        timing_debug = {}
         role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
         if role != "decode":
             return PDFlipMigrationReqOutput(
@@ -1623,13 +1689,59 @@ class Scheduler(
                 status=self._pd_flip_migration_status_dict(),
             )
 
+        scan_started = time.monotonic()
         running_reqs = list(getattr(getattr(self, "running_batch", None), "reqs", []))
-        if recv_req.max_reqs is not None:
-            running_reqs = running_reqs[: max(0, recv_req.max_reqs)]
+        timing_debug["scan_running_reqs_s"] = time.monotonic() - scan_started
+        timing_debug["running_reqs"] = len(running_reqs)
 
+        waiting_scan_started = time.monotonic()
+        waiting_reqs = list(getattr(self, "waiting_queue", []))
+        waiting_selected, waiting_skipped = self._pd_flip_classify_waiting_reqs(
+            waiting_reqs
+        )
+        timing_debug["scan_waiting_reqs_s"] = time.monotonic() - waiting_scan_started
+        timing_debug["waiting_reqs"] = len(waiting_reqs)
+        timing_debug["waiting_skipped_count"] = len(waiting_skipped)
+        timing_debug["waiting_skipped"] = waiting_skipped
+
+        live_waiting_skipped = [
+            item for item in waiting_skipped if item.get("reason") != "finished"
+        ]
+        if live_waiting_skipped:
+            skipped_summary = ", ".join(
+                f"{item.get('rid', '')}:{item.get('reason', '')}"
+                for item in live_waiting_skipped
+            )
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=(
+                    "refusing partial migration; live waiting requests are not "
+                    f"migratable: {skipped_summary}"
+                ),
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        eligible_reqs = len(running_reqs) + len(waiting_selected)
+        if recv_req.max_reqs is not None:
+            max_reqs = max(0, int(recv_req.max_reqs))
+            if eligible_reqs > max_reqs:
+                omitted = eligible_reqs - max_reqs
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message=(
+                        f"refusing partial migration; max_reqs={max_reqs} would "
+                        f"omit {omitted} eligible requests"
+                    ),
+                    status=self._pd_flip_migration_status_dict(),
+                )
+
+        manifest_started = time.monotonic()
         manifests = []
+        migration_reqs = []
+        source_waiting_reqs = []
         for req in running_reqs:
             manifest = self._pd_flip_build_migration_manifest(req)
+            manifest["pd_flip_source_queue"] = "running"
             manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
                 req
             )
@@ -1641,11 +1753,45 @@ class Scheduler(
                 )
             )
             manifests.append(manifest)
-        session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
-        real_entries, real_error = self._pd_flip_start_source_entries(
-            running_reqs, manifests
+            migration_reqs.append(req)
+        timing_debug["running_manifest_count"] = len(manifests)
+        waiting_manifest_started = time.monotonic()
+        for queue_index, req in waiting_selected:
+            manifest = self._pd_flip_build_migration_manifest(req)
+            manifest["pd_flip_source_queue"] = "waiting"
+            manifest["pd_flip_waiting_queue_index"] = queue_index
+            manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
+                req
+            )
+            manifest["source_bootstrap_port"] = (
+                getattr(
+                    getattr(self, "server_args", None),
+                    "disaggregation_bootstrap_port",
+                    8998,
+                )
+            )
+            manifests.append(manifest)
+            migration_reqs.append(req)
+            source_waiting_reqs.append(
+                {
+                    "rid": str(manifest.get("rid") or getattr(req, "rid", "")),
+                    "req": req,
+                    "original_index": queue_index,
+                }
+            )
+        timing_debug["build_waiting_manifests_s"] = (
+            time.monotonic() - waiting_manifest_started
         )
-        self.pd_flip_migration_session = {
+        timing_debug["waiting_manifest_count"] = len(source_waiting_reqs)
+        timing_debug["build_manifests_s"] = time.monotonic() - manifest_started
+        timing_debug["manifest_count"] = len(manifests)
+        session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
+        entry_started = time.monotonic()
+        real_entries, real_error = self._pd_flip_start_source_entries(
+            migration_reqs, manifests
+        )
+        timing_debug["start_source_entries_s"] = time.monotonic() - entry_started
+        session = {
             "session_id": session_id,
             "role": "source",
             "state": "source_started" if not real_error else "source_failed",
@@ -1658,8 +1804,14 @@ class Scheduler(
             "last_error": real_error,
             "dry_run": not bool(real_entries),
             "source_entries": real_entries,
+            "source_waiting_reqs": source_waiting_reqs,
+            "timing_debug": timing_debug,
         }
+        self.pd_flip_migration_session = session
         if real_entries:
+            freeze_started = time.monotonic()
+            self._pd_flip_freeze_waiting_source_requests(session)
+            timing_debug["freeze_waiting_reqs_s"] = time.monotonic() - freeze_started
             self._pd_flip_source_pump_transfer(self.pd_flip_migration_session)
         return PDFlipMigrationReqOutput(
             success=not bool(real_error),
@@ -1681,9 +1833,12 @@ class Scheduler(
 
         session_id = recv_req.session_id or f"pd-flip-target-{int(time.time() * 1000)}"
         manifests = list(recv_req.manifests or [])
+        timing_debug = {"manifest_count": len(manifests)}
+        entry_started = time.monotonic()
         target_entries, real_error = self._pd_flip_prepare_target_entries(
             manifests, recv_req.source_url
         )
+        timing_debug["prepare_target_entries_s"] = time.monotonic() - entry_started
         self.pd_flip_migration_session = {
             "session_id": session_id,
             "role": "target",
@@ -1701,12 +1856,84 @@ class Scheduler(
             "adopt_on_commit": recv_req.adopt_on_commit,
             "held_reqs": 0,
             "target_entries": target_entries,
+            "timing_debug": timing_debug,
         }
         if target_entries:
             self._pd_flip_target_pump_transfer(self.pd_flip_migration_session)
         return PDFlipMigrationReqOutput(
             success=not bool(real_error),
             message=real_error or "target migration session prepared",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+        )
+
+    def prepare_pd_flip_migration_target_delta(
+        self, recv_req: PDFlipMigrationTargetDeltaPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        self._pd_flip_target_pump_transfer(session)
+        entries = session.get("target_entries") or {}
+        manifests = list(recv_req.manifests or [])
+        real_error = ""
+        delta_entries = 0
+        for manifest in manifests:
+            rid = str(manifest.get("rid", ""))
+            entry = entries.get(rid)
+            if entry is None:
+                real_error = f"target delta references unknown rid={rid}"
+                break
+            if entry.get("phase") != "transferred_held":
+                real_error = f"target delta requires held base transfer for rid={rid}"
+                break
+            try:
+                if manifest.get("pd_flip_drop_target"):
+                    entry["drop_on_commit"] = True
+                    self._pd_flip_apply_delta_manifest_to_target(entry, manifest)
+                    self._pd_flip_release_target_request(entry)
+                    entry["held"] = False
+                    continue
+                if manifest.get("delta_noop"):
+                    self._pd_flip_apply_delta_manifest_to_target(entry, manifest)
+                    continue
+                self._pd_flip_start_target_delta_entry(
+                    entry, manifest, recv_req.source_url
+                )
+                delta_entries += 1
+            except Exception as exc:
+                real_error = str(exc)
+                entry["phase"] = "failed"
+                break
+
+        session["delta_manifests"] = manifests
+        session["delta_pending_reqs"] = delta_entries
+        session["pending_reqs"] = delta_entries
+        if real_error:
+            session["state"] = "target_failed"
+            session["last_error"] = real_error
+            session["failed_reqs"] = int(session.get("failed_reqs", 0)) + 1
+        else:
+            session["state"] = (
+                "target_delta_started" if delta_entries else "target_delta_transferred"
+            )
+        if delta_entries:
+            self._pd_flip_target_pump_transfer(session)
+
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "target migration delta prepared",
             status=self._pd_flip_migration_status_dict(),
             manifests=manifests,
         )
@@ -1728,6 +1955,7 @@ class Scheduler(
                 status=self._pd_flip_migration_status_dict(),
             )
 
+        self._pd_flip_note_timing(session, "commit_received")
         self._pd_flip_target_pump_transfer(session)
         entries = session.get("target_entries") or {}
         requested = set(recv_req.rids or entries.keys())
@@ -1748,7 +1976,9 @@ class Scheduler(
         for rid, entry in entries.items():
             if rid not in requested:
                 continue
-            if session.get("adopt_on_commit", True):
+            if entry.get("drop_on_commit"):
+                self._pd_flip_release_target_request(entry)
+            elif session.get("adopt_on_commit", True):
                 self._pd_flip_adopt_target_request(entry)
             else:
                 self._pd_flip_release_target_request(entry)
@@ -1825,6 +2055,7 @@ class Scheduler(
                 status=self._pd_flip_migration_status_dict(),
             )
 
+        self._pd_flip_note_timing(session, "finish_received")
         self._pd_flip_source_pump_transfer(session)
 
         manifests = list(session.get("manifests", []))
@@ -1847,6 +2078,42 @@ class Scheduler(
                 manifests=manifests,
             )
 
+        entries = session.get("source_entries") or {}
+        advanced_snapshots = []
+        for rid in released:
+            entry = entries.get(rid)
+            if not entry:
+                continue
+            source_queue = entry.get("source_queue") or (
+                entry.get("manifest") or {}
+            ).get("pd_flip_source_queue")
+            if source_queue != "running":
+                continue
+            try:
+                snapshot_len = int(entry.get("committed_len") or 0)
+                current_len = int(
+                    getattr(entry.get("req"), "kv_committed_len", snapshot_len) or 0
+                )
+            except (TypeError, ValueError):
+                continue
+            if current_len > snapshot_len:
+                advanced_snapshots.append(f"{rid}: {snapshot_len}->{current_len}")
+        if advanced_snapshots and not session.get("dry_run", False):
+            message = (
+                "running requests advanced after migration snapshot; "
+                "delta KV transfer is required before source release: "
+                + ", ".join(sorted(advanced_snapshots))
+            )
+            session["state"] = "source_failed"
+            session["last_error"] = message
+            session["failed_reqs"] = len(advanced_snapshots)
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=message,
+                status=self._pd_flip_migration_status_dict(),
+                manifests=manifests,
+            )
+
         self._pd_flip_release_source_requests(session, released)
         session["state"] = "source_released"
         session["pending_reqs"] = max(0, len(manifests) - len(released))
@@ -1857,6 +2124,77 @@ class Scheduler(
             message="source migration session released",
             status=self._pd_flip_migration_status_dict(),
             manifests=manifests,
+        )
+
+    def start_pd_flip_migration_source_delta(
+        self, recv_req: PDFlipMigrationSourceDeltaReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no source migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "source":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not source",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        self._pd_flip_source_pump_transfer(session)
+        entries = session.get("source_entries") or {}
+        requested = set(recv_req.rids or entries.keys())
+        delta_index = int(session.get("delta_generation", 0)) + 1
+        session["delta_generation"] = delta_index
+        delta_manifests: List[Dict[str, Any]] = []
+        delta_entries = 0
+        real_error = ""
+
+        for rid in sorted(requested):
+            entry = entries.get(rid)
+            if not entry:
+                continue
+            source_queue = entry.get("source_queue") or (
+                entry.get("manifest") or {}
+            ).get("pd_flip_source_queue")
+            if source_queue != "running":
+                continue
+            manifest = self._pd_flip_build_delta_manifest(entry, delta_index)
+            delta_manifests.append(manifest)
+            if manifest.get("pd_flip_drop_target") or manifest.get("delta_noop"):
+                self._pd_flip_mark_source_delta_applied(entry, manifest)
+                continue
+            try:
+                self._pd_flip_start_source_delta_entry(entry, manifest)
+                delta_entries += 1
+            except Exception as exc:
+                real_error = str(exc)
+                entry["failed"] = True
+                session.setdefault("failed_rids", set()).add(rid)
+                break
+
+        session["delta_manifests"] = delta_manifests
+        session["delta_pending_reqs"] = delta_entries
+        session["pending_reqs"] = delta_entries
+        session["failed_reqs"] = int(session.get("failed_reqs", 0)) + (
+            1 if real_error else 0
+        )
+        session["state"] = (
+            "source_delta_started" if delta_entries else "source_delta_transferred"
+        )
+        if real_error:
+            session["state"] = "source_failed"
+            session["last_error"] = real_error
+        if delta_entries:
+            self._pd_flip_source_pump_transfer(session)
+
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "source migration delta started",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=delta_manifests,
         )
 
     def abort_pd_flip_migration(
@@ -1890,7 +2228,22 @@ class Scheduler(
                     sender.abort()
                 except Exception:
                     pass
+            delta = entry.get("delta")
+            if isinstance(delta, dict):
+                delta_sender = delta.get("sender")
+                if delta_sender is not None and hasattr(delta_sender, "abort"):
+                    try:
+                        delta_sender.abort()
+                    except Exception:
+                        pass
+                self._pd_flip_free_source_delta_metadata(delta)
+            self._pd_flip_finish_source_kv_release_defer(entry)
             self._pd_flip_free_source_metadata(entry)
+        restore_started = time.monotonic()
+        self._pd_flip_restore_waiting_source_requests(session)
+        session.setdefault("timing_debug", {})["restore_waiting_reqs_s"] = (
+            time.monotonic() - restore_started
+        )
         session["state"] = "source_aborted"
         session["last_error"] = reason
         session["pending_reqs"] = 0
@@ -1942,6 +2295,102 @@ class Scheduler(
         base = int.from_bytes(digest[:8], "big") % (2**30)
         return (base // dp_size) * dp_size + int(dp_rank)
 
+    def _pd_flip_delta_room_for_req(self, req: Req, delta_index: int) -> int:
+        server_args = getattr(self, "server_args", None)
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1)))
+        return self._pd_flip_migration_room_for_req(req) + dp_size * max(
+            1, int(delta_index)
+        )
+
+    def _pd_flip_delta_page_start(self, committed_len: int) -> int:
+        page_size = int(getattr(self.token_to_kv_pool_allocator, "page_size", 1) or 1)
+        return (max(0, int(committed_len)) // page_size) * page_size
+
+    def _pd_flip_source_page_indices_range(
+        self, req: Req, start_len: int, end_len: int
+    ):
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
+                "before migration delta transfer"
+            )
+        if hasattr(req_pool_idx, "item"):
+            req_pool_idx = req_pool_idx.item()
+        page_start = self._pd_flip_delta_page_start(start_len)
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[int(req_pool_idx), page_start:end_len]
+            .cpu()
+            .numpy()
+        )
+        if kv_indices.ndim != 1:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} produced non-1D delta KV indices "
+                f"shape={kv_indices.shape}"
+            )
+        return kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+
+    def _pd_flip_build_delta_manifest(
+        self, entry: Dict[str, Any], delta_index: int
+    ) -> Dict[str, Any]:
+        req = entry.get("req")
+        base_manifest = dict(entry.get("manifest") or {})
+        if req is None:
+            manifest = base_manifest
+            manifest["pd_flip_drop_target"] = True
+            manifest["delta_noop"] = True
+            return manifest
+
+        old_len = int(entry.get("committed_len") or 0)
+        current_len = int(getattr(req, "kv_committed_len", old_len) or old_len)
+        manifest = self._pd_flip_build_migration_manifest(req)
+        migration_room = self._pd_flip_delta_room_for_req(req, delta_index)
+        manifest.update(
+            {
+                "pd_flip_delta": True,
+                "pd_flip_source_queue": "running",
+                "delta_from_len": old_len,
+                "delta_page_start_len": self._pd_flip_delta_page_start(old_len),
+                "migration_bootstrap_room": migration_room,
+                "source_bootstrap_port": getattr(
+                    getattr(self, "server_args", None),
+                    "disaggregation_bootstrap_port",
+                    8998,
+                ),
+            }
+        )
+        if req.finished():
+            manifest["pd_flip_drop_target"] = True
+            manifest["delta_noop"] = True
+        elif current_len <= old_len:
+            manifest["delta_noop"] = True
+        else:
+            manifest["delta_noop"] = False
+        return manifest
+
+    def _pd_flip_mark_source_delta_applied(
+        self, entry: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> None:
+        entry["committed_len"] = int(
+            manifest.get("kv_committed_len") or entry.get("committed_len") or 0
+        )
+        entry["manifest"] = manifest
+        entry["delta"] = {
+            "phase": "transferred",
+            "from_len": int(manifest.get("delta_from_len") or 0),
+            "to_len": int(manifest.get("kv_committed_len") or 0),
+            "noop": True,
+            "drop_target": bool(manifest.get("pd_flip_drop_target")),
+        }
+        req = entry.get("req")
+        if req is not None and not req.finished():
+            req.pd_flip_migrated_to_target = True
+            req.pd_flip_waiting_for_relay_output = True
+            req.to_finish = FINISH_MIGRATED()
+
     def _pd_flip_start_source_entries(
         self, running_reqs: List[Req], manifests: List[Dict[str, Any]]
     ) -> Tuple[Dict[str, Dict[str, Any]], str]:
@@ -1951,25 +2400,43 @@ class Scheduler(
             return {}, "PD flip migration does not support HiSparse decode yet"
 
         try:
+            manager_started = time.monotonic()
             kv_manager = self._pd_flip_get_source_kv_manager()
+            manager_s = time.monotonic() - manager_started
             sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
             bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
             entries: Dict[str, Dict[str, Any]] = {}
+
+            def fail(message: str) -> Tuple[Dict[str, Dict[str, Any]], str]:
+                for entry in entries.values():
+                    sender = entry.get("sender")
+                    if hasattr(sender, "abort"):
+                        try:
+                            sender.abort()
+                        except Exception:
+                            pass
+                    self._pd_flip_clear_source_kv_release_defer(entry.get("req"))
+                    self._pd_flip_free_source_metadata(entry)
+                return {}, message
+
             for req, manifest in zip(running_reqs, manifests):
+                entry_started = time.monotonic()
+                timing_debug = {"get_source_kv_manager_s": manager_s}
                 rid = str(manifest.get("rid") or getattr(req, "rid", ""))
                 committed_len = int(manifest.get("kv_committed_len") or 0)
                 if committed_len <= 0:
-                    return {}, f"request {rid} has no committed KV to migrate"
-                if len(getattr(req, "output_ids", []) or []) == 0:
-                    return {}, f"request {rid} has no decode output token to resume"
+                    return fail(f"request {rid} has no committed KV to migrate")
                 if getattr(req, "req_pool_idx", None) is None:
-                    return {}, f"request {rid} has no req_pool_idx"
+                    return fail(f"request {rid} has no req_pool_idx")
 
+                alloc_started = time.monotonic()
                 metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+                timing_debug["metadata_alloc_s"] = time.monotonic() - alloc_started
                 if metadata_index is None:
-                    return {}, "no metadata buffer available for source migration"
+                    return fail("no metadata buffer available for source migration")
 
                 migration_room = int(manifest["migration_bootstrap_room"])
+                sender_started = time.monotonic()
                 sender = sender_class(
                     mgr=kv_manager,
                     bootstrap_addr=bootstrap_addr,
@@ -1977,22 +2444,166 @@ class Scheduler(
                     dest_tp_ranks=[self.ps.tp_rank],
                     pp_rank=self.ps.pp_rank,
                 )
+                timing_debug["sender_create_s"] = time.monotonic() - sender_started
+                page_started = time.monotonic()
                 page_indices = self._pd_flip_source_page_indices(req, committed_len)
+                timing_debug["source_page_indices_initial_s"] = (
+                    time.monotonic() - page_started
+                )
+                init_started = time.monotonic()
                 sender.init(len(page_indices), metadata_index)
+                timing_debug["sender_init_s"] = time.monotonic() - init_started
+                self._pd_flip_defer_source_kv_release(req)
                 entries[rid] = {
                     "req": req,
                     "sender": sender,
                     "manifest": manifest,
+                    "source_queue": manifest.get("pd_flip_source_queue", "running"),
                     "metadata_index": metadata_index,
                     "migration_bootstrap_room": migration_room,
                     "committed_len": committed_len,
                     "sent": False,
                     "transferred": False,
                     "failed": False,
+                    "timing_debug": timing_debug,
                 }
+                timing_debug["source_entry_init_total_s"] = (
+                    time.monotonic() - entry_started
+                )
             return entries, ""
         except Exception as exc:
-            return {}, str(exc)
+            try:
+                return fail(str(exc))
+            except Exception:
+                return {}, str(exc)
+
+    def _pd_flip_start_source_delta_entry(
+        self, entry: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> None:
+        if not self._pd_flip_can_use_real_migration():
+            self._pd_flip_mark_source_delta_applied(entry, manifest)
+            return
+        req = entry.get("req")
+        if req is None:
+            raise ValueError("source delta entry has no request")
+        if getattr(req, "req_pool_idx", None) is None:
+            raise ValueError(f"request {getattr(req, 'rid', '')} has no req_pool_idx")
+
+        req.pd_flip_migrated_to_target = True
+        req.pd_flip_waiting_for_relay_output = True
+        req.to_finish = FINISH_MIGRATED()
+
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for source delta migration")
+
+        kv_manager = self._pd_flip_get_source_kv_manager()
+        sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        migration_room = int(manifest["migration_bootstrap_room"])
+        sender = sender_class(
+            mgr=kv_manager,
+            bootstrap_addr=self._pd_flip_local_bootstrap_addr(kv_manager),
+            bootstrap_room=migration_room,
+            dest_tp_ranks=[self.ps.tp_rank],
+            pp_rank=self.ps.pp_rank,
+        )
+        from_len = int(manifest.get("delta_from_len") or entry.get("committed_len") or 0)
+        to_len = int(manifest.get("kv_committed_len") or from_len)
+        page_indices = self._pd_flip_source_page_indices_range(req, from_len, to_len)
+        sender.init(len(page_indices), metadata_index)
+        entry["delta"] = {
+            "phase": "new",
+            "sender": sender,
+            "metadata_index": metadata_index,
+            "migration_bootstrap_room": migration_room,
+            "from_len": from_len,
+            "to_len": to_len,
+            "page_start_len": int(
+                manifest.get("delta_page_start_len")
+                or self._pd_flip_delta_page_start(from_len)
+            ),
+            "sent": False,
+            "transferred": False,
+            "failed": False,
+            "manifest": manifest,
+        }
+        entry["manifest"] = manifest
+
+    def _pd_flip_freeze_waiting_source_requests(
+        self, session: Dict[str, Any]
+    ) -> None:
+        waiting_specs = session.get("source_waiting_reqs") or []
+        if not waiting_specs:
+            session.setdefault("timing_debug", {})["waiting_frozen_count"] = 0
+            return
+
+        by_id = {
+            id(spec.get("req")): spec
+            for spec in waiting_specs
+            if spec.get("req") is not None
+        }
+        if not by_id:
+            session.setdefault("timing_debug", {})["waiting_frozen_count"] = 0
+            return
+
+        new_queue = []
+        frozen_count = 0
+        entries = session.get("source_entries") or {}
+        for index, req in enumerate(getattr(self, "waiting_queue", [])):
+            spec = by_id.get(id(req))
+            if spec is None:
+                new_queue.append(req)
+                continue
+            spec.setdefault("original_index", index)
+            spec["frozen"] = True
+            spec["restored"] = False
+            frozen_count += 1
+            rid = str(spec.get("rid") or getattr(req, "rid", ""))
+            entry = entries.get(rid)
+            if entry is not None:
+                self._pd_flip_note_timing(entry, "source_waiting_frozen")
+
+        self.waiting_queue = new_queue
+        session.setdefault("timing_debug", {})["waiting_frozen_count"] = frozen_count
+
+    def _pd_flip_restore_waiting_source_requests(
+        self, session: Dict[str, Any]
+    ) -> None:
+        waiting_specs = [
+            spec
+            for spec in (session.get("source_waiting_reqs") or [])
+            if spec.get("frozen") and not spec.get("restored")
+        ]
+        if not waiting_specs:
+            session.setdefault("timing_debug", {})["waiting_restored_count"] = 0
+            return
+
+        entries = session.get("source_entries") or {}
+        restored_count = 0
+        for spec in sorted(
+            waiting_specs, key=lambda item: int(item.get("original_index", 0))
+        ):
+            req = spec.get("req")
+            if req is None:
+                continue
+            if any(existing is req for existing in self.waiting_queue):
+                spec["restored"] = True
+                continue
+            insert_at = min(
+                max(0, int(spec.get("original_index", len(self.waiting_queue)))),
+                len(self.waiting_queue),
+            )
+            self.waiting_queue.insert(insert_at, req)
+            spec["restored"] = True
+            restored_count += 1
+            rid = str(spec.get("rid") or getattr(req, "rid", ""))
+            entry = entries.get(rid)
+            if entry is not None:
+                self._pd_flip_note_timing(entry, "source_waiting_restored")
+
+        session.setdefault("timing_debug", {})[
+            "waiting_restored_count"
+        ] = restored_count
 
     def _pd_flip_get_source_kv_manager(self):
         manager = getattr(self, "pd_flip_source_kv_manager", None)
@@ -2046,13 +2657,37 @@ class Scheduler(
         return f"{host}:{self.server_args.disaggregation_bootstrap_port}"
 
     def _pd_flip_source_page_indices(self, req: Req, committed_len: int):
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
+                "before migration transfer"
+            )
+        non_scalar_error = (
+            f"request {getattr(req, 'rid', '')} has non-scalar req_pool_idx "
+            f"{req_pool_idx!r}"
+        )
+        if hasattr(req_pool_idx, "numel") and req_pool_idx.numel() != 1:
+            raise ValueError(non_scalar_error)
+        if hasattr(req_pool_idx, "item"):
+            try:
+                req_pool_idx = req_pool_idx.item()
+            except (RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError(non_scalar_error) from exc
+        if not isinstance(req_pool_idx, numbers.Integral):
+            raise ValueError(non_scalar_error)
         kv_indices = (
             self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :committed_len
+                int(req_pool_idx), :committed_len
             ]
             .cpu()
             .numpy()
         )
+        if kv_indices.ndim != 1:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} produced non-1D KV indices "
+                f"shape={kv_indices.shape}"
+            )
         return kv_to_page_indices(
             kv_indices,
             self.token_to_kv_pool_allocator.page_size,
@@ -2178,6 +2813,7 @@ class Scheduler(
                     session["last_error"] = str(exc)
                 continue
             if poll == KVPoll.WaitingForInput and not entry.get("sent"):
+                self._pd_flip_note_timing(entry, "source_waiting_for_input")
                 req = entry["req"]
                 old_metadata_index = getattr(req, "metadata_buffer_index", -1)
                 old_bootstrap_room = getattr(req, "bootstrap_room", None)
@@ -2186,18 +2822,35 @@ class Scheduler(
                     req.metadata_buffer_index = entry["metadata_index"]
                     req.bootstrap_room = entry["migration_bootstrap_room"]
                     req.disagg_kv_sender = sender
+                    metadata_started = time.monotonic()
                     self._pd_flip_set_source_metadata(
                         req,
                         entry["metadata_index"],
                         entry["migration_bootstrap_room"],
                     )
+                    self._pd_flip_note_timing(
+                        entry, "source_set_metadata", metadata_started
+                    )
+                    page_started = time.monotonic()
                     page_indices = self._pd_flip_source_page_indices(
                         req, entry["committed_len"]
                     )
+                    self._pd_flip_note_timing(
+                        entry, "source_page_indices_send", page_started
+                    )
+                    entry["source_index_shape"] = list(page_indices.shape)
+                    entry["source_index_size"] = int(page_indices.size)
+                    state_started = time.monotonic()
                     state_indices = self._pd_flip_source_state_indices(
                         req, entry["committed_len"], sender.kv_mgr
                     )
+                    self._pd_flip_note_timing(
+                        entry, "source_state_indices", state_started
+                    )
+                    send_started = time.monotonic()
                     sender.send(page_indices, state_indices)
+                    self._pd_flip_note_timing(entry, "source_send", send_started)
+                    self._pd_flip_note_timing(entry, "source_sent")
                     entry["sent"] = True
                 except Exception as exc:
                     entry["failed"] = True
@@ -2213,6 +2866,7 @@ class Scheduler(
             if poll == KVPoll.Success:
                 entry["transferred"] = True
                 transferred.add(rid)
+                self._pd_flip_note_timing(entry, "source_transferred")
                 self._pd_flip_free_source_metadata(entry)
 
         session["transferred_rids"] = transferred
@@ -2226,6 +2880,103 @@ class Scheduler(
             session["state"] = "source_failed"
         elif session["pending_reqs"] == 0 and session.get("state") == "source_started":
             session["state"] = "source_transferred"
+        self._pd_flip_source_pump_delta_transfer(session)
+
+    def _pd_flip_free_source_delta_metadata(self, delta: Dict[str, Any]) -> None:
+        if delta.get("metadata_freed"):
+            return
+        metadata_index = delta.get("metadata_index")
+        if metadata_index is not None and metadata_index >= 0:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+        delta["metadata_freed"] = True
+
+    def _pd_flip_source_pump_delta_transfer(self, session: Dict[str, Any]) -> None:
+        entries = session.get("source_entries") or {}
+        delta_entries = {
+            rid: entry
+            for rid, entry in entries.items()
+            if isinstance(entry.get("delta"), dict)
+            and not entry["delta"].get("noop")
+        }
+        if not delta_entries:
+            return
+
+        transferred = set(session.get("delta_transferred_rids", set()))
+        failed = set(session.get("delta_failed_rids", set()))
+        for rid, entry in delta_entries.items():
+            delta = entry["delta"]
+            if delta.get("transferred") or delta.get("failed"):
+                continue
+            sender = delta["sender"]
+            poll = sender.poll()
+            if poll == KVPoll.Failed:
+                delta["failed"] = True
+                failed.add(rid)
+                try:
+                    sender.failure_exception()
+                except Exception as exc:
+                    session["last_error"] = str(exc)
+                continue
+            if poll == KVPoll.WaitingForInput and not delta.get("sent"):
+                req = entry["req"]
+                old_metadata_index = getattr(req, "metadata_buffer_index", -1)
+                old_bootstrap_room = getattr(req, "bootstrap_room", None)
+                old_sender = getattr(req, "disagg_kv_sender", None)
+                try:
+                    req.metadata_buffer_index = delta["metadata_index"]
+                    req.bootstrap_room = delta["migration_bootstrap_room"]
+                    req.disagg_kv_sender = sender
+                    self._pd_flip_set_source_metadata(
+                        req,
+                        delta["metadata_index"],
+                        delta["migration_bootstrap_room"],
+                    )
+                    page_indices = self._pd_flip_source_page_indices_range(
+                        req, delta["from_len"], delta["to_len"]
+                    )
+                    delta["source_index_shape"] = list(page_indices.shape)
+                    delta["source_index_size"] = int(page_indices.size)
+                    state_indices = self._pd_flip_source_state_indices(
+                        req, delta["to_len"], sender.kv_mgr
+                    )
+                    sender.send(page_indices, state_indices)
+                    delta["sent"] = True
+                    self._pd_flip_note_timing(entry, "source_delta_sent")
+                except Exception as exc:
+                    delta["failed"] = True
+                    failed.add(rid)
+                    session["last_error"] = str(exc)
+                    if hasattr(sender, "abort"):
+                        sender.abort()
+                finally:
+                    req.metadata_buffer_index = old_metadata_index
+                    req.bootstrap_room = old_bootstrap_room
+                    req.disagg_kv_sender = old_sender
+            poll = sender.poll()
+            if poll == KVPoll.Success:
+                delta["transferred"] = True
+                transferred.add(rid)
+                entry["committed_len"] = int(delta["to_len"])
+                entry["manifest"] = delta.get("manifest") or entry.get("manifest")
+                self._pd_flip_note_timing(entry, "source_delta_transferred")
+                self._pd_flip_free_source_delta_metadata(delta)
+
+        session["delta_transferred_rids"] = transferred
+        session["delta_failed_rids"] = failed
+        session["delta_transferred_reqs"] = len(transferred)
+        session["delta_failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(delta_entries) - len(transferred) - len(failed)
+        )
+        session["delta_pending_reqs"] = session["pending_reqs"]
+        if failed:
+            session["state"] = "source_failed"
+            session["failed_reqs"] = max(
+                int(session.get("failed_reqs", 0) or 0), len(failed)
+            )
+        elif session["pending_reqs"] == 0:
+            session["state"] = "source_delta_transferred"
 
     def _pd_flip_free_source_metadata(self, entry: Dict[str, Any]) -> None:
         if entry.get("metadata_freed"):
@@ -2236,6 +2987,38 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
         entry["metadata_freed"] = True
 
+    @staticmethod
+    def _pd_flip_defer_source_kv_release(req: Req) -> None:
+        req.pd_flip_defer_kv_release = True
+        req.pd_flip_force_kv_release = False
+        req.pd_flip_kv_release_deferred = False
+        req.pd_flip_deferred_kv_release_is_insert = False
+
+    @staticmethod
+    def _pd_flip_clear_source_kv_release_defer(req: Optional[Req]) -> None:
+        if req is None:
+            return
+        req.pd_flip_defer_kv_release = False
+        req.pd_flip_force_kv_release = False
+
+    def _pd_flip_finish_source_kv_release_defer(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        req = entry.get("req")
+        if req is None:
+            return
+        was_deferred = bool(getattr(req, "pd_flip_kv_release_deferred", False))
+        is_insert = bool(getattr(req, "pd_flip_deferred_kv_release_is_insert", False))
+        self._pd_flip_clear_source_kv_release_defer(req)
+        if was_deferred and getattr(req, "req_pool_idx", None) is not None:
+            req.pd_flip_force_kv_release = True
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+            finally:
+                req.pd_flip_force_kv_release = False
+        req.pd_flip_kv_release_deferred = False
+        req.pd_flip_deferred_kv_release_is_insert = False
+
     def _pd_flip_release_source_requests(
         self, session: Dict[str, Any], released_rids: set
     ) -> None:
@@ -2244,11 +3027,32 @@ class Scheduler(
             if not entry:
                 continue
             req = entry.get("req")
+            source_queue = entry.get("source_queue") or (
+                entry.get("manifest") or {}
+            ).get("pd_flip_source_queue")
+            if source_queue == "waiting":
+                if req is not None:
+                    self._pd_flip_clear_source_kv_release_defer(req)
+                    req.pd_flip_force_kv_release = True
+                    try:
+                        release_kv_cache(req, self.tree_cache)
+                    finally:
+                        req.pd_flip_force_kv_release = False
+                    req.pd_flip_kv_release_deferred = False
+                    req.pd_flip_deferred_kv_release_is_insert = False
+                entry["request_released"] = True
+                self._pd_flip_note_timing(entry, "source_waiting_released")
+                self._pd_flip_free_source_metadata(entry)
+                continue
             if req is not None and not req.finished():
+                self._pd_flip_clear_source_kv_release_defer(req)
                 req.pd_flip_migrated_to_target = True
-                req.to_finish = FINISH_ABORT(
-                    "Request migrated during PD role flip; output continues on target decode.",
-                )
+                req.pd_flip_waiting_for_relay_output = True
+                req.to_finish = FINISH_MIGRATED()
+                self._pd_flip_note_timing(entry, "source_finish_migrated")
+            else:
+                self._pd_flip_finish_source_kv_release_defer(entry)
+                self._pd_flip_note_timing(entry, "source_finish_released")
             self._pd_flip_free_source_metadata(entry)
 
     def _pd_flip_prepare_target_entries(
@@ -2264,19 +3068,30 @@ class Scheduler(
             receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
             kv_manager = self.disagg_decode_prealloc_queue.kv_manager
             for manifest in manifests:
+                entry_started = time.monotonic()
+                timing_debug = {}
+                req_started = time.monotonic()
                 req = self._pd_flip_manifest_to_req(manifest, source_host)
+                timing_debug["manifest_to_req_s"] = time.monotonic() - req_started
+                receiver_started = time.monotonic()
                 receiver = receiver_class(
                     mgr=kv_manager,
                     bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                     bootstrap_room=req.bootstrap_room,
                 )
+                timing_debug["receiver_create_s"] = time.monotonic() - receiver_started
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
                 entries[req.rid] = {
                     "decode_req": decode_req,
                     "phase": "new",
                     "manifest": manifest,
+                    "source_queue": manifest.get("pd_flip_source_queue", "running"),
                     "metadata_index": -1,
+                    "timing_debug": timing_debug,
                 }
+                timing_debug["target_entry_prepare_total_s"] = (
+                    time.monotonic() - entry_started
+                )
             return entries, ""
         except Exception as exc:
             return {}, str(exc)
@@ -2335,6 +3150,8 @@ class Scheduler(
             ),
         )
         req.output_ids = array("q", list(manifest.get("output_ids") or []))
+        req.send_token_offset = len(req.output_ids)
+        req.send_decode_id_offset = len(req.output_ids)
         req.logprob_start_len = int(manifest.get("logprob_start_len", -1))
         req.kv_committed_len = int(
             manifest.get("kv_committed_len")
@@ -2377,6 +3194,220 @@ class Scheduler(
         kwargs = {key: value for key, value in dict(values).items() if key in allowed}
         return SamplingParams(**kwargs)
 
+    def _pd_flip_apply_delta_manifest_to_target(
+        self, entry: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> None:
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None:
+            return
+        req.output_ids = array("q", list(manifest.get("output_ids") or []))
+        req.send_token_offset = len(req.output_ids)
+        req.send_decode_id_offset = len(req.output_ids)
+        req.logprob_start_len = int(manifest.get("logprob_start_len", -1))
+        committed_len = int(
+            manifest.get("kv_committed_len")
+            or len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        )
+        req.kv_committed_len = committed_len
+        req.kv_allocated_len = max(int(getattr(req, "kv_allocated_len", 0) or 0), committed_len)
+        entry["committed_len"] = committed_len
+        entry["manifest"] = manifest
+        self._pd_flip_note_timing(entry, "target_delta_state_applied")
+
+    def _pd_flip_start_target_delta_entry(
+        self,
+        entry: Dict[str, Any],
+        manifest: Dict[str, Any],
+        source_url: Optional[str],
+    ) -> None:
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None:
+            raise ValueError("target delta entry has no request")
+        receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        source_host = self._pd_flip_source_host_from_url(
+            source_url or (entry.get("manifest") or {}).get("source_url") or ""
+        )
+        migration_room = int(manifest["migration_bootstrap_room"])
+        receiver = receiver_class(
+            mgr=self.disagg_decode_prealloc_queue.kv_manager,
+            bootstrap_addr=f"{source_host}:{int(manifest.get('source_bootstrap_port') or getattr(self.server_args, 'disaggregation_bootstrap_port', 8998))}",
+            bootstrap_room=migration_room,
+        )
+        req.bootstrap_host = source_host
+        req.bootstrap_port = int(
+            manifest.get("source_bootstrap_port")
+            or getattr(self.server_args, "disaggregation_bootstrap_port", 8998)
+        )
+        req.bootstrap_room = migration_room
+        decode_req.kv_receiver = receiver
+        entry["delta"] = {
+            "phase": "new",
+            "manifest": manifest,
+            "from_len": int(manifest.get("delta_from_len") or entry.get("committed_len") or 0),
+            "to_len": int(manifest.get("kv_committed_len") or 0),
+            "metadata_index": -1,
+            "transferred": False,
+            "failed": False,
+        }
+
+    def _pd_flip_target_delta_prealloc_and_send_metadata(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        delta = entry["delta"]
+        manifest = delta["manifest"]
+        decode_req: DecodeRequest = entry["decode_req"]
+        req = decode_req.req
+        from_len = int(delta["from_len"])
+        to_len = int(delta["to_len"])
+        if to_len < from_len:
+            raise RuntimeError(
+                f"target delta regressed committed length for {req.rid}: {from_len}->{to_len}"
+            )
+
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for target delta migration")
+        delta["metadata_index"] = metadata_index
+        entry["metadata_index"] = metadata_index
+        decode_req.metadata_buffer_index = metadata_index
+
+        delta_len = to_len - from_len
+        if delta_len > 0:
+            device = self.token_to_kv_pool_allocator.device
+            if from_len > 0:
+                last_loc = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, from_len - 1
+                ].reshape(1).to(dtype=torch.int64, device=device)
+            else:
+                last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=torch.tensor([from_len], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([from_len], dtype=torch.int64),
+                    seq_lens=torch.tensor([to_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([to_len], dtype=torch.int64),
+                    last_loc=last_loc,
+                    extend_num_tokens=delta_len,
+                )
+            if kv_loc is None:
+                raise RuntimeError("KV cache is full during target delta migration")
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(from_len, from_len + len(kv_loc))),
+                kv_loc,
+            )
+
+        req.kv_committed_len = to_len
+        req.kv_allocated_len = max(int(getattr(req, "kv_allocated_len", 0) or 0), to_len)
+        page_start = int(
+            manifest.get("delta_page_start_len")
+            or self._pd_flip_delta_page_start(from_len)
+        )
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, page_start:to_len]
+            .cpu()
+            .numpy()
+        )
+        page_indices = kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+        delta["target_index_shape"] = list(page_indices.shape)
+        delta["target_index_size"] = int(page_indices.size)
+        state_indices = self._pd_flip_target_state_indices(req, to_len)
+        decode_req.kv_receiver.send_metadata(
+            page_indices,
+            metadata_index,
+            state_indices,
+            decode_prefix_len=page_start,
+        )
+        if self.transfer_backend == TransferBackend.FAKE:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index, 0] = (
+                req.bootstrap_room
+            )
+
+    def _pd_flip_target_pump_delta_transfer(self, session: Dict[str, Any]) -> None:
+        entries = session.get("target_entries") or {}
+        delta_entries = {
+            rid: entry
+            for rid, entry in entries.items()
+            if isinstance(entry.get("delta"), dict)
+            and not entry["delta"].get("noop")
+        }
+        if not delta_entries:
+            return
+
+        transferred = set(session.get("delta_transferred_rids", set()))
+        failed = set(session.get("delta_failed_rids", set()))
+        for rid, entry in delta_entries.items():
+            delta = entry["delta"]
+            if delta.get("transferred") or delta.get("failed"):
+                continue
+            decode_req = entry["decode_req"]
+            try:
+                if delta.get("phase") == "new":
+                    if not self._pd_flip_target_init_receiver(decode_req):
+                        continue
+                    delta["phase"] = "waiting_for_input"
+
+                if delta.get("phase") == "waiting_for_input":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target delta bootstrap failed")
+                    if poll != KVPoll.WaitingForInput:
+                        continue
+                    self._pd_flip_target_delta_prealloc_and_send_metadata(entry)
+                    delta["phase"] = "transferring"
+
+                if delta.get("phase") == "transferring":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target delta transfer failed")
+                    if poll == KVPoll.Success and self._pd_flip_target_metadata_ready(
+                        entry
+                    ):
+                        self._pd_flip_apply_delta_manifest_to_target(
+                            entry, delta["manifest"]
+                        )
+                        transferred.add(rid)
+                        delta["transferred"] = True
+                        delta["phase"] = "transferred"
+                        entry["phase"] = "transferred_held"
+                        entry["held"] = not bool(entry.get("drop_on_commit"))
+                        if getattr(decode_req, "kv_receiver", None) is not None:
+                            decode_req.kv_receiver.clear()
+                            decode_req.kv_receiver = None
+                        self._pd_flip_free_target_metadata(entry)
+            except Exception as exc:
+                failed.add(rid)
+                delta["failed"] = True
+                delta["phase"] = "failed"
+                entry["phase"] = "failed"
+                session["last_error"] = str(exc)
+                if getattr(decode_req, "kv_receiver", None) is not None:
+                    decode_req.kv_receiver.abort()
+                self._pd_flip_free_target_metadata(entry)
+
+        session["delta_transferred_rids"] = transferred
+        session["delta_failed_rids"] = failed
+        session["delta_transferred_reqs"] = len(transferred)
+        session["delta_failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(delta_entries) - len(transferred) - len(failed)
+        )
+        session["delta_pending_reqs"] = session["pending_reqs"]
+        if failed:
+            session["state"] = "target_failed"
+            session["failed_reqs"] = max(
+                int(session.get("failed_reqs", 0) or 0), len(failed)
+            )
+        elif session["pending_reqs"] == 0:
+            session["state"] = "target_delta_transferred"
+
     def _pd_flip_target_pump_transfer(self, session: Dict[str, Any]) -> None:
         entries = session.get("target_entries") or {}
         if not entries:
@@ -2391,9 +3422,12 @@ class Scheduler(
             phase = entry.get("phase")
             try:
                 if phase == "new":
+                    init_started = time.monotonic()
                     if not self._pd_flip_target_init_receiver(decode_req):
                         continue
+                    self._pd_flip_note_timing(entry, "target_init_receiver", init_started)
                     entry["phase"] = "waiting_for_input"
+                    self._pd_flip_note_timing(entry, "target_waiting_for_input")
                     phase = "waiting_for_input"
 
                 if phase == "waiting_for_input":
@@ -2402,16 +3436,25 @@ class Scheduler(
                         raise RuntimeError("migration target bootstrap failed")
                     if poll != KVPoll.WaitingForInput:
                         continue
+                    metadata_started = time.monotonic()
                     self._pd_flip_target_prealloc_and_send_metadata(entry)
+                    self._pd_flip_note_timing(
+                        entry, "target_prealloc_send_metadata", metadata_started
+                    )
                     entry["phase"] = "transferring"
+                    self._pd_flip_note_timing(entry, "target_transferring")
 
                 if entry.get("phase") == "transferring":
+                    if self._pd_flip_target_hicache_restore_pending(decode_req):
+                        continue
                     poll = decode_req.kv_receiver.poll()
                     if poll == KVPoll.Failed:
                         raise RuntimeError("migration target transfer failed")
                     if poll == KVPoll.Success and self._pd_flip_target_metadata_ready(
                         entry
                     ):
+                        self._pd_flip_target_commit_hicache_restore(decode_req)
+                        self._pd_flip_note_timing(entry, "target_transfer_success")
                         transferred.add(rid)
                         entry["phase"] = (
                             "transferred_held"
@@ -2423,6 +3466,7 @@ class Scheduler(
                             decode_req.kv_receiver = None
                         if session.get("prepare_only", False):
                             entry["held"] = True
+                            self._pd_flip_note_timing(entry, "target_held")
                         elif session.get("adopt_on_success", False):
                             self._pd_flip_adopt_target_request(entry)
                         else:
@@ -2455,6 +3499,55 @@ class Scheduler(
             session["state"] = "target_transferred_held"
         elif session["pending_reqs"] == 0:
             session["state"] = "target_transferred"
+        self._pd_flip_target_pump_delta_transfer(session)
+
+    def _pd_flip_target_hicache_restore_pending(
+        self, decode_req: DecodeRequest
+    ) -> bool:
+        if not getattr(self, "enable_decode_hicache", False):
+            return False
+        prefix_match = getattr(decode_req, "prefix_match", None)
+        if prefix_match is None or not getattr(
+            prefix_match, "needs_local_restore", False
+        ):
+            return False
+
+        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+        if transfer_queue is None or not hasattr(
+            transfer_queue, "_process_hicache_local_restores"
+        ):
+            return True
+        transfer_queue._process_hicache_local_restores([decode_req])
+        status_value = getattr(
+            getattr(decode_req, "hicache_restore_status", None), "value", None
+        )
+        if status_value == "failed":
+            raise RuntimeError("migration target HiCache restore failed")
+        return status_value == "pending"
+
+    def _pd_flip_target_commit_hicache_restore(self, decode_req: DecodeRequest) -> None:
+        if not getattr(self, "enable_decode_hicache", False):
+            return
+        prefix_match = getattr(decode_req, "prefix_match", None)
+        if prefix_match is None or not getattr(
+            prefix_match, "needs_local_restore", False
+        ):
+            return
+
+        status_value = getattr(
+            getattr(decode_req, "hicache_restore_status", None), "value", None
+        )
+        if status_value == "failed":
+            raise RuntimeError("migration target HiCache restore failed")
+        if status_value == "pending":
+            raise RuntimeError("migration target HiCache restore is still pending")
+
+        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+        if transfer_queue is None or not hasattr(
+            transfer_queue, "_commit_hicache_local_restore_to_req"
+        ):
+            raise RuntimeError("migration target HiCache restore cannot be committed")
+        transfer_queue._commit_hicache_local_restore_to_req(decode_req)
 
     def _pd_flip_target_init_receiver(self, decode_req: DecodeRequest) -> bool:
         queue = self.disagg_decode_prealloc_queue
@@ -2488,11 +3581,46 @@ class Scheduler(
         entry["metadata_index"] = metadata_index
         decode_req.metadata_buffer_index = metadata_index
 
-        dst_kv_indices = queue._pre_alloc(req, prefix_len=0, total_prefix_len=0)
         committed_len = int(req.kv_committed_len)
+        prefix_match = None
+        prefix_indices = None
+        prefix_len = 0
+        total_prefix_len = 0
+        if (
+            os.getenv("SGLANG_PD_FLIP_HICACHE_STITCH", "").lower()
+            in ("1", "true", "yes", "on")
+            and self.server_args.disaggregation_decode_enable_radix_cache
+        ):
+            prefix_started = time.monotonic()
+            prefix_match = queue._match_prefix_and_lock(req)
+            prefix_indices = prefix_match.prefix_indices
+            prefix_len = int(prefix_match.l1_prefix_len)
+            total_prefix_len = int(prefix_match.decode_prefix_len)
+            entry["target_hicache_prefix_match_s"] = time.monotonic() - prefix_started
+            entry["target_hicache_l1_prefix_len"] = prefix_len
+            entry["target_hicache_prefix_len"] = total_prefix_len
+            entry["target_hicache_restore_tokens"] = max(
+                0, total_prefix_len - prefix_len
+            )
+            decode_req.prefix_match = prefix_match
+
+        if prefix_indices is None:
+            dst_kv_indices = queue._pre_alloc(
+                req, prefix_len=prefix_len, total_prefix_len=total_prefix_len
+            )
+        else:
+            dst_kv_indices = queue._pre_alloc(
+                req,
+                prefix_indices=prefix_indices,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+            )
+        if prefix_match is not None and getattr(self, "enable_decode_hicache", False):
+            queue._start_hicache_prefetch(req, prefix_match)
+
         if self.server_args.disaggregation_decode_enable_radix_cache:
             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                :committed_len
+                total_prefix_len:committed_len
             ].cpu().numpy()
         else:
             kv_indices = dst_kv_indices.cpu().numpy()
@@ -2500,12 +3628,14 @@ class Scheduler(
             kv_indices,
             self.token_to_kv_pool_allocator.page_size,
         )
+        entry["target_index_shape"] = list(page_indices.shape)
+        entry["target_index_size"] = int(page_indices.size)
         state_indices = self._pd_flip_target_state_indices(req, committed_len)
         decode_req.kv_receiver.send_metadata(
             page_indices,
             metadata_index,
             state_indices,
-            decode_prefix_len=0,
+            decode_prefix_len=total_prefix_len,
         )
         if self.transfer_backend == TransferBackend.FAKE:
             self.disagg_metadata_buffers.bootstrap_room[metadata_index, 0] = (
@@ -2588,9 +3718,11 @@ class Scheduler(
         req = getattr(decode_req, "req", None)
         if req is None or getattr(req, "req_pool_idx", None) is None:
             entry["request_released"] = True
+            self._pd_flip_note_timing(entry, "target_released")
             return
         release_kv_cache(req, self.tree_cache, is_insert=False)
         entry["request_released"] = True
+        self._pd_flip_note_timing(entry, "target_released")
 
     def _pd_flip_adopt_target_request(self, entry: Dict[str, Any]) -> None:
         if entry.get("request_adopted"):
@@ -2599,6 +3731,7 @@ class Scheduler(
         req = getattr(decode_req, "req", None)
         if req is None:
             entry["request_adopted"] = True
+            self._pd_flip_note_timing(entry, "target_adopted")
             return
         req.init_next_round_input(self.tree_cache)
         if hasattr(req, "time_stats") and hasattr(
@@ -2607,6 +3740,7 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
         self.waiting_queue.append(req)
         entry["request_adopted"] = True
+        self._pd_flip_note_timing(entry, "target_adopted")
 
     def _pd_flip_build_migration_manifest(self, req: Req) -> Dict[str, Any]:
         origin_input_ids = list(getattr(req, "origin_input_ids", []) or [])
@@ -2680,7 +3814,15 @@ class Scheduler(
                 "last_error": "",
                 "dry_run": False,
                 "prepare_only": False,
+                "waiting_reqs": 0,
+                "waiting_manifest_count": 0,
+                "waiting_skipped_count": 0,
+                "waiting_skipped": [],
+                "delta_pending_reqs": 0,
+                "delta_transferred_reqs": 0,
+                "delta_failed_reqs": 0,
             }
+        session_timing = session.get("timing_debug") or {}
         return {
             "enabled": True,
             "role": session.get("role", "none"),
@@ -2694,10 +3836,100 @@ class Scheduler(
             "last_error": session.get("last_error", ""),
             "dry_run": bool(session.get("dry_run", False)),
             "prepare_only": bool(session.get("prepare_only", False)),
+            "waiting_reqs": int(session_timing.get("waiting_reqs", 0) or 0),
+            "waiting_manifest_count": int(
+                session_timing.get("waiting_manifest_count", 0) or 0
+            ),
+            "waiting_skipped_count": int(
+                session_timing.get("waiting_skipped_count", 0) or 0
+            ),
+            "waiting_skipped": list(session_timing.get("waiting_skipped") or []),
+            "delta_pending_reqs": int(session.get("delta_pending_reqs", 0) or 0),
+            "delta_transferred_reqs": int(
+                session.get("delta_transferred_reqs", 0) or 0
+            ),
+            "delta_failed_reqs": int(session.get("delta_failed_reqs", 0) or 0),
+            "index_debug": self._pd_flip_migration_index_debug(session),
+            "timing_debug": self._pd_flip_migration_timing_debug(session),
         }
+
+    @staticmethod
+    def _pd_flip_note_timing(
+        container: Dict[str, Any], name: str, started: Optional[float] = None
+    ) -> None:
+        timing = container.setdefault("timing_debug", {})
+        now = time.monotonic()
+        if started is None:
+            timing.setdefault(f"{name}_mono", now)
+        else:
+            timing[f"{name}_s"] = now - started
+            timing.setdefault(f"{name}_mono", now)
+
+    @staticmethod
+    def _pd_flip_json_safe_timing(values: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {}
+        for key, value in dict(values or {}).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe[key] = value
+        return safe
+
+    def _pd_flip_migration_timing_debug(
+        self, session: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        entries = session.get("source_entries") or session.get("target_entries") or {}
+        return {
+            "session": self._pd_flip_json_safe_timing(
+                session.get("timing_debug") or {}
+            ),
+            "entries": [
+                {
+                    "rid": rid,
+                    "phase": entry.get("phase"),
+                    "source_queue": entry.get("source_queue")
+                    or (entry.get("manifest") or {}).get("pd_flip_source_queue"),
+                    "timing": self._pd_flip_json_safe_timing(
+                        entry.get("timing_debug") or {}
+                    ),
+                }
+                for rid, entry in entries.items()
+            ],
+        }
+
+    @staticmethod
+    def _pd_flip_migration_index_debug(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+        entries = session.get("source_entries") or session.get("target_entries") or {}
+        debug = []
+        for rid, entry in entries.items():
+            item = {
+                "rid": rid,
+                "phase": entry.get("phase"),
+                "source_queue": entry.get("source_queue")
+                or (entry.get("manifest") or {}).get("pd_flip_source_queue"),
+                "source_index_shape": entry.get("source_index_shape"),
+                "source_index_size": entry.get("source_index_size"),
+                "target_index_shape": entry.get("target_index_shape"),
+                "target_index_size": entry.get("target_index_size"),
+            }
+            delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
+            if delta:
+                item["delta_source_index_shape"] = delta.get("source_index_shape")
+                item["delta_source_index_size"] = delta.get("source_index_size")
+                item["delta_target_index_shape"] = delta.get("target_index_shape")
+                item["delta_target_index_size"] = delta.get("target_index_size")
+            if any(value is not None for key, value in item.items() if key != "rid"):
+                debug.append(item)
+        return debug
 
     def _pd_flip_migration_is_active(self) -> bool:
         return self._pd_flip_migration_status_dict()["enabled"]
+
+    def _pd_flip_source_migration_blocks_idle(self) -> bool:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("role") != "source":
+            return False
+        if session.get("state") in ("source_released", "source_aborted"):
+            return False
+        return bool(session.get("manifests") or session.get("source_entries"))
 
     def _pd_flip_migration_is_released(self) -> bool:
         status = self._pd_flip_migration_status_dict()
@@ -2706,6 +3938,26 @@ class Scheduler(
             and status["pending_reqs"] == 0
             and status["failed_reqs"] == 0
         )
+
+    def _pd_flip_target_held_reqs(self) -> List[Req]:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("role") != "target":
+            return []
+
+        held_reqs = []
+        for entry in (session.get("target_entries") or {}).values():
+            phase = entry.get("phase")
+            if (
+                phase not in ("transferring", "transferred_held")
+                or entry.get("request_released")
+                or entry.get("request_adopted")
+            ):
+                continue
+            decode_req = entry.get("decode_req")
+            req = getattr(decode_req, "req", None)
+            if req is not None and getattr(req, "req_pool_idx", None) is not None:
+                held_reqs.append(req)
+        return held_reqs
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -2910,6 +4162,14 @@ class Scheduler(
                 (
                     PDFlipMigrationSourceFinishReq,
                     self.finish_pd_flip_migration_source,
+                ),
+                (
+                    PDFlipMigrationSourceDeltaReq,
+                    self.start_pd_flip_migration_source_delta,
+                ),
+                (
+                    PDFlipMigrationTargetDeltaPrepareReq,
+                    self.prepare_pd_flip_migration_target_delta,
                 ),
                 (PDFlipMigrationAbortReq, self.abort_pd_flip_migration),
                 (PDRuntimeRoleSetReq, self.set_pd_runtime_role),
@@ -3261,6 +4521,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_pd_flip_held_reqs=self._pd_flip_target_held_reqs,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -4944,6 +6205,8 @@ class Scheduler(
         idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
+            idle &= not self._pd_flip_source_migration_blocks_idle()
+
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
