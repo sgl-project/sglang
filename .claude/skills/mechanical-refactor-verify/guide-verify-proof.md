@@ -5,6 +5,17 @@
   chain-level contract: `spec-reproduction-cli.md`.
 - How the proof was produced and the folder it arrives in: `guide-construct-proof.md`.
 
+## 0. Do not trust the PR — verify yourself
+
+- Everything the PR shows you is a **claim**, not evidence: a pasted `PASS` verdict, a
+  pasted chain report, a green checkmark, the classification words themselves. All of it
+  is text the author (or the author's tooling) produced and could be wrong or fabricated.
+- The proof is only ever the run **you** perform locally: run the chain verifier (§1)
+  against the PR's actual base and head, with the proof folder you downloaded — never
+  approve from the author's pasted output.
+- This is cheap by design: the whole point of the machinery is that re-verification is
+  one command, so there is no excuse to trust instead of re-run.
+
 ## 1. Verify the whole chain
 
 - The default entry point: do not re-run proofs one by one — run the chain verifier:
