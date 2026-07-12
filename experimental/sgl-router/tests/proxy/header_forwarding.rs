@@ -25,6 +25,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {

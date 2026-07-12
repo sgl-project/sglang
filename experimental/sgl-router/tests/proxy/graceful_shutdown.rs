@@ -38,6 +38,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {

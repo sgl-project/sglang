@@ -124,6 +124,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: sgl_router::config::ModelConfig {

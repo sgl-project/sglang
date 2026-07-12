@@ -79,6 +79,7 @@ mod tests {
             server: ServerConfig {
                 host: "127.0.0.1".into(),
                 port: 30000,
+                pd_flip_router_admin_api_key: None,
             },
             observability: ObservabilityConfig::default(),
             model: ModelConfig {

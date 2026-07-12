@@ -4,6 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${ENV_FILE:-${SCRIPT_DIR}/env.example}"
 
+case "${ADMIN_API_KEY:-}" in
+  ""|replace-with-*|changeme|CHANGE_ME)
+    echo "ADMIN_API_KEY must be set to a non-placeholder secret" >&2
+    exit 2
+    ;;
+esac
+
 ROLE="${1:?usage: run_worker.sh prefill|decode <local-bind-ip-or-0.0.0.0>}"
 LOCAL_IP="${2:?usage: run_worker.sh prefill|decode <local-bind-ip-or-0.0.0.0>}"
 
@@ -53,9 +60,7 @@ if [[ "${ENABLE_PD_FLIP_HICACHE_STITCH:-1}" == "1" ]]; then
   )
 fi
 
-if [[ -n "${ADMIN_API_KEY:-}" ]]; then
-  server_args+=(--admin-api-key "${ADMIN_API_KEY}")
-fi
+server_args+=(--admin-api-key "${ADMIN_API_KEY}")
 
 if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
   # shellcheck disable=SC2206

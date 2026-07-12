@@ -8,6 +8,8 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::workers::Worker;
 use axum::extract::State;
+use axum::http::header::AUTHORIZATION;
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -66,7 +68,30 @@ fn get_worker(ctx: &AppContext, worker_id: &str) -> Result<Arc<Worker>, ApiError
         .ok_or_else(|| ApiError::BadRequest(format!("unknown worker_id: {worker_id}")))
 }
 
-pub async fn list_workers(State(ctx): State<Arc<AppContext>>) -> Json<RouterWorkersResponse> {
+fn require_admin(headers: &HeaderMap, ctx: &AppContext) -> Result<(), ApiError> {
+    let key = ctx
+        .config
+        .server
+        .pd_flip_router_admin_api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .ok_or(ApiError::Unauthorized)?;
+    let expected = format!("Bearer {key}");
+    let actual = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError::Unauthorized)?;
+    if actual != expected {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(())
+}
+
+pub async fn list_workers(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+) -> Result<Json<RouterWorkersResponse>, ApiError> {
+    require_admin(&headers, &ctx)?;
     let mut workers: Vec<RouterWorkerStatus> = ctx
         .registry
         .all()
@@ -74,13 +99,15 @@ pub async fn list_workers(State(ctx): State<Arc<AppContext>>) -> Json<RouterWork
         .map(|w| snapshot_worker(&w))
         .collect();
     workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
-    Json(RouterWorkersResponse { workers })
+    Ok(Json(RouterWorkersResponse { workers }))
 }
 
 pub async fn set_worker_drain(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
     Json(req): Json<RouterWorkerDrainReq>,
 ) -> Result<Json<RouterWorkerControlResponse>, ApiError> {
+    require_admin(&headers, &ctx)?;
     let worker = get_worker(&ctx, &req.worker_id)?;
     worker.set_draining(req.draining);
     let snapshot = snapshot_worker(&worker);
@@ -97,8 +124,10 @@ pub async fn set_worker_drain(
 
 pub async fn set_worker_role(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
     Json(req): Json<RouterWorkerRoleReq>,
 ) -> Result<Json<RouterWorkerControlResponse>, ApiError> {
+    require_admin(&headers, &ctx)?;
     let worker = get_worker(&ctx, &req.worker_id)?;
     worker.set_runtime_role(req.role, req.bootstrap_port);
     if let Some(draining) = req.draining {
@@ -121,8 +150,9 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn app_with_worker() -> axum::Router {
-        let ctx = AppContext::stub();
+    fn app_with_worker(admin_key: Option<&str>) -> (axum::Router, Arc<AppContext>) {
+        let mut ctx = AppContext::stub();
+        ctx.config.server.pd_flip_router_admin_api_key = admin_key.map(str::to_owned);
         ctx.registry
             .add(WorkerSpec {
                 id: WorkerId("w1".into()),
@@ -132,17 +162,19 @@ mod tests {
                 bootstrap_port: None,
             })
             .expect("test worker accepted");
-        crate::server::app::build_router(Arc::new(ctx))
+        let ctx = Arc::new(ctx);
+        (crate::server::app::build_router(Arc::clone(&ctx)), ctx)
     }
 
     #[tokio::test]
     async fn drain_endpoint_marks_worker_draining() {
-        let app = app_with_worker();
+        let (app, _) = app_with_worker(Some("test-secret"));
         let res = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/pd_flip/router/worker/drain")
+                    .header("authorization", "Bearer test-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"worker_id":"w1","draining":true}"#))
                     .unwrap(),
@@ -159,12 +191,13 @@ mod tests {
 
     #[tokio::test]
     async fn role_endpoint_updates_role_and_bootstrap_port() {
-        let app = app_with_worker();
+        let (app, _) = app_with_worker(Some("test-secret"));
         let res = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/pd_flip/router/worker/role")
+                    .header("authorization", "Bearer test-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"worker_id":"w1","role":"prefill","bootstrap_port":8997,"draining":false}"#,
@@ -180,5 +213,71 @@ mod tests {
         assert_eq!(worker.role, WorkerMode::Prefill);
         assert_eq!(worker.bootstrap_port, Some(8997));
         assert!(!worker.draining);
+    }
+
+    #[tokio::test]
+    async fn missing_admin_key_is_unauthorized() {
+        let (app, _) = app_with_worker(None);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pd_flip/router/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_bearer_is_unauthorized() {
+        let (app, _) = app_with_worker(Some("test-secret"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pd_flip/router/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_bearer_is_unauthorized_without_mutation() {
+        let (app, ctx) = app_with_worker(Some("test-secret"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pd_flip/router/worker/drain")
+                    .header("authorization", "Bearer wrong")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"worker_id":"w1","draining":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let worker = get_worker(&ctx, "w1").unwrap();
+        assert!(!worker.is_draining(), "unauthorized request mutated worker");
+    }
+
+    #[tokio::test]
+    async fn correct_bearer_authorizes_controls() {
+        let (app, _) = app_with_worker(Some("test-secret"));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pd_flip/router/workers")
+                    .header("authorization", "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }

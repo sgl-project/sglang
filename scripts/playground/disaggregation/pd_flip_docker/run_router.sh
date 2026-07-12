@@ -4,6 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${ENV_FILE:-${SCRIPT_DIR}/env.example}"
 
+router_admin_key="${PD_FLIP_ROUTER_ADMIN_API_KEY:-${ADMIN_API_KEY:-}}"
+case "${ADMIN_API_KEY:-}" in
+  ""|replace-with-*|changeme|CHANGE_ME)
+    echo "ADMIN_API_KEY must be set to a non-placeholder secret" >&2
+    exit 2
+    ;;
+esac
+case "${router_admin_key}" in
+  ""|replace-with-*|changeme|CHANGE_ME)
+    echo "PD_FLIP_ROUTER_ADMIN_API_KEY must be set to a non-placeholder secret" >&2
+    exit 2
+    ;;
+esac
+if [[ "${router_admin_key}" != "${ADMIN_API_KEY}" ]]; then
+  echo "PD_FLIP_ROUTER_ADMIN_API_KEY must match ADMIN_API_KEY because the controller uses one credential" >&2
+  exit 2
+fi
+
 mounts=(-v "${SGLANG_REPO}:/sgl-workspace/sglang")
 if [[ -d "${MODEL_PATH}" ]]; then
   mounts+=(-v "${MODEL_PATH}:${MODEL_PATH}:ro")
@@ -13,6 +31,7 @@ args=(
   --host 0.0.0.0
   --port "${ROUTER_PORT}"
   --model-id "${MODEL_ID}"
+  --pd-flip-router-admin-api-key "${router_admin_key}"
 )
 router_tokenizer_path="${TOKENIZER_PATH:-}"
 if [[ -d "${router_tokenizer_path}" && -f "${router_tokenizer_path}/tokenizer.json" ]]; then

@@ -751,8 +751,12 @@ async def abort_pd_flip_migration_target(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_pd_flip_migration_status(request: Request):
     return await _global_state.tokenizer_manager.get_pd_flip_migration_status(
-        PDFlipMigrationStatusReq()
+        _pd_flip_status_req_from_request(request)
     )
+
+
+def _pd_flip_status_req_from_request(request: Request) -> PDFlipMigrationStatusReq:
+    return PDFlipMigrationStatusReq(session_id=request.query_params.get("session_id"))
 
 
 @app.post("/pd_flip/migration/source/finish")

@@ -33,6 +33,9 @@ param(
     [double]$MemFractionStatic = 0.88,
     [string]$TransferBackend = "mooncake",
     [string]$IbDevice = "mlx5_0",
+    [string]$MooncakeMaster = "10.0.0.10:50051",
+    [string]$MooncakeMetadataServer = "http://10.0.0.10:8080/metadata",
+    [string]$AdminApiKey = "",
     [string]$RouterHost = "127.0.0.1",
     [int]$RouterPort = 8000,
     [double]$TtftSloSeconds = 0.2,
@@ -52,9 +55,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($AdminApiKey) -or $AdminApiKey -match "^(replace-with-|changeme|CHANGE_ME)") {
+    throw "-AdminApiKey must be a non-placeholder secret; refusing unsafe orchestration"
+}
+
 $Nodes = @(
     @{ Name = "node0"; Host = "cloud-099"; Role = "prefill"; Session = "pd-node0" },
-    @{ Name = "node1"; Host = "cloud-100"; Role = "prefill"; Session = "pd-node1" },
+    @{ Name = "node1"; Host = "cloud-100"; Role = "decode"; Session = "pd-node1" },
     @{ Name = "node2"; Host = "cloud-101"; Role = "decode"; Session = "pd-node2" },
     @{ Name = "node3"; Host = "cloud-102"; Role = "decode"; Session = "pd-node3" }
 )
@@ -112,13 +119,21 @@ function Write-EnvFile {
         "",
         "TRANSFER_BACKEND=$TransferBackend",
         "IB_DEVICE=$IbDevice",
+        "MOONCAKE_MASTER=$MooncakeMaster",
+        "MOONCAKE_TE_META_DATA_SERVER=$MooncakeMetadataServer",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
+        "MOONCAKE_PROTOCOL=rdma",
+        "MOONCAKE_DEVICE=$IbDevice",
+        "MOONCAKE_STORE_PORT=8081",
+        "HICACHE_STORAGE_BACKEND=mooncake",
+        "HICACHE_WRITE_POLICY=write_through",
         "",
         "NODE0_HOST=cloud-099",
         "NODE1_HOST=cloud-100",
         "NODE2_HOST=cloud-101",
         "NODE3_HOST=cloud-102",
         "NODE0_ROLE=prefill",
-        "NODE1_ROLE=prefill",
+        "NODE1_ROLE=decode",
         "NODE2_ROLE=decode",
         "NODE3_ROLE=decode",
         "",
@@ -137,6 +152,14 @@ function Write-EnvFile {
         "PD_FLIP_COMMIT_THRESHOLD=$PDFlipCommitThreshold",
         "PD_FLIP_MONITOR_ITERATIONS=$MonitorIterations",
         "PD_FLIP_MONITOR_POLL_INTERVAL=$MonitorPollInterval",
+        "PD_FLIP_FIRST_MIGRATION_RATIO=0.5",
+        "PD_FLIP_OBSERVATION_SECONDS=10",
+        "PD_FLIP_SLO_THRESHOLD=0.9",
+        "PD_FLIP_MIN_PREFILL_SLO_SAMPLES=20",
+        "PD_FLIP_MIN_DECODE_SLO_SAMPLES=20",
+        "ADMIN_API_KEY=$AdminApiKey",
+        "PD_FLIP_ROUTER_ADMIN_API_KEY=$AdminApiKey",
+        "PD_FLIP_ARTIFACT_DIR=/sgl-workspace/sglang/pd-flip-artifacts/four-node-progressive",
         "",
         "EXTRA_SGLANG_ARGS=$(Quote-ShValue $ExtraSGLangArgs)",
         "EXTRA_DOCKER_ARGS=$(Quote-ShValue $ExtraDockerArgs)",
@@ -248,9 +271,9 @@ function Start-Monitor {
 
 function Invoke-Status {
     foreach ($node in $Nodes) {
-        Invoke-Remote $node.Host "if command -v tmux >/dev/null 2>&1; then tmux ls || true; else cd $RemoteDockerDir && for f in *.pid; do [ -f `$f ] && echo `$f=`$(cat `$f); done; fi; curl -fsS http://127.0.0.1:30000/pd_flip/runtime_role/status || true"
+        Invoke-Remote $node.Host "source $RemoteEnvFile && if command -v tmux >/dev/null 2>&1; then tmux ls || true; else cd $RemoteDockerDir && for f in *.pid; do [ -f `$f ] && echo `$f=`$(cat `$f); done; fi; curl -fsS -H `"Authorization: Bearer `${ADMIN_API_KEY}`" http://127.0.0.1:30000/pd_flip/runtime_role/status"
     }
-    Invoke-Remote $ControllerHost "source $RemoteEnvFile && curl -fsS http://127.0.0.1:`${ROUTER_PORT}/pd_flip/router/workers || true"
+    Invoke-Remote $ControllerHost "source $RemoteEnvFile && curl -fsS -H `"Authorization: Bearer `${PD_FLIP_ROUTER_ADMIN_API_KEY}`" http://127.0.0.1:`${ROUTER_PORT}/pd_flip/router/workers"
 }
 
 function Invoke-Logs {

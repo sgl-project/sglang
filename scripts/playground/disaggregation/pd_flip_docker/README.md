@@ -57,6 +57,19 @@ cp env.example env.local
 chmod 600 env.local
 vi env.local
 export ENV_FILE="$PWD/env.local"
+# task11-clean-shell-smoke-begin
+set -a
+source "$ENV_FILE"
+set +a
+case "$ADMIN_API_KEY" in
+  ""|replace-with-*|changeme|CHANGE_ME) echo "unsafe ADMIN_API_KEY" >&2; exit 2 ;;
+esac
+: "${SGLANG_REPO:?}" "${MODEL_PATH:?}" "${NODE0:?}" "${NODE1:?}" "${NODE2:?}" "${NODE3:?}"
+[[ "$MOONCAKE_GLOBAL_SEGMENT_SIZE" == "0" ]] || {
+  echo "workers must use the dedicated store (MOONCAKE_GLOBAL_SEGMENT_SIZE=0)" >&2
+  exit 2
+}
+# task11-clean-shell-smoke-end
 ```
 
 Set the same `MODEL_PATH`, `MODEL_ID`, `TOKENIZER_PATH`, node URLs, Mooncake
@@ -78,6 +91,8 @@ HiCache storage, `write_through`, prefix stitching, and an admin API key. The
 controller forwards that key as a Bearer token and uses the same ratio,
 observation, SLO sample, and durable session-journal settings. Do not put the
 real key in `EXTRA_SGLANG_ARGS` or a checked-in file.
+`PD_FLIP_ROUTER_ADMIN_API_KEY` defaults to `ADMIN_API_KEY` and must currently
+match it because the controller uses one credential for router and workers.
 
 ## Mooncake prerequisites
 
@@ -108,10 +123,11 @@ timeout 3 bash -c "</dev/tcp/${MOONCAKE_MASTER%:*}/${MOONCAKE_STORE_PORT}"
 ibv_devices
 ```
 
-`MOONCAKE_GLOBAL_SEGMENT_SIZE=0` requires a separate store; the example uses a
-separate store even with `4gb` so service ownership is explicit. HiCache must
-stay `write_through`: the hit-mode acceptance checks below depend on completed
-prefix publication, not eventual write-back.
+This runbook uses one topology only: the dedicated store contributes the 4 GiB
+segment shown above and every worker has `MOONCAKE_GLOBAL_SEGMENT_SIZE=0`.
+Preflight fails if a worker advertises a contributed segment or the dedicated
+store is absent. HiCache must stay `write_through`: the hit-mode acceptance
+checks below depend on completed prefix publication, not eventual write-back.
 
 ## Start and health checks
 
@@ -139,6 +155,7 @@ Use the admin credential on every worker control/status call:
 
 ```bash
 AUTH=(-H "Authorization: Bearer ${ADMIN_API_KEY}")
+ROUTER_AUTH=(-H "Authorization: Bearer ${PD_FLIP_ROUTER_ADMIN_API_KEY:-$ADMIN_API_KEY}")
 for url in "$NODE0" "$NODE1" "$NODE2" "$NODE3"; do
   curl --fail --silent "${AUTH[@]}" "$url/health" >/dev/null
   curl --fail --silent "${AUTH[@]}" "$url/pd_flip/runtime_role/status" | jq -e \
@@ -148,7 +165,8 @@ for url in "$NODE0" "$NODE1" "$NODE2" "$NODE3"; do
       .status.role == .status.active_event_loop_role)'
   curl --fail --silent "${AUTH[@]}" "$url/pd_flip/migration/status" | jq .
 done
-curl --fail --silent "http://${ROUTER_HOST}:${ROUTER_PORT}/pd_flip/router/workers" | jq .
+curl --fail --silent "${ROUTER_AUTH[@]}" \
+  "http://${ROUTER_HOST}:${ROUTER_PORT}/pd_flip/router/workers" | jq .
 ```
 
 Before traffic, assert roles rather than inspecting them visually:
@@ -176,7 +194,8 @@ TTFT, per-token latency, complete token/text output, and output sequence. Start
 the measurement sidecar before the controller:
 
 ```bash
-PATH_KIND=recovery # use commit for the persistent-risk run
+PATH_KIND=${PATH_KIND:-recovery} # recovery or commit
+MODE=${MODE:-full}               # full, partial, or zero
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${PATH_KIND}"
 HOST_ARTIFACT_DIR="${SGLANG_REPO}/pd-flip-artifacts/${RUN_ID}"
 CONTAINER_ARTIFACT_DIR="/sgl-workspace/sglang/pd-flip-artifacts/${RUN_ID}"
@@ -185,57 +204,81 @@ set -a; source "$ENV_FILE"; set +a
 cp "$ENV_FILE" "$HOST_ARTIFACT_DIR/env.resolved.private"
 git rev-parse HEAD >"$HOST_ARTIFACT_DIR/git-commit.txt"
 docker image inspect "$IMAGE" --format '{{json .RepoDigests}}' >"$HOST_ARTIFACT_DIR/image-digests.json"
-ADMIN_API_KEY="$ADMIN_API_KEY" EVENTS="$HOST_ARTIFACT_DIR/migration_events.jsonl" \
+ADMIN_API_KEY="$ADMIN_API_KEY" \
+ROUTER_ADMIN_API_KEY="${PD_FLIP_ROUTER_ADMIN_API_KEY:-$ADMIN_API_KEY}" \
+EVENTS="$HOST_ARTIFACT_DIR/migration_events.jsonl" \
 ROUTER_URL="http://${ROUTER_HOST}:${ROUTER_PORT}" \
 NODE0="$NODE0" NODE1="$NODE1" NODE2="$NODE2" NODE3="$NODE3" python3 - <<'PY' &
 import json, os, time, urllib.request
 from scripts.playground.disaggregation import pd_flip_migration_measure as m
 class AuthClient(m.HttpClient):
+    def __init__(self, key, timeout_seconds=3):
+        super().__init__(timeout_seconds=timeout_seconds)
+        self.key = key
     def get_json(self, url):
-        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ADMIN_API_KEY"]})
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.key})
         with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8", errors="replace"))
-client = AuthClient(timeout_seconds=3)
+worker_client = AuthClient(os.environ["ADMIN_API_KEY"])
+router_client = AuthClient(os.environ["ROUTER_ADMIN_API_KEY"])
 nodes = [{"name": "node%d" % i, "worker_url": os.environ["NODE%d" % i]} for i in range(4)]
 names = {node["worker_url"].rstrip("/"): node["name"] for node in nodes}
 deadline = time.monotonic() + 420
 with open(os.environ["EVENTS"], "w", encoding="utf-8") as output:
     while time.monotonic() < deadline:
         started = time.monotonic()
-        m.write_event(output, m.collect_router_event(client, os.environ["ROUTER_URL"], names))
+        m.write_event(output, m.collect_router_event(router_client, os.environ["ROUTER_URL"], names))
         for node in nodes:
-            for event in m.collect_worker_events(client, node):
+            for event in m.collect_worker_events(worker_client, node):
                 m.write_event(output, event)
         time.sleep(max(0, 0.25 - (time.monotonic() - started)))
 PY
 MEASURE_PID=$!
+python3 scripts/playground/disaggregation/pd_flip_progressive_workload.py \
+  --base-url "http://${ROUTER_HOST}:${ROUTER_PORT}" \
+  --api-key "$ADMIN_API_KEY" --model "$MODEL_ID" \
+  --mode "$MODE" --decision-path "$PATH_KIND" \
+  --output-dir "$HOST_ARTIFACT_DIR" \
+  --ttft-slo-seconds "$TTFT_SLO_SECONDS" --tpot-slo-seconds "$TPOT_SLO_SECONDS" &
+WORKLOAD_PID=$!
+sleep 1
 ```
 
-For **SLO recovery without role flip**, apply enough short-request pressure to
-drop prefill TTFT attainment below `PD_FLIP_ENTER_THRESHOLD`. Wait until the
-journal/status shows the first batch held on node3 and the controller enters
-`observing`; then stop the short-request pressure while long decode traffic
-continues. Run:
+The producer's `recovery` profile stops short-request pressure early; its
+`commit` profile continues pressure past the observation window. These are
+inputs, not proof of the decision. Run the controller and retain stderr/stdout:
 
 ```bash
 PD_FLIP_ARTIFACT_DIR="$CONTAINER_ARTIFACT_DIR" \
-PD_FLIP_MONITOR_ITERATIONS=120 ./run_controller.sh monitor |
-  tee "$HOST_ARTIFACT_DIR/controller-monitor.jsonl"
+PD_FLIP_MONITOR_ITERATIONS=120 ./run_controller.sh monitor |& \
+  tee "$HOST_ARTIFACT_DIR/controller-monitor.log"
+CONTROLLER_EXIT=${PIPESTATUS[0]}
+wait "$WORKLOAD_PID"; WORKLOAD_EXIT=$?
+test "$CONTROLLER_EXIT" -eq 0
+test "$WORKLOAD_EXIT" -eq 0
 ```
+
+Execute all six input/path combinations in fresh stores/namespaces by setting
+the two variables before repeating the complete block above:
+
+```bash
+for PATH_KIND in recovery commit; do
+  for MODE in full partial zero; do
+    printf 'run fresh case: PATH_KIND=%s MODE=%s\n' "$PATH_KIND" "$MODE"
+  done
+done
+```
+
+For **SLO recovery without role flip**, accept only when prefill pressure first
+causes a first migration, post-first-migration samples recover, and:
 
 Accept recovery only if the journal ends `aborted`, node2 admission is resumed,
 the first batch remains owned/active on node3, no runtime/router role changes,
 and all four `role == active_event_loop_role` checks still match `1P3D`.
 
-For **persistent prefill risk with successful D-to-P**, repeat with a fresh run
-directory and keep prefill pressure below the SLO threshold throughout the
-post-first-migration observation window while decode attainment remains healthy:
-
-```bash
-PD_FLIP_ARTIFACT_DIR="$CONTAINER_ARTIFACT_DIR" \
-PD_FLIP_MONITOR_ITERATIONS=120 ./run_controller.sh monitor |
-  tee "$HOST_ARTIFACT_DIR/controller-monitor.jsonl"
-```
+For **persistent prefill risk with successful D-to-P**, use
+`PATH_KIND=commit`; accept only when the post-first-migration samples remain
+risky while decode attainment remains healthy.
 
 Accept commit only if the journal ends `target_active`, node3 owns every
 journaled request exactly once, node2 has no migrated residual request, and:
@@ -259,7 +302,9 @@ success; abort admission and reconcile it.
 
 Run each mode in an isolated Mooncake namespace/store or clear the test store
 between cases. Keep prompts page-aligned where noted and confirm publication
-has completed before starting the active long decode request.
+has completed before starting the active long decode request. The producer's
+`--mode` selects only a warm-up/input strategy; it cannot force or prove a
+cache hit. Accept the mode only from worker `request_measurements.stitch_mode`.
 
 1. `full_prefix_stitch`: send a warm-up request whose prefix is P, wait for
    write-through completion, then start a long request with the same P and a
@@ -341,6 +386,7 @@ Stop the sidecar and summarize only after traffic and final consistency checks:
 kill "$MEASURE_PID"; wait "$MEASURE_PID" || true
 python3 scripts/playground/disaggregation/pd_flip_migration_measure.py summarize \
   --events-jsonl "$HOST_ARTIFACT_DIR/migration_events.jsonl" \
+  --controller-log "$HOST_ARTIFACT_DIR/controller-monitor.log" \
   --request-metrics-jsonl "$HOST_ARTIFACT_DIR/request_metrics.jsonl" \
   --errors-jsonl "$HOST_ARTIFACT_DIR/errors.jsonl" \
   --output-dir "$HOST_ARTIFACT_DIR/summary"

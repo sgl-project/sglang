@@ -36,6 +36,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {

@@ -35,6 +35,9 @@ pub struct Cli {
     /// Port to bind the HTTP server to.
     #[arg(long, default_value_t = 30000)]
     pub port: u16,
+    /// Bearer secret required by all /pd_flip/router/* endpoints.
+    #[arg(long)]
+    pub pd_flip_router_admin_api_key: Option<String>,
 
     // ---- model (exactly one) ----
     /// Model id this router serves (the OpenAI `model` field).
@@ -253,6 +256,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.host,
                 port: self.port,
+                pd_flip_router_admin_api_key: self.pd_flip_router_admin_api_key,
             },
             observability: ObservabilityConfig {
                 log_level: self.log_level,
@@ -391,6 +395,24 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.server.pd_flip_router_admin_api_key, None);
+    }
+
+    #[test]
+    fn pd_flip_router_admin_key_is_preserved() {
+        let c = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--pd-flip-router-admin-api-key",
+            "test-secret",
+        ])
+        .unwrap();
+        assert_eq!(
+            c.server.pd_flip_router_admin_api_key.as_deref(),
+            Some("test-secret")
+        );
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

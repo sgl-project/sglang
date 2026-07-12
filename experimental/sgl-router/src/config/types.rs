@@ -101,6 +101,9 @@ pub enum PolicyKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Exact Bearer secret for the PD runtime control plane. `None` remains a
+    /// valid process configuration, but the protected endpoints fail closed.
+    pub pd_flip_router_admin_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -112,6 +112,7 @@ mod tests {
             server: crate::config::ServerConfig {
                 host: "x".into(),
                 port: 0,
+                pd_flip_router_admin_api_key: None,
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {

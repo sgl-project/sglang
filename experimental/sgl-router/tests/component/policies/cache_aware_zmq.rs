@@ -63,6 +63,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         server: sgl_router::config::ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: Default::default(),
         model: sgl_router::config::ModelConfig {

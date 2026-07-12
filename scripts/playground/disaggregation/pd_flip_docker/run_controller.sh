@@ -3,7 +3,37 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
+
+# Values explicitly exported on the command line are per-run controls and take
+# precedence over the shared ENV_FILE. Preserve both set and set-to-empty values.
+override_names=(
+  ADMIN_API_KEY DIRECTION SOURCE_NAME PD_FLIP_CONTROLLER_USE_DOCKER
+  PD_FLIP_FIRST_MIGRATION_RATIO PD_FLIP_OBSERVATION_SECONDS PD_FLIP_SLO_THRESHOLD
+  PD_FLIP_MIN_PREFILL_SLO_SAMPLES PD_FLIP_MIN_DECODE_SLO_SAMPLES
+  PD_FLIP_ARTIFACT_DIR PD_FLIP_SESSION_JOURNAL_PATH
+  PD_FLIP_MONITOR_ITERATIONS PD_FLIP_MONITOR_POLL_INTERVAL
+  TTFT_SLO_SECONDS TPOT_SLO_SECONDS PD_FLIP_WINDOW_SECONDS
+  PD_FLIP_ENTER_THRESHOLD PD_FLIP_EXIT_THRESHOLD PD_FLIP_COMMIT_THRESHOLD
+)
+declare -A command_overrides=()
+for name in "${override_names[@]}"; do
+  if [[ -v "${name}" ]]; then
+    command_overrides["${name}"]="${!name}"
+  fi
+done
 source "${ENV_FILE:-${SCRIPT_DIR}/env.example}"
+for name in "${override_names[@]}"; do
+  if [[ -v "command_overrides[${name}]" ]]; then
+    printf -v "${name}" '%s' "${command_overrides[${name}]}"
+  fi
+done
+
+case "${ADMIN_API_KEY:-}" in
+  ""|replace-with-*|changeme|CHANGE_ME)
+    echo "ADMIN_API_KEY must be set to a non-placeholder secret" >&2
+    exit 2
+    ;;
+esac
 
 ACTION="${1:-dry-run}"
 DIRECTION="${DIRECTION:-d_to_p}"
@@ -20,12 +50,10 @@ base_args=(
   --slo-threshold "${PD_FLIP_SLO_THRESHOLD:-0.9}"
   --min-prefill-slo-samples "${PD_FLIP_MIN_PREFILL_SLO_SAMPLES:-20}"
   --min-decode-slo-samples "${PD_FLIP_MIN_DECODE_SLO_SAMPLES:-20}"
-  --session-journal-path "${PD_FLIP_ARTIFACT_DIR:-/sgl-workspace/sglang/pd-flip-artifacts/four-node-progressive}/pd_flip_session.json"
+  --session-journal-path "${PD_FLIP_SESSION_JOURNAL_PATH:-${PD_FLIP_ARTIFACT_DIR:-/sgl-workspace/sglang/pd-flip-artifacts/four-node-progressive}/pd_flip_session.json}"
 )
 
-if [[ -n "${ADMIN_API_KEY:-}" ]]; then
-  base_args+=(--api-key "${ADMIN_API_KEY}")
-fi
+base_args+=(--api-key "${ADMIN_API_KEY}")
 
 run_controller() {
   if [[ "${PD_FLIP_CONTROLLER_USE_DOCKER:-1}" == "1" ]]; then
