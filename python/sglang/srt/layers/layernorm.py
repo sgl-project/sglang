@@ -31,8 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -94,6 +93,7 @@ if _is_cuda or _is_xpu or _is_musa:
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
+_has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -109,6 +109,19 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
+
+if _is_hip:
+    try:
+        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+            gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
+        )
+        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+            gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
+        )
+
+        _has_rocm_triton_gemma_rms_norm = True
+    except ImportError:
+        _has_rocm_triton_gemma_rms_norm = False
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -193,7 +206,7 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
+            if _use_aiter and get_server_args().enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
@@ -271,7 +284,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_global_server_args().rl_on_policy_target == "fsdp"
+                or get_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -358,6 +371,10 @@ class RMSNorm(MultiPlatformOp):
             if residual is not None:
                 return x, residual
             return x
+        if self.weight.data.dtype != x.dtype:
+            # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
+            # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
+            return self.forward_native(x, residual, post_residual_addition)
         # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
         # already-safe layout as a zero-copy path, and only normalize strided or
         # higher-rank views such as Q/K slices from packed QKV projections.
@@ -367,6 +384,22 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         elif not x.is_contiguous():
             x = x.contiguous()
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_server_args().rl_on_policy_target == "fsdp"
+                or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            out = rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         # Fused (add +) rmsnorm + zero-pad path. Triggered when caller
         # constructed RMSNorm with x_pad_to_multiple > 0. Output last
         # dim is padded up; residual_out stays at original width. Used
@@ -411,6 +444,19 @@ class RMSNorm(MultiPlatformOp):
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
+
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
 
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
@@ -530,10 +576,7 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_global_server_args().rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or get_server_args().rl_on_policy_target == "fsdp":
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -724,24 +767,24 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _use_aiter and _has_rocm_triton_gemma_rms_norm:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return rocm_triton_gemma_fused_add_rmsnorm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+            return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
-        w = self.gemma_weight
         if _use_aiter:
-            # aiter API: rms_norm(input, weight, eps) -> output
-            #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
-            if residual is not None:
-                output = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    output, x, residual, residual_out, w, self.variance_epsilon
-                )
-                return output, residual_out
-            return rms_norm(x, w, self.variance_epsilon)
+            # AITER's ROCm rmsnorm2d_fwd has the same dtype requirement here;
+            # keep Gemma RMSNorm on native torch math for correctness.
+            return self.forward_native(x, residual, post_residual_addition)
         else:
+            w = self.gemma_weight
             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
             #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
             if not x.is_contiguous():

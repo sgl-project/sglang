@@ -37,7 +37,6 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
@@ -46,8 +45,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -93,6 +90,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -187,7 +185,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     ):
         super().__init__(model_runner)
         # --- core state ------------------------------------------------
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -206,10 +204,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.enable_pdmux = model_runner.server_args.enable_pdmux
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
         # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
         # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
         # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
@@ -239,7 +236,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
+        self.num_tokens_per_bs = model_runner.decode_num_tokens_per_bs(
+            num_draft_tokens=self.speculative_num_draft_tokens
+        )
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -248,14 +247,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    self.speculative_num_draft_tokens, model_runner.is_draft_worker
-                )
-            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
-            self.num_tokens_per_bs = self.dllm_config.block_size
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -265,7 +258,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        if self.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -314,7 +307,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
-            vocab_size=self.model_runner.model_config.vocab_size,
+            next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
+                self.model_runner.model_config.vocab_size, rows=self.max_num_token
+            ),
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
@@ -508,7 +503,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         export_cuda_graph_capture_trace(
             prof_context,
             runner_name=type(self).__name__,
-            tp_rank=get_tensor_model_parallel_rank(),
+            tp_rank=get_parallel().tp_rank,
         )
 
     def capture_prepare(
@@ -670,9 +665,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.warmup()
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
-        if self.enable_torch_compile and not (
-            self.model_runner.server_args.enable_torch_compile
-        ):
+        if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
                 self.model_runner, self.num_tokens_per_bs
@@ -725,7 +718,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Reverse so cuda graphs share memory better.
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
         lora_variants = (
@@ -734,7 +727,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else [(None, None)]
         )
         for bs in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
@@ -827,21 +820,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     **kwargs,
                 )
-                dflash_sampler = getattr(
-                    self.model_runner, "dflash_draft_sampler", None
-                )
-                if dflash_sampler is not None:
-                    # Must be captured here, or replay leaves a stale output buffer
-                    # the worker would read as valid tokens -- fail loudly instead.
-                    if (
-                        not isinstance(out, LogitsProcessorOutput)
-                        or out.hidden_states is None
-                    ):
-                        raise RuntimeError(
-                            "DFLASH draft sampler set but the draft forward has no "
-                            "hidden_states to capture into the graph."
-                        )
-                    dflash_sampler(out.hidden_states)
+                for capture_hook in self.model_runner.capture_tail_hooks:
+                    capture_hook(self, out, forward_batch, num_tokens)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -888,7 +868,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
-            if self.model_runner.server_args.enable_return_hidden_states
+            if self.enable_return_hidden_states
             else CaptureHiddenMode.NULL
         )
 
