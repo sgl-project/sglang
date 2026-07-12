@@ -193,6 +193,12 @@ class SpeculativeAlgorithm(Enum):
             _handle_ngram,
         )
 
+        # Validate for every algorithm at startup: the metrics paths read the
+        # ragged-verify mode env and must not be where a typo'd value raises.
+        from sglang.srt.speculative.ragged_verify import read_ragged_verify_mode
+
+        read_ragged_verify_mode()
+
         if self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_dspark():

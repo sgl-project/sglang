@@ -97,8 +97,6 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
@@ -199,12 +197,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(
             model_runner.server_args
         ) and not self._forward_is_dp_local(model_runner)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        # Composite predicates derive from the instance values so the dp-local
+        # draft exemption above stays consistent (require_gathered_buffer ==
+        # mlp_tp_gather or attn_tp_gather; require_mlp_sync adds dp attention).
+        self.require_gathered_buffer = (
+            self.require_mlp_tp_gather or self.require_attn_tp_gather
+        )
+        self.require_mlp_sync = (
+            model_runner.server_args.enable_dp_attention or self.require_gathered_buffer
+        )
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
