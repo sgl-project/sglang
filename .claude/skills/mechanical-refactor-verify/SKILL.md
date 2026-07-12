@@ -19,11 +19,10 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 
 ## 2. What do you want to do?
 
-- **Make a refactor branch satisfy this skill** (the whole authoring contract, in one
-  place) → `guide-split.md` §5: classification format, correct labeling, proofs PASS,
-  non-mechanical commits equivalence-reviewed.
-- **Split a change into commits** (extract, move, file split) → `guide-split.md`: the
-  prepare + move + postpare rule, the case recipes, and the anti-patterns.
+- **Author a compliant refactor branch — split it into commits, satisfy the contract**
+  (extract, move, file split) → `guide-split.md`: the prepare + move + postpare rule, the
+  case recipes, the anti-patterns, and the chain contract (§5: classification format,
+  correct labeling, proofs PASS, non-mechanical commits equivalence-reviewed).
 - **Construct the proof for a move commit** → `guide-construct-proof.md`: run
   `scripts/mechanical_refactor_proof_generator.py`, or hand-write a `Repro` when the
   generator reports `UNSUPPORTED`.
