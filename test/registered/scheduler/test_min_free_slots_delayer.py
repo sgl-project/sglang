@@ -14,17 +14,17 @@ class TestResolveMinFreeSlots(unittest.TestCase):
 
     def test_unset_non_dflash_disables(self):
         # Unset + not DFlash -> trigger stays disabled.
-        self.assertIsNone(resolve_min_free_slots(None, 512, is_dflash_or_dspark=False))
+        self.assertIsNone(resolve_min_free_slots(None, 512, is_dflash_family=False))
 
     def test_unset_dflash_auto_enables(self):
         # Unset + DFlash -> falls back to the legacy formula (full mapping).
-        self.assertEqual(resolve_min_free_slots(None, 512, is_dflash_or_dspark=True), 4)
-        self.assertEqual(resolve_min_free_slots(None, 8, is_dflash_or_dspark=True), 2)
+        self.assertEqual(resolve_min_free_slots(None, 512, is_dflash_family=True), 4)
+        self.assertEqual(resolve_min_free_slots(None, 8, is_dflash_family=True), 2)
 
     def test_unset_dflash_small_cluster_disables(self):
         # DFlash auto-default still respects the < 8 guard.
-        self.assertIsNone(resolve_min_free_slots(None, 7, is_dflash_or_dspark=True))
-        self.assertIsNone(resolve_min_free_slots(None, 0, is_dflash_or_dspark=True))
+        self.assertIsNone(resolve_min_free_slots(None, 7, is_dflash_family=True))
+        self.assertIsNone(resolve_min_free_slots(None, 0, is_dflash_family=True))
 
     def test_le_one_disables(self):
         # <= 1 can never batch, so it is a no-op.
@@ -47,7 +47,7 @@ class TestResolveMinFreeSlots(unittest.TestCase):
 
     def test_user_value_overrides_dflash_default(self):
         # An explicit user value wins over the DFlash auto-default.
-        self.assertEqual(resolve_min_free_slots(3, 512, is_dflash_or_dspark=True), 3)
+        self.assertEqual(resolve_min_free_slots(3, 512, is_dflash_family=True), 3)
 
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):

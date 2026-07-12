@@ -261,7 +261,7 @@ class FlashAttentionBackend(AttentionBackend):
         # CPU mirror.
         self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
-        ).is_dflash_or_dspark()
+        ).is_dflash_family()
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size

@@ -4,7 +4,7 @@ from typing import Optional
 def resolve_min_free_slots(
     user_value: Optional[int],
     max_running_requests: int,
-    is_dflash_or_dspark: bool = False,
+    is_dflash_family: bool = False,
 ) -> Optional[int]:
     """Resolve the min-free-slots threshold (None = disabled).
 
@@ -16,7 +16,7 @@ def resolve_min_free_slots(
     max_running_requests = max(0, int(max_running_requests))
     formula = min(4, max(2, (max_running_requests + 5) // 6))
     if user_value is None:
-        user_value = formula if is_dflash_or_dspark else None
+        user_value = formula if is_dflash_family else None
 
     if user_value is None or user_value <= 1:
         return None

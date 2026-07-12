@@ -79,7 +79,7 @@ class CustomSpecAlgo:
     def is_dspark(self) -> bool:
         return False
 
-    def is_dflash_or_dspark(self) -> bool:
+    def is_dflash_family(self) -> bool:
         return False
 
     def is_standalone(self) -> bool:

@@ -113,7 +113,7 @@ class SpeculativeAlgorithm(Enum):
     def is_dspark(self) -> bool:
         return self == SpeculativeAlgorithm.DSPARK
 
-    def is_dflash_or_dspark(self) -> bool:
+    def is_dflash_family(self) -> bool:
         return self.is_dflash() or self.is_dspark()
 
     def is_standalone(self) -> bool:
@@ -123,7 +123,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash_or_dspark()
+        return self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -350,7 +350,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash_or_dspark():
+    elif spec_algorithm.is_dflash_family():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

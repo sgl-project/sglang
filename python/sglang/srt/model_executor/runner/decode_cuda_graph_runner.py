@@ -500,7 +500,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash_or_dspark()
+                or self.model_runner.spec_algorithm.is_dflash_family()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -952,7 +952,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash_or_dspark()
+                    self.model_runner.spec_algorithm.is_dflash_family()
                     and self.model_runner.is_draft_worker
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
@@ -1071,7 +1071,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_ids[self.raw_num_token : graph_size_key].zero_()
             if (
                 not is_ragged
-                and self.model_runner.spec_algorithm.is_dflash_or_dspark()
+                and self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
@@ -1114,7 +1114,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     max_num_tokens / self.num_tokens_per_bs
                     if self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
-                    or self.model_runner.spec_algorithm.is_dflash_or_dspark()
+                    or self.model_runner.spec_algorithm.is_dflash_family()
                     else max_num_tokens
                 )
                 bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -1136,7 +1136,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             not is_ragged
-            and self.model_runner.spec_algorithm.is_dflash_or_dspark()
+            and self.model_runner.spec_algorithm.is_dflash_family()
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
@@ -1207,7 +1207,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         publish_read_done = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
-            and self.model_runner.spec_algorithm.is_dflash_or_dspark()
+            and self.model_runner.spec_algorithm.is_dflash_family()
         )
         read_done_post_replay = (
             publish_read_done
@@ -1308,7 +1308,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=self.model_runner.dtype,
                     device=self.model_runner.device,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash_or_dspark():
+        elif self.model_runner.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,

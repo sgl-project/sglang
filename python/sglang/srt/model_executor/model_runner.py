@@ -423,9 +423,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         self.eagle_draft_num_layers = None
-        self.dflash_or_dspark_use_aux_hidden_state = False
-        self.dflash_or_dspark_target_layer_ids = None
-        self.dflash_or_dspark_draft_num_layers = None
+        self.dflash_family_use_aux_hidden_state = False
+        self.dflash_family_target_layer_ids = None
+        self.dflash_family_draft_num_layers = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -465,7 +465,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # if there is no aux layer, set to None
                     self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash_or_dspark() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building draft context features.
@@ -523,9 +523,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if dspark_draft_config.target_layer_ids is not None:
                     target_layer_ids = list(dspark_draft_config.target_layer_ids)
 
-            self.dflash_or_dspark_use_aux_hidden_state = True
-            self.dflash_or_dspark_draft_num_layers = int(draft_num_layers)
-            self.dflash_or_dspark_target_layer_ids = target_layer_ids
+            self.dflash_family_use_aux_hidden_state = True
+            self.dflash_family_draft_num_layers = int(draft_num_layers)
+            self.dflash_family_target_layer_ids = target_layer_ids
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -1075,16 +1075,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.set_eagle3_layers_to_capture(
                 self.eagle_aux_hidden_state_layer_ids
             )
-        if self.dflash_or_dspark_use_aux_hidden_state:
+        if self.dflash_family_use_aux_hidden_state:
             if self.spec_algorithm.is_dspark() and hasattr(
                 self.model, "set_dspark_layers_to_capture"
             ):
                 self.model.set_dspark_layers_to_capture(
-                    self.dflash_or_dspark_target_layer_ids
+                    self.dflash_family_target_layer_ids
                 )
             elif hasattr(self.model, "set_dflash_layers_to_capture"):
                 self.model.set_dflash_layers_to_capture(
-                    self.dflash_or_dspark_target_layer_ids
+                    self.dflash_family_target_layer_ids
                 )
             else:
                 raise ValueError(

@@ -885,7 +885,7 @@ class Scheduler(
         min_free_slots = resolve_min_free_slots(
             self.server_args.min_free_slots_delay,
             self.max_running_requests,
-            is_dflash_or_dspark=self.spec_algorithm.is_dflash_or_dspark(),
+            is_dflash_family=self.spec_algorithm.is_dflash_family(),
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
@@ -2186,7 +2186,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash_or_dspark():
+        if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
