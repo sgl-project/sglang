@@ -15,7 +15,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -823,11 +822,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Seed the first draft-decode loop from each request's last prefill
         # position. Gather last-per-req before the copy (prefill can be long).
-        # Skipped under context-parallel prefill (token layout wouldn't match).
         seed_from_extend = (
             self.seed_dsa_topk_from_draft_extend
             and not forward_batch.forward_mode.is_idle()
-            and not dsa_use_prefill_cp(forward_batch)
         )
         if seed_from_extend:
             bs = forward_batch.batch_size
