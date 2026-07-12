@@ -19,7 +19,7 @@ MLP layers.
 """
 
 import logging
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen3_moe import (
     Qwen3MoeAttention,
     Qwen3MoeDecoderLayer,
@@ -216,6 +217,8 @@ class MellumAttention(Qwen3MoeAttention):
             self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
 
+        # TODO: Precompute YaRN parameters in Qwen3MoeAttention for all
+        # inheriting models instead of recomputing them in every forward pass.
         self._yarn_params = _compute_yarn_from_rope_params(
             rope_params, self.head_dim, max_position_embeddings
         )
@@ -253,9 +256,6 @@ class MellumAttention(Qwen3MoeAttention):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
             theta = self.rope_theta
-            positions = (
-                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
-            )
             fused_qk_norm_rope(
                 qkv,
                 self.num_heads,
@@ -495,6 +495,14 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             )
 
         self.model = MellumModel(cfg, quant_config, prefix=add_prefix("model", prefix))
+        self.use_fused_qk_norm_rope = any(
+            getattr(
+                getattr(layer, "self_attn", None),
+                "use_fused_qk_norm_rope",
+                False,
+            )
+            for layer in self.model.layers
+        )
         self.lm_head = ParallelLMHead(
             cfg.vocab_size,
             cfg.hidden_size,
@@ -512,6 +520,60 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
         assert self.attn_cp_size % self.moe_dp_size == 0, (
             f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
             f"moe_dp_size ({self.moe_dp_size})"
+        )
+
+    def _prepare_positions(
+        self,
+        positions: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self.use_fused_qk_norm_rope:
+            return positions.view(-1).to(dtype=torch.int32, device=device).contiguous()
+        return positions
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if pp_proxy_tensors is not None:
+            positions_device = pp_proxy_tensors["hidden_states"].device
+        elif input_embeds is not None:
+            positions_device = input_embeds.device
+        else:
+            positions_device = input_ids.device
+        positions = self._prepare_positions(positions, positions_device)
+        return super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        positions_device = (
+            input_embeds.device if input_embeds is not None else input_ids.device
+        )
+        positions = self._prepare_positions(positions, positions_device)
+        return super().forward_split_prefill(
+            input_ids,
+            positions,
+            forward_batch,
+            split_interval,
+            input_embeds,
         )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:

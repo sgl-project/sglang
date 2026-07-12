@@ -1753,23 +1753,9 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "LagunaForCausalLM" in model_architectures
+        or "MellumForCausalLM" in model_architectures
     ):
-        layer_types = getattr(hf_text_config, "layer_types", [])
-        swa_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "sliding_attention"
-        ]
-        full_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "full_attention"
-        ]
-    elif "LagunaForCausalLM" in model_architectures:
-        layer_types = getattr(hf_text_config, "layer_types", [])
-        swa_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "sliding_attention"
-        ]
-        full_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "full_attention"
-        ]
-    elif "MellumForCausalLM" in model_architectures:
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"
