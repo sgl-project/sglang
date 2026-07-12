@@ -735,7 +735,13 @@ class FlashAttentionBackend(AttentionBackend):
                         seq_lens=forward_batch.seq_lens, layout=ragged_layout
                     )
                     metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
-                    metadata.max_seq_len_q = geometry.max_seq_len_q
+                    # Device-only layouts carry no host lens; the verify
+                    # window is a valid varlen upper bound.
+                    metadata.max_seq_len_q = (
+                        geometry.max_seq_len_q
+                        if geometry.max_seq_len_q is not None
+                        else self.speculative_num_draft_tokens
+                    )
                     metadata.max_seq_len_k = int(
                         metadata.cache_seqlens_int32.max().item()
                     )
