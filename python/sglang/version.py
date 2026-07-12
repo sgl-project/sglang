@@ -1,3 +1,4 @@
+# sandbox-verify-main-ci: 20260712T190749Z refactor-base-4884f6fbee (do not merge)
 try:
     from sglang._version import __version__, __version_tuple__
 except ImportError:
