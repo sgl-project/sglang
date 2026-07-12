@@ -948,7 +948,7 @@ class ServerArgs:
     ] = 0
     gpu_id_step: A[
         int,
-        "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+        "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,... Setting it to 0 colocates all data-parallel workers on the base GPU (same-GPU data parallelism); this requires tp_size=1, pp_size=1, and --max-total-tokens, and works best with CUDA MPS.",
     ] = 1
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
@@ -6707,6 +6707,19 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _check_same_gpu_dp(self):
+        assert self.gpu_id_step >= 0, "gpu_id_step must be non-negative"
+        if self.gpu_id_step == 0:
+            assert self.dp_size > 1, "gpu_id_step=0 (same-GPU DP) requires dp_size > 1"
+            assert (
+                self.tp_size == 1 and self.pp_size == 1
+            ), "gpu_id_step=0 (same-GPU DP) colocates whole replicas, so tp_size and pp_size must be 1"
+            # Colocated workers each profile the remaining free memory at
+            # startup, so pool sizes must be declared, not profiled.
+            assert (
+                self.max_total_tokens is not None
+            ), "gpu_id_step=0 (same-GPU DP) requires --max-total-tokens to bound each worker's KV pool"
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -6738,7 +6751,7 @@ class ServerArgs:
         ), "multi-node data parallel is not supported unless dp attention!"
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+        self._check_same_gpu_dp()
 
         assert self.moe_dense_tp_size in (
             None,

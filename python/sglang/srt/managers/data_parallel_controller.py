@@ -318,10 +318,17 @@ class DataParallelController:
             sock.close()
 
         # Start all threads
-        for thread in threads:
-            thread.start()
-        for event in ready_events:
-            event.wait()
+        if server_args.gpu_id_step == 0:
+            # Same-GPU DP: colocated workers race each other's startup memory
+            # profiling and CUDA graph capture, so start them one at a time.
+            for thread, event in zip(threads, ready_events):
+                thread.start()
+                event.wait()
+        else:
+            for thread in threads:
+                thread.start()
+            for event in ready_events:
+                event.wait()
 
     def launch_tensor_parallel_group_thread(
         self,
