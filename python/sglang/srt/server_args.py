@@ -871,6 +871,7 @@ class ServerArgs:
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
     enable_pd_flip_state_machine: bool = False
+    enable_pd_flip_hicache_stitch: bool = False
     pd_flip_window_seconds: float = 1.0
     pd_flip_slo_threshold: float = 0.9
     pd_flip_prefill_nodes: Optional[int] = None
@@ -1086,6 +1087,7 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+        self._validate_pd_flip_hicache_stitch()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -4446,6 +4448,21 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+    def _validate_pd_flip_hicache_stitch(self):
+        if not self.enable_pd_flip_hicache_stitch:
+            return
+        if not (
+            self.enable_pd_runtime_role_switch
+            and self.disaggregation_decode_enable_radix_cache
+            and self.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "--enable-pd-flip-hicache-stitch requires "
+                "--enable-pd-runtime-role-switch, "
+                "--disaggregation-decode-enable-radix-cache, and "
+                "--hicache-storage-backend"
+            )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -7448,6 +7465,12 @@ class ServerArgs:
             "The first implementation observes local scheduler state and emits "
             "safe/preparing/flipping transitions; real request/KV migration is "
             "provided by the flip callbacks.",
+        )
+        parser.add_argument(
+            "--enable-pd-flip-hicache-stitch",
+            action="store_true",
+            default=ServerArgs.enable_pd_flip_hicache_stitch,
+            help="Stitch a target HiCache prefix with the source decode KV suffix during PD flip migration.",
         )
         parser.add_argument(
             "--enable-pd-runtime-role-switch",

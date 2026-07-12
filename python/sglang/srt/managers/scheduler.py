@@ -18,7 +18,6 @@ import faulthandler
 import hashlib
 import logging
 import numbers
-import os
 import signal
 import sys
 import time
@@ -2382,6 +2381,19 @@ class Scheduler(
         page_size = int(getattr(self.token_to_kv_pool_allocator, "page_size", 1) or 1)
         return (max(0, int(committed_len)) // page_size) * page_size
 
+    @staticmethod
+    def _pd_flip_stitch_boundary(
+        storage_hit: int, prompt_len: int, page_size: int
+    ) -> Tuple[int, str]:
+        page_size = max(1, int(page_size))
+        page_aligned_prompt = (max(0, int(prompt_len)) // page_size) * page_size
+        hit_len = min(max(0, int(storage_hit)), page_aligned_prompt)
+        if hit_len == 0:
+            return 0, "source_decode_full_fallback"
+        if hit_len == page_aligned_prompt:
+            return hit_len, "full_prefix_stitch"
+        return hit_len, "partial_prefix_stitch"
+
     def _pd_flip_source_page_indices_range(
         self, req: Req, start_len: int, end_len: int
     ):
@@ -2521,14 +2533,6 @@ class Scheduler(
                     pp_rank=self.ps.pp_rank,
                 )
                 timing_debug["sender_create_s"] = time.monotonic() - sender_started
-                page_started = time.monotonic()
-                page_indices = self._pd_flip_source_page_indices(req, committed_len)
-                timing_debug["source_page_indices_initial_s"] = (
-                    time.monotonic() - page_started
-                )
-                init_started = time.monotonic()
-                sender.init(len(page_indices), metadata_index)
-                timing_debug["sender_init_s"] = time.monotonic() - init_started
                 self._pd_flip_defer_source_kv_release(req)
                 entries[rid] = {
                     "req": req,
@@ -2815,6 +2819,45 @@ class Scheduler(
                 state_indices.append(None)
         return state_indices
 
+    def _pd_flip_source_send_initial(self, entry: Dict[str, Any]) -> None:
+        sender = entry["sender"]
+        req = entry["req"]
+        committed_len = int(entry["committed_len"])
+        if getattr(
+            getattr(self, "server_args", None),
+            "enable_pd_flip_hicache_stitch",
+            False,
+        ):
+            hit_len = int(sender.pop_decode_prefix_len())
+        else:
+            hit_len = 0
+        if not 0 <= hit_len <= committed_len:
+            raise ValueError(
+                f"invalid PD flip stitch boundary H={hit_len}, C0={committed_len}"
+            )
+        page_indices = self._pd_flip_source_page_indices_range(
+            req, hit_len, committed_len
+        )
+        sender.init(len(page_indices), entry["metadata_index"])
+        sender.send(
+            page_indices,
+            self._pd_flip_source_state_indices(req, committed_len, sender.kv_mgr),
+        )
+        entry.update(
+            mooncake_hit_len=hit_len,
+            source_transfer_start=hit_len,
+            source_transfer_end=committed_len,
+            stitch_mode=(
+                "source_decode_full_fallback" if hit_len == 0 else "prefix_stitch"
+            ),
+            source_index_shape=list(page_indices.shape)
+            if hasattr(page_indices, "shape")
+            else [len(page_indices)],
+            source_index_size=int(page_indices.size)
+            if hasattr(page_indices, "size")
+            else len(page_indices),
+        )
+
     def _pd_flip_set_source_metadata(
         self, req: Req, metadata_index: int, migration_room: int
     ) -> None:
@@ -2907,24 +2950,8 @@ class Scheduler(
                     self._pd_flip_note_timing(
                         entry, "source_set_metadata", metadata_started
                     )
-                    page_started = time.monotonic()
-                    page_indices = self._pd_flip_source_page_indices(
-                        req, entry["committed_len"]
-                    )
-                    self._pd_flip_note_timing(
-                        entry, "source_page_indices_send", page_started
-                    )
-                    entry["source_index_shape"] = list(page_indices.shape)
-                    entry["source_index_size"] = int(page_indices.size)
-                    state_started = time.monotonic()
-                    state_indices = self._pd_flip_source_state_indices(
-                        req, entry["committed_len"], sender.kv_mgr
-                    )
-                    self._pd_flip_note_timing(
-                        entry, "source_state_indices", state_started
-                    )
                     send_started = time.monotonic()
-                    sender.send(page_indices, state_indices)
+                    self._pd_flip_source_send_initial(entry)
                     self._pd_flip_note_timing(entry, "source_send", send_started)
                     self._pd_flip_note_timing(entry, "source_sent")
                     entry["sent"] = True
@@ -3526,8 +3553,10 @@ class Scheduler(
                     poll = decode_req.kv_receiver.poll()
                     if poll == KVPoll.Failed:
                         raise RuntimeError("migration target transfer failed")
-                    if poll == KVPoll.Success and self._pd_flip_target_metadata_ready(
-                        entry
+                    if (
+                        poll == KVPoll.Success
+                        and self._pd_flip_target_metadata_ready(entry)
+                        and self._pd_flip_target_stitch_ready(entry)
                     ):
                         self._pd_flip_target_commit_hicache_restore(decode_req)
                         self._pd_flip_note_timing(entry, "target_transfer_success")
@@ -3601,6 +3630,35 @@ class Scheduler(
             raise RuntimeError("migration target HiCache restore failed")
         return status_value == "pending"
 
+    def _pd_flip_target_stitch_ready(self, entry: Dict[str, Any]) -> bool:
+        if not getattr(
+            getattr(self, "server_args", None),
+            "enable_pd_flip_hicache_stitch",
+            False,
+        ):
+            return True
+        hit_len = int(entry.get("mooncake_hit_len", -1))
+        prompt_len = int(entry.get("target_prompt_len", -1))
+        committed_len = int(entry.get("target_committed_len", -1))
+        if not 0 <= hit_len <= prompt_len <= committed_len:
+            return False
+        if (
+            int(entry.get("target_received_suffix_start", -1)) != hit_len
+            or int(entry.get("target_received_suffix_end", -1)) != committed_len
+        ):
+            return False
+        prefix_match = getattr(entry["decode_req"], "prefix_match", None)
+        if prefix_match is None or not getattr(
+            prefix_match, "needs_local_restore", False
+        ):
+            return True
+        status_value = getattr(
+            getattr(entry["decode_req"], "hicache_restore_status", None),
+            "value",
+            None,
+        )
+        return status_value == "ready"
+
     def _pd_flip_target_commit_hicache_restore(self, decode_req: DecodeRequest) -> None:
         if not getattr(self, "enable_decode_hicache", False):
             return
@@ -3662,16 +3720,29 @@ class Scheduler(
         prefix_indices = None
         prefix_len = 0
         total_prefix_len = 0
-        if (
-            os.getenv("SGLANG_PD_FLIP_HICACHE_STITCH", "").lower()
-            in ("1", "true", "yes", "on")
-            and self.server_args.disaggregation_decode_enable_radix_cache
-        ):
+        if getattr(self.server_args, "enable_pd_flip_hicache_stitch", False):
             prefix_started = time.monotonic()
             prefix_match = queue._match_prefix_and_lock(req)
+            raw_prefix_len = int(prefix_match.decode_prefix_len)
+            prompt_len = len(req.origin_input_ids)
+            total_prefix_len, stitch_mode = self._pd_flip_stitch_boundary(
+                raw_prefix_len,
+                prompt_len,
+                self.token_to_kv_pool_allocator.page_size,
+            )
+            prefix_len = min(int(prefix_match.l1_prefix_len), total_prefix_len)
+            prefix_match.prefix_indices = prefix_match.prefix_indices[:prefix_len]
+            remaining_prefix = total_prefix_len - prefix_len
+            if hasattr(prefix_match, "l2_host_hit_length"):
+                prefix_match.l2_host_hit_length = min(
+                    int(prefix_match.l2_host_hit_length), remaining_prefix
+                )
+                remaining_prefix -= prefix_match.l2_host_hit_length
+            if hasattr(prefix_match, "l3_storage_hit_length"):
+                prefix_match.l3_storage_hit_length = min(
+                    int(prefix_match.l3_storage_hit_length), remaining_prefix
+                )
             prefix_indices = prefix_match.prefix_indices
-            prefix_len = int(prefix_match.l1_prefix_len)
-            total_prefix_len = int(prefix_match.decode_prefix_len)
             entry["target_hicache_prefix_match_s"] = time.monotonic() - prefix_started
             entry["target_hicache_l1_prefix_len"] = prefix_len
             entry["target_hicache_prefix_len"] = total_prefix_len
@@ -3679,6 +3750,14 @@ class Scheduler(
                 0, total_prefix_len - prefix_len
             )
             decode_req.prefix_match = prefix_match
+            entry.update(
+                mooncake_hit_len=total_prefix_len,
+                target_prompt_len=prompt_len,
+                target_committed_len=committed_len,
+                target_received_suffix_start=total_prefix_len,
+                target_received_suffix_end=committed_len,
+                stitch_mode=stitch_mode,
+            )
 
         if prefix_indices is None:
             dst_kv_indices = queue._pre_alloc(

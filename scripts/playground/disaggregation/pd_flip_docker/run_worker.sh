@@ -43,6 +43,15 @@ if [[ "${ENABLE_PD_RUNTIME_ROLE_SWITCH:-${ENABLE_PD_FLIP_STATE_MACHINE:-1}}" == 
   server_args+=(--enable-pd-runtime-role-switch)
 fi
 
+if [[ "${ENABLE_PD_FLIP_HICACHE_STITCH:-1}" == "1" ]]; then
+  server_args+=(
+    --enable-pd-flip-hicache-stitch
+    --disaggregation-decode-enable-radix-cache
+    --enable-hierarchical-cache
+    --hicache-storage-backend "${HICACHE_STORAGE_BACKEND:-mooncake}"
+  )
+fi
+
 if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
   extra_args=(${EXTRA_SGLANG_ARGS})

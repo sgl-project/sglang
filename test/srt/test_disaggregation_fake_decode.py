@@ -200,6 +200,7 @@ class TestFakePDFlipTargetMigration(unittest.TestCase):
             bootstrap_room=123,
             kv_committed_len=6,
             req_pool_idx=1,
+            origin_input_ids=[1, 2, 3, 4, 5, 6],
         )
         receiver = Receiver()
         decode_req = types.SimpleNamespace(req=req, kv_receiver=receiver)
@@ -208,7 +209,8 @@ class TestFakePDFlipTargetMigration(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.transfer_backend = TransferBackend.FAKE
         scheduler.server_args = types.SimpleNamespace(
-            disaggregation_decode_enable_radix_cache=True
+            disaggregation_decode_enable_radix_cache=True,
+            enable_pd_flip_hicache_stitch=True,
         )
         scheduler.disagg_decode_prealloc_queue = queue
         scheduler.enable_decode_hicache = True
@@ -227,8 +229,7 @@ class TestFakePDFlipTargetMigration(unittest.TestCase):
             bootstrap_room=torch.zeros((1, 1), dtype=torch.int64)
         )
 
-        with patch.dict("os.environ", {"SGLANG_PD_FLIP_HICACHE_STITCH": "1"}):
-            Scheduler._pd_flip_target_prealloc_and_send_metadata(scheduler, entry)
+        Scheduler._pd_flip_target_prealloc_and_send_metadata(scheduler, entry)
 
         self.assertEqual(queue.prealloc_args["prefix_indices"], [10, 20])
         self.assertEqual(queue.prealloc_args["prefix_len"], 2)
@@ -238,6 +239,11 @@ class TestFakePDFlipTargetMigration(unittest.TestCase):
         self.assertEqual(receiver.sent["decode_prefix_len"], 3)
         self.assertEqual(receiver.sent["page_indices"], [40, 50, 60])
         self.assertEqual(entry["target_hicache_prefix_len"], 3)
+        self.assertEqual(entry["mooncake_hit_len"], 3)
+        self.assertEqual(entry["target_prompt_len"], 6)
+        self.assertEqual(entry["target_committed_len"], 6)
+        self.assertEqual(entry["target_received_suffix_start"], 3)
+        self.assertEqual(entry["target_received_suffix_end"], 6)
 
     def test_pd_flip_target_waits_for_hicache_restore_before_success(self):
         class Receiver:
