@@ -32,7 +32,10 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
-from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_target_verify_geometry,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -72,13 +75,6 @@ class TRTLLMMHAMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
-
-
-def _resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
-    spec_info = getattr(forward_batch, "spec_info", None)
-    if spec_info is None:
-        return None
-    return getattr(spec_info, "ragged_verify_layout", None)
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -475,7 +471,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 : bs + 1
             ]
             metadata.is_ragged_verify = (
-                getattr(spec_info, "ragged_verify_layout", None) is not None
+                spec_info is not None and spec_info.ragged_verify_layout is not None
             )
             metadata.max_seq_len_q = (
                 self.speculative_num_draft_tokens
@@ -558,7 +554,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            if getattr(spec_info, "ragged_verify_layout", None) is not None:
+            if spec_info is not None and spec_info.ragged_verify_layout is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
                 # rebuild this metadata. It is written eagerly on every
@@ -659,7 +655,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if (
             forward_mode.is_target_verify()
-            and _resolve_ragged_verify_layout(forward_batch) is not None
+            and resolve_ragged_verify_layout(forward_batch) is not None
         ):
             self._assert_ragged_verify_supported()
 
@@ -673,7 +669,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
             self.forward_metadata = self.target_verify_metadata[bs]
-            ragged_layout = _resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
                     self.forward_metadata, forward_batch, ragged_layout, bs
@@ -776,7 +772,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            ragged_layout = _resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._assert_ragged_verify_supported()
                 geometry = build_ragged_target_verify_geometry(

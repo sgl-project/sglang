@@ -64,6 +64,7 @@ from sglang.srt.speculative.ragged_verify import (
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
+    resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
@@ -124,15 +125,6 @@ RAGGED_VERIFY_CHOICES = tuple(m.value for m in RaggedVerifyMode)
 
 def _ragged_verify_mode() -> str:
     return read_ragged_verify_mode().value
-
-
-def _resolve_ragged_verify_layout(
-    forward_batch: ForwardBatch,
-) -> Optional[RaggedVerifyLayout]:
-    spec_info = getattr(forward_batch, "spec_info", None)
-    if spec_info is None:
-        return None
-    return getattr(spec_info, "ragged_verify_layout", None)
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
@@ -595,7 +587,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         bs: int,
     ) -> Optional[RaggedVerifyLayout]:
-        layout = _resolve_ragged_verify_layout(forward_batch)
+        layout = resolve_ragged_verify_layout(forward_batch)
         if layout is None:
             return None
         if _ragged_verify_mode() != RAGGED_VERIFY_COMPACT:

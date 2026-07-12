@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -286,6 +287,12 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Per-request verify lengths for the ragged-verify graphs (see
+    # sglang.srt.speculative.ragged_verify). Class-level default so every
+    # spec input exposes the attribute; verify inputs of algorithms with
+    # supports_ragged_verify() override it per step.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 

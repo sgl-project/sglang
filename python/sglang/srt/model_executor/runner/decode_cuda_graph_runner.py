@@ -447,7 +447,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         spec_info = forward_batch.spec_info
         if spec_info is None:
             return None
-        return getattr(spec_info, "ragged_verify_layout", None)
+        return spec_info.ragged_verify_layout
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
