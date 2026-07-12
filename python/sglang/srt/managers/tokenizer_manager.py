@@ -2374,8 +2374,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["spec_cap_length"] = (
                         recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
                     )
+                from sglang.srt.speculative.ragged_verify import (
+                    RaggedVerifyMode,
+                    read_ragged_verify_mode,
+                )
+
                 if (
-                    envs.SGLANG_RAGGED_VERIFY_MODE.get() == "cap-accept"
+                    read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
                     and getattr(recv_obj, "spec_num_block_accept_tokens", None)
                     is not None
                     and len(recv_obj.spec_num_block_accept_tokens) > i

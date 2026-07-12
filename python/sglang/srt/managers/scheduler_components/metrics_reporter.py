@@ -765,10 +765,15 @@ class SchedulerMetricsReporter:
                 if self.spec_num_forward_ct > 0
                 else 0
             )
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
             spec_block_accept_length = (
                 self.spec_num_block_accept_tokens / self.spec_num_forward_ct
                 if self.spec_num_forward_ct > 0
-                and envs.SGLANG_RAGGED_VERIFY_MODE.get() == "cap-accept"
+                and read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
                 else 0
             )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
