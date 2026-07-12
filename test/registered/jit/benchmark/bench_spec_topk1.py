@@ -11,7 +11,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
