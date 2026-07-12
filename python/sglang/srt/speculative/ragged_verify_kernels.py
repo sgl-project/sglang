@@ -5,15 +5,24 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
-
 
 class PaddedToBucket:
     @classmethod
-    def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
+    def execute(
+        cls,
+        *,
+        verify_lens: torch.Tensor,
+        graph_num_tokens: int,
+        bs: int,
+        padded_bs: int,
+    ) -> torch.Tensor:
+        impl = cls.triton if verify_lens.is_cuda else cls.torch
+        return impl(
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            bs=bs,
+            padded_bs=padded_bs,
+        )
 
     @classmethod
     def torch(
@@ -133,10 +142,9 @@ class QoIndptrResult(msgspec.Struct):
 
 class BuildQoIndptr:
     @classmethod
-    def execute(cls, *args, **kwargs) -> QoIndptrResult:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
+    def execute(cls, *, verify_lens: torch.Tensor) -> QoIndptrResult:
+        impl = cls.triton if verify_lens.is_cuda else cls.torch
+        return impl(verify_lens=verify_lens)
 
     @classmethod
     def torch(cls, *, verify_lens: torch.Tensor) -> QoIndptrResult:

@@ -12,6 +12,7 @@ import unittest
 
 import torch
 
+from sglang.srt.speculative import ragged_verify_kernels
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
@@ -19,7 +20,6 @@ from sglang.srt.speculative.dspark_components.kernels import (
     dspark_accept,
     dspark_attn_metadata,
     dspark_draft_model,
-    dspark_ragged,
     dspark_schedule,
     dspark_verify_window,
 )
@@ -367,7 +367,7 @@ def _case_padded_to_bucket(tc):
         if int(verify_lens.sum()) > graph_num_tokens:
             verify_lens = torch.ones(bs, dtype=torch.int32, device=DEVICE)
         got, _ = tc._parity(
-            dspark_ragged.PaddedToBucket,
+            ragged_verify_kernels.PaddedToBucket,
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             bs=bs,
@@ -398,7 +398,7 @@ def _case_page_table_positions(tc):
 
 def _case_qo_indptr(tc):
     torch.manual_seed(17)
-    cls = dspark_ragged.BuildQoIndptr
+    cls = ragged_verify_kernels.BuildQoIndptr
     for dtype in (torch.int32, torch.int64):
         verify_lens = _ri(1, 8, (129,), dtype)  # straddles the 128 block
         ref = cls.torch(verify_lens=verify_lens)

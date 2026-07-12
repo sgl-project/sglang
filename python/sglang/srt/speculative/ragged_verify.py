@@ -110,7 +110,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
-        from sglang.srt.speculative.dspark_components.kernels.dspark_ragged import (
+        from sglang.srt.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
         )
 
@@ -190,7 +190,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
     def padded_to_bucket(self, *, padded_bs: int) -> RaggedVerifyLayout:
-        from sglang.srt.speculative.dspark_components.kernels.dspark_ragged import (
+        from sglang.srt.speculative.ragged_verify_kernels import (
             PaddedToBucket,
         )
 
