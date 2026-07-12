@@ -135,9 +135,6 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     report_online_quantization,
     resolve_sliding_window_size,
 )
-from sglang.srt.model_executor.model_runner_components.misc_utils import (
-    maybe_disable_chunked_prefix_cache,
-)
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
@@ -329,7 +326,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        maybe_disable_chunked_prefix_cache(
+        misc_utils.maybe_disable_chunked_prefix_cache(
             server_args=server_args,
             use_mla_backend=self.use_mla_backend,
             is_draft_worker=self.is_draft_worker,
