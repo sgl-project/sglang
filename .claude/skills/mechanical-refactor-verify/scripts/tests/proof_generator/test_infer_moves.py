@@ -288,3 +288,52 @@ def test_infer_recipe_records_the_source_class_for_disambiguation(repo: Path) ->
     assert [mv["from_class"] for mv in recipe.moves] == ["M"]
     script = recipe_to_script(recipe, "move M.foo onto C")
     assert "from_class='M'" in script
+
+
+def test_infer_recipe_module_level_def_shadowed_by_method_name(repo: Path) -> None:
+    """A column-0 cut resolves to the module-level def even when a method shares its name."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "def foo(*, x):\n"
+                "    return x + 1\n"
+                "\n"
+                "\n"
+                "class M:\n"
+                "    def foo(self):\n"
+                "        return foo(x=self.x)\n"
+            ),
+            "util.py": "def keep():\n    return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "from util import foo\n"
+                "\n"
+                "\n"
+                "class M:\n"
+                "    def foo(self):\n"
+                "        return foo(x=self.x)\n"
+            ),
+            "util.py": (
+                "def keep():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "def foo(*, x):\n"
+                "    return x + 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move module-level foo to util")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [mv["name"] for mv in recipe.moves] == ["foo"]
+    assert recipe.moves[0]["from_class"] is None
+    assert recipe.moves[0]["into_class"] is None

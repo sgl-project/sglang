@@ -613,12 +613,30 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             recipe.notes.append(f"skip {name}: nested function (moves with parent)")
             continue
         src_tree = ast.parse(src_before)
-        src_class = _enclosing_class_of_def(src_tree, name)
         dst_tree = ast.parse(_git_output(["show", f"{commit}:{dst}"], root))
-        into_class = _enclosing_class_of_def(dst_tree, name)
-        dst_def = rr._find_def(dst_tree, name)
-        src_indent = _def_indent(files[src]["removed"], name) or 0
-        dst_indent = _def_indent(files[dst]["added"], name) or 0
+        src_indent = _def_indent(files[src]["removed"], name)
+        dst_indent = _def_indent(files[dst]["added"], name)
+        # The diff's def-line indentation says which same-named def actually moved: a
+        # column-0 cut is the module-level def even when a class method shares its name.
+        src_class = (
+            None if src_indent == 0 else _enclosing_class_of_def(src_tree, name)
+        )
+        into_class = (
+            None if dst_indent == 0 else _enclosing_class_of_def(dst_tree, name)
+        )
+        try:
+            src_def = rr._find_unique_def(
+                src_tree, name, from_class=src_class, where=src
+            )
+            dst_def = rr._find_unique_def(
+                dst_tree, name, from_class=into_class, where=dst
+            )
+        except AssertionError as exc:
+            recipe.supported = False
+            recipe.notes.append(f"{name}: cannot disambiguate moved def ({exc})")
+            continue
+        src_indent = src_indent or 0
+        dst_indent = dst_indent or 0
         recipe.moves.append(
             {
                 "name": name,
@@ -629,9 +647,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "dedent": src_indent - dst_indent,
                 "dst_order": dst_def.lineno if dst_def else 0,
                 "before": _next_sibling_def_name(dst_tree, name, into_class),
-                "drop_self_annotation": _self_annotation_dropped(
-                    rr._find_def(src_tree, name), dst_def
-                ),
+                "drop_self_annotation": _self_annotation_dropped(src_def, dst_def),
             }
         )
         if src_class is not None:
