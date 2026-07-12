@@ -2421,6 +2421,40 @@ class Scheduler(
             self.token_to_kv_pool_allocator.page_size,
         )
 
+    def _pd_flip_stitch_page_indices_range(
+        self, req: Req, hit_len: int, committed_len: int
+    ):
+        hit_len = int(hit_len)
+        committed_len = int(committed_len)
+        if not 0 <= hit_len <= committed_len:
+            raise ValueError(
+                f"invalid PD flip stitch page range H={hit_len}, C0={committed_len}"
+            )
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
+                "before migration stitch transfer"
+            )
+        if hasattr(req_pool_idx, "item"):
+            req_pool_idx = req_pool_idx.item()
+        page_size = int(self.token_to_kv_pool_allocator.page_size)
+        mapping_start = (hit_len // page_size) * page_size
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[
+                int(req_pool_idx), mapping_start:committed_len
+            ]
+            .cpu()
+            .numpy()
+        )
+        expected_mapping_len = committed_len - mapping_start
+        if kv_indices.ndim != 1 or len(kv_indices) != expected_mapping_len:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} has incomplete stitch KV "
+                f"mapping shape={kv_indices.shape}, expected_tokens={expected_mapping_len}"
+            )
+        return kv_to_page_indices(kv_indices, page_size)
+
     def _pd_flip_build_delta_manifest(
         self, entry: Dict[str, Any], delta_index: int
     ) -> Dict[str, Any]:
@@ -2835,7 +2869,7 @@ class Scheduler(
             raise ValueError(
                 f"invalid PD flip stitch boundary H={hit_len}, C0={committed_len}"
             )
-        page_indices = self._pd_flip_source_page_indices_range(
+        page_indices = self._pd_flip_stitch_page_indices_range(
             req, hit_len, committed_len
         )
         sender.init(len(page_indices), entry["metadata_index"])
@@ -3609,26 +3643,37 @@ class Scheduler(
     def _pd_flip_target_hicache_restore_pending(
         self, decode_req: DecodeRequest
     ) -> bool:
-        if not getattr(self, "enable_decode_hicache", False):
-            return False
         prefix_match = getattr(decode_req, "prefix_match", None)
         if prefix_match is None or not getattr(
             prefix_match, "needs_local_restore", False
         ):
             return False
 
+        if not getattr(self, "enable_decode_hicache", False):
+            raise RuntimeError(
+                "migration target requires HiCache restore but decode HiCache is disabled"
+            )
+
         transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
         if transfer_queue is None or not hasattr(
             transfer_queue, "_process_hicache_local_restores"
         ):
-            return True
+            raise RuntimeError(
+                "migration target requires HiCache restore but no restore processor is available"
+            )
         transfer_queue._process_hicache_local_restores([decode_req])
         status_value = getattr(
             getattr(decode_req, "hicache_restore_status", None), "value", None
         )
         if status_value == "failed":
             raise RuntimeError("migration target HiCache restore failed")
-        return status_value == "pending"
+        if status_value == "pending":
+            return True
+        if status_value == "ready":
+            return False
+        raise RuntimeError(
+            f"migration target HiCache restore returned invalid status {status_value!r}"
+        )
 
     def _pd_flip_target_stitch_ready(self, entry: Dict[str, Any]) -> bool:
         if not getattr(
@@ -3637,16 +3682,27 @@ class Scheduler(
             False,
         ):
             return True
-        hit_len = int(entry.get("mooncake_hit_len", -1))
-        prompt_len = int(entry.get("target_prompt_len", -1))
-        committed_len = int(entry.get("target_committed_len", -1))
+        try:
+            hit_len = int(entry["mooncake_hit_len"])
+            prompt_len = int(entry["target_prompt_len"])
+            committed_len = int(entry["target_committed_len"])
+            suffix_start = int(entry["target_received_suffix_start"])
+            suffix_end = int(entry["target_received_suffix_end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "migration target stitch metadata H/P/C0/coverage is missing or invalid"
+            ) from exc
         if not 0 <= hit_len <= prompt_len <= committed_len:
-            return False
-        if (
-            int(entry.get("target_received_suffix_start", -1)) != hit_len
-            or int(entry.get("target_received_suffix_end", -1)) != committed_len
-        ):
-            return False
+            raise RuntimeError(
+                f"migration target stitch boundary is invalid: "
+                f"H={hit_len}, P={prompt_len}, C0={committed_len}"
+            )
+        if suffix_start != hit_len or suffix_end != committed_len:
+            raise RuntimeError(
+                f"migration target suffix coverage mismatch: "
+                f"received=[{suffix_start},{suffix_end}), "
+                f"expected=[{hit_len},{committed_len})"
+            )
         prefix_match = getattr(entry["decode_req"], "prefix_match", None)
         if prefix_match is None or not getattr(
             prefix_match, "needs_local_restore", False
@@ -3657,7 +3713,11 @@ class Scheduler(
             "value",
             None,
         )
-        return status_value == "ready"
+        if status_value != "ready":
+            raise RuntimeError(
+                f"migration target HiCache restore is not ready: {status_value!r}"
+            )
+        return True
 
     def _pd_flip_target_commit_hicache_restore(self, decode_req: DecodeRequest) -> None:
         if not getattr(self, "enable_decode_hicache", False):
@@ -3773,16 +3833,24 @@ class Scheduler(
         if prefix_match is not None and getattr(self, "enable_decode_hicache", False):
             queue._start_hicache_prefetch(req, prefix_match)
 
-        if self.server_args.disaggregation_decode_enable_radix_cache:
+        if getattr(self.server_args, "enable_pd_flip_hicache_stitch", False):
+            page_indices = self._pd_flip_stitch_page_indices_range(
+                req, total_prefix_len, committed_len
+            )
+        elif self.server_args.disaggregation_decode_enable_radix_cache:
             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
                 total_prefix_len:committed_len
             ].cpu().numpy()
+            page_indices = kv_to_page_indices(
+                kv_indices,
+                self.token_to_kv_pool_allocator.page_size,
+            )
         else:
             kv_indices = dst_kv_indices.cpu().numpy()
-        page_indices = kv_to_page_indices(
-            kv_indices,
-            self.token_to_kv_pool_allocator.page_size,
-        )
+            page_indices = kv_to_page_indices(
+                kv_indices,
+                self.token_to_kv_pool_allocator.page_size,
+            )
         entry["target_index_shape"] = list(page_indices.shape)
         entry["target_index_size"] = int(page_indices.size)
         state_indices = self._pd_flip_target_state_indices(req, committed_len)

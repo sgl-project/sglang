@@ -37,6 +37,27 @@ def _load_class_method(path, class_name, method_name, extra_namespace=None):
     return namespace[method_name]
 
 
+class ArrayTensor:
+    def __init__(self, values):
+        self.values = np.asarray(values)
+
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, item):
+        value = self.values[item]
+        return ArrayTensor(value) if isinstance(value, np.ndarray) else value
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.values
+
+    def tolist(self):
+        return self.values.tolist()
+
+
 @pytest.mark.parametrize(
     "storage_hit,prompt_len,page_size,expected_h,expected_mode",
     [
@@ -46,9 +67,7 @@ def _load_class_method(path, class_name, method_name, extra_namespace=None):
         (1024, 1027, 16, 1024, "full_prefix_stitch"),
     ],
 )
-def test_stitch_boundary(
-    storage_hit, prompt_len, page_size, expected_h, expected_mode
-):
+def test_stitch_boundary(storage_hit, prompt_len, page_size, expected_h, expected_mode):
     boundary = _load_class_method(
         SCHEDULER_PATH, "Scheduler", "_pd_flip_stitch_boundary"
     )
@@ -117,7 +136,7 @@ def _make_source_scheduler(*, enabled):
     )
     scheduler = types.SimpleNamespace(
         server_args=types.SimpleNamespace(enable_pd_flip_hicache_stitch=enabled),
-        _pd_flip_source_page_indices_range=lambda req, start, end: list(
+        _pd_flip_stitch_page_indices_range=lambda req, start, end: list(
             range(start, end)
         ),
         _pd_flip_source_state_indices=lambda req, end, kv_mgr: [],
@@ -166,6 +185,121 @@ def test_source_full_fallback_preserves_fake_decode_behavior():
     assert entry["stitch_mode"] == "source_decode_full_fallback"
 
 
+@pytest.mark.parametrize(
+    "hit_len,committed_len,page_size,expected_pages",
+    [
+        (6, 10, 4, [1, 2]),
+        (0, 10, 4, [0, 1, 2]),
+        (8, 10, 4, [2]),
+        (6, 8, 4, [1]),
+        (3, 4, 4, [0]),
+    ],
+)
+def test_stitch_page_range_covers_tail_without_reading_past_committed_mapping(
+    hit_len, committed_len, page_size, expected_pages
+):
+    method = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_stitch_page_indices_range",
+        {
+            "Req": object,
+            "kv_to_page_indices": lambda values, size: values[::size] // size,
+        },
+    )
+    slices = []
+
+    class Table:
+        def __getitem__(self, item):
+            req_pool_idx, token_slice = item
+            assert req_pool_idx == 0
+            slices.append(token_slice)
+            return ArrayTensor(range(32))[token_slice]
+
+    scheduler = types.SimpleNamespace(
+        req_to_token_pool=types.SimpleNamespace(req_to_token=Table()),
+        token_to_kv_pool_allocator=types.SimpleNamespace(page_size=page_size),
+    )
+    req = types.SimpleNamespace(rid="req", req_pool_idx=0)
+
+    pages = method(scheduler, req, hit_len, committed_len)
+
+    assert pages.tolist() == expected_pages
+    assert slices == [slice((hit_len // page_size) * page_size, committed_len)]
+
+
+def test_stitch_page_range_rejects_truncated_committed_mapping():
+    method = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_stitch_page_indices_range",
+        {
+            "Req": object,
+            "kv_to_page_indices": lambda values, size: values[::size] // size,
+        },
+    )
+
+    class TruncatedTable:
+        def __getitem__(self, item):
+            return ArrayTensor([4, 5, 6])
+
+    scheduler = types.SimpleNamespace(
+        req_to_token_pool=types.SimpleNamespace(req_to_token=TruncatedTable()),
+        token_to_kv_pool_allocator=types.SimpleNamespace(page_size=4),
+    )
+
+    with pytest.raises(ValueError, match="incomplete stitch KV mapping"):
+        method(
+            scheduler,
+            types.SimpleNamespace(rid="req", req_pool_idx=0),
+            6,
+            10,
+        )
+
+
+def test_source_stitch_uses_page_range_but_keeps_state_at_logical_c0():
+    page_range = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_stitch_page_indices_range",
+        {
+            "Req": object,
+            "kv_to_page_indices": lambda values, size: values[::size] // size,
+        },
+    )
+    send_initial = _load_class_method(
+        SCHEDULER_PATH, "Scheduler", "_pd_flip_source_send_initial"
+    )
+    state_committed_lens = []
+    sender = FakeSender(prefix_len=6)
+    scheduler = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(enable_pd_flip_hicache_stitch=True),
+        req_to_token_pool=types.SimpleNamespace(
+            req_to_token=ArrayTensor([list(range(10))])
+        ),
+        token_to_kv_pool_allocator=types.SimpleNamespace(page_size=4),
+        _pd_flip_source_state_indices=lambda req, committed_len, kv_mgr: state_committed_lens.append(
+            committed_len
+        )
+        or [],
+    )
+    scheduler._pd_flip_stitch_page_indices_range = types.MethodType(
+        page_range, scheduler
+    )
+    entry = {
+        "sender": sender,
+        "req": types.SimpleNamespace(rid="req", req_pool_idx=0),
+        "committed_len": 10,
+        "metadata_index": 5,
+    }
+
+    send_initial(scheduler, entry)
+
+    assert sender.init_args == (2, 5)
+    assert sender.sent_indices.tolist() == [1, 2]
+    assert state_committed_lens == [10]
+
+
 def _target_stitch_ready(entry, *, enabled=True):
     method = _load_class_method(
         SCHEDULER_PATH, "Scheduler", "_pd_flip_target_stitch_ready"
@@ -194,15 +328,26 @@ def _target_entry(*, h=32, p=64, c0=100, start=32, end=100, restore="ready"):
 
 def test_target_stitch_completion_requires_valid_boundaries_and_full_coverage():
     assert _target_stitch_ready(_target_entry())
-    assert not _target_stitch_ready(_target_entry(h=65, p=64))
-    assert not _target_stitch_ready(_target_entry(p=101, c0=100))
-    assert not _target_stitch_ready(_target_entry(start=33))
-    assert not _target_stitch_ready(_target_entry(end=99))
+    for invalid_entry in (
+        _target_entry(h=65, p=64),
+        _target_entry(p=101, c0=100),
+        _target_entry(start=33),
+        _target_entry(end=99),
+    ):
+        with pytest.raises(RuntimeError):
+            _target_stitch_ready(invalid_entry)
+
+    missing = _target_entry()
+    del missing["mooncake_hit_len"]
+    with pytest.raises(RuntimeError):
+        _target_stitch_ready(missing)
 
 
 def test_target_stitch_completion_requires_hicache_restore_ready():
-    assert not _target_stitch_ready(_target_entry(restore="pending"))
-    assert not _target_stitch_ready(_target_entry(restore="failed"))
+    with pytest.raises(RuntimeError):
+        _target_stitch_ready(_target_entry(restore="pending"))
+    with pytest.raises(RuntimeError):
+        _target_stitch_ready(_target_entry(restore="failed"))
 
 
 def test_target_full_fallback_does_not_require_hicache_restore():
@@ -213,32 +358,134 @@ def test_target_full_fallback_does_not_require_hicache_restore():
     assert _target_stitch_ready({}, enabled=False)
 
 
+class Poll:
+    WaitingForInput = "waiting"
+    Success = "success"
+    Failed = "failed"
+
+
+def _pump_target_entry(entry, *, processor="none"):
+    pump = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_target_pump_transfer",
+        {
+            "KVPoll": Poll,
+            "time": types.SimpleNamespace(monotonic=lambda: 1.0),
+        },
+    )
+    restore_pending = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_target_hicache_restore_pending",
+        {"DecodeRequest": object},
+    )
+    stitch_ready = _load_class_method(
+        SCHEDULER_PATH, "Scheduler", "_pd_flip_target_stitch_ready"
+    )
+    events = []
+    scheduler = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(enable_pd_flip_hicache_stitch=True),
+        enable_decode_hicache=True,
+        _pd_flip_target_metadata_ready=lambda entry: True,
+        _pd_flip_target_commit_hicache_restore=lambda decode_req: events.append(
+            "commit"
+        ),
+        _pd_flip_release_target_request=lambda entry: events.append("release"),
+        _pd_flip_free_target_metadata=lambda entry: events.append("free"),
+        _pd_flip_note_timing=lambda *args: None,
+        _pd_flip_target_pump_delta_transfer=lambda session: None,
+    )
+    scheduler._pd_flip_target_hicache_restore_pending = types.MethodType(
+        restore_pending, scheduler
+    )
+    scheduler._pd_flip_target_stitch_ready = types.MethodType(stitch_ready, scheduler)
+    if processor == "pending":
+        scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            _process_hicache_local_restores=lambda decode_reqs: None
+        )
+        entry["decode_req"].hicache_restore_status = types.SimpleNamespace(
+            value="pending"
+        )
+    elif processor == "unknown":
+        scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            _process_hicache_local_restores=lambda decode_reqs: None
+        )
+
+    session = {
+        "manifests": [{"rid": "req"}],
+        "target_entries": {"req": entry},
+    }
+    pump(scheduler, session)
+    return session, events
+
+
+def _pumping_entry(*, needs_restore=False):
+    events = []
+
+    class Receiver:
+        def poll(self):
+            return Poll.Success
+
+        def abort(self):
+            events.append("abort")
+
+    entry = _target_entry()
+    entry["phase"] = "transferring"
+    entry["decode_req"].prefix_match.needs_local_restore = needs_restore
+    entry["decode_req"].kv_receiver = Receiver()
+    return entry, events
+
+
+@pytest.mark.parametrize("invalid", ["missing_h", "coverage"])
+def test_target_pump_fails_and_cleans_up_permanent_stitch_mismatch(invalid):
+    entry, receiver_events = _pumping_entry()
+    if invalid == "missing_h":
+        del entry["mooncake_hit_len"]
+    else:
+        entry["target_received_suffix_start"] += 1
+
+    session, cleanup_events = _pump_target_entry(entry)
+
+    assert entry["phase"] == "failed"
+    assert session["state"] == "target_failed"
+    assert session["failed_rids"] == {"req"}
+    assert receiver_events == ["abort"]
+    assert cleanup_events == ["release", "free"]
+
+
+@pytest.mark.parametrize("processor", ["none", "unknown"])
+def test_target_pump_fails_and_cleans_up_unserviceable_restore(processor):
+    entry, receiver_events = _pumping_entry(needs_restore=True)
+    if hasattr(entry["decode_req"], "hicache_restore_status"):
+        del entry["decode_req"].hicache_restore_status
+
+    session, cleanup_events = _pump_target_entry(entry, processor=processor)
+
+    assert entry["phase"] == "failed"
+    assert session["state"] == "target_failed"
+    assert receiver_events == ["abort"]
+    assert cleanup_events == ["release", "free"]
+
+
+def test_target_pump_waits_only_while_restore_processor_reports_pending():
+    entry, receiver_events = _pumping_entry(needs_restore=True)
+
+    session, cleanup_events = _pump_target_entry(entry, processor="pending")
+
+    assert entry["phase"] == "transferring"
+    assert session.get("state") != "target_failed"
+    assert session["pending_reqs"] == 1
+    assert receiver_events == []
+    assert cleanup_events == []
+
+
 def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
-    class FakeTensor:
-        def __init__(self, values):
-            self.values = np.asarray(values)
-
-        def __len__(self):
-            return len(self.values)
-
-        def __getitem__(self, item):
-            value = self.values[item]
-            return FakeTensor(value) if isinstance(value, np.ndarray) else value
-
-        def cpu(self):
-            return self
-
-        def numpy(self):
-            return self.values
-
-        def tolist(self):
-            return self.values.tolist()
-
     class PrefixMatch:
         def __init__(self):
-            self.prefix_indices = FakeTensor([10, 20, 30, 40])
+            self.prefix_indices = ArrayTensor([10, 20, 30, 40])
             self.l2_host_hit_length = 0
-            self.l3_storage_hit_length = 8
+            self.l3_storage_hit_length = 2
 
         @property
         def l1_prefix_len(self):
@@ -292,7 +539,7 @@ def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
     req = types.SimpleNamespace(
         rid="req",
         origin_input_ids=list(range(10)),
-        kv_committed_len=12,
+        kv_committed_len=10,
         req_pool_idx=0,
         bootstrap_room=123,
     )
@@ -302,6 +549,16 @@ def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
         "metadata_index": -1,
     }
     queue = Queue()
+    state_committed_lens = []
+    page_range = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_stitch_page_indices_range",
+        {
+            "Req": object,
+            "kv_to_page_indices": lambda values, size: values[::size] // size,
+        },
+    )
     scheduler = types.SimpleNamespace(
         server_args=types.SimpleNamespace(
             enable_pd_flip_hicache_stitch=True,
@@ -311,7 +568,7 @@ def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
         req_to_metadata_buffer_idx_allocator=types.SimpleNamespace(alloc=lambda: 0),
         token_to_kv_pool_allocator=types.SimpleNamespace(page_size=4),
         req_to_token_pool=types.SimpleNamespace(
-            req_to_token=FakeTensor([list(range(12))])
+            req_to_token=ArrayTensor([list(range(10))])
         ),
         disagg_metadata_buffers=types.SimpleNamespace(
             bootstrap_room=np.zeros((1, 1), dtype=np.int64)
@@ -319,27 +576,33 @@ def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
         enable_decode_hicache=True,
         transfer_backend="fake",
         _pd_flip_stitch_boundary=boundary,
-        _pd_flip_target_state_indices=lambda req, committed_len: [],
+        _pd_flip_target_state_indices=lambda req, committed_len: state_committed_lens.append(
+            committed_len
+        )
+        or [],
+    )
+    scheduler._pd_flip_stitch_page_indices_range = types.MethodType(
+        page_range, scheduler
     )
 
     method(scheduler, entry)
 
-    assert receiver.sent == ([8, 9, 10, 11], 8)
-    assert queue.prefetched == 8
-    assert entry["mooncake_hit_len"] == 8
+    assert receiver.sent == ([1, 2], 6)
+    assert queue.prefetched == 6
+    assert state_committed_lens == [10]
+    assert entry["mooncake_hit_len"] == 6
     assert entry["target_prompt_len"] == 10
-    assert entry["target_committed_len"] == 12
-    assert entry["target_received_suffix_start"] == 8
-    assert entry["target_received_suffix_end"] == 12
-    assert entry["stitch_mode"] == "full_prefix_stitch"
+    assert entry["target_committed_len"] == 10
+    assert entry["target_received_suffix_start"] == 6
+    assert entry["target_received_suffix_end"] == 10
+    assert entry["stitch_mode"] == "partial_prefix_stitch"
 
 
 def test_stitch_uses_explicit_server_and_worker_flags_only():
     scheduler_source = SCHEDULER_PATH.read_text(encoding="utf-8")
     server_args_source = SERVER_ARGS_PATH.read_text(encoding="utf-8")
     worker_source = (
-        REPO_ROOT
-        / "scripts/playground/disaggregation/pd_flip_docker/run_worker.sh"
+        REPO_ROOT / "scripts/playground/disaggregation/pd_flip_docker/run_worker.sh"
     ).read_text(encoding="utf-8")
 
     assert "SGLANG_PD_FLIP_HICACHE_STITCH" not in scheduler_source
