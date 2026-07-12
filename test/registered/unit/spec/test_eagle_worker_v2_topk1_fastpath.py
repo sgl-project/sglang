@@ -72,10 +72,11 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     return worker
 
 
-def _make_backend_factory(decode_backend, draft_extend_backend):
+def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=None):
     class FakeDraftBackendFactory:
         def __init__(self, *args, **kwargs):
-            pass
+            if captured_kwargs is not None:
+                captured_kwargs.update(kwargs)
 
         def create_decode_backend(self):
             return decode_backend
@@ -203,6 +204,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
         worker.topk = 1
         worker.speculative_num_steps = 2
+        worker.seed_dsa_topk_from_draft_extend = False
 
         with patch(
             "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
@@ -224,10 +226,14 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
         worker.topk = 1
         worker.speculative_num_steps = 2
+        worker.seed_dsa_topk_from_draft_extend = True
+        factory_kwargs = {}
 
         with patch(
             "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
-            _make_backend_factory(decode_backend, draft_extend_backend),
+            _make_backend_factory(
+                decode_backend, draft_extend_backend, captured_kwargs=factory_kwargs
+            ),
         ):
             worker.init_attention_backend()
 
@@ -235,6 +241,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         self.assertIs(worker.draft_extend_attn_backend, draft_extend_backend)
         self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
         self.assertIs(worker.draft_runner.attn_backend, draft_extend_backend)
+        self.assertTrue(factory_kwargs["seed_dsa_topk_from_draft_extend"])
 
     def _make_adaptive_worker(self, runner_attn_backend):
         """An EAGLEWorkerV2 with a draft worker whose state-machine fields are
