@@ -319,6 +319,19 @@ async fn streaming_2xx_request_sets_server_timing_router_ttfb_header() {
     let res = app.oneshot(streaming_chat_request()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
+    // `router.stage` is stamped only by `ApiError::into_response`, never on a
+    // 2xx — check every `Server-Timing` entry (`get_all`, not `get`, since the
+    // header is list-valued and a single `get` only sees the first value) so
+    // an appended second value could never smuggle a stage past a `get`-only
+    // assertion.
+    for v in res.headers().get_all("server-timing") {
+        let v = v.to_str().unwrap();
+        assert!(
+            !v.contains("router.stage"),
+            "a 2xx response must never carry router.stage; got Server-Timing entry: {v}",
+        );
+    }
+
     let server_timing = res
         .headers()
         .get("server-timing")
@@ -393,9 +406,13 @@ async fn streaming_2xx_request_records_ttft_overhead_metric() {
 }
 
 /// A non-2xx response (streaming request to a dead upstream → gateway error)
-/// records neither artifact: both are gated on a 2xx dispatch (successful
-/// response headers), so an error hop emits no `router.ttfb` header and no
-/// overhead sample.
+/// records neither `router.ttfb` artifact: both are gated on a 2xx dispatch
+/// (successful response headers), so an error hop emits no `router.ttfb`
+/// entry on `Server-Timing` and no overhead sample. It DOES still carry
+/// `router.stage` on the same header — that stamp comes from `ApiError`'s
+/// `into_response` (see `server::error::ApiError::stage`), not the 2xx-gated
+/// ttfb path, so a router-synthesized error is never silent about which stage
+/// it died in.
 #[tokio::test]
 async fn streaming_error_response_omits_server_timing_header() {
     // Bind a port, drop it — a guaranteed closed/refused TCP destination.
@@ -412,9 +429,28 @@ async fn streaming_error_response_omits_server_timing_header() {
         "a dead upstream must not yield a 2xx; got {}",
         res.status(),
     );
+    let server_timing = res
+        .headers()
+        .get("server-timing")
+        .expect("a router-generated error response must carry router.stage on Server-Timing")
+        .to_str()
+        .unwrap();
     assert!(
-        res.headers().get("server-timing").is_none(),
-        "error responses must not carry a router.ttfb Server-Timing header",
+        !server_timing.contains("router.ttfb"),
+        "error responses must not carry a router.ttfb Server-Timing entry; got: {server_timing}",
+    );
+    let stage = server_timing
+        .strip_prefix("router.stage;desc=")
+        .unwrap_or_else(|| {
+            panic!("Server-Timing must be `router.stage;desc=<stage>`; got: {server_timing}")
+        });
+    // Deterministic scenario: a dead listener refuses the connection, so the
+    // proxy always resolves this as `ApiError::UpstreamUnreachable`, which
+    // `ApiError::stage` maps to `dispatch` — a worker was selected, the
+    // failure is on the wire to it.
+    assert_eq!(
+        stage, "dispatch",
+        "a connection-refused dispatch failure must report stage=dispatch; got: {server_timing}",
     );
     assert!(
         !ctx.metrics
@@ -861,6 +897,21 @@ async fn non_streaming_upstream_500_preserved() {
     assert!(
         res.headers().get("x-router-error-code").is_none(),
         "router envelope must NOT wrap upstream 5xx — passthrough",
+    );
+    // `router.stage` is stamped only by `ApiError::into_response` — a
+    // passthrough (the proxy forwarding the worker's own status and body)
+    // never constructs an `ApiError`, so it must never carry the header
+    // either, confirming the discriminator a downstream hop relies on:
+    // `router.stage` present ⇒ router-synthesized (absence alone proves
+    // nothing — see `ApiError::stage`'s doc comment).
+    let no_stage = res
+        .headers()
+        .get("server-timing")
+        .map(|v| !v.to_str().unwrap().contains("router.stage"))
+        .unwrap_or(true);
+    assert!(
+        no_stage,
+        "router.stage must NOT be set on upstream-passthrough responses",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let got: Value = serde_json::from_slice(&bytes).unwrap();
@@ -2158,6 +2209,110 @@ async fn admission_parks_second_request_until_first_stream_frees_the_slot() {
         "queue should drain to 0: {}",
         ctx.metrics.render(),
     );
+}
+
+/// Flagship end-to-end pin for the cancelled-request `stage=` wiring (see
+/// `RequestPhaseCell` in `crate::server::app`): a request cancelled while
+/// genuinely parked in the REAL admission wait queue must have its fallback
+/// log line carry `stage=queue`. The unit tests in `server::app::tests`
+/// exercise the plumbing with a stub handler that fakes a park via
+/// `tokio::time::sleep`; this test is the one place that drives the actual
+/// path end to end: middleware inserts the cell → the chat handler's real
+/// `Extension` extractor reads it → `set(Queue)` fires immediately before the
+/// real `AdmissionQueue::acquire` call → the caller is cancelled while
+/// genuinely parked there → the guard reads the cell back on `Drop`.
+#[tokio::test]
+async fn admission_cancel_while_parked_reports_stage_queue() {
+    let buf = global_log_buf();
+    let rid = "rid-cancel-while-parked-in-queue";
+
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(200),
+    )
+    .await;
+
+    // cap=1 per worker so the second request has nowhere to go but the real
+    // wait queue — same admission setup as
+    // `admission_parks_second_request_until_first_stream_frees_the_slot`.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(4),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+
+    // Request A claims the only slot and is held open (not drained) so B has
+    // nowhere to go.
+    let res_a = build_router(ctx.clone())
+        .oneshot(make_chat_req(true, "rid-a-holds-the-slot"))
+        .await
+        .unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+
+    // Request B parks in the real admission wait queue.
+    let ctx_b = ctx.clone();
+    let req_b = make_chat_req(true, rid);
+    let b = tokio::spawn(async move { build_router(ctx_b).oneshot(req_b).await });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !b.is_finished(),
+        "B should park while A holds the only slot, not return"
+    );
+    assert!(
+        ctx.metrics
+            .render()
+            .contains("sgl_router_queued_requests 1\n"),
+        "B should be counted as parked: {}",
+        ctx.metrics.render(),
+    );
+
+    // Cancel B while it is genuinely parked — aborting the task drops the
+    // whole middleware+handler future chain, exactly like a real client
+    // disconnect does mid-park.
+    b.abort();
+    let _ = b.await;
+
+    // The aborted future's drop glue (and this guard's `Drop`) runs on the
+    // runtime asynchronously relative to `abort()` returning — poll with a
+    // generous ceiling instead of asserting on one fixed wait, same pattern as
+    // `server::app::tests::cancelled_request_still_emits_one_log_line`.
+    let mut logs = String::new();
+    for _ in 0..40 {
+        logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        if logs.contains(rid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        access_log_count(&logs, rid),
+        1,
+        "a cancelled parked request must be logged exactly once; captured:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"stage="queue""#) || logs.contains("stage=queue"),
+        "a request cancelled while genuinely parked in the admission queue \
+         must report stage=queue on the fallback line; captured:\n{logs}"
+    );
+
+    // Clean up: drain A so the mock worker's background task can finish.
+    let _ = BodyExt::collect(res_a.into_body()).await.unwrap();
 }
 
 /// A request shed by the admission gate (503 `service_overloaded`) must show up

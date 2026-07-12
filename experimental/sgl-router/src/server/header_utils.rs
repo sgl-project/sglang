@@ -5,6 +5,12 @@
 
 use axum::http::HeaderName;
 
+/// `Server-Timing` response header name, shared by every site that appends a
+/// metric to it — e.g. `router.ttfb` on 2xx streaming responses (`chat.rs`),
+/// `router.stage` on router-generated errors (`error.rs`). One definition so
+/// the header name itself can't drift between call sites.
+pub const SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
 /// True if a request header from the inbound client should be forwarded
 /// to the upstream worker. Mirrors SMG's whitelist semantics.
 pub fn should_forward_request_header(name: &HeaderName) -> bool {

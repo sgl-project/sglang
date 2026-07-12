@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -82,6 +83,79 @@ fn pod_id() -> &'static str {
     })
 }
 
+/// Coarse point in the request lifecycle a handler has reached, as observed
+/// by the cancelled-request fallback log line (see `AccessLogFallbackGuard`).
+/// Distinct from [`crate::server::error::ApiError::stage`] (which attributes a
+/// completed error *response*): this attributes an *abandoned* request that
+/// never produced one, so the fallback line can tell "the caller hung up
+/// while queued for admission" apart from "the caller hung up while the
+/// engine was still working" without an engine-side join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RequestPhase {
+    /// Before admission: parsing / validating the request, or not yet
+    /// reached the admission gate. The default — a handler that never
+    /// advances the phase attributes any cancellation here.
+    Ingress,
+    /// Parked in (or about to enter) the admission wait queue.
+    Queue,
+    /// Past admission, waiting on the selected engine.
+    Dispatch,
+}
+
+impl RequestPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            RequestPhase::Ingress => "ingress",
+            RequestPhase::Queue => "queue",
+            RequestPhase::Dispatch => "dispatch",
+        }
+    }
+}
+
+/// Shared, request-scoped cell holding the current [`RequestPhase`]. Inserted
+/// into `req.extensions_mut()` by `access_log_and_record` and read by the
+/// `AccessLogFallbackGuard`'s `Drop`; the chat handler holds a clone (via the
+/// `Extension` extractor) and advances it as the request moves through
+/// admission. Only meaningful pre-headers: the fallback guard disarms once
+/// the handler returns a response, and a mid-stream drop after that point is
+/// the SSE pump's own outcome to record, not this cell's.
+///
+/// `Relaxed` ordering is enough even though the write (handler) and the read
+/// (the guard's `Drop`) can run on different executor threads: safety here
+/// comes from the runtime's task handoff, not from the ordering. The guard's
+/// `Drop` only runs after the handler's future has been dropped, and dropping
+/// a future establishes a happens-before edge over everything the future did
+/// while it was still alive (including any `set()` call) — so the read is
+/// already ordered-after every write without needing `Acquire`/`Release`.
+pub(crate) struct RequestPhaseCell(AtomicU8);
+
+impl Default for RequestPhaseCell {
+    fn default() -> Self {
+        Self(AtomicU8::new(RequestPhase::Ingress as u8))
+    }
+}
+
+impl RequestPhaseCell {
+    pub(crate) fn set(&self, phase: RequestPhase) {
+        self.0.store(phase as u8, Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> RequestPhase {
+        match self.0.load(Ordering::Relaxed) {
+            v if v == RequestPhase::Ingress as u8 => RequestPhase::Ingress,
+            v if v == RequestPhase::Queue as u8 => RequestPhase::Queue,
+            v if v == RequestPhase::Dispatch as u8 => RequestPhase::Dispatch,
+            // The only writer is `set()`, which only ever stores one of the
+            // three discriminants above — a fourth value here would mean the
+            // cell was corrupted or written through some other path, not that
+            // a real 4th `RequestPhase` variant was added (that case is
+            // exhaustively handled by the arms above).
+            v => unreachable!("RequestPhaseCell holds invalid discriminant {v}"),
+        }
+    }
+}
+
 /// Guards `access_log_and_record`'s normal access-log line, which is only
 /// reached after `next.run(req).await` resolves. If the client disconnects
 /// while that await is still pending, axum drops that function's future
@@ -104,6 +178,7 @@ struct AccessLogFallbackGuard {
     start: std::time::Instant,
     is_infra: bool,
     armed: bool,
+    phase: Arc<RequestPhaseCell>,
 }
 
 impl AccessLogFallbackGuard {
@@ -125,6 +200,7 @@ impl Drop for AccessLogFallbackGuard {
             route = %self.route,
             latency_ms = self.start.elapsed().as_millis() as u64,
             outcome = "cancelled",
+            stage = %self.phase.get().as_str(),
             "http_request: client disconnected before a response was produced",
         );
     }
@@ -155,7 +231,7 @@ impl Drop for AccessLogFallbackGuard {
 /// means no outcome is missed and none is double-counted.
 async fn access_log_and_record(
     State(metrics): State<Arc<MetricsRegistry>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let method = req.method().clone();
@@ -184,6 +260,13 @@ async fn access_log_and_record(
     // a never-answered request still shows up (intake - responses = the gap).
     metrics.record_ingress(&route, method_label);
 
+    // Handed to the handler via `req.extensions_mut()` (advanced as the
+    // request moves through admission) and to the fallback guard (read only
+    // if the handler's future is dropped before it responds) — see
+    // `RequestPhaseCell`'s doc comment.
+    let phase = Arc::new(RequestPhaseCell::default());
+    req.extensions_mut().insert(Arc::clone(&phase));
+
     let mut log_guard = AccessLogFallbackGuard {
         request_id: request_id.clone(),
         method_label,
@@ -192,6 +275,7 @@ async fn access_log_and_record(
         start,
         is_infra: is_infra_path(&path),
         armed: true,
+        phase,
     };
 
     let resp = next.run(req).await;
@@ -519,6 +603,126 @@ mod tests {
         assert!(
             logs.contains(r#"outcome="cancelled""#) || logs.contains("outcome=cancelled"),
             "the fallback log line must mark the outcome as cancelled; captured:\n{logs}"
+        );
+        // The stub handler above never advances the phase past its default —
+        // the fallback line must attribute the cancellation to `ingress`.
+        assert!(
+            logs.contains(r#"stage="ingress""#) || logs.contains("stage=ingress"),
+            "a handler that never advances the phase must attribute the \
+             cancellation to `ingress`; captured:\n{logs}"
+        );
+    }
+
+    /// Companion to the above: a handler that DOES advance the phase (as the
+    /// chat handler does immediately before `ctx.admission.acquire(...)`) must
+    /// have that phase reflected on the fallback line — validates the full
+    /// extension plumbing (middleware inserts the cell, handler reads and
+    /// advances it, guard reads it back on `Drop`) with a stub handler,
+    /// without standing up a real admission queue. A real park-and-cancel
+    /// through the actual admission queue is covered separately by the chat
+    /// integration suite.
+    #[tokio::test]
+    async fn cancelled_request_after_queue_phase_reports_stage_queue() {
+        use axum::extract::Extension;
+
+        ensure_global_tracing_default();
+        let (buf, _guard) = capture_logs();
+
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|phase: Extension<Arc<RequestPhaseCell>>| async move {
+                    phase.set(RequestPhase::Queue);
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-request-id", "test-queue-cancelled-rid")
+            .body(Body::empty())
+            .unwrap();
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.oneshot(req)).await;
+        assert!(abandoned.is_err(), "request must not complete within 50ms");
+        let mut logs = String::new();
+        for _ in 0..20 {
+            logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            if logs.contains("test-queue-cancelled-rid") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            logs.contains("test-queue-cancelled-rid"),
+            "a cancelled request's rid must still be logged; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains(r#"stage="queue""#) || logs.contains("stage=queue"),
+            "a handler that advanced to Queue before being cancelled must \
+             report stage=queue on the fallback line; captured:\n{logs}"
+        );
+    }
+
+    /// Mirror of the `Queue` case above for `Dispatch` — the chat handler's
+    /// third and last phase, set once a worker has been selected. Together
+    /// the two stub tests round-trip all three `RequestPhase` values through
+    /// the fallback line (a cancellation that never advances the phase is
+    /// covered by `cancelled_request_still_emits_one_log_line`, above).
+    #[tokio::test]
+    async fn cancelled_request_after_dispatch_phase_reports_stage_dispatch() {
+        use axum::extract::Extension;
+
+        ensure_global_tracing_default();
+        let (buf, _guard) = capture_logs();
+
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|phase: Extension<Arc<RequestPhaseCell>>| async move {
+                    phase.set(RequestPhase::Dispatch);
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-request-id", "test-dispatch-cancelled-rid")
+            .body(Body::empty())
+            .unwrap();
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.oneshot(req)).await;
+        assert!(abandoned.is_err(), "request must not complete within 50ms");
+        let mut logs = String::new();
+        for _ in 0..20 {
+            logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            if logs.contains("test-dispatch-cancelled-rid") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            logs.contains("test-dispatch-cancelled-rid"),
+            "a cancelled request's rid must still be logged; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains(r#"stage="dispatch""#) || logs.contains("stage=dispatch"),
+            "a handler that advanced to Dispatch before being cancelled must \
+             report stage=dispatch on the fallback line; captured:\n{logs}"
         );
     }
 

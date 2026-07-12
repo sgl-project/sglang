@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::server::header_utils::SERVER_TIMING;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -53,6 +54,29 @@ impl ErrorClass {
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Where in the request lifecycle an [`ApiError`] originated — see
+/// [`ApiError::stage`] for the per-variant mapping and rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Ingress,
+    Queue,
+    Dispatch,
+}
+
+impl Stage {
+    /// The pre-composed `Server-Timing` entry for this stage. A `HeaderValue`
+    /// (not a `&'static str`) so the call site (`into_response`) is a plain
+    /// `append`, with no runtime formatting and no fallible parse — the three
+    /// values are fixed at compile time.
+    fn server_timing(self) -> HeaderValue {
+        match self {
+            Stage::Ingress => HeaderValue::from_static("router.stage;desc=ingress"),
+            Stage::Queue => HeaderValue::from_static("router.stage;desc=queue"),
+            Stage::Dispatch => HeaderValue::from_static("router.stage;desc=dispatch"),
         }
     }
 }
@@ -235,6 +259,67 @@ impl ApiError {
     /// (e.g. 502/503/504) instead of a sentinel.
     pub fn status_code(&self) -> StatusCode {
         self.class().status()
+    }
+
+    /// Coarse attribution of WHERE in the request lifecycle an error
+    /// originated — a wire contract read by a downstream hop (see
+    /// [`Stage::server_timing`]'s `Server-Timing: router.stage;desc=<stage>`)
+    /// to tell a router-owned stall apart from an engine-owned one without a
+    /// join back to the engine's own timing data. Three values:
+    ///
+    /// * [`Ingress`](Stage::Ingress) — died before worker selection ever
+    ///   started ([`BadRequest`](ApiError::BadRequest),
+    ///   [`ModelNotFound`](ApiError::ModelNotFound)), or the catch-all
+    ///   [`Internal`](ApiError::Internal): that variant is in practice
+    ///   raisable at any point (including well after selection — see e.g. the
+    ///   worker-URL joins in the forwarders), but its stage is never knowable
+    ///   from the variant alone, so it defaults here. `stage=ingress` paired
+    ///   with `internal_error` reads as "unattributed", not "pre-admission".
+    /// * [`Queue`](Stage::Queue) — the router owns the stall: either it died
+    ///   during admission / worker selection itself
+    ///   ([`NoHealthyWorkers`](ApiError::NoHealthyWorkers),
+    ///   [`NoPrefillWorkersAvailable`](ApiError::NoPrefillWorkersAvailable),
+    ///   [`NoDecodeWorkersAvailable`](ApiError::NoDecodeWorkersAvailable),
+    ///   [`PolicySelectionFailed`](ApiError::PolicySelectionFailed),
+    ///   [`BreakerOpen`](ApiError::BreakerOpen),
+    ///   [`ServiceOverloaded`](ApiError::ServiceOverloaded)), or it surfaces
+    ///   after selection but no byte ever reached a worker and the fault is
+    ///   router/discovery-owned, not the engine's
+    ///   ([`WorkerMisconfigured`](ApiError::WorkerMisconfigured) — the
+    ///   forwarder trips the breaker before returning, so this is a
+    ///   discovery-config defect, not an engine stall).
+    /// * [`Dispatch`](Stage::Dispatch) — died waiting on (or talking to) an
+    ///   already-selected worker; the engine owns the stall
+    ///   ([`UpstreamUnreachable`](ApiError::UpstreamUnreachable),
+    ///   [`UpstreamStatus`](ApiError::UpstreamStatus),
+    ///   [`UpstreamTimeout`](ApiError::UpstreamTimeout),
+    ///   [`AttemptTimeout`](ApiError::AttemptTimeout),
+    ///   [`StaleRequestExpired`](ApiError::StaleRequestExpired) — the
+    ///   stale-cancel token only exists once admission has already granted a
+    ///   slot, so this one is `dispatch` by construction even though the
+    ///   janitor is a router-side actor).
+    ///
+    /// Exhaustive (wildcard-free) for the same reason as `error_code` and
+    /// `class`: a future variant is forced to pick a stage rather than
+    /// silently inheriting one via a catch-all arm.
+    fn stage(&self) -> Stage {
+        match self {
+            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) | ApiError::Internal(_) => {
+                Stage::Ingress
+            }
+            ApiError::NoHealthyWorkers { .. }
+            | ApiError::NoPrefillWorkersAvailable { .. }
+            | ApiError::NoDecodeWorkersAvailable { .. }
+            | ApiError::PolicySelectionFailed { .. }
+            | ApiError::BreakerOpen { .. }
+            | ApiError::WorkerMisconfigured { .. }
+            | ApiError::ServiceOverloaded { .. } => Stage::Queue,
+            ApiError::UpstreamUnreachable { .. }
+            | ApiError::UpstreamStatus { .. }
+            | ApiError::UpstreamTimeout { .. }
+            | ApiError::AttemptTimeout { .. }
+            | ApiError::StaleRequestExpired { .. } => Stage::Dispatch,
+        }
     }
 
     /// Whether this is a transient *dispatch* failure the router may recover by
@@ -449,6 +534,21 @@ impl IntoResponse for ApiError {
                 HeaderValue::from(upstream.as_u16()),
             );
         }
+        // `router.stage` on `Server-Timing` — see `stage()`'s doc comment for the
+        // wire contract. Every `ApiError` reaches this `into_response`, so EVERY
+        // router-generated error response gets stamped; a well-formed non-2xx
+        // response the proxy forwards with the worker's own status and body
+        // never passes through here at all, so it is never stamped either — a
+        // worker can't spoof this header even if it tried. The discriminator is
+        // ONE-directional though: presence of `router.stage` ⇒ the router
+        // synthesized the response; absence proves nothing on its own (a
+        // response that bypasses `ApiError` entirely — a panic-caught 500, an
+        // extractor-rejection 400, an unmatched-route 404 — is also unstamped).
+        // `append`, not `insert` — `Server-Timing` is list-valued, so this must
+        // add without clobbering a value a prior layer may have set (mirrors
+        // the `router.ttfb` stamping in the chat handler).
+        resp.headers_mut()
+            .append(SERVER_TIMING, self.stage().server_timing());
         resp
     }
 }
@@ -688,9 +788,13 @@ mod tests {
         );
     }
 
-    /// The three client-facing signals of the router status-code contract:
-    /// the HTTP status, `x-router-error-code`, and `x-router-upstream-status`.
-    fn signals(err: ApiError) -> (StatusCode, Option<String>, Option<String>) {
+    /// The four client-facing signals of the router status-code contract:
+    /// the HTTP status, `x-router-error-code`, `x-router-upstream-status`, and
+    /// the `router.stage` entry on `Server-Timing`. `Server-Timing` is
+    /// list-valued (appended, not inserted), but every router-originated
+    /// error appends exactly one entry, so a single `get` (first value) is
+    /// enough here — a genuine multi-value case would need `get_all`.
+    fn signals(err: ApiError) -> (StatusCode, Option<String>, Option<String>, Option<String>) {
         let resp = err.into_response();
         let status = resp.status();
         let header = |name: &str| {
@@ -703,8 +807,21 @@ mod tests {
             status,
             header("x-router-error-code"),
             header("x-router-upstream-status"),
+            header("server-timing"),
         )
     }
+
+    /// One table-test row: label, error, expected status, expected
+    /// x-router-error-code, expected x-router-upstream-status, expected
+    /// router.stage.
+    type StageCase = (
+        &'static str,
+        ApiError,
+        StatusCode,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+    );
 
     /// Every router-*originated* condition maps to a fixed (status, error-code)
     /// pair, and ONLY the mid-body-drop case echoes the worker's real status in
@@ -717,9 +834,7 @@ mod tests {
     #[test]
     fn router_originated_scenarios_match_status_and_headers() {
         let worker = reqwest::Url::parse("http://host:1/").unwrap();
-        // (label, error, expected status, expected x-router-error-code,
-        //  expected x-router-upstream-status)
-        let cases: Vec<(&str, ApiError, StatusCode, &str, Option<&str>)> = vec![
+        let cases: Vec<StageCase> = vec![
             (
                 "mid-body drop preserves worker status",
                 ApiError::UpstreamStatus {
@@ -728,6 +843,7 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
                 "upstream_body_incomplete",
                 Some("200"),
+                "dispatch",
             ),
             (
                 "unreachable",
@@ -738,6 +854,7 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
                 "upstream_unreachable",
                 None,
+                "dispatch",
             ),
             (
                 "request timeout",
@@ -747,6 +864,15 @@ mod tests {
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream_timeout",
                 None,
+                "dispatch",
+            ),
+            (
+                "attempt deadline exceeded",
+                ApiError::AttemptTimeout { model: "m".into() },
+                StatusCode::GATEWAY_TIMEOUT,
+                "attempt_timeout",
+                None,
+                "dispatch",
             ),
             (
                 "stale-deadline cancel",
@@ -754,6 +880,7 @@ mod tests {
                 StatusCode::GATEWAY_TIMEOUT,
                 "stale_request_expired",
                 None,
+                "dispatch",
             ),
             (
                 "admission shed",
@@ -761,6 +888,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_overloaded",
                 None,
+                "queue",
             ),
             (
                 "no healthy workers",
@@ -768,6 +896,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_healthy_workers",
                 None,
+                "queue",
             ),
             (
                 "bad request",
@@ -775,6 +904,7 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "bad_request",
                 None,
+                "ingress",
             ),
             (
                 "model not found",
@@ -782,6 +912,7 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "model_not_found",
                 None,
+                "ingress",
             ),
             (
                 "no prefill workers",
@@ -789,6 +920,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_prefill_workers_available",
                 None,
+                "queue",
             ),
             (
                 "no decode workers",
@@ -796,6 +928,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_decode_workers_available",
                 None,
+                "queue",
             ),
             (
                 "policy selection failed",
@@ -803,6 +936,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "policy_selection_failed",
                 None,
+                "queue",
             ),
             (
                 "breaker open",
@@ -812,6 +946,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "breaker_open",
                 None,
+                "queue",
             ),
             (
                 "worker misconfigured",
@@ -822,6 +957,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "worker_misconfigured",
                 None,
+                "queue",
             ),
             (
                 "internal",
@@ -829,10 +965,11 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 None,
+                "ingress",
             ),
         ];
-        for (label, err, want_status, want_code, want_upstream) in cases {
-            let (status, code, upstream) = signals(err);
+        for (label, err, want_status, want_code, want_upstream, want_stage) in cases {
+            let (status, code, upstream, server_timing) = signals(err);
             assert_eq!(status, want_status, "status mismatch for `{label}`");
             assert_eq!(
                 code.as_deref(),
@@ -843,6 +980,11 @@ mod tests {
                 upstream.as_deref(),
                 want_upstream,
                 "x-router-upstream-status mismatch for `{label}`",
+            );
+            assert_eq!(
+                server_timing.as_deref(),
+                Some(format!("router.stage;desc={want_stage}").as_str()),
+                "router.stage mismatch for `{label}`",
             );
         }
     }

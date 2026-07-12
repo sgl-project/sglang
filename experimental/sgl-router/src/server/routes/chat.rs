@@ -7,8 +7,10 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::proxy::sse::StreamEnd;
 use crate::proxy::AbortReason;
+use crate::server::app::{RequestPhase, RequestPhaseCell};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::server::header_utils::SERVER_TIMING;
 use crate::server::metrics::{
     MetricsRegistry, RequestLogContext, StaleRequestOutcome, StreamOutcome, WorkerModeLabel,
 };
@@ -40,7 +42,7 @@ fn abort_reason_from_api_error(err: &ApiError) -> AbortReason {
 }
 use crate::workers::Worker;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
@@ -65,17 +67,6 @@ const PHASE_LOG_SAMPLE: u64 = 64;
 /// prefix matches `x-sgl-router-error-code` so router-emitted metadata
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
-
-/// `Server-Timing` response header. On streaming 2xx responses the router
-/// attaches a single `router.ttfb;dur=<ms>` metric: the router's
-/// ingress → upstream-response-headers span (`at_post_dispatch`). This is the
-/// whole span the router synchronously owns before the SSE pump takes over, so
-/// a downstream hop that also measures the engine's own generation latency can
-/// separate router-incurred time from engine-incurred time on a per-request
-/// basis (something aggregate histograms can't do per-request). It is a
-/// response header, so it must be readable at header-flush time — hence
-/// to-headers rather than to-first-token (the first token has not arrived yet).
-const SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -156,12 +147,23 @@ impl Drop for RecordDurationOnDrop {
 /// pre-routing rejection. Routed requests carry a
 /// [`RequestLogContext`](crate::server::metrics::RequestLogContext) so the
 /// middleware can attach their per-worker labels.
-pub async fn chat_completions(
+pub(crate) async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
+    // `Option<...>` so handler-only tests that exercise this function without
+    // the `access_log_and_record` middleware (which is what inserts the
+    // extension) keep working — see `RequestPhaseCell`'s doc comment in
+    // `crate::server::app`.
+    phase: Option<Extension<Arc<RequestPhaseCell>>>,
+    // Body-consuming extractor: MUST stay last. Every extractor before this
+    // one must implement `FromRequestParts` (borrows the request head only);
+    // `Bytes` is the one `FromRequest` extractor allowed per handler because
+    // it consumes the request. Axum enforces the ordering at compile time —
+    // putting another extractor after `Bytes` fails to compile, it does not
+    // silently receive an empty body.
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    chat_completions_inner(ctx, headers, body).await
+    chat_completions_inner(ctx, headers, phase.map(|Extension(p)| p), body).await
 }
 
 /// Parse model from body, select a healthy worker via the per-model policy, then
@@ -176,6 +178,7 @@ pub async fn chat_completions(
 async fn chat_completions_inner(
     ctx: Arc<AppContext>,
     headers: HeaderMap,
+    phase: Option<Arc<RequestPhaseCell>>,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
@@ -295,10 +298,22 @@ async fn chat_completions_inner(
     // `worker` / `guard` are `mut` so the plain-mode retry loop below can
     // reselect a different worker and claim a fresh slot on a retryable
     // dispatch failure. The PD branch never reassigns them.
+    //
+    // Advance the phase cell right before the parking `.await` and right
+    // after it resolves, so a caller hang-up (which cancels this future —
+    // see `RequestPhaseCell` in `crate::server::app`) is attributed to
+    // `queue` while parked in the admission wait vs `dispatch` once a worker
+    // has been selected.
+    if let Some(p) = &phase {
+        p.set(RequestPhase::Queue);
+    }
     let (mut worker, mut guard) = ctx
         .admission
         .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
         .await?;
+    if let Some(p) = &phase {
+        p.set(RequestPhase::Dispatch);
+    }
     let at_post_admit = start.elapsed();
     // Diagnostic: count this request as holding a slot inside the synchronous
     // handler (post-acquire → response returned). Drops when the function
@@ -1126,9 +1141,17 @@ async fn chat_completions_inner(
     //     pump); the two diverge only for a 2xx stream that yields no first
     //     byte.
     //   - `Server-Timing: router.ttfb;dur=<ms>` = `at_post_dispatch` = the full
-    //     ingress → upstream-headers span (see `SERVER_TIMING`). Carries the
-    //     whole span, not the pre-dispatch subset, so a downstream hop can do
-    //     its own per-request router-vs-engine split.
+    //     ingress → upstream-response-headers span. Carries the whole span,
+    //     not the pre-dispatch subset, so a downstream hop that also measures
+    //     the engine's own generation latency can separate router-incurred
+    //     time from engine-incurred time on a per-request basis (something
+    //     aggregate histograms can't do per-request). It is a response
+    //     header, so it must be readable at header-flush time — hence
+    //     to-headers rather than to-first-token (the first token has not
+    //     arrived yet). `error.rs` appends `router.stage;desc=<stage>` to the
+    //     same `Server-Timing` header on router-generated ERROR responses
+    //     (see [`crate::server::error::ApiError::stage`]) — the two never
+    //     collide since this site only fires on a 2xx.
     if streaming && response.status().is_success() {
         ctx.metrics
             .observe_ttft_overhead(&log_ctx.model_id, at_post_build.as_secs_f64());
