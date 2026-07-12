@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
+from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -51,3 +53,17 @@ def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
 
     seed_all(mode=True)
     return PrecisionDebugger(config_path=server_args.msprobe_dump_config)
+
+
+def resolve_pp_proxy_topk_size(
+    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
+) -> Optional[int]:
+    hf_config = model_config.hf_text_config
+    if (
+        pp_size <= 1
+        or pp_rank == 0
+        or not is_deepseek_dsa(hf_config)
+        or not dsa_layer_skips_topk(hf_config, start_layer)
+    ):
+        return None
+    return getattr(hf_config, "index_topk", None)
