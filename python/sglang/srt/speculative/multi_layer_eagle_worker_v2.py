@@ -884,7 +884,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         for i in range(self.speculative_num_steps):
             success, message = self._draft_worker.draft_runner_list[
                 i
-            ].update_weights_from_disk(
+            ].weight_updater.update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
                 recapture_cuda_graph=recv_req.recapture_cuda_graph,
@@ -897,7 +897,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         for i in range(self.speculative_num_steps):
             success, message = self._draft_worker.draft_runner_list[
                 i
-            ].update_weights_from_ipc(recv_req)
+            ].weight_updater.update_weights_from_ipc(recv_req)
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
