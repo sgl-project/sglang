@@ -171,10 +171,7 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     return (
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
-        and (
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-            or is_sm120_supported()
-        )
+        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
     )
 
 
