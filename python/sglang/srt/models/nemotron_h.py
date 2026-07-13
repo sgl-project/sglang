@@ -550,11 +550,13 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             if is_in_breakable_cuda_graph():
                 output = torch.empty_like(hidden_states)
                 breakable_nemotron_mamba2_with_output(
-                    hidden_states, output, self.layer_id
+                    hidden_states, output, self.layer_id, fuse_mlp_allreduce
                 )
             elif is_in_tc_piecewise_cuda_graph():
                 output = torch.empty_like(hidden_states)
-                nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+                nemotron_mamba2_with_output(
+                    hidden_states, output, self.layer_id, fuse_mlp_allreduce
+                )
             else:
                 output = self._forward_mamba(hidden_states, forward_batch)
 
@@ -1189,6 +1191,7 @@ def nemotron_mamba2_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
+    fuse_mlp_allreduce: bool = False,
 ) -> None:
     """Split op for Mamba2 forward in piecewise CUDA graph mode."""
     context = get_tc_piecewise_forward_context()
@@ -1208,7 +1211,12 @@ def nemotron_mamba2_with_output(
     if hidden_states.shape[0] != num_actual_tokens:
         hidden_states = hidden_states[:num_actual_tokens]
 
-    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+    # This function is an opaque custom op under torch.compile. The caller's
+    # ForwardFlags scope is Python control-plane state and is no longer active
+    # when the compiled graph invokes this implementation. Carry the scalar
+    # across the graph boundary and republish it for RowParallelLinear.
+    with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+        ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
 
     # Copy result back; output may be larger (padded) so only fill actual tokens
     output[:num_actual_tokens].view(ret.shape).copy_(ret)
