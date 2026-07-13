@@ -183,6 +183,30 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
+    def config_from_budget(
+        self: ModelRunner, budget_bytes: int, *, cap_tokens: Optional[int] = None
+    ) -> MemoryPoolConfig:
+        """Turn a KV byte budget into a pool config via the configurator, re-applying
+        the external token constraints (user cap, page alignment, PP sync) and the
+        optional ``cap_tokens`` clamp."""
+        # Local import avoids a pool_configurator import cycle.
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.calculate_pool_sizes(
+            budget_bytes, self.server_args.page_size
+        )
+        max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
+        if cap_tokens is not None:
+            max_tokens = min(max_tokens, cap_tokens)
+        if max_tokens != config.max_total_num_tokens:
+            config = configurator.calculate_pool_sizes_from_max_tokens(
+                max_tokens, self.server_args.page_size
+            )
+        return config
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
