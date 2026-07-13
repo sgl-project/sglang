@@ -22,6 +22,9 @@ import itertools
 import logging
 import multiprocessing
 import os
+import pathlib
+import socket
+import time
 from multiprocessing.context import SpawnProcess
 from typing import List
 
@@ -89,14 +92,43 @@ TEST_DTYPES = get_ci_test_range(TEST_DTYPES, [torch.bfloat16])
 # ---------------------------------------------------------------------------
 
 
+def _diag(msg: str) -> None:
+    """Timestamped, unbuffered diagnostic line for the CI log.
+
+    ``print`` instead of ``logging``: these lines must survive both the
+    outer launcher process and the ``spawn`` precompile children, neither
+    of which is guaranteed a configured logging handler in CI.
+    """
+    print(f"[custom-ar {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _jit_cache_dir() -> pathlib.Path:
+    return pathlib.Path(
+        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+    ).expanduser()
+
+
 def _compile_one(dtype: torch.dtype, world_size: int) -> None:
     """Compile both (push, pull) variants for a single (dtype, world_size).
 
     Top-level so it survives ``spawn`` pickling. Compiled artifacts are
     cached on disk by ``tvm_ffi``; torchrun children will reuse them.
+
+    Per-variant wall time is the cache-hit/miss oracle for the CI log: a
+    warm-cache load is sub-second, a cold compile is 60-180s on H200.
     """
-    _jit_custom_all_reduce_pull_module(dtype, world_size)
-    _jit_custom_all_reduce_push_module(dtype, world_size)
+    for label, build in (
+        ("pull", _jit_custom_all_reduce_pull_module),
+        ("push", _jit_custom_all_reduce_push_module),
+    ):
+        tic = time.perf_counter()
+        build(dtype, world_size)
+        elapsed = time.perf_counter() - tic
+        verdict = "warm cache" if elapsed < 5 else "COLD COMPILE"
+        _diag(
+            f"precompile {label} dtype={dtype} world_size={world_size}: "
+            f"{elapsed:.1f}s ({verdict})"
+        )
 
 
 def _precompile_kernels(num_gpus: List[int]) -> None:
@@ -105,6 +137,19 @@ def _precompile_kernels(num_gpus: List[int]) -> None:
     Without this, every torchrun child serial-compiles its kernels on first
     use, multiplying the wall-clock cost of the run by ~(#dtypes * #ranks).
     """
+    cache_dir = _jit_cache_dir()
+    cached = (
+        sorted(p.name for p in cache_dir.glob("*custom_all_reduce_*"))
+        if cache_dir.is_dir()
+        else []
+    )
+    _diag(
+        f"host={socket.gethostname()} jit_cache_dir={cache_dir} "
+        f"exists={cache_dir.is_dir()} custom_all_reduce_entries={len(cached)}"
+    )
+    for name in cached:
+        _diag(f"  cached: {name}")
+    tic = time.perf_counter()
     ctx = multiprocessing.get_context("spawn")
     procs: list[tuple[torch.dtype, int, SpawnProcess]] = []
     for dtype, world_size in itertools.product(TEST_DTYPES, num_gpus):
@@ -118,6 +163,7 @@ def _precompile_kernels(num_gpus: List[int]) -> None:
                 f"Custom-all-reduce precompile failed for "
                 f"{dtype=} {world_size=} (exit {p.exitcode})"
             )
+    _diag(f"precompile total: {time.perf_counter() - tic:.1f}s")
 
 
 # ---------------------------------------------------------------------------

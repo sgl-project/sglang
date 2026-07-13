@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from typing import Any, Callable, List, NoReturn, Optional, Sequence
 
 import psutil
@@ -172,6 +173,17 @@ def multigpu_launch(
     # block-buffered progress output is otherwise lost or flushed out of
     # order into the CI log, making it impossible to tell which test hung.
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    # Timestamped INFO on stdout for the outer launcher: CI invokes these
+    # files with plain `python3`, where the root logger defaults to WARNING,
+    # so the launch/timing breadcrumbs below are otherwise invisible exactly
+    # where they are needed to attribute a per-file timeout. No-op if the
+    # harness already configured logging.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s %(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
     signal.signal(signal.SIGINT, signal.default_int_handler)
     runnable: List[int] = []
     for N in sorted(num_gpus):
@@ -182,9 +194,12 @@ def multigpu_launch(
         runnable.append(N)
     if pre_launch_fn is not None and runnable:
         logger.info(f"Running pre-launch hook for world sizes {runnable}")
+        tic = time.monotonic()
         pre_launch_fn(runnable)
+        logger.info(f"Pre-launch hook took {time.monotonic() - tic:.1f}s")
     for N in runnable:
         logger.info(f"Running {kind} with {N} GPUs")
+        tic = time.monotonic()
         cmd = [
             "torchrun",
             "--nproc_per_node",
@@ -209,10 +224,15 @@ def multigpu_launch(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        elapsed = time.monotonic() - tic
         if timed_out:
             logger.error(f"{kind} (nproc={N}) timed out after {timeout} seconds")
             sys.exit(1)
         if returncode != 0:
-            logger.error(f"{kind} failed with {N} GPUs (exit {returncode})")
+            logger.error(
+                f"{kind} failed with {N} GPUs (exit {returncode}) "
+                f"after {elapsed:.1f}s"
+            )
             sys.exit(returncode)
+        logger.info(f"{kind} with {N} GPUs passed in {elapsed:.1f}s")
     logger.info(f"All {kind}s passed")

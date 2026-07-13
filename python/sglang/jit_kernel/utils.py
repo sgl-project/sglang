@@ -7,6 +7,7 @@ import logging
 import os
 import pathlib
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -303,7 +304,7 @@ def load_jit(
         # include cuda files
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
-        with _jit_compile_context():
+        with _jit_compile_context(module_name, build_directory):
             return load_inline(
                 module_name,
                 cpp_sources=cpp_sources,
@@ -316,7 +317,7 @@ def load_jit(
             )
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
-        with _jit_compile_context():
+        with _jit_compile_context(module_name, build_directory):
             return load(
                 module_name,
                 cpp_files=cpp_files,
@@ -357,15 +358,27 @@ def _init_jit_cuda_arch_once():
 
 
 @contextmanager
-def _jit_compile_context():
+def _jit_compile_context(module_name: str, build_directory: str):
+    # Reaching this context means the prebuilt .so was absent (or unloadable):
+    # a cold compile follows. Log it with wall time at INFO so slow starts --
+    # server bring-up or a CI runner with an empty cache -- are attributable
+    # from the log; the cache-hit path stays quiet (DEBUG).
+    logger.info("JIT cache miss for %s; compiling in %s", module_name, build_directory)
+    tic = time.perf_counter()
     if is_hip_runtime():
         yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
+        logger.info(
+            "Compiled JIT module %s in %.1fs", module_name, time.perf_counter() - tic
+        )
         return
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     old_value = os.environ.get(env_key, None)
     os.environ[env_key] = get_jit_cuda_arch().target_name
     try:
         yield
+        logger.info(
+            "Compiled JIT module %s in %.1fs", module_name, time.perf_counter() - tic
+        )
     finally:
         if old_value is None:
             os.environ.pop(env_key, None)
