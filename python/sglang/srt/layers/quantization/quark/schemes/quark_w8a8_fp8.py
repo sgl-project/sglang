@@ -200,6 +200,10 @@ class QuarkW8A8Fp8Block(QuarkLinearScheme):
     on the Triton path, ``aiter_per1x128_quant`` on the AITER path).
     """
 
+    # BlockQuantScaleParameter (and the merged/QKV block-scale offset math it
+    # needs) is only implemented on the v2 loader path.
+    requires_weight_loader_v2 = True
+
     def __init__(
         self,
         weight_config: dict[str, Any],
