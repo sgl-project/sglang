@@ -237,6 +237,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
+        if envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get():
+            return
+
         if not _is_npu:
             self.cuda_graph_runner_for_draft_extend = (
                 MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
