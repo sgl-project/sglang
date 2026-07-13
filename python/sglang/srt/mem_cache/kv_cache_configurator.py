@@ -411,35 +411,10 @@ class KVCacheConfigurator:
                 )
         else:
             if self.is_hybrid_swa:
-                kwargs = {}
-                if self.is_hybrid_swa_compress:
-                    kwargs = {
-                        "swa_head_num": max(
-                            1,
-                            self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_parallel().attn_tp_size,
-                        ),
-                        "swa_head_dim": self.model_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.v_head_dim,
-                    }
-                token_to_kv_pool = SWAKVPool(
-                    size=full_max_total_num_tokens,
-                    size_swa=swa_max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    device=self.device,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
-                    token_to_kv_pool_class=mha_pool_class,
-                    **kwargs,
+                token_to_kv_pool = self._build_hybrid_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                    mha_pool_class=mha_pool_class,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 _hf_config = self.model_config.hf_config
@@ -1321,6 +1296,41 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
             start_layer=self.start_layer,
             end_layer=self.end_layer,
+        )
+        return token_to_kv_pool
+
+    def _build_hybrid_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+        mha_pool_class: type,
+    ) -> KVCache:
+        kwargs = {}
+        if self.is_hybrid_swa_compress:
+            kwargs = {
+                "swa_head_num": max(
+                    1,
+                    self.model_config.hf_text_config.swa_num_key_value_heads
+                    // get_parallel().attn_tp_size,
+                ),
+                "swa_head_dim": self.model_config.swa_head_dim,
+                "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                "v_head_dim": self.model_config.v_head_dim,
+            }
+        token_to_kv_pool = SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            device=self.device,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            token_to_kv_pool_class=mha_pool_class,
+            **kwargs,
         )
         return token_to_kv_pool
 
