@@ -98,21 +98,19 @@ class ModelRunnerKVCacheMixin:
         unsupported_pool_family = None
         if is_dsv4_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
-        elif current_platform.is_out_of_tree() and not mambaish_config(
-            self.model_config
-        ):
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
-        elif self.server_args.attention_backend == "ascend" and not mambaish_config(
-            self.model_config
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
-        elif self.use_mla_backend and not mambaish_config(self.model_config):
+        elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
         elif self.is_hybrid_swa:
             unsupported_pool_family = "SWA KV pool"
-        elif mambaish_config(self.model_config):
+        elif self.mambaish_config:
             unsupported_pool_family = "hybrid linear/Mamba KV pool"
         elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
             unsupported_pool_family = "FP4 MHA KV pool"
