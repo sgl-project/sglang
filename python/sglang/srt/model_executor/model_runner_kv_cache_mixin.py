@@ -36,10 +36,6 @@ from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import (
-    MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO,
-    MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP,
-    MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP,
-    MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY,
     _should_enable_lazy_compaction,
     calculate_mla_kv_cache_dim,
 )
@@ -243,25 +239,7 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
-        if self.server_args.disable_radix_cache:
-            return 1
-
-        additional_ratio = 0
-        if self.server_args.enable_mamba_extra_buffer():
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not self.server_args.disable_overlap_schedule:
-                if self.server_args.enable_mamba_extra_buffer_lazy():
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
-                else:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
-            else:
-                assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
-
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        return self.kv_cache_configurator._calculate_mamba_ratio()
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,

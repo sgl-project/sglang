@@ -92,6 +92,27 @@ class KVCacheConfigurator:
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         raise NotImplementedError("populated in kvc-migrate-method-bodies")
 
+    def _calculate_mamba_ratio(self) -> int:
+        if self.server_args.disable_radix_cache:
+            return 1
+
+        additional_ratio = 0
+        if self.server_args.enable_mamba_extra_buffer():
+            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
+            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
+            if not self.server_args.disable_overlap_schedule:
+                if self.server_args.enable_mamba_extra_buffer_lazy():
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
+                else:
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            else:
+                assert (
+                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+
+        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+
 
 def calculate_mla_kv_cache_dim(
     *,
