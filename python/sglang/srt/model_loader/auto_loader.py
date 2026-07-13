@@ -20,11 +20,11 @@ This module provides:
 - RemapRegistry: architecture-specific name remap registration.
 - Re-exports of AutoWeightsLoader and WeightsMapper from models/utils.py.
 
-Load / post-load split (PR1 protocol, see design.md):
+Load / post-load split (PR1 protocol, see #31051):
   load_weights(..., run_post_load=True)  -> WeightLoadResult
   post_load_weights(loaded=result)       -> optional GPU derivations (MLA w_kc/w_vc, etc.)
 
-Migration plan: design.md in this directory.
+Migration plan: https://github.com/sgl-project/sglang/issues/31051 (RFC #24703).
 """
 
 from __future__ import annotations
