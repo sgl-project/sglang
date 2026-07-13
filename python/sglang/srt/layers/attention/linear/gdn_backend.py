@@ -4,6 +4,10 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
+    GDNQKVShape,
+    split_gdn_prefill_qkv,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -18,19 +22,13 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
-
-if is_cuda() or is_hip():
-    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
-    from sglang.jit_kernel.triton.gdn_prefill_glue import gdn_prefill_glue
-
-MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -95,6 +93,17 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     if is_flashinfer_gdn_prefill_available():
         args.linear_attn_prefill_backend = "flashinfer"
         rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+
+
+def _qkv_shape_from_layer(layer: RadixLinearAttention) -> GDNQKVShape:
+    return GDNQKVShape(
+        num_q_heads=layer.num_q_heads,
+        num_k_heads=layer.num_k_heads,
+        num_v_heads=layer.num_v_heads,
+        head_q_dim=layer.head_q_dim,
+        head_k_dim=layer.head_k_dim,
+        head_v_dim=layer.head_v_dim,
+    )
 
 
 class GDNKernelDispatcher:
@@ -171,13 +180,13 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Capability of the RESOLVED extend kernel (which may be the SM90
-        # CuteDSL->Triton fallback above); semantics documented on
-        # LinearAttnKernelBase. extend_expects_exp_gate is only ever True on
-        # CUDA, so the exp_gate kwarg never reaches the NPU/CPU
-        # fused_gdn_gating rebinds.
-        self.extend_supports_glue = self.extend_kernel.supports_prenormed_extend and (
-            is_cuda() or is_hip()
+        # Resolve the complete packed-prefill strategy once. Bind FlashInfer
+        # explicitly so an API rename fails during initialization instead of
+        # silently disabling the optimization.
+        self._extend_prefill_impl = (
+            self.extend_kernel.extend_packed
+            if prefill_backend.is_flashinfer()
+            else self._extend_prefill_separated
         )
 
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
@@ -261,6 +270,87 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             **kwargs,
+        )
+
+    def build_extend_prep(
+        self,
+        *,
+        head_k_dim: int,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        ssm_states: torch.Tensor,
+        total_seq_len: int,
+    ) -> Optional[tuple]:
+        return self.extend_kernel.build_extend_prep(
+            head_k_dim=head_k_dim,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            ssm_states=ssm_states,
+            total_seq_len=total_seq_len,
+        )
+
+    def extend_prefill_from_packed(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        shape: GDNQKVShape,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        prep: Optional[tuple] = None,
+        no_prefix: bool = False,
+    ) -> tuple:
+        """Run GDN prefill without exposing backend tensor representations."""
+        return self._extend_prefill_impl(
+            mixed_qkv,
+            a,
+            b,
+            shape=shape,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            prep=prep,
+            no_prefix=no_prefix,
+        )
+
+    def _extend_prefill_separated(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        shape: GDNQKVShape,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        prep: Optional[tuple] = None,
+        no_prefix: bool = False,
+    ) -> tuple:
+        query, key, value = split_gdn_prefill_qkv(mixed_qkv, shape)
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+        return self.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            prep=prep,
+            no_prefix=no_prefix,
         )
 
     def extend(
@@ -483,35 +573,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             out=out,
         )
 
-    def _split_qkv_prefill(
-        self,
-        *,
-        mixed_qkv: torch.Tensor,
-        layer: RadixLinearAttention,
-        actual_seq_len: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            return fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-        return (
-            query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim),
-            key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim),
-            value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim),
-        )
-
     def _forward_target_verify(
         self,
         *,
@@ -550,8 +611,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
 
-        query, key, value = self._split_qkv_prefill(
-            mixed_qkv=mixed_qkv, layer=layer, actual_seq_len=mixed_qkv.shape[0]
+        query, key, value = split_gdn_prefill_qkv(
+            mixed_qkv, _qkv_shape_from_layer(layer)
         )
         return self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
@@ -647,23 +708,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)[:seq_len]
 
         actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        # Prologue glue: one launch for split + gating + q/k l2norm. Usable only
-        # when the extend kernel accepts pre-normalized q/k (extend_prenormed)
-        # and the geometry matches the glue's pinned clone shape; otherwise fall
-        # back to the unfused chain — do not loosen this gate.
-        glue_applicable = (
-            self.kernel_dispatcher.extend_supports_glue
-            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and mixed_qkv.stride(1) == 1
-            and layer.num_q_heads == layer.num_k_heads
-            and layer.head_q_dim == layer.head_k_dim == 128
-            and layer.num_v_heads & (layer.num_v_heads - 1) == 0
-        )
-        if not glue_applicable:
-            query, key, value = self._split_qkv_prefill(
-                mixed_qkv=mixed_qkv, layer=layer, actual_seq_len=actual_seq_len
-            )
+        qkv_shape = _qkv_shape_from_layer(layer)
 
         # Layer-invariant prep (pool-gather indices; for CuteDSL also cu_seqlens
         # + chunk metadata), built on the first layer of each forward. Keyed by
@@ -673,7 +718,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # build_extend_prep sees the same ssm_states_contig / state_cache_indices
         # the kernel's extend receives.
         if self._extend_prep is None:
-            self._extend_prep = self.kernel_dispatcher.extend_kernel.build_extend_prep(
+            self._extend_prep = self.kernel_dispatcher.build_extend_prep(
                 head_k_dim=layer.head_k_dim,
                 query_start_loc=query_start_loc,
                 cache_indices=state_cache_indices,
@@ -681,44 +726,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 total_seq_len=actual_seq_len,
             )
 
-        extend_kernel = self.kernel_dispatcher.extend_kernel
-        state_kwargs = dict(
-            ssm_states=ssm_states_contig,
-            cache_indices=state_cache_indices,
-            query_start_loc=query_start_loc,
-            out=out,
-            prep=self._extend_prep,
-            no_prefix=self._extend_no_prefix,
-        )
-        if glue_applicable:
-            # The glue call and the extend_prenormed dispatch must stay adjacent
-            # in this branch: q/k leave the glue ALREADY normalized — routing
-            # them through plain extend() would double-normalize.
-            query, key, value, g, beta = gdn_prefill_glue(
+        core_attn_out, last_recurrent_state, h = (
+            self.kernel_dispatcher.extend_prefill_from_packed(
                 mixed_qkv,
                 a,
                 b,
-                layer.A_log,
-                layer.dt_bias,
-                num_qk_heads=layer.num_q_heads,
-                num_v_heads=layer.num_v_heads,
-                head_qk_dim=layer.head_q_dim,
-                head_v_dim=layer.head_v_dim,
-                exp_gate=extend_kernel.extend_expects_exp_gate,
+                shape=qkv_shape,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                query_start_loc=query_start_loc,
+                out=out,
+                prep=self._extend_prep,
+                no_prefix=self._extend_no_prefix,
             )
-            core_attn_out, last_recurrent_state, h = extend_kernel.extend_prenormed(
-                q_normed=query, k_normed=key, v=value, g=g, beta=beta, **state_kwargs
-            )
-        else:
-            if extend_kernel.extend_expects_exp_gate:
-                g, beta = fused_gdn_gating(
-                    layer.A_log, a, b, layer.dt_bias, exp_gate=True
-                )
-            else:
-                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query, k=key, v=value, g=g, beta=beta, **state_kwargs
-            )
+        )
 
         if is_npu() and last_recurrent_state is not None:
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)

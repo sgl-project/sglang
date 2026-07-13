@@ -14,8 +14,8 @@ import torch
 
 from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
-from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
-    LinearAttnKernelBase,
+from sglang.srt.layers.attention.linear.kernels.gdn_kernel_backend import (
+    GDNKernelBase,
     unwrap_direct_write_out,
 )
 
@@ -30,7 +30,7 @@ def _is_blackwell() -> bool:
     return major >= 10
 
 
-class CuteDSLGDNKernel(LinearAttnKernelBase):
+class CuteDSLGDNKernel(GDNKernelBase):
     """CuTe DSL kernel for GDN.
 
     Decode: ``cutedsl_fused_sigmoid_gating_delta_rule_update`` (SM90+).

@@ -15,9 +15,14 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
-from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
-    LinearAttnKernelBase,
+from sglang.srt.layers.attention.linear.kernels.gdn_kernel_backend import (
+    GDNKernelBase,
     unwrap_direct_write_out,
+)
+from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
+    MAX_FUSED_QKV_SPLIT_DIM,
+    GDNQKVShape,
+    split_gdn_prefill_qkv,
 )
 from sglang.srt.utils import is_cuda
 
@@ -85,7 +90,7 @@ def is_flashinfer_gdn_prefill_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-class FlashInferGDNKernel(LinearAttnKernelBase):
+class FlashInferGDNKernel(GDNKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
@@ -93,10 +98,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     Requires flashinfer >= 0.6.7.
     """
-
-    # extend() consumes alpha = exp(g), produced by fused_gdn_gating(exp_gate=True).
-    extend_expects_exp_gate = True
-    supports_prenormed_extend = True
 
     def __init__(self):
         (
@@ -273,16 +274,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
+        """Generic GDN contract: raw q/k and log-space decay ``g``.
 
-        # g is already alpha = exp(g) (see extend_expects_exp_gate); the
-        # .to(float32) calls are normally no-op guards.
-        return self._extend_core(
-            q_fi=q_fi,
-            k_fi=k_fi,
-            v_fi=v[0].contiguous(),
-            alpha_fi=g[0].to(torch.float32),
-            beta_fi=beta[0].to(torch.float32),
+        Production FlashInfer prefill uses :meth:`extend_packed`, which folds
+        the exponential into gating without exposing alpha to the caller.
+        """
+        return self._extend_with_alpha(
+            q=q,
+            k=k,
+            v=v,
+            alpha=torch.exp(g.to(torch.float32)),
+            beta=beta,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -291,14 +293,25 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             no_prefix=no_prefix,
         )
 
-    def extend_prenormed(
+    @staticmethod
+    def _can_use_fused(mixed_qkv: torch.Tensor, shape: GDNQKVShape) -> bool:
+        return (
+            shape.total_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and mixed_qkv.stride(1) == 1
+            and shape.num_q_heads == shape.num_k_heads
+            and shape.head_q_dim == shape.head_k_dim == 128
+            and shape.num_v_heads & (shape.num_v_heads - 1) == 0
+        )
+
+    def extend_packed(
         self,
-        q_normed: torch.Tensor,
-        k_normed: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
+        shape: GDNQKVShape,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -307,23 +320,82 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        """Glue-kernel entry point: q/k are ALREADY L2-normalized and ``g`` is
-        already alpha = exp(g) fp32 (gdn_prefill_glue with exp_gate=True). No
-        normalization or gate transform happens here — passing raw q/k or
-        log-space g silently corrupts outputs, hence the loud asserts."""
-        assert (
-            g.dtype == torch.float32 and beta.dtype == torch.float32
-        ), "extend_prenormed expects fp32 alpha/beta straight from the glue kernel"
-        q_fi = q_normed[0]
-        k_fi = k_normed[0]
-        v_fi = v[0]
-        assert q_fi.is_contiguous() and k_fi.is_contiguous() and v_fi.is_contiguous()
+        """Run FlashInfer prefill from canonical packed, raw GDN inputs.
+
+        The fused path's normalized q/k and multiplicative alpha are consumed
+        immediately by ``_extend_core``. The ordinary fallback keeps the same
+        private alpha representation without exposing a caller-side protocol.
+        """
+        from sglang.srt.layers.attention.fla.fused_gdn_gating import (
+            fused_gdn_gating,
+        )
+
+        if self._can_use_fused(mixed_qkv, shape):
+            from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
+
+            q_normed, k_normed, value, alpha, beta = gdn_prefill_fused(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                num_qk_heads=shape.num_q_heads,
+                num_v_heads=shape.num_v_heads,
+                head_qk_dim=shape.head_q_dim,
+                head_v_dim=shape.head_v_dim,
+            )
+            return self._extend_core(
+                q_fi=q_normed[0],
+                k_fi=k_normed[0],
+                v_fi=value[0],
+                alpha_fi=alpha[0],
+                beta_fi=beta[0],
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                out=out,
+                prep=prep,
+                no_prefix=no_prefix,
+            )
+
+        query, key, value = split_gdn_prefill_qkv(mixed_qkv, shape)
+        alpha, beta = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
+        return self._extend_with_alpha(
+            q=query,
+            k=key,
+            v=value,
+            alpha=alpha,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            prep=prep,
+            no_prefix=no_prefix,
+        )
+
+    def _extend_with_alpha(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor],
+        prep: Optional[tuple],
+        no_prefix: bool,
+    ) -> tuple:
+        q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
         return self._extend_core(
             q_fi=q_fi,
             k_fi=k_fi,
-            v_fi=v_fi,
-            alpha_fi=g[0],
-            beta_fi=beta[0],
+            v_fi=v[0].contiguous(),
+            alpha_fi=alpha[0].to(torch.float32),
+            beta_fi=beta[0].to(torch.float32),
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,

@@ -1,4 +1,4 @@
-"""Axis-stacked GDN prefill prologue glue: split + gating + q/k L2 norm in ONE launch.
+"""Fused axis-stacked GDN prefill prologue: split + gating + q/k L2 norm in ONE launch.
 
 Fuses the GDN extend prologue chain ``fused_qkv_split_gdn_prefill`` ->
 ``fused_gdn_gating`` -> ``l2norm_fwd_qk`` into a single kernel whose 1D grid is
@@ -11,8 +11,8 @@ Clone discipline (do NOT "clean up" without re-proving the 0-ULP matrix in
 test_gdn_prefill_flashinfer_opts.py):
 
 1. The gating body must use ``tl.exp``/``tl.log`` (fast paths) for softplus and
-   ``-exp(A_log)``, and ``libdevice.exp`` ONLY under ``EXP_GATE`` — swapping
-   either direction silently breaks bit-parity with the standalone kernels.
+   ``-exp(A_log)``, then ``libdevice.exp`` for FlashInfer's alpha — swapping
+   either exponential silently breaks bit-parity with the standalone kernels.
 2. The norm role's 0-ULP equality under manual-pointer loads (vs the original
    block-ptr loads) is a Triton lowering property pinned by CI, not a language
    contract; a Triton upgrade that breaks it must fail the 0-ULP matrix test.
@@ -85,7 +85,7 @@ def _vcopy_body(
 
 @triton.jit
 def _gating_body_matched(
-    g,
+    alpha,
     beta_output,
     A_log,
     a,
@@ -99,7 +99,6 @@ def _gating_body_matched(
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BT_G: tl.constexpr,
-    EXP_GATE: tl.constexpr,
 ):
     # fused_gdn_gating_kernel math on a matched BT_G x NUM_V_HEADS tile
     # (elementwise, lane-remap-invariant => bit-identical to the nw=1 original;
@@ -117,9 +116,8 @@ def _gating_body_matched(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    if EXP_GATE:
-        blk_g = libdevice.exp(blk_g)
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    blk_alpha = libdevice.exp(blk_g)
+    tl.store(alpha + off, blk_alpha.to(alpha.dtype.element_ty), mask=mask)
     # beta quirk kept verbatim from fused_gdn_gating_kernel: the sigmoid is
     # rounded to b's dtype (bf16) before the fp32 store.
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
@@ -127,7 +125,7 @@ def _gating_body_matched(
 
 
 @triton.jit
-def gdn_prefill_glue_kernel(
+def gdn_prefill_fused_kernel(
     mixed_qkv,
     a,
     b,
@@ -136,7 +134,7 @@ def gdn_prefill_glue_kernel(
     q_norm,
     k_norm,
     v,
-    g,
+    alpha,
     beta_out,
     eps,
     seq_len,
@@ -155,7 +153,6 @@ def gdn_prefill_glue_kernel(
     BT_G: tl.constexpr,
     beta: tl.constexpr,
     threshold: tl.constexpr,
-    EXP_GATE: tl.constexpr,
 ):
     # 1D grid range-partitioned by pid (zero dead programs):
     #   [0, nbn)                q-norm  (BT=16 row-blocks over (Hk*T, 128))
@@ -202,7 +199,7 @@ def gdn_prefill_glue_kernel(
         )
     else:
         _gating_body_matched(
-            g,
+            alpha,
             beta_out,
             A_log,
             a,
@@ -216,11 +213,10 @@ def gdn_prefill_glue_kernel(
             beta,
             threshold,
             BT_G,
-            EXP_GATE,
         )
 
 
-def gdn_prefill_glue(
+def gdn_prefill_fused(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -231,7 +227,6 @@ def gdn_prefill_glue(
     num_v_heads: int,
     head_qk_dim: int,
     head_v_dim: int,
-    exp_gate: bool,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One-launch GDN prefill prologue.
@@ -241,17 +236,15 @@ def gdn_prefill_glue(
             column layout ``[q | k | v]``, last dim contiguous.
         a, b: gating projections ``(T, num_v_heads)`` (rows may be strided).
         A_log, dt_bias: per-head gating parameters ``(num_v_heads,)``.
-        exp_gate: store ``alpha = exp(g)`` (FlashInfer form) instead of
-            log-space ``g``.
 
     Returns:
-        ``(q_norm, k_norm, v, g, beta)`` with shapes ``(1, T, Hk, Dqk)`` bf16,
+        ``(q_norm, k_norm, v, alpha, beta)`` with shapes ``(1, T, Hk, Dqk)`` bf16,
         ``(1, T, Hk, Dqk)`` bf16, ``(1, T, Hv, Dv)`` bf16, ``(1, T, Hv)`` fp32,
         ``(1, T, Hv)`` fp32 — bit-identical to the three-kernel chain.
     """
     seq_len, qkv_dim = mixed_qkv.shape
     assert qkv_dim == 2 * num_qk_heads * head_qk_dim + num_v_heads * head_v_dim
-    assert mixed_qkv.stride(1) == 1, "glue requires a row-contiguous mixed_qkv"
+    assert mixed_qkv.stride(1) == 1, "fused path requires a row-contiguous mixed_qkv"
     assert head_qk_dim == 128, "norm body is the verified BD=128 clone shape"
     assert (
         num_v_heads & (num_v_heads - 1) == 0
@@ -269,7 +262,7 @@ def gdn_prefill_glue(
         (1, seq_len, num_qk_heads, head_qk_dim), dtype=dtype, device=device
     )
     v = torch.empty((1, seq_len, num_v_heads, head_v_dim), dtype=dtype, device=device)
-    g = torch.empty((1, seq_len, num_v_heads), dtype=torch.float32, device=device)
+    alpha = torch.empty((1, seq_len, num_v_heads), dtype=torch.float32, device=device)
     beta_out = torch.empty(
         (1, seq_len, num_v_heads), dtype=torch.float32, device=device
     )
@@ -278,7 +271,7 @@ def gdn_prefill_glue(
     t_rows = seq_len * num_qk_heads
     nbn = triton.cdiv(t_rows, BT)
     grid = (2 * nbn + seq_len + triton.cdiv(seq_len, BT),)
-    gdn_prefill_glue_kernel[grid](
+    gdn_prefill_fused_kernel[grid](
         mixed_qkv,
         a,
         b,
@@ -287,7 +280,7 @@ def gdn_prefill_glue(
         q_norm,
         k_norm,
         v,
-        g,
+        alpha,
         beta_out,
         eps,
         seq_len,
@@ -306,8 +299,7 @@ def gdn_prefill_glue(
         BT_G=BT,
         beta=1.0,
         threshold=20.0,
-        EXP_GATE=exp_gate,
         num_warps=8,
         num_stages=3,
     )
-    return q_norm, k_norm, v, g, beta_out
+    return q_norm, k_norm, v, alpha, beta_out

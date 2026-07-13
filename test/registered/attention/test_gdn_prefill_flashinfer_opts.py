@@ -23,6 +23,10 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (  # noqa:
     FlashInferGDNKernel,
     is_flashinfer_gdn_prefill_available,
 )
+from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (  # noqa: E402
+    GDNQKVShape,
+    split_gdn_prefill_qkv,
+)
 
 if not is_flashinfer_gdn_prefill_available():
     pytest.skip("FlashInfer GDN prefill unavailable", allow_module_level=True)
@@ -63,9 +67,6 @@ def _build_extend_inputs(num_seqs: int):
     g_log = -A_log.exp().view(1, 1, num_v_heads) * F.softplus(
         a.float() + dt_bias.view(1, 1, num_v_heads)
     )
-    # FlashInferGDNKernel.extend consumes alpha = exp(g) (extend_expects_exp_gate;
-    # produced in serving by fused_gdn_gating(exp_gate=True)).
-    g = torch.exp(g_log)
     beta = torch.sigmoid(b.float())
 
     # Mirror the production MambaSlotAllocator layout: slot 0 is the reserved
@@ -89,7 +90,7 @@ def _build_extend_inputs(num_seqs: int):
         q=q,
         k=k,
         v=v,
-        g=g,
+        g=g_log,
         beta=beta,
         ssm_states=ssm_states,
         cache_indices=cache_indices,
@@ -225,8 +226,8 @@ def _bits_equal(x: torch.Tensor, y: torch.Tensor) -> bool:
     )
 
 
-def _make_glue_inputs(total_tokens: int, seed: int, strided_ab: bool = False):
-    """Adversarial glue inputs: wide magnitudes exercise both softplus branches
+def _make_fused_inputs(total_tokens: int, seed: int, strided_ab: bool = False):
+    """Adversarial fused inputs: wide magnitudes exercise both softplus branches
     (threshold 20), sigmoid saturation, and exp under/overflow."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     Hk, Hv, D = 4, 16, 128
@@ -251,35 +252,34 @@ def _make_glue_inputs(total_tokens: int, seed: int, strided_ab: bool = False):
     return mixed_qkv, a, b, A_log, dt_bias
 
 
-def _glue_ref_chain(mixed_qkv, a, b, A_log, dt_bias, exp_gate):
+def _fused_ref_chain(mixed_qkv, a, b, A_log, dt_bias):
     """The real 3-kernel chain exactly as forward_extend runs it."""
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 
     q, k, v = fused_qkv_split_gdn_prefill(mixed_qkv, 4, 4, 16, 128, 128, 128)
-    g, beta = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=exp_gate)
+    alpha, beta = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
     q_norm, k_norm = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
-    return q_norm, k_norm, v[0], g, beta
+    return q_norm, k_norm, v[0], alpha, beta
 
 
 @pytest.mark.parametrize("total_tokens", [1, 7, 127, 1021, 1024, 16384])
-@pytest.mark.parametrize("exp_gate", [False, True])
-def test_gdn_prefill_glue_bitexact(total_tokens: int, exp_gate: bool):
-    """The axis-stacked glue kernel must be bit-identical (0-ULP) to the real
+def test_gdn_prefill_fused_bitexact(total_tokens: int):
+    """The axis-stacked fused kernel must be bit-identical (0-ULP) to the real
     split -> gating -> l2norm chain on all five outputs. This is the
-    load-bearing guard for the glue's clone discipline AND for Triton-upgrade
+    load-bearing guard for the fused kernel's clone discipline AND for Triton-upgrade
     lowering drift (the manual-pointer norm loads equal the block-ptr original
     as a lowering property, not a language contract)."""
-    from sglang.jit_kernel.triton.gdn_prefill_glue import gdn_prefill_glue
+    from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
 
-    mixed_qkv, a, b, A_log, dt_bias = _make_glue_inputs(
+    mixed_qkv, a, b, A_log, dt_bias = _make_fused_inputs(
         total_tokens, seed=1234 + total_tokens, strided_ab=(total_tokens == 1021)
     )
-    q_ref, k_ref, v_ref, g_ref, beta_ref = _glue_ref_chain(
-        mixed_qkv, a, b, A_log, dt_bias, exp_gate
+    q_ref, k_ref, v_ref, alpha_ref, beta_ref = _fused_ref_chain(
+        mixed_qkv, a, b, A_log, dt_bias
     )
-    q_norm, k_norm, v, g, beta = gdn_prefill_glue(
+    q_norm, k_norm, v, alpha, beta = gdn_prefill_fused(
         mixed_qkv,
         a,
         b,
@@ -289,45 +289,65 @@ def test_gdn_prefill_glue_bitexact(total_tokens: int, exp_gate: bool):
         num_v_heads=16,
         head_qk_dim=128,
         head_v_dim=128,
-        exp_gate=exp_gate,
     )
     torch.cuda.synchronize()
 
     assert _bits_equal(q_norm[0].view(-1, 128), q_ref.view(-1, 128))
     assert _bits_equal(k_norm[0].view(-1, 128), k_ref.view(-1, 128))
     assert _bits_equal(v[0], v_ref)
-    assert _bits_equal(g, g_ref)
+    assert _bits_equal(alpha, alpha_ref)
     assert _bits_equal(beta, beta_ref)
 
 
-def test_flashinfer_extend_prenormed_matches_extend():
-    """extend_prenormed(glue outputs) must be bit-identical to extend(raw
-    split outputs) from the same initial state — output tensor, updated
-    ssm_states, and the out= buffer. Guards that extend() and
-    extend_prenormed() share identical core behavior."""
-    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
-    from sglang.jit_kernel.triton.gdn_prefill_glue import gdn_prefill_glue
+@pytest.mark.parametrize("force_fallback", [False, True])
+def test_flashinfer_extend_packed_matches_extend(force_fallback: bool):
+    """The atomic packed route must match the canonical log-g ``extend`` API.
+
+    This covers both the fused path and the FlashInfer-owned separated fallback,
+    including output aliasing and SSM-state writeback.
+    """
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 
     kernel = FlashInferGDNKernel()
     T = 940
-    mixed_qkv, a, b, A_log, dt_bias = _make_glue_inputs(T, seed=77)
+    mixed_qkv, a, b, A_log, dt_bias = _make_fused_inputs(T, seed=77)
+    packed_qkv = mixed_qkv
+    if force_fallback:
+        backing = torch.empty(
+            T,
+            mixed_qkv.shape[1] * 2,
+            device=mixed_qkv.device,
+            dtype=mixed_qkv.dtype,
+        )
+        backing[:, ::2].copy_(mixed_qkv)
+        packed_qkv = backing[:, ::2]
+        assert packed_qkv.stride(1) == 2
+        assert torch.equal(packed_qkv, mixed_qkv)
+
+    shape = GDNQKVShape(
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+        head_q_dim=128,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
     cu = torch.tensor([0, T], device="cuda", dtype=torch.int32)
     pool = torch.zeros(2, 16, 128, 128, device="cuda", dtype=torch.bfloat16)
     idx = torch.arange(1, 2, device="cuda", dtype=torch.int32)
 
-    # Legacy path: raw split + gating(exp) through extend() (norms internally).
-    q_raw, k_raw, v_raw = fused_qkv_split_gdn_prefill(
-        mixed_qkv, 4, 4, 16, 128, 128, 128
-    )
-    g_e, beta_e = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
+    # Canonical public path: raw split, log-space gate, q/k normalized internally.
+    # Keep this input contiguous so the fallback test independently checks the
+    # stride-aware split used only by extend_packed.
+    q_raw, k_raw, v_raw = split_gdn_prefill_qkv(mixed_qkv, shape)
+    g_log, beta_e = fused_gdn_gating(A_log, a, b, dt_bias)
     pool_e = pool.clone()
     out_e = torch.empty(1, T, 16, 128, device="cuda", dtype=torch.bfloat16)
     o_e, _, _ = kernel.extend(
         q=q_raw,
         k=k_raw,
         v=v_raw,
-        g=g_e,
+        g=g_log,
         beta=beta_e,
         ssm_states=pool_e,
         cache_indices=idx,
@@ -335,27 +355,16 @@ def test_flashinfer_extend_prenormed_matches_extend():
         out=out_e,
     )
 
-    # Glue path through extend_prenormed.
-    q_n, k_n, v_g, g_g, beta_g = gdn_prefill_glue(
-        mixed_qkv,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        num_qk_heads=4,
-        num_v_heads=16,
-        head_qk_dim=128,
-        head_v_dim=128,
-        exp_gate=True,
-    )
+    # Production path: packed/raw inputs remain atomic inside FlashInfer.
     pool_p = pool.clone()
     out_p = torch.empty(1, T, 16, 128, device="cuda", dtype=torch.bfloat16)
-    o_p, s1, s2 = kernel.extend_prenormed(
-        q_normed=q_n,
-        k_normed=k_n,
-        v=v_g,
-        g=g_g,
-        beta=beta_g,
+    o_p, s1, s2 = kernel.extend_packed(
+        packed_qkv,
+        a,
+        b,
+        shape=shape,
+        A_log=A_log,
+        dt_bias=dt_bias,
         ssm_states=pool_p,
         cache_indices=idx,
         query_start_loc=cu,
@@ -370,33 +379,10 @@ def test_flashinfer_extend_prenormed_matches_extend():
     assert o_p.data_ptr() == out_p.data_ptr()  # direct-write preserved
 
 
-def test_prenormed_capability_contract():
-    """Only kernels declaring supports_prenormed_extend implement
-    extend_prenormed; the base contract fails loudly for the rest, so no
-    dispatcher change can silently route pre-normed inputs to a kernel that
-    would re-normalize."""
-    from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-
-    assert FlashInferGDNKernel.supports_prenormed_extend is True
-    assert TritonGDNKernel.supports_prenormed_extend is False
-    with pytest.raises(NotImplementedError):
-        TritonGDNKernel().extend_prenormed(
-            None,
-            None,
-            None,
-            None,
-            None,
-            ssm_states=None,
-            cache_indices=None,
-            query_start_loc=None,
-        )
-
-
 def test_fused_gdn_gating_exp_gate_parity():
     """fused_gdn_gating(exp_gate=True) must equal torch.exp of the log-space
-    output elementwise, with beta byte-identical. Guards the in-kernel exp fold
-    the FlashInfer prefill path relies on (extend_expects_exp_gate): a gate-
-    form regression here silently corrupts every FlashInfer prefill."""
+    output elementwise, with beta byte-identical. Guards the private in-kernel
+    exp fold used by the FlashInfer packed-prefill implementation."""
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 
     T, Hv = 1024, 16
