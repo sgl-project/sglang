@@ -744,15 +744,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         anchor_tokens: torch.Tensor,
         sampled_tokens: torch.Tensor,
         x_post_hc: torch.Tensor,
+        gamma: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         confidence_head = self.confidence_head
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        gamma = self.gamma if gamma is None else int(gamma)
+        x_post_hc = x_post_hc.view(bs, gamma, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : gamma - 1]], dim=1
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
