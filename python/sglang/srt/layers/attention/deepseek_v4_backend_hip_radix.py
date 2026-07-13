@@ -414,6 +414,7 @@ class DeepseekV4HipRadixBackend(
     # both children and leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
     # TboAttnBackend reads this to skip children in the *_graph paths only.
     tbo_supports_cuda_graph = False
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -458,6 +459,12 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_draft_tokens: int = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and getattr(model_runner, "is_draft_worker", False)
+            and model_runner.spec_algorithm.is_dspark()
+        ):
+            self.speculative_num_draft_tokens -= 1
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -534,14 +541,34 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        compress_gpu_plan: bool = False,
+        extend_start_loc: Optional[torch.Tensor] = None,
     ) -> DSV4Metadata:
-        seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
-            num_tokens=num_tokens,
-            seq_lens=seq_lens_cpu,
-            extend_seq_lens=extend_seq_lens_cpu,
-            req_pool_indices=req_pool_indices,
-            padded_num_tokens=out_cache_loc.shape[0],
-        )
+        if extend_start_loc is not None:
+            from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
+                ExpandPrefillCausally,
+            )
+
+            _expanded = ExpandPrefillCausally.execute(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                extend_start_loc=extend_start_loc,
+                seq_lens_cpu=None,
+                extend_seq_lens_cpu=None,
+                num_tokens=num_tokens,
+                padded_num_tokens=out_cache_loc.shape[0],
+            )
+            seq_lens_casual = _expanded.seq_lens_casual
+            req_pool_indices_repeated = _expanded.req_pool_indices_repeated
+        else:
+            seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
+                num_tokens=num_tokens,
+                seq_lens=seq_lens_cpu,
+                extend_seq_lens=extend_seq_lens_cpu,
+                req_pool_indices=req_pool_indices,
+                padded_num_tokens=out_cache_loc.shape[0],
+            )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -561,6 +588,20 @@ class DeepseekV4HipRadixBackend(
         )
         if not need_compress:
             create = _create_dummy_paged_compress_data
+        elif compress_gpu_plan:
+            create = functools.partial(
+                create_paged_compressor_data,
+                is_prefill=True,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                extend_lens=extend_seq_lens,
+                extend_lens_cpu=None,
+                num_q_tokens=num_tokens,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+            )
         else:
             create = functools.partial(
                 create_paged_compressor_data,
@@ -590,6 +631,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
         seq_lens_cpu: Optional[List[int]] = None,
+        ragged_layout=None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly even when
         # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
@@ -603,6 +645,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            ragged_layout=ragged_layout,
         )
 
     def init_forward_metadata_target_verify_old(
@@ -613,13 +656,36 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        ragged_layout=None,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
-        seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-        extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
-        num_tokens = self.speculative_num_draft_tokens * batch_size
+        extend_start_loc = None
+        if ragged_layout is not None:
+            verify_lens_dev = ragged_layout.verify_lens.to(
+                device=seq_lens.device, dtype=torch.int32
+            )
+            extend_start_loc = ragged_layout.extend_start_loc.to(
+                device=seq_lens.device, dtype=torch.int32
+            )
+            extend_seq_lens = verify_lens_dev
+            seq_lens = seq_lens + verify_lens_dev.to(seq_lens.dtype)
+            # Total verify tokens to expand. For the graph path the padded layout
+            # sets total_verify_tokens == graph_num_tokens (tier); the eager path
+            # resolves a device-assembled layout whose total_verify_tokens is None,
+            # so fall back to sum(verify_lens) (== real total; padded == tier).
+            num_tokens = ragged_layout.total_verify_tokens
+            if num_tokens is None:
+                num_tokens = int(verify_lens_dev.sum().item())
+            else:
+                num_tokens = int(num_tokens)
+            extend_seq_lens_cpu = None
+            seq_lens_cpu = None
+        else:
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            num_tokens = self.speculative_num_draft_tokens * batch_size
+            extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -633,6 +699,8 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            compress_gpu_plan=ragged_layout is not None,
+            extend_start_loc=extend_start_loc,
         )
 
     def make_forward_metadata_from_raw_verify(
@@ -848,6 +916,8 @@ class DeepseekV4HipRadixBackend(
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         assert actual_max_seq_len <= chosen_max_seq_len
 
+        graph_key = bs
+
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
@@ -864,14 +934,14 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            if resolve_ragged_verify_layout(forward_batch) is not None:
-                raise NotImplementedError(
-                    "DSV4 ragged verify is not supported on the HIP backend "
-                    "(DeepseekV4HipRadixBackend) cuda-graph path; disable "
-                    "SGLANG_RAGGED_VERIFY_MODE or use a CUDA device."
-                )
             assert out_cache_loc is not None
-            num_tokens_v = self.speculative_num_draft_tokens * bs
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            if ragged_layout is not None:
+                ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+                num_tokens_v = ragged_layout.graph_num_tokens
+                graph_key = num_tokens_v
+            else:
+                num_tokens_v = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, num_tokens_v - len(out_cache_loc)),
@@ -887,6 +957,7 @@ class DeepseekV4HipRadixBackend(
                 # CPU mirror already available here (== seq_lens, no D2H);
                 # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
                 seq_lens_cpu=seq_lens_cpu.tolist(),
+                ragged_layout=ragged_layout,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
@@ -912,7 +983,7 @@ class DeepseekV4HipRadixBackend(
             raise NotImplementedError
 
         self.replay_cuda_graph_metadata_from(
-            bs=bs, temp_metadata=temp_metadata, bucket=bucket
+            bs=graph_key, temp_metadata=temp_metadata, bucket=bucket
         )
 
         if in_capture:
@@ -957,12 +1028,7 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
-            if resolve_ragged_verify_layout(forward_batch) is not None:
-                raise NotImplementedError(
-                    "DSV4 ragged verify is not supported on the HIP backend "
-                    "(DeepseekV4HipRadixBackend); disable SGLANG_RAGGED_VERIFY_MODE "
-                    "or use a CUDA device."
-                )
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -972,6 +1038,7 @@ class DeepseekV4HipRadixBackend(
                 seq_lens_cpu=(
                     seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
                 ),
+                ragged_layout=ragged_layout,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
