@@ -47,6 +47,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    SPLIT_N_HV_GRID: tl.constexpr = False,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
@@ -55,8 +56,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
+    if SPLIT_N_HV_GRID:
+        i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        i_k = 0
+    else:
+        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
     if IS_VARLEN:
@@ -307,7 +312,8 @@ def fused_sigmoid_gating_delta_rule_update(
 
     NP2_T = triton.next_power_of_2(T)
 
-    grid = (NK, NV, N * HV)
+    split_n_hv_grid = q.device.type == "cuda"
+    grid = (NV, N, HV) if split_n_hv_grid else (NK, NV, N * HV)
 
     # Per-req stride must match the buffer's allocated dim, not runtime steps
     # (they can differ under --speculative-adaptive).
@@ -356,6 +362,7 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        SPLIT_N_HV_GRID=split_n_hv_grid,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,

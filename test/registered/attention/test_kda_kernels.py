@@ -150,6 +150,67 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestFusedSigmoidGatingLargeGrid(unittest.TestCase):
+    def _run_case(self, is_kda):
+        N, H, HV, K, V = 2048, 1, 32, 4, 4
+        self.assertEqual(N * HV, 65536)
+        torch.manual_seed(44 + is_kda)
+
+        q = torch.randn(1, N, H, K, dtype=torch.float32, device="cuda")
+        k = torch.randn(1, N, H, K, dtype=torch.float32, device="cuda")
+        v = torch.randn(1, N, HV, V, dtype=torch.float32, device="cuda")
+        a_width = HV * K if is_kda else HV
+        a = torch.randn(1, N, a_width, dtype=torch.float32, device="cuda")
+        b = torch.randn(1, N, HV, dtype=torch.float32, device="cuda")
+        A_log = torch.randn(HV, dtype=torch.float32, device="cuda") * 0.2
+        dt_bias = torch.randn(a_width, dtype=torch.float32, device="cuda") * 0.1
+        state = torch.randn(N, HV, V, K, dtype=torch.float32, device="cuda") * 0.01
+        state_ref = state.clone()
+        cache_indices = torch.arange(N, dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.arange(N + 1, dtype=torch.int32, device="cuda")
+
+        output = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+            is_kda=is_kda,
+        )
+
+        q_ref = q[0, :, 0] * (K**-0.5)
+        k_ref = k[0, :, 0]
+        if is_kda:
+            x = a.reshape(N, HV, K) + dt_bias.reshape(1, HV, K)
+            g = -torch.exp(A_log).reshape(1, HV, 1) * torch.nn.functional.softplus(x)
+            state_ref *= torch.exp(g.unsqueeze(-2))
+        else:
+            x = a[0] + dt_bias
+            g = -torch.exp(A_log) * torch.nn.functional.softplus(x)
+            state_ref *= torch.exp(g[..., None, None])
+        delta = v[0] - torch.sum(state_ref * k_ref[:, None, None, :], dim=-1)
+        delta *= torch.sigmoid(b[0]).unsqueeze(-1)
+        state_ref += delta.unsqueeze(-1) * k_ref[:, None, None, :]
+        output_ref = torch.sum(state_ref * q_ref[:, None, None, :], dim=-1).unsqueeze(0)
+
+        torch.testing.assert_close(output, output_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(state, state_ref, rtol=1e-4, atol=1e-4)
+
+    def test_kda(self):
+        self._run_case(is_kda=True)
+
+    def test_gdn(self):
+        self._run_case(is_kda=False)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAGateChunkCumsum(unittest.TestCase):
     """Test kda_gate_chunk_cumsum against torch reference (gate activation + cumsum)."""
 
