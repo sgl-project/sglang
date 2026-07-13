@@ -289,8 +289,8 @@ For this error
 ```text
 root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 --2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
-Connecting to 141.5.152.215:6688... connected.
-ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web Secure Internet Gateway CA V2,OU=IT,O=Huawei,L=Shenzhen,ST=GuangDong,C=CN’:
+Connecting to <PROXY_IP>:<PROXY_PORT>... connected.
+ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘<CERT_ISSUER>’:
   Self-signed certificate encountered.
 To connect to www.modelscope.cn insecurely, use `--no-check-certificate`.
 ```
