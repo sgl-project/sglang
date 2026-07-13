@@ -128,10 +128,6 @@ class RotaryEmbedding(MultiPlatformOp):
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
         if get_global_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(
-                dynamic=True,
-                disable=_is_npu,
-            )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:

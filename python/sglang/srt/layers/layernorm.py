@@ -171,7 +171,7 @@ def _forward_with_allreduce_fusion(
 
         if world_size > 1:
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                x = x + post_residual_addition
 
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
             if _use_aiter:
@@ -207,7 +207,7 @@ class RMSNorm(MultiPlatformOp):
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
-        fp32_residual: bool = False,
+        fp32_residual: bool = True,
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
@@ -400,10 +400,10 @@ class RMSNorm(MultiPlatformOp):
                 self.x_pad_to_multiple,
             )
         if residual is not None:
-            residual_out = torch.empty_like(x)
-            output = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            residual_out = torch.empty_like(x)
+            output = torch.empty_like(x)
             fused_add_rms_norm(
                 output,
                 x,
@@ -445,10 +445,10 @@ class RMSNorm(MultiPlatformOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            out = torch.empty_like(x)
+            residual_out = torch.empty_like(x)
             fused_add_rms_norm(
                 out, x, residual_out, residual, self.weight.data, self.variance_epsilon
             )
@@ -489,15 +489,18 @@ class RMSNorm(MultiPlatformOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
+
+        if residual is not None and not self.fp32_residual:
+            x = x + residual
+            if post_residual_addition is not None:
+                x = x + post_residual_addition
+            residual = x.clone()
         x = x.to(torch.float32)
-        if residual is not None:
+        if residual is not None and self.fp32_residual:
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
+            residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
@@ -728,7 +731,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         orig_dtype = x.dtype
         if residual is not None:
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                x = x + post_residual_addition
             x = x + residual
             residual = x
 
