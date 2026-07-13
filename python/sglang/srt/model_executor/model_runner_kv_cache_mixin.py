@@ -190,10 +190,19 @@ class ModelRunnerKVCacheMixin:
             max_num_reqs=max_num_reqs, max_total_num_tokens=max_total_num_tokens
         )
 
-    def _init_unified_swa_pools(self: ModelRunner, max_num_reqs: int):
+    def _init_unified_swa_pools(
+        self: ModelRunner,
+        *,
+        max_num_reqs: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
         buffer split between the full-attention and SWA KV pools."""
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedPoolBundle,
+            init_unified_swa_pools,
+        )
 
         assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
@@ -206,7 +215,7 @@ class ModelRunnerKVCacheMixin:
         extra_max_context_len = 4
         if self.server_args.speculative_num_draft_tokens is not None:
             extra_max_context_len += self.server_args.speculative_num_draft_tokens
-        self.req_to_token_pool = ReqToTokenPool(
+        req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
@@ -258,8 +267,8 @@ class ModelRunnerKVCacheMixin:
             end_layer=self.layer_info.end_layer,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
-            full_max_total_num_tokens=self.full_max_total_num_tokens,
-            swa_max_total_num_tokens=self.swa_max_total_num_tokens,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
             enable_memory_saver=self.server_args.enable_memory_saver,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
@@ -268,10 +277,12 @@ class ModelRunnerKVCacheMixin:
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
         )
-        self.token_to_kv_pool = bundle.token_to_kv_pool
-        self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
-        # Keep a reference so the shared byte buffer is not GC'd.
-        self._unified_memory_pool = bundle.unified_memory_pool
+        return UnifiedPoolBundle(
+            unified_memory_pool=bundle.unified_memory_pool,
+            token_to_kv_pool=bundle.token_to_kv_pool,
+            token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+            req_to_token_pool=req_to_token_pool,
+        )
 
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
@@ -297,7 +308,16 @@ class ModelRunnerKVCacheMixin:
                 self._unified_memory_pool = bundle.unified_memory_pool
                 return
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
-                self._init_unified_swa_pools(max_num_reqs)
+                bundle = self._init_unified_swa_pools(
+                    max_num_reqs=max_num_reqs,
+                    full_max_total_num_tokens=self.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=self.swa_max_total_num_tokens,
+                )
+                self.req_to_token_pool = bundle.req_to_token_pool
+                self.token_to_kv_pool = bundle.token_to_kv_pool
+                self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
+                # Keep a reference so the shared byte buffer is not GC'd.
+                self._unified_memory_pool = bundle.unified_memory_pool
                 return
             # Fail loud, not silently fall through to the normal pools (which would
             # leave the flag a no-op). The feature replaces the HYBRID pools only.
