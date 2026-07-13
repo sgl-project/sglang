@@ -553,6 +553,9 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
+        self.enable_return_hidden_states = (
+            model_runner.server_args.enable_return_hidden_states
+        )
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -581,7 +584,7 @@ class CPUGraphRunner:
         self.num_tokens_per_bs = 1
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        if self.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         assert (
@@ -870,7 +873,7 @@ class CPUGraphRunner:
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
-            if self.model_runner.server_args.enable_return_hidden_states
+            if self.enable_return_hidden_states
             else CaptureHiddenMode.NULL
         )
 

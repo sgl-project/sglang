@@ -1284,6 +1284,7 @@ class GroupCoordinator:
         obj: Any,
         dst: int,
         async_send: bool = False,
+        tag: int = 0,
     ) -> List[P2PWork]:
         """
         Send the input object list to the destination rank.
@@ -1314,6 +1315,7 @@ class GroupCoordinator:
             size_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(size_work, size_tensor))
@@ -1322,6 +1324,7 @@ class GroupCoordinator:
             object_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(object_work, object_tensor))
@@ -1331,6 +1334,7 @@ class GroupCoordinator:
     def recv_object(
         self,
         src: int,
+        tag: int = 0,
     ) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1345,7 +1349,7 @@ class GroupCoordinator:
         # Receive object size
         # We have to use irecv here to make it work for both isend and send.
         work = torch.distributed.irecv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -1357,7 +1361,7 @@ class GroupCoordinator:
         )
 
         work = torch.distributed.irecv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
+            object_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -2239,7 +2243,8 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    if moe_ep_size == tensor_model_parallel_size:
+    # NPU requires a standalone group for MOE expert parallelism
+    if moe_ep_size == tensor_model_parallel_size and not _is_npu:
         _MOE_EP = _TP
     else:
         group_ranks = []

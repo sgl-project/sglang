@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -46,6 +47,25 @@ def dsa_enable_prefill_cp():
     # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
     # no longer require additional communication for reduce, scatter, etc.
     return is_dsa_enable_prefill_cp()
+
+
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: ForwardBatch,
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
+
+    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
+    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
+    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
+    overlaps it with the current layer's attention compute.
+    """
+    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+    if prefetch_kv_buffer is not None:
+        prefetch_kv_buffer(next_full_attention_layer_id)
 
 
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
