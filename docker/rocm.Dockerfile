@@ -357,8 +357,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cp -v /tmp/build-gtest/lib/*.a /usr/lib/x86_64-linux-gnu/ && \
   rm -rf /tmp/build-gtest; \
   \
-  # Keep setuptools < 80 (compat with base image)
-  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel cmake ninja scikit-build-core && \
+  # Keep setuptools < 80 (compat with base image). Pin cmake to the last known-good
+  # 4.3.4: cmake 4.4's gtest_discover_tests breaks the (pinned) MoRI build with a
+  # JSON parse error. This image is rebuilt daily, so pin the exact version for
+  # reproducible builds rather than letting cmake drift.
+  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
   # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
