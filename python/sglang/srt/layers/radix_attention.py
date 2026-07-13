@@ -158,9 +158,10 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        context = get_tc_piecewise_forward_context()
         if (
             forward_batch.forward_mode.is_extend()
-            and get_tc_piecewise_forward_context() is not None
+            and context is not None
             # ``_force_eager_attn`` is only set inside Inkling's eager
             # norm+attn+sconv region, never during tc-piecewise capture. Reading
             # the ContextVar under the fullgraph torch.compile trace is
@@ -232,14 +233,60 @@ class RadixAttention(nn.Module):
                         q, k, v, output, save_kv_cache, self.layer_id, kwargs
                     )
                 return output
-            if is_in_breakable_cuda_graph():
+            # Chunked-prefix MHA needs LSE to merge independently normalized
+            # suffix and cached-prefix attention states.
+            return_lse = bool(forward_batch.mha_return_lse)
+            mha_companion_layers = context.mha_companion_layers
+            use_mha_companion = (
+                mha_companion_layers is not None
+                and mha_companion_layers[self.layer_id] is self
+            )
+            if return_lse and is_in_breakable_cuda_graph():
+                lse = breakable_unified_attention_with_output_and_lse(
+                    q,
+                    k,
+                    v,
+                    output,
+                    save_kv_cache,
+                    self.layer_id,
+                    use_mha_companion=use_mha_companion,
+                    **kwargs,
+                )
+            elif return_lse:
+                lse = unified_attention_with_output_and_lse(
+                    q,
+                    k,
+                    v,
+                    output,
+                    save_kv_cache,
+                    self.layer_id,
+                    use_mha_companion=use_mha_companion,
+                    **kwargs,
+                )
+            elif is_in_breakable_cuda_graph():
                 breakable_unified_attention_with_output(
-                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                    q,
+                    k,
+                    v,
+                    output,
+                    save_kv_cache,
+                    self.layer_id,
+                    use_mha_companion=use_mha_companion,
+                    **kwargs,
                 )
             else:
                 unified_attention_with_output(
-                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                    q,
+                    k,
+                    v,
+                    output,
+                    save_kv_cache,
+                    self.layer_id,
+                    use_mha_companion=use_mha_companion,
+                    **kwargs,
                 )
+            if return_lse:
+                return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
             return get_attn_backend().forward(
@@ -253,15 +300,15 @@ class RadixAttention(nn.Module):
             )
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_attention_with_output(
+def _unified_attention_with_output_impl(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
     value: Optional[torch.Tensor],
     output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
+    use_mha_companion: bool,
+    return_lse: bool,
     *,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
@@ -272,7 +319,7 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
-) -> None:
+) -> Optional[torch.Tensor]:
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
@@ -285,10 +332,14 @@ def unified_attention_with_output(
     if value is not None:
         value = value[:real_num_tokens]
 
-    if not save_kv_cache and context.mha_companion_layers is not None:
-        mha_companion_layer = context.mha_companion_layers[layer_id]
-        if mha_companion_layer is not None:
-            attention_layer = mha_companion_layer
+    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
+    # attn_mha) that share the same layer_id. Preserve the calling instance's
+    # identity through the custom-op boundary; save_kv_cache is not an identity
+    # signal because absorbed MLA can also disable a redundant cache store.
+    if use_mha_companion:
+        assert context.mha_companion_layers is not None
+        attention_layer = context.mha_companion_layers[layer_id]
+        assert attention_layer is not None
 
     kwargs = {}
     if q_rope is not None:
@@ -327,6 +378,13 @@ def unified_attention_with_output(
     )
     forward_batch.out_cache_loc = original_out_cache_loc
 
+    lse = None
+    if return_lse:
+        assert isinstance(ret, tuple)
+        ret, lse, *_ = ret
+    else:
+        assert isinstance(ret, torch.Tensor)
+
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
 
@@ -338,7 +396,126 @@ def unified_attention_with_output(
     # Use context.raw_num_tokens (pre-padding count from PCG runner) instead of
     # forward_batch.extend_num_tokens, which is None for TARGET_VERIFY batches.
     _zero_padded_pcg_tail(output, context)
-    return
+    if lse is not None and lse.shape[0] != output.shape[0]:
+        padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
+        padded_lse[:real_num_tokens].copy_(lse)
+        lse = padded_lse
+    return lse
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    use_mha_companion: bool = False,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> None:
+    _unified_attention_with_output_impl(
+        query,
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        use_mha_companion,
+        False,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        sinks=sinks,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+
+
+def _unified_attention_with_output_and_lse_fake(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    use_mha_companion: bool = False,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    del (
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        use_mha_companion,
+        q_rope,
+        k_rope,
+        sinks,
+        cos_sin_cache,
+        is_neox,
+        llama_4_scaling,
+        topk_indices,
+    )
+    return query.new_empty((query.shape[0], query.shape[1]), dtype=torch.float32)
+
+
+@register_custom_op(
+    mutates_args=["output"], fake_impl=_unified_attention_with_output_and_lse_fake
+)
+@register_split_op()
+def unified_attention_with_output_and_lse(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    use_mha_companion: bool = False,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    lse = _unified_attention_with_output_impl(
+        query,
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        use_mha_companion,
+        True,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        sinks=sinks,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+    assert lse is not None
+    return lse
 
 
 @register_custom_op(mutates_args=["attn_out", "idx_out"])
@@ -400,6 +577,9 @@ def unified_sparse_attention_with_output(
 
 breakable_unified_attention_with_output = eager_on_graph(True)(
     unified_attention_with_output
+)
+breakable_unified_attention_with_output_and_lse = eager_on_graph(True)(
+    unified_attention_with_output_and_lse
 )
 
 
