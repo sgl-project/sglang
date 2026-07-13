@@ -194,26 +194,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    # v for head group i_qk: in the all_v region
-    blk_v_ptr = (
-        mixed_qkvz
-        + i_bs * TOTAL_QKVZ
-        + TOTAL_Q
-        + TOTAL_K
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-    # z for head group i_qk: in the all_z region
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * TOTAL_QKVZ
-        + TOTAL_Q
-        + TOTAL_K
-        + TOTAL_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-
     # ── Write to output (identical layout to the interleaved kernel) ──
     blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
     blk_k_st_ptr = (
@@ -223,24 +203,83 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    blk_v_st_ptr = (
-        mixed_qkv
-        + i_bs * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK * 2
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
 
     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+
+    # tl.arange requires power-of-2 ranges: copy the v/z group as one wide
+    # block when V_PER_GROUP * HEAD_V is a power of two, else one v-head per
+    # static_range step (matching the b/a loops below).
+    V_GROUP_DIM: tl.constexpr = V_PER_GROUP * HEAD_V
+    V_GROUP_IS_POW2: tl.constexpr = (V_GROUP_DIM & (V_GROUP_DIM - 1)) == 0
+    if V_GROUP_IS_POW2:
+        blk_v_ptr = (
+            mixed_qkvz
+            + i_bs * TOTAL_QKVZ
+            + TOTAL_Q
+            + TOTAL_K
+            + i_qk * V_GROUP_DIM
+            + tl.arange(0, V_GROUP_DIM)
+        )
+        blk_z_ptr = (
+            mixed_qkvz
+            + i_bs * TOTAL_QKVZ
+            + TOTAL_Q
+            + TOTAL_K
+            + TOTAL_V
+            + i_qk * V_GROUP_DIM
+            + tl.arange(0, V_GROUP_DIM)
+        )
+        blk_v_st_ptr = (
+            mixed_qkv
+            + i_bs * QKV_DIM_T
+            + NUM_HEADS_QK * HEAD_QK * 2
+            + i_qk * V_GROUP_DIM
+            + tl.arange(0, V_GROUP_DIM)
+        )
+        blk_z_st_ptr = (
+            z
+            + i_bs * NUM_HEADS_V * HEAD_V
+            + i_qk * V_GROUP_DIM
+            + tl.arange(0, V_GROUP_DIM)
+        )
+        tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+        tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+    else:
+        for i in tl.static_range(V_PER_GROUP):
+            blk_v_ptr = (
+                mixed_qkvz
+                + i_bs * TOTAL_QKVZ
+                + TOTAL_Q
+                + TOTAL_K
+                + (i_qk * V_PER_GROUP + i) * HEAD_V
+                + tl.arange(0, HEAD_V)
+            )
+            blk_v_st_ptr = (
+                mixed_qkv
+                + i_bs * QKV_DIM_T
+                + NUM_HEADS_QK * HEAD_QK * 2
+                + (i_qk * V_PER_GROUP + i) * HEAD_V
+                + tl.arange(0, HEAD_V)
+            )
+            tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+
+            blk_z_ptr = (
+                mixed_qkvz
+                + i_bs * TOTAL_QKVZ
+                + TOTAL_Q
+                + TOTAL_K
+                + TOTAL_V
+                + (i_qk * V_PER_GROUP + i) * HEAD_V
+                + tl.arange(0, HEAD_V)
+            )
+            blk_z_st_ptr = (
+                z
+                + i_bs * NUM_HEADS_V * HEAD_V
+                + (i_qk * V_PER_GROUP + i) * HEAD_V
+                + tl.arange(0, HEAD_V)
+            )
+            tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
 
     # ── b and a from contiguous [all_b | all_a] ──
     for i in tl.static_range(V_PER_GROUP):
@@ -252,6 +291,22 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         blk_a_ptr = mixed_ba + i_bs * TOTAL_BA + NUM_HEADS_V + i_qk * V_PER_GROUP + i
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
+
+
+def fused_qkvzba_split_contiguous_supported(
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    """Shapes the contiguous split kernel can compile: v heads must divide
+    evenly into k-head groups, and the q/k and per-head v/z copies need
+    power-of-2 tl.arange widths."""
+
+    def _is_pow2(n):
+        return n > 0 and (n & (n - 1)) == 0
+
+    return num_heads_v % num_heads_qk == 0 and _is_pow2(head_qk) and _is_pow2(head_v)
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(

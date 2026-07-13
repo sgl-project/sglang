@@ -23,6 +23,7 @@ import torch.nn as nn
 import triton
 
 from sglang.jit_kernel.triton.gdn_fused_proj import (
+    fused_qkvzba_split_contiguous_supported,
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 
@@ -518,7 +519,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            fused_qkvzba_split_contiguous_supported(
+                self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim
+            )
             and not _is_cpu
             and not _is_npu
         ):
