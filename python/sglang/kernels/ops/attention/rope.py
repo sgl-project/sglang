@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 # For XPU, try to import JIT infrastructure from sgl_kernel
 try:
+    from sgl_kernel.jit import apply_rope_inplace as _xpu_apply_rope_inplace
     from sgl_kernel.jit import (
-        apply_rope_inplace as _xpu_apply_rope_inplace,
         apply_rope_inplace_with_kvcache as _xpu_apply_rope_inplace_with_kvcache,
     )
 

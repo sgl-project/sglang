@@ -21,9 +21,9 @@ if TYPE_CHECKING:
 try:
     from sgl_kernel.jit import (
         can_use_fused_inplace_qknorm as _xpu_can_use_fused_inplace_qknorm,
-        fused_inplace_qknorm as _xpu_fused_inplace_qknorm,
-        rmsnorm as _xpu_rmsnorm,
     )
+    from sgl_kernel.jit import fused_inplace_qknorm as _xpu_fused_inplace_qknorm
+    from sgl_kernel.jit import rmsnorm as _xpu_rmsnorm
 
     _HAS_SGL_KERNEL_JIT = True
 except ImportError:
