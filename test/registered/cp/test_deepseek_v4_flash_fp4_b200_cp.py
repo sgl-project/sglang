@@ -80,6 +80,8 @@ class TestDSV4FlashFP4B200Balanced_CP(
                 "round-robin-split",
                 "--deepep-config",
                 DEEPEP_CONFIG,
+                "--mem-fraction-static",
+                "0.80",
             ],
             env=_DEEPEP_ENV,
         )
