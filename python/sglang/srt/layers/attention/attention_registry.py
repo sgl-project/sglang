@@ -277,6 +277,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
         )
+        from sglang.srt.layers.attention.linear.rwkv7_backend import Rwkv7AttnBackend
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
@@ -366,6 +367,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
+        elif runner.rwkv7_config is not None:
+            logger.info("Using hybrid linear attention backend for RWKV-7 models.")
+            linear_attn_backend = Rwkv7AttnBackend(runner)
         else:
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:

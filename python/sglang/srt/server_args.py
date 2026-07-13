@@ -4550,6 +4550,32 @@ class ServerArgs:
             logger.info(
                 f"Using {attention_backend} as attention backend for {model_arch}."
             )
+        elif model_arch in ["RWKV7ForCausalLM", "Rwkv7ForCausalLM"]:
+            # RWKV-7 is pure-recurrent: the per-request WKV state is not
+            # prefix-cacheable, so the token radix cache would corrupt shared-prefix
+            # batches. Force it off until a state-aware MambaRadixCache is wired up.
+            if not self.disable_radix_cache:
+                logger.info(
+                    "Disabling radix cache for RWKV-7 (recurrent state is not prefix-cacheable)."
+                )
+                self.disable_radix_cache = True
+            # The model calls its linear-attention backend directly (the WKV
+            # r/w/k/v/kk/a signature does not fit the fixed mixed_qkv custom-op
+            # schema), so the backend's per-batch varlen metadata sits INSIDE
+            # captured prefill regions for either prefill graph backend.
+            # Disable prefill CUDA graph unless the user explicitly picked a
+            # backend; decode CUDA graph is fully supported.
+            if (
+                Phase.PREFILL,
+                "backend",
+            ) not in self._cuda_graph_config_locked and (
+                self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            ):
+                logger.info(
+                    "Disabling prefill CUDA graph for RWKV-7 (the backend's "
+                    "varlen metadata is used inside captured regions)."
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             # Quantization / MoE runner / attention backend defaults moved to
             # the override registry (arg_groups/overrides.py:
