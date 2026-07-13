@@ -178,7 +178,7 @@ if _is_cuda:
     except ImportError:
         fused_topk_deepseek = None
 
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip:
     from sglang.kernels.ops.moe import topk_softmax
 
     try:
@@ -198,6 +198,8 @@ if _is_musa:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
+if _is_xpu:
+    from sgl_kernel import topk_sigmoid, topk_softmax
 
 # -------------------------------- TopKConfig ---------------------------------------
 
