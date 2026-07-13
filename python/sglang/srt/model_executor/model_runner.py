@@ -47,10 +47,10 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed import (
+    bootstrap,
     get_tp_group,
     get_world_group,
 )
-from sglang.srt.distributed.bootstrap import init_torch_distributed
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -464,28 +464,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
-        result = init_torch_distributed(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            device=self.device,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            dp_size=self.attn_dp_size,
-            attn_cp_size=self.attn_cp_size,
-            moe_ep_size=self.moe_ep_size,
-            moe_dp_size=self.moe_dp_size,
-            dcp_size=self.dcp_size,
-            dist_port=self.dist_port,
-            is_draft_worker=self.is_draft_worker,
-            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
-        )
-        self.tp_group = result.tp_group
-        self.pp_group = result.pp_group
-        self.attention_tp_group = result.attention_tp_group
-        self.pre_model_load_memory = result.pre_model_load_memory
+        self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -1117,6 +1096,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
                     f"You can fix this by setting arguments `--tp` and `--ep` correctly."
                 )
+
+    def init_torch_distributed(self):
+        result = bootstrap.init_torch_distributed(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_size=self.attn_dp_size,
+            attn_cp_size=self.attn_cp_size,
+            moe_ep_size=self.moe_ep_size,
+            moe_dp_size=self.moe_dp_size,
+            dcp_size=self.dcp_size,
+            dist_port=self.dist_port,
+            is_draft_worker=self.is_draft_worker,
+            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
+        )
+        self.tp_group = result.tp_group
+        self.pp_group = result.pp_group
+        self.attention_tp_group = result.attention_tp_group
+        self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         """
