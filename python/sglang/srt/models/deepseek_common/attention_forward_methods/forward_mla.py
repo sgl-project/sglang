@@ -27,10 +27,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
-from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
-    is_quark_w8a8_fp8_layer,
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
+)
+from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+    is_quark_w8a8_fp8_layer,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
