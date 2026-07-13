@@ -130,7 +130,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        self.padded_static_len = -1
 
         # Size cuda-graph buffers by num_draft_tokens (full tree width), not
         # num_steps + 1, or topk > 1 draft-extend overflows them.
@@ -395,7 +394,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            padded_static_len=self.padded_static_len,
         )
 
         if self.buffers.dsa_seed_topk_capture is not None:
