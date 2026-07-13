@@ -5,13 +5,13 @@ from typing import Any, Callable, Optional, cast
 import torch
 from torch.nn import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     aiter_w8a8_block_fp8_linear,

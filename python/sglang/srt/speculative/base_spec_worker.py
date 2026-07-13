@@ -190,12 +190,12 @@ class EagleDraftWorkerBase(ABC):
         topk: int,
         num_steps: int,
     ):
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_draft_cache_locs_contiguous,
+        )
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
-        )
-        from sglang.srt.speculative.triton_ops.cache_locs import (
-            assign_draft_cache_locs_contiguous,
         )
 
         if not batch.forward_mode.is_idle():
@@ -335,6 +335,14 @@ class BaseSpecWorker(ABC):
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Hook called by the batch-result processor when a request finishes.
+
+        Default no-op. DSpark overrides this to settle / censor its
+        block-accept estimator state for the finished request.
         """
         pass
 
