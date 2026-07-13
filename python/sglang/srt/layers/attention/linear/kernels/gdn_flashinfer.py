@@ -10,15 +10,10 @@ Requires flashinfer >= 0.6.7.
 
 import logging
 import os
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
-    MAX_FUSED_QKV_SPLIT_DIM,
-    GDNQKVShape,
-)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -26,12 +21,7 @@ from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True, slots=True, eq=False)
-class FlashInferGDNExtendPrep:
-    """FlashInfer state-gather metadata shared by all GDN layers in a forward."""
-
-    ssm_cache_indices: torch.Tensor
+_MAX_FUSED_PREFILL_DIM = 8192
 
 
 # ---------------------------------------------------------------------------
@@ -233,28 +223,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     # ---- extend (prefill) ----
 
-    def build_extend_prep(
-        self,
-        *,
-        cache_indices: torch.Tensor,
-        state_pool_size: int,
-    ) -> FlashInferGDNExtendPrep:
-        """Compute layer-invariant state-gather indices once per forward."""
-        if self.use_state_pool:
-            # Negative indices (e.g. -1) are padding markers for slots not yet
-            # assigned to a real sequence; clamp them to 0 (the reserved dummy
-            # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-        else:
-            # SM90: negative (pad) indices remap to the last slot, the reserved
-            # sentinel.
-            ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                state_pool_size - 1,
-            ).to(torch.int64)
-        return FlashInferGDNExtendPrep(ssm_cache_indices=ssm_cache_indices)
-
     def extend(
         self,
         q: torch.Tensor,
@@ -342,13 +310,29 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         return core_attn_out, None, None
 
     @staticmethod
-    def can_use_fused_prefill(mixed_qkv: torch.Tensor, shape: GDNQKVShape) -> bool:
+    def can_use_fused_prefill(
+        mixed_qkv: torch.Tensor,
+        *,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_q_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
+    ) -> bool:
+        total_dim = (
+            num_q_heads * head_q_dim
+            + num_k_heads * head_k_dim
+            + num_v_heads * head_v_dim
+        )
         return (
-            shape.total_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            mixed_qkv.shape[1] == total_dim
+            and total_dim <= _MAX_FUSED_PREFILL_DIM
             and mixed_qkv.stride(1) == 1
-            and shape.num_q_heads == shape.num_k_heads
-            and shape.head_q_dim == shape.head_k_dim == 128
-            and shape.num_v_heads & (shape.num_v_heads - 1) == 0
+            and num_q_heads == num_k_heads
+            and head_q_dim == head_k_dim == 128
+            and num_v_heads > 0
+            and num_v_heads & (num_v_heads - 1) == 0
         )
 
     def extend_fused(
@@ -357,14 +341,18 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a: torch.Tensor,
         b: torch.Tensor,
         *,
-        shape: GDNQKVShape,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_q_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        prep: Optional[FlashInferGDNExtendPrep] = None,
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
@@ -377,10 +365,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             b,
             A_log,
             dt_bias,
-            num_qk_heads=shape.num_q_heads,
-            num_v_heads=shape.num_v_heads,
-            head_qk_dim=shape.head_q_dim,
-            head_v_dim=shape.head_v_dim,
+            num_qk_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            head_qk_dim=head_q_dim,
+            head_v_dim=head_v_dim,
         )
         q_fi = q_fi[0]
         k_fi = k_fi[0]
@@ -392,14 +380,19 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v_fi.shape[1]
         head_v_dim = v_fi.shape[2]
 
-        if prep is None:
-            # Fallback for direct extend_fused() callers; production passes
-            # prep built once per forward.
-            prep = self.build_extend_prep(
-                cache_indices=cache_indices,
-                state_pool_size=ssm_states.shape[0],
-            )
-        ssm_cache_indices = prep.ssm_cache_indices
+        if self.use_state_pool:
+            # Negative indices (e.g. -1) are padding markers for slots not yet
+            # assigned to a real sequence; clamp them to 0 (the reserved dummy
+            # slot) so the FlashInfer kernel never reads out-of-bounds state.
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+        else:
+            # SM90: negative (pad) indices remap to the last slot, the reserved
+            # sentinel.
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            ).to(torch.int64)
 
         if out is not None:
             expected_shape = (1, total_seq_len, num_v_heads, head_v_dim)
