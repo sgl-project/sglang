@@ -89,9 +89,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def _get_param_type(self, param_schema: Any) -> str:
         """Infer the parser conversion type from a JSON schema parameter."""
-        if not isinstance(param_schema, dict):
-            return "string"
-
         inferred_type = infer_type_from_json_schema(param_schema)
         if inferred_type is None:
             return "string"
