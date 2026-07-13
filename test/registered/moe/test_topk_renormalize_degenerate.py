@@ -39,15 +39,16 @@ HIDDEN = 64
 class TestTopkRenormalizeDegenerate(CustomTestCase):
     DEVICE = "cuda"
 
-    def _inputs(self, num_tokens=4, degenerate_rows=(0,)):
+    def _inputs(self, num_tokens=4, degenerate_rows=(0,), dtype=torch.float32):
         """Rows in `degenerate_rows` get all-very-negative logits so every
-        selected expert's sigmoid weight underflows to exactly zero."""
-        hidden = torch.randn(num_tokens, HIDDEN, device=self.DEVICE)
+        selected expert's sigmoid weight underflows to exactly zero. In
+        float16 the sigmoid already underflows below logits of about -18."""
+        hidden = torch.randn(num_tokens, HIDDEN, device=self.DEVICE, dtype=dtype)
         logits = torch.randn(num_tokens, NUM_EXPERTS, device=self.DEVICE)
         for r in degenerate_rows:
             logits[r] = -100.0 + torch.rand(NUM_EXPERTS, device=self.DEVICE)
         bias = 11.2 + torch.rand(NUM_EXPERTS, device=self.DEVICE) * 0.1
-        return hidden, logits, bias
+        return hidden, logits.to(dtype), bias.to(dtype)
 
     def _check(self, topk_weights, name):
         self.assertFalse(
@@ -69,6 +70,26 @@ class TestTopkRenormalizeDegenerate(CustomTestCase):
         hidden, logits, bias = self._inputs()
         weights, _ = biased_topk_impl(hidden, logits, bias, topk=TOPK, renormalize=True)
         self._check(weights, "biased_topk_impl")
+
+    def test_biased_topk_impl_fp16(self):
+        # the 1e-20 epsilon underflows to zero in float16; the renormalization
+        # must run in float32 for the guard to hold (fp16 sigmoid already
+        # underflows below logits of about -18)
+        hidden, logits, bias = self._inputs(dtype=torch.float16)
+        weights, _ = biased_topk_impl(hidden, logits, bias, topk=TOPK, renormalize=True)
+        self._check(weights, "biased_topk_impl[fp16]")
+
+    def test_fused_topk_torch_native_sigmoid_bias_fp16(self):
+        hidden, logits, bias = self._inputs(dtype=torch.float16)
+        weights, _ = fused_topk_torch_native(
+            hidden,
+            logits,
+            topk=TOPK,
+            renormalize=True,
+            correction_bias=bias,
+            scoring_func="sigmoid",
+        )
+        self._check(weights, "fused_topk_torch_native[fp16]")
 
     def test_biased_grouped_topk_impl(self):
         hidden, logits, bias = self._inputs()

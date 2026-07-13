@@ -141,7 +141,8 @@ _is_musa = is_musa()
 # router logits can have every gathered sigmoid weight underflow to exactly
 # zero; a bare division then yields 0/0 = NaN and poisons the token's output
 # row. For healthy tokens the sum is >= sigmoid(logit_max) >> 1e-20, so results
-# are bit-identical.
+# are unchanged. The renormalization is performed in float32 (the reference gate
+# computes the whole gate in fp32); the epsilon underflows to zero in float16.
 _RENORMALIZE_SUM_EPSILON = 1e-20
 
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
@@ -684,6 +685,8 @@ def fused_topk_torch_native(
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
+        # fp32 like the reference gate; the epsilon is not representable in fp16
+        topk_weights = topk_weights.float()
         topk_weights = topk_weights / (
             topk_weights.sum(dim=-1, keepdim=True) + _RENORMALIZE_SUM_EPSILON
         )
@@ -955,6 +958,8 @@ def grouped_topk_gpu(
             )
 
     if renormalize:
+        # fp32 like the reference gate; the epsilon is not representable in fp16
+        topk_weights = topk_weights.float()
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
@@ -1024,6 +1029,8 @@ def kimi_k2_biased_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if renormalize:
+        # fp32 like the reference gate; the epsilon is not representable in fp16
+        topk_weights = topk_weights.float()
         topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
@@ -1080,6 +1087,8 @@ def biased_topk_impl(
             )
 
     if renormalize:
+        # fp32 like the reference gate; the epsilon is not representable in fp16
+        topk_weights = topk_weights.float()
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
@@ -1209,6 +1218,8 @@ def biased_grouped_topk_impl(
             )
 
     if renormalize:
+        # fp32 like the reference gate; the epsilon is not representable in fp16
+        topk_weights = topk_weights.float()
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
