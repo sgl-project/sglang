@@ -698,13 +698,6 @@ def fused_topk_softmax_torch_raw_logits(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-# The num_experts values supported by the topk_softmax_cpu C++ kernel.
-# Kept in sync with sgl-kernel/csrc/cpu/topk.cpp topk_softmax_cpu().
-_TOPK_SOFTMAX_CPU_SUPPORTED_NUM_EXPERTS = frozenset(
-    {1, 2, 4, 8, 16, 32, 64, 128, 160, 256, 384, 512}
-)
-
-
 def fused_topk_cpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -717,13 +710,7 @@ def fused_topk_cpu(
     # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
     # correction bias. Fall back to the torch-native impl for the rest
     # (e.g. MiniMax sets both correction_bias and scoring_func).
-    # The kernel also only supports a fixed set of num_experts values; fall back
-    # to the torch-native impl for unsupported counts (e.g. Qwen1.5-MoE has 60).
-    if (
-        correction_bias is not None
-        or scoring_func != "softmax"
-        or gating_output.size(-1) not in _TOPK_SOFTMAX_CPU_SUPPORTED_NUM_EXPERTS
-    ):
+    if correction_bias is not None or scoring_func != "softmax":
         return fused_topk_torch_native(
             hidden_states,
             gating_output,
