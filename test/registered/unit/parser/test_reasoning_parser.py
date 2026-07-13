@@ -3,6 +3,7 @@
 import unittest
 
 from sglang.srt.parser.reasoning_parser import (
+    Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     Gemma4Detector,
@@ -349,6 +350,73 @@ class TestNemotron3Detector(CustomTestCase):
         # Truncated reasoning has no normal_text, so swap should occur
         self.assertEqual(result.normal_text, "Truncated reasoning without end token")
         self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_truncated_reasoning_reclassified_on_finish(self):
+        """force_nonempty_content: truncated reasoning (no think_end) is flushed
+        as normal_text when the stream ends, so streaming content is non-empty."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning part one")
+        detector.parse_streaming_increment(" more reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "reasoning part one more reasoning")
+
+    def test_streaming_tool_start_ends_reasoning_and_noops_finish(self):
+        """tool_start_token interrupts reasoning; finish() then no-ops because
+        _in_reasoning is already False."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning here")
+        result = detector.parse_streaming_increment(
+            detector.tool_start_token + "payload"
+        )
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, detector.tool_start_token + "payload")
+        self.assertFalse(detector._in_reasoning)
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+
+    def test_streaming_truncated_no_stream_reasoning_strips_think_start(self):
+        """force_nonempty_content + stream_reasoning=False: the opening think
+        token must not leak into content when truncation is flushed on finish.
+
+        Regression: with stream_reasoning=False the base parse_streaming_increment
+        never clears _buffer, so the stripped think_start survives in _buffer and
+        finish() would prepend it to the reclassified content."""
+        detector = Nemotron3Detector(
+            force_nonempty_content=True, stream_reasoning=False
+        )
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("hidden reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "hidden reasoning")
+        self.assertNotIn(detector.think_start_token, end.normal_text)
+
+
+class TestApertus2509DetectorForceNonempty(CustomTestCase):
+    """force_nonempty_content swap on Apertus2509 (non-streaming, via base helper)."""
+
+    def test_swap_when_only_reasoning(self):
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token
+            + "apertus reasoning only"
+            + detector.think_end_token
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "apertus reasoning only")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_no_swap_when_normal_exists(self):
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token + "reason" + detector.think_end_token + "answer"
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reason")
+        self.assertEqual(result.normal_text, "answer")
 
 
 class TestGemma4Detector(CustomTestCase):
