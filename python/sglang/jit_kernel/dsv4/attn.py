@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -32,6 +33,14 @@ def _jit_fused_store_module(
     page_size: int,
 ):
     args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
+    if name == "indexer":
+        args = make_cpp_args(
+            input_dtype,
+            index_dtype,
+            page_size,
+            is_arch_support_pdl(),
+            envs.SGLANG_DSV4_INDEXER_K_CACHE_PRESHUFFLE.get(),
+        )
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(

@@ -137,6 +137,24 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        alloc = self.token_to_kv_pool_allocator
+        alloc = getattr(alloc, "logical_attn_allocator", alloc)
+        if getattr(alloc, "_unified", False):
+            # Unified-KV DSV4: SWA is a fixed per-request ring, reused per request
+            # and released together with the req_pool slot (which has its own
+            # leak check). swa_available_size() is deliberately non-binding (it
+            # always reports the full ring so it never throttles admission), and
+            # cached radix prefixes still report swa_evictable even though the
+            # completed request already freed its ring slot. The token-pool
+            # invariant (available + evictable + protected + session == total)
+            # therefore does not model this pool -- skip it to avoid a spurious
+            # leak. Ring-slot leaks are still caught by the req_to_token check.
+            return False, (
+                "[swa] unified ring (leak-check skipped): "
+                f"available={ps.swa_available_size}, "
+                f"evictable={ps.swa_evictable_size}, "
+                f"total={self.swa_tokens_per_layer}"
+            )
         return self._check_pool_invariant(
             "swa",
             ps.swa_available_size,

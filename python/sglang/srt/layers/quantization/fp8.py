@@ -1236,10 +1236,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
-            # CK FP4 MoE kernel requires K_packed divisible by 128
-            # (i.e., K_logical divisible by 256).
+            # CK FP4 MoE kernel K-dim alignment (logical elements). Defaults to
+            # 256 (K_packed divisible by 128, i.e. K_logical divisible by 256).
+            # Lower to 128 via SGLANG_OPT_FP4_MOE_K_ALIGN on aiter builds that
+            # accept K_logical % 128 == 0, to avoid padding e.g. 384 -> 512.
             # Pad intermediate_size_per_partition if needed.
-            fp4_k_align = 256
+            fp4_k_align = envs.SGLANG_OPT_FP4_MOE_K_ALIGN.get()
             E, w13_N, w13_K_packed = layer.w13_weight.shape
             _, w2_N, w2_K_packed = layer.w2_weight.shape
             inter_per_part = w13_N // 2

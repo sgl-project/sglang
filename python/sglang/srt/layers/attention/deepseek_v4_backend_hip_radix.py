@@ -551,7 +551,7 @@ class DeepseekV4HipRadixBackend(
             is_prefill=True,
         )
         self._attach_unified_kv_prefill_meta(
-            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
+            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens, num_tokens
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1090,6 +1090,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        num_tokens: int,
     ) -> None:
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1102,8 +1103,11 @@ class DeepseekV4HipRadixBackend(
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
         # token -> req index (length L = sum(extend_seq_lens))
+        # Pass output_size to avoid the implicit device->host sync
         bid = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64), extend_seq_lens
+            torch.arange(bs, device=device, dtype=torch.int64),
+            extend_seq_lens,
+            output_size=num_tokens,
         )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()

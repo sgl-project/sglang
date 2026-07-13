@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -14,7 +15,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
 # uses the page_size=64 preshuffle layout (i.e. when the matching MQA gluon path
 # is also enabled).
-_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
+_use_aiter_preshuffle = (
+    aiter_can_use_preshuffle_paged_mqa()
+    and envs.SGLANG_DSV4_INDEXER_K_CACHE_PRESHUFFLE.get()
+)
 
 if _use_aiter_preshuffle:
     from aiter.ops.cache import cp_gather_indexer_k_quant_cache
@@ -341,6 +345,7 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        USE_PRESHUFFLE=envs.SGLANG_DSV4_INDEXER_K_CACHE_PRESHUFFLE.get(),
     )
 
 
@@ -356,6 +361,7 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    USE_PRESHUFFLE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
@@ -370,11 +376,26 @@ def _set_k_and_s_triton_kernel(
     loc_page_index = loc // PAGE_SIZE
     loc_token_offset_in_page = loc % PAGE_SIZE
 
-    out_k_offsets = (
-        loc_page_index * BUF_NUMEL_PER_PAGE
-        + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
-        + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-    )
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if USE_PRESHUFFLE:
+        tile = 16
+        token_tile_id = loc_token_offset_in_page // tile
+        token_in_tile = loc_token_offset_in_page % tile
+        col_tile_id = k_range // tile
+        col_in_tile = k_range % tile
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + token_tile_id * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile_id * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
+            + k_range
+        )
 
     # "//4" b/c it is fp32 instead of uint8
     out_s_offset = (

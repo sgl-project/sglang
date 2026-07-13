@@ -158,7 +158,7 @@ def _aiter_fp8_paged_mqa_logits(
         page_table.to(torch.int32),
         max_seq_len,
         KVBlockSize=kv_block_size,
-        Preshuffle=True,
+        Preshuffle=envs.SGLANG_DSV4_INDEXER_K_CACHE_PRESHUFFLE.get(),
     )
     return logits
 

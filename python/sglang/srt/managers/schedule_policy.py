@@ -580,8 +580,16 @@ class PrefillAdder:
 
     @property
     def rem_swa_tokens(self):
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(allocator, "_unified", False):
+            # Unified-KV: SWA is a per-request ring, not a tree-reusable token
+            # pool. swa_available_size() already reports ring capacity
+            # (free_slots * ring_cost). tree swa_evictable is in the old linear
+            # token unit and freeing it does not release ring space, so exclude
+            # it here to keep a single consistent accounting unit.
+            return allocator.swa_available_size() - self.rem_swa_token_offset
         return (
-            self.token_to_kv_pool_allocator.swa_available_size()
+            allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
             - self.rem_swa_token_offset
         )
@@ -621,9 +629,16 @@ class PrefillAdder:
           + chunk N+1 (new allocation)
         Since chunk N and locked tokens are already excluded from
         swa_available + swa_evictable, the budget only needs to cover the
-        chunk N+1 allocation. We floor at sliding_window_size to reserve
+        chunk N+1 allocation.         We floor at sliding_window_size to reserve
         room for the decode phase.
         """
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(allocator, "_unified", False):
+            # Unified-KV: each request occupies exactly one fixed SWA ring slot,
+            # independent of context / chunk length; a host-hit prefix reuses the
+            # same ring. Budget the fixed per-slot ring cost (paired with the
+            # ring-based swa_available_size on the allocator).
+            return allocator.swa_ring_cost_tokens
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:

@@ -1213,6 +1213,7 @@ class ModelRunnerKVCacheMixin:
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
+                        req_to_token_pool=self.req_to_token_pool,
                     )
                 else:
                     if self.enable_hisparse:
@@ -1264,6 +1265,32 @@ class ModelRunnerKVCacheMixin:
                 self.req_to_token_pool.register_dsv4_allocator(
                     self.token_to_kv_pool_allocator
                 )
+
+            # Unified-KV DSV4: SWA is a fixed per-request ring, so the allocator
+            # reports ring capacity (free_req_slots * ring_cost) from
+            # swa_available_size(), while swa_max_total_num_tokens was sized from
+            # the (vestigial, unallocated) full_token-scaled SWA pool. The idle
+            # pool-leak invariant requires swa total == swa available, so
+            # reconcile the reported SWA total to the allocator's actual idle ring
+            # capacity. Safe: on unified_kv swa_kv_pool is None, so no real buffer
+            # is resized -- this only fixes token accounting / usage reporting.
+            if self.is_hybrid_swa and getattr(
+                self.token_to_kv_pool, "_unified_kv", False
+            ):
+                alloc = self.token_to_kv_pool_allocator
+                if hasattr(alloc, "swa_available_size"):
+                    ring_capacity = int(alloc.swa_available_size())
+                    # Only reconcile downward to the (smaller) ring capacity. A
+                    # value >= the current total means swa_available_size() hit a
+                    # non-binding fallback (e.g. req_to_token pool not wired), in
+                    # which case leave the reported total untouched.
+                    if 0 < ring_capacity < self.swa_max_total_num_tokens:
+                        logger.info(
+                            "Unified-KV: reconciling swa_max_total_num_tokens "
+                            f"{self.swa_max_total_num_tokens} -> {ring_capacity} "
+                            "(fixed per-request SWA ring capacity)."
+                        )
+                        self.swa_max_total_num_tokens = ring_capacity
 
         else:
             assert self.is_draft_worker

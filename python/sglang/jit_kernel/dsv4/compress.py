@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -26,7 +27,8 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool = False,
 ) -> Module:
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(),
+        envs.SGLANG_DSV4_INDEXER_K_CACHE_PRESHUFFLE.get(), bf16_store
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:

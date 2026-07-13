@@ -287,6 +287,20 @@ class SchedulerPoolStatsObserver:
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
+        # Unified-KV DSV4: SWA is a fixed per-request ring, released with the
+        # req_pool slot. Cached radix prefixes still report swa_evictable even
+        # though the completed request already freed its ring slot, and
+        # swa_available_size() is non-binding (always the full ring). Counting
+        # that evictable here would double-count against the ring and drive
+        # swa_num_used / swa_token_usage negative. The ring holds nothing
+        # evictable, so zero it out to keep the usage stats coherent.
+        _swa_alloc = getattr(
+            self.token_to_kv_pool_allocator,
+            "logical_attn_allocator",
+            self.token_to_kv_pool_allocator,
+        )
+        if getattr(_swa_alloc, "_unified", False):
+            swa_evictable_size = 0
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
         )

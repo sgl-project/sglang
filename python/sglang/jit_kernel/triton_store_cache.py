@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -22,6 +23,7 @@ _MLA_ROPE_TILE_ID = 7  # tile id reserved for the rope copy
 
 # C4 indexer paged FP8 cache layout
 _INDEXER_HEAD_DIM = 128
+_INDEXER_PRESHUFFLE_TILE = 16
 
 _UE8M0_EXPONENT_BIAS = 127
 
@@ -156,6 +158,7 @@ def _triton_fused_store_indexer_kernel(
     BYTES_PER_PAGE_F32: tl.constexpr,
     SCALE_PAGE_OFFSET_F32: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_PRESHUFFLE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
@@ -179,7 +182,20 @@ def _triton_fused_store_indexer_kernel(
         cache_fp8_ptr.dtype.element_ty
     )
 
-    fp8_offset = page * BYTES_PER_PAGE + slot * HEAD_DIM + lane
+    if USE_PRESHUFFLE:
+        token_tile_id = slot // _INDEXER_PRESHUFFLE_TILE
+        token_in_tile = slot % _INDEXER_PRESHUFFLE_TILE
+        col_tile_id = lane // _INDEXER_PRESHUFFLE_TILE
+        col_in_tile = lane % _INDEXER_PRESHUFFLE_TILE
+        fp8_offset = (
+            page * BYTES_PER_PAGE
+            + token_tile_id * (_INDEXER_PRESHUFFLE_TILE * HEAD_DIM)
+            + col_tile_id * (_INDEXER_PRESHUFFLE_TILE * _INDEXER_PRESHUFFLE_TILE)
+            + token_in_tile * _INDEXER_PRESHUFFLE_TILE
+            + col_in_tile
+        )
+    else:
+        fp8_offset = page * BYTES_PER_PAGE + slot * HEAD_DIM + lane
     tl.store(cache_fp8_ptr + fp8_offset, x_fp8)
 
     f32_offset = page * BYTES_PER_PAGE_F32 + SCALE_PAGE_OFFSET_F32 + slot
@@ -216,6 +232,7 @@ def triton_fused_store_indexer(
         BYTES_PER_PAGE_F32=bytes_per_page_f32,
         SCALE_PAGE_OFFSET_F32=scale_page_offset_f32,
         HEAD_DIM=_INDEXER_HEAD_DIM,
+        USE_PRESHUFFLE=envs.SGLANG_DSV4_INDEXER_K_CACHE_PRESHUFFLE.get(),
         FP8_MIN=_FP8_INFO.min,
         FP8_MAX=_FP8_INFO.max,
         EPS=1e-8,
