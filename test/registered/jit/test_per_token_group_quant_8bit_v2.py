@@ -21,7 +21,7 @@ if sgl_per_token_group_quant_8bit is None and not torch.cuda.is_available():
 if sgl_per_token_group_quant_8bit is None:
     raise ImportError("sgl_kernel AOT reference op is unavailable")
 
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
