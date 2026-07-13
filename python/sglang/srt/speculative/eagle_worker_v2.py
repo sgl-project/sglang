@@ -137,6 +137,32 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
+def _load_checkpoint_tensor(model_path: str, tensor_name: str) -> torch.Tensor:
+    """Load one tensor from a local safetensors checkpoint (PP+spec path)."""
+    import glob
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            shard_files = [json.load(f)["weight_map"][tensor_name]]
+    else:
+        shard_files = sorted(
+            os.path.basename(p)
+            for p in glob.glob(os.path.join(model_path, "*.safetensors"))
+        )
+    for shard_file in shard_files:
+        with safe_open(
+            os.path.join(model_path, shard_file), framework="pt", device="cpu"
+        ) as f:
+            if tensor_name in f.keys():
+                return f.get_tensor(tensor_name)
+    raise ValueError(f"{tensor_name} not found in checkpoint at {model_path}")
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -341,9 +367,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if _os.environ.get("SGLANG_ALLOW_PP_SPEC") and self.server_args.pp_size > 1:
             # PP+spec: the target's embedding lives on the first PP stage
-            # (PPMissingLayer here on the last stage), so the draft keeps its
-            # own embedding weights and shares only the target's lm_head.
+            # (PPMissingLayer here on the last stage) and NextN/MTP layers
+            # carry no embedding of their own in the checkpoint, so the
+            # draft's embedding must be loaded from the checkpoint directly
+            # — otherwise it stays randomly initialized and accept_length
+            # collapses to ~1.
             embed = self.draft_runner.model.model.embed_tokens.weight
+            if self.server_args.load_format != "dummy":
+                loaded_embed = _load_checkpoint_tensor(
+                    model_path=self.draft_runner.model_config.model_path,
+                    tensor_name="model.embed_tokens.weight",
+                )
+                embed.weight_loader(embed, loaded_embed)
             head = self.target_worker.model_runner.model.lm_head.weight
             self.draft_runner.model.set_embed_and_head(embed, head)
             return

@@ -1490,8 +1490,8 @@ class SchedulerPPMixin:
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=(
-                        self.cur_batch.copy()
-                        if not self.cur_batch.spec_algorithm.is_none()
+                        cur_batch.copy()
+                        if not cur_batch.spec_algorithm.is_none()
                         else None
                     ),
                 )
