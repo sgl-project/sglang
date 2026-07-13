@@ -9,6 +9,12 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
+
 # Import to register custom ops for torch.compile compatibility
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -26,14 +32,8 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    _moe_output_buf,
     register_fused_func,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
-)
-from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
@@ -1001,7 +1001,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
-        _provided = _moe_output_buf.get()
+        from sglang.srt.runtime_context import get_forward
+
+        _provided = get_forward().moe_output_buffer
         _symm_required = is_allocation_symmetric()
         if (
             _provided is not None

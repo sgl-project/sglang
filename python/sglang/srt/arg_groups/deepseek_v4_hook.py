@@ -53,12 +53,14 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if server_args.speculative_algorithm is not None:
-        assert (
-            server_args.speculative_algorithm == "EAGLE"
-        ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
-        assert (
-            server_args.speculative_eagle_topk == 1
-        ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+        assert server_args.speculative_algorithm in (
+            "EAGLE",
+            "DSPARK",
+        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+        if server_args.speculative_algorithm == "EAGLE":
+            assert (
+                server_args.speculative_eagle_topk == 1
+            ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
