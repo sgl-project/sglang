@@ -647,8 +647,8 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
-    # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
-    # default static local-batch path.
+    # Force dynamic Waterfill with runtime EP all-reduce instead of the default
+    # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
 
     # NIXL-EP
@@ -671,8 +671,6 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
-    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
-    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
