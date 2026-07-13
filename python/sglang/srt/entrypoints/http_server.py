@@ -621,6 +621,8 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    if _global_state.tokenizer_manager.server_args.enable_beam_search:
+        sampling_params["n"] = 2
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
