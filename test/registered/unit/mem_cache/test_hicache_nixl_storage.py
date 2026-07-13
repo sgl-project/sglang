@@ -688,8 +688,6 @@ class TestNixlUnified(CustomTestCase):
         self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
 
 
-
-
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
 class TestNixlDirectIO(CustomTestCase):
     """Tests for the O_DIRECT file I/O path in NixlFileManager and HiCacheNixl."""
