@@ -3,6 +3,11 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#
+# Flavor notes:
+#   GPU_ARCH=gfx950-rocm720 is built on a Python 3.12 base and upgrades the stack to
+#   torch 2.11 (+torchvision 0.26 / torchaudio 2.11) and triton 3.6.0 for ROCm 7.2.
+#   The other flavors (gfx942, gfx950, gfx942-rocm720) are unchanged.
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -25,6 +30,11 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+# gfx950-rocm720 is upgraded to Python 3.12 + torch 2.11 + triton 3.6.0 (see the
+# gfx950-rocm720 torch/triton steps below). This base provides ROCm 7.2.4 + Python 3.12;
+# its preinstalled torch is replaced with 2.11 in those steps, so the base's torch
+# version does not affect the final image.
+ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -60,10 +70,11 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
-# Base image 950 with rocm720 and args
-FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
+# Base image 950 with rocm720 and args (Python 3.12 + torch 2.11 upgrade)
+FROM $BASE_IMAGE_950_ROCM724 AS gfx950-rocm720
 ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="1"
+# triton 3.6.0 comes from a prebuilt ROCm wheel (see gfx950-rocm720 steps), not source.
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -87,6 +98,15 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
+
+# gfx950-rocm720 torch/triton upgrade pins (Python 3.12, ROCm 7.2).
+# torch 2.11 for ROCm 7.2 is only published on the PyTorch Foundation index; AMD's
+# repo.radeon.com wheels top out at torch 2.10. triton 3.6.0 is AMD's prebuilt wheel.
+ARG TORCH_ROCM_INDEX_URL="https://download.pytorch.org/whl/rocm7.2"
+ARG TORCH_ROCM_VERSION="2.11.0+rocm7.2"
+ARG TORCHVISION_ROCM_VERSION="0.26.0+rocm7.2"
+ARG TORCHAUDIO_ROCM_VERSION="2.11.0+rocm7.2"
+ARG TRITON_ROCM_WHEEL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.6.0%2Brocm7.2.4.git4ed88892-cp312-cp312-linux_x86_64.whl"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -193,6 +213,23 @@ RUN set -eux; \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
         ;; \
     esac
+
+# -----------------------
+# gfx950-rocm720: upgrade torch 2.9.1 -> 2.11.0 (+ vision/audio) and install triton 3.6.0.
+# Done here, before AITER / sgl-kernel, so those extensions build against torch 2.11's ABI.
+# torch 2.11 pins `triton-rocm` in its metadata; strip that line so AMD's triton 3.6.0
+# wheel satisfies it (otherwise setup.py-install consumers such as fast-hadamard-transform
+# try to fetch triton-rocm from PyPI and fail).
+RUN if [ "${GPU_ARCH}" = "gfx950-rocm720" ]; then \
+      python3 -m pip install --no-cache-dir --index-url "${TORCH_ROCM_INDEX_URL}" \
+          "torch==${TORCH_ROCM_VERSION}" \
+          "torchvision==${TORCHVISION_ROCM_VERSION}" \
+          "torchaudio==${TORCHAUDIO_ROCM_VERSION}" \
+      && { python3 -m pip uninstall -y pytorch-triton-rocm triton-rocm triton || true; } \
+      && python3 -m pip install --no-cache-dir --no-deps "${TRITON_ROCM_WHEEL}" \
+      && META="$(python3 -c "import glob,sysconfig; print(next(iter(glob.glob(sysconfig.get_paths()['purelib']+'/torch-*.dist-info/METADATA')), ''))")" \
+      && [ -n "$META" ] && sed -i -E '/^Requires-Dist:[[:space:]]*(pytorch-triton-rocm|triton-rocm|triton)([[:space:]<>=;].*)?$/d' "$META"; \
+    fi
 
 WORKDIR /sgl-workspace
 
@@ -305,6 +342,25 @@ RUN git clone ${SGL_REPO} \
        fi
 
 RUN python -m pip cache purge
+
+# -----------------------
+# gfx950-rocm720: re-pin torch 2.11 after the SGLang install. SGLang's dependency
+# closure (e.g. cache-dit -> torch>=2.7.1) makes pip pull CUDA torch from PyPI,
+# clobbering the ROCm build and adding nvidia-*-cu12 wheels. Restore the ROCm trio
+# (--no-deps), drop the CUDA runtime packages, reinstall triton 3.6.0, and re-strip
+# torch's triton-rocm pin. Runs before TileLang / FHT / MORI / NIXL, which need torch.
+RUN if [ "${GPU_ARCH}" = "gfx950-rocm720" ]; then \
+      python3 -m pip install --no-cache-dir --force-reinstall --no-deps --index-url "${TORCH_ROCM_INDEX_URL}" \
+          "torch==${TORCH_ROCM_VERSION}" \
+          "torchvision==${TORCHVISION_ROCM_VERSION}" \
+          "torchaudio==${TORCHAUDIO_ROCM_VERSION}" \
+      && pip list --format=freeze 2>/dev/null | awk -F= '/^nvidia-.*-cu12/{print $1}' | xargs -r python3 -m pip uninstall -y \
+      && { python3 -m pip uninstall -y pytorch-triton-rocm triton-rocm triton || true; } \
+      && python3 -m pip install --no-cache-dir --no-deps "${TRITON_ROCM_WHEEL}" \
+      && META="$(python3 -c "import glob,sysconfig; print(next(iter(glob.glob(sysconfig.get_paths()['purelib']+'/torch-*.dist-info/METADATA')), ''))")" \
+      && { [ -z "$META" ] || sed -i -E '/^Requires-Dist:[[:space:]]*(pytorch-triton-rocm|triton-rocm|triton)([[:space:]<>=;].*)?$/d' "$META"; } \
+      && python3 -c "import torch; assert 'rocm' in torch.__version__, torch.__version__; print('restored torch', torch.__version__)"; \
+    fi
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
@@ -516,6 +572,10 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   apt-get update && apt-get install -y --no-install-recommends \
       build-essential autoconf automake libtool pkg-config git \
       libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
+  # Remove the distro Abseil (too old for nixl: has absl_base but not absl_log).
+  # nixl refuses to mix its bundled Abseil with a system one; drop it so the build
+  # uses a consistent Abseil. Harmless where libabsl is absent (|| true).
+  apt-get remove -y libabsl-dev libabsl20220623 || true; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
@@ -542,7 +602,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # The artifact hardcoded the supported triton version to be 3.5.1.
 # Rewrite the restriction directly.
 ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
+RUN if [ "${GPU_ARCH}" != "gfx942-rocm720" ]; then echo "[torch .lw] skip hack.py for ${GPU_ARCH}"; exit 0; fi; \
+     mkdir /tmp/whl && cd /tmp/whl \
      && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
      && cat > hack.py <<"PY"
 import zipfile, csv, os, re
@@ -591,18 +652,12 @@ with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
 print("Wrote", out_whl)
 PY
 
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
+RUN if [ "${GPU_ARCH}" != "gfx942-rocm720" ]; then echo "[torch .lw] skip patch for ${GPU_ARCH}"; exit 0; fi; \
+    echo "ROCm 7.2 (py3.10) flavor detected from GPU_ARCH=${GPU_ARCH}" \
+    && cd /tmp/whl \
+    && python hack.py \
+    && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
+    && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE}
 
 
 # -----------------------
