@@ -49,6 +49,7 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    is_hybrid_mla_backend: bool
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -111,6 +112,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod

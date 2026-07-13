@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
@@ -142,6 +142,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
+            server_args=SimpleNamespace(speculative_attention_mode="decode"),
         ),
         prefill_backend=make_fake("prefill", calls),
         decode_backend=make_fake("decode", calls),
