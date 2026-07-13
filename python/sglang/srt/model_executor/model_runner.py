@@ -464,6 +464,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
             gpu_id=self.gpu_id,
+            ps=self.ps,
             model_config=self.model_config,
             server_args=self.server_args,
             kv_cache_dtype=self.kv_cache_dtype,

@@ -50,6 +50,7 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
     )
@@ -70,6 +71,7 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
 class KVCacheConfigurator:
     device: str
     gpu_id: int
+    ps: ParallelState
     model_config: ModelConfig
     server_args: ServerArgs
     kv_cache_dtype: torch.dtype
