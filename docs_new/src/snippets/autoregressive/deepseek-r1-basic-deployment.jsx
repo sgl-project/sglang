@@ -122,6 +122,7 @@ export const DeepSeekR1BasicDeployment = () => {
       command += ' \\\n  --ep 8';
     }
     if (strategyValues.includes('mtp')) {
+      command = 'SGLANG_ENABLE_SPEC_V2=1 ' + command;
       command +=
         ' \\\n  --speculative-algorithm EAGLE' +
         ' \\\n  --speculative-num-steps 3' +

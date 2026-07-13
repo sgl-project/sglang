@@ -87,7 +87,8 @@ export const InternS2PreviewDeployment = () => {
     flags.push('  --host 0.0.0.0');
     flags.push('  --port 30000');
 
-    return `sglang serve \\\n${flags.join(' \\\n')}`;
+    const envPrefix = mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 \\\n' : '';
+    return `${envPrefix}sglang serve \\\n${flags.join(' \\\n')}`;
   };
 
   const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };

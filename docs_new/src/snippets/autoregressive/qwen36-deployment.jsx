@@ -177,8 +177,8 @@ export const Qwen36Deployment = () => {
 
     // NVFP4: nvidia/Qwen3.6-27B-NVFP4 on Blackwell (B200/B300). Follows the exact command
     // shape from the checkpoint's docs — explicit --tp-size 1, --attention-backend trtllm_mha,
-    // new-style --mamba-radix-cache-strategy, and explicit --host/--port (no
-    // --mem-fraction-static). Reasoning / tool-call parsers still follow their toggles.
+    // new-style --mamba-radix-cache-strategy, and explicit --host/--port (no --mem-fraction-static
+    // or SGLANG_ENABLE_SPEC_V2 prefix). Reasoning / tool-call parsers still follow their toggles.
     if (quantization === 'nvfp4') {
       let cmd = `sglang serve --model-path nvidia/Qwen3.6-${sizeConfig.baseName}-NVFP4`;
       cmd += ` \\\n  --tp-size ${hwConfig.tp} --attention-backend trtllm_mha`;
@@ -199,7 +199,12 @@ export const Qwen36Deployment = () => {
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
     const modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}${quantSuffix}`;
 
-    let cmd = `sglang serve --model-path ${modelName}`;
+    let cmd = '';
+    if (speculative === 'enabled') {
+      cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
+    }
+
+    cmd += `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     }

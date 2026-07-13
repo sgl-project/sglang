@@ -117,6 +117,7 @@ export const Hunyuan3PreviewDeployment = () => {
     const enableSpec = values.speculative === 'enabled' && !isXeon;
 
     let cmd = '';
+    if (enableSpec) cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
     cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;

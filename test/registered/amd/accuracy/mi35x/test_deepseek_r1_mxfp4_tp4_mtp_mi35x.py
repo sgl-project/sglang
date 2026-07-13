@@ -125,6 +125,7 @@ class TestDeepSeekR1MXFP4TP4MTPMI35x(unittest.TestCase):
                 "SGLANG_USE_AITER": "1",
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
                 # Retired on current main, but kept to mirror the reported launch.
+                "SGLANG_ENABLE_SPEC_V2": "1",
                 "ROCM_QUICK_REDUCE_QUANTIZATION": "NONE",
                 "SGLANG_AITER_FP8_PREFILL_ATTN": "1",
                 "SGLANG_AITER_MLA_PERSIST": "1",
