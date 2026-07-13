@@ -1,4 +1,7 @@
-from typing import Optional, Tuple, Union
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -24,6 +27,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+        FlashInferGDNExtendPrep,
+    )
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -52,6 +60,27 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+class _Unbuilt:
+    __slots__ = ()
+
+
+_UNBUILT = _Unbuilt()
+
+
+@dataclass(frozen=True, slots=True, eq=False, kw_only=True)
+class GDNExtendMetadata:
+    """Immutable values shared by every GDN layer in one extend forward."""
+
+    has_initial_states: torch.Tensor
+    no_prefix: bool
+    needs_state_gather: bool
+    source_cache_indices: torch.Tensor
+    state_cache_indices: torch.Tensor
+    source_state_pool_size: int
+    state_pool_size: int
+    flashinfer_prep: Optional[FlashInferGDNExtendPrep]
 
 
 def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
@@ -180,15 +209,7 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Resolve the FlashInfer-only packed-prefill strategy and metadata
-        # hoist once. Other backends retain their original separated path and
-        # per-layer metadata behavior.
-        if prefill_backend.is_flashinfer():
-            self._extend_prefill_impl = self.extend_kernel.extend_packed
-            self._build_extend_prep_impl = self.extend_kernel.build_extend_prep
-        else:
-            self._extend_prefill_impl = self._extend_prefill_separated
-            self._build_extend_prep_impl = None
+        self.uses_flashinfer_prefill = prefill_backend.is_flashinfer()
 
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
@@ -273,25 +294,16 @@ class GDNKernelDispatcher:
             **kwargs,
         )
 
-    def build_extend_prep(
+    def build_flashinfer_extend_prep(
         self,
         *,
-        head_k_dim: int,
-        query_start_loc: torch.Tensor,
         cache_indices: torch.Tensor,
-        ssm_states: torch.Tensor,
-        total_seq_len: int,
-    ) -> Optional[tuple]:
-        if self._build_extend_prep_impl is None:
-            # Empty opaque metadata marks this forward as initialized without
-            # changing non-FlashInfer backend behavior.
-            return ()
-        return self._build_extend_prep_impl(
-            head_k_dim=head_k_dim,
-            query_start_loc=query_start_loc,
+        state_pool_size: int,
+    ) -> FlashInferGDNExtendPrep:
+        assert self.uses_flashinfer_prefill
+        return self.extend_kernel.build_extend_prep(
             cache_indices=cache_indices,
-            ssm_states=ssm_states,
-            total_seq_len=total_seq_len,
+            state_pool_size=state_pool_size,
         )
 
     def extend_prefill_from_packed(
@@ -307,11 +319,28 @@ class GDNKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        prep: Optional[tuple] = None,
+        flashinfer_prep: Optional[FlashInferGDNExtendPrep] = None,
         no_prefix: bool = False,
     ) -> tuple:
         """Run GDN prefill without exposing backend tensor representations."""
-        return self._extend_prefill_impl(
+        if self.uses_flashinfer_prefill:
+            return self.extend_kernel.extend_packed(
+                mixed_qkv,
+                a,
+                b,
+                shape=shape,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                out=out,
+                prep=flashinfer_prep,
+                no_prefix=no_prefix,
+            )
+
+        assert flashinfer_prep is None
+        return self._extend_prefill_separated(
             mixed_qkv,
             a,
             b,
@@ -322,7 +351,6 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             out=out,
-            prep=prep,
             no_prefix=no_prefix,
         )
 
@@ -339,7 +367,6 @@ class GDNKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        prep: Optional[tuple] = None,
         no_prefix: bool = False,
     ) -> tuple:
         query, key, value = split_gdn_prefill_qkv(mixed_qkv, shape)
@@ -354,7 +381,6 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             out=out,
-            prep=prep,
             no_prefix=no_prefix,
         )
 
@@ -439,20 +465,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        # Per-forward extend memo, keyed on the forward_metadata object (rebuilt
-        # each forward/replay -> auto-invalidated by identity; a held reference
-        # forecloses id() reuse). Owns every layer-invariant value the per-layer
-        # extend calls reuse.
-        self._extend_memo_fm = None
-        self._has_initial_states = None
-        self._extend_no_prefix = False
-        self._extend_prep = None
+        self._extend_metadata: GDNExtendMetadata | _Unbuilt = _UNBUILT
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
+    def _reset_extend_metadata(self) -> None:
+        self._extend_metadata = _UNBUILT
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._reset_extend_metadata()
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -462,6 +485,72 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        super().init_forward_metadata_out_graph(forward_batch, in_capture)
+        self._reset_extend_metadata()
+
+    def init_forward_metadata_capture_cpu_graph(self, *args, **kwargs):
+        super().init_forward_metadata_capture_cpu_graph(*args, **kwargs)
+        self._reset_extend_metadata()
+
+    def _get_or_build_extend_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        needs_state_gather: bool,
+        cache_indices: torch.Tensor,
+        source_state_pool_size: int,
+    ) -> GDNExtendMetadata:
+        metadata = self._extend_metadata
+        state_pool_size = (
+            cache_indices.shape[0] if needs_state_gather else source_state_pool_size
+        )
+        if metadata is _UNBUILT:
+            state_cache_indices = (
+                torch.arange(
+                    cache_indices.shape[0],
+                    device=cache_indices.device,
+                    dtype=cache_indices.dtype,
+                )
+                if needs_state_gather
+                else cache_indices
+            )
+            flashinfer_prep = (
+                self.kernel_dispatcher.build_flashinfer_extend_prep(
+                    cache_indices=state_cache_indices,
+                    state_pool_size=state_pool_size,
+                )
+                if self.kernel_dispatcher.uses_flashinfer_prefill
+                else None
+            )
+            metadata = GDNExtendMetadata(
+                has_initial_states=forward_batch.extend_prefix_lens > 0,
+                no_prefix=(
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and not any(forward_batch.extend_prefix_lens_cpu)
+                ),
+                needs_state_gather=needs_state_gather,
+                source_cache_indices=cache_indices,
+                state_cache_indices=state_cache_indices,
+                source_state_pool_size=source_state_pool_size,
+                state_pool_size=state_pool_size,
+                flashinfer_prep=flashinfer_prep,
+            )
+            self._extend_metadata = metadata
+            return metadata
+
+        assert isinstance(metadata, GDNExtendMetadata)
+        assert metadata.needs_state_gather == needs_state_gather
+        assert metadata.source_cache_indices.shape == cache_indices.shape
+        assert metadata.source_cache_indices.dtype == cache_indices.dtype
+        assert metadata.source_cache_indices.device == cache_indices.device
+        assert metadata.source_cache_indices.data_ptr() == cache_indices.data_ptr()
+        assert metadata.source_state_pool_size == source_state_pool_size
+        assert metadata.state_pool_size == state_pool_size
+        return metadata
 
     def forward_decode(
         self,
@@ -655,20 +744,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
 
-        if self._extend_memo_fm is not forward_metadata:
-            # Layer-invariant per forward (extend_prefix_lens is fixed at batch
-            # prep): compute once, reuse across the GDN layers.
-            self._has_initial_states = forward_batch.extend_prefix_lens > 0
-            # CPU-side "no request has a prefix" signal (no GPU sync): lets
-            # backends skip the SSM initial-state pool gather entirely and
-            # zero-seed in-kernel (bit-identical: freed slots are cleared).
-            self._extend_no_prefix = (
-                forward_batch.extend_prefix_lens_cpu is not None
-                and not any(forward_batch.extend_prefix_lens_cpu)
-            )
-            self._extend_prep = None
-            self._extend_memo_fm = forward_metadata
-
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
@@ -680,18 +755,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         needs_state_gather = (
             not conv_states.is_contiguous() or not ssm_states.is_contiguous()
         )
+        extend_metadata = self._get_or_build_extend_metadata(
+            forward_batch,
+            needs_state_gather=needs_state_gather,
+            cache_indices=cache_indices,
+            source_state_pool_size=ssm_states.shape[0],
+        )
+        state_cache_indices = extend_metadata.state_cache_indices
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()
             ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
         else:
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
-            state_cache_indices = cache_indices
 
         mixed_qkv = mixed_qkv.transpose(0, 1)
         if forward_metadata.has_mamba_track_mask:
@@ -706,29 +782,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.bias,
             activation=layer.activation,
             conv_states=conv_states_contig,
-            has_initial_state=self._has_initial_states,
+            has_initial_state=extend_metadata.has_initial_states,
             cache_indices=state_cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)[:seq_len]
 
-        actual_seq_len = mixed_qkv.shape[0]
         qkv_shape = _qkv_shape_from_layer(layer)
-
-        # FlashInfer's layer-invariant pool-gather indices are built on the
-        # first layer of each forward. Other backends receive empty opaque
-        # metadata and preserve their original per-layer behavior. Keyed by the
-        # memo generation above, NOT by state_cache_indices (a fresh arange per
-        # layer in the envelope pool). needs_state_gather and pool contiguity
-        # are layer-invariant, so layer-1's tensors are exact for all layers.
-        if self._extend_prep is None:
-            self._extend_prep = self.kernel_dispatcher.build_extend_prep(
-                head_k_dim=layer.head_k_dim,
-                query_start_loc=query_start_loc,
-                cache_indices=state_cache_indices,
-                ssm_states=ssm_states_contig,
-                total_seq_len=actual_seq_len,
-            )
 
         core_attn_out, last_recurrent_state, h = (
             self.kernel_dispatcher.extend_prefill_from_packed(
@@ -742,8 +802,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
                 out=out,
-                prep=self._extend_prep,
-                no_prefix=self._extend_no_prefix,
+                flashinfer_prep=extend_metadata.flashinfer_prep,
+                no_prefix=extend_metadata.no_prefix,
             )
         )
 

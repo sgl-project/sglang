@@ -20,6 +20,7 @@ if not torch.cuda.is_available():
     pytest.skip("requires CUDA", allow_module_level=True)
 
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (  # noqa: E402
+    FlashInferGDNExtendPrep,
     FlashInferGDNKernel,
     is_flashinfer_gdn_prefill_available,
 )
@@ -166,14 +167,12 @@ def test_flashinfer_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
         inp["cache_indices"][-1] = -1
 
     prep = kernel.build_extend_prep(
-        head_k_dim=inp["k"].shape[-1],
-        query_start_loc=inp["query_start_loc"],
         cache_indices=inp["cache_indices"],
-        ssm_states=inp["ssm_states"],
-        total_seq_len=inp["total_tokens"],
+        state_pool_size=inp["ssm_states"].shape[0],
     )
 
-    (ssm_cache_indices,) = prep
+    assert isinstance(prep, FlashInferGDNExtendPrep)
+    ssm_cache_indices = prep.ssm_cache_indices
     if kernel.use_state_pool:
         expected = inp["cache_indices"].clamp(min=0).to(torch.int64)
     else:

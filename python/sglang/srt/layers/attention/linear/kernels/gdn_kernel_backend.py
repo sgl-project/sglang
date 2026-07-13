@@ -28,18 +28,6 @@ class GDNKernelBase(LinearAttnKernelBase):
     ``alpha = exp(g)`` remain private to the concrete implementation.
     """
 
-    def build_extend_prep(
-        self,
-        *,
-        head_k_dim: int,
-        query_start_loc: torch.Tensor,
-        cache_indices: torch.Tensor,
-        ssm_states: torch.Tensor,
-        total_seq_len: int,
-    ) -> Optional[tuple]:
-        """Build opaque, backend-specific metadata reused across GDN layers."""
-        return None
-
     @abstractmethod
     def extend(
         self,
@@ -53,7 +41,6 @@ class GDNKernelBase(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        prep: Optional[tuple] = None,
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:

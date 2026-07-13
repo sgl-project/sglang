@@ -10,6 +10,7 @@ Requires flashinfer >= 0.6.7.
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -27,6 +28,14 @@ from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FlashInferGDNExtendPrep:
+    """FlashInfer state-gather metadata shared by all GDN layers in a forward."""
+
+    ssm_cache_indices: torch.Tensor
+
 
 # ---------------------------------------------------------------------------
 # Lazy import for FlashInfer GDN kernels
@@ -230,18 +239,14 @@ class FlashInferGDNKernel(GDNKernelBase):
     def build_extend_prep(
         self,
         *,
-        head_k_dim: int,
-        query_start_loc: torch.Tensor,
         cache_indices: torch.Tensor,
-        ssm_states: torch.Tensor,
-        total_seq_len: int,
-    ) -> tuple:
+        state_pool_size: int,
+    ) -> FlashInferGDNExtendPrep:
         """Compute the layer-invariant extend metadata once per forward.
 
         The pool-gather indices depend only on per-request cache slots,
         identical across all GDN layers of a forward, so forward_extend builds
-        this once and reuses it for every per-layer extend() call. Must stay
-        bit-identical to extend()'s prep=None recompute.
+        this once and reuses it for every per-layer extend() call.
         """
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
@@ -254,9 +259,9 @@ class FlashInferGDNKernel(GDNKernelBase):
             ssm_cache_indices = torch.where(
                 cache_indices >= 0,
                 cache_indices,
-                ssm_states.shape[0] - 1,
+                state_pool_size - 1,
             ).to(torch.int64)
-        return (ssm_cache_indices,)
+        return FlashInferGDNExtendPrep(ssm_cache_indices=ssm_cache_indices)
 
     def extend(
         self,
@@ -270,7 +275,7 @@ class FlashInferGDNKernel(GDNKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        prep: Optional[tuple] = None,
+        prep: Optional[FlashInferGDNExtendPrep] = None,
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
@@ -316,7 +321,7 @@ class FlashInferGDNKernel(GDNKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        prep: Optional[tuple] = None,
+        prep: Optional[FlashInferGDNExtendPrep] = None,
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
@@ -386,7 +391,7 @@ class FlashInferGDNKernel(GDNKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor],
-        prep: Optional[tuple],
+        prep: Optional[FlashInferGDNExtendPrep],
         no_prefix: bool,
     ) -> tuple:
         q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
@@ -416,7 +421,7 @@ class FlashInferGDNKernel(GDNKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor],
-        prep: Optional[tuple],
+        prep: Optional[FlashInferGDNExtendPrep],
         no_prefix: bool,
     ) -> tuple:
         total_seq_len = q_fi.shape[0]
@@ -427,13 +432,10 @@ class FlashInferGDNKernel(GDNKernelBase):
             # Fallback for direct extend() callers (e.g. unit tests); the hot
             # path passes prep built once per forward.
             prep = self.build_extend_prep(
-                head_k_dim=q_fi.shape[-1],
-                query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
-                ssm_states=ssm_states,
-                total_seq_len=total_seq_len,
+                state_pool_size=ssm_states.shape[0],
             )
-        (ssm_cache_indices,) = prep
+        ssm_cache_indices = prep.ssm_cache_indices
 
         output_buf = unwrap_direct_write_out(
             out, expected_shape=(1, total_seq_len, num_v_heads, head_v_dim)
