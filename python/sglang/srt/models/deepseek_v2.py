@@ -971,27 +971,14 @@ class DeepseekV2MoE(nn.Module):
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
         )
-        copy_add_ctx = nullcontext(None)
-        if (
-            has_shared_output
-            and not self._shared_expert_tp1
-            and not get_flags().capture.enable_torch_compile
-        ):
-            from sglang.srt.layers.moe.moe_runner.base import moe_output_copy_add_ctx
-
-            copy_add_ctx = moe_output_copy_add_ctx()
-
-        with copy_add_ctx as copy_add_state:
-            if deferred_finalize:
-                final_hidden_states = self.experts.forward_deferred_finalize(
-                    hidden_states, topk_output
-                )
-            elif use_flashinfer_trtllm_bypass:
-                final_hidden_states = self.experts.forward_impl(
-                    hidden_states, topk_output
-                )
-            else:
-                final_hidden_states = self.experts(hidden_states, topk_output)
+        if deferred_finalize:
+            final_hidden_states = self.experts.forward_deferred_finalize(
+                hidden_states, topk_output
+            )
+        elif use_flashinfer_trtllm_bypass:
+            final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             not _is_cuda
             and not _is_musa
@@ -1007,15 +994,6 @@ class DeepseekV2MoE(nn.Module):
             )
 
         current_stream.wait_stream(self.alt_stream)
-        if copy_add_state is not None and shared_output is not None:
-            from sglang.srt.layers.moe.moe_runner.base import (
-                finalize_moe_output_copy_add,
-            )
-
-            if finalize_moe_output_copy_add(copy_add_state, shared_output):
-                # The deferred FlashInfer output copy already folded in the
-                # shared output, so skip the generic shared add below.
-                shared_output = None
 
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

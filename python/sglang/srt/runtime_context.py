@@ -400,7 +400,6 @@ class ForwardFlags:
     _DEFAULTS = {
         "multi_stream": False,
         "moe_output_buffer": None,
-        "moe_output_copy_add_state": None,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,
