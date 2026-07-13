@@ -506,9 +506,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
-        # CUTLASS block-FP8 beats the (untuned) Triton kernel on SM120 at
-        # every M measured (DSv4-Flash shapes, RTX PRO 6000): decode
-        # graph-replay M=1/8/64 is 24-28% faster, M=16384 prefill ~24%.
+        # The Triton block-FP8 kernel has no SM120 tuning.
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)

@@ -1075,7 +1075,7 @@ def _apply_swiglu_limit(
 
     num_tokens, hidden_size_x2 = gateup_output.shape
     half = hidden_size_x2 // 2
-    # In-place clamp avoids torch.cat overhead (7.4ms/step from CatArrayBatchedCopy)
+    # In-place to avoid materializing a concat.
     gateup_output[:, :half].clamp_(max=swiglu_limit)
     gateup_output[:, half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
     return gateup_output

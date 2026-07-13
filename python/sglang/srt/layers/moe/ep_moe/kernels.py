@@ -1198,7 +1198,6 @@ def _per_token_group_quant_fp8_pow2_kernel(
     absmax = tl.max(tl.abs(x))
     absmax = tl.maximum(absmax, 1e-10)
     raw_scale = absmax / fp8_max
-    # Round up to next power of 2: 2^ceil(log2(x))
     scale = tl.exp2(tl.ceil(tl.math.log2(raw_scale)))
     inv_scale = 1.0 / scale
 
