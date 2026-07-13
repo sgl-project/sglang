@@ -51,6 +51,22 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
+def _detect_is_gfx1250() -> bool:
+    if not _is_hip:
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but its
+# aiter rope kernels (ck_tile) do not build, so it runs sglang's native rope which
+# lacks the separate cos_cache/sin_cache buffers the gfx95 fused-rope decode path
+# expects. This flag lets gfx1250 carve out of that fused-rope path.
+_is_gfx1250 = _detect_is_gfx1250()
+
+
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
