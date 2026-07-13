@@ -90,7 +90,9 @@ class DenoisingRequestState:
     attn_metadata_is_static: bool = False
     # Deep-copied raw request for mid-flight export/import.
     raw_req_snapshot: Req | None = None
-    # Per-request TeaCache state snapshot.
+    # Per-request TeaCache snapshots keyed by model phase
+    # ("transformer" / "transformer_2") so dual-DiT pipelines never share
+    # cached residuals across experts.
     teacache_state: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -132,7 +134,19 @@ _TEACACHE_PREFIX_ATTRS = ("previous_", "accumulated_rel_l1")
 
 
 class TeaCacheStateIsolator:
-    """Capture/restore per-request TeaCache state on a shared DiT model."""
+    """Capture/restore per-request TeaCache state on a shared DiT model.
+
+    Models exposing the explicit cache-state interface
+    (``capture_teacache_state`` / ``install_teacache_state``) use typed
+    :class:`TeaCacheRequestState` snapshots; other models fall back to a
+    legacy attribute scan.
+    """
+
+    @staticmethod
+    def _has_explicit_interface(model: Any) -> bool:
+        return callable(getattr(model, "capture_teacache_state", None)) and callable(
+            getattr(model, "install_teacache_state", None)
+        )
 
     @staticmethod
     def state_attrs(model: Any) -> tuple[str, ...]:
@@ -145,11 +159,16 @@ class TeaCacheStateIsolator:
         return tuple(names)
 
     @classmethod
-    def capture(cls, model: Any) -> dict[str, Any]:
+    def capture(cls, model: Any) -> Any:
+        if cls._has_explicit_interface(model):
+            return model.capture_teacache_state()
         return {name: getattr(model, name) for name in cls.state_attrs(model)}
 
     @classmethod
-    def install(cls, model: Any, snapshot: dict[str, Any] | None) -> None:
+    def install(cls, model: Any, snapshot: Any | None) -> None:
+        if cls._has_explicit_interface(model):
+            model.install_teacache_state(snapshot)
+            return
         if snapshot is not None:
             for name, value in snapshot.items():
                 setattr(model, name, value)
@@ -560,13 +579,33 @@ class ContinuousDenoisingCoordinator:
         return "transformer"
 
     def _request_is_packable(self, state: DenoisingRequestState) -> bool:
-        if state.req.enable_teacache:
-            # TeaCache is per-request and must run unpacked.
+        from sglang.multimodal_gen.runtime.pipelines_core.batched_solver import (
+            scheduler_is_batchable,
+        )
+
+        if state.req.enable_teacache and not self._teacache_can_run_packed(state):
+            # TeaCache without a row-aware model must run unpacked.
             return False
         if not state.attn_metadata_is_static:
             # Sparse/video backends have step-dependent metadata; keep separate.
             return False
+        if not scheduler_is_batchable(state.denoising_context.scheduler, diagnose=True):
+            # Packed groups step only through the vectorized solver (no
+            # per-request scheduler.step fallback), so non-batchable
+            # schedulers run unpacked.
+            return False
         return True
+
+    def _teacache_can_run_packed(self, state: DenoisingRequestState) -> bool:
+        """TeaCache rows may pack when the model supports per-row plans."""
+        if not (
+            self.allow_step_caches
+            and bool(getattr(self.server_args, "cb_packed_teacache", False))
+        ):
+            return False
+        step = state.current_step
+        model = getattr(step, "current_model", None) if step is not None else None
+        return bool(getattr(model, "supports_packed_teacache", False))
 
     def prepare_next_denoising_step(self, state: DenoisingRequestState) -> bool:
         if state.step_index >= state.num_timesteps:
@@ -652,9 +691,28 @@ class ContinuousDenoisingCoordinator:
             return selected[:1]
         return selected
 
+    def _teacache_phase_states(self, state: DenoisingRequestState) -> dict[str, Any]:
+        if state.teacache_state is None:
+            state.teacache_state = {}
+        return state.teacache_state
+
+    def _teacache_state_for_phase(
+        self, state: DenoisingRequestState, phase: str
+    ) -> Any | None:
+        """Snapshot for this phase; entering a new phase seeds from the last.
+
+        The forward counter carries across the expert boundary but cached
+        tensors never do, so one expert's residuals can never patch the other.
+        """
+        from sglang.multimodal_gen.runtime.cache.teacache import (
+            resolve_teacache_phase_state,
+        )
+
+        return resolve_teacache_phase_state(self._teacache_phase_states(state), phase)
+
     def _swap_in_teacache_state(
         self, state: DenoisingRequestState
-    ) -> tuple[Any, dict[str, Any]] | None:
+    ) -> tuple[Any, Any, str] | None:
         """Install this request's TeaCache state on the active model."""
         if not (self.allow_step_caches and state.req.enable_teacache):
             return None
@@ -662,19 +720,22 @@ class ContinuousDenoisingCoordinator:
         model = getattr(step, "current_model", None) if step is not None else None
         if model is None or not TeaCacheStateIsolator.model_has_teacache(model):
             return None
+        phase = self._model_phase(state)
         previous = TeaCacheStateIsolator.capture(model)
-        TeaCacheStateIsolator.install(model, state.teacache_state)
-        return model, previous
+        TeaCacheStateIsolator.install(
+            model, self._teacache_state_for_phase(state, phase)
+        )
+        return model, previous, phase
 
     def _swap_out_teacache_state(
         self,
         state: DenoisingRequestState,
-        swap: tuple[Any, dict[str, Any]] | None,
+        swap: tuple[Any, Any, str] | None,
     ) -> None:
         if swap is None:
             return
-        model, previous = swap
-        state.teacache_state = TeaCacheStateIsolator.capture(model)
+        model, previous, phase = swap
+        self._teacache_phase_states(state)[phase] = TeaCacheStateIsolator.capture(model)
         TeaCacheStateIsolator.install(model, previous)
 
     def run_selected_steps_and_advance_requests(
@@ -750,6 +811,35 @@ class ContinuousDenoisingCoordinator:
             "response_group_id": state.response_group_id,
             "response_index": state.response_index,
             "response_group_size": state.response_group_size,
+            "teacache_state": self._export_teacache_states(state),
+        }
+
+    @staticmethod
+    def _export_teacache_states(
+        state: DenoisingRequestState,
+    ) -> dict[str, dict[str, Any]] | None:
+        """CPU-serialize per-phase TeaCache snapshots for drain/resume."""
+        if not state.teacache_state:
+            return None
+        payloads: dict[str, dict[str, Any]] = {}
+        for phase, snapshot in state.teacache_state.items():
+            to_payload = getattr(snapshot, "to_payload", None)
+            if callable(to_payload):
+                payloads[phase] = to_payload()
+        return payloads or None
+
+    @staticmethod
+    def _import_teacache_states(
+        payloads: dict[str, dict[str, Any]] | None,
+        device: Any,
+    ) -> dict[str, Any] | None:
+        if not payloads:
+            return None
+        from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheRequestState
+
+        return {
+            phase: TeaCacheRequestState.from_payload(payload, device=device)
+            for phase, payload in payloads.items()
         }
 
     def import_request_state(
@@ -775,6 +865,10 @@ class ContinuousDenoisingCoordinator:
         scheduler_step_index = payload.get("scheduler_step_index")
         if scheduler_step_index is not None:
             ctx.scheduler._step_index = int(scheduler_step_index)
+        state.teacache_state = self._import_teacache_states(
+            payload.get("teacache_state"),
+            ctx.latents.device,
+        )
         if not self.prepare_next_denoising_step(state):
             raise ContinuousBatchingError(
                 f"imported request {state.request_id} has no remaining steps"

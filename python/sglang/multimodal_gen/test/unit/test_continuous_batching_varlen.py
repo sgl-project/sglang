@@ -10,7 +10,10 @@ from sglang.multimodal_gen.runtime.managers.continuous_batching import (
     build_denoising_batch_key,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.batched_solver import (
+    SolverRejection,
     build_batched_solver,
+    scheduler_is_batchable,
+    sigma_table_cache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
@@ -195,10 +198,74 @@ class TestBatchedSolver(unittest.TestCase):
         self.assertEqual(scheduler_a._step_index, 3)
         self.assertEqual(scheduler_b._step_index, 1)
 
-    def test_try_build_rejects_unknown_scheduler(self):
+    def test_build_rejects_unknown_scheduler(self):
         scheduler = SimpleNamespace(sigmas=torch.linspace(1, 0, 5), order=1)
         state = _make_state(torch.randn(1, 4, 8), scheduler=scheduler)
-        self.assertIsNone(build_batched_solver([state], torch.device("cpu")))
+        self.assertFalse(scheduler_is_batchable(scheduler))
+        with self.assertRaises(SolverRejection):
+            build_batched_solver([state], torch.device("cpu"))
+
+    def test_scheduler_batchable_accepts_flow_match_euler(self):
+        scheduler = self._make_scheduler(4)
+        self.assertTrue(scheduler_is_batchable(scheduler))
+
+    def test_sigma_table_cache_reuses_rows(self):
+        scheduler = self._make_scheduler(6)
+        latents = torch.randn(1, 4, 8)
+        sigma_table_cache.clear()
+        state = _make_state(latents, step_index=0, scheduler=scheduler)
+        build_batched_solver([state], torch.device("cpu"))
+        self.assertEqual(sigma_table_cache.misses, 1)
+        build_batched_solver([state], torch.device("cpu"))
+        self.assertEqual(sigma_table_cache.hits, 1)
+        self.assertEqual(sigma_table_cache.misses, 1)
+
+    def test_repeated_steps_to_terminal_match_scheduler(self):
+        """Drive both members to their terminal step and compare each update."""
+        num_steps_a, num_steps_b = 4, 6
+        scheduler_a = self._make_scheduler(num_steps_a)
+        scheduler_b = self._make_scheduler(num_steps_b)
+        ref_a = self._make_scheduler(num_steps_a)
+        ref_b = self._make_scheduler(num_steps_b)
+
+        latents_a = torch.randn(1, 4, 8)
+        latents_b = torch.randn(1, 4, 8)
+        ref_latents_a = latents_a.clone()
+        ref_latents_b = latents_b.clone()
+        state_a = _make_state(latents_a, step_index=2, scheduler=scheduler_a)
+        state_b = _make_state(latents_b, step_index=0, scheduler=scheduler_b)
+        ref_a._step_index = 2
+        ref_b._step_index = 0
+
+        solver = build_batched_solver([state_a, state_b], torch.device("cpu"))
+        packed = torch.cat([latents_a, latents_b], dim=0)
+
+        # Step until member A hits its terminal step (indices 2..3).
+        for offset in range(num_steps_a - 2):
+            noise = torch.randn_like(packed)
+            packed = solver.step_rows(noise, packed, [state_a, state_b])
+
+            ref_latents_a = ref_a.step(
+                model_output=noise[0:1],
+                timestep=ref_a.timesteps[2 + offset],
+                sample=ref_latents_a,
+                return_dict=False,
+            )[0]
+            ref_latents_b = ref_b.step(
+                model_output=noise[1:2],
+                timestep=ref_b.timesteps[offset],
+                sample=ref_latents_b,
+                return_dict=False,
+            )[0]
+            state_a.step_index += 1
+            state_b.step_index += 1
+
+            torch.testing.assert_close(packed[0:1], ref_latents_a)
+            torch.testing.assert_close(packed[1:2], ref_latents_b)
+
+        # Member A is finished; scheduler counters stayed mirrored throughout.
+        self.assertEqual(scheduler_a._step_index, num_steps_a)
+        self.assertEqual(scheduler_b._step_index, 2)
 
 
 class TestVarlenBatchKey(unittest.TestCase):

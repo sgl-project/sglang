@@ -352,7 +352,9 @@ class ServerArgs(DisaggServerArgsMixin):
     cb_fold_cfg_branches: bool = True
     cb_batch_bucket_sizes: str | None = None
     cb_async_stages: bool = True
+    cb_stage_queue_depth: int = 8
     cb_allow_step_caches: bool = True
+    cb_packed_teacache: bool = False
     cb_varlen_packing: bool = False
     cb_drain_export_dir: str | None = None
 
@@ -1809,8 +1811,18 @@ class ServerArgs(DisaggServerArgsMixin):
             type=lambda value: value.lower() in ("1", "true", "yes"),
             default=ServerArgs.cb_async_stages,
             help=(
-                "Run encode/decode stages on a side stream so denoising "
-                "keeps running. Disabled when component offload is enabled."
+                "Run encode/decode stages on dedicated side-stream workers so "
+                "denoising keeps running. Disabled when component offload is "
+                "enabled."
+            ),
+        )
+        parser.add_argument(
+            "--cb-stage-queue-depth",
+            type=int,
+            default=ServerArgs.cb_stage_queue_depth,
+            help=(
+                "Bounded queue depth per async stage worker (encode/finalize). "
+                "Full queues apply backpressure instead of running inline."
             ),
         )
         parser.add_argument(
@@ -1818,6 +1830,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=lambda value: value.lower() in ("1", "true", "yes"),
             default=ServerArgs.cb_allow_step_caches,
             help="Allow TeaCache requests in the continuous loop (unpacked).",
+        )
+        parser.add_argument(
+            "--cb-packed-teacache",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_packed_teacache,
+            help=(
+                "EXPERIMENTAL: pack TeaCache requests with per-row hit/miss "
+                "gather-scatter on models that support it (e.g. Wan)."
+            ),
         )
         parser.add_argument(
             "--cb-varlen-packing",
@@ -2462,6 +2483,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 ) from e
             if any(bucket < 1 for bucket in buckets):
                 raise ValueError("cb_batch_bucket_sizes entries must be >= 1")
+        if self.cb_stage_queue_depth < 1:
+            raise ValueError("cb_stage_queue_depth must be >= 1")
         if self.batching_mode == "continuous":
             validate_continuous_batching_config(self)
 

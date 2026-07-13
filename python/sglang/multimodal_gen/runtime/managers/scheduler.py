@@ -1276,11 +1276,17 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         pipeline = continuous_coordinator.pipeline
         server_args = self.server_args
-        stage_worker.submit(
-            "encode",
-            ticket,
-            lambda: pipeline.run_stages_before_denoising(req, server_args),
-        )
+        try:
+            stage_worker.submit(
+                "encode",
+                ticket,
+                lambda: pipeline.run_stages_before_denoising(req, server_args),
+            )
+        except Exception as e:
+            # Admission pre-checks queue capacity, so a submit failure means
+            # the worker died or the invariant broke; fail the request loudly.
+            pending_admissions.pop(ticket, None)
+            on_error(e, log=True)
 
     def _admit_waiting_requests_to_continuous_loop(
         self,
@@ -1301,6 +1307,24 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 has_inflight and self._continuous_item_is_warmup(req_or_group)
             ):
                 break
+
+            if (
+                stage_worker is not None
+                and not self._continuous_item_is_warmup(req_or_group)
+                and (
+                    isinstance(req_or_group, Req)
+                    or self._is_continuous_request_group(req_or_group)
+                )
+            ):
+                needed = (
+                    len(req_or_group)
+                    if self._is_continuous_request_group(req_or_group)
+                    else 1
+                )
+                if not stage_worker.can_submit("encode", needed):
+                    # Bounded encode queue: apply backpressure by leaving the
+                    # request in the waiting queue until capacity frees up.
+                    break
 
             pending_reqs = [item.req for item in pending_admissions.values()]
 
@@ -1590,6 +1614,46 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 is_warmup=state.req.is_warmup,
             )
 
+    def _drain_finalize_backlog(
+        self,
+        continuous_coordinator: ContinuousDenoisingCoordinator,
+        stage_worker: Any,
+        finalize_backlog: list[DenoisingRequestState],
+        pending_finalizes: dict[int, DenoisingRequestState],
+        pending_groups: dict[str, ContinuousResponseGroup],
+    ) -> None:
+        """Submit backlogged finalize jobs as bounded-queue capacity frees up."""
+        from sglang.multimodal_gen.runtime.managers.continuous_stage_worker import (
+            WorkerState,
+        )
+
+        if stage_worker.worker_state("finalize") is not WorkerState.RUNNING:
+            # The finalize worker died; fail the backlog loudly instead of
+            # silently decoding inline.
+            while finalize_backlog:
+                state = finalize_backlog.pop(0)
+                state.set_error_output(
+                    "continuous batching finalize worker is not running"
+                )
+                self._safe_return_completed_request_state(state, pending_groups)
+            return
+        while finalize_backlog and stage_worker.can_submit("finalize"):
+            state = finalize_backlog.pop(0)
+            ticket = self._next_admission_ticket
+            self._next_admission_ticket += 1
+            pending_finalizes[ticket] = state
+            submitted = stage_worker.try_submit(
+                "finalize",
+                ticket,
+                lambda state=state: (
+                    continuous_coordinator.finalize_completed_request(state)
+                ),
+            )
+            if not submitted:
+                pending_finalizes.pop(ticket, None)
+                finalize_backlog.insert(0, state)
+                break
+
     def _run_continuous_batching_loop(self) -> None:
         logger.info(
             "Continuous batching scheduler enabled "
@@ -1608,8 +1672,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         pending_groups: dict[str, ContinuousResponseGroup] = {}
         pending_admissions: dict[int, _PendingAdmission] = {}
         pending_finalizes: dict[int, DenoisingRequestState] = {}
+        finalize_backlog: list[DenoisingRequestState] = []
         stage_worker = (
-            AsyncContinuousStageWorker()
+            AsyncContinuousStageWorker(
+                queue_depth=int(
+                    getattr(self.server_args, "cb_stage_queue_depth", 8) or 8
+                )
+            )
             if async_stages_supported(self.server_args)
             else None
         )
@@ -1661,6 +1730,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     pending_admissions,
                     pending_finalizes,
                 )
+                self._drain_finalize_backlog(
+                    continuous_coordinator,
+                    stage_worker,
+                    finalize_backlog,
+                    pending_finalizes,
+                    pending_groups,
+                )
 
             if self._should_wait_for_more_initial_requests(
                 active_states, pending_admissions
@@ -1686,7 +1762,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 active_states
             )
             if not denoising_batch:
-                if stage_worker is not None and stage_worker.pending > 0:
+                if stage_worker is not None and (
+                    stage_worker.pending > 0 or finalize_backlog
+                ):
                     # No denoising work yet; block on the next async result.
                     self._process_stage_worker_results(
                         continuous_coordinator,
@@ -1696,6 +1774,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         pending_admissions,
                         pending_finalizes,
                         block_one=True,
+                    )
+                    self._drain_finalize_backlog(
+                        continuous_coordinator,
+                        stage_worker,
+                        finalize_backlog,
+                        pending_finalizes,
+                        pending_groups,
                     )
                 elif self.waiting_queue and self.receiver is not None:
                     self._poller.poll(
@@ -1747,20 +1832,20 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     # Already failed; return the error immediately.
                     self._safe_return_completed_request_state(state, pending_groups)
                 elif stage_worker is not None and not state.req.is_warmup:
-                    # Offload VAE decode/postprocessing to keep denoising busy.
-                    ticket = self._next_admission_ticket
-                    self._next_admission_ticket += 1
-                    pending_finalizes[ticket] = state
-                    stage_worker.submit(
-                        "finalize",
-                        ticket,
-                        lambda state=state: (
-                            continuous_coordinator.finalize_completed_request(state)
-                        ),
-                    )
+                    # Offload VAE decode/postprocessing to keep denoising busy;
+                    # the bounded finalize queue is fed through the backlog.
+                    finalize_backlog.append(state)
                 else:
                     continuous_coordinator.finalize_completed_request(state)
                     self._safe_return_completed_request_state(state, pending_groups)
+            if stage_worker is not None:
+                self._drain_finalize_backlog(
+                    continuous_coordinator,
+                    stage_worker,
+                    finalize_backlog,
+                    pending_finalizes,
+                    pending_groups,
+                )
 
             active_states = [state for state in active_states if not state.is_complete]
             if rotate_policy and len(active_states) > 1:
@@ -1778,16 +1863,24 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         # Flush async work and drain-export remaining in-flight requests.
         if stage_worker is not None:
-            while stage_worker.pending > 0:
-                self._process_stage_worker_results(
+            while stage_worker.pending > 0 or finalize_backlog:
+                self._drain_finalize_backlog(
                     continuous_coordinator,
                     stage_worker,
-                    active_states,
-                    pending_groups,
-                    pending_admissions,
+                    finalize_backlog,
                     pending_finalizes,
-                    block_one=True,
+                    pending_groups,
                 )
+                if stage_worker.pending > 0:
+                    self._process_stage_worker_results(
+                        continuous_coordinator,
+                        stage_worker,
+                        active_states,
+                        pending_groups,
+                        pending_admissions,
+                        pending_finalizes,
+                        block_one=True,
+                    )
             stage_worker.shutdown()
 
         in_flight = [state for state in active_states if not state.is_complete]

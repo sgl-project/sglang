@@ -3,30 +3,116 @@
 
 Advances all packed rows in one fused update and keeps per-request scheduler
 state consistent so requests can leave the batch at any step.
+
+Packed execution has no per-request ``scheduler.step()`` fallback: only
+schedulers accepted by :func:`scheduler_is_batchable` may join a packed
+group, and a packed group that cannot build its solver is a hard error.
+Requests with unsupported schedulers simply run unpacked; the reason is
+surfaced through rate-limited diagnostics instead of a silent degradation.
+
+A fused CUDA kernel for the update was intentionally not added: the packed
+update is a couple of elementwise kernels on latents and profiling on the
+target GPUs should justify a custom kernel before one is introduced.
 """
 
 from __future__ import annotations
 
+import hashlib
+import threading
+from collections import OrderedDict
 from typing import Any
 
 import torch
+
+from sglang.multimodal_gen.runtime.pipelines_core.fallback_diagnostics import (
+    fallback_diagnostics,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 # First-order FlowMatch-Euler update: prev = sample + (sigma_next - sigma) * model_output.
 _FLOW_MATCH_EULER_CLASS_NAMES = frozenset({"FlowMatchEulerDiscreteScheduler"})
 
 
-def _scheduler_is_plain_flow_match_euler(scheduler: Any) -> bool:
+class SolverRejection(Exception):
+    """The batched solver cannot handle these schedulers (with the reason)."""
+
+
+def _scheduler_rejection_reason(scheduler: Any) -> str | None:
+    """Why this scheduler cannot use the vectorized solver, or None if it can."""
     if type(scheduler).__name__ not in _FLOW_MATCH_EULER_CLASS_NAMES:
-        return False
+        return f"unsupported scheduler {type(scheduler).__name__}"
     if getattr(scheduler, "order", 1) != 1:
-        return False
+        return "scheduler order != 1"
     config = getattr(scheduler, "config", None)
     if config is not None and getattr(config, "stochastic_sampling", False):
-        return False
+        return "stochastic_sampling is not vectorized"
     sigmas = getattr(scheduler, "sigmas", None)
     if not isinstance(sigmas, torch.Tensor) or sigmas.ndim != 1:
-        return False
-    return True
+        return "scheduler sigmas are not a 1-D tensor"
+    return None
+
+
+def scheduler_is_batchable(scheduler: Any, *, diagnose: bool = False) -> bool:
+    """Whether this scheduler may join a packed (vectorized) step group.
+
+    With ``diagnose=True`` a rejection is recorded in the rate-limited
+    fallback diagnostics so operators can see why requests run unpacked.
+    """
+    reason = _scheduler_rejection_reason(scheduler)
+    if reason is None:
+        return True
+    if diagnose:
+        fallback_diagnostics.record("batched-solver", type(scheduler).__name__, reason)
+    return False
+
+
+class _SigmaTableCache:
+    """LRU cache of per-schedule sigma rows already resident on device.
+
+    Keyed by the schedule content (hash of the fp32 sigmas) and target device
+    so repeated group rebuilds with the same schedules skip the host-to-device
+    copies. Tables are tiny ([num_steps + 1] fp32) so a small LRU suffices.
+    """
+
+    def __init__(self, max_entries: int = 64) -> None:
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple[str, str], torch.Tensor] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _fingerprint(sigmas: torch.Tensor) -> str:
+        cpu = sigmas.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        return hashlib.sha1(cpu.numpy().tobytes()).hexdigest()
+
+    def get(self, sigmas: torch.Tensor, device: torch.device) -> torch.Tensor:
+        key = (self._fingerprint(sigmas), str(device))
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is not None:
+                self._entries.move_to_end(key)
+                self.hits += 1
+                return cached
+            self.misses += 1
+        row = sigmas.detach().to(device=device, dtype=torch.float32)
+        with self._lock:
+            self._entries[key] = row
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return row
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self.hits = 0
+            self.misses = 0
+
+
+sigma_table_cache = _SigmaTableCache()
 
 
 class BatchedFlowMatchEulerSolver:
@@ -54,26 +140,27 @@ class BatchedFlowMatchEulerSolver:
         cls,
         states: list[Any],
         device: torch.device,
-    ) -> BatchedFlowMatchEulerSolver | None:
-        """Build a vectorized solver for member states, or return None."""
+    ) -> BatchedFlowMatchEulerSolver:
+        """Build a vectorized solver for member states or raise SolverRejection."""
         schedulers = [state.denoising_context.scheduler for state in states]
-        if not all(_scheduler_is_plain_flow_match_euler(s) for s in schedulers):
-            return None
-
-        sigma_rows: list[torch.Tensor] = []
-        max_len = 0
         for scheduler in schedulers:
-            sigmas = scheduler.sigmas
-            max_len = max(max_len, int(sigmas.shape[0]))
+            reason = _scheduler_rejection_reason(scheduler)
+            if reason is not None:
+                raise SolverRejection(reason)
+
+        rows = [
+            sigma_table_cache.get(scheduler.sigmas, device) for scheduler in schedulers
+        ]
+        max_len = max(int(row.shape[0]) for row in rows)
         # +1 so sigma_{i+1} at the final step stays in range.
         table_len = max_len + 1
-        for scheduler in schedulers:
-            sigmas = scheduler.sigmas.to(dtype=torch.float32)
-            pad = table_len - int(sigmas.shape[0])
+        padded_rows = []
+        for row in rows:
+            pad = table_len - int(row.shape[0])
             if pad > 0:
-                sigmas = torch.cat([sigmas, sigmas[-1:].expand(pad)])
-            sigma_rows.append(sigmas)
-        sigma_table = torch.stack(sigma_rows).to(device=device, non_blocking=True)
+                row = torch.cat([row, row[-1:].expand(pad)])
+            padded_rows.append(row)
+        sigma_table = torch.stack(padded_rows)
 
         start_indices = torch.tensor(
             [int(state.step_index) for state in states],
@@ -129,11 +216,13 @@ class BatchedFlowMatchEulerSolver:
 def build_batched_solver(
     states: list[Any],
     device: torch.device,
-) -> BatchedFlowMatchEulerSolver | None:
-    """Build a batched solver, falling back to None on any error."""
+) -> BatchedFlowMatchEulerSolver:
+    """Build the batched solver for a packed group.
+
+    Raises :class:`SolverRejection` when any member's scheduler is not
+    vectorizable. Packed groups must not form around such schedulers, so a
+    rejection here means the packability pre-screen was bypassed.
+    """
     if not states:
-        return None
-    try:
-        return BatchedFlowMatchEulerSolver.try_build(states, device)
-    except Exception:
-        return None
+        raise SolverRejection("no member states")
+    return BatchedFlowMatchEulerSolver.try_build(states, device)

@@ -227,7 +227,8 @@ class PackedStepGroup:
     # Merged cond/uncond kwargs for single-forward CFG; None if folded per branch.
     folded_kwargs: dict[str, Any] | None
     guidance: torch.Tensor | None
-    # Persistent packed latents; None when using per-request solver fallback.
+    # Persistent packed latents; packed groups always step through the
+    # vectorized solver (there is no per-request scheduler.step fallback).
     packed_latents: torch.Tensor | None
     solver: Any | None
     current_model: Any
@@ -1797,7 +1798,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             try:
                 group = self.build_packed_step_group(states, server_args)
             except DenoisingStepPackingError as exc:
-                logger.debug("Step batch packing fell back to local steps: %s", exc)
+                from sglang.multimodal_gen.runtime.pipelines_core.fallback_diagnostics import (
+                    fallback_diagnostics,
+                )
+
+                fallback_diagnostics.record(
+                    "step-packing",
+                    type(server_args.pipeline_config).__name__,
+                    str(exc),
+                )
                 self._run_unpacked_denoising_steps(states, server_args)
                 return None
 
@@ -1891,15 +1900,108 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         finally:
             self.close_denoising_progress(ctx)
 
+    def _model_phase_name(self, model: Any) -> str:
+        """Name the DiT phase for per-request cache snapshots."""
+        transformer_2 = getattr(self, "transformer_2", None)
+        if transformer_2 is not None and model is transformer_2:
+            return "transformer_2"
+        return "transformer"
+
+    def _packed_teacache_allowed(
+        self, states: list[Any], server_args: ServerArgs
+    ) -> bool:
+        """Whether TeaCache members may run packed via a per-row plan."""
+        teacache_states = [
+            state for state in states if getattr(state.req, "enable_teacache", False)
+        ]
+        if not teacache_states:
+            return True
+        if not (
+            getattr(server_args, "cb_allow_step_caches", True)
+            and getattr(server_args, "cb_packed_teacache", False)
+        ):
+            return False
+        for state in teacache_states:
+            step = state.current_step
+            model = getattr(step, "current_model", None) if step is not None else None
+            if not getattr(model, "supports_packed_teacache", False):
+                return False
+            if not hasattr(state, "teacache_state"):
+                # Only coordinator-managed states carry per-request snapshots.
+                return False
+            if should_apply_wan_ti2v(state.req, server_args):
+                return False
+        return True
+
+    def _build_packed_teacache_plan(
+        self, group: PackedStepGroup, states: list[Any]
+    ) -> Any | None:
+        """Build the per-row TeaCache plan for one packed step, or None."""
+        if group.varlen_row_seq_lens is not None or group.uses_wan_ti2v_timesteps:
+            return None
+        if not any(getattr(state.req, "enable_teacache", False) for state in states):
+            return None
+        from sglang.multimodal_gen.runtime.cache.teacache import (
+            TeaCachePackedMember,
+            TeaCachePackedPlan,
+            resolve_teacache_phase_state,
+        )
+
+        phase = self._model_phase_name(group.current_model)
+        members = []
+        for index, state in enumerate(states):
+            req = state.req
+            teacache_params = getattr(req, "teacache_params", None)
+            member_state = None
+            if (
+                getattr(req, "enable_teacache", False)
+                and teacache_params is not None
+                and hasattr(state, "teacache_state")
+            ):
+                phase_states = state.teacache_state
+                if phase_states is None:
+                    phase_states = {}
+                    state.teacache_state = phase_states
+                member_state = resolve_teacache_phase_state(
+                    phase_states, phase, create=True
+                )
+            members.append(
+                TeaCachePackedMember(
+                    row_slice=group.row_slices[index],
+                    state=member_state,
+                    step_index=int(state.current_step.step_index),
+                    num_inference_steps=int(
+                        getattr(req, "num_inference_steps", 0) or 0
+                    ),
+                    do_cfg=bool(getattr(req, "do_classifier_free_guidance", False)),
+                    teacache_params=teacache_params,
+                )
+            )
+        plan = TeaCachePackedPlan(members=members)
+        return plan if plan.any_enabled else None
+
     def can_run_steps_in_one_forward_pass(
         self, states: list[Any], server_args: ServerArgs
     ) -> bool:
+        from sglang.multimodal_gen.runtime.pipelines_core.batched_solver import (
+            scheduler_is_batchable,
+        )
+
         if not states:
             return False
         if type(self)._run_denoising_step is not DenoisingStage._run_denoising_step:
             return False
         if getattr(server_args, "enable_cfg_parallel", False):
             return False
+        if not self._packed_teacache_allowed(states, server_args):
+            return False
+        # Packed groups have no per-request scheduler.step() fallback, so only
+        # solver-batchable schedulers (and whole-tensor timesteps) may pack.
+        for state in states:
+            if not scheduler_is_batchable(state.denoising_context.scheduler):
+                return False
+            if should_apply_wan_ti2v(state.req, server_args):
+                return False
 
         first = states[0]
         first_step = first.current_step
@@ -1960,27 +2062,50 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return False
         return True
 
+    def _varlen_step_packing_block_reason(
+        self, states: list[Any], server_args: ServerArgs
+    ) -> str | None:
+        """Why cross-resolution packing is unavailable, or None when allowed."""
+        if not getattr(server_args, "cb_varlen_packing", False):
+            return "disabled (--cb-varlen-packing false)"
+        if not getattr(
+            server_args.pipeline_config, "supports_varlen_step_packing", False
+        ):
+            return "pipeline does not support varlen step packing"
+        for attr in ("sp_degree", "ulysses_degree", "ring_degree"):
+            if int(getattr(server_args, attr, 1) or 1) != 1:
+                return f"sequence parallelism is unsupported ({attr} != 1)"
+        first_step = states[0].current_step
+        model = getattr(first_step, "current_model", None) if first_step else None
+        if not getattr(model, "supports_varlen_step_packing", False):
+            return "model does not support varlen step packing"
+        # zero_cond_t modulation indexes assume equal per-row sequence sizes.
+        if getattr(model, "zero_cond_t", False):
+            return "zero_cond_t modulation requires equal sequence sizes"
+        if not all(state.denoising_context.latents.ndim == 3 for state in states):
+            return "latents are not [batch, seq, channels] shaped"
+        return None
+
     def _varlen_step_packing_allowed(
         self, states: list[Any], server_args: ServerArgs
     ) -> bool:
         """Whether cross-resolution sequence packing may be used for states."""
-        if not getattr(server_args, "cb_varlen_packing", False):
-            return False
-        if not getattr(
-            server_args.pipeline_config, "supports_varlen_step_packing", False
-        ):
-            return False
-        for attr in ("sp_degree", "ulysses_degree", "ring_degree"):
-            if int(getattr(server_args, attr, 1) or 1) != 1:
-                return False
-        first_step = states[0].current_step
-        model = getattr(first_step, "current_model", None) if first_step else None
-        if not getattr(model, "supports_varlen_step_packing", False):
-            return False
-        # zero_cond_t modulation indexes assume equal per-row sequence sizes.
-        if getattr(model, "zero_cond_t", False):
-            return False
-        return all(state.denoising_context.latents.ndim == 3 for state in states)
+        reason = self._varlen_step_packing_block_reason(states, server_args)
+        if reason is None:
+            return True
+        if getattr(server_args, "cb_varlen_packing", False):
+            # Varlen was requested but cannot apply; surface why so mixed
+            # resolutions visibly split into separate groups.
+            from sglang.multimodal_gen.runtime.pipelines_core.fallback_diagnostics import (
+                fallback_diagnostics,
+            )
+
+            fallback_diagnostics.record(
+                "varlen-packing",
+                type(server_args.pipeline_config).__name__,
+                reason,
+            )
+        return False
 
     @staticmethod
     def _can_share_packed_forward_batch_context(first: Req, current: Req) -> bool:
@@ -2592,41 +2717,37 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.tensor(row_counts, device=device),
             )
 
-        solver = None
-        if not uses_wan_ti2v:
-            from sglang.multimodal_gen.runtime.pipelines_core.batched_solver import (
-                build_batched_solver,
-            )
+        from sglang.multimodal_gen.runtime.pipelines_core.batched_solver import (
+            build_batched_solver,
+        )
 
-            solver = build_batched_solver(states, device)
+        # Packed groups step exclusively through the vectorized solver; the
+        # packability pre-screen guarantees this build succeeds, and a
+        # rejection here is a hard error rather than a silent fallback.
+        solver = build_batched_solver(states, device)
 
-        packed_latents = None
-        if solver is not None:
-            try:
-                if varlen:
-                    max_img_seq = max(row_seq_lens)
-                    packed_latents = torch.cat(
-                        [
-                            self._pad_seq_dim(
-                                state.denoising_context.latents, max_img_seq
-                            )
-                            for state in states
-                        ],
-                        dim=0,
-                    )
-                else:
-                    packed_latents = torch.cat(
-                        [state.denoising_context.latents for state in states], dim=0
-                    )
-            except RuntimeError as exc:
-                raise DenoisingStepPackingError(
-                    f"step batch latent packing failed: {exc}"
-                ) from exc
+        try:
+            if varlen:
+                max_img_seq = max(row_seq_lens)
+                packed_latents = torch.cat(
+                    [
+                        self._pad_seq_dim(state.denoising_context.latents, max_img_seq)
+                        for state in states
+                    ],
+                    dim=0,
+                )
+            else:
+                packed_latents = torch.cat(
+                    [state.denoising_context.latents for state in states], dim=0
+                )
+        except RuntimeError as exc:
+            raise DenoisingStepPackingError(
+                f"step batch latent packing failed: {exc}"
+            ) from exc
 
         pipeline_config = server_args.pipeline_config
         vectorized_combine = (
-            solver is not None
-            and type(pipeline_config).postprocess_cfg_noise
+            type(pipeline_config).postprocess_cfg_noise
             is PipelineConfig.postprocess_cfg_noise
             and type(pipeline_config).slice_noise_pred
             is PipelineConfig.slice_noise_pred
@@ -2694,12 +2815,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         latent_model_input: torch.Tensor,
         timestep: torch.Tensor,
         current_timestep: int | None,
+        teacache_plan: Any | None = None,
     ) -> list[torch.Tensor | tuple[torch.Tensor, ...]]:
         """Run the packed model forward, folded or per-branch."""
         with set_forward_context(
             current_timestep=current_timestep,
             attn_metadata=group.attn_metadata,
             forward_batch=group.forward_batch,
+            teacache_plan=teacache_plan,
         ):
             if group.folded_kwargs is not None:
                 num_branches = len(group.branch_kwargs)
@@ -2821,29 +2944,23 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             states[0].current_step.step_index if len(step_indices) == 1 else None
         )
 
-        # Assemble packed latents and per-row timesteps.
+        # Assemble packed latents and per-row timesteps. Packed groups always
+        # step through the vectorized solver; there is no per-request
+        # scheduler.step() fallback.
         varlen_lens = group.varlen_row_seq_lens
         max_seq = max(varlen_lens) if varlen_lens else None
-        if group.solver is not None and group.packed_latents is not None:
-            packed_latents = group.packed_latents
-            latent_model_input = group.solver.scale_model_input(packed_latents).to(
-                group.target_dtype
+        packed_latents = group.packed_latents
+        if group.solver is None or packed_latents is None:
+            raise RuntimeError(
+                "packed step group is missing its vectorized solver state; "
+                "non-batchable schedulers must not join packed groups"
             )
-        else:
-            per_request_inputs = []
-            for state in states:
-                ctx = state.denoising_context
-                scaled = ctx.scheduler.scale_model_input(
-                    ctx.latents.to(ctx.target_dtype),
-                    state.current_step.t_device,
-                )
-                if varlen_lens is not None:
-                    scaled = self._pad_seq_dim(scaled, max_seq)
-                per_request_inputs.append(scaled)
-            packed_latents = None
-            latent_model_input = torch.cat(per_request_inputs, dim=0)
+        latent_model_input = group.solver.scale_model_input(packed_latents).to(
+            group.target_dtype
+        )
         latent_model_input = self._pad_model_rows(latent_model_input, group.padded_rows)
         timestep = self._build_packed_timestep(group, states, server_args)
+        teacache_plan = self._build_packed_teacache_plan(group, states)
 
         # Run one (folded) or per-branch packed forward.
         with maybe_nvtx_range("predict_noise", use_nvtx):
@@ -2853,7 +2970,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 enabled=group.autocast_enabled,
             ):
                 branch_predictions = self._packed_forward(
-                    group, latent_model_input, timestep, current_timestep
+                    group,
+                    latent_model_input,
+                    timestep,
+                    current_timestep,
+                    teacache_plan=teacache_plan,
                 )
 
         # Combine CFG branches and advance the solver.
@@ -2910,44 +3031,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     req.noise_pred = noise_pred
                 noise_preds.append(noise_pred)
 
-            if (
-                group.solver is not None
-                and packed_latents is not None
-                and all(not isinstance(noise_pred, tuple) for noise_pred in noise_preds)
-            ):
-                if varlen_lens is not None:
-                    noise_preds = [
-                        self._pad_seq_dim(noise_pred, max_seq)
-                        for noise_pred in noise_preds
-                    ]
-                packed_noise_pred = torch.cat(noise_preds, dim=0)
-                new_packed = group.solver.step_rows(
-                    packed_noise_pred, packed_latents, states
+            if any(isinstance(noise_pred, tuple) for noise_pred in noise_preds):
+                raise RuntimeError(
+                    "packed step groups require tensor noise predictions; "
+                    "multi-output models must not join packed groups"
                 )
-                self._scatter_packed_latents(group, states, new_packed, server_args)
-                return
-
-            # Per-request solver fallback; latents live per request.
-            group.packed_latents = None
-            for index, state in enumerate(states):
-                ctx = state.denoising_context
-                step = state.current_step
-                req = state.req
-                ctx.latents = ctx.scheduler.step(
-                    model_output=noise_preds[index],
-                    timestep=step.t_device,
-                    sample=ctx.latents,
-                    **ctx.extra_step_kwargs,
-                    return_dict=False,
-                )[0]
-                ctx.latents = self.post_forward_for_ti2v_task(
-                    req,
-                    server_args,
-                    ctx.reserved_frames_mask,
-                    ctx.latents,
-                    ctx.z,
-                )
-                self._record_trajectory(ctx, step, req, server_args)
+            if varlen_lens is not None:
+                noise_preds = [
+                    self._pad_seq_dim(noise_pred, max_seq) for noise_pred in noise_preds
+                ]
+            packed_noise_pred = torch.cat(noise_preds, dim=0)
+            new_packed = group.solver.step_rows(
+                packed_noise_pred, packed_latents, states
+            )
+            self._scatter_packed_latents(group, states, new_packed, server_args)
 
     def forward(
         self,
