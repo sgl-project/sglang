@@ -59,8 +59,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of logical expert IDs per batch when submitting P2P ops during EPLB rebalance on ROCm. Smaller values prevent RCCL GPU-side accumulation hangs but increase overhead.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of expert IDs per batch when submitting P2P ops during EPLB rebalance (CUDA and ROCm). Smaller values prevent NCCL/RCCL GPU-side accumulation hangs but increase overhead; set <code>&gt;= num_physical_experts</code> to submit a single batch. Deprecated alias: <code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>32</code></td>
     </tr>
     <tr>
@@ -403,7 +403,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_STATIC_WATERFILL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force dynamic DeepEP waterfill with runtime EP all-reduce instead of the default static local-batch path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force dynamic Waterfill with runtime EP all-reduce instead of the default static local-batch path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
