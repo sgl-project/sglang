@@ -46,13 +46,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
-    if server_args.moe_runner_backend == "deep_gemm":
-        # The contiguous grouped-GEMM prefill path is only viable with the
-        # fused swiglu+quant kernel; the unfused fallback keeps a bf16
-        # [all_tokens, N] transient alive across the FC2 GEMM.
-        if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
-            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
-
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
         logger.warning(
