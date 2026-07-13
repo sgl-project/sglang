@@ -25,8 +25,13 @@ from sglang.srt.managers.scheduler_gc_manager import SchedulerGCManager
 class TestSchedulerGCManager(unittest.TestCase):
     def setUp(self):
         self._saved_threshold = gc.get_threshold()
+        # SGLANG_ENABLE_SCHEDULER_GC_MANAGEMENT defaults to off; enable it
+        # explicitly so these tests exercise the managed behavior.
+        self._enable_ctx = envs.SGLANG_ENABLE_SCHEDULER_GC_MANAGEMENT.override(True)
+        self._enable_ctx.__enter__()
 
     def tearDown(self):
+        self._enable_ctx.__exit__(None, None, None)
         gc.set_threshold(*self._saved_threshold)
 
     def test_disabled_is_a_strict_noop(self):
