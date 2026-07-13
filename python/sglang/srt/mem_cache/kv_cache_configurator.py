@@ -310,31 +310,10 @@ class KVCacheConfigurator:
                 # Extra slots for pre-allocated requests
                 pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
                 if self.mambaish_config:
-                    from sglang.srt.disaggregation.decode import (
-                        HybridMambaDecodeReqToTokenPool,
-                    )
-
-                    req_to_token_pool = HybridMambaDecodeReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=self.mambaish_config.mamba2_cache_params,
-                        mamba_layer_ids=(
-                            [
-                                i
-                                for i in self.mambaish_config.mamba2_cache_params.layers
-                                if self.start_layer <= i < self.end_layer
-                            ]
-                        ),
-                        speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
-                        speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
+                        max_num_reqs=max_num_reqs,
+                        extra_max_context_len=extra_max_context_len,
                         pre_alloc_size=pre_alloc_size,
-                        enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-                        mamba_size=self.server_args.max_mamba_cache_size,
-                        start_layer=self.start_layer,
                     )
                 else:
                     from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
@@ -1193,6 +1172,40 @@ class KVCacheConfigurator:
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
+
+    def _build_hybrid_mamba_decode_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+        pre_alloc_size: int,
+    ) -> ReqToTokenPool:
+        from sglang.srt.disaggregation.decode import (
+            HybridMambaDecodeReqToTokenPool,
+        )
+
+        req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            cache_params=self.mambaish_config.mamba2_cache_params,
+            mamba_layer_ids=(
+                [
+                    i
+                    for i in self.mambaish_config.mamba2_cache_params.layers
+                    if self.start_layer <= i < self.end_layer
+                ]
+            ),
+            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            pre_alloc_size=pre_alloc_size,
+            enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+            mamba_size=self.server_args.max_mamba_cache_size,
+            start_layer=self.start_layer,
+        )
+        return req_to_token_pool
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
