@@ -119,7 +119,7 @@ cvt_fp16_to_fp4(
   for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
     for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP4_ELTS_PER_THREAD; colIdx += blockDim.x) {
       int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
-      PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+      PackedVec in_vec = reinterpret_cast<PackedVec const*>(__builtin_assume_aligned(in, 16))[inOffset];
       // Get the output tensor offset.
       // Same as inOffset because 8 elements are packed into one uint32_t.
       int64_t outOffset = inOffset;
