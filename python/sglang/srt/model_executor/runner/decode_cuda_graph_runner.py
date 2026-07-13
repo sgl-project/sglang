@@ -1062,7 +1062,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # When the last layer's output is SCATTERED (require_attn_tp_gather),
+            # each rank holds bs // attn_tp_size rows, not bs.
+            pp_output_tokens = self.bs
+            if self.require_attn_tp_gather:
+                pp_output_tokens = self.bs // self.attn_tp_size
+            return PPProxyTensors(
+                {k: v[:pp_output_tokens] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

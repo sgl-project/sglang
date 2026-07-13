@@ -452,7 +452,7 @@ class BaseRunner(ABC):
             # moe_dense_tp_size=1), hidden states at the PP boundary have
             # num_tokens / attn_tp_size rows per rank, not num_tokens.
             if require_attn_tp_gather(mr.server_args):
-                pp_hidden_tokens = pp_hidden_tokens // get_parallel().attn_tp_size
+                pp_hidden_tokens = pp_hidden_tokens // self.attn_tp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
