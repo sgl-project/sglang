@@ -136,6 +136,7 @@ class _DpGatheredBufferWrapper:
     _local_dp_buffer_len: int = 0
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
+    _global_num_tokens_gpu: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -153,11 +154,13 @@ class _DpGatheredBufferWrapper:
         local_dp_buffer_len: int,
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
+        global_num_tokens_gpu: Optional[torch.Tensor] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
+        cls._global_num_tokens_gpu = global_num_tokens_gpu
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
@@ -200,6 +203,10 @@ class _DpGatheredBufferWrapper:
     @classmethod
     def get_dp_global_num_tokens(cls) -> List[int]:
         return cls._global_num_tokens
+
+    @classmethod
+    def get_dp_global_num_tokens_gpu(cls) -> Optional[torch.Tensor]:
+        return cls._global_num_tokens_gpu
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
@@ -554,6 +561,55 @@ def _dequant_per_token_group_fp8_kernel(
         qv = tl.load(q_ptr + row * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
         sv = tl.load(s_ptr + row * NGROUPS + offs // GROUP, mask=mask, other=0.0)
         tl.store(out_ptr + row * HIDDEN + offs, (qv * sv).to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _mask_dp_pad_topk_ids_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    max_len,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    rank = row // max_len
+    pos = row % max_len
+    valid = pos < tl.load(counts_ptr + rank)
+    if valid == 0:
+        offs = tl.arange(0, BLOCK)
+        tl.store(topk_ids_ptr + row * TOPK + offs, -1, mask=offs < TOPK)
+
+
+def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
+    """Set MAX_LEN pad rows' (post-translation, local) topk_ids to -1 in place.
+
+    Under dp-attention MAX_LEN padding the gathered MoE buffer is
+    [dp_size * max_len, hidden] with rank r's real rows at
+    [r*max_len, r*max_len + global_num_tokens[r]); the pad rows carry stale
+    hidden values, run the router, and get dispatched into experts whose
+    outputs are then discarded by the post-reorder scatter — pure wasted
+    compute, and a masked-grouped-GEMM workspace blow-up when they collide
+    on the same top-k.  -1 is the drop sentinel both the triton fused_moe
+    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
+    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
+    the mapping table's last entry).  Capture-safe: per-batch state is read
+    only from the replay-updated global_num_tokens_gpu tensor.
+    """
+    counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+    if counts is None:
+        return
+    max_len = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+    rows, topk = topk_ids.shape
+    if max_len <= 0 or rows != counts.shape[0] * max_len:
+        # Layout mismatch (e.g. non-DP or logits-path caller): do nothing.
+        return
+    _mask_dp_pad_topk_ids_kernel[(rows,)](
+        topk_ids,
+        counts,
+        max_len,
+        TOPK=topk,
+        BLOCK=triton.next_power_of_2(topk),
+    )
 
 
 def _dp_gather_via_all_gatherv_fp8(
