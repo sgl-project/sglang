@@ -195,19 +195,23 @@ class BaseTpWorker(ABC):
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):
-        # The LoRA code handles TP sharding internally using slice_lora_a_weights
-        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        # TP sharding for LoRA happens inside the lora module (see
+        # lora/layers.py:46-49 and mem_pool.py:437-440). Each TP rank
+        # deserializes its own producer's bytes — same convention as
+        # ``update_weights_from_tensor`` above. One producer per one
+        # consumer means the CUDA-IPC ref counter on the producer's
+        # bucket drops cleanly each cycle.
+        monkey_patch_torch_reductions()
+        serialized = recv_req.serialized_named_tensors[self.tp_rank]
         if recv_req.load_format == "flattened_bucket":
-            flattened_data = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_tensors
-            )
+            flattened_data = MultiprocessingSerializer.deserialize(serialized)
             bucket = FlattenedTensorBucket(
                 flattened_tensor=flattened_data["flattened_tensor"],
                 metadata=flattened_data["metadata"],
             )
             tensors = dict(bucket.reconstruct_tensors())
         else:
-            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+            tensors = MultiprocessingSerializer.deserialize(serialized)
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
