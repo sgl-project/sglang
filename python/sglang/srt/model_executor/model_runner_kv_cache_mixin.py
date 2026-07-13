@@ -64,6 +64,7 @@ from sglang.srt.utils.common import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.unified_memory_pool import UnifiedPoolBundle
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -182,14 +183,16 @@ class ModelRunnerKVCacheMixin:
             get_available_gpu_memory(self.device, self.gpu_id),
         )
 
-    def _init_unified_mamba_pools(self: ModelRunner, max_num_reqs: int):
+    def _init_unified_mamba_pools(
+        self: ModelRunner, *, max_num_reqs: int, max_total_num_tokens: int
+    ) -> UnifiedPoolBundle:
         """Build the shared-KV-pool stack for a hybrid-Mamba model:
         one byte buffer split between the full-attn MHA KV pool and the
         per-request Mamba state pool, with virtual slot ids above the
         allocator."""
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_pools
 
-        config = mambaish_config(self.model_config)
+        config = self.mambaish_config
         assert config is not None
         assert (
             not self.use_mla_backend
@@ -228,7 +231,7 @@ class ModelRunnerKVCacheMixin:
             mamba2_cache_params=config.mamba2_cache_params,
             model_context_len=self.model_config.context_len,
             extra_max_context_len=extra_max_context_len,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=max_total_num_tokens,
             max_mamba_cache_size=self.server_args.max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
             enable_memory_saver=self.server_args.enable_memory_saver,
@@ -244,11 +247,7 @@ class ModelRunnerKVCacheMixin:
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
         )
-        self.req_to_token_pool = bundle.req_to_token_pool
-        self.token_to_kv_pool = bundle.token_to_kv_pool
-        self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
-        # Keep a reference so the shared byte buffer is not GC'd.
-        self._unified_memory_pool = bundle.unified_memory_pool
+        return bundle
 
     def _init_unified_swa_pools(self: ModelRunner, max_num_reqs: int):
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
@@ -346,7 +345,15 @@ class ModelRunnerKVCacheMixin:
             and self.req_to_token_pool is None
         ):
             if mambaish_config(self.model_config) is not None:
-                self._init_unified_mamba_pools(max_num_reqs)
+                bundle = self._init_unified_mamba_pools(
+                    max_num_reqs=max_num_reqs,
+                    max_total_num_tokens=self.max_total_num_tokens,
+                )
+                self.req_to_token_pool = bundle.req_to_token_pool
+                self.token_to_kv_pool = bundle.token_to_kv_pool
+                self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
+                # Keep a reference so the shared byte buffer is not GC'd.
+                self._unified_memory_pool = bundle.unified_memory_pool
                 return
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 self._init_unified_swa_pools(max_num_reqs)
