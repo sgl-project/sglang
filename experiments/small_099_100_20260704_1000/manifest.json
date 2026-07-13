@@ -1,0 +1,19 @@
+{
+  "source_node": "lingjun-099",
+  "target_node": "lingjun-100",
+  "target_ssh_host": "root@192.168.0.40",
+  "logical_sizes": "1MiB..32MiB step 1MiB",
+  "warmup": 3,
+  "repeat": 20,
+  "background_traffic": "none",
+  "head_rdma": "split across mlx5_bond_N, N=4 or N=2; per-shard size is logical_size/N",
+  "tail_rdma": "historical tail_single_nic control/session lane0 with mlx5_0 transport",
+  "runs": [
+    "head_rdma_small_uncapped_4x200_split",
+    "head_rdma_small_cap4x100_split",
+    "head_rdma_small_cap2x200_split",
+    "tail_rdma_small_uncapped_single_nic",
+    "tail_rdma_small_cap100_single_nic",
+    "tail_rdma_small_cap200_single_nic"
+  ]
+}

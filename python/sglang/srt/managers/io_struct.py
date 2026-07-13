@@ -1775,6 +1775,19 @@ class PDFlipMigrationSourceDeltaReq(BaseReq):
 
 
 @dataclass
+class PDFlipMigrationSourceFallbackReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: List[str] = field(default_factory=list)
+    reason: str = ""
+
+
+@dataclass
+class PDFlipMigrationTargetFallbackPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: List[str] = field(default_factory=list)
+
+
+@dataclass
 class PDFlipMigrationTargetDeltaPrepareReq(BaseReq):
     session_id: Optional[str] = None
     source_url: Optional[str] = None

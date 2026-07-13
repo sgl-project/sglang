@@ -1,0 +1,1 @@
+{"model":"/models/deepseek_v3.1_terminus","messages":[{"role":"user","content":"Write a very long numbered list about distributed systems. Keep going with detailed explanations for every item."}],"max_tokens":8192,"temperature":0,"ignore_eos":true}

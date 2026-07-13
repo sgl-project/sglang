@@ -16,8 +16,10 @@
 import dataclasses
 import faulthandler
 import hashlib
+import json
 import logging
 import numbers
+import os
 import signal
 import sys
 import time
@@ -145,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationAbortReq,
     PDFlipMigrationReqOutput,
     PDFlipMigrationSourceDeltaReq,
+    PDFlipMigrationSourceFallbackReq,
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
@@ -152,6 +155,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetDeltaPrepareReq,
+    PDFlipMigrationTargetFallbackPrepareReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleReqOutput,
@@ -1774,59 +1778,179 @@ class Scheduler(
         return selected
 
     @staticmethod
-    def _pd_flip_can_rollover_session(
+    def _pd_flip_rollover_blockers(
         session: Dict[str, Any], next_role: str
-    ) -> bool:
+    ) -> List[Dict[str, Any]]:
+        def bounded(values: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            limit = 32
+            if len(values) <= limit:
+                return values
+            return values[:limit] + [
+                {
+                    "code": "rollover_blockers_truncated",
+                    "omitted": len(values) - limit,
+                }
+            ]
+
+        blockers = []
         if session.get("role") != next_role:
-            return False
+            blockers.append(
+                {
+                    "code": "session_role_mismatch",
+                    "expected": next_role,
+                    "observed": session.get("role"),
+                }
+            )
         if session.get("pending_reqs") != 0:
-            return False
+            blockers.append(
+                {
+                    "code": "session_pending_reqs",
+                    "observed": session.get("pending_reqs"),
+                }
+            )
         if session.get("failed_reqs") != 0:
-            return False
+            blockers.append(
+                {
+                    "code": "session_failed_reqs",
+                    "observed": session.get("failed_reqs"),
+                }
+            )
         if next_role == "source":
             state = session.get("state")
             if state not in {"source_released", "source_aborted"}:
-                return False
-            for entry in (session.get("source_entries") or {}).values():
+                blockers.append(
+                    {"code": "source_state_not_terminal", "observed": state}
+                )
+            source_entries = session.get("source_entries") or {}
+            for rid in sorted(source_entries, key=str):
+                entry = source_entries[rid]
+                rid = str(rid)
                 if not entry.get("metadata_freed"):
-                    return False
+                    blockers.append(
+                        {"code": "source_entry_metadata_not_freed", "rid": rid}
+                    )
                 if state == "source_released":
-                    if not entry.get("transferred") or entry.get("final_owner") != "target":
-                        return False
-                elif entry.get("final_owner") != "source":
-                    return False
+                    if not entry.get("transferred"):
+                        blockers.append(
+                            {"code": "source_entry_not_transferred", "rid": rid}
+                        )
+                    if entry.get("final_owner") != "target":
+                        blockers.append(
+                            {
+                                "code": "source_entry_final_owner_mismatch",
+                                "rid": rid,
+                                "observed": entry.get("final_owner"),
+                            }
+                        )
+                elif (
+                    state == "source_aborted"
+                    and entry.get("final_owner") != "source"
+                ):
+                    blockers.append(
+                        {
+                            "code": "source_entry_final_owner_mismatch",
+                            "rid": rid,
+                            "observed": entry.get("final_owner"),
+                        }
+                    )
                 delta = entry.get("delta")
                 if isinstance(delta, dict) and not delta.get("noop"):
-                    if not delta.get("transferred") or not delta.get("metadata_freed"):
-                        return False
-            return True
+                    if not delta.get("transferred"):
+                        blockers.append(
+                            {"code": "source_delta_not_transferred", "rid": rid}
+                        )
+                    if not delta.get("metadata_freed"):
+                        blockers.append(
+                            {
+                                "code": "source_delta_metadata_not_freed",
+                                "rid": rid,
+                            }
+                        )
+            return bounded(blockers)
         if next_role == "target":
             state = session.get("state")
             if state not in {"active", "target_aborted"}:
-                return False
+                blockers.append(
+                    {"code": "target_state_not_terminal", "observed": state}
+                )
             if session.get("held_reqs") != 0:
-                return False
-            for entry in (session.get("target_entries") or {}).values():
+                blockers.append(
+                    {
+                        "code": "target_held_reqs",
+                        "observed": session.get("held_reqs"),
+                    }
+                )
+            target_entries = session.get("target_entries") or {}
+            for rid in sorted(target_entries, key=str):
+                entry = target_entries[rid]
+                rid = str(rid)
                 if entry.get("held") is not False:
-                    return False
+                    blockers.append(
+                        {
+                            "code": "target_entry_still_held",
+                            "rid": rid,
+                            "observed": entry.get("held"),
+                        }
+                    )
                 if state == "active":
                     owned = entry.get("request_adopted") or entry.get(
                         "request_released"
                     ) or entry.get("drop_on_commit")
-                    if (
-                        entry.get("phase") != "active"
-                        or not owned
-                        or entry.get("final_owner") != "target"
-                    ):
-                        return False
-                elif (
-                    entry.get("phase") != "aborted"
-                    or not entry.get("request_released")
-                    or entry.get("final_owner") != "source"
-                ):
-                    return False
-            return True
-        return False
+                    if entry.get("phase") != "active":
+                        blockers.append(
+                            {
+                                "code": "target_entry_phase_not_active",
+                                "rid": rid,
+                                "observed": entry.get("phase"),
+                            }
+                        )
+                    if not owned:
+                        blockers.append(
+                            {"code": "target_entry_request_not_owned", "rid": rid}
+                        )
+                    if entry.get("final_owner") != "target":
+                        blockers.append(
+                            {
+                                "code": "target_entry_final_owner_mismatch",
+                                "rid": rid,
+                                "observed": entry.get("final_owner"),
+                            }
+                        )
+                elif state == "target_aborted":
+                    if entry.get("phase") != "aborted":
+                        blockers.append(
+                            {
+                                "code": "target_entry_phase_not_aborted",
+                                "rid": rid,
+                                "observed": entry.get("phase"),
+                            }
+                        )
+                    if not entry.get("request_released"):
+                        blockers.append(
+                            {
+                                "code": "target_entry_request_not_released",
+                                "rid": rid,
+                            }
+                        )
+                    if entry.get("final_owner") != "source":
+                        blockers.append(
+                            {
+                                "code": "target_entry_final_owner_mismatch",
+                                "rid": rid,
+                                "observed": entry.get("final_owner"),
+                            }
+                        )
+            return bounded(blockers)
+        blockers.append(
+            {"code": "unsupported_next_role", "observed": next_role}
+        )
+        return bounded(blockers)
+
+    @staticmethod
+    def _pd_flip_can_rollover_session(
+        session: Dict[str, Any], next_role: str
+    ) -> bool:
+        return not Scheduler._pd_flip_rollover_blockers(session, next_role)
 
     def _pd_flip_archive_rollover_session(self, session: Dict[str, Any]) -> None:
         archive = list(getattr(self, "pd_flip_migration_session_archive", []))
@@ -1860,11 +1984,18 @@ class Scheduler(
                     status=self._pd_flip_migration_status_dict(),
                     manifests=list(existing.get("manifests", [])),
                 )
-            if not self._pd_flip_can_rollover_session(existing, "source"):
+            blockers = self._pd_flip_rollover_blockers(existing, "source")
+            if blockers:
+                status = self._pd_flip_migration_status_dict()
+                status["rollover_blockers"] = blockers
                 return PDFlipMigrationReqOutput(
                     success=False,
-                    message="conflicting migration session already exists",
-                    status=self._pd_flip_migration_status_dict(),
+                    message=(
+                        "conflicting migration session already exists: "
+                        "rollover_blockers="
+                        f"{json.dumps(blockers, sort_keys=True, separators=(',', ':'))}"
+                    ),
+                    status=status,
                     manifests=list(existing.get("manifests", [])),
                 )
             self._pd_flip_archive_rollover_session(existing)
@@ -2024,11 +2155,18 @@ class Scheduler(
                     status=self._pd_flip_migration_status_dict(),
                     manifests=list(existing.get("manifests", [])),
                 )
-            if not self._pd_flip_can_rollover_session(existing, "target"):
+            blockers = self._pd_flip_rollover_blockers(existing, "target")
+            if blockers:
+                status = self._pd_flip_migration_status_dict()
+                status["rollover_blockers"] = blockers
                 return PDFlipMigrationReqOutput(
                     success=False,
-                    message="conflicting migration session already exists",
-                    status=self._pd_flip_migration_status_dict(),
+                    message=(
+                        "conflicting migration session already exists: "
+                        "rollover_blockers="
+                        f"{json.dumps(blockers, sort_keys=True, separators=(',', ':'))}"
+                    ),
+                    status=status,
                     manifests=list(existing.get("manifests", [])),
                 )
             self._pd_flip_archive_rollover_session(existing)
@@ -2371,15 +2509,28 @@ class Scheduler(
             )
 
         previous_waiting_queue = self.waiting_queue
+        previous_request_adoption_state = [
+            (
+                req,
+                req.last_node,
+                hasattr(req, "pd_flip_prebuilt_kv_ready"),
+                getattr(req, "pd_flip_prebuilt_kv_ready", None),
+            )
+            for req in requests
+        ]
         previous_entry_state = {
             rid: (
                 entries[rid].get("phase"),
                 entries[rid].get("held"),
                 entries[rid].get("request_adopted"),
+                "final_owner" in entries[rid],
+                entries[rid].get("final_owner"),
             )
             for rid in requested_rids
         }
         try:
+            for req in requests:
+                self._pd_flip_prepare_target_request_for_adoption(req)
             self.waiting_queue = [*previous_waiting_queue, *requests]
             for rid in requested_rids:
                 entry = entries[rid]
@@ -2391,7 +2542,19 @@ class Scheduler(
                 entry["final_owner"] = "target"
         except Exception as exc:
             self.waiting_queue = previous_waiting_queue
-            for rid, (phase, held, request_adopted) in previous_entry_state.items():
+            for req, last_node, had_ready, ready in previous_request_adoption_state:
+                req.last_node = last_node
+                if had_ready:
+                    req.pd_flip_prebuilt_kv_ready = ready
+                elif hasattr(req, "pd_flip_prebuilt_kv_ready"):
+                    del req.pd_flip_prebuilt_kv_ready
+            for rid, (
+                phase,
+                held,
+                request_adopted,
+                had_final_owner,
+                final_owner,
+            ) in previous_entry_state.items():
                 entry = entries[rid]
                 entry["phase"] = phase
                 entry["held"] = held
@@ -2399,6 +2562,10 @@ class Scheduler(
                     entry.pop("request_adopted", None)
                 else:
                     entry["request_adopted"] = request_adopted
+                if had_final_owner:
+                    entry["final_owner"] = final_owner
+                else:
+                    entry.pop("final_owner", None)
             return PDFlipMigrationReqOutput(
                 success=False,
                 message=f"target batch activation failed: {exc}",
@@ -3275,6 +3442,12 @@ class Scheduler(
         ] = restored_count
 
     def _pd_flip_get_source_kv_manager(self):
+        prefill_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        manager = getattr(prefill_queue, "kv_manager", None)
+        if manager is not None:
+            self.pd_flip_source_kv_manager = manager
+            return manager
+
         manager = getattr(self, "pd_flip_source_kv_manager", None)
         if manager is not None:
             return manager
@@ -3447,6 +3620,124 @@ class Scheduler(
             else len(page_indices),
         )
 
+    def _pd_flip_source_send_full_fallback(
+        self, entry: Dict[str, Any], reason: str
+    ) -> None:
+        """Retry one source entry without relying on a remote prefix restore."""
+        sender = entry["sender"]
+        req = entry["req"]
+        committed_len = int(entry["committed_len"])
+        page_indices = self._pd_flip_stitch_page_indices_range(req, 0, committed_len)
+        sender.init(len(page_indices), entry["metadata_index"])
+        sender.send(
+            page_indices,
+            self._pd_flip_source_state_indices(req, committed_len, sender.kv_mgr),
+        )
+        entry.update(
+            mooncake_hit_len=0,
+            source_transfer_start=0,
+            source_transfer_end=committed_len,
+            stitch_mode="source_decode_full_fallback",
+            fallback_reason=str(reason),
+            fallback_attempted=True,
+            fallback_source_bytes=None,
+            fallback_duration_seconds=None,
+            source_index_shape=list(page_indices.shape)
+            if hasattr(page_indices, "shape")
+            else [len(page_indices)],
+            source_index_size=int(page_indices.size)
+            if hasattr(page_indices, "size")
+            else len(page_indices),
+        )
+
+    def _pd_flip_source_rebuild_full_fallback(
+        self, session: Dict[str, Any], rids: List[str], reason: str
+    ) -> None:
+        """Install fresh senders for a selective full-copy fallback retry."""
+        entries = session.get("source_entries") or {}
+        kv_manager = self._pd_flip_get_source_kv_manager()
+        sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
+        rebuilt = []
+        touched = []
+        try:
+            for rid in rids:
+                entry = entries[str(rid)]
+                touched.append(entry)
+                if entry.get("fallback_attempted"):
+                    raise RuntimeError(f"fallback already attempted for request {rid}")
+                old_sender = entry.get("sender")
+                if old_sender is not None and hasattr(old_sender, "abort"):
+                    old_sender.abort()
+                entry["sender"] = None
+                self._pd_flip_free_source_metadata(entry)
+                metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+                if metadata_index is None:
+                    raise RuntimeError("no metadata buffer available for fallback source")
+                entry.update(
+                    metadata_index=metadata_index,
+                    metadata_freed=False,
+                )
+                sender = sender_class(
+                    mgr=kv_manager,
+                    bootstrap_addr=bootstrap_addr,
+                    bootstrap_room=int(entry["migration_bootstrap_room"]),
+                    dest_tp_ranks=[self.ps.tp_rank],
+                    pp_rank=self.ps.pp_rank,
+                )
+                entry.update(
+                    sender=sender,
+                    sent=False,
+                    transferred=False,
+                    failed=False,
+                    fallback_attempted=True,
+                    fallback_reason=str(reason),
+                    stitch_mode="source_decode_full_fallback",
+                )
+                self._pd_flip_note_timing(entry, "source_fallback_command_received")
+                rebuilt.append(entry)
+            session.get("transferred_rids", set()).difference_update(map(str, rids))
+            session.get("failed_rids", set()).difference_update(map(str, rids))
+            session["state"] = "source_fallback_started"
+        except Exception as exc:
+            for entry in touched:
+                sender = entry.get("sender")
+                if sender is not None and hasattr(sender, "abort"):
+                    try:
+                        sender.abort()
+                    except Exception:
+                        pass
+                self._pd_flip_free_source_metadata(entry)
+                entry["failed"] = True
+                entry["rollback_reason"] = str(exc)
+            session["state"] = "source_failed"
+            session["last_error"] = str(exc)
+            raise
+
+    def start_pd_flip_migration_source_fallback(
+        self, recv_req: PDFlipMigrationSourceFallbackReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("session_id") != recv_req.session_id:
+            return PDFlipMigrationReqOutput(False, "migration session not found")
+        rids = [str(rid).strip() for rid in recv_req.rids]
+        if not rids or any(not rid for rid in rids) or len(set(rids)) != len(rids):
+            return PDFlipMigrationReqOutput(False, "fallback RIDs must be nonempty and unique")
+        unknown = set(rids).difference((session.get("source_entries") or {}).keys())
+        if unknown:
+            return PDFlipMigrationReqOutput(False, f"fallback RIDs not in source session: {sorted(unknown)}")
+        try:
+            self._pd_flip_source_rebuild_full_fallback(
+                session, rids, recv_req.reason
+            )
+            return PDFlipMigrationReqOutput(
+                True, status=self._pd_flip_migration_status_dict()
+            )
+        except Exception as exc:
+            return PDFlipMigrationReqOutput(
+                False, str(exc), status=self._pd_flip_migration_status_dict()
+            )
+
     def _pd_flip_set_source_metadata(
         self, req: Req, metadata_index: int, migration_room: int
     ) -> None:
@@ -3541,7 +3832,15 @@ class Scheduler(
                     )
                     send_started = time.monotonic()
                     self._pd_flip_note_timing(entry, "source_transfer_started")
-                    self._pd_flip_source_send_initial(entry)
+                    if entry.get("fallback_attempted"):
+                        self._pd_flip_note_timing(
+                            entry, "source_fallback_transfer_started"
+                        )
+                        self._pd_flip_source_send_full_fallback(
+                            entry, entry.get("fallback_reason", "")
+                        )
+                    else:
+                        self._pd_flip_source_send_initial(entry)
                     self._pd_flip_note_timing(entry, "source_send", send_started)
                     self._pd_flip_note_timing(entry, "source_sent")
                     entry["sent"] = True
@@ -3561,6 +3860,16 @@ class Scheduler(
                 transferred.add(rid)
                 self._pd_flip_note_timing(entry, "source_transfer_completed")
                 self._pd_flip_record_sender_metric(entry, sender, "source")
+                if entry.get("fallback_attempted"):
+                    self._pd_flip_note_timing(
+                        entry, "source_fallback_transfer_completed"
+                    )
+                    entry["fallback_source_bytes"] = entry.get(
+                        "source_transfer_bytes"
+                    )
+                    entry["fallback_duration_seconds"] = entry.get(
+                        "source_transfer_duration_s"
+                    )
                 self._pd_flip_note_timing(entry, "source_transferred")
                 self._pd_flip_free_source_metadata(entry)
 
@@ -3669,12 +3978,14 @@ class Scheduler(
             0, len(delta_entries) - len(transferred) - len(failed)
         )
         session["delta_pending_reqs"] = session["pending_reqs"]
+        terminal = session.get("state") in {"source_released", "source_aborted"}
         if failed:
-            session["state"] = "source_failed"
+            if not terminal:
+                session["state"] = "source_failed"
             session["failed_reqs"] = max(
                 int(session.get("failed_reqs", 0) or 0), len(failed)
             )
-        elif session["pending_reqs"] == 0:
+        elif session["pending_reqs"] == 0 and not terminal:
             session["state"] = "source_delta_transferred"
 
     def _pd_flip_free_source_metadata(self, entry: Dict[str, Any]) -> None:
@@ -3796,6 +4107,92 @@ class Scheduler(
             return entries, ""
         except Exception as exc:
             return {}, str(exc)
+
+    def _pd_flip_target_reprepare_full_fallback(
+        self, session: Dict[str, Any], rids: List[str]
+    ) -> None:
+        """Recreate cleaned target entries with prefix restoration disabled."""
+        entries = session.get("target_entries") or {}
+        replacements = {}
+        try:
+            for rid in rids:
+                rid = str(rid)
+                old_entry = entries[rid]
+                manifest = old_entry.get("manifest") or {}
+                prepared, error = self._pd_flip_prepare_target_entries(
+                    [manifest], session.get("source_url")
+                )
+                if error or rid not in prepared:
+                    raise RuntimeError(error or f"failed to reprepare fallback {rid}")
+                replacement = prepared[rid]
+                replacement["timing_debug"] = dict(
+                    old_entry.get("timing_debug") or {}
+                )
+                replacement.update(
+                    fallback_attempted=True,
+                    fallback_reason=old_entry.get("fallback_reason"),
+                    force_source_full_fallback=True,
+                    stitch_mode="source_decode_full_fallback",
+                    original_stitch_mode=old_entry.get("stitch_mode"),
+                    original_mooncake_hit_len=old_entry.get("mooncake_hit_len"),
+                    target_hicache_l1_prefix_len=old_entry.get(
+                        "target_hicache_l1_prefix_len"
+                    ),
+                    target_hicache_l2_prefix_len=old_entry.get(
+                        "target_hicache_l2_prefix_len"
+                    ),
+                    target_hicache_l3_prefix_len=old_entry.get(
+                        "target_hicache_l3_prefix_len"
+                    ),
+                )
+                self._pd_flip_note_timing(
+                    replacement, "target_fallback_prepare_received"
+                )
+                replacements[rid] = replacement
+            entries.update(replacements)
+            required = set(session.get("fallback_required_rids", set()))
+            required.difference_update(replacements)
+            session["fallback_required_rids"] = required
+            session["state"] = "target_fallback_prepared"
+        except Exception as exc:
+            for replacement in replacements.values():
+                decode_req = replacement.get("decode_req")
+                receiver = getattr(decode_req, "kv_receiver", None)
+                if receiver is not None and hasattr(receiver, "abort"):
+                    try:
+                        receiver.abort()
+                    except Exception:
+                        pass
+                self._pd_flip_release_target_request(replacement)
+                self._pd_flip_free_target_metadata(replacement)
+                replacement["rollback_reason"] = str(exc)
+            session["state"] = "target_failed"
+            session["last_error"] = str(exc)
+            raise
+
+    def prepare_pd_flip_migration_target_fallback(
+        self, recv_req: PDFlipMigrationTargetFallbackPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("session_id") != recv_req.session_id:
+            return PDFlipMigrationReqOutput(False, "migration session not found")
+        rids = [str(rid).strip() for rid in recv_req.rids]
+        if not rids or any(not rid for rid in rids) or len(set(rids)) != len(rids):
+            return PDFlipMigrationReqOutput(False, "fallback RIDs must be nonempty and unique")
+        required = set(session.get("fallback_required_rids") or set())
+        if not set(rids) <= required:
+            return PDFlipMigrationReqOutput(False, "fallback RIDs were not requested by target")
+        try:
+            self._pd_flip_target_reprepare_full_fallback(
+                session, rids
+            )
+            return PDFlipMigrationReqOutput(
+                True, status=self._pd_flip_migration_status_dict()
+            )
+        except Exception as exc:
+            return PDFlipMigrationReqOutput(
+                False, str(exc), status=self._pd_flip_migration_status_dict()
+            )
 
     def _pd_flip_source_host_from_url(self, source_url: Optional[str]) -> str:
         if not source_url:
@@ -4110,12 +4507,14 @@ class Scheduler(
             0, len(delta_entries) - len(transferred) - len(failed)
         )
         session["delta_pending_reqs"] = session["pending_reqs"]
+        terminal = session.get("state") in {"active", "target_aborted"}
         if failed:
-            session["state"] = "target_failed"
+            if not terminal:
+                session["state"] = "target_failed"
             session["failed_reqs"] = max(
                 int(session.get("failed_reqs", 0) or 0), len(failed)
             )
-        elif session["pending_reqs"] == 0:
+        elif session["pending_reqs"] == 0 and not terminal:
             session["state"] = "target_delta_transferred"
 
     def _pd_flip_target_pump_transfer(self, session: Dict[str, Any]) -> None:
@@ -4125,6 +4524,7 @@ class Scheduler(
 
         transferred = set(session.get("transferred_rids", set()))
         failed = set(session.get("failed_rids", set()))
+        fallback_required = set(session.get("fallback_required_rids", set()))
         for rid, entry in entries.items():
             if rid in transferred or rid in failed:
                 continue
@@ -4168,6 +4568,10 @@ class Scheduler(
                         if not session.get("prepare_only", False):
                             self._pd_flip_target_commit_hicache_restore(decode_req)
                         self._pd_flip_note_timing(entry, "target_transfer_success")
+                        if entry.get("fallback_attempted"):
+                            self._pd_flip_note_timing(
+                                entry, "target_fallback_receive_completed"
+                            )
                         transferred.add(rid)
                         entry["phase"] = (
                             "transferred_held"
@@ -4186,6 +4590,25 @@ class Scheduler(
                             self._pd_flip_release_target_request(entry)
                         self._pd_flip_free_target_metadata(entry)
             except Exception as exc:
+                hit_len = int(entry.get("mooncake_hit_len") or 0)
+                restore_failed = (
+                    hit_len > 0
+                    and "HiCache restore failed" in str(exc)
+                    and not entry.get("fallback_attempted", False)
+                )
+                if restore_failed:
+                    self._pd_flip_note_timing(entry, "target_fallback_required")
+                    fallback_required.add(rid)
+                    entry["phase"] = "fallback_required"
+                    entry["fallback_reason"] = str(exc)
+                    entry["fallback_attempted"] = False
+                    session["fallback_reason"] = str(exc)
+                    if getattr(decode_req, "kv_receiver", None) is not None:
+                        decode_req.kv_receiver.abort()
+                        decode_req.kv_receiver = None
+                    self._pd_flip_release_target_request(entry)
+                    self._pd_flip_free_target_metadata(entry)
+                    continue
                 failed.add(rid)
                 entry["phase"] = "failed"
                 session["last_error"] = str(exc)
@@ -4196,6 +4619,7 @@ class Scheduler(
 
         session["transferred_rids"] = transferred
         session["failed_rids"] = failed
+        session["fallback_required_rids"] = fallback_required
         session["transferred_reqs"] = len(transferred)
         session["failed_reqs"] = len(failed)
         session["held_reqs"] = sum(
@@ -4206,12 +4630,16 @@ class Scheduler(
         session["pending_reqs"] = max(
             0, len(session.get("manifests", [])) - len(transferred) - len(failed)
         )
-        if failed:
-            session["state"] = "target_failed"
-        elif session.get("held_reqs", 0) > 0:
-            session["state"] = "target_transferred_held"
-        elif session["pending_reqs"] == 0:
-            session["state"] = "target_transferred"
+        terminal = session.get("state") in {"active", "target_aborted"}
+        if not terminal:
+            if failed:
+                session["state"] = "target_failed"
+            elif fallback_required:
+                session["state"] = "target_fallback_required"
+            elif session.get("held_reqs", 0) > 0:
+                session["state"] = "target_transferred_held"
+            elif session["pending_reqs"] == 0:
+                session["state"] = "target_transferred"
         self._pd_flip_target_pump_delta_transfer(session)
 
     def _pd_flip_target_hicache_restore_pending(
@@ -4242,6 +4670,7 @@ class Scheduler(
             getattr(decode_req, "hicache_restore_status", None), "value", None
         )
         if status_value == "failed":
+            self._pd_flip_note_timing(entry, "target_hicache_restore_failed")
             raise RuntimeError("migration target HiCache restore failed")
         if status_value == "pending":
             return True
@@ -4362,8 +4791,13 @@ class Scheduler(
         prefix_indices = None
         prefix_len = 0
         total_prefix_len = 0
-        if getattr(self.server_args, "enable_pd_flip_hicache_stitch", False):
+        force_full_fallback = bool(entry.get("force_source_full_fallback", False))
+        if (
+            getattr(self.server_args, "enable_pd_flip_hicache_stitch", False)
+            and not force_full_fallback
+        ):
             prefix_started = time.monotonic()
+            self._pd_flip_note_timing(entry, "target_prefix_query_started")
             prefix_match = queue._match_prefix_and_lock(req)
             raw_prefix_len = int(prefix_match.decode_prefix_len)
             prompt_len = len(req.origin_input_ids)
@@ -4386,7 +4820,14 @@ class Scheduler(
                 )
             prefix_indices = prefix_match.prefix_indices
             entry["target_hicache_prefix_match_s"] = time.monotonic() - prefix_started
+            self._pd_flip_note_timing(entry, "target_prefix_query_completed")
             entry["target_hicache_l1_prefix_len"] = prefix_len
+            entry["target_hicache_l2_prefix_len"] = int(
+                getattr(prefix_match, "l2_host_hit_length", 0) or 0
+            )
+            entry["target_hicache_l3_prefix_len"] = int(
+                getattr(prefix_match, "l3_storage_hit_length", 0) or 0
+            )
             entry["target_hicache_prefix_len"] = total_prefix_len
             entry["target_hicache_restore_tokens"] = max(
                 0, total_prefix_len - prefix_len
@@ -4400,6 +4841,15 @@ class Scheduler(
                 target_received_suffix_end=committed_len,
                 stitch_mode=stitch_mode,
             )
+        elif force_full_fallback:
+            entry.update(
+                mooncake_hit_len=0,
+                target_prompt_len=len(req.origin_input_ids),
+                target_committed_len=committed_len,
+                target_received_suffix_start=0,
+                target_received_suffix_end=committed_len,
+                stitch_mode="source_decode_full_fallback",
+            )
 
         if prefix_indices is None:
             dst_kv_indices = queue._pre_alloc(
@@ -4412,6 +4862,7 @@ class Scheduler(
                 prefix_len=prefix_len,
                 total_prefix_len=total_prefix_len,
             )
+        req.cache_protected_len = total_prefix_len
         if prefix_match is not None and getattr(self, "enable_decode_hicache", False):
             if int(getattr(prefix_match, "l3_storage_hit_length", 0) or 0) > 0:
                 entry.setdefault("timing_debug", {}).setdefault(
@@ -4533,6 +4984,21 @@ class Scheduler(
         entry["request_released"] = True
         self._pd_flip_note_timing(entry, "target_released")
 
+    def _pd_flip_prepare_target_request_for_adoption(self, req: Req) -> None:
+        # The request already owns a complete req_to_token mapping populated by
+        # the migration receiver.  Re-matching the radix tree here can replace
+        # cache_protected_len/prefix_indices without replacing that mapping,
+        # causing migrated KV indices to be mistaken for cache-owned indices at
+        # final release.  Let the prebuilt admission path initialize the input
+        # once while explicitly preserving the received KV ownership.
+        if req.last_node is None:
+            # Full-source fallback deliberately uses a zero-length target
+            # prefix, so it has no radix match/lock.  The unfinished-cache path
+            # still expects a valid lock owner; the root is the canonical
+            # zero-prefix owner and dec_lock_ref(root) is a no-op.
+            req.last_node = self.tree_cache.root_node
+        req.pd_flip_prebuilt_kv_ready = True
+
     def _pd_flip_adopt_target_request(self, entry: Dict[str, Any]) -> None:
         if entry.get("request_adopted"):
             return
@@ -4542,7 +5008,7 @@ class Scheduler(
             entry["request_adopted"] = True
             self._pd_flip_note_timing(entry, "target_adopted")
             return
-        req.init_next_round_input(self.tree_cache)
+        self._pd_flip_prepare_target_request_for_adoption(req)
         if hasattr(req, "time_stats") and hasattr(
             req.time_stats, "set_wait_queue_entry_time"
         ):
@@ -4634,6 +5100,9 @@ class Scheduler(
                 "delta_pending_reqs": 0,
                 "delta_transferred_reqs": 0,
                 "delta_failed_reqs": 0,
+                "fallback_required_rids": [],
+                "fallback_reason": "",
+                "rollover_blockers": [],
                 "request_measurements": [],
                 "session_archive": list(
                     getattr(self, "pd_flip_migration_session_archive", [])
@@ -4666,6 +5135,13 @@ class Scheduler(
                 session.get("delta_transferred_reqs", 0) or 0
             ),
             "delta_failed_reqs": int(session.get("delta_failed_reqs", 0) or 0),
+            "fallback_required_rids": sorted(
+                str(rid) for rid in session.get("fallback_required_rids", set())
+            ),
+            "fallback_reason": session.get("fallback_reason", ""),
+            "rollover_blockers": self._pd_flip_rollover_blockers(
+                session, session.get("role")
+            ),
             "index_debug": self._pd_flip_migration_index_debug(session),
             "timing_debug": self._pd_flip_migration_timing_debug(session),
             "request_measurements": self._pd_flip_migration_request_measurements(
@@ -4680,6 +5156,15 @@ class Scheduler(
     def _pd_flip_migration_request_measurements(
         session: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
+        def elapsed(timing: Dict[str, Any], start: str, end: str) -> Any:
+            start_value = timing.get(f"{start}_mono")
+            end_value = timing.get(f"{end}_mono")
+            if not isinstance(start_value, (int, float)) or not isinstance(
+                end_value, (int, float)
+            ):
+                return None
+            return max(0.0, end_value - start_value)
+
         entries = session.get("source_entries") or session.get("target_entries") or {}
         session_timing = session.get("timing_debug") or {}
         rows = []
@@ -4697,10 +5182,16 @@ class Scheduler(
                 {
                     "rid": str(rid),
                     "p_tokens": len(base_manifest.get("origin_input_ids") or []),
-                    "h_tokens": entry.get("mooncake_hit_len"),
+                    "h_tokens": entry.get("original_mooncake_hit_len")
+                    if entry.get("original_mooncake_hit_len") is not None
+                    else entry.get("mooncake_hit_len"),
                     "c0_tokens": int(c0 or 0),
                     "c1_tokens": int(c1 or 0),
                     "stitch_mode": entry.get("stitch_mode"),
+                    "original_stitch_mode": entry.get("original_stitch_mode"),
+                    "l1_hit_tokens": entry.get("target_hicache_l1_prefix_len"),
+                    "l2_hit_tokens": entry.get("target_hicache_l2_prefix_len"),
+                    "l3_hit_tokens": entry.get("target_hicache_l3_prefix_len"),
                     "mooncake_bytes": entry.get("mooncake_bytes"),
                     "mooncake_bytes_available": entry.get("mooncake_bytes")
                     is not None,
@@ -4728,6 +5219,41 @@ class Scheduler(
                     "final_owner": entry.get("final_owner"),
                     "output_boundary": manifest.get("last_emitted_output_seq"),
                     "rollback_reason": entry.get("rollback_reason"),
+                    "fallback_reason": entry.get("fallback_reason"),
+                    "fallback_attempted": bool(
+                        entry.get("fallback_attempted", False)
+                    ),
+                    "fallback_source_bytes": entry.get("fallback_source_bytes"),
+                    "fallback_duration_seconds": entry.get(
+                        "fallback_duration_seconds"
+                    ),
+                    "stitch_attempt_seconds": elapsed(
+                        timing,
+                        "target_prefix_query_started",
+                        "target_fallback_required",
+                    ),
+                    "stitch_failure_detection_seconds": elapsed(
+                        timing,
+                        "target_hicache_restore_started",
+                        "target_hicache_restore_failed",
+                    ),
+                    "fallback_transfer_seconds": elapsed(
+                        timing,
+                        "target_fallback_prepare_received",
+                        "target_fallback_receive_completed",
+                    )
+                    or entry.get("fallback_duration_seconds"),
+                    "stitch_failure_to_fallback_complete_seconds": elapsed(
+                        timing,
+                        "target_fallback_required",
+                        "target_fallback_receive_completed",
+                    ),
+                    "failed_stitch_added_cost_seconds": elapsed(
+                        timing,
+                        "target_prefix_query_started",
+                        "target_fallback_required",
+                    ),
+                    "timing_measurement_kind": "exact_process",
                 }
             )
         return rows
@@ -4759,11 +5285,14 @@ class Scheduler(
     ) -> None:
         timing = container.setdefault("timing_debug", {})
         now = time.monotonic()
+        epoch_now = time.time()
         if started is None:
             timing.setdefault(f"{name}_mono", now)
+            timing.setdefault(f"{name}_epoch", epoch_now)
         else:
             timing[f"{name}_s"] = now - started
             timing.setdefault(f"{name}_mono", now)
+            timing.setdefault(f"{name}_epoch", epoch_now)
 
     @staticmethod
     def _pd_flip_json_safe_timing(values: Dict[str, Any]) -> Dict[str, Any]:
@@ -5070,6 +5599,14 @@ class Scheduler(
                 (
                     PDFlipMigrationSourceDeltaReq,
                     self.start_pd_flip_migration_source_delta,
+                ),
+                (
+                    PDFlipMigrationSourceFallbackReq,
+                    self.start_pd_flip_migration_source_fallback,
+                ),
+                (
+                    PDFlipMigrationTargetFallbackPrepareReq,
+                    self.prepare_pd_flip_migration_target_fallback,
                 ),
                 (
                     PDFlipMigrationTargetDeltaPrepareReq,

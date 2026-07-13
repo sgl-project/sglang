@@ -1,0 +1,18 @@
+{
+  "suite_dir": "/root/sglang/experiments/pd_flip_waiting_queue_20260708_102000",
+  "repo": "/root/sglang",
+  "router_url": "http://127.0.0.1:18001",
+  "model_id": "deepseek_v3.1_terminus",
+  "max_running_requests": 1,
+  "migration_max_reqs": 2,
+  "requests": 60,
+  "interval_seconds": 0.1,
+  "force_delay_seconds": 100,
+  "pin_node3_drain_for_waiting": 1,
+  "nodes": {
+    "node0": "http://192.168.0.42:32000",
+    "node1": "http://192.168.0.40:32000",
+    "node2": "http://192.168.0.39:32000",
+    "node3": "http://192.168.0.41:32000"
+  }
+}

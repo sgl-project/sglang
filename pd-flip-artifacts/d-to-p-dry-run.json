@@ -1,0 +1,443 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+{
+  "actions": [
+    {
+      "method": "POST",
+      "payload": {
+        "draining": true,
+        "worker_id": "http://192.168.0.39:31000"
+      },
+      "step": "router_drain_source",
+      "target": "router:http://192.168.0.39:31000",
+      "url": "http://127.0.0.1:18000/pd_flip/router/worker/drain"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "paused": true
+      },
+      "step": "pause_source_admission",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/admission"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "session_id": "pd-flip-node2-to-node3",
+        "target_url": "http://192.168.0.41:31000"
+      },
+      "step": "start_decode_migration_source",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/migration/source/start"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "adopt_on_success": true,
+        "manifests": "<from start_decode_migration_source>",
+        "session_id": "pd-flip-node2-to-node3",
+        "source_url": "http://192.168.0.39:31000"
+      },
+      "step": "prepare_decode_migration_target",
+      "target": "node3",
+      "url": "http://192.168.0.41:31000/pd_flip/migration/target/prepare"
+    },
+    {
+      "method": "GET",
+      "payload": {
+        "poll_interval_seconds": 0.5,
+        "target_url": "http://192.168.0.41:31000",
+        "timeout_seconds": 120.0
+      },
+      "step": "wait_decode_migration_source",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/migration/status"
+    },
+    {
+      "method": "GET",
+      "payload": {
+        "poll_interval_seconds": 0.5,
+        "source_url": "http://192.168.0.39:31000",
+        "timeout_seconds": 120.0
+      },
+      "step": "wait_decode_migration_target",
+      "target": "node3",
+      "url": "http://192.168.0.41:31000/pd_flip/migration/status"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "released_rids": "<from migration target manifests>",
+        "session_id": "pd-flip-node2-to-node3"
+      },
+      "step": "finish_decode_migration_source",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/migration/source/finish"
+    },
+    {
+      "method": "GET",
+      "payload": {
+        "poll_interval_seconds": 0.5,
+        "timeout_seconds": 120.0
+      },
+      "step": "wait_source_idle",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/status"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "force": false,
+        "role": "prefill"
+      },
+      "step": "set_source_runtime_role",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/set"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "bootstrap_port": 18998,
+        "draining": false,
+        "role": "prefill",
+        "worker_id": "http://192.168.0.39:31000"
+      },
+      "step": "refresh_router_source_role",
+      "target": "router:http://192.168.0.39:31000",
+      "url": "http://127.0.0.1:18000/pd_flip/router/worker/role"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "paused": false
+      },
+      "step": "resume_source_admission",
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/admission"
+    },
+    {
+      "method": "POST",
+      "payload": {
+        "draining": false,
+        "worker_id": "http://192.168.0.39:31000"
+      },
+      "step": "router_undrain_source",
+      "target": "router:http://192.168.0.39:31000",
+      "url": "http://127.0.0.1:18000/pd_flip/router/worker/drain"
+    }
+  ],
+  "direction": "d_to_p",
+  "dry_run": true,
+  "metrics": [
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node0",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "prefill",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 0.0,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": -1.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "prefill",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "prefill",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "prefill",
+      "router_worker_id": "http://192.168.0.42:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "prefill",
+      "worker_url": "http://192.168.0.42:31000"
+    },
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node1",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "prefill",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 0.0,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": -1.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "prefill",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "prefill",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "prefill",
+      "router_worker_id": "http://192.168.0.40:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "prefill",
+      "worker_url": "http://192.168.0.40:31000"
+    },
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node2",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "decode",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 3.233,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": 0.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "decode",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "decode",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "decode",
+      "router_worker_id": "http://192.168.0.39:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "decode",
+      "worker_url": "http://192.168.0.39:31000"
+    },
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node3",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "decode",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 3.233,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": 0.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "decode",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "decode",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "decode",
+      "router_worker_id": "http://192.168.0.41:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "decode",
+      "worker_url": "http://192.168.0.41:31000"
+    }
+  ],
+  "migration_target": "node3",
+  "reason": "move decode node node2 to prefill after migrating active decode state to node3",
+  "source": "node2",
+  "target_role": "prefill"
+}

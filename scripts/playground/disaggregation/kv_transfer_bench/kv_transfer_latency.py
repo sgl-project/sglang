@@ -54,6 +54,11 @@ class TargetInfo:
             "protocol": self.protocol,
         }
 
+    def __eq__(self, other):
+        if not isinstance(other, TargetInfo):
+            return NotImplemented
+        return self.as_dict() == other.as_dict()
+
 
 def _time_ns() -> int:
     if hasattr(time, "time_ns"):

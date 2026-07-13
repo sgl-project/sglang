@@ -1,0 +1,12 @@
+{
+  "suite_dir": "/root/sglang/experiments/pd_flip_suite_20260707_172536",
+  "repo": "/root/sglang",
+  "router_url": "http://127.0.0.1:18001",
+  "model_id": "deepseek_v3.1_terminus",
+  "nodes": {
+    "node0": "http://192.168.0.42:32000",
+    "node1": "http://192.168.0.40:32000",
+    "node2": "http://192.168.0.39:32000",
+    "node3": "http://192.168.0.41:32000"
+  }
+}

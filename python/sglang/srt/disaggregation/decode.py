@@ -1903,11 +1903,21 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
-                if self.server_args.disaggregation_decode_enable_radix_cache:
+                pd_flip_prebuilt_kv_ready = bool(
+                    getattr(req, "pd_flip_prebuilt_kv_ready", False)
+                )
+                if pd_flip_prebuilt_kv_ready:
+                    # PD-flip migration already populated req_to_token and its
+                    # prefix ownership fields.  A fresh radix match would only
+                    # change the ownership metadata, not the received mapping.
+                    tree_cache = None
+                elif self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
+                if pd_flip_prebuilt_kv_ready:
+                    req.pd_flip_prebuilt_kv_ready = False
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).

@@ -1,0 +1,82 @@
+{
+  "artifact_dir": "/root/sglang/scripts/playground/disaggregation/pd_flip_docker/artifacts/pd_flip_live_20260703_113901",
+  "client_completion_tokens": 2698,
+  "client_content_len": 12289,
+  "client_error": null,
+  "client_finish_reason": "stop",
+  "client_has_abort_literal": false,
+  "kv_failed_reqs_observed": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "kv_transferred_reqs_observed": [
+    0,
+    0,
+    0,
+    0,
+    2,
+    2,
+    2,
+    2
+  ],
+  "monitor_exit": 0,
+  "monitor_message": "pd flip committed after two-phase migration",
+  "post_workers": [
+    {
+      "active_load": 0,
+      "bootstrap_port": null,
+      "draining": false,
+      "role": "decode",
+      "url": "http://192.168.0.39:32000",
+      "worker_id": "http://192.168.0.39:32000"
+    },
+    {
+      "active_load": 0,
+      "bootstrap_port": null,
+      "draining": false,
+      "role": "plain",
+      "url": "http://192.168.0.40:32000",
+      "worker_id": "http://192.168.0.40:32000"
+    },
+    {
+      "active_load": 0,
+      "bootstrap_port": null,
+      "draining": false,
+      "role": "decode",
+      "url": "http://192.168.0.41:32000",
+      "worker_id": "http://192.168.0.41:32000"
+    },
+    {
+      "active_load": 0,
+      "bootstrap_port": 19998,
+      "draining": false,
+      "role": "prefill",
+      "url": "http://192.168.0.42:32000",
+      "worker_id": "http://192.168.0.42:32000"
+    }
+  ],
+  "restore_exit": 0,
+  "state_trace": [
+    "safe",
+    "preparing_kv_transfer",
+    "flipping_role",
+    "safe"
+  ],
+  "success": true,
+  "trace_slo_ledger": "/root/sglang/scripts/playground/disaggregation/pd_flip_docker/artifacts/pd_flip_live_20260703_113901/trace_slo_ledger.jsonl",
+  "trace_slo_probe": {
+    "completion_chunks": 128,
+    "content": "Of course. Here is a concise, numbered list of essential checks for distributed serving systems, covering key areas from infrastructure to application logic.\n\n### Distributed Serving Checks\n\n1.  **Infrastructure & Dependencies**\n    1.  **Dependency Health:** Verify all downstream services (databases, caches, other microservices) are reachable and responding within the expected latency threshold.\n    2.  **Service Discovery:** Confirm the service can register with and query the service discovery system (e.g., Consul, Eureka, Kubernetes DNS).\n    3.  **Configuration Load:** Ensure the service has successfully loaded its runtime configuration (",
+    "elapsed_seconds": 8.65814442402916,
+    "finish_reason": "length",
+    "request_id": "428299170cd8449fa2d800b343a80a9f"
+  },
+  "trace_slo_probe_error": null,
+  "trace_slo_probe_exit": 0
+}

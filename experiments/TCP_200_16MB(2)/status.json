@@ -1,0 +1,12 @@
+{
+  "run": "TCP_200_16MB(2)",
+  "inner_run": "TCP_200_16MB_2",
+  "status": "complete",
+  "samples": 500,
+  "success_samples": 500,
+  "error_samples": 0,
+  "latency_ms_p50": 8.770821,
+  "latency_ms_p90": 10.140619300000001,
+  "latency_ms_p99": 13.466265059999996,
+  "latency_ms_max": 17.432196
+}

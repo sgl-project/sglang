@@ -1,0 +1,1 @@
+{"batch_ordinal": 1, "batch_rids": ["r0"], "next_fsm_phase": "observing", "phase": "observation_recovered_safe", "router_drained": false, "session_id": "pd-flip-source-to-target-first", "source_admission_paused": false, "source_finished": true, "source_name": "source", "source_url": "http://source", "target_name": "target", "target_url": "http://target"}

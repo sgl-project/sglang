@@ -1,0 +1,127 @@
+﻿[
+    {
+        "Name":  "artifact_manifest.json",
+        "Length":  3483,
+        "LastWriteTime":  "\/Date(1783045924715)\/"
+    },
+    {
+        "Name":  "experiment1_monitor_events.csv",
+        "Length":  670,
+        "LastWriteTime":  "\/Date(1783046037795)\/"
+    },
+    {
+        "Name":  "experiment1_monitor_snapshots.csv",
+        "Length":  1050,
+        "LastWriteTime":  "\/Date(1783046037793)\/"
+    },
+    {
+        "Name":  "experiment2_decode_after_migration.csv",
+        "Length":  4958,
+        "LastWriteTime":  "\/Date(1783046037803)\/"
+    },
+    {
+        "Name":  "experiment2_kv_migration_manifest.json",
+        "Length":  3063,
+        "LastWriteTime":  "\/Date(1783046037800)\/"
+    },
+    {
+        "Name":  "experiment2_kv_migration_requests.csv",
+        "Length":  994,
+        "LastWriteTime":  "\/Date(1783046037798)\/"
+    },
+    {
+        "Name":  "experiment3_wait_before_flip_events.csv",
+        "Length":  570,
+        "LastWriteTime":  "\/Date(1783046037805)\/"
+    },
+    {
+        "Name":  "experiment4_baseline_events.csv",
+        "Length":  21,
+        "LastWriteTime":  "\/Date(1783046037823)\/"
+    },
+    {
+        "Name":  "experiment4_baseline_results.csv",
+        "Length":  9392,
+        "LastWriteTime":  "\/Date(1783046037815)\/"
+    },
+    {
+        "Name":  "experiment4_state_machine_events.csv",
+        "Length":  415,
+        "LastWriteTime":  "\/Date(1783046037821)\/"
+    },
+    {
+        "Name":  "experiment4_state_machine_results.csv",
+        "Length":  10094,
+        "LastWriteTime":  "\/Date(1783046037819)\/"
+    },
+    {
+        "Name":  "experiment4_summary.json",
+        "Length":  969,
+        "LastWriteTime":  "\/Date(1783046037825)\/"
+    },
+    {
+        "Name":  "metadata.json",
+        "Length":  357,
+        "LastWriteTime":  "\/Date(1783046037790)\/"
+    },
+    {
+        "Name":  "preflight_environment.json",
+        "Length":  1114,
+        "LastWriteTime":  "\/Date(1783045924710)\/"
+    },
+    {
+        "Name":  "README.md",
+        "Length":  164,
+        "LastWriteTime":  "\/Date(1783046037834)\/"
+    },
+    {
+        "Name":  "report.html",
+        "Length":  6222,
+        "LastWriteTime":  "\/Date(1783046037832)\/"
+    },
+    {
+        "Name":  "report.md",
+        "Length":  4764,
+        "LastWriteTime":  "\/Date(1783046037830)\/"
+    },
+    {
+        "Name":  "run_pd_flip_weekly_experiments.py",
+        "Length":  25439,
+        "LastWriteTime":  "\/Date(1783046030296)\/"
+    },
+    {
+        "Name":  "slo_attainment_comparison.csv",
+        "Length":  363,
+        "LastWriteTime":  "\/Date(1783046037828)\/"
+    },
+    {
+        "Name":  "trace_100_requests.csv",
+        "Length":  4497,
+        "LastWriteTime":  "\/Date(1783046037809)\/"
+    },
+    {
+        "Name":  "trace_100_requests.md",
+        "Length":  5993,
+        "LastWriteTime":  "\/Date(1783046037811)\/"
+    },
+    {
+        "Name":  "unit_test_pd_flip_active_decode_handoff.log",
+        "Length":  1036,
+        "LastWriteTime":  "\/Date(1783045902810)\/"
+    },
+    {
+        "Name":  "unit_test_pd_flip_controller_attempt.log",
+        "Length":  146,
+        "LastWriteTime":  "\/Date(1783045902887)\/"
+    },
+    {
+        "Name":  "unit_test_pd_flip_monitor.log",
+        "Length":  678,
+        "LastWriteTime":  "\/Date(1783045902858)\/"
+    },
+    {
+        "Name":  "unit_test_pd_flip_state_machine_attempt.log",
+        "Length":  701,
+        "LastWriteTime":  "\/Date(1783045902988)\/"
+    }
+]

@@ -1,7 +1,132 @@
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 class PDFlipMigrationMeasureTest(unittest.TestCase):
+    def test_fallback_measurements_are_preserved_in_request_and_status_rows(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import (
+            flatten_migration_request_samples,
+            flatten_migration_samples,
+            migration_request_fields,
+            migration_status_fields,
+        )
+
+        status = {
+            "session_id": "s",
+            "fallback_required_rids": ["r0"],
+            "fallback_reason": "prefix restore failed",
+            "request_measurements": [{
+                "rid": "r0", "fallback_reason": "prefix restore failed",
+                "fallback_attempted": True, "fallback_source_bytes": 4096,
+                "fallback_duration_seconds": 0.25,
+            }],
+        }
+        events = [{"event_type": "migration_status", "ts_mono": 1.0,
+                   "node": "target", "status": status}]
+
+        request = flatten_migration_request_samples(events)[0]
+        sample = flatten_migration_samples(events)[0]
+        for field, value in {
+            "fallback_reason": "prefix restore failed",
+            "fallback_attempted": True,
+            "fallback_source_bytes": 4096,
+            "fallback_duration_seconds": 0.25,
+        }.items():
+            self.assertEqual(request[field], value)
+            self.assertIn(field, migration_request_fields())
+            self.assertIn(field, migration_status_fields())
+            self.assertEqual(sample[field], value)
+        self.assertEqual(sample["fallback_required_rids"], '["r0"]')
+
+    def test_fallback_stages_and_summary_report_timing(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import (
+            build_timeline, write_outputs,
+        )
+
+        events = [
+            {"event_type": "migration_status", "ts_mono": 10.0, "node": "target",
+             "status": {"role": "target", "state": "target_fallback_required",
+                        "session_id": "s", "fallback_required_rids": ["r0"],
+                        "fallback_reason": "prefix restore failed"}},
+            {"event_type": "migration_status", "ts_mono": 10.1, "node": "source",
+             "status": {"role": "source", "state": "source_fallback_started",
+                        "session_id": "s"}},
+            {"event_type": "migration_status", "ts_mono": 10.4, "node": "target",
+             "status": {"role": "target", "state": "target_fallback_prepared",
+                        "session_id": "s", "request_measurements": [{
+                            "rid": "r0", "fallback_attempted": True,
+                            "fallback_reason": "prefix restore failed",
+                            "fallback_source_bytes": 8192,
+                            "fallback_duration_seconds": 0.3,
+                        }]}},
+        ]
+        timeline = build_timeline(events)
+        self.assertEqual([row["stage"] for row in timeline], [
+            "target_full_fallback_required", "source_full_fallback_started",
+            "target_full_fallback_prepared",
+        ])
+        prepared = timeline[-1]
+        self.assertEqual(prepared["fallback_reason"], "prefix restore failed")
+        self.assertTrue(prepared["fallback_attempted"])
+        self.assertEqual(prepared["fallback_source_bytes"], 8192)
+        self.assertEqual(prepared["fallback_duration_seconds"], 0.3)
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "events.jsonl"
+            raw.write_text("".join(json.dumps(e) + "\n" for e in events))
+            summary = write_outputs(events_path=raw, output_dir=root / "out",
+                                    controller_log=None, request_metrics_path=None,
+                                    errors_path=None)
+        self.assertTrue(summary["fallback_attempted"])
+        self.assertEqual(summary["fallback_reason"], "prefix restore failed")
+        self.assertEqual(summary["fallback_source_bytes"], 8192)
+        self.assertAlmostEqual(summary["fallback_duration_seconds"], 0.3)
+
+    def test_fallback_summary_deduplicates_polls_and_distinct_rids(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import summarize_fallback
+
+        rows = [
+            {"session_id": "s", "rid": "r0", "ts_mono": 1.0,
+             "fallback_attempted": True, "fallback_source_bytes": 100,
+             "fallback_duration_seconds": 0.1, "fallback_reason": "missing"},
+            {"session_id": "s", "rid": "r0", "ts_mono": 2.0,
+             "fallback_attempted": True, "fallback_source_bytes": 100,
+             "fallback_duration_seconds": 0.2, "fallback_reason": "missing"},
+            {"session_id": "s", "rid": "r1", "ts_mono": 2.0,
+             "fallback_attempted": True, "fallback_source_bytes": 300,
+             "fallback_duration_seconds": 0.4, "fallback_reason": "missing"},
+        ]
+        result = summarize_fallback(rows, [])
+        self.assertEqual(result["fallback_source_bytes"], 400)
+        self.assertEqual(result["fallback_duration_seconds"], 0.4)
+        self.assertAlmostEqual(result["fallback_total_duration_seconds"], 0.6)
+
+    def test_fallback_summary_preserves_none_and_real_zero(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import summarize_fallback
+
+        empty = summarize_fallback([], [])
+        self.assertFalse(empty["fallback_attempted"])
+        self.assertIsNone(empty["fallback_source_bytes"])
+        self.assertIsNone(empty["fallback_duration_seconds"])
+        zero = summarize_fallback([{"session_id": "s", "rid": "r",
+                                    "fallback_attempted": True,
+                                    "fallback_source_bytes": 0,
+                                    "fallback_duration_seconds": 0.0}], [])
+        self.assertEqual(zero["fallback_source_bytes"], 0)
+        self.assertEqual(zero["fallback_duration_seconds"], 0.0)
+
+    def test_fallback_stage_duration_rows_keep_observed_intervals(self):
+        from scripts.playground.disaggregation.pd_flip_migration_measure import build_stage_durations
+        rows = build_stage_durations([
+            {"stage": "target_full_fallback_required", "node": "t", "ts_mono": 1.0},
+            {"stage": "source_full_fallback_started", "node": "s", "ts_mono": 1.25},
+            {"stage": "target_full_fallback_prepared", "node": "t", "ts_mono": 2.0},
+        ])
+        self.assertEqual(rows[0]["duration_to_next_s"], 0.25)
+        self.assertEqual(rows[1]["duration_to_next_s"], 0.75)
     def test_flattens_per_request_measurements_with_stable_schema(self):
         from scripts.playground.disaggregation.pd_flip_migration_measure import (
             flatten_migration_request_samples,

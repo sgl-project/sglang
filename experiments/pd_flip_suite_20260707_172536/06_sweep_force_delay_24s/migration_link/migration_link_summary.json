@@ -1,0 +1,11 @@
+{
+  "controller_message": "timed out",
+  "controller_success": false,
+  "event_count": 0,
+  "events_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/06_sweep_force_delay_24s/migration_events.jsonl",
+  "migration_outcome": "no_migration_observed",
+  "request_count": 80,
+  "request_error_count": 33,
+  "timeline_stage_count": 0,
+  "timeline_stages": []
+}

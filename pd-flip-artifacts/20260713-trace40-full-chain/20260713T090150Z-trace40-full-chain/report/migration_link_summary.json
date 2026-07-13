@@ -1,0 +1,33 @@
+{
+  "controller_message": "post_migration_idle_assertion timed out for node2: [{'rid': None, 'http_worker_ipc': None, 'success': True, 'message': 'ok', 'role': 'decode', 'status': {'dp_rank': None, 'tp_rank': 0, 'role': 'decode', 'active_event_loop_role': 'decode', 'runtime_role_switch_enabled': True, 'admission_paused': True, 'pd_flip_admission_paused': True, 'is_idle': False, 'dual_queues_initialized': True, 'event_loop_dynamic': True, 'free_request_slots': 4096, 'available_kv_tokens': 593819, 'max_running_requests_per_dp': 4096, 'reserved_decode_tokens_per_req': 512, 'running_requests': [], 'waiting_requests': []}}]",
+  "controller_success": false,
+  "event_count": 11489,
+  "events_path": "/home/tiancij/pd-artifacts/20260713T090150Z-trace40-full-chain/metrics/events.jsonl",
+  "failed_stitch_added_cost_seconds": null,
+  "fallback_attempted": false,
+  "fallback_duration_seconds": null,
+  "fallback_reason": null,
+  "fallback_source_bytes": null,
+  "fallback_total_duration_seconds": null,
+  "fallback_transfer_seconds": null,
+  "migration_outcome": "kv_transfer_complete_without_commit_observed",
+  "migration_request_sample_count": 1510,
+  "request_count": 40,
+  "request_error_count": 0,
+  "request_migration_join_count": 0,
+  "stitch_attempt_seconds": null,
+  "stitch_failure_detection_seconds": null,
+  "stitch_failure_to_fallback_complete_seconds": null,
+  "timeline_stage_count": 7,
+  "timeline_stages": [
+    "router_source_drained",
+    "source_admission_paused",
+    "source_migration_started",
+    "target_migration_prepared",
+    "kv_transfer_first_progress",
+    "kv_transfer_complete",
+    "cleanup_router_undrain"
+  ],
+  "timing_measurement_kind": null,
+  "worker_load_sample_count": 3535
+}

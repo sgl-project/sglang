@@ -3,6 +3,9 @@ import json
 from pathlib import Path
 
 from scripts.playground.disaggregation.kv_transfer_bench import kv_auto_experiment as auto
+from scripts.playground.disaggregation.kv_transfer_bench import (
+    kv_resweep_fine_dense_experiment as resweep,
+)
 from scripts.playground.disaggregation.kv_transfer_bench import kv_transfer_latency as bench
 from scripts.playground.disaggregation.kv_transfer_bench.kv_transfer_latency import (
     TargetInfo,
@@ -284,6 +287,9 @@ def test_auto_parser_accepts_multi_hca_suites():
     args = auto.build_parser().parse_args(["--suite", "multi-hca-bg"])
     assert args.suite == "multi-hca-bg"
 
+    args = auto.build_parser().parse_args(["--suite", "head-tcp-sweep"])
+    assert args.suite == "head-tcp-sweep"
+
     args = auto.build_parser().parse_args(["--suite", "multi-hca-portcap-bg"])
     assert args.suite == "multi-hca-portcap-bg"
 
@@ -295,6 +301,154 @@ def test_auto_parser_accepts_multi_hca_suites():
 
     args = auto.build_parser().parse_args(["--suite", "ratelimit-empty"])
     assert args.suite == "ratelimit-empty"
+
+
+def test_resweep_parser_accepts_visible_suites():
+    for suite in (
+        "all-visible",
+        "singleflow",
+        "head-tcp-sweep",
+        "legacy-multi-hca-unaverage",
+        "small-flow",
+        "competition",
+    ):
+        args = resweep.build_parser().parse_args(["--suite", suite])
+        assert args.suite == suite
+
+
+def test_resweep_fine_dense_sizes_are_logical_per_shard():
+    one_shard = resweep.fine_dense_sizes_for_shards(1, auto.DENSE_SIZES_1).split(",")
+    assert one_shard == auto.HEAD_TCP_FINE_DENSE_SIZES.split(",")
+
+    two_shards = resweep.fine_dense_sizes_for_shards(2, auto.DENSE_SIZES_2).split(",")
+    assert two_shards[:4] == ["512KB", "1MB", "1536KB", "2MB"]
+    assert two_shards[31] == "16MB"
+    assert two_shards[32] == "24MB"
+    assert [auto.parse_size(size) * 2 for size in two_shards[:32]] == [
+        size * 1024**2 for size in range(1, 33)
+    ]
+
+    four_shards = resweep.fine_dense_sizes_for_shards(4, auto.DENSE_SIZES_4).split(",")
+    assert four_shards[:4] == ["256KB", "512KB", "768KB", "1MB"]
+    assert four_shards[31] == "8MB"
+    assert four_shards[32] == "12MB"
+    assert [auto.parse_size(size) * 4 for size in four_shards[:32]] == [
+        size * 1024**2 for size in range(1, 33)
+    ]
+    assert auto.parse_size(four_shards[-1]) * 4 == 2 * 1024**3
+
+
+def test_resweep_all_visible_covers_86_experiments_without_duplicates():
+    args = resweep.build_parser().parse_args(["--suite", "all-visible"])
+    matrix_runs = resweep.selected_matrix_runs(args)
+    competition_cases = resweep.selected_competition_cases(args)
+    names = [run.run for run in matrix_runs] + [case.run for case in competition_cases]
+
+    assert len(matrix_runs) == 68
+    assert len(competition_cases) == 18
+    assert len(names) == 86
+    assert len(set(names)) == 86
+
+    expected_prefix = [size * 1024**2 for size in range(1, 33)]
+    for run in matrix_runs:
+        logical_sizes = resweep.logical_sizes_bytes(run)
+        assert logical_sizes[:32] == expected_prefix
+        assert all(size > 32 * 1024**2 for size in logical_sizes[32:])
+
+
+def test_resweep_small_flow_recreates_head_and_tail_profiles():
+    args = resweep.build_parser().parse_args(["--suite", "small-flow"])
+    runs = {run.run: run for run in resweep.small_flow_runs(args)}
+
+    assert sorted(runs) == [
+        "head_rdma_small_cap2x200_split",
+        "head_rdma_small_cap4x100_split",
+        "head_rdma_small_uncapped_4x200_split",
+        "tail_rdma_small_cap100_single_nic",
+        "tail_rdma_small_cap200_single_nic",
+        "tail_rdma_small_uncapped_single_nic",
+    ]
+
+    head_uncapped = runs["head_rdma_small_uncapped_4x200_split"]
+    assert head_uncapped.shards == 4
+    assert len(head_uncapped.lanes) == 4
+    assert head_uncapped.max_bytes == "512MB"
+    assert head_uncapped.fg_rate_gbps is None
+    assert head_uncapped.sizes.split(",")[:3] == ["256KB", "512KB", "768KB"]
+    assert resweep.logical_sizes_bytes(head_uncapped)[0] == 1024**2
+    assert resweep.logical_sizes_bytes(head_uncapped)[-1] == 2 * 1024**3
+
+    tail_uncapped = runs["tail_rdma_small_uncapped_single_nic"]
+    assert tail_uncapped.shards == 1
+    assert tail_uncapped.max_bytes == "2GB"
+    assert tail_uncapped.fg_rate_gbps is None
+    assert tail_uncapped.lanes[0].ib_device == "mlx5_0"
+
+
+def test_resweep_lane_host_overrides_update_rdma_defaults():
+    args = resweep.build_parser().parse_args(
+        [
+            "--suite",
+            "fixed-missing",
+            "--src-rdma-hosts",
+            "src0,src1,src2,src3",
+            "--tgt-rdma-hosts",
+            "tgt0,tgt1,tgt2,tgt3",
+        ]
+    )
+
+    old_src = dict(auto.SRC_IPS)
+    old_tgt = dict(auto.TGT_IPS)
+    try:
+        resweep.apply_lane_host_overrides(args)
+        runs = {run.run: run for run in resweep.fixed_missing_runs(args)}
+    finally:
+        auto.SRC_IPS.clear()
+        auto.SRC_IPS.update(old_src)
+        auto.TGT_IPS.clear()
+        auto.TGT_IPS.update(old_tgt)
+
+    split = runs["800_4x200_bg1_cap200_moonbg_fixed"]
+    assert [endpoint.src_host for endpoint in split.lanes] == ["src0", "src1", "src2", "src3"]
+    assert [endpoint.tgt_host for endpoint in split.lanes] == ["tgt0", "tgt1", "tgt2", "tgt3"]
+
+    single = runs["200_1x200_tail_single_nic_bg1_cap200_moonbg_fixed"]
+    assert single.lanes[0].src_host == "src0"
+    assert single.lanes[0].tgt_host == "tgt0"
+
+
+def test_head_tcp_sweep_runs_cover_100g_200g_and_fine_sizes():
+    args = auto.build_parser().parse_args(["--suite", "head-tcp-sweep"])
+    runs = {run.run: run for run in auto.head_tcp_sweep_runs(args)}
+
+    assert sorted(runs) == [
+        "100_1x100_head_tcp_bg0_fine_dense",
+        "200_1x200_head_tcp_bg0_fine_dense",
+    ]
+
+    fine_sizes = [f"{size}MB" for size in range(1, 33)]
+    for rate, name in (
+        (100.0, "100_1x100_head_tcp_bg0_fine_dense"),
+        (200.0, "200_1x200_head_tcp_bg0_fine_dense"),
+    ):
+        run = runs[name]
+        assert run.protocol == "tcp"
+        assert run.shards == 1
+        assert run.max_bytes == "2GB"
+        assert run.lane_cap_gbps == rate
+        assert run.bg_rate_gbps == 0.0
+        assert run.fg_rate_gbps == rate
+        assert run.capfill_lanes == ()
+        assert run.sizes.split(",")[:32] == fine_sizes
+        assert "48MB" in run.sizes.split(",")
+        assert "2GB" in run.sizes.split(",")
+        assert run.lanes[0] == auto.Endpoint(
+            0,
+            0,
+            "192.168.0.39",
+            "192.168.0.41",
+            "mlx5_bond_0",
+        )
 
 
 def test_multi_hca_bg_uses_one_logical_flow_over_device_group():

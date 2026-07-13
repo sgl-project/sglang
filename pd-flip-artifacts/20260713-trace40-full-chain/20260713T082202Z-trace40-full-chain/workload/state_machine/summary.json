@@ -1,0 +1,22 @@
+{
+  "all_attainment": 0.15,
+  "all_met_count": 6,
+  "completed_count": 40,
+  "error_count": 0,
+  "ledger_path": "/home/tiancij/pd-artifacts/20260713T082202Z-trace40-full-chain/workload/trace_slo_ledger.jsonl",
+  "mode": "state_machine",
+  "request_count": 40,
+  "router_url": "http://127.0.0.1:8000",
+  "run_elapsed_s": 48.51485506282188,
+  "run_started_wall": 1783930932.2603185,
+  "tpot_avg_attainment": 1.0,
+  "tpot_avg_met_count": 40,
+  "tpot_good_intervals": 91735,
+  "tpot_interval_attainment": 0.999945498146937,
+  "tpot_p95_attainment": 1.0,
+  "tpot_p95_met_count": 40,
+  "tpot_total_intervals": 91740,
+  "trace_requests": 40,
+  "ttft_attainment": 0.15,
+  "ttft_met_count": 6
+}

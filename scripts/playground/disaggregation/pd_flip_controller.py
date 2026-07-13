@@ -477,6 +477,12 @@ class PDFlipController:
             and record.get("batch_scope") == "waiting_only_pending_manifest"
         )
         phase = str(record.get("phase") or "")
+        fallback_pre_cutover_phases = {
+            "source_full_fallback_intent",
+            "source_full_fallback_started",
+            "target_full_fallback_prepare_intent",
+            "target_full_fallback_prepared",
+        }
         next_fsm_phase = record.get("next_fsm_phase") or record.get("next_phase")
         current_cutover_phases = {
             "ownership_cutover_intent",
@@ -806,6 +812,29 @@ class PDFlipController:
             source_states == {"source_aborted"}
             and target_states == {"target_aborted"}
         ):
+            if phase == "abort_complete_traffic_recovery_incomplete":
+                try:
+                    self._resume_decode_source(source, records)
+                except Exception as exc:
+                    self._write_journal_phase(
+                        source,
+                        target,
+                        session_id,
+                        batch_rids,
+                        "abort_complete_traffic_recovery_incomplete",
+                        False,
+                        {"recovery_error": str(exc)},
+                    )
+                    return FlipExecutionResult(
+                        False,
+                        "migration aborted but source traffic recovery failed: "
+                        + str(exc),
+                        "d_to_p",
+                        source.name,
+                        "decode",
+                        target.name,
+                        actions=records,
+                    )
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "aborted", False
             )
@@ -850,6 +879,7 @@ class PDFlipController:
             "source_quiesce_requested",
             "source_delta_started",
             "source_delta_transferred",
+            "source_fallback_started",
             "source_failed",
         }
         safe_target_abort_states = {
@@ -857,6 +887,8 @@ class PDFlipController:
             "target_transferred_held",
             "target_delta_started",
             "target_delta_transferred",
+            "target_fallback_required",
+            "target_fallback_prepared",
             "ready_to_activate",
             "target_failed",
         }
@@ -888,6 +920,29 @@ class PDFlipController:
                     target.name,
                     actions=records,
                 )
+            if phase in fallback_pre_cutover_phases:
+                try:
+                    self._resume_decode_source(source, records)
+                except Exception as exc:
+                    self._write_journal_phase(
+                        source,
+                        target,
+                        session_id,
+                        batch_rids,
+                        "abort_complete_traffic_recovery_incomplete",
+                        False,
+                        {"recovery_error": str(exc)},
+                    )
+                    return FlipExecutionResult(
+                        False,
+                        "migration aborted but source traffic recovery failed: "
+                        + str(exc),
+                        "d_to_p",
+                        source.name,
+                        "decode",
+                        target.name,
+                        actions=records,
+                    )
             return FlipExecutionResult(
                 True,
                 "session aborted during reconciliation",
@@ -1236,6 +1291,8 @@ class PDFlipController:
         *,
         iterations: int,
         poll_interval_seconds: Optional[float] = None,
+        source_name: Optional[str] = None,
+        migration_target_name: Optional[str] = None,
     ) -> MonitorLoopResult:
         snapshots: List[JsonDict] = []
         records: List[ActionRecord] = []
@@ -1269,11 +1326,24 @@ class PDFlipController:
             if decision is ProgressiveDecision.START:
                 source = self._select_source(
                     metrics,
-                    source_name=None,
+                    source_name=source_name,
                     expected_role="decode",
                     prefer_high_load=True,
                 )
-                target = self._select_decode_migration_target(metrics, source)
+                if migration_target_name is None:
+                    target = self._select_decode_migration_target(metrics, source)
+                else:
+                    target = _find_metric(metrics, migration_target_name)
+                    if target is None:
+                        raise RuntimeError(
+                            f"migration target {migration_target_name!r} was not found"
+                        )
+                    if target.name == source.name:
+                        raise RuntimeError("migration source and target must differ")
+                    if target.effective_role != "decode":
+                        raise RuntimeError(
+                            f"migration target {target.name} is not decode"
+                        )
                 return self._execute_progressive_d_to_p(
                     source=source,
                     target=target,
@@ -1623,13 +1693,14 @@ class PDFlipController:
             self._write_journal_phase(
                 source, target, session_id, batch_rids, "target_prepared"
             )
-            self._wait_migration(records, "wait_decode_migration_source", source)
-            self._wait_migration(records, "wait_decode_migration_target", target)
+            self._wait_atomic_initial_transfer(
+                records, source, target, session_id, batch_rids
+            )
             delta_manifests = self._poll_source_delta_manifests(
                 records, source, session_id, batch_rids
             )
             delta_rids = tuple(_manifest_rids(delta_manifests))
-            if delta_rids != batch_rids:
+            if not _same_atomic_rids(delta_rids, batch_rids):
                 raise RuntimeError(
                     "source delta manifests do not match atomic batch RIDs"
                 )
@@ -1757,6 +1828,99 @@ class PDFlipController:
                 source_finished=source_finished,
                 cutover_started=cutover_started,
             ) from exc
+
+    def _wait_atomic_initial_transfer(
+        self,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        batch_rids: Sequence[str],
+    ) -> None:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        attempted = set()
+        last_source = last_target = None
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    "atomic initial migration timed out: "
+                    f"source={last_source}, target={last_target}"
+                )
+            last_source = self._record_get(
+                records,
+                "wait_decode_migration_source",
+                source.name,
+                source.worker_url,
+                "/pd_flip/migration/status",
+            )
+            last_target = self._record_get(
+                records,
+                "wait_decode_migration_target",
+                target.name,
+                target.worker_url,
+                "/pd_flip/migration/status",
+            )
+            fallback_rids, reason, status_session = _migration_fallback_request(
+                last_target
+            )
+            if fallback_rids:
+                if status_session and status_session != session_id:
+                    raise RuntimeError("fallback status session does not match batch")
+                unknown = set(fallback_rids).difference(map(str, batch_rids))
+                if unknown:
+                    raise RuntimeError(
+                        "fallback requested unknown RIDs: "
+                        + ", ".join(sorted(unknown))
+                    )
+                repeated = attempted.intersection(fallback_rids)
+                if repeated:
+                    raise RuntimeError(
+                        "full fallback already attempted for RIDs: "
+                        + ", ".join(sorted(repeated))
+                    )
+                attempted.update(fallback_rids)
+                metadata = {"fallback_rids": fallback_rids}
+                self._write_journal_phase(
+                    source, target, session_id, batch_rids,
+                    "source_full_fallback_intent", metadata=metadata
+                )
+                self._post_worker(
+                    records,
+                    "start_decode_migration_source_full_fallback",
+                    source,
+                    "/pd_flip/migration/source/fallback",
+                    {"session_id": session_id, "rids": fallback_rids, "reason": reason},
+                )
+                self._write_journal_phase(
+                    source, target, session_id, batch_rids,
+                    "source_full_fallback_started", metadata=metadata
+                )
+                self._write_journal_phase(
+                    source, target, session_id, batch_rids,
+                    "target_full_fallback_prepare_intent", metadata=metadata
+                )
+                self._post_worker(
+                    records,
+                    "prepare_decode_migration_target_full_fallback",
+                    target,
+                    "/pd_flip/migration/target/fallback/prepare",
+                    {"session_id": session_id, "rids": fallback_rids},
+                )
+                self._write_journal_phase(
+                    source, target, session_id, batch_rids,
+                    "target_full_fallback_prepared", metadata=metadata
+                )
+                continue
+            failures = []
+            if _migration_response_failed(last_source):
+                failures.append(f"{source.name}: {_migration_response_error(last_source)}")
+            if _migration_response_failed(last_target):
+                failures.append(f"{target.name}: {_migration_response_error(last_target)}")
+            if failures:
+                raise RuntimeError("atomic migration failed: " + "; ".join(failures))
+            if _migration_response_complete(last_source) and _migration_response_complete(last_target):
+                return
+            time.sleep(self.config.migration_poll_interval_seconds)
 
     def _poll_source_delta_manifests(
         self,
@@ -2403,6 +2567,8 @@ class PDFlipController:
                 slo_monitor=slo_monitor,
                 monitor_nodes=monitor_nodes,
                 exit_threshold=exit_threshold,
+                session_id=session_id,
+                migration_rids=released_rids,
             )
             migration_seconds = time.monotonic() - migration_started
             if transfer_result == "recovered":
@@ -2691,6 +2857,8 @@ class PDFlipController:
         slo_monitor: PDFlipSLOMonitor,
         monitor_nodes: List[Tuple[str, str, str]],
         exit_threshold: float,
+        session_id: Optional[str] = None,
+        migration_rids: Optional[List[str]] = None,
     ) -> str:
         started = time.monotonic()
         transfer_deadline = started + self.config.migration_timeout_seconds
@@ -2698,6 +2866,7 @@ class PDFlipController:
         transfer_complete = False
         last_source_status: Any = None
         last_target_status: Any = None
+        fallback_attempted_rids = set()
         while True:
             now = time.monotonic()
             if not transfer_complete and now > transfer_deadline:
@@ -2727,6 +2896,75 @@ class PDFlipController:
             )
             last_source_status = source_status
             last_target_status = target_status
+            fallback_rids, fallback_reason, status_session_id = (
+                _migration_fallback_request(target_status)
+            )
+            if fallback_rids:
+                effective_session_id = session_id or status_session_id
+                if not effective_session_id:
+                    raise RuntimeError(
+                        "target requested full fallback without a migration session id"
+                    )
+                repeated = fallback_attempted_rids.intersection(fallback_rids)
+                if repeated:
+                    raise RuntimeError(
+                        "full fallback already attempted for RIDs: "
+                        + ", ".join(sorted(repeated))
+                    )
+                fallback_attempted_rids.update(fallback_rids)
+                journal_rids = migration_rids or fallback_rids
+                fallback_details = {"fallback_rids": fallback_rids}
+                self._write_journal_phase(
+                    source,
+                    target,
+                    effective_session_id,
+                    journal_rids,
+                    "source_full_fallback_intent",
+                    metadata=fallback_details,
+                )
+                self._post_worker(
+                    records,
+                    "start_decode_migration_source_full_fallback",
+                    source,
+                    "/pd_flip/migration/source/fallback",
+                    {
+                        "session_id": effective_session_id,
+                        "rids": fallback_rids,
+                        "reason": fallback_reason,
+                    },
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    effective_session_id,
+                    journal_rids,
+                    "source_full_fallback_started",
+                    metadata=fallback_details,
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    effective_session_id,
+                    journal_rids,
+                    "target_full_fallback_prepare_intent",
+                    metadata=fallback_details,
+                )
+                self._post_worker(
+                    records,
+                    "prepare_decode_migration_target_full_fallback",
+                    target,
+                    "/pd_flip/migration/target/fallback/prepare",
+                    {"session_id": effective_session_id, "rids": fallback_rids},
+                )
+                self._write_journal_phase(
+                    source,
+                    target,
+                    effective_session_id,
+                    journal_rids,
+                    "target_full_fallback_prepared",
+                    metadata=fallback_details,
+                )
+                continue
             if _migration_response_complete(
                 source_status
             ) and _migration_response_complete(target_status):
@@ -3863,6 +4101,16 @@ def _manifest_rids(manifests: List[JsonDict]) -> List[str]:
     ]
 
 
+def _same_atomic_rids(left: Sequence[str], right: Sequence[str]) -> bool:
+    """Match a complete RID batch without imposing manifest response order."""
+    return (
+        len(left) == len(right)
+        and len(set(left)) == len(left)
+        and len(set(right)) == len(right)
+        and set(left) == set(right)
+    )
+
+
 def _migration_response_complete(response: Any) -> bool:
     item = _first_successful_response(response)
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
@@ -3888,6 +4136,29 @@ def _migration_response_error(response: Any) -> str:
         or status.get("state")
         or "migration failed"
     )
+
+
+def _migration_fallback_request(response: Any) -> Tuple[List[str], str, Optional[str]]:
+    responses = response if isinstance(response, list) else [response]
+    rids = []
+    seen = set()
+    reason = ""
+    session_id = None
+    for item in responses:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        session_id = session_id or status.get("session_id") or item.get("session_id")
+        reason = reason or str(status.get("fallback_reason") or "")
+        requested = status.get("fallback_required_rids") or []
+        if not isinstance(requested, list):
+            raise RuntimeError("fallback_required_rids must be a list")
+        for rid in requested:
+            rid = str(rid).strip()
+            if rid and rid not in seen:
+                seen.add(rid)
+                rids.append(rid)
+    return rids, reason, str(session_id) if session_id is not None else None
 
 
 def _parse_runtime_status(item: JsonDict) -> Tuple[str, bool, bool]:
@@ -4105,6 +4376,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--api-key", default=None)
+    parser.add_argument(
+        "--api-key-env",
+        default=None,
+        help="Read the API key from this environment variable instead of argv.",
+    )
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
     parser.add_argument("--first-migration-ratio", type=float, default=0.5)
     parser.add_argument("--observation-seconds", type=float, default=10.0)
@@ -4149,7 +4425,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Use request-level trace SLO JSONL ledger instead of Prometheus histograms.",
     )
+
+    progressive = subparsers.add_parser(
+        "monitor-progressive",
+        help="Run request-level SLO progressive D-to-P migration and observation.",
+    )
+    progressive.add_argument("--trace-slo-ledger", required=True)
+    progressive.add_argument("--source-name", default=None)
+    progressive.add_argument("--migration-target-name", default=None)
+    progressive.add_argument("--iterations", type=int, default=1)
+    progressive.add_argument("--poll-interval", type=float, default=1.0)
     return parser
+
+
+def resolve_api_key(args: argparse.Namespace) -> Optional[str]:
+    if args.api_key and args.api_key_env:
+        raise ValueError("use only one of --api-key and --api-key-env")
+    if not args.api_key_env:
+        return args.api_key
+    api_key = os.environ.get(args.api_key_env)
+    if not api_key:
+        raise ValueError(
+            f"API key environment variable is empty or missing: {args.api_key_env}"
+        )
+    return api_key
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -4160,7 +4459,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     try:
         config = config_from_args(args)
-        client = HttpClient(api_key=args.api_key, timeout_seconds=args.timeout_seconds)
+        client = HttpClient(
+            api_key=resolve_api_key(args), timeout_seconds=args.timeout_seconds
+        )
         controller = PDFlipController(config, client)
         if args.command == "metrics":
             output = controller.collect_metrics()
@@ -4203,6 +4504,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 commit_threshold=args.commit_threshold,
                 iterations=args.iterations,
                 poll_interval_seconds=args.poll_interval,
+            )
+        elif args.command == "monitor-progressive":
+            slo_monitor = TraceSLOMonitor(
+                ledger_path=args.trace_slo_ledger,
+                window_seconds=max(config.observation_seconds, 1.0),
+                client=client,
+            )
+            output = controller.monitor_progressive(
+                slo_monitor=slo_monitor,
+                iterations=args.iterations,
+                poll_interval_seconds=args.poll_interval,
+                source_name=args.source_name,
+                migration_target_name=args.migration_target_name,
             )
         else:
             parser.error(f"unknown command {args.command}")

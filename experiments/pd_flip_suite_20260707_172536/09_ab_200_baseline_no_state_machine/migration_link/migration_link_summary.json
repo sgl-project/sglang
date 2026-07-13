@@ -1,0 +1,11 @@
+{
+  "controller_message": null,
+  "controller_success": null,
+  "event_count": 0,
+  "events_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/09_ab_200_baseline_no_state_machine/migration_events.jsonl",
+  "migration_outcome": "no_migration_observed",
+  "request_count": 200,
+  "request_error_count": 0,
+  "timeline_stage_count": 0,
+  "timeline_stages": []
+}

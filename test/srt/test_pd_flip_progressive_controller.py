@@ -437,6 +437,12 @@ class ProgressiveScenarioClient:
         if path == "/pd_flip/migration/target/prepare":
             self.steps.append("target_prepare")
             return {"success": True}
+        if path == "/pd_flip/migration/source/fallback":
+            self.steps.append("source_fallback")
+            return {"success": True}
+        if path == "/pd_flip/migration/target/fallback/prepare":
+            self.steps.append("target_fallback_prepare")
+            return {"success": True}
         if path == "/pd_flip/migration/source/delta":
             session_id = payload["session_id"]
             attempts = self.delta_attempts.get(session_id, 0) + 1
@@ -937,6 +943,8 @@ def test_progressive_commit_skips_empty_final_source_start():
     assert result.success
     assert len(client.source_starts) == 1
     assert client.source_starts[0]["rids"] == ["only"]
+    assert client.steps.count("set_source_runtime_role") == 1
+    assert client.source_role == "prefill"
 
 
 def test_progressive_failure_before_source_finish_aborts_both_sides():
@@ -952,6 +960,295 @@ def test_progressive_failure_before_source_finish_aborts_both_sides():
     assert [record.target for record in abort_records] == ["target", "source"]
     assert "source_finish" not in client.steps
     assert client.steps[-2:] == ["resume_source_admission", "router_undrain_source"]
+
+
+def test_two_phase_wait_selectively_retries_target_requested_full_fallback():
+    controller, client, monitor = progressive_scenario((14, 20, 19, 20))
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    records = []
+    polls = {"target": 0}
+
+    def get_json(base_url, path):
+        assert path == "/pd_flip/migration/status"
+        if base_url == "http://target":
+            polls["target"] += 1
+            if polls["target"] == 1:
+                return {
+                    "success": True,
+                    "status": {
+                        "state": "target_fallback_required",
+                        "pending_reqs": 1,
+                        "failed_reqs": 0,
+                        "fallback_required_rids": ["r1"],
+                        "fallback_reason": "Mooncake bytes unavailable",
+                    },
+                }
+        return {
+            "success": True,
+            "status": {"state": "transferred", "pending_reqs": 0, "failed_reqs": 0},
+        }
+
+    client.get_json = get_json
+
+    result = controller._wait_two_phase_migration_or_recovery(
+        records=records,
+        source=source,
+        target=target,
+        slo_monitor=monitor,
+        monitor_nodes=[],
+        exit_threshold=0.99,
+        session_id="session",
+    )
+
+    assert result == "transferred"
+    fallback_posts = [
+        (path, payload)
+        for base_url, path, payload in client.posts
+        if "fallback" in path
+    ]
+    assert fallback_posts == [
+        (
+            "/pd_flip/migration/source/fallback",
+            {
+                "session_id": "session",
+                "rids": ["r1"],
+                "reason": "Mooncake bytes unavailable",
+            },
+        ),
+        (
+            "/pd_flip/migration/target/fallback/prepare",
+            {"session_id": "session", "rids": ["r1"]},
+        ),
+    ]
+    assert [record.step for record in records if "fallback" in record.step] == [
+        "start_decode_migration_source_full_fallback",
+        "prepare_decode_migration_target_full_fallback",
+    ]
+
+
+def test_progressive_atomic_initial_transfer_fallback_preserves_following_order():
+    controller, client, _ = progressive_scenario((14, 20, 19, 20))
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    original = client.get_json
+    target_polls = 0
+
+    def get_json(base_url, path):
+        nonlocal target_polls
+        if path == "/pd_flip/migration/status" and base_url == "http://target":
+            target_polls += 1
+            if target_polls == 1:
+                return {"success": True, "status": {
+                    "session_id": "atomic", "state": "target_fallback_required",
+                    "pending_reqs": 1, "failed_reqs": 0,
+                    "fallback_required_rids": ["r0"], "fallback_reason": "missing prefix",
+                }}
+        return original(base_url, path)
+
+    client.get_json = get_json
+    records = []
+    migrated = controller._execute_atomic_batch(
+        source, target, "atomic", ["r0"], False,
+        next_fsm_phase="observing", records=records,
+    )
+
+    assert migrated == ("r0",)
+    steps = [record.step for record in records]
+    assert steps.index("start_decode_migration_source_full_fallback") < steps.index(
+        "prepare_decode_migration_target_full_fallback"
+    ) < steps.index("start_decode_migration_source_delta") < steps.index(
+        "commit_decode_migration_target"
+    ) < steps.index("finish_decode_migration_source") < steps.index(
+        "activate_decode_migration_target"
+    )
+
+
+@pytest.mark.parametrize(
+    "fail_path",
+    [
+        "/pd_flip/migration/source/fallback",
+        "/pd_flip/migration/target/fallback/prepare",
+    ],
+)
+def test_progressive_fallback_post_failure_aborts_both_workers(fail_path):
+    client = ProgressiveScenarioClient(fail_path=fail_path)
+    controller, client, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    original = client.get_json
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status" and base_url == "http://target":
+            return {"success": True, "status": {
+                "session_id": "atomic", "state": "target_fallback_required",
+                "pending_reqs": 1, "failed_reqs": 0,
+                "fallback_required_rids": ["r0"], "fallback_reason": "missing prefix",
+            }}
+        return original(base_url, path)
+
+    client.get_json = get_json
+    records = []
+    with pytest.raises(controller_module.ProgressiveAtomicBatchError):
+        controller._execute_atomic_batch(
+            source, target, "atomic", ["r0"], False,
+            next_fsm_phase="observing", records=records,
+        )
+    assert [record.target for record in records if record.step == "abort_decode_migration"] == [
+        "target", "source"
+    ]
+
+
+@pytest.mark.parametrize(
+    "phase,source_state,target_state",
+    [
+        ("source_full_fallback_intent", "source_started", "target_fallback_required"),
+        ("source_full_fallback_started", "source_fallback_started", "target_fallback_required"),
+        ("target_full_fallback_prepare_intent", "source_fallback_started", "target_fallback_required"),
+        ("target_full_fallback_prepared", "source_fallback_started", "target_fallback_prepared"),
+    ],
+)
+def test_reconcile_fallback_journal_phases_abort_safely(
+    tmp_path, phase, source_state, target_state
+):
+    controller, client, _ = progressive_scenario((14, 20, 19, 20))
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source, target, "fallback-session", ["r0"], phase,
+        metadata={"fallback_rids": ["r0"]},
+    )
+    original = client.get_json
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = source_state if base_url == "http://source" else target_state
+            return {"success": True, "status": {
+                "session_id": "fallback-session", "state": state,
+                "pending_reqs": 1, "failed_reqs": 0,
+            }}
+        return original(base_url, path)
+
+    client.get_json = get_json
+    result = controller.reconcile_session("fallback-session")
+    assert result.success
+    assert controller.session_journal.read()["phase"] == "aborted"
+    assert client.steps.count("abort") == 2
+    assert client.steps[-2:] == ["resume_source_admission", "router_undrain_source"]
+
+
+def test_reconcile_fallback_abort_reports_source_traffic_recovery_failure(tmp_path):
+    client = ProgressiveScenarioClient(fail_path="/pd_flip/runtime_role/admission")
+    controller, client, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source, target, "fallback-session", ["r0"],
+        "target_full_fallback_prepared", metadata={"fallback_rids": ["r0"]},
+    )
+    original = client.get_json
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = "source_fallback_started" if base_url == "http://source" else "target_fallback_prepared"
+            return {"success": True, "status": {
+                "session_id": "fallback-session", "state": state,
+                "pending_reqs": 1, "failed_reqs": 0,
+            }}
+        return original(base_url, path)
+
+    client.get_json = get_json
+    result = controller.reconcile_session("fallback-session")
+    assert not result.success
+    assert "traffic recovery failed" in result.message
+    assert controller.session_journal.read()["phase"] == "abort_complete_traffic_recovery_incomplete"
+
+
+@pytest.mark.parametrize(
+    "transient_path",
+    ["/pd_flip/runtime_role/admission", "/pd_flip/router/worker/drain"],
+)
+def test_second_reconcile_retries_transient_fallback_traffic_recovery_failure(
+    tmp_path, transient_path
+):
+    client = ProgressiveScenarioClient()
+    controller, client, _ = progressive_scenario((14, 20, 19, 20), client=client)
+    controller.session_journal = controller_module.PDFlipSessionJournal(
+        tmp_path / "journal.json"
+    )
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    controller._write_journal_phase(
+        source, target, "fallback-session", ["r0"],
+        "abort_complete_traffic_recovery_incomplete",
+        metadata={"recovery_error": "transient"},
+    )
+    original_get = client.get_json
+    original_post = client.post_json
+    failed_once = False
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status":
+            state = "source_aborted" if base_url == "http://source" else "target_aborted"
+            return {"success": True, "status": {
+                "session_id": "fallback-session", "state": state,
+                "pending_reqs": 0, "failed_reqs": 0,
+            }}
+        return original_get(base_url, path)
+
+    def post_json(base_url, path, payload):
+        nonlocal failed_once
+        if path == transient_path and not failed_once:
+            failed_once = True
+            return {"success": False, "message": "transient recovery failure"}
+        return original_post(base_url, path, payload)
+
+    client.get_json = get_json
+    client.post_json = post_json
+    first = controller.reconcile_session("fallback-session")
+    assert not first.success
+    assert controller.session_journal.read()["phase"] == "abort_complete_traffic_recovery_incomplete"
+
+    second = controller.reconcile_session("fallback-session")
+    assert second.success
+    assert controller.session_journal.read()["phase"] == "aborted"
+    assert second.actions[-2].step == "resume_source_admission"
+    assert second.actions[-1].step == "router_undrain_source"
+
+
+def test_progressive_repeated_fallback_request_is_rejected_and_aborted():
+    controller, client, _ = progressive_scenario((14, 20, 19, 20))
+    source = controller_module.NodeMetrics("source", "http://source", "source")
+    target = controller_module.NodeMetrics("target", "http://target", "target")
+    original = client.get_json
+
+    def get_json(base_url, path):
+        if path == "/pd_flip/migration/status" and base_url == "http://target":
+            return {"success": True, "status": {
+                "session_id": "atomic", "state": "target_fallback_required",
+                "pending_reqs": 1, "failed_reqs": 0,
+                "fallback_required_rids": ["r0"], "fallback_reason": "still missing",
+            }}
+        return original(base_url, path)
+
+    client.get_json = get_json
+    records = []
+    with pytest.raises(
+        controller_module.ProgressiveAtomicBatchError,
+        match="full fallback already attempted",
+    ):
+        controller._execute_atomic_batch(
+            source, target, "atomic", ["r0"], False,
+            next_fsm_phase="observing", records=records,
+        )
+    assert len([record for record in records if record.step == "start_decode_migration_source_full_fallback"]) == 1
+    assert [record.target for record in records if record.step == "abort_decode_migration"] == ["target", "source"]
 
 
 def test_progressive_failure_after_source_finish_does_not_abort_ownership():

@@ -1,0 +1,1398 @@
+﻿diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index f1f9adc21..00e3522f2 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -17,6 +17,7 @@ import dataclasses
+ import faulthandler
+ import hashlib
+ import logging
++import numbers
+ import os
+ import signal
+ import sys
+@@ -188,6 +189,7 @@ from sglang.srt.managers.prefill_delayer import (
+ )
+ from sglang.srt.managers.schedule_batch import (
+     FINISH_ABORT,
++    FINISH_MIGRATED,
+     MultimodalInputs,
+     Req,
+     ScheduleBatch,
+@@ -313,6 +315,7 @@ else:
+ 
+ 
+ logger = logging.getLogger(__name__)
++PD_FLIP_MIN_METADATA_BUFFER_SIZE = 1024
+ 
+ # Test retract decode for debugging purposes
+ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
+@@ -1121,21 +1124,42 @@ class Scheduler(
+     def _init_pd_metadata_buffers(
+         self, buffer_size: int, hidden_size: int, hidden_states_dtype
+     ) -> None:
+-        if hasattr(self, "req_to_metadata_buffer_idx_allocator"):
+-            return
++        current_allocator = getattr(self, "req_to_metadata_buffer_idx_allocator", None)
++        current_size = int(getattr(current_allocator, "size", 0) or 0)
++        if current_allocator is not None:
++            if current_size >= buffer_size:
++                return
++            available_size = (
++                current_allocator.available_size()
++                if hasattr(current_allocator, "available_size")
++                else current_size
++            )
++            if available_size != current_size:
++                raise RuntimeError(
++                    "cannot grow PD metadata buffers while metadata entries are allocated"
++                )
+ 
+         self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+             buffer_size
+         )
++        custom_mem_pool = None
++        kv_pool_allocator = getattr(self, "token_to_kv_pool_allocator", None)
++        if kv_pool_allocator is not None:
++            custom_mem_pool = (
++                kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool()
++            )
+         self.disagg_metadata_buffers = MetadataBuffers(
+             buffer_size,
+             hidden_size=hidden_size,
+             hidden_states_dtype=hidden_states_dtype,
+-            custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
++            custom_mem_pool=custom_mem_pool,
+         )
+ 
+     def _init_hybrid_disaggregation_metadata(self, model_config) -> None:
+-        buffer_size = max(self.req_to_token_pool.size, self.max_running_requests) * 2
++        buffer_size = max(
++            max(self.req_to_token_pool.size, self.max_running_requests) * 2,
++            PD_FLIP_MIN_METADATA_BUFFER_SIZE,
++        )
+         hidden_size = (
+             model_config.spec_hidden_size
+             if self.spec_algorithm.is_eagle()
+@@ -1151,17 +1175,16 @@ class Scheduler(
+         self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+ 
+     def _init_decode_disaggregation(self, draft_token_to_kv_pool, model_config) -> None:
+-        if not hasattr(self, "req_to_metadata_buffer_idx_allocator"):
+-            buffer_size = self.req_to_token_pool.size * 2
+-            hidden_size = (
+-                model_config.spec_hidden_size
+-                if self.spec_algorithm.is_eagle()
+-                else 16  # minimal padding size for RDMA
+-            )
+-            hidden_states_dtype = (
+-                model_config.dtype if self.spec_algorithm.is_eagle() else torch.float32
+-            )
+-            self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
++        buffer_size = self.req_to_token_pool.size * 2
++        hidden_size = (
++            model_config.spec_hidden_size
++            if self.spec_algorithm.is_eagle()
++            else 16  # minimal padding size for RDMA
++        )
++        hidden_states_dtype = (
++            model_config.dtype if self.spec_algorithm.is_eagle() else torch.float32
++        )
++        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+ 
+         # The decode requests polling kv cache
+         self.disagg_decode_transfer_queue = DecodeTransferQueue(
+@@ -1198,21 +1221,20 @@ class Scheduler(
+     def _init_prefill_disaggregation(
+         self, draft_token_to_kv_pool, model_config
+     ) -> None:
+-        if not hasattr(self, "req_to_metadata_buffer_idx_allocator"):
+-            buffer_size = self.max_running_requests * 2
+-            hidden_size = (
+-                model_config.spec_hidden_size
+-                if self.spec_algorithm.is_eagle()
+-                or self.spec_algorithm.is_standalone()
+-                else 16  # minimal padding size for RDMA
+-            )
+-            hidden_states_dtype = (
+-                model_config.dtype
+-                if self.spec_algorithm.is_eagle()
+-                or self.spec_algorithm.is_standalone()
+-                else torch.float32
+-            )
+-            self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
++        buffer_size = self.max_running_requests * 2
++        hidden_size = (
++            model_config.spec_hidden_size
++            if self.spec_algorithm.is_eagle()
++            or self.spec_algorithm.is_standalone()
++            else 16  # minimal padding size for RDMA
++        )
++        hidden_states_dtype = (
++            model_config.dtype
++            if self.spec_algorithm.is_eagle()
++            or self.spec_algorithm.is_standalone()
++            else torch.float32
++        )
++        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+ 
+         self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
+             token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+@@ -1237,7 +1259,8 @@ class Scheduler(
+         return DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+ 
+     def pd_runtime_role_switch_enabled(self) -> bool:
+-        return bool(getattr(self.server_args, "enable_pd_runtime_role_switch", False))
++        server_args = getattr(self, "server_args", None)
++        return bool(getattr(server_args, "enable_pd_runtime_role_switch", False))
+ 
+     def _pd_runtime_role_status_dict(self) -> Dict[str, Any]:
+         is_idle = False
+@@ -1404,6 +1427,8 @@ class Scheduler(
+         )
+ 
+     def pd_flip_is_idle_for_commit(self, snapshot: ClusterSnapshot) -> bool:
++        if self._pd_flip_source_migration_blocks_idle():
++            return False
+         snapshot_idle = (
+             snapshot.waiting_reqs == 0
+             and snapshot.running_reqs == 0
+@@ -1612,9 +1637,48 @@ class Scheduler(
+         except TypeError:
+             return 0
+ 
++    def _pd_flip_waiting_req_skip_reason(self, req: Req) -> str:
++        finished = getattr(req, "finished", None)
++        if callable(finished) and finished():
++            return "finished"
++        if getattr(req, "req_pool_idx", None) is None:
++            return "missing_req_pool_idx"
++        kv_committed_len = getattr(req, "kv_committed_len", None)
++        if kv_committed_len is None:
++            kv_committed_len = len(getattr(req, "origin_input_ids", []) or []) + max(
++                0, len(getattr(req, "output_ids", []) or []) - 1
++            )
++        try:
++            committed_len = int(kv_committed_len or 0)
++        except (TypeError, ValueError):
++            committed_len = 0
++        if committed_len <= 0:
++            return "missing_committed_kv"
++        return ""
++
++    def _pd_flip_classify_waiting_reqs(
++        self, waiting_reqs: List[Req]
++    ) -> Tuple[List[Tuple[int, Req]], List[Dict[str, Any]]]:
++        selected: List[Tuple[int, Req]] = []
++        skipped: List[Dict[str, Any]] = []
++        for index, req in enumerate(waiting_reqs):
++            reason = self._pd_flip_waiting_req_skip_reason(req)
++            if reason:
++                skipped.append(
++                    {
++                        "rid": getattr(req, "rid", ""),
++                        "queue_index": index,
++                        "reason": reason,
++                    }
++                )
++                continue
++            selected.append((index, req))
++        return selected, skipped
++
+     def start_pd_flip_migration_source(
+         self, recv_req: PDFlipMigrationSourceStartReq
+     ) -> PDFlipMigrationReqOutput:
++        timing_debug = {}
+         role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+         if role != "decode":
+             return PDFlipMigrationReqOutput(
+@@ -1623,13 +1687,77 @@ class Scheduler(
+                 status=self._pd_flip_migration_status_dict(),
+             )
+ 
++        scan_started = time.monotonic()
+         running_reqs = list(getattr(getattr(self, "running_batch", None), "reqs", []))
++        timing_debug["scan_running_reqs_s"] = time.monotonic() - scan_started
++        timing_debug["running_reqs"] = len(running_reqs)
++
++        waiting_scan_started = time.monotonic()
++        waiting_reqs = list(getattr(self, "waiting_queue", []))
++        waiting_selected, waiting_skipped = self._pd_flip_classify_waiting_reqs(
++            waiting_reqs
++        )
++        timing_debug["scan_waiting_reqs_s"] = time.monotonic() - waiting_scan_started
++        timing_debug["waiting_reqs"] = len(waiting_reqs)
++        timing_debug["waiting_skipped_count"] = len(waiting_skipped)
++        timing_debug["waiting_skipped"] = waiting_skipped
++
++        live_waiting_skipped = [
++            item for item in waiting_skipped if item.get("reason") != "finished"
++        ]
++        if live_waiting_skipped:
++            skipped_summary = ", ".join(
++                f"{item.get('rid', '')}:{item.get('reason', '')}"
++                for item in live_waiting_skipped
++            )
++            return PDFlipMigrationReqOutput(
++                success=False,
++                message=(
++                    "refusing partial migration; live waiting requests are not "
++                    f"migratable: {skipped_summary}"
++                ),
++                status=self._pd_flip_migration_status_dict(),
++            )
++
++        eligible_reqs = len(running_reqs) + len(waiting_selected)
+         if recv_req.max_reqs is not None:
+-            running_reqs = running_reqs[: max(0, recv_req.max_reqs)]
++            max_reqs = max(0, int(recv_req.max_reqs))
++            if eligible_reqs > max_reqs:
++                omitted = eligible_reqs - max_reqs
++                return PDFlipMigrationReqOutput(
++                    success=False,
++                    message=(
++                        f"refusing partial migration; max_reqs={max_reqs} would "
++                        f"omit {omitted} eligible requests"
++                    ),
++                    status=self._pd_flip_migration_status_dict(),
++                )
+ 
++        manifest_started = time.monotonic()
+         manifests = []
++        migration_reqs = []
++        source_waiting_reqs = []
+         for req in running_reqs:
+             manifest = self._pd_flip_build_migration_manifest(req)
++            manifest["pd_flip_source_queue"] = "running"
++            manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
++                req
++            )
++            manifest["source_bootstrap_port"] = (
++                getattr(
++                    getattr(self, "server_args", None),
++                    "disaggregation_bootstrap_port",
++                    8998,
++                )
++            )
++            manifests.append(manifest)
++            migration_reqs.append(req)
++        timing_debug["running_manifest_count"] = len(manifests)
++        waiting_manifest_started = time.monotonic()
++        for queue_index, req in waiting_selected:
++            manifest = self._pd_flip_build_migration_manifest(req)
++            manifest["pd_flip_source_queue"] = "waiting"
++            manifest["pd_flip_waiting_queue_index"] = queue_index
+             manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
+                 req
+             )
+@@ -1641,11 +1769,27 @@ class Scheduler(
+                 )
+             )
+             manifests.append(manifest)
++            migration_reqs.append(req)
++            source_waiting_reqs.append(
++                {
++                    "rid": str(manifest.get("rid") or getattr(req, "rid", "")),
++                    "req": req,
++                    "original_index": queue_index,
++                }
++            )
++        timing_debug["build_waiting_manifests_s"] = (
++            time.monotonic() - waiting_manifest_started
++        )
++        timing_debug["waiting_manifest_count"] = len(source_waiting_reqs)
++        timing_debug["build_manifests_s"] = time.monotonic() - manifest_started
++        timing_debug["manifest_count"] = len(manifests)
+         session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
++        entry_started = time.monotonic()
+         real_entries, real_error = self._pd_flip_start_source_entries(
+-            running_reqs, manifests
++            migration_reqs, manifests
+         )
+-        self.pd_flip_migration_session = {
++        timing_debug["start_source_entries_s"] = time.monotonic() - entry_started
++        session = {
+             "session_id": session_id,
+             "role": "source",
+             "state": "source_started" if not real_error else "source_failed",
+@@ -1658,8 +1802,14 @@ class Scheduler(
+             "last_error": real_error,
+             "dry_run": not bool(real_entries),
+             "source_entries": real_entries,
++            "source_waiting_reqs": source_waiting_reqs,
++            "timing_debug": timing_debug,
+         }
++        self.pd_flip_migration_session = session
+         if real_entries:
++            freeze_started = time.monotonic()
++            self._pd_flip_freeze_waiting_source_requests(session)
++            timing_debug["freeze_waiting_reqs_s"] = time.monotonic() - freeze_started
+             self._pd_flip_source_pump_transfer(self.pd_flip_migration_session)
+         return PDFlipMigrationReqOutput(
+             success=not bool(real_error),
+@@ -1681,9 +1831,12 @@ class Scheduler(
+ 
+         session_id = recv_req.session_id or f"pd-flip-target-{int(time.time() * 1000)}"
+         manifests = list(recv_req.manifests or [])
++        timing_debug = {"manifest_count": len(manifests)}
++        entry_started = time.monotonic()
+         target_entries, real_error = self._pd_flip_prepare_target_entries(
+             manifests, recv_req.source_url
+         )
++        timing_debug["prepare_target_entries_s"] = time.monotonic() - entry_started
+         self.pd_flip_migration_session = {
+             "session_id": session_id,
+             "role": "target",
+@@ -1701,6 +1854,7 @@ class Scheduler(
+             "adopt_on_commit": recv_req.adopt_on_commit,
+             "held_reqs": 0,
+             "target_entries": target_entries,
++            "timing_debug": timing_debug,
+         }
+         if target_entries:
+             self._pd_flip_target_pump_transfer(self.pd_flip_migration_session)
+@@ -1728,6 +1882,7 @@ class Scheduler(
+                 status=self._pd_flip_migration_status_dict(),
+             )
+ 
++        self._pd_flip_note_timing(session, "commit_received")
+         self._pd_flip_target_pump_transfer(session)
+         entries = session.get("target_entries") or {}
+         requested = set(recv_req.rids or entries.keys())
+@@ -1825,6 +1980,7 @@ class Scheduler(
+                 status=self._pd_flip_migration_status_dict(),
+             )
+ 
++        self._pd_flip_note_timing(session, "finish_received")
+         self._pd_flip_source_pump_transfer(session)
+ 
+         manifests = list(session.get("manifests", []))
+@@ -1847,6 +2003,42 @@ class Scheduler(
+                 manifests=manifests,
+             )
+ 
++        entries = session.get("source_entries") or {}
++        advanced_snapshots = []
++        for rid in released:
++            entry = entries.get(rid)
++            if not entry:
++                continue
++            source_queue = entry.get("source_queue") or (
++                entry.get("manifest") or {}
++            ).get("pd_flip_source_queue")
++            if source_queue != "running":
++                continue
++            try:
++                snapshot_len = int(entry.get("committed_len") or 0)
++                current_len = int(
++                    getattr(entry.get("req"), "kv_committed_len", snapshot_len) or 0
++                )
++            except (TypeError, ValueError):
++                continue
++            if current_len > snapshot_len:
++                advanced_snapshots.append(f"{rid}: {snapshot_len}->{current_len}")
++        if advanced_snapshots and not session.get("dry_run", False):
++            message = (
++                "running requests advanced after migration snapshot; "
++                "delta KV transfer is required before source release: "
++                + ", ".join(sorted(advanced_snapshots))
++            )
++            session["state"] = "source_failed"
++            session["last_error"] = message
++            session["failed_reqs"] = len(advanced_snapshots)
++            return PDFlipMigrationReqOutput(
++                success=False,
++                message=message,
++                status=self._pd_flip_migration_status_dict(),
++                manifests=manifests,
++            )
++
+         self._pd_flip_release_source_requests(session, released)
+         session["state"] = "source_released"
+         session["pending_reqs"] = max(0, len(manifests) - len(released))
+@@ -1890,7 +2082,13 @@ class Scheduler(
+                     sender.abort()
+                 except Exception:
+                     pass
++            self._pd_flip_finish_source_kv_release_defer(entry)
+             self._pd_flip_free_source_metadata(entry)
++        restore_started = time.monotonic()
++        self._pd_flip_restore_waiting_source_requests(session)
++        session.setdefault("timing_debug", {})["restore_waiting_reqs_s"] = (
++            time.monotonic() - restore_started
++        )
+         session["state"] = "source_aborted"
+         session["last_error"] = reason
+         session["pending_reqs"] = 0
+@@ -1951,25 +2149,43 @@ class Scheduler(
+             return {}, "PD flip migration does not support HiSparse decode yet"
+ 
+         try:
++            manager_started = time.monotonic()
+             kv_manager = self._pd_flip_get_source_kv_manager()
++            manager_s = time.monotonic() - manager_started
+             sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+             bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
+             entries: Dict[str, Dict[str, Any]] = {}
++
++            def fail(message: str) -> Tuple[Dict[str, Dict[str, Any]], str]:
++                for entry in entries.values():
++                    sender = entry.get("sender")
++                    if hasattr(sender, "abort"):
++                        try:
++                            sender.abort()
++                        except Exception:
++                            pass
++                    self._pd_flip_clear_source_kv_release_defer(entry.get("req"))
++                    self._pd_flip_free_source_metadata(entry)
++                return {}, message
++
+             for req, manifest in zip(running_reqs, manifests):
++                entry_started = time.monotonic()
++                timing_debug = {"get_source_kv_manager_s": manager_s}
+                 rid = str(manifest.get("rid") or getattr(req, "rid", ""))
+                 committed_len = int(manifest.get("kv_committed_len") or 0)
+                 if committed_len <= 0:
+-                    return {}, f"request {rid} has no committed KV to migrate"
+-                if len(getattr(req, "output_ids", []) or []) == 0:
+-                    return {}, f"request {rid} has no decode output token to resume"
++                    return fail(f"request {rid} has no committed KV to migrate")
+                 if getattr(req, "req_pool_idx", None) is None:
+-                    return {}, f"request {rid} has no req_pool_idx"
++                    return fail(f"request {rid} has no req_pool_idx")
+ 
++                alloc_started = time.monotonic()
+                 metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
++                timing_debug["metadata_alloc_s"] = time.monotonic() - alloc_started
+                 if metadata_index is None:
+-                    return {}, "no metadata buffer available for source migration"
++                    return fail("no metadata buffer available for source migration")
+ 
+                 migration_room = int(manifest["migration_bootstrap_room"])
++                sender_started = time.monotonic()
+                 sender = sender_class(
+                     mgr=kv_manager,
+                     bootstrap_addr=bootstrap_addr,
+@@ -1977,22 +2193,114 @@ class Scheduler(
+                     dest_tp_ranks=[self.ps.tp_rank],
+                     pp_rank=self.ps.pp_rank,
+                 )
++                timing_debug["sender_create_s"] = time.monotonic() - sender_started
++                page_started = time.monotonic()
+                 page_indices = self._pd_flip_source_page_indices(req, committed_len)
++                timing_debug["source_page_indices_initial_s"] = (
++                    time.monotonic() - page_started
++                )
++                init_started = time.monotonic()
+                 sender.init(len(page_indices), metadata_index)
++                timing_debug["sender_init_s"] = time.monotonic() - init_started
++                self._pd_flip_defer_source_kv_release(req)
+                 entries[rid] = {
+                     "req": req,
+                     "sender": sender,
+                     "manifest": manifest,
++                    "source_queue": manifest.get("pd_flip_source_queue", "running"),
+                     "metadata_index": metadata_index,
+                     "migration_bootstrap_room": migration_room,
+                     "committed_len": committed_len,
+                     "sent": False,
+                     "transferred": False,
+                     "failed": False,
++                    "timing_debug": timing_debug,
+                 }
++                timing_debug["source_entry_init_total_s"] = (
++                    time.monotonic() - entry_started
++                )
+             return entries, ""
+         except Exception as exc:
+-            return {}, str(exc)
++            try:
++                return fail(str(exc))
++            except Exception:
++                return {}, str(exc)
++
++    def _pd_flip_freeze_waiting_source_requests(
++        self, session: Dict[str, Any]
++    ) -> None:
++        waiting_specs = session.get("source_waiting_reqs") or []
++        if not waiting_specs:
++            session.setdefault("timing_debug", {})["waiting_frozen_count"] = 0
++            return
++
++        by_id = {
++            id(spec.get("req")): spec
++            for spec in waiting_specs
++            if spec.get("req") is not None
++        }
++        if not by_id:
++            session.setdefault("timing_debug", {})["waiting_frozen_count"] = 0
++            return
++
++        new_queue = []
++        frozen_count = 0
++        entries = session.get("source_entries") or {}
++        for index, req in enumerate(getattr(self, "waiting_queue", [])):
++            spec = by_id.get(id(req))
++            if spec is None:
++                new_queue.append(req)
++                continue
++            spec.setdefault("original_index", index)
++            spec["frozen"] = True
++            spec["restored"] = False
++            frozen_count += 1
++            rid = str(spec.get("rid") or getattr(req, "rid", ""))
++            entry = entries.get(rid)
++            if entry is not None:
++                self._pd_flip_note_timing(entry, "source_waiting_frozen")
++
++        self.waiting_queue = new_queue
++        session.setdefault("timing_debug", {})["waiting_frozen_count"] = frozen_count
++
++    def _pd_flip_restore_waiting_source_requests(
++        self, session: Dict[str, Any]
++    ) -> None:
++        waiting_specs = [
++            spec
++            for spec in (session.get("source_waiting_reqs") or [])
++            if spec.get("frozen") and not spec.get("restored")
++        ]
++        if not waiting_specs:
++            session.setdefault("timing_debug", {})["waiting_restored_count"] = 0
++            return
++
++        entries = session.get("source_entries") or {}
++        restored_count = 0
++        for spec in sorted(
++            waiting_specs, key=lambda item: int(item.get("original_index", 0))
++        ):
++            req = spec.get("req")
++            if req is None:
++                continue
++            if any(existing is req for existing in self.waiting_queue):
++                spec["restored"] = True
++                continue
++            insert_at = min(
++                max(0, int(spec.get("original_index", len(self.waiting_queue)))),
++                len(self.waiting_queue),
++            )
++            self.waiting_queue.insert(insert_at, req)
++            spec["restored"] = True
++            restored_count += 1
++            rid = str(spec.get("rid") or getattr(req, "rid", ""))
++            entry = entries.get(rid)
++            if entry is not None:
++                self._pd_flip_note_timing(entry, "source_waiting_restored")
++
++        session.setdefault("timing_debug", {})[
++            "waiting_restored_count"
++        ] = restored_count
+ 
+     def _pd_flip_get_source_kv_manager(self):
+         manager = getattr(self, "pd_flip_source_kv_manager", None)
+@@ -2046,13 +2354,37 @@ class Scheduler(
+         return f"{host}:{self.server_args.disaggregation_bootstrap_port}"
+ 
+     def _pd_flip_source_page_indices(self, req: Req, committed_len: int):
++        req_pool_idx = getattr(req, "req_pool_idx", None)
++        if req_pool_idx is None:
++            raise ValueError(
++                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
++                "before migration transfer"
++            )
++        non_scalar_error = (
++            f"request {getattr(req, 'rid', '')} has non-scalar req_pool_idx "
++            f"{req_pool_idx!r}"
++        )
++        if hasattr(req_pool_idx, "numel") and req_pool_idx.numel() != 1:
++            raise ValueError(non_scalar_error)
++        if hasattr(req_pool_idx, "item"):
++            try:
++                req_pool_idx = req_pool_idx.item()
++            except (RuntimeError, TypeError, ValueError) as exc:
++                raise ValueError(non_scalar_error) from exc
++        if not isinstance(req_pool_idx, numbers.Integral):
++            raise ValueError(non_scalar_error)
+         kv_indices = (
+             self.req_to_token_pool.req_to_token[
+-                req.req_pool_idx, :committed_len
++                int(req_pool_idx), :committed_len
+             ]
+             .cpu()
+             .numpy()
+         )
++        if kv_indices.ndim != 1:
++            raise ValueError(
++                f"request {getattr(req, 'rid', '')} produced non-1D KV indices "
++                f"shape={kv_indices.shape}"
++            )
+         return kv_to_page_indices(
+             kv_indices,
+             self.token_to_kv_pool_allocator.page_size,
+@@ -2178,6 +2510,7 @@ class Scheduler(
+                     session["last_error"] = str(exc)
+                 continue
+             if poll == KVPoll.WaitingForInput and not entry.get("sent"):
++                self._pd_flip_note_timing(entry, "source_waiting_for_input")
+                 req = entry["req"]
+                 old_metadata_index = getattr(req, "metadata_buffer_index", -1)
+                 old_bootstrap_room = getattr(req, "bootstrap_room", None)
+@@ -2186,18 +2519,35 @@ class Scheduler(
+                     req.metadata_buffer_index = entry["metadata_index"]
+                     req.bootstrap_room = entry["migration_bootstrap_room"]
+                     req.disagg_kv_sender = sender
++                    metadata_started = time.monotonic()
+                     self._pd_flip_set_source_metadata(
+                         req,
+                         entry["metadata_index"],
+                         entry["migration_bootstrap_room"],
+                     )
++                    self._pd_flip_note_timing(
++                        entry, "source_set_metadata", metadata_started
++                    )
++                    page_started = time.monotonic()
+                     page_indices = self._pd_flip_source_page_indices(
+                         req, entry["committed_len"]
+                     )
++                    self._pd_flip_note_timing(
++                        entry, "source_page_indices_send", page_started
++                    )
++                    entry["source_index_shape"] = list(page_indices.shape)
++                    entry["source_index_size"] = int(page_indices.size)
++                    state_started = time.monotonic()
+                     state_indices = self._pd_flip_source_state_indices(
+                         req, entry["committed_len"], sender.kv_mgr
+                     )
++                    self._pd_flip_note_timing(
++                        entry, "source_state_indices", state_started
++                    )
++                    send_started = time.monotonic()
+                     sender.send(page_indices, state_indices)
++                    self._pd_flip_note_timing(entry, "source_send", send_started)
++                    self._pd_flip_note_timing(entry, "source_sent")
+                     entry["sent"] = True
+                 except Exception as exc:
+                     entry["failed"] = True
+@@ -2213,6 +2563,7 @@ class Scheduler(
+             if poll == KVPoll.Success:
+                 entry["transferred"] = True
+                 transferred.add(rid)
++                self._pd_flip_note_timing(entry, "source_transferred")
+                 self._pd_flip_free_source_metadata(entry)
+ 
+         session["transferred_rids"] = transferred
+@@ -2236,6 +2587,38 @@ class Scheduler(
+             self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+         entry["metadata_freed"] = True
+ 
++    @staticmethod
++    def _pd_flip_defer_source_kv_release(req: Req) -> None:
++        req.pd_flip_defer_kv_release = True
++        req.pd_flip_force_kv_release = False
++        req.pd_flip_kv_release_deferred = False
++        req.pd_flip_deferred_kv_release_is_insert = False
++
++    @staticmethod
++    def _pd_flip_clear_source_kv_release_defer(req: Optional[Req]) -> None:
++        if req is None:
++            return
++        req.pd_flip_defer_kv_release = False
++        req.pd_flip_force_kv_release = False
++
++    def _pd_flip_finish_source_kv_release_defer(
++        self, entry: Dict[str, Any]
++    ) -> None:
++        req = entry.get("req")
++        if req is None:
++            return
++        was_deferred = bool(getattr(req, "pd_flip_kv_release_deferred", False))
++        is_insert = bool(getattr(req, "pd_flip_deferred_kv_release_is_insert", False))
++        self._pd_flip_clear_source_kv_release_defer(req)
++        if was_deferred and getattr(req, "req_pool_idx", None) is not None:
++            req.pd_flip_force_kv_release = True
++            try:
++                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
++            finally:
++                req.pd_flip_force_kv_release = False
++        req.pd_flip_kv_release_deferred = False
++        req.pd_flip_deferred_kv_release_is_insert = False
++
+     def _pd_flip_release_source_requests(
+         self, session: Dict[str, Any], released_rids: set
+     ) -> None:
+@@ -2244,11 +2627,32 @@ class Scheduler(
+             if not entry:
+                 continue
+             req = entry.get("req")
++            source_queue = entry.get("source_queue") or (
++                entry.get("manifest") or {}
++            ).get("pd_flip_source_queue")
++            if source_queue == "waiting":
++                if req is not None:
++                    self._pd_flip_clear_source_kv_release_defer(req)
++                    req.pd_flip_force_kv_release = True
++                    try:
++                        release_kv_cache(req, self.tree_cache)
++                    finally:
++                        req.pd_flip_force_kv_release = False
++                    req.pd_flip_kv_release_deferred = False
++                    req.pd_flip_deferred_kv_release_is_insert = False
++                entry["request_released"] = True
++                self._pd_flip_note_timing(entry, "source_waiting_released")
++                self._pd_flip_free_source_metadata(entry)
++                continue
+             if req is not None and not req.finished():
++                self._pd_flip_clear_source_kv_release_defer(req)
+                 req.pd_flip_migrated_to_target = True
+-                req.to_finish = FINISH_ABORT(
+-                    "Request migrated during PD role flip; output continues on target decode.",
+-                )
++                req.pd_flip_waiting_for_relay_output = True
++                req.to_finish = FINISH_MIGRATED()
++                self._pd_flip_note_timing(entry, "source_finish_migrated")
++            else:
++                self._pd_flip_finish_source_kv_release_defer(entry)
++                self._pd_flip_note_timing(entry, "source_finish_released")
+             self._pd_flip_free_source_metadata(entry)
+ 
+     def _pd_flip_prepare_target_entries(
+@@ -2264,19 +2668,30 @@ class Scheduler(
+             receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+             kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+             for manifest in manifests:
++                entry_started = time.monotonic()
++                timing_debug = {}
++                req_started = time.monotonic()
+                 req = self._pd_flip_manifest_to_req(manifest, source_host)
++                timing_debug["manifest_to_req_s"] = time.monotonic() - req_started
++                receiver_started = time.monotonic()
+                 receiver = receiver_class(
+                     mgr=kv_manager,
+                     bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                     bootstrap_room=req.bootstrap_room,
+                 )
++                timing_debug["receiver_create_s"] = time.monotonic() - receiver_started
+                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+                 entries[req.rid] = {
+                     "decode_req": decode_req,
+                     "phase": "new",
+                     "manifest": manifest,
++                    "source_queue": manifest.get("pd_flip_source_queue", "running"),
+                     "metadata_index": -1,
++                    "timing_debug": timing_debug,
+                 }
++                timing_debug["target_entry_prepare_total_s"] = (
++                    time.monotonic() - entry_started
++                )
+             return entries, ""
+         except Exception as exc:
+             return {}, str(exc)
+@@ -2335,6 +2750,8 @@ class Scheduler(
+             ),
+         )
+         req.output_ids = array("q", list(manifest.get("output_ids") or []))
++        req.send_token_offset = len(req.output_ids)
++        req.send_decode_id_offset = len(req.output_ids)
+         req.logprob_start_len = int(manifest.get("logprob_start_len", -1))
+         req.kv_committed_len = int(
+             manifest.get("kv_committed_len")
+@@ -2391,9 +2808,12 @@ class Scheduler(
+             phase = entry.get("phase")
+             try:
+                 if phase == "new":
++                    init_started = time.monotonic()
+                     if not self._pd_flip_target_init_receiver(decode_req):
+                         continue
++                    self._pd_flip_note_timing(entry, "target_init_receiver", init_started)
+                     entry["phase"] = "waiting_for_input"
++                    self._pd_flip_note_timing(entry, "target_waiting_for_input")
+                     phase = "waiting_for_input"
+ 
+                 if phase == "waiting_for_input":
+@@ -2402,16 +2822,25 @@ class Scheduler(
+                         raise RuntimeError("migration target bootstrap failed")
+                     if poll != KVPoll.WaitingForInput:
+                         continue
++                    metadata_started = time.monotonic()
+                     self._pd_flip_target_prealloc_and_send_metadata(entry)
++                    self._pd_flip_note_timing(
++                        entry, "target_prealloc_send_metadata", metadata_started
++                    )
+                     entry["phase"] = "transferring"
++                    self._pd_flip_note_timing(entry, "target_transferring")
+ 
+                 if entry.get("phase") == "transferring":
++                    if self._pd_flip_target_hicache_restore_pending(decode_req):
++                        continue
+                     poll = decode_req.kv_receiver.poll()
+                     if poll == KVPoll.Failed:
+                         raise RuntimeError("migration target transfer failed")
+                     if poll == KVPoll.Success and self._pd_flip_target_metadata_ready(
+                         entry
+                     ):
++                        self._pd_flip_target_commit_hicache_restore(decode_req)
++                        self._pd_flip_note_timing(entry, "target_transfer_success")
+                         transferred.add(rid)
+                         entry["phase"] = (
+                             "transferred_held"
+@@ -2423,6 +2852,7 @@ class Scheduler(
+                             decode_req.kv_receiver = None
+                         if session.get("prepare_only", False):
+                             entry["held"] = True
++                            self._pd_flip_note_timing(entry, "target_held")
+                         elif session.get("adopt_on_success", False):
+                             self._pd_flip_adopt_target_request(entry)
+                         else:
+@@ -2456,6 +2886,54 @@ class Scheduler(
+         elif session["pending_reqs"] == 0:
+             session["state"] = "target_transferred"
+ 
++    def _pd_flip_target_hicache_restore_pending(
++        self, decode_req: DecodeRequest
++    ) -> bool:
++        if not getattr(self, "enable_decode_hicache", False):
++            return False
++        prefix_match = getattr(decode_req, "prefix_match", None)
++        if prefix_match is None or not getattr(
++            prefix_match, "needs_local_restore", False
++        ):
++            return False
++
++        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
++        if transfer_queue is None or not hasattr(
++            transfer_queue, "_process_hicache_local_restores"
++        ):
++            return True
++        transfer_queue._process_hicache_local_restores([decode_req])
++        status_value = getattr(
++            getattr(decode_req, "hicache_restore_status", None), "value", None
++        )
++        if status_value == "failed":
++            raise RuntimeError("migration target HiCache restore failed")
++        return status_value == "pending"
++
++    def _pd_flip_target_commit_hicache_restore(self, decode_req: DecodeRequest) -> None:
++        if not getattr(self, "enable_decode_hicache", False):
++            return
++        prefix_match = getattr(decode_req, "prefix_match", None)
++        if prefix_match is None or not getattr(
++            prefix_match, "needs_local_restore", False
++        ):
++            return
++
++        status_value = getattr(
++            getattr(decode_req, "hicache_restore_status", None), "value", None
++        )
++        if status_value == "failed":
++            raise RuntimeError("migration target HiCache restore failed")
++        if status_value == "pending":
++            raise RuntimeError("migration target HiCache restore is still pending")
++
++        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
++        if transfer_queue is None or not hasattr(
++            transfer_queue, "_commit_hicache_local_restore_to_req"
++        ):
++            raise RuntimeError("migration target HiCache restore cannot be committed")
++        transfer_queue._commit_hicache_local_restore_to_req(decode_req)
++
+     def _pd_flip_target_init_receiver(self, decode_req: DecodeRequest) -> bool:
+         queue = self.disagg_decode_prealloc_queue
+         if self.transfer_backend == TransferBackend.FAKE:
+@@ -2488,11 +2966,46 @@ class Scheduler(
+         entry["metadata_index"] = metadata_index
+         decode_req.metadata_buffer_index = metadata_index
+ 
+-        dst_kv_indices = queue._pre_alloc(req, prefix_len=0, total_prefix_len=0)
+         committed_len = int(req.kv_committed_len)
++        prefix_match = None
++        prefix_indices = None
++        prefix_len = 0
++        total_prefix_len = 0
++        if (
++            os.getenv("SGLANG_PD_FLIP_HICACHE_STITCH", "").lower()
++            in ("1", "true", "yes", "on")
++            and self.server_args.disaggregation_decode_enable_radix_cache
++        ):
++            prefix_started = time.monotonic()
++            prefix_match = queue._match_prefix_and_lock(req)
++            prefix_indices = prefix_match.prefix_indices
++            prefix_len = int(prefix_match.l1_prefix_len)
++            total_prefix_len = int(prefix_match.decode_prefix_len)
++            entry["target_hicache_prefix_match_s"] = time.monotonic() - prefix_started
++            entry["target_hicache_l1_prefix_len"] = prefix_len
++            entry["target_hicache_prefix_len"] = total_prefix_len
++            entry["target_hicache_restore_tokens"] = max(
++                0, total_prefix_len - prefix_len
++            )
++            decode_req.prefix_match = prefix_match
++
++        if prefix_indices is None:
++            dst_kv_indices = queue._pre_alloc(
++                req, prefix_len=prefix_len, total_prefix_len=total_prefix_len
++            )
++        else:
++            dst_kv_indices = queue._pre_alloc(
++                req,
++                prefix_indices=prefix_indices,
++                prefix_len=prefix_len,
++                total_prefix_len=total_prefix_len,
++            )
++        if prefix_match is not None and getattr(self, "enable_decode_hicache", False):
++            queue._start_hicache_prefetch(req, prefix_match)
++
+         if self.server_args.disaggregation_decode_enable_radix_cache:
+             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+-                :committed_len
++                total_prefix_len:committed_len
+             ].cpu().numpy()
+         else:
+             kv_indices = dst_kv_indices.cpu().numpy()
+@@ -2500,12 +3013,14 @@ class Scheduler(
+             kv_indices,
+             self.token_to_kv_pool_allocator.page_size,
+         )
++        entry["target_index_shape"] = list(page_indices.shape)
++        entry["target_index_size"] = int(page_indices.size)
+         state_indices = self._pd_flip_target_state_indices(req, committed_len)
+         decode_req.kv_receiver.send_metadata(
+             page_indices,
+             metadata_index,
+             state_indices,
+-            decode_prefix_len=0,
++            decode_prefix_len=total_prefix_len,
+         )
+         if self.transfer_backend == TransferBackend.FAKE:
+             self.disagg_metadata_buffers.bootstrap_room[metadata_index, 0] = (
+@@ -2588,9 +3103,11 @@ class Scheduler(
+         req = getattr(decode_req, "req", None)
+         if req is None or getattr(req, "req_pool_idx", None) is None:
+             entry["request_released"] = True
++            self._pd_flip_note_timing(entry, "target_released")
+             return
+         release_kv_cache(req, self.tree_cache, is_insert=False)
+         entry["request_released"] = True
++        self._pd_flip_note_timing(entry, "target_released")
+ 
+     def _pd_flip_adopt_target_request(self, entry: Dict[str, Any]) -> None:
+         if entry.get("request_adopted"):
+@@ -2599,6 +3116,7 @@ class Scheduler(
+         req = getattr(decode_req, "req", None)
+         if req is None:
+             entry["request_adopted"] = True
++            self._pd_flip_note_timing(entry, "target_adopted")
+             return
+         req.init_next_round_input(self.tree_cache)
+         if hasattr(req, "time_stats") and hasattr(
+@@ -2607,6 +3125,7 @@ class Scheduler(
+             req.time_stats.set_wait_queue_entry_time()
+         self.waiting_queue.append(req)
+         entry["request_adopted"] = True
++        self._pd_flip_note_timing(entry, "target_adopted")
+ 
+     def _pd_flip_build_migration_manifest(self, req: Req) -> Dict[str, Any]:
+         origin_input_ids = list(getattr(req, "origin_input_ids", []) or [])
+@@ -2680,7 +3199,12 @@ class Scheduler(
+                 "last_error": "",
+                 "dry_run": False,
+                 "prepare_only": False,
++                "waiting_reqs": 0,
++                "waiting_manifest_count": 0,
++                "waiting_skipped_count": 0,
++                "waiting_skipped": [],
+             }
++        session_timing = session.get("timing_debug") or {}
+         return {
+             "enabled": True,
+             "role": session.get("role", "none"),
+@@ -2694,11 +3218,90 @@ class Scheduler(
+             "last_error": session.get("last_error", ""),
+             "dry_run": bool(session.get("dry_run", False)),
+             "prepare_only": bool(session.get("prepare_only", False)),
++            "waiting_reqs": int(session_timing.get("waiting_reqs", 0) or 0),
++            "waiting_manifest_count": int(
++                session_timing.get("waiting_manifest_count", 0) or 0
++            ),
++            "waiting_skipped_count": int(
++                session_timing.get("waiting_skipped_count", 0) or 0
++            ),
++            "waiting_skipped": list(session_timing.get("waiting_skipped") or []),
++            "index_debug": self._pd_flip_migration_index_debug(session),
++            "timing_debug": self._pd_flip_migration_timing_debug(session),
+         }
+ 
++    @staticmethod
++    def _pd_flip_note_timing(
++        container: Dict[str, Any], name: str, started: Optional[float] = None
++    ) -> None:
++        timing = container.setdefault("timing_debug", {})
++        now = time.monotonic()
++        if started is None:
++            timing.setdefault(f"{name}_mono", now)
++        else:
++            timing[f"{name}_s"] = now - started
++            timing.setdefault(f"{name}_mono", now)
++
++    @staticmethod
++    def _pd_flip_json_safe_timing(values: Dict[str, Any]) -> Dict[str, Any]:
++        safe = {}
++        for key, value in dict(values or {}).items():
++            if isinstance(value, (str, int, float, bool)) or value is None:
++                safe[key] = value
++        return safe
++
++    def _pd_flip_migration_timing_debug(
++        self, session: Dict[str, Any]
++    ) -> Dict[str, Any]:
++        entries = session.get("source_entries") or session.get("target_entries") or {}
++        return {
++            "session": self._pd_flip_json_safe_timing(
++                session.get("timing_debug") or {}
++            ),
++            "entries": [
++                {
++                    "rid": rid,
++                    "phase": entry.get("phase"),
++                    "source_queue": entry.get("source_queue")
++                    or (entry.get("manifest") or {}).get("pd_flip_source_queue"),
++                    "timing": self._pd_flip_json_safe_timing(
++                        entry.get("timing_debug") or {}
++                    ),
++                }
++                for rid, entry in entries.items()
++            ],
++        }
++
++    @staticmethod
++    def _pd_flip_migration_index_debug(session: Dict[str, Any]) -> List[Dict[str, Any]]:
++        entries = session.get("source_entries") or session.get("target_entries") or {}
++        debug = []
++        for rid, entry in entries.items():
++            item = {
++                "rid": rid,
++                "phase": entry.get("phase"),
++                "source_queue": entry.get("source_queue")
++                or (entry.get("manifest") or {}).get("pd_flip_source_queue"),
++                "source_index_shape": entry.get("source_index_shape"),
++                "source_index_size": entry.get("source_index_size"),
++                "target_index_shape": entry.get("target_index_shape"),
++                "target_index_size": entry.get("target_index_size"),
++            }
++            if any(value is not None for key, value in item.items() if key != "rid"):
++                debug.append(item)
++        return debug
++
+     def _pd_flip_migration_is_active(self) -> bool:
+         return self._pd_flip_migration_status_dict()["enabled"]
+ 
++    def _pd_flip_source_migration_blocks_idle(self) -> bool:
++        session = getattr(self, "pd_flip_migration_session", None)
++        if not session or session.get("role") != "source":
++            return False
++        if session.get("state") in ("source_released", "source_aborted"):
++            return False
++        return bool(session.get("manifests") or session.get("source_entries"))
++
+     def _pd_flip_migration_is_released(self) -> bool:
+         status = self._pd_flip_migration_status_dict()
+         return (
+@@ -2707,6 +3310,26 @@ class Scheduler(
+             and status["failed_reqs"] == 0
+         )
+ 
++    def _pd_flip_target_held_reqs(self) -> List[Req]:
++        session = getattr(self, "pd_flip_migration_session", None)
++        if not session or session.get("role") != "target":
++            return []
++
++        held_reqs = []
++        for entry in (session.get("target_entries") or {}).values():
++            phase = entry.get("phase")
++            if (
++                phase not in ("transferring", "transferred_held")
++                or entry.get("request_released")
++                or entry.get("request_adopted")
++            ):
++                continue
++            decode_req = entry.get("decode_req")
++            req = getattr(decode_req, "req", None)
++            if req is not None and getattr(req, "req_pool_idx", None) is not None:
++                held_reqs.append(req)
++        return held_reqs
++
+     def init_overlap(self):
+         self.device_module = torch.get_device_module(self.device)
+ 
+@@ -3261,6 +3884,7 @@ class Scheduler(
+             pool_stats_observer=self.pool_stats_observer,
+             get_last_batch=lambda: self.last_batch,
+             get_running_batch=lambda: self.running_batch,
++            get_pd_flip_held_reqs=self._pd_flip_target_held_reqs,
+         )
+ 
+     def init_kv_events_publisher(self) -> None:
+@@ -4944,6 +5568,8 @@ class Scheduler(
+         idle &= len(self.waiting_queue) == 0
+ 
+         if not for_health_check:
++            idle &= not self._pd_flip_source_migration_blocks_idle()
++
+             # Grammar queue and prefill inflight queue may not produce batch
+             # results instantly, but they still indicate the server is not idle.
+             idle &= len(self.grammar_manager.grammar_queue) == 0
+diff --git a/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh b/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh
+index 50e3e2438..477eb3a86 100755
+--- a/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh
++++ b/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh
+@@ -32,11 +32,17 @@ server_args=(
+   --disaggregation-transfer-backend "${TRANSFER_BACKEND}"
+   --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+   --disaggregation-ib-device "${IB_DEVICE}"
+-  --enable-pd-flip-state-machine
+-  --enable-pd-runtime-role-switch
+   --mem-fraction-static "${MEM_FRACTION_STATIC}"
+ )
+ 
++if [[ "${ENABLE_PD_FLIP_STATE_MACHINE:-1}" == "1" ]]; then
++  server_args+=(--enable-pd-flip-state-machine)
++fi
++
++if [[ "${ENABLE_PD_RUNTIME_ROLE_SWITCH:-${ENABLE_PD_FLIP_STATE_MACHINE:-1}}" == "1" ]]; then
++  server_args+=(--enable-pd-runtime-role-switch)
++fi
++
+ if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
+   # shellcheck disable=SC2206
+   extra_args=(${EXTRA_SGLANG_ARGS})
+@@ -48,6 +54,12 @@ launch_cmd="cd /sgl-workspace/sglang && PYTHONPATH=python exec ${server_cmd}"
+ 
+ # shellcheck disable=SC2206
+ extra_docker_args=(${EXTRA_DOCKER_ARGS:-})
++if [[ "${EXTRA_DOCKER_ARGS:-}" != *"MOONCAKE_LOCAL_HOSTNAME"* ]]; then
++  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
++  if [[ -n "${host_ip}" ]]; then
++    extra_docker_args+=(-e "MOONCAKE_LOCAL_HOSTNAME=${host_ip}")
++  fi
++fi
+ 
+ exec docker run --rm \
+   --gpus all \
+diff --git a/test/srt/test_disaggregation_fake_decode.py b/test/srt/test_disaggregation_fake_decode.py
+index 55edf41d7..11c9864f1 100644
+--- a/test/srt/test_disaggregation_fake_decode.py
++++ b/test/srt/test_disaggregation_fake_decode.py
+@@ -146,6 +146,217 @@ class TestFakePDFlipTargetMigration(unittest.TestCase):
+             scheduler.disagg_metadata_buffers.bootstrap_room[0, 0].item(), 123
+         )
+ 
++    def test_pd_flip_target_hicache_stitch_sends_only_uncached_suffix(self):
++        class Allocator:
++            def alloc(self):
++                return 0
++
++        class Receiver:
++            def __init__(self):
++                self.sent = None
++
++            def send_metadata(
++                self, page_indices, metadata_index, state_indices, decode_prefix_len
++            ):
++                self.sent = {
++                    "page_indices": page_indices.tolist(),
++                    "metadata_index": metadata_index,
++                    "state_indices": state_indices,
++                    "decode_prefix_len": decode_prefix_len,
++                }
++
++        class Queue:
++            def __init__(self):
++                self.prefix_match = types.SimpleNamespace(
++                    prefix_indices=torch.tensor([10, 20], dtype=torch.int64),
++                    l1_prefix_len=2,
++                    decode_prefix_len=3,
++                    restore_token_count=1,
++                )
++                self.prealloc_args = None
++                self.prefetch_args = None
++                self.kv_manager = types.SimpleNamespace(
++                    kv_args=types.SimpleNamespace(state_types=[])
++                )
++
++            def _match_prefix_and_lock(self, req):
++                return self.prefix_match
++
++            def _pre_alloc(
++                self, req, prefix_indices=None, prefix_len=None, total_prefix_len=None
++            ):
++                self.prealloc_args = {
++                    "prefix_indices": prefix_indices.tolist(),
++                    "prefix_len": prefix_len,
++                    "total_prefix_len": total_prefix_len,
++                }
++                return torch.tensor([40, 50, 60], dtype=torch.int64)
++
++            def _start_hicache_prefetch(self, req, prefix_match):
++                self.prefetch_args = (req.rid, prefix_match.decode_prefix_len)
++
++        req = types.SimpleNamespace(
++            rid="req",
++            bootstrap_room=123,
++            kv_committed_len=6,
++            req_pool_idx=1,
++        )
++        receiver = Receiver()
++        decode_req = types.SimpleNamespace(req=req, kv_receiver=receiver)
++        entry = {"decode_req": decode_req, "metadata_index": -1}
++        queue = Queue()
++        scheduler = Scheduler.__new__(Scheduler)
++        scheduler.transfer_backend = TransferBackend.FAKE
++        scheduler.server_args = types.SimpleNamespace(
++            disaggregation_decode_enable_radix_cache=True
++        )
++        scheduler.disagg_decode_prealloc_queue = queue
++        scheduler.enable_decode_hicache = True
++        scheduler.req_to_metadata_buffer_idx_allocator = Allocator()
++        scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(page_size=1)
++        scheduler.req_to_token_pool = types.SimpleNamespace(
++            req_to_token=torch.tensor(
++                [
++                    [0, 0, 0, 0, 0, 0],
++                    [10, 20, 30, 40, 50, 60],
++                ],
++                dtype=torch.int64,
++            )
++        )
++        scheduler.disagg_metadata_buffers = types.SimpleNamespace(
++            bootstrap_room=torch.zeros((1, 1), dtype=torch.int64)
++        )
++
++        with patch.dict("os.environ", {"SGLANG_PD_FLIP_HICACHE_STITCH": "1"}):
++            Scheduler._pd_flip_target_prealloc_and_send_metadata(scheduler, entry)
++
++        self.assertEqual(queue.prealloc_args["prefix_indices"], [10, 20])
++        self.assertEqual(queue.prealloc_args["prefix_len"], 2)
++        self.assertEqual(queue.prealloc_args["total_prefix_len"], 3)
++        self.assertEqual(queue.prefetch_args, ("req", 3))
++        self.assertEqual(decode_req.prefix_match, queue.prefix_match)
++        self.assertEqual(receiver.sent["decode_prefix_len"], 3)
++        self.assertEqual(receiver.sent["page_indices"], [40, 50, 60])
++        self.assertEqual(entry["target_hicache_prefix_len"], 3)
++
++    def test_pd_flip_target_waits_for_hicache_restore_before_success(self):
++        class Receiver:
++            def __init__(self):
++                self.cleared = False
++
++            def poll(self):
++                return KVPoll.Success
++
++            def clear(self):
++                self.cleared = True
++
++            def abort(self):
++                raise AssertionError("abort should not be called")
++
++        class TransferQueue:
++            def __init__(self):
++                self.processed = []
++
++            def _process_hicache_local_restores(self, decode_reqs):
++                self.processed.extend(decode_reqs)
++
++        scheduler = Scheduler.__new__(Scheduler)
++        scheduler.enable_decode_hicache = True
++        scheduler.disagg_decode_transfer_queue = TransferQueue()
++        scheduler._pd_flip_target_metadata_ready = lambda entry: True
++        scheduler._pd_flip_release_target_request = lambda entry: self.fail(
++            "target must not release before HiCache restore is ready"
++        )
++        scheduler._pd_flip_free_target_metadata = lambda entry: self.fail(
++            "metadata must stay allocated while HiCache restore is pending"
++        )
++
++        receiver = Receiver()
++        req = types.SimpleNamespace(rid="req")
++        decode_req = types.SimpleNamespace(
++            req=req,
++            kv_receiver=receiver,
++            prefix_match=types.SimpleNamespace(needs_local_restore=True),
++            hicache_restore_status=types.SimpleNamespace(value="pending"),
++        )
++        session = {
++            "manifests": [{"rid": "req"}],
++            "target_entries": {
++                "req": {
++                    "decode_req": decode_req,
++                    "phase": "transferring",
++                }
++            },
++        }
++
++        Scheduler._pd_flip_target_pump_transfer(scheduler, session)
++
++        self.assertEqual(scheduler.disagg_decode_transfer_queue.processed, [decode_req])
++        self.assertFalse(receiver.cleared)
++        self.assertEqual(session["transferred_reqs"], 0)
++        self.assertEqual(session["pending_reqs"], 1)
++
++    def test_pd_flip_target_commits_hicache_restore_before_release(self):
++        class Receiver:
++            def __init__(self):
++                self.cleared = False
++
++            def poll(self):
++                return KVPoll.Success
++
++            def clear(self):
++                self.cleared = True
++
++            def abort(self):
++                raise AssertionError("abort should not be called")
++
++        events = []
++
++        class TransferQueue:
++            def _process_hicache_local_restores(self, decode_reqs):
++                events.append("process_restore")
++
++            def _commit_hicache_local_restore_to_req(self, decode_req):
++                events.append("commit_restore")
++
++        scheduler = Scheduler.__new__(Scheduler)
++        scheduler.enable_decode_hicache = True
++        scheduler.disagg_decode_transfer_queue = TransferQueue()
++        scheduler._pd_flip_target_metadata_ready = lambda entry: True
++        scheduler._pd_flip_release_target_request = lambda entry: events.append(
++            "release"
++        )
++        scheduler._pd_flip_free_target_metadata = lambda entry: events.append(
++            "free_metadata"
++        )
++
++        receiver = Receiver()
++        req = types.SimpleNamespace(rid="req")
++        decode_req = types.SimpleNamespace(
++            req=req,
++            kv_receiver=receiver,
++            prefix_match=types.SimpleNamespace(needs_local_restore=True),
++            hicache_restore_status=types.SimpleNamespace(value="ready"),
++        )
++        session = {
++            "manifests": [{"rid": "req"}],
++            "target_entries": {
++                "req": {
++                    "decode_req": decode_req,
++                    "phase": "transferring",
++                }
++            },
++        }
++
++        Scheduler._pd_flip_target_pump_transfer(scheduler, session)
++
++        self.assertEqual(
++            events,
++            ["process_restore", "commit_restore", "release", "free_metadata"],
++        )
++        self.assertTrue(receiver.cleared)
++        self.assertEqual(session["transferred_reqs"], 1)
++
+     def test_fake_target_success_releases_placeholder_request(self):
+         class Receiver:
+             def __init__(self):

@@ -1,0 +1,26 @@
+{
+  "name": "rdma_tail_0706",
+  "date": "2026-07-06",
+  "source_node": "cloud-099 / lingjun-099",
+  "target_node": "cloud-100 / lingjun-100",
+  "source_eth0": "192.168.0.42",
+  "target_eth0": "192.168.0.40",
+  "source_rdma_host": "fd03:4514:80:6240::1",
+  "target_rdma_host": "fd03:4514:80:7b80::1",
+  "ib_device": "mlx5_0",
+  "protocol": "rdma",
+  "sizes": "1MiB..32MiB step 1MiB",
+  "warmup": 3,
+  "repeat": 20,
+  "chunk_size": "16MB",
+  "background_traffic": "none",
+  "runs": [
+    "tail_rdma_small_1x100",
+    "tail_rdma_small_1x200"
+  ],
+  "raw_layout": {
+    "source": "initiator logs, samples, per-run aggregated summaries, driver log",
+    "target": "target logs/json and rdma receive monitor raw files",
+    "tidy": "derived CSV summaries"
+  }
+}

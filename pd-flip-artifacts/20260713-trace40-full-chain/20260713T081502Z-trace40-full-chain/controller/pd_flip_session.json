@@ -1,0 +1,1 @@
+{"batch_rids": ["df1d06f14c5641d682c345232265b231", "6504b0d842e546dead9c692997a30572"], "phase": "abort_incomplete", "session_id": "20260713T081502Z-trace40-full-chain-first", "source_finished": false, "source_name": "node2", "source_url": "http://192.168.0.39:30000", "target_name": "node3", "target_url": "http://192.168.0.41:30000"}

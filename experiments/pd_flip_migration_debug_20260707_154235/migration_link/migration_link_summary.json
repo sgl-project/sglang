@@ -1,0 +1,20 @@
+{
+  "controller_message": "pd flip committed after two-phase migration",
+  "controller_success": true,
+  "event_count": 25285,
+  "events_path": "experiments/pd_flip_migration_debug_20260707_154235/migration_events.jsonl",
+  "migration_outcome": "committed",
+  "request_count": 80,
+  "request_error_count": 1,
+  "timeline_stage_count": 8,
+  "timeline_stages": [
+    "router_source_drained",
+    "source_admission_paused",
+    "source_migration_started",
+    "target_migration_prepared",
+    "kv_transfer_first_progress",
+    "kv_transfer_complete",
+    "source_role_committed",
+    "cleanup_router_undrain"
+  ]
+}

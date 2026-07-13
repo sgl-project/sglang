@@ -18,8 +18,13 @@ def start_disagg_service(
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
-        # only start bootstrap server on prefill tm
+    if (
+        disagg_mode == DisaggregationMode.PREFILL
+        or server_args.enable_pd_runtime_role_switch
+    ):
+        # Runtime-switchable decode nodes also initialize their prefill-side KV
+        # manager during startup. Keep a local bootstrap server available so
+        # that manager can register before the first role transition.
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )

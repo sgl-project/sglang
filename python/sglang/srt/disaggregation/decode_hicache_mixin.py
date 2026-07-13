@@ -194,6 +194,27 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
 
+        # Re-match updates Req's live radix-match fields in place.  Keep the
+        # preallocation ownership state so a failed restore can release only
+        # the actually allocated suffix.  In particular, [L1, decode_prefix)
+        # is a logical restore hole and must never enter the generic free path.
+        ownership_fields = (
+            "prefix_indices",
+            "last_node",
+            "last_host_node",
+            "best_match_node",
+            "host_hit_length",
+            "swa_host_hit_length",
+            "mamba_host_hit_length",
+            "cache_protected_len",
+            "num_matched_prefix_tokens",
+            "mamba_branching_seqlen",
+        )
+        missing = object()
+        prealloc_ownership = {
+            field: getattr(dr.req, field, missing) for field in ownership_fields
+        }
+
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
             self.tree_cache,
@@ -211,9 +232,15 @@ class DecodeHiCacheTransferMixin:
         )
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+            hole_indices = self.tree_cache.req_to_token_pool.req_to_token[
+                dr.req.req_pool_idx
+            ][pm.l1_prefix_len : pm.decode_prefix_len]
+            dr.req.hicache_restore_ownership_failure = True
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
-                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
+                "new_indices=%d, expected decode_prefix_len=%d "
+                "(l1=%d, l2=%d, l3=%d), prealloc_cache_protected=%s, "
+                "logical_hole_indices=%s",
                 dr.req.rid,
                 len(rematch.device_indices),
                 len(new_indices),
@@ -221,7 +248,17 @@ class DecodeHiCacheTransferMixin:
                 pm.l1_prefix_len,
                 pm.l2_host_hit_length,
                 pm.l3_storage_hit_length,
+                prealloc_ownership["cache_protected_len"],
+                hole_indices.cpu().tolist()
+                if hasattr(hole_indices, "cpu")
+                else list(hole_indices),
             )
+            for field, value in prealloc_ownership.items():
+                if value is missing:
+                    if hasattr(dr.req, field):
+                        delattr(dr.req, field)
+                else:
+                    setattr(dr.req, field, value)
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 

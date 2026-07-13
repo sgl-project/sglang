@@ -1,0 +1,12 @@
+{
+  "effective_sha256": "510e54dea21376a15352ab562cd5aa8946ec4374327400917c31bc9b35d42a67",
+  "effective_trace": "/home/tiancij/pd-artifacts/20260713T090150Z-trace40-full-chain/trace/trace40_scheduled.jsonl",
+  "intra_wave_interval_seconds": 0.15,
+  "last_arrival_offset_s": 19.35,
+  "request_count": 40,
+  "source_sha256": "aba2a2a8597351c91c842994116ca114c98e097cffb0c74c1558b5b68ba4d757",
+  "source_trace": "/home/tiancij/pd-artifacts/20260713-095054-trace40/trace/trace_interleaved_long_decode.jsonl",
+  "ttft_slo_override_seconds": 0.03,
+  "wave_gap_seconds": 6.0,
+  "wave_size": 10
+}

@@ -1,0 +1,23 @@
+{
+  "requested_transition": "1P3D -> 2P2D",
+  "initial_roles": {
+    "node0": "prefill",
+    "node1": "decode",
+    "node2": "decode",
+    "node3": "decode"
+  },
+  "forced_source": "node2",
+  "expected_final_roles": {
+    "node0": "prefill",
+    "node1": "decode",
+    "node2": "prefill",
+    "node3": "decode"
+  },
+  "request_reschedule_strategy": "drain node1/node3 before force_delay so node2 accumulates waiting_queue; before flip undrain node1 for user traffic and keep node3 draining as the explicit KV migration target",
+  "current_kv_path": "decode-source committed KV is migrated to the selected target decode node",
+  "prefill_decode_kv_stitching": {
+    "requested": true,
+    "exercised_in_this_runner": false,
+    "reason": "router only handles request routing/drain/role refresh today; target-side concatenation of prefill KV and decode KV needs worker/controller support beyond the existing decode-source migration path"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "TCP_200_16MB(2)",
+  "inner_run": "TCP_200_16MB_2",
+  "date": "2026-07-06",
+  "source_node": "cloud-099 / lingjun-099",
+  "target_node": "cloud-100 / lingjun-100",
+  "source_host": "192.168.0.42",
+  "target_host": "192.168.0.40",
+  "protocol": "tcp",
+  "ib_device_arg": "mlx5_bond_0",
+  "rate_limit_gbps": 200,
+  "size": "16MB",
+  "warmup": 3,
+  "repeat": 500,
+  "chunk_size": "16MB",
+  "run_id": "TCP_200_16MB_2_099_100_20260706_143743"
+}

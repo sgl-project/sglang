@@ -1,0 +1,22 @@
+{
+  "all_attainment": 0.91,
+  "all_met_count": 182,
+  "completed_count": 192,
+  "error_count": 8,
+  "ledger_path": "/root/sglang/experiments/pd_flip_trace_ab_20260707_143008/state_machine/trace_slo_ledger.jsonl",
+  "mode": "state_machine",
+  "request_count": 200,
+  "router_url": "http://127.0.0.1:18001",
+  "run_elapsed_s": 200.13806201703846,
+  "run_started_wall": 1783408062.6411052,
+  "tpot_avg_attainment": 0.96,
+  "tpot_avg_met_count": 192,
+  "tpot_good_intervals": 40958,
+  "tpot_interval_attainment": 0.9968360591900312,
+  "tpot_p95_attainment": 0.96,
+  "tpot_p95_met_count": 192,
+  "tpot_total_intervals": 41088,
+  "trace_requests": 200,
+  "ttft_attainment": 0.91,
+  "ttft_met_count": 182
+}

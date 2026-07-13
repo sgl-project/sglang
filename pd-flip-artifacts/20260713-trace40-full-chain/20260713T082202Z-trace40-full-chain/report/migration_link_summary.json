@@ -1,0 +1,33 @@
+{
+  "controller_message": "conflicting migration session already exists",
+  "controller_success": false,
+  "event_count": 12139,
+  "events_path": "/home/tiancij/pd-artifacts/20260713T082202Z-trace40-full-chain/metrics/events.jsonl",
+  "failed_stitch_added_cost_seconds": null,
+  "fallback_attempted": false,
+  "fallback_duration_seconds": null,
+  "fallback_reason": null,
+  "fallback_source_bytes": null,
+  "fallback_total_duration_seconds": null,
+  "fallback_transfer_seconds": null,
+  "migration_outcome": "kv_transfer_complete_without_commit_observed",
+  "migration_request_sample_count": 3584,
+  "request_count": 40,
+  "request_error_count": 0,
+  "request_migration_join_count": 0,
+  "stitch_attempt_seconds": null,
+  "stitch_failure_detection_seconds": null,
+  "stitch_failure_to_fallback_complete_seconds": null,
+  "timeline_stage_count": 7,
+  "timeline_stages": [
+    "router_source_drained",
+    "source_admission_paused",
+    "source_migration_started",
+    "target_migration_prepared",
+    "kv_transfer_first_progress",
+    "kv_transfer_complete",
+    "cleanup_router_undrain"
+  ],
+  "timing_measurement_kind": null,
+  "worker_load_sample_count": 3735
+}

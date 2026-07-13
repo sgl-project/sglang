@@ -407,6 +407,13 @@ def _pump_target_entry(entry, *, processor="none"):
         entry["decode_req"].hicache_restore_status = types.SimpleNamespace(
             value="pending"
         )
+    elif processor == "failed":
+        scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            _process_hicache_local_restores=lambda decode_reqs: None
+        )
+        entry["decode_req"].hicache_restore_status = types.SimpleNamespace(
+            value="failed"
+        )
     elif processor == "unknown":
         scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
             _process_hicache_local_restores=lambda decode_reqs: None
@@ -429,6 +436,9 @@ def _pumping_entry(*, needs_restore=False):
 
         def abort(self):
             events.append("abort")
+
+        def clear(self):
+            events.append("clear")
 
     entry = _target_entry()
     entry["phase"] = "transferring"
@@ -478,6 +488,398 @@ def test_target_pump_waits_only_while_restore_processor_reports_pending():
     assert session["pending_reqs"] == 1
     assert receiver_events == []
     assert cleanup_events == []
+
+
+def test_target_restore_failure_requests_full_fallback_without_terminal_failure():
+    entry, receiver_events = _pumping_entry(needs_restore=True)
+    entry["decode_req"].hicache_restore_status = types.SimpleNamespace(value="failed")
+
+    session, cleanup_events = _pump_target_entry(entry, processor="failed")
+
+    assert entry["phase"] == "fallback_required"
+    assert session["state"] == "target_fallback_required"
+    assert session["fallback_required_rids"] == {"req"}
+    assert session["failed_rids"] == set()
+    assert entry["fallback_reason"] == "migration target HiCache restore failed"
+    assert receiver_events == ["abort"]
+    assert cleanup_events == ["release", "free"]
+
+
+def test_target_restore_failure_marks_only_failed_rid_for_fallback():
+    failed_entry, _ = _pumping_entry(needs_restore=True)
+    failed_entry["decode_req"].hicache_restore_status = types.SimpleNamespace(
+        value="failed"
+    )
+    successful_entry, _ = _pumping_entry(needs_restore=False)
+    session = {
+        "manifests": [{"rid": "failed"}, {"rid": "ok"}],
+        "target_entries": {"failed": failed_entry, "ok": successful_entry},
+        "prepare_only": True,
+    }
+    pump = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_target_pump_transfer",
+        {"KVPoll": Poll, "time": types.SimpleNamespace(monotonic=lambda: 1.0)},
+    )
+    scheduler = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(enable_pd_flip_hicache_stitch=True),
+        enable_decode_hicache=True,
+        disagg_decode_transfer_queue=types.SimpleNamespace(
+            _process_hicache_local_restores=lambda decode_reqs: None
+        ),
+        _pd_flip_target_metadata_ready=lambda entry: True,
+        _pd_flip_target_commit_hicache_restore=lambda decode_req: None,
+        _pd_flip_release_target_request=lambda entry: None,
+        _pd_flip_free_target_metadata=lambda entry: None,
+        _pd_flip_note_timing=lambda *args: None,
+        _pd_flip_target_pump_delta_transfer=lambda session: None,
+    )
+    scheduler._pd_flip_target_hicache_restore_pending = types.MethodType(
+        _load_class_method(
+            SCHEDULER_PATH,
+            "Scheduler",
+            "_pd_flip_target_hicache_restore_pending",
+            {"DecodeRequest": object},
+        ),
+        scheduler,
+    )
+    scheduler._pd_flip_target_stitch_ready = types.MethodType(
+        _load_class_method(
+            SCHEDULER_PATH, "Scheduler", "_pd_flip_target_stitch_ready"
+        ),
+        scheduler,
+    )
+
+    pump(scheduler, session)
+
+    assert session["fallback_required_rids"] == {"failed"}
+    assert session["transferred_rids"] == {"ok"}
+    assert failed_entry["phase"] == "fallback_required"
+    assert successful_entry["phase"] == "transferred_held"
+
+
+def test_source_full_fallback_retry_sends_complete_range_and_records_measurement():
+    sender = FakeSender(prefix_len=99)
+    scheduler = _make_source_scheduler(enabled=True)
+    entry = {
+        "sender": sender,
+        "req": object(),
+        "committed_len": 4,
+        "metadata_index": 3,
+        "final_owner": "source",
+    }
+    retry = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_source_send_full_fallback",
+        {"time": types.SimpleNamespace(monotonic=lambda: 1.0)},
+    )
+
+    retry(scheduler, entry, "migration target HiCache restore failed")
+
+    assert sender.calls == ["init", "send"]
+    assert sender.sent_indices == [0, 1, 2, 3]
+    assert entry["source_transfer_start"] == 0
+    assert entry["source_transfer_end"] == 4
+    assert entry["stitch_mode"] == "source_decode_full_fallback"
+    assert entry["fallback_attempted"] is True
+    assert entry["fallback_reason"] == "migration target HiCache restore failed"
+    assert entry["final_owner"] == "source"
+
+
+def test_source_full_fallback_rebuilds_sender_and_metadata():
+    class Sender:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    old_sender = types.SimpleNamespace(abort=lambda: None)
+    entry = {
+        "sender": old_sender,
+        "metadata_index": 1,
+        "migration_bootstrap_room": 9,
+    }
+    session = {"source_entries": {"req": entry}, "transferred_rids": {"req"}}
+    scheduler = types.SimpleNamespace(
+        transfer_backend="fake",
+        ps=types.SimpleNamespace(tp_rank=0, pp_rank=0),
+        req_to_metadata_buffer_idx_allocator=types.SimpleNamespace(alloc=lambda: 7),
+        _pd_flip_get_source_kv_manager=lambda: "manager",
+        _pd_flip_local_bootstrap_addr=lambda manager: "host:1",
+        _pd_flip_free_source_metadata=lambda entry: entry.update(metadata_freed=True),
+        _pd_flip_note_timing=lambda *args: None,
+    )
+    rebuild = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_source_rebuild_full_fallback",
+        {
+            "get_kv_class": lambda backend, kind: Sender,
+            "KVClassType": types.SimpleNamespace(SENDER="sender"),
+            "List": list,
+            "Dict": dict,
+            "Any": object,
+        },
+    )
+
+    rebuild(scheduler, session, ["req"], "restore failed")
+
+    assert isinstance(entry["sender"], Sender)
+    assert entry["sender"] is not old_sender
+    assert entry["metadata_index"] == 7
+    assert entry["metadata_freed"] is False
+    assert entry["fallback_attempted"] is True
+    assert session["state"] == "source_fallback_started"
+
+
+def test_source_full_fallback_rebuild_failure_rolls_back_entry():
+    events = []
+    entry = {
+        "sender": types.SimpleNamespace(abort=lambda: events.append("old_abort")),
+        "metadata_index": 1,
+        "migration_bootstrap_room": 9,
+    }
+    session = {"source_entries": {"req": entry}}
+    scheduler = types.SimpleNamespace(
+        transfer_backend="fake",
+        ps=types.SimpleNamespace(tp_rank=0, pp_rank=0),
+        req_to_metadata_buffer_idx_allocator=types.SimpleNamespace(alloc=lambda: None),
+        _pd_flip_get_source_kv_manager=lambda: "manager",
+        _pd_flip_local_bootstrap_addr=lambda manager: "host:1",
+        _pd_flip_free_source_metadata=lambda entry: events.append("free"),
+    )
+    rebuild = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_source_rebuild_full_fallback",
+        {
+            "get_kv_class": lambda backend, kind: object,
+            "KVClassType": types.SimpleNamespace(SENDER="sender"),
+            "List": list,
+            "Dict": dict,
+            "Any": object,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="no metadata buffer"):
+        rebuild(scheduler, session, ["req"], "restore failed")
+
+    assert events == ["old_abort", "free", "free"]
+    assert entry["failed"] is True
+    assert entry["rollback_reason"] == "no metadata buffer available for fallback source"
+    assert session["state"] == "source_failed"
+
+
+def test_source_fallback_sender_constructor_failure_frees_new_metadata():
+    events = []
+
+    class BrokenSender:
+        def __init__(self, **kwargs):
+            raise RuntimeError("sender construction failed")
+
+    entry = {
+        "sender": types.SimpleNamespace(abort=lambda: events.append("old_abort")),
+        "metadata_index": 1,
+        "migration_bootstrap_room": 9,
+    }
+    session = {"source_entries": {"req": entry}}
+
+    def free_metadata(current):
+        events.append(("free", current.get("metadata_index")))
+        current["metadata_freed"] = True
+
+    scheduler = types.SimpleNamespace(
+        transfer_backend="fake",
+        ps=types.SimpleNamespace(tp_rank=0, pp_rank=0),
+        req_to_metadata_buffer_idx_allocator=types.SimpleNamespace(alloc=lambda: 7),
+        _pd_flip_get_source_kv_manager=lambda: "manager",
+        _pd_flip_local_bootstrap_addr=lambda manager: "host:1",
+        _pd_flip_free_source_metadata=free_metadata,
+    )
+    rebuild = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_source_rebuild_full_fallback",
+        {
+            "get_kv_class": lambda backend, kind: BrokenSender,
+            "KVClassType": types.SimpleNamespace(SENDER="sender"),
+            "List": list,
+            "Dict": dict,
+            "Any": object,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="sender construction failed"):
+        rebuild(scheduler, session, ["req"], "restore failed")
+
+    assert events == [("old_abort"), ("free", 1), ("free", 7)]
+    assert entry["metadata_index"] == 7
+    assert entry["metadata_freed"] is True
+    assert entry["sender"] is None
+    assert entry["failed"] is True
+    assert session["state"] == "source_failed"
+
+
+def test_source_pump_dispatches_rebuilt_fallback_as_full_copy_without_prefix_pop():
+    class Sender(FakeSender):
+        def __init__(self):
+            super().__init__(prefix_len=3)
+            self.poll_count = 0
+
+        def poll(self):
+            self.poll_count += 1
+            return Poll.WaitingForInput if self.poll_count == 1 else Poll.Success
+
+        def get_transfer_metric(self):
+            return types.SimpleNamespace(
+                transfer_total_bytes=123, transfer_latency_s=0.25
+            )
+
+    sender = Sender()
+    req = types.SimpleNamespace(
+        metadata_buffer_index=-1,
+        bootstrap_room=None,
+        disagg_kv_sender=None,
+    )
+    entry = {
+        "sender": sender,
+        "req": req,
+        "committed_len": 4,
+        "metadata_index": 7,
+        "migration_bootstrap_room": 9,
+        "fallback_attempted": True,
+        "fallback_reason": "restore failed",
+        "sent": False,
+        "transferred": False,
+        "failed": False,
+    }
+    session = {
+        "source_entries": {"req": entry},
+        "manifests": [{"rid": "req"}],
+        "state": "source_fallback_started",
+    }
+    pump = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_source_pump_transfer",
+        {
+            "KVPoll": Poll,
+            "time": types.SimpleNamespace(monotonic=lambda: 1.0),
+            "Dict": dict,
+            "Any": object,
+        },
+    )
+    scheduler = types.SimpleNamespace(
+        _pd_flip_note_timing=lambda *args: None,
+        _pd_flip_set_source_metadata=lambda *args: None,
+        _pd_flip_source_send_initial=lambda entry: pytest.fail(
+            "fallback must not use initial prefix path"
+        ),
+        _pd_flip_source_send_full_fallback=types.MethodType(
+            _load_class_method(
+                SCHEDULER_PATH,
+                "Scheduler",
+                "_pd_flip_source_send_full_fallback",
+                {"time": types.SimpleNamespace(monotonic=lambda: 1.0)},
+            ),
+            types.SimpleNamespace(
+                _pd_flip_stitch_page_indices_range=lambda req, start, end: list(
+                    range(start, end)
+                ),
+                _pd_flip_source_state_indices=lambda req, end, kv_mgr: [],
+            ),
+        ),
+        _pd_flip_record_sender_metric=lambda entry, sender, segment: (
+            entry.update(
+                source_transfer_bytes=123, source_transfer_duration_s=0.25
+            )
+        ),
+        _pd_flip_free_source_metadata=lambda entry: None,
+        _pd_flip_source_pump_delta_transfer=lambda session: None,
+    )
+
+    pump(scheduler, session)
+
+    assert "pop" not in sender.calls
+    assert sender.sent_indices == [0, 1, 2, 3]
+    assert sender.calls == ["init", "send"]
+    assert entry["transferred"] is True
+    assert entry["fallback_source_bytes"] == 123
+    assert entry["fallback_duration_seconds"] == 0.25
+
+
+def test_target_cleanup_reprepare_creates_h0_receiver_entry():
+    replacement = {"decode_req": types.SimpleNamespace(kv_receiver=object())}
+    old = {"manifest": {"rid": "req"}, "fallback_reason": "restore failed"}
+    session = {
+        "target_entries": {"req": old},
+        "fallback_required_rids": {"req"},
+        "source_url": "http://source",
+    }
+    scheduler = types.SimpleNamespace(
+        _pd_flip_prepare_target_entries=lambda manifests, source_url: (
+            {"req": replacement},
+            "",
+        ),
+        _pd_flip_release_target_request=lambda entry: None,
+        _pd_flip_free_target_metadata=lambda entry: None,
+        _pd_flip_note_timing=lambda *args: None,
+    )
+    reprepare = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_target_reprepare_full_fallback",
+        {"List": list, "Dict": dict, "Any": object},
+    )
+
+    reprepare(scheduler, session, ["req"])
+
+    assert session["target_entries"]["req"] is replacement
+    assert replacement["force_source_full_fallback"] is True
+    assert replacement["stitch_mode"] == "source_decode_full_fallback"
+    assert session["fallback_required_rids"] == set()
+    assert session["state"] == "target_fallback_prepared"
+
+
+def test_target_fallback_reprepare_failure_aborts_partial_replacements():
+    events = []
+
+    class Receiver:
+        def abort(self):
+            events.append("abort")
+
+    replacement = {"decode_req": types.SimpleNamespace(kv_receiver=Receiver())}
+    entries = {
+        "one": {"manifest": {"rid": "one"}},
+        "two": {"manifest": {"rid": "two"}},
+    }
+    calls = 0
+
+    def prepare(manifests, source_url):
+        nonlocal calls
+        calls += 1
+        return ({"one": replacement}, "") if calls == 1 else ({}, "boom")
+
+    session = {"target_entries": entries, "source_url": "http://source"}
+    scheduler = types.SimpleNamespace(
+        _pd_flip_prepare_target_entries=prepare,
+        _pd_flip_release_target_request=lambda entry: events.append("release"),
+        _pd_flip_free_target_metadata=lambda entry: events.append("free"),
+        _pd_flip_note_timing=lambda *args: None,
+    )
+    reprepare = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_target_reprepare_full_fallback",
+        {"List": list, "Dict": dict, "Any": object},
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        reprepare(scheduler, session, ["one", "two"])
+
+    assert events == ["abort", "release", "free"]
+    assert session["state"] == "target_failed"
+    assert session["last_error"] == "boom"
 
 
 def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
@@ -580,6 +982,7 @@ def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
             committed_len
         )
         or [],
+        _pd_flip_note_timing=lambda *args: None,
     )
     scheduler._pd_flip_stitch_page_indices_range = types.MethodType(
         page_range, scheduler
@@ -596,6 +999,93 @@ def test_target_metadata_advertises_bounded_prefix_and_complete_suffix():
     assert entry["target_received_suffix_start"] == 6
     assert entry["target_received_suffix_end"] == 10
     assert entry["stitch_mode"] == "partial_prefix_stitch"
+
+
+@pytest.mark.parametrize(
+    "prefix_indices,l3_storage_hit_length,expected_protected_len",
+    [
+        pytest.param([10, 20], 2, 4, id="matched-prefix"),
+        pytest.param([], 0, 0, id="zero-prefix"),
+    ],
+)
+def test_target_prealloc_records_stitched_prefix_ownership(
+    prefix_indices, l3_storage_hit_length, expected_protected_len
+):
+    class PrefixMatch:
+        def __init__(self):
+            self.prefix_indices = ArrayTensor(prefix_indices)
+            self.l2_host_hit_length = 0
+            self.l3_storage_hit_length = l3_storage_hit_length
+
+        @property
+        def l1_prefix_len(self):
+            return len(self.prefix_indices)
+
+        @property
+        def decode_prefix_len(self):
+            return (
+                self.l1_prefix_len
+                + self.l2_host_hit_length
+                + self.l3_storage_hit_length
+            )
+
+    class Queue:
+        def _match_prefix_and_lock(self, req):
+            return PrefixMatch()
+
+        def _pre_alloc(self, req, **kwargs):
+            return ArrayTensor(range(len(req.origin_input_ids)))
+
+    class Receiver:
+        def send_metadata(self, *args, **kwargs):
+            pass
+
+    method = _load_class_method(
+        SCHEDULER_PATH,
+        "Scheduler",
+        "_pd_flip_target_prealloc_and_send_metadata",
+        {
+            "DecodeRequest": object,
+            "time": types.SimpleNamespace(monotonic=lambda: 1.0),
+            "TransferBackend": types.SimpleNamespace(FAKE="fake"),
+        },
+    )
+    boundary = _load_class_method(
+        SCHEDULER_PATH, "Scheduler", "_pd_flip_stitch_boundary"
+    )
+    req = types.SimpleNamespace(
+        rid="req",
+        origin_input_ids=list(range(6)),
+        kv_committed_len=6,
+        req_pool_idx=0,
+        bootstrap_room=123,
+        cache_protected_len=0,
+    )
+    entry = {
+        "decode_req": types.SimpleNamespace(req=req, kv_receiver=Receiver()),
+        "metadata_index": -1,
+    }
+    scheduler = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(
+            enable_pd_flip_hicache_stitch=True,
+            disaggregation_decode_enable_radix_cache=True,
+        ),
+        disagg_decode_prealloc_queue=Queue(),
+        req_to_metadata_buffer_idx_allocator=types.SimpleNamespace(alloc=lambda: 0),
+        token_to_kv_pool_allocator=types.SimpleNamespace(page_size=1),
+        enable_decode_hicache=False,
+        transfer_backend="not-fake",
+        _pd_flip_stitch_boundary=boundary,
+        _pd_flip_stitch_page_indices_range=lambda req, start, end: np.asarray(
+            range(start, end)
+        ),
+        _pd_flip_target_state_indices=lambda req, committed_len: [],
+        _pd_flip_note_timing=lambda *args: None,
+    )
+
+    method(scheduler, entry)
+
+    assert req.cache_protected_len == expected_protected_len
 
 
 def test_stitch_uses_explicit_server_and_worker_flags_only():

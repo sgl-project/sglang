@@ -1,0 +1,11 @@
+{
+  "controller_message": "request d63b1fdacc024c4eb01cdc5c15b144d4 has no req_pool_idx",
+  "controller_success": false,
+  "event_count": 0,
+  "events_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/05_sweep_force_delay_12s/migration_events.jsonl",
+  "migration_outcome": "no_migration_observed",
+  "request_count": 80,
+  "request_error_count": 0,
+  "timeline_stage_count": 0,
+  "timeline_stages": []
+}

@@ -1,0 +1,5 @@
+﻿Thu Jul  9 01:17:46 PM CST 2026
+lingjun-101
+              total        used        free      shared  buff/cache   available
+Mem:          2.0Ti        21Gi       1.9Ti       7.0Mi        34Gi       1.9Ti
+Swap:            0B          0B          0B

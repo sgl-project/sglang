@@ -1,0 +1,18 @@
+{
+  "custom_params": {
+    "pd_flip_slo": {
+      "tpot_seconds": 0.02,
+      "ttft_seconds": 0.001
+    }
+  },
+  "max_tokens": 128,
+  "messages": [
+    {
+      "content": "Write a concise numbered list of distributed serving checks.",
+      "role": "user"
+    }
+  ],
+  "model": "deepseek_v3.1_terminus",
+  "stream": true,
+  "temperature": 0.0
+}

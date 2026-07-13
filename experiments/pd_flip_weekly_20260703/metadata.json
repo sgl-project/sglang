@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-07-03T02:33:57.762121+00:00",
+  "slo": {
+    "commit_threshold": 0.9,
+    "enter_threshold": 0.9,
+    "exit_threshold": 0.95,
+    "tpot_seconds": 0.025,
+    "ttft_seconds": 0.25
+  },
+  "topology": {
+    "node0": "prefill",
+    "node1": "prefill",
+    "node2": "decode/source candidate",
+    "node3": "decode/migration target"
+  }
+}

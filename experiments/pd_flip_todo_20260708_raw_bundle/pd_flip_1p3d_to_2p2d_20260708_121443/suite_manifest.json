@@ -1,0 +1,35 @@
+{
+  "suite_dir": "/root/sglang/experiments/pd_flip_1p3d_to_2p2d_20260708_121443",
+  "repo": "/root/sglang",
+  "router_url": "http://127.0.0.1:18001",
+  "model_id": "deepseek_v3.1_terminus",
+  "max_running_requests": 2,
+  "migration_max_reqs": 4,
+  "requests": 40,
+  "interval_seconds": 0.5,
+  "short_chars": 1000,
+  "long_chars": 10000,
+  "short_count": 20,
+  "long_count": 20,
+  "force_delay_seconds": 8,
+  "post_unpin_delay_seconds": 25,
+  "observation_quiesce_seconds": 15,
+  "post_migration_idle_timeout_seconds": 2,
+  "force_source_name": "node2",
+  "migration_target_name": "node3",
+  "initial_roles": {
+    "node0": "prefill",
+    "node1": "decode",
+    "node2": "decode",
+    "node3": "decode"
+  },
+  "pin_drain_for_waiting": 1,
+  "pin_drain_worker_ids": "http://192.168.0.40:32000 http://192.168.0.41:32000",
+  "unpin_before_flip_worker_ids": "http://192.168.0.40:32000",
+  "nodes": {
+    "node0": "http://192.168.0.42:32000",
+    "node1": "http://192.168.0.40:32000",
+    "node2": "http://192.168.0.39:32000",
+    "node3": "http://192.168.0.41:32000"
+  }
+}

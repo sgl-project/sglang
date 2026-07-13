@@ -295,6 +295,23 @@ def build_timeline(events: Sequence[JsonDict]) -> List[JsonDict]:
 
         elif event_type == "migration_status":
             status = event.get("status") or {}
+            fallback_measurements = [
+                item for item in status.get("request_measurements") or []
+                if isinstance(item, dict)
+            ]
+            fallback_bytes = [
+                item.get("fallback_source_bytes") for item in fallback_measurements
+                if item.get("fallback_source_bytes") is not None
+            ]
+            fallback_durations = [
+                float(item.get("fallback_duration_seconds"))
+                for item in fallback_measurements
+                if item.get("fallback_duration_seconds") is not None
+            ]
+            nested_reasons = [
+                item.get("fallback_reason") for item in fallback_measurements
+                if item.get("fallback_reason")
+            ]
             state = str(status.get("state") or "")
             role = str(status.get("role") or "")
             session_id = status.get("session_id")
@@ -307,11 +324,30 @@ def build_timeline(events: Sequence[JsonDict]) -> List[JsonDict]:
                 "failed_reqs": status.get("failed_reqs"),
                 "held_reqs": status.get("held_reqs"),
                 "last_error": status.get("last_error"),
+                "fallback_reason": status.get("fallback_reason") or (
+                    nested_reasons[-1] if nested_reasons else None
+                ),
+                "fallback_attempted": any(
+                    bool(item.get("fallback_attempted"))
+                    for item in fallback_measurements
+                ),
+                "fallback_source_bytes": (
+                    sum(fallback_bytes) if fallback_bytes else None
+                ),
+                "fallback_duration_seconds": (
+                    max(fallback_durations) if fallback_durations else None
+                ),
             }
             if role == "source" and state == "source_started":
                 add("source_migration_started", event, node=event.get("node"), details=details)
             if role == "target" and state == "target_prepared":
                 add("target_migration_prepared", event, node=event.get("node"), details=details)
+            if state == "target_fallback_required":
+                add("target_full_fallback_required", event, node=event.get("node"), details=details)
+            if state == "source_fallback_started":
+                add("source_full_fallback_started", event, node=event.get("node"), details=details)
+            if state == "target_fallback_prepared":
+                add("target_full_fallback_prepared", event, node=event.get("node"), details=details)
 
             transferred = int_or_zero(status.get("transferred_reqs"))
             pending = int_or_zero(status.get("pending_reqs"))
@@ -533,6 +569,21 @@ def flatten_migration_samples(events: Sequence[JsonDict]) -> List[JsonDict]:
         if event.get("event_type") != "migration_status":
             continue
         status = event.get("status") or {}
+        fallback_measurements = [
+            item for item in status.get("request_measurements") or []
+            if isinstance(item, dict)
+        ]
+        fallback_attempted = any(
+            bool(item.get("fallback_attempted")) for item in fallback_measurements
+        )
+        fallback_bytes = [
+            item.get("fallback_source_bytes") for item in fallback_measurements
+            if item.get("fallback_source_bytes") is not None
+        ]
+        fallback_durations = [
+            item.get("fallback_duration_seconds") for item in fallback_measurements
+            if item.get("fallback_duration_seconds") is not None
+        ]
         row = {
             "ts_wall": event.get("ts_wall"),
             "ts_mono": event.get("ts_mono"),
@@ -549,6 +600,15 @@ def flatten_migration_samples(events: Sequence[JsonDict]) -> List[JsonDict]:
             "failed_reqs": status.get("failed_reqs"),
             "held_reqs": status.get("held_reqs"),
             "last_error": status.get("last_error"),
+            "fallback_required_rids": json.dumps(
+                status.get("fallback_required_rids") or [], sort_keys=True
+            ),
+            "fallback_reason": status.get("fallback_reason"),
+            "fallback_attempted": fallback_attempted,
+            "fallback_source_bytes": sum(fallback_bytes) if fallback_bytes else None,
+            "fallback_duration_seconds": (
+                max(fallback_durations) if fallback_durations else None
+            ),
             "waiting_reqs": status.get("waiting_reqs"),
             "waiting_manifest_count": status.get("waiting_manifest_count"),
             "waiting_skipped_count": status.get("waiting_skipped_count"),
@@ -593,6 +653,88 @@ def flatten_migration_request_samples(events: Sequence[JsonDict]) -> List[JsonDi
                     row[field] = measurement.get(field)
                 rows.append(row)
     return rows
+
+
+def summarize_fallback(
+    request_rows: Sequence[JsonDict], status_rows: Sequence[JsonDict]
+) -> JsonDict:
+    """Summarize latest per-RID fallback measurements without poll double-counting."""
+    distinct = {}
+    for row in sorted(request_rows, key=lambda item: float(item.get("ts_mono") or 0)):
+        key = (row.get("session_id"), row.get("rid"))
+        if not all(key):
+            continue
+        merged = distinct.setdefault(key, {})
+        for field in (
+            "fallback_reason", "fallback_attempted", "fallback_source_bytes",
+            "fallback_duration_seconds",
+            "stitch_attempt_seconds", "stitch_failure_detection_seconds",
+            "fallback_transfer_seconds",
+            "stitch_failure_to_fallback_complete_seconds",
+            "failed_stitch_added_cost_seconds", "timing_measurement_kind",
+        ):
+            if row.get(field) is not None:
+                merged[field] = row.get(field)
+
+    attempted = any(bool(row.get("fallback_attempted")) for row in distinct.values())
+    attempted_rows = [
+        row for row in distinct.values() if row.get("fallback_attempted")
+    ]
+    byte_values = [
+        row["fallback_source_bytes"] for row in attempted_rows
+        if row.get("fallback_source_bytes") is not None
+    ]
+    duration_values = [
+        float(row["fallback_duration_seconds"]) for row in attempted_rows
+        if row.get("fallback_duration_seconds") is not None
+    ]
+    def max_phase(field: str) -> Optional[float]:
+        values = [
+            float(row[field])
+            for row in attempted_rows
+            if row.get(field) is not None
+        ]
+        return max(values) if values else None
+
+    reasons = [
+        row.get("fallback_reason") for row in distinct.values()
+        if row.get("fallback_reason")
+    ]
+    if not reasons:
+        reasons = [
+            row.get("fallback_reason") for row in status_rows
+            if row.get("fallback_reason")
+        ]
+    return {
+        "fallback_attempted": attempted,
+        "fallback_reason": reasons[-1] if reasons else None,
+        "fallback_source_bytes": sum(byte_values) if byte_values else (
+            0 if attempted and any(
+                row.get("fallback_source_bytes") == 0 for row in attempted_rows
+            ) else None
+        ),
+        "fallback_duration_seconds": max(duration_values) if duration_values else None,
+        "fallback_total_duration_seconds": sum(duration_values) if duration_values else None,
+        "stitch_attempt_seconds": max_phase("stitch_attempt_seconds"),
+        "stitch_failure_detection_seconds": max_phase(
+            "stitch_failure_detection_seconds"
+        ),
+        "fallback_transfer_seconds": max_phase("fallback_transfer_seconds"),
+        "stitch_failure_to_fallback_complete_seconds": max_phase(
+            "stitch_failure_to_fallback_complete_seconds"
+        ),
+        "failed_stitch_added_cost_seconds": max_phase(
+            "failed_stitch_added_cost_seconds"
+        ),
+        "timing_measurement_kind": next(
+            (
+                row.get("timing_measurement_kind")
+                for row in attempted_rows
+                if row.get("timing_measurement_kind")
+            ),
+            None,
+        ),
+    }
 
 
 def flatten_router_samples(events: Sequence[JsonDict]) -> List[JsonDict]:
@@ -784,6 +926,7 @@ def write_outputs(
         ),
         "request_error_count": len(error_rows),
     }
+    summary.update(summarize_fallback(migration_request_samples, migration_samples))
     with (output_dir / "migration_link_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
     write_measurement_plan(output_dir)
@@ -845,6 +988,10 @@ def timeline_fields() -> List[str]:
         "failed_reqs",
         "held_reqs",
         "last_error",
+        "fallback_reason",
+        "fallback_attempted",
+        "fallback_source_bytes",
+        "fallback_duration_seconds",
     ]
 
 
@@ -869,6 +1016,11 @@ def migration_status_fields() -> List[str]:
         "failed_reqs",
         "held_reqs",
         "last_error",
+        "fallback_required_rids",
+        "fallback_reason",
+        "fallback_attempted",
+        "fallback_source_bytes",
+        "fallback_duration_seconds",
         "waiting_reqs",
         "waiting_manifest_count",
         "waiting_skipped_count",
@@ -891,6 +1043,10 @@ def migration_request_fields() -> List[str]:
         "c0_tokens",
         "c1_tokens",
         "stitch_mode",
+        "original_stitch_mode",
+        "l1_hit_tokens",
+        "l2_hit_tokens",
+        "l3_hit_tokens",
         "mooncake_bytes",
         "mooncake_bytes_available",
         "mooncake_restore_tokens",
@@ -899,6 +1055,16 @@ def migration_request_fields() -> List[str]:
         "mooncake_duration_seconds",
         "source_duration_seconds",
         "delta_duration_seconds",
+        "fallback_reason",
+        "fallback_attempted",
+        "fallback_source_bytes",
+        "fallback_duration_seconds",
+        "stitch_attempt_seconds",
+        "stitch_failure_detection_seconds",
+        "fallback_transfer_seconds",
+        "stitch_failure_to_fallback_complete_seconds",
+        "failed_stitch_added_cost_seconds",
+        "timing_measurement_kind",
         "held_at_mono",
         "freeze_at_mono",
         "commit_at_mono",

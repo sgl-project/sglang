@@ -1,0 +1,22 @@
+{
+  "all_attainment": 0.0,
+  "all_met_count": 0,
+  "completed_count": 0,
+  "error_count": 50,
+  "ledger_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/08_abort_branch/abort_branch/trace_slo_ledger.jsonl",
+  "mode": "abort_branch",
+  "request_count": 50,
+  "router_url": "http://127.0.0.1:18001",
+  "run_elapsed_s": 24.505652994965203,
+  "run_started_wall": 1783419523.1913004,
+  "tpot_avg_attainment": 0.0,
+  "tpot_avg_met_count": 0,
+  "tpot_good_intervals": 0,
+  "tpot_interval_attainment": null,
+  "tpot_p95_attainment": 0.0,
+  "tpot_p95_met_count": 0,
+  "tpot_total_intervals": 0,
+  "trace_requests": 50,
+  "ttft_attainment": 0.0,
+  "ttft_met_count": 0
+}

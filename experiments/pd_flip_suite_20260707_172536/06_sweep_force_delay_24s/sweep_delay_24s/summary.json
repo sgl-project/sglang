@@ -1,0 +1,22 @@
+{
+  "all_attainment": 0.0,
+  "all_met_count": 0,
+  "completed_count": 47,
+  "error_count": 33,
+  "ledger_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/06_sweep_force_delay_24s/sweep_delay_24s/trace_slo_ledger.jsonl",
+  "mode": "sweep_delay_24s",
+  "request_count": 80,
+  "router_url": "http://127.0.0.1:18001",
+  "run_elapsed_s": 219.58012803900056,
+  "run_started_wall": 1783419083.5184062,
+  "tpot_avg_attainment": 0.0,
+  "tpot_avg_met_count": 0,
+  "tpot_good_intervals": 0,
+  "tpot_interval_attainment": null,
+  "tpot_p95_attainment": 0.0,
+  "tpot_p95_met_count": 0,
+  "tpot_total_intervals": 0,
+  "trace_requests": 80,
+  "ttft_attainment": 0.575,
+  "ttft_met_count": 46
+}

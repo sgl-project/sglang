@@ -1,0 +1,16 @@
+{
+  "controller_message": "pd flip committed after two-phase migration",
+  "controller_success": true,
+  "event_count": 25038,
+  "events_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/10_ab_200_state_machine_two_phase/migration_events.jsonl",
+  "migration_outcome": "committed",
+  "request_count": 200,
+  "request_error_count": 46,
+  "timeline_stage_count": 4,
+  "timeline_stages": [
+    "router_source_drained",
+    "source_admission_paused",
+    "source_role_committed",
+    "cleanup_router_undrain"
+  ]
+}

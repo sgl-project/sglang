@@ -33,6 +33,25 @@ DENSE_SIZES_1 = (
     "1MB,2MB,4MB,8MB,16MB,24MB,32MB,48MB,64MB,96MB,128MB,"
     "192MB,256MB,384MB,512MB,768MB,1GB,1.25GB,1.5GB,1.75GB,2GB"
 )
+HEAD_TCP_FINE_DENSE_SIZES = ",".join(
+    [f"{size}MB" for size in range(1, 33)]
+    + [
+        "48MB",
+        "64MB",
+        "96MB",
+        "128MB",
+        "192MB",
+        "256MB",
+        "384MB",
+        "512MB",
+        "768MB",
+        "1GB",
+        "1.25GB",
+        "1.5GB",
+        "1.75GB",
+        "2GB",
+    ]
+)
 DENSE_SIZES_2 = (
     "512KB,1MB,2MB,4MB,8MB,12MB,16MB,24MB,32MB,48MB,64MB,"
     "96MB,128MB,192MB,256MB,384MB,512MB,640MB,768MB,896MB,1GB"
@@ -249,7 +268,7 @@ class Runner:
         cmd = self.docker_cmd(name=name, env=env, out_dir=out_dir, inner_cmd=inner_cmd)
         print("+ " + " ".join(q(x) for x in cmd) + f" > {log_path} 2>&1", flush=True)
         if self.args.dry_run:
-            proc = subprocess.Popen(["true"])
+            proc = subprocess.Popen([sys.executable, "-c", ""])
             self.local_children.append(proc)
             return proc
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -879,6 +898,28 @@ def matrix_runs(args: Optional[argparse.Namespace] = None) -> List[MatrixRun]:
     return runs
 
 
+def head_tcp_sweep_runs(args: Optional[argparse.Namespace] = None) -> List[MatrixRun]:
+    endpoint = one_lane_endpoint(
+        getattr(args, "head_tcp_src_host", "192.168.0.39"),
+        getattr(args, "head_tcp_tgt_host", "192.168.0.41"),
+        getattr(args, "head_tcp_ib_device", "mlx5_bond_0"),
+    )
+    return [
+        MatrixRun(
+            run=f"{int(rate)}_1x{int(rate)}_head_tcp_bg0_fine_dense",
+            lanes=(endpoint,),
+            shards=1,
+            max_bytes="2GB",
+            sizes=HEAD_TCP_FINE_DENSE_SIZES,
+            protocol="tcp",
+            lane_cap_gbps=rate,
+            bg_rate_gbps=0.0,
+            fg_rate_gbps=rate,
+        )
+        for rate in (100.0, 200.0)
+    ]
+
+
 def multi_hca_matrix_runs() -> List[MatrixRun]:
     runs: List[MatrixRun] = []
     specs = [
@@ -1045,6 +1086,14 @@ def selected_matrix_runs(args: argparse.Namespace) -> List[MatrixRun]:
     return runs
 
 
+def selected_head_tcp_sweep_runs(args: argparse.Namespace) -> List[MatrixRun]:
+    runs = head_tcp_sweep_runs(args)
+    if args.only:
+        requested = set(args.only)
+        runs = [run for run in runs if run.run in requested]
+    return runs
+
+
 def selected_multi_hca_matrix_runs(args: argparse.Namespace) -> List[MatrixRun]:
     runs = multi_hca_matrix_runs()
     if args.only:
@@ -1093,6 +1142,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--suite",
         choices=(
             "fixed-missing",
+            "head-tcp-sweep",
             "multi-hca-bg",
             "multi-hca-portcap-bg",
             "multi-hca-bgcap-only",
@@ -1146,6 +1196,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.suite in ("list", "fixed-missing", "all"):
         for run in selected_matrix_runs(args):
+            if args.suite == "list":
+                print_list_item(run.run)
+            else:
+                runner.run_matrix(run)
+
+    if args.suite in ("list", "head-tcp-sweep", "all"):
+        for run in selected_head_tcp_sweep_runs(args):
             if args.suite == "list":
                 print_list_item(run.run)
             else:

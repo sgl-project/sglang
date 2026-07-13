@@ -1,0 +1,20 @@
+{
+  "controller_message": "pd flip committed after two-phase migration",
+  "controller_success": true,
+  "event_count": 38155,
+  "events_path": "/root/sglang/experiments/pd_flip_waiting_queue_20260708_102000/01_waiting_queue_two_phase/migration_events.jsonl",
+  "migration_outcome": "aborted_or_failed",
+  "request_count": 60,
+  "request_error_count": 2,
+  "timeline_stage_count": 8,
+  "timeline_stages": [
+    "router_source_drained",
+    "migration_abort_or_failed",
+    "cleanup_router_undrain",
+    "source_admission_paused",
+    "source_migration_started",
+    "target_migration_prepared",
+    "kv_transfer_first_progress",
+    "kv_transfer_complete"
+  ]
+}

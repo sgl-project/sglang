@@ -1,0 +1,1 @@
+{"model":"/models/deepseek_v3.1_terminus","messages":[{"role":"user","content":"Say hello in four words."}],"max_tokens":8,"temperature":0}

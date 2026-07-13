@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#e9eef7" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="monitorGrad" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#1e5bff"/>
+      <stop offset="100%" stop-color="#00a7c8"/>
+    </linearGradient>
+    <linearGradient id="selectedGrad" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#eef7ff"/>
+      <stop offset="100%" stop-color="#ffffff"/>
+    </linearGradient>
+    <filter id="softShadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0b1f44" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrowBlue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 1 1 L 11 6 L 1 11 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 1 1 L 11 6 L 1 11 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 1 1 L 11 6 L 1 11 z" fill="#dc2626"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fbff; }
+      .title { font: 700 38px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #10213f; }
+      .subtitle { font: 500 18px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #49627f; }
+      .label { font: 700 18px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #10213f; }
+      .body { font: 500 16px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #34445f; }
+      .small { font: 500 13px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #52647b; }
+      .whiteLabel { font: 700 23px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #ffffff; }
+      .whiteSmall { font: 500 15px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #e9f5ff; }
+      .state { font: 700 18px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #0f2a4d; }
+      .chip { font: 700 14px "Microsoft YaHei", "PingFang SC", Arial, sans-serif; fill: #075985; }
+      .card { fill: #ffffff; stroke: #d8e2f0; stroke-width: 1.5; rx: 18; filter: url(#softShadow); }
+      .node { fill: #ffffff; stroke: #d8e2f0; stroke-width: 1.5; rx: 16; }
+      .nodeSelected { fill: url(#selectedGrad); stroke: #2563eb; stroke-width: 3; rx: 18; filter: url(#softShadow); }
+      .lane { fill: #ffffff; stroke: #c9d8ea; stroke-width: 1.5; rx: 24; filter: url(#softShadow); }
+      .process { fill: #f8fbff; stroke: #bcd0e8; stroke-width: 1.5; rx: 14; }
+      .processGreen { fill: #ecfdf5; stroke: #34d399; stroke-width: 1.6; rx: 14; }
+      .processBlue { fill: #eff6ff; stroke: #60a5fa; stroke-width: 1.6; rx: 14; }
+      .metricLine { fill: none; stroke: #7b8ba3; stroke-width: 2; stroke-dasharray: 6 8; }
+      .controlLine { fill: none; stroke: #f59e0b; stroke-width: 4; marker-end: url(#arrowAmber); }
+      .blueLine { fill: none; stroke: #2563eb; stroke-width: 3.2; marker-end: url(#arrowBlue); }
+      .redLine { fill: none; stroke: #dc2626; stroke-width: 2.4; stroke-dasharray: 8 8; marker-end: url(#arrowRed); }
+      .divider { stroke: #dbe6f3; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="900"/>
+  <rect x="0" y="0" width="1600" height="900" fill="url(#grid)" opacity="0.55"/>
+
+  <text x="80" y="62" class="title">图 1：预想中的 KV 状态机完整工作流</text>
+  <text x="82" y="94" class="subtitle">Monitor 监控四个节点，触发某个节点内部状态机，再由状态转换带出控制面和 KV 数据面动作</text>
+
+  <rect x="520" y="78" width="560" height="134" rx="26" fill="url(#monitorGrad)" filter="url(#softShadow)"/>
+  <text x="565" y="126" class="whiteLabel">Monitor / Controller</text>
+  <text x="565" y="160" class="whiteSmall">监控指标：Prefill SLO、Decode SLO、queue、running reqs、KV usage、网络带宽</text>
+  <text x="565" y="186" class="whiteSmall">输出动作：选择 Source Decode 节点，触发 D→P 状态机转换</text>
+
+  <g opacity="0.9">
+    <path class="metricLine" d="M205 248 C310 145 430 137 520 135"/>
+    <path class="metricLine" d="M530 248 C590 185 630 168 700 212"/>
+    <path class="metricLine" d="M910 248 C900 206 912 190 890 212"/>
+    <path class="metricLine" d="M1205 248 C1135 164 1084 152 1080 145"/>
+  </g>
+
+  <path class="controlLine" d="M800 212 L800 282"/>
+  <text x="824" y="256" class="chip" fill="#92400e">触发 D→P</text>
+
+  <rect class="node" x="70" y="248" width="270" height="160"/>
+  <text x="98" y="286" class="label">Node 0</text>
+  <text x="98" y="314" class="body">Role: Prefill</text>
+  <line class="divider" x1="98" y1="330" x2="312" y2="330"/>
+  <text x="98" y="358" class="small">Prefill SLO / queue</text>
+  <text x="98" y="382" class="small">KV usage / bandwidth</text>
+
+  <rect class="node" x="390" y="248" width="270" height="160"/>
+  <text x="418" y="286" class="label">Node 1</text>
+  <text x="418" y="314" class="body">Role: Prefill</text>
+  <line class="divider" x1="418" y1="330" x2="632" y2="330"/>
+  <text x="418" y="358" class="small">Prefill SLO / queue</text>
+  <text x="418" y="382" class="small">KV usage / bandwidth</text>
+
+  <rect class="nodeSelected" x="710" y="238" width="370" height="180"/>
+  <text x="740" y="278" class="label">Node 2：Source Decode</text>
+  <text x="740" y="306" class="body">内部组件：KV Flip StateMachine</text>
+  <line class="divider" x1="740" y1="324" x2="1040" y2="324"/>
+  <text x="740" y="354" class="small">当前状态：SAFE</text>
+  <text x="740" y="378" class="small">接收 Monitor 触发，进入 PREPARING</text>
+  <text x="740" y="402" class="small">后续负责导出 manifest 和发送 KV pages</text>
+
+  <rect class="node" x="1200" y="248" width="270" height="160"/>
+  <text x="1228" y="286" class="label">Node 3</text>
+  <text x="1228" y="314" class="body">Role: Decode Target</text>
+  <line class="divider" x1="1228" y1="330" x2="1442" y2="330"/>
+  <text x="1228" y="358" class="small">Decode SLO / running reqs</text>
+  <text x="1228" y="382" class="small">可接管迁移请求</text>
+
+  <path class="blueLine" d="M895 418 L895 472"/>
+
+  <rect class="lane" x="80" y="470" width="1440" height="350"/>
+  <text x="122" y="518" class="label">Node 2 内部状态机与迁移流程</text>
+  <text x="122" y="548" class="subtitle">状态转换不是单独发生，而是每个状态会驱动对应的控制动作和 KV 迁移动作</text>
+
+  <g>
+    <rect class="processBlue" x="135" y="586" width="160" height="62"/>
+    <text x="176" y="623" class="state">SAFE</text>
+    <path class="blueLine" d="M295 617 L360 617"/>
+
+    <rect class="processBlue" x="360" y="586" width="190" height="62"/>
+    <text x="397" y="612" class="state">PREPARING</text>
+    <text x="394" y="636" class="small">暂停新请求</text>
+    <path class="blueLine" d="M550 617 L615 617"/>
+
+    <rect class="processBlue" x="615" y="586" width="190" height="62"/>
+    <text x="658" y="612" class="state">MIGRATING</text>
+    <text x="652" y="636" class="small">迁移 active KV</text>
+    <path class="blueLine" d="M805 617 L870 617"/>
+
+    <rect class="processBlue" x="870" y="586" width="180" height="62"/>
+    <text x="916" y="612" class="state">FLIPPING</text>
+    <text x="908" y="636" class="small">切换运行角色</text>
+    <path class="blueLine" d="M1050 617 L1115 617"/>
+
+    <rect class="processGreen" x="1115" y="586" width="210" height="62"/>
+    <text x="1156" y="612" class="state">SAFE(新角色)</text>
+    <text x="1168" y="636" class="small">Decode → Prefill</text>
+  </g>
+
+  <g>
+    <rect class="process" x="165" y="700" width="210" height="78"/>
+    <text x="190" y="730" class="label">PREPARING 流程</text>
+    <text x="190" y="756" class="small">Router drain source</text>
+    <text x="190" y="776" class="small">Admission pause</text>
+
+    <path class="blueLine" d="M375 739 L425 739"/>
+    <rect class="process" x="425" y="700" width="270" height="78"/>
+    <text x="450" y="730" class="label">Source 侧</text>
+    <text x="450" y="756" class="small">导出 active request manifest</text>
+    <text x="450" y="776" class="small">读取 KV pages + metadata</text>
+
+    <path class="blueLine" d="M695 739 L745 739"/>
+    <rect class="process" x="745" y="700" width="250" height="78"/>
+    <text x="770" y="730" class="label">KV Backend</text>
+    <text x="770" y="756" class="small">Mooncake / NIXL / Fake</text>
+    <text x="770" y="776" class="small">发送 KV pages</text>
+
+    <path class="blueLine" d="M995 739 L1045 739"/>
+    <rect class="process" x="1045" y="700" width="300" height="78"/>
+    <text x="1070" y="730" class="label">Target 侧</text>
+    <text x="1070" y="756" class="small">prealloc KV slots + 回传 metadata</text>
+    <text x="1070" y="776" class="small">adopt request 继续 decode</text>
+  </g>
+
+  <path class="redLine" d="M1325 617 C1460 606 1470 790 1352 790 L230 790 C150 790 140 655 180 650"/>
+  <text x="1175" y="804" class="small" fill="#b91c1c">失败 / 超时 / abort：回滚到 SAFE</text>
+</svg>

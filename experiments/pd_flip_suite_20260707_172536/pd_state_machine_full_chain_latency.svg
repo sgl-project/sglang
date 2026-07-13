@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="940" viewBox="0 0 1800 940">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:"Microsoft YaHei","Noto Sans CJK SC",Arial,sans-serif;fill:#20242a}.title{font-size:34px;font-weight:700}.sub{font-size:18px;fill:#525866}.box-title{font-size:18px;font-weight:700}.lat{font-size:22px;font-weight:700}.detail{font-size:13px;fill:#525866}.small{font-size:14px;fill:#525866}.arrow{stroke:#6d7785;stroke-width:2.2;fill:none;marker-end:url(#arrow)}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#6d7785"/></marker></defs>
+<text x="70" y="62" class="title">PD 状态机 D→P 全链路延迟</text>
+<text x="70" y="96" class="sub">数据口径：03_stream_false_two_phase；source=node2, target=node3；manifest_count=2；total=7.414s；controller migration=0.603s；KV transfer≈0.556s</text>
+<path class="arrow" d="M326,215.0 L350,215.0"/>
+<path class="arrow" d="M616,215.0 L640,215.0"/>
+<path class="arrow" d="M906,215.0 L930,215.0"/>
+<path class="arrow" d="M1196,215.0 L1220,215.0"/>
+<path class="arrow" d="M1486,215.0 L1510,215.0"/>
+<path class="arrow" d="M1645.0,270 C1645.0,340 1645.0,310 1645.0,378"/>
+<path class="arrow" d="M1514,435.0 L1490,435.0"/>
+<path class="arrow" d="M1224,435.0 L1200,435.0"/>
+<path class="arrow" d="M934,435.0 L910,435.0"/>
+<path class="arrow" d="M644,435.0 L620,435.0"/>
+<path class="arrow" d="M354,435.0 L330,435.0"/>
+<rect x="70" y="170" width="250" height="90" rx="8" fill="#f4f7fb" stroke="#3569b7" stroke-width="2"/>
+<text x="86" y="198" class="box-title">1. router 标记 source draining</text>
+<text x="86" y="228" class="lat" fill="#3569b7">0.40 ms</text>
+<text x="86" y="250" class="detail">router /worker/drain</text>
+<rect x="360" y="170" width="250" height="90" rx="8" fill="#f8f4ec" stroke="#9a6b19" stroke-width="2"/>
+<text x="376" y="198" class="box-title">2. 暂停 source admission</text>
+<text x="376" y="228" class="lat" fill="#9a6b19">7.11 ms</text>
+<text x="376" y="250" class="detail">source /runtime_role/admission</text>
+<rect x="650" y="170" width="250" height="90" rx="8" fill="#eef7f1" stroke="#2f7d58" stroke-width="2"/>
+<text x="666" y="198" class="box-title">3. source/start 扫描 + manifest</text>
+<text x="666" y="228" class="lat" fill="#2f7d58">29.46 ms</text>
+<text x="666" y="250" class="detail">scan 0.002 ms; build 0.123 ms; entries 9.08 ms; co</text>
+<rect x="940" y="170" width="250" height="90" rx="8" fill="#f5f1fb" stroke="#7655a6" stroke-width="2"/>
+<text x="956" y="198" class="box-title">4. target/prepare receiver</text>
+<text x="956" y="228" class="lat" fill="#7655a6">17.05 ms</text>
+<text x="956" y="250" class="detail">prepare 0.279 ms; receiver init max 2.82 ms</text>
+<rect x="1230" y="170" width="250" height="90" rx="8" fill="#fff7e8" stroke="#b86b00" stroke-width="2"/>
+<text x="1246" y="198" class="box-title">5. KV 传输到 target held</text>
+<text x="1246" y="228" class="lat" fill="#b86b00">556.38 ms</text>
+<text x="1246" y="250" class="detail">target 556.38 ms; source 544.01 ms; controller mig</text>
+<rect x="1520" y="170" width="250" height="90" rx="8" fill="#eef6f7" stroke="#237884" stroke-width="2"/>
+<text x="1536" y="198" class="box-title">6. target commit/adopt</text>
+<text x="1536" y="228" class="lat" fill="#237884">10.47 ms</text>
+<text x="1536" y="250" class="detail">target held-&gt;adopt max 10.50 ms</text>
+<rect x="1520" y="390" width="250" height="90" rx="8" fill="#f4f7fb" stroke="#3569b7" stroke-width="2"/>
+<text x="1536" y="418" class="box-title">7. source finish/release</text>
+<text x="1536" y="448" class="lat" fill="#3569b7">6.51 ms</text>
+<text x="1536" y="470" class="detail">source transferred-&gt;finish max 25.25 ms</text>
+<rect x="1230" y="390" width="250" height="90" rx="8" fill="#fff1f1" stroke="#ba3d45" stroke-width="2"/>
+<text x="1246" y="418" class="box-title">8. 等待 source idle</text>
+<text x="1246" y="448" class="lat" fill="#ba3d45">6.78 s</text>
+<text x="1246" y="470" class="detail">包含轮询 sleep，是总耗时大头</text>
+<rect x="940" y="390" width="250" height="90" rx="8" fill="#eef7f1" stroke="#2f7d58" stroke-width="2"/>
+<text x="956" y="418" class="box-title">9. decode -&gt; prefill</text>
+<text x="956" y="448" class="lat" fill="#2f7d58">2.11 ms</text>
+<text x="956" y="470" class="detail">/runtime_role/set</text>
+<rect x="650" y="390" width="250" height="90" rx="8" fill="#f8f4ec" stroke="#9a6b19" stroke-width="2"/>
+<text x="666" y="418" class="box-title">10. router 刷新 role</text>
+<text x="666" y="448" class="lat" fill="#9a6b19">0.50 ms</text>
+<text x="666" y="470" class="detail">router role=prefill</text>
+<rect x="360" y="390" width="250" height="90" rx="8" fill="#f5f1fb" stroke="#7655a6" stroke-width="2"/>
+<text x="376" y="418" class="box-title">11. 恢复 admission</text>
+<text x="376" y="448" class="lat" fill="#7655a6">1.78 ms</text>
+<text x="376" y="470" class="detail">paused=false</text>
+<rect x="70" y="390" width="250" height="90" rx="8" fill="#eef6f7" stroke="#237884" stroke-width="2"/>
+<text x="86" y="418" class="box-title">12. router undrain</text>
+<text x="86" y="448" class="lat" fill="#237884">0.42 ms</text>
+<text x="86" y="470" class="detail">draining=false</text>
+<rect x="70" y="640" width="520" height="180" rx="8" fill="#f7f9fb" stroke="#c7d0db"/>
+<text x="95" y="675" class="box-title">关键耗时结论</text>
+<text x="105" y="708" class="small">• 总 PD flip：7.414s</text>
+<text x="105" y="732" class="small">• KV 迁移本体：约 556.38ms</text>
+<text x="105" y="756" class="small">• controller migration_seconds：602.77ms</text>
+<text x="105" y="780" class="small">• 最大耗时：wait source idle 约 6.78s</text>
+<text x="105" y="804" class="small">• role set + router refresh + resume/undrain：约 4.81ms</text>
+<rect x="630" y="640" width="1090" height="180" rx="8" fill="#fffaf2" stroke="#dfc58f"/>
+<text x="655" y="675" class="box-title">读图说明</text>
+<text x="665" y="708" class="small">• 方框数字是阶段代表延迟；HTTP action 用 controller elapsed，KV/held/finish 用 worker timing_debug 推导。</text>
+<text x="665" y="738" class="small">• wait source idle 不是单个 HTTP 请求耗时，而是 commit 后等待 source 彻底 idle 的阶段耗时，包含轮询间隔。</text>
+<text x="665" y="768" class="small">• 10 号重跑提供完整 worker sampler 对齐，但那次 manifest_count=0；这里用 03 号真实 KV 迁移样本画 KV 阶段。</text>
+</svg>

@@ -1,0 +1,34 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+{
+  "avg_tpot_s": 0.012941653576721762,
+  "avg_ttft_s": 0.49810619961332914,
+  "combined_attainment": 0.83,
+  "completed": 83,
+  "errors": 17,
+  "p95_tpot_s": 0.016340020992866477,
+  "p95_ttft_s": 1.3099116463330576,
+  "requests": 100,
+  "tpot_attainment": 0.83,
+  "tpot_slo_seconds": 0.02,
+  "ttft_attainment": 0.83,
+  "ttft_slo_seconds": 8.0,
+  "wall_seconds": 608.6377421179786
+}

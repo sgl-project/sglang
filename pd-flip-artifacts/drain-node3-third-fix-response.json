@@ -1,0 +1,1 @@
+{"success":true,"message":"worker http://192.168.0.41:31000 is draining","worker":{"worker_id":"http://192.168.0.41:31000","url":"http://192.168.0.41:31000","role":"decode","draining":true,"active_load":0,"bootstrap_port":null}}

@@ -38,6 +38,7 @@ def load_scheduler_methods():
         "_pd_flip_migration_timing_debug",
         "_pd_flip_migration_index_debug",
         "_pd_flip_json_safe_timing",
+        "_pd_flip_rollover_blockers",
         "_pd_flip_can_rollover_session",
         "_pd_flip_archive_rollover_session",
     }
@@ -52,6 +53,12 @@ def load_scheduler_methods():
             ast.ImportFrom(
                 module="__future__", names=[ast.alias("annotations")], level=0
             ),
+            *[
+                node
+                for node in tree.body
+                if isinstance(node, ast.Import)
+                and any(alias.name == "json" for alias in node.names)
+            ],
             ast.ClassDef(
                 name="Scheduler",
                 bases=[],
@@ -80,7 +87,6 @@ def load_scheduler_methods():
     namespace = {
         "PDFlipMigrationReqOutput": Output,
         "DisaggregationMode": ForbiddenMode,
-        "json": json,
         "array": array,
         "time": __import__("time"),
     }
@@ -90,6 +96,18 @@ def load_scheduler_methods():
 
 Scheduler = load_scheduler_methods()
 Req = SimpleNamespace
+
+
+def test_delta_manifest_signature_is_stable_and_canonical():
+    left = [{"rid": "b", "c1": 12, "nested": {"z": 2, "a": 1}}]
+    right = [{"nested": {"a": 1, "z": 2}, "c1": 12, "rid": "b"}]
+
+    assert Scheduler._pd_flip_delta_manifest_signature(left) == (
+        Scheduler._pd_flip_delta_manifest_signature(right)
+    )
+    assert Scheduler._pd_flip_delta_manifest_signature(left) == (
+        '[{"c1":12,"nested":{"a":1,"z":2},"rid":"b"}]'
+    )
 
 
 class ReconciliationClient:
@@ -441,6 +459,116 @@ def test_worker_rollover_predicate_defaults_missing_entry_fields_to_unsafe():
     assert not Scheduler._pd_flip_can_rollover_session(target, "target")
 
 
+def test_worker_rollover_blockers_identify_source_entry_flag():
+    session = worker_with_session("source", "source_released").pd_flip_migration_session
+    session["source_entries"] = {
+        "r0": {
+            "metadata_freed": True,
+            "transferred": False,
+            "final_owner": "target",
+        }
+    }
+
+    assert Scheduler._pd_flip_rollover_blockers(session, "source") == [
+        {"code": "source_entry_not_transferred", "rid": "r0"}
+    ]
+
+
+def test_worker_rollover_blockers_empty_for_safe_source_entry():
+    session = worker_with_session("source", "source_released").pd_flip_migration_session
+    session["source_entries"] = {
+        "r0": {
+            "metadata_freed": True,
+            "transferred": True,
+            "final_owner": "target",
+            "delta": {
+                "noop": False,
+                "transferred": True,
+                "metadata_freed": True,
+            },
+        }
+    }
+
+    assert Scheduler._pd_flip_rollover_blockers(session, "source") == []
+    assert Scheduler._pd_flip_can_rollover_session(session, "source")
+
+
+def test_worker_rollover_blockers_truncate_with_omitted_count():
+    worker = worker_with_session("source", "source_released")
+    session = worker.pd_flip_migration_session
+    session["source_entries"] = {
+        f"r{index:02d}": {
+            "metadata_freed": True,
+            "transferred": False,
+            "final_owner": "target",
+        }
+        for index in range(40)
+    }
+
+    blockers = Scheduler._pd_flip_rollover_blockers(session, "source")
+
+    assert len(blockers) == 33
+    assert blockers[:32] == [
+        {"code": "source_entry_not_transferred", "rid": f"r{index:02d}"}
+        for index in range(32)
+    ]
+    assert blockers[32] == {
+        "code": "rollover_blockers_truncated",
+        "omitted": 8,
+    }
+    assert not Scheduler._pd_flip_can_rollover_session(session, "source")
+
+    output = Scheduler.start_pd_flip_migration_source(
+        worker,
+        Req(session_id="other", rids=[], target_url=None, include_waiting=False),
+    )
+
+    assert output.status["rollover_blockers"] == blockers
+    assert '"code":"rollover_blockers_truncated","omitted":8' in output.message
+
+
+def test_worker_rollover_blockers_identify_source_delta_metadata_flag():
+    session = worker_with_session("source", "source_released").pd_flip_migration_session
+    session["source_entries"] = {
+        "r0": {
+            "metadata_freed": True,
+            "transferred": True,
+            "final_owner": "target",
+            "delta": {
+                "noop": False,
+                "transferred": True,
+                "metadata_freed": False,
+            },
+        }
+    }
+
+    assert Scheduler._pd_flip_rollover_blockers(session, "source") == [
+        {"code": "source_delta_metadata_not_freed", "rid": "r0"}
+    ]
+
+
+def test_worker_conflict_response_exposes_rollover_blockers():
+    worker = worker_with_session("source", "source_released")
+    worker.pd_flip_migration_session["source_entries"] = {
+        "r0": {
+            "metadata_freed": True,
+            "transferred": False,
+            "final_owner": "target",
+        }
+    }
+
+    output = Scheduler.start_pd_flip_migration_source(
+        worker,
+        Req(session_id="other", rids=["r0"], target_url=None, include_waiting=False),
+    )
+
+    assert not output.success
+    assert "source_entry_not_transferred" in output.message
+    assert output.status["rollover_blockers"] == [
+        {"code": "source_entry_not_transferred", "rid": "r0"}
+    ]
+
+
 def test_worker_repeated_target_prepare_returns_existing_session_without_allocating():
     worker = worker_with_session("target", "ready_to_activate")
 
@@ -648,6 +776,10 @@ def test_worker_status_exports_real_request_measurement_fields():
         "final_owner": "target",
         "output_boundary": 5,
         "rollback_reason": None,
+        "fallback_reason": None,
+        "fallback_attempted": False,
+        "fallback_source_bytes": None,
+        "fallback_duration_seconds": None,
     }
 
 

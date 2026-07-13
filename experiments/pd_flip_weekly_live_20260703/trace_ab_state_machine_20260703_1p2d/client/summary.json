@@ -1,0 +1,15 @@
+{
+  "avg_tpot_s": 0.012941653576721762,
+  "avg_ttft_s": 0.49810619961332914,
+  "combined_attainment": 0.83,
+  "completed": 83,
+  "errors": 17,
+  "p95_tpot_s": 0.016340020992866477,
+  "p95_ttft_s": 1.3099116463330576,
+  "requests": 100,
+  "tpot_attainment": 0.83,
+  "tpot_slo_seconds": 0.02,
+  "ttft_attainment": 0.83,
+  "ttft_slo_seconds": 8.0,
+  "wall_seconds": 608.6377421179786
+}

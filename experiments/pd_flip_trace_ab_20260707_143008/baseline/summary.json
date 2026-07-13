@@ -1,0 +1,22 @@
+{
+  "all_attainment": 0.965,
+  "all_met_count": 193,
+  "completed_count": 200,
+  "error_count": 0,
+  "ledger_path": null,
+  "mode": "baseline",
+  "request_count": 200,
+  "router_url": "http://127.0.0.1:18001",
+  "run_elapsed_s": 200.09722970495932,
+  "run_started_wall": 1783406952.7206013,
+  "tpot_avg_attainment": 1.0,
+  "tpot_avg_met_count": 200,
+  "tpot_good_intervals": 41996,
+  "tpot_interval_attainment": 0.9995953633399186,
+  "tpot_p95_attainment": 1.0,
+  "tpot_p95_met_count": 200,
+  "tpot_total_intervals": 42013,
+  "trace_requests": 200,
+  "ttft_attainment": 0.965,
+  "ttft_met_count": 193
+}

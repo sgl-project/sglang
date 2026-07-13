@@ -1,0 +1,25 @@
+[
+  {
+    "all_attainment": 0.05,
+    "all_met_count": 2,
+    "completed_count": 40,
+    "error_count": 0,
+    "experiment": "01_1p3d_to_2p2d_two_phase",
+    "ledger_path": "/root/sglang/experiments/pd_flip_1p3d_to_2p2d_20260708_124626/01_1p3d_to_2p2d_two_phase/one_p_three_d_state_machine/trace_slo_ledger.jsonl",
+    "mode": "one_p_three_d_state_machine",
+    "request_count": 40,
+    "router_url": "http://127.0.0.1:18001",
+    "run_elapsed_s": 60.27117090404499,
+    "run_started_wall": 1783486441.1836421,
+    "tpot_avg_attainment": 1.0,
+    "tpot_avg_met_count": 40,
+    "tpot_good_intervals": 17171,
+    "tpot_interval_attainment": 0.9984881083909984,
+    "tpot_p95_attainment": 1.0,
+    "tpot_p95_met_count": 40,
+    "tpot_total_intervals": 17197,
+    "trace_requests": 40,
+    "ttft_attainment": 0.05,
+    "ttft_met_count": 2
+  }
+]

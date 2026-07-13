@@ -1,0 +1,16 @@
+lingjun-101
+1783930073746238848
+2026-07-13T16:07:53,746699613+08:00
+Reference ID    : 64643D58 (100.100.61.88)
+Stratum         : 2
+Ref time (UTC)  : Mon Jul 13 08:01:05 2026
+System time     : 0.000111622 seconds fast of NTP time
+Last offset     : -0.000010290 seconds
+RMS offset      : 0.000052245 seconds
+Frequency       : 4.572 ppm slow
+Residual freq   : +0.000 ppm
+Skew            : 0.005 ppm
+Root delay      : 0.003358602 seconds
+Root dispersion : 0.010568830 seconds
+Update interval : 1043.1 seconds
+Leap status     : Normal

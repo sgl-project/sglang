@@ -12,6 +12,8 @@ from typing import (
     Tuple,
 )
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -303,6 +305,75 @@ class SchedulerInvariantChecker:
             )
 
     def _report_leak(self, pool_name: str, token_msg: str):
+        if pool_name == "pool":
+            token_msg += (
+                f"\nallocator_class={type(self.token_to_kv_pool_allocator).__name__}, "
+                f"tree_cache_class={type(self.tree_cache).__name__}"
+            )
+            free_parts = []
+            seen_allocators = set()
+            pending_allocators = [self.token_to_kv_pool_allocator]
+            while pending_allocators:
+                allocator = pending_allocators.pop()
+                if id(allocator) in seen_allocators:
+                    continue
+                seen_allocators.add(id(allocator))
+                for name in ("free_pages", "release_pages"):
+                    part = getattr(allocator, name, None)
+                    if isinstance(part, torch.Tensor) and part.numel() > 0:
+                        free_parts.append(part.flatten())
+                for name in (
+                    "full_attn_allocator",
+                    "logical_attn_allocator",
+                    "allocator",
+                ):
+                    child = getattr(allocator, name, None)
+                    if child is not None:
+                        pending_allocators.append(child)
+            if free_parts:
+                free_indices = torch.cat(free_parts)
+                unique, counts = torch.unique(free_indices, return_counts=True)
+                token_msg += (
+                    f"\nallocator_free_entries={free_indices.numel()}, "
+                    f"allocator_free_unique={unique.numel()}, "
+                    f"allocator_free_min={int(unique.min().item())}, "
+                    f"allocator_free_max={int(unique.max().item())}"
+                )
+                duplicate = unique[counts > 1]
+                if duplicate.numel() > 0:
+                    token_msg += (
+                        f"\nallocator_duplicate_free_entries="
+                        f"{int((counts[counts > 1] - 1).sum().item())}, "
+                        f"duplicate_index_sample={duplicate[:16].cpu().tolist()}"
+                    )
+                root = getattr(self.tree_cache, "root_node", None)
+                tree_parts = []
+                pending_nodes = [root] if root is not None else []
+                while pending_nodes:
+                    node = pending_nodes.pop()
+                    value = getattr(node, "value", None)
+                    if isinstance(value, torch.Tensor) and value.numel() > 0:
+                        tree_parts.append(value.flatten())
+                    pending_nodes.extend(getattr(node, "children", {}).values())
+                if tree_parts:
+                    tree_values = torch.cat(tree_parts)
+                    tree_indices = torch.unique(tree_values)
+                    token_msg += (
+                        f"\ntree_value_entries={tree_values.numel()}, "
+                        f"tree_value_unique={tree_indices.numel()}, "
+                        f"tree_value_min={int(tree_indices.min().item())}, "
+                        f"tree_value_max={int(tree_indices.max().item())}"
+                    )
+                    free_tree_overlap = tree_indices[
+                        torch.isin(tree_indices, unique)
+                    ]
+                    if free_tree_overlap.numel() > 0:
+                        token_msg += (
+                            f"\nallocator_tree_overlap="
+                            f"{free_tree_overlap.numel()}, "
+                            f"overlap_index_sample="
+                            f"{free_tree_overlap[:16].cpu().tolist()}"
+                        )
         msg = f"{pool_name} memory leak detected! {token_msg}"
         raise_error_or_warn(
             self,

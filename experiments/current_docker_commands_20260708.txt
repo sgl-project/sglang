@@ -1,0 +1,138 @@
+﻿
+===== cloud-099 =====
+host=lingjun-099
+--- docker ps -a ---
+NAME=ptrain2_8b_bare1k_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_8b_bare1k_parambench.npz --label 8b_bare1k_parambench --out _probe_8b_bare1k_parambench.json"
+NAME=ptrain2_8b_bare1k_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_8b_bare1k_a3test.npz --label 8b_bare1k_a3test --out _probe_8b_bare1k_a3test.json"
+NAME=ptrain2_32b_bare1k_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_32b_bare1k_parambench.npz --label 32b_bare1k_parambench --out _probe_32b_bare1k_parambench.json"
+NAME=ptrain2_32b_bare1k_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_32b_bare1k_a3test.npz --label 32b_bare1k_a3test --out _probe_32b_bare1k_a3test.json"
+NAME=ptrain2_14b_bare1k_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_14b_bare1k_parambench.npz --label 14b_bare1k_parambench --out _probe_14b_bare1k_parambench.json"
+NAME=ptrain2_14b_bare1k_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_14b_bare1k_a3test.npz --label 14b_bare1k_a3test --out _probe_14b_bare1k_a3test.json"
+NAME=ptrain_8b_richer_sft_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 11 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_8b_richer_sft_parambench.npz --label 8b_richer_sft_parambench --out _probe_8b_richer_sft_parambench.json"
+NAME=ptrain_8b_richer_sft_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 11 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_8b_richer_sft_a3test.npz --label 8b_richer_sft_a3test --out _probe_8b_richer_sft_a3test.json"
+NAME=ptrain_32b_richer_sft_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 11 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_32b_richer_sft_parambench.npz --label 32b_richer_sft_parambench --out _probe_32b_richer_sft_parambench.json"
+NAME=ptrain_32b_richer_sft_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 11 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_32b_richer_sft_a3test.npz --label 32b_richer_sft_a3test --out _probe_32b_richer_sft_a3test.json"
+NAME=ptrain_14b_richer_sft_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 11 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_14b_richer_sft_parambench.npz --label 14b_richer_sft_parambench --out _probe_14b_richer_sft_parambench.json"
+NAME=ptrain_14b_richer_sft_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 11 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_pb_probe_train_v2.py --npz _feats_14b_richer_sft_a3test.npz --label 14b_richer_sft_a3test --out _probe_14b_richer_sft_a3test.json"
+NAME=merge_32b | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 13 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_merge_lora.py /data/aaai099/models/Qwen3-32B /data/aaai099/adapters/32b_richer2 /data/aaai099/work/merged_32b_richer2"
+NAME=merge_14b | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 13 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_merge_lora.py /data/aaai099/models/Qwen3-14B /data/aaai099/adapters/14b_richer /data/aaai099/work/merged_14b_richer"
+NAME=merge_8b | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 13 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai099/work/_merge_lora.py /data/aaai099/models/Qwen3-8B /data/aaai099/adapters/8b_richer099 /data/aaai099/work/merged_8b_richer099"
+NAME=sglang_shouq | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (137) 12 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=eval_c3onbox | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 2 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc '\npip install -q peft 2>&1 | tail -1\ncd /work/scripts\nCUDA_VISIBLE_DEVICES=1 python3 sft_eval_rich_v0.py   --base /work/models/Qwen3-8B   --adapter /work/runs/8b_richer099 --merge   --label c3_onbox_2726   --eval-file /work/data/a3_test.jsonl   --max-new-tokens 256 --gpu 0   --out /work/eval_emceiling/_c3_onbox_2726.json > /work/eval_emceiling/_eval_c3onbox.log 2>&1\necho EXIT=$? >> /work/eval_emceiling/_eval_c3onbox.log\n'"
+NAME=eval_emceiling | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 2 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc '\npip install -q peft 2>&1 | tail -1\ncd /work/scripts\nCUDA_VISIBLE_DEVICES=0 python3 sft_eval_rich_v0.py   --base /work/models/Qwen3-8B   --adapter /work/runs/8b_emceiling --merge   --label emceiling_9389   --eval-file /work/data/a3_test.jsonl   --max-new-tokens 256 --gpu 0   --out /work/eval_emceiling/_emceiling_9389.json > /work/eval_emceiling/_eval_emceiling.log 2>&1\necho EXIT=$? >> /work/eval_emceiling/_eval_emceiling.log\n'"
+NAME=emceiling_train | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 2 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc '\npip install -q peft 2>&1 | tail -1\ncd /work\ntorchrun --standalone --nproc_per_node=8 scripts/train_sft_plain.py   --base /work/models/Qwen3-8B   --train /work/data/a3_emceiling_onbox.jsonl   --out /work/runs/8b_emceiling   --target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj   --lora-r 32 --lora-alpha 64 --epochs 3 --lr 5e-4   --bsz 1 --accum 8 --device-map single --seed 20260622 --ddp-find-unused   > /work/runs/_emceiling_train.log 2>&1\necho EXIT=$? >> /work/runs/_emceiling_train.log\n'"
+NAME=hope_sglang_dst2 | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (137) 5 days ago | CMD="sleep infinity"
+NAME=aaai099 | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (137) 8 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=doca | IMAGE=nvcr.io/nvidia/doca/doca:devel-cuda13.0.0-3.4.0-devel-host | STATUS=Exited (137) 8 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=vllm_shouq | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (137) 5 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+--- images likely relevant ---
+yanshu_mlu_img:v1 38b569a119dd 615MB
+epic-agentic:dev 9bd2949729fd 59.6GB
+wyh_doca:latest 8cec943cc8e3 14.9GB
+shouq_sglang:peft c61b42cdff29 26.8GB
+wyh_mooncake:latest 5f6b7dbdec94 1.15GB
+sglang-pd-switch:dev b8fdd23aa507 37.5GB
+sglang-pd-switch:tianciJ b8fdd23aa507 37.5GB
+nvcr.io/nvidia/doca/doca:devel-cuda13.0.0-3.4.0-devel-host c08dc8b777f6 14.7GB
+sglang-mooncake:wangh 7e67d56e8ef6 36.4GB
+sglang-mooncake:time-stats-check 369720fb63f6 36.4GB
+shouq_sglang:v0.5.11_cu130 c5cd97921ffe 26.8GB
+fe_rnic:latest 4f59b9196bf5 11.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04-lj cf9eb2a6d799 2.97GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:test2 7e8168695409 3.03GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:test1 6d3a21c00514 2.99GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:test 81c4526bc231 2.98GB
+shouq_vllm:v0.11.0 f80d0c075a2a 37GB
+crpi-ltzh4vhxjp2rrfn8.cn-shanghai.personal.cr.aliyuncs.com/mingxli/cuda:13.0.2-devel-ubuntu24.04 b3b006c11330 7.39GB
+nvcr.io/nvidia/doca/doca:3.1.0-devel-cuda12.8.0-host 650945a7ce17 17.4GB
+nvidia/cuda:12.9.1-base-ubuntu24.04 7fd106f3a608 404MB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04 9b370e88b99a 2.97GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/fdb:7.3.63-ubuntu22.04 ba0a26c7a3f7 471MB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/clickhouse:25.3.1.2703-ubuntu22.04 a335d4622e51 677MB
+nvidia/cuda:12.8.1-base-ubuntu22.04 8ab6c9ffd563 292MB
+===== cloud-100 =====
+host=lingjun-100
+--- docker ps -a ---
+NAME=sglang_shouq | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (137) 12 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=model_dl | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 13 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc 'pip install -q hf_transfer 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1;     echo START $(date);     echo \"== Qwen2.5-14B ==\"; hf download Qwen/Qwen2.5-14B-Instruct --local-dir /models/Qwen2.5-14B-Instruct 2>&1 | tail -2;     echo \"== Llama-3.1-8B (ungated mirror) ==\"; hf download NousResearch/Meta-Llama-3.1-8B-Instruct --local-dir /models/Meta-Llama-3.1-8B-Instruct 2>&1 | tail -2;     echo DONE $(date)'"
+NAME=hope_3fs_client | IMAGE=ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04-lj | STATUS=Exited (137) 8 days ago | CMD="tail -f /dev/null"
+NAME=my_vllm | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (255) 2 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=hope_vllm_v0.11.0 | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (143) 4 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=hope_sglang_v0.5.11_cu130 | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (143) 4 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=vllm_shouq | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (137) 4 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+--- images likely relevant ---
+epic-agentic:dev 9bd2949729fd 59.6GB
+wyh_doca:latest 92ef38e1a39b 14.9GB
+wyh_mooncake:latest 7a390549c17c 1.15GB
+wyh_test:latest ea3bd5970300 15.1GB
+sglang-pd-switch:tianciJ b8fdd23aa507 37.5GB
+nvcr.io/nvidia/doca/doca:devel-cuda13.0.0-3.4.0-devel-host c08dc8b777f6 14.7GB
+shouq_sglang:v0.5.10-tcp-fix 3de3f70ee347 36.3GB
+shouq_sglang:mooncake_tcp fd2bfcd65875 36.3GB
+sglang-mooncake:wangh 9f49373c7ec3 36.4GB
+shouq_sglang:v0.5.11_cu130 c5cd97921ffe 26.8GB
+shouq_sglang:v0.5.10 fd508514a7df 36.2GB
+fe_rnic:latest 4f59b9196bf5 11.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04-lj c4a5bc205720 2.97GB
+shouq_vllm:v0.11.0 f80d0c075a2a 37GB
+crpi-ltzh4vhxjp2rrfn8.cn-shanghai.personal.cr.aliyuncs.com/mingxli/cuda:13.0.2-devel-ubuntu24.04 b3b006c11330 7.39GB
+nvcr.io/nvidia/doca/doca:3.1.0-devel-cuda12.8.0-host 650945a7ce17 17.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04 9b370e88b99a 2.97GB
+===== cloud-101 =====
+host=lingjun-101
+--- docker ps -a ---
+NAME=yanshu_bwa | IMAGE=crpi-ltzh4vhxjp2rrfn8.cn-shanghai.personal.cr.aliyuncs.com/mingxli/cuda:13.0.2-devel-ubuntu24.04 | STATUS=Up 5 minutes | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=simtest_shouq | IMAGE=ali_acs_sglang:v0.5.12.post1_cu130 | STATUS=Up 26 minutes | CMD="sleep infinity"
+NAME=aaai_probe | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (137) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=hope_sglang_3fs | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (137) 7 days ago | CMD="tail -f /dev/null"
+NAME=hope_sglang_v0.5.11_cu130 | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (255) 2 weeks ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+--- images likely relevant ---
+epic-agentic:dev 9bd2949729fd 59.6GB
+wyh_doca:3.4.0 09333a613eca 14.9GB
+ali_acs_sglang:v0.5.12.post1_cu130 d6c6b9c05065 27.4GB
+sglang-pd-switch:tianciJ b8fdd23aa507 37.5GB
+nvcr.io/nvidia/doca/doca:devel-cuda13.0.0-3.4.0-devel-host c08dc8b777f6 14.7GB
+sglang-mooncake:wangh 65240bab353d 36.4GB
+shouq_sglang:v0.5.11_cu130 c5cd97921ffe 26.8GB
+fe_rnic:latest 4f59b9196bf5 11.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04-lj 8e95282f3e0d 2.97GB
+shouq_vllm:v0.11.0 f80d0c075a2a 37GB
+crpi-ltzh4vhxjp2rrfn8.cn-shanghai.personal.cr.aliyuncs.com/mingxli/cuda:13.0.2-devel-ubuntu24.04 b3b006c11330 7.39GB
+nvcr.io/nvidia/doca/doca:3.1.0-devel-cuda12.8.0-host 650945a7ce17 17.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04 9b370e88b99a 2.97GB
+===== cloud-102 =====
+host=lingjun-102
+--- docker ps -a ---
+NAME=simtest_shouq | IMAGE=ali_acs_sglang:v0.5.12.post1_cu130 | STATUS=Up 26 minutes | CMD="sleep infinity"
+NAME=yanshu_bwa | IMAGE=crpi-ltzh4vhxjp2rrfn8.cn-shanghai.personal.cr.aliyuncs.com/mingxli/cuda:13.0.2-devel-ubuntu24.04 | STATUS=Up 41 minutes | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+NAME=ptrain2_inst2507_bare1k_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_inst2507_bare1k_parambench.npz --label inst2507_bare1k_parambench --out _probe_inst2507_bare1k_parambench.json"
+NAME=ptrain2_inst2507_bare1k_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_inst2507_bare1k_a3test.npz --label inst2507_bare1k_a3test --out _probe_inst2507_bare1k_a3test.json"
+NAME=ptrain2_30ba3b_bare1k_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_bare1k_parambench.npz --label 30ba3b_bare1k_parambench --out _probe_30ba3b_bare1k_parambench.json"
+NAME=ptrain2_30ba3b_bare1k_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 7 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_bare1k_a3test.npz --label 30ba3b_bare1k_a3test --out _probe_30ba3b_bare1k_a3test.json"
+NAME=ptrain_30ba3b_inst2507_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (1) 9 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_inst2507_parambench.npz --label 30ba3b_inst2507_parambench --out _probe_30ba3b_inst2507_parambench.json"
+NAME=ptrain_30ba3b_inst2507_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (1) 9 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_inst2507_a3test.npz --label 30ba3b_inst2507_a3test --out _probe_30ba3b_inst2507_a3test.json"
+NAME=ptrain_30ba3b_expert_sft_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 9 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_expert_sft_parambench.npz --label 30ba3b_expert_sft_parambench --out _probe_30ba3b_expert_sft_parambench.json"
+NAME=ptrain_30ba3b_expert_sft_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 9 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_expert_sft_a3test.npz --label 30ba3b_expert_sft_a3test --out _probe_30ba3b_expert_sft_a3test.json"
+NAME=ptrain_30ba3b_base_parambench | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (0) 9 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_base_parambench.npz --label 30ba3b_base_parambench --out _probe_30ba3b_base_parambench.json"
+NAME=ptrain_30ba3b_base_a3test | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (1) 9 hours ago | CMD="/opt/nvidia/nvidia_entrypoint.sh python3 /data/aaai_h20/work/_pb_probe_train_v2.py --npz _feats_30ba3b_base_a3test.npz --label 30ba3b_base_a3test --out _probe_30ba3b_base_a3test.json"
+NAME=rq1_80b | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 7 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc '\ncd /data/aaai_h20/work/rq3_scaling/scripts\npython sft_eval_rich_v0_noPeft.py --base /models/Qwen3-Next-80B-A3B-Instruct --label rq1_indomain_base_80b --eval-file /data/aaai_h20/work/rq3_scaling/data/a3_test.jsonl --max-new-tokens 256 --gpu 0 --device-map auto --out /data/aaai_h20/work/rq3_scaling/eval_out/_rq1_indomain_base_80b.json > /data/aaai_h20/work/rq3_scaling/logs/rq1_80b.log 2>&1\n'"
+NAME=rq1_30b | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 7 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc '\ncd /data/aaai_h20/work/rq3_scaling/scripts\npython sft_eval_rich_v0_noPeft.py --base /models/Qwen3-30B-A3B --label rq1_indomain_base_30b --eval-file /data/aaai_h20/work/rq3_scaling/data/a3_test.jsonl --max-new-tokens 256 --gpu 0 --device-map single --out /data/aaai_h20/work/rq3_scaling/eval_out/_rq1_indomain_base_30b.json > /data/aaai_h20/work/rq3_scaling/logs/rq1_30b.log 2>&1\n'"
+NAME=rq1_32b | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 7 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc '\ncd /data/aaai_h20/work/rq3_scaling/scripts\npython sft_eval_rich_v0_noPeft.py --base /models/Qwen3-32B --label rq1_indomain_base_32b --eval-file /data/aaai_h20/work/rq3_scaling/data/a3_test.jsonl --max-new-tokens 256 --gpu 0 --device-map single --out /data/aaai_h20/work/rq3_scaling/eval_out/_rq1_indomain_base_32b.json > /data/aaai_h20/work/rq3_scaling/logs/rq1_32b.log 2>&1\n'"
+NAME=rq3_80b | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 7 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc 'bash /data/aaai_h20/work/rq3_scaling/scripts/run_80b.sh > /data/aaai_h20/work/rq3_scaling/logs/train_80b.log 2>&1'"
+NAME=rq3_30b | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 7 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc 'bash /data/aaai_h20/work/rq3_scaling/scripts/run_30b.sh > /data/aaai_h20/work/rq3_scaling/logs/train_30b.log 2>&1'"
+NAME=rq3_32b | IMAGE=shouq_sglang:v0.5.11_cu130 | STATUS=Exited (0) 7 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh bash -lc 'bash /data/aaai_h20/work/rq3_scaling/scripts/run_32b.sh > /data/aaai_h20/work/rq3_scaling/logs/train_32b.log 2>&1'"
+NAME=aaai_exp | IMAGE=shouq_vllm:v0.11.0 | STATUS=Exited (137) 5 days ago | CMD="/opt/nvidia/nvidia_entrypoint.sh sleep infinity"
+--- images likely relevant ---
+yanshu_mlu_img:v1 38b569a119dd 615MB
+epic-agentic:dev 9bd2949729fd 59.6GB
+ali_acs_sglang:v0.5.12.post1_cu130 d6c6b9c05065 27.4GB
+sglang-pd-switch:tianciJ b8fdd23aa507 37.5GB
+nvcr.io/nvidia/doca/doca:devel-cuda13.0.0-3.4.0-devel-host c08dc8b777f6 14.7GB
+sglang-mooncake:wangh 379006820d7a 36.4GB
+shouq_sglang:v0.5.11_cu130 c5cd97921ffe 26.8GB
+fe_rnic:latest 4f59b9196bf5 11.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04-lj b28ffcc997f3 2.97GB
+shouq_vllm:v0.11.0 f80d0c075a2a 37GB
+crpi-ltzh4vhxjp2rrfn8.cn-shanghai.personal.cr.aliyuncs.com/mingxli/cuda:13.0.2-devel-ubuntu24.04 b3b006c11330 7.39GB
+nvcr.io/nvidia/doca/doca:3.1.0-devel-cuda12.8.0-host 650945a7ce17 17.4GB
+ac2-registry.cn-hangzhou.cr.aliyuncs.com/ac2/3fs:b71ffc55-fdb7.3.63-fuse3.16.2-ubuntu22.04 9b370e88b99a 2.97GB

@@ -1,0 +1,9 @@
+{
+  "session_id": "[fd03:4514:80:7b81::1]:16553",
+  "host": "fd03:4514:80:7b81::1",
+  "gpu_id": 1,
+  "ptr": 140324366188544,
+  "bytes": 33554432,
+  "ib_device": "mlx5_bond_1",
+  "protocol": "rdma"
+}

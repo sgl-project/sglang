@@ -1,0 +1,11 @@
+{
+  "controller_message": "pd flip committed after two-phase migration",
+  "controller_success": true,
+  "event_count": 0,
+  "events_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/02_stream_true_two_phase/migration_events.jsonl",
+  "migration_outcome": "no_migration_observed",
+  "request_count": 40,
+  "request_error_count": 10,
+  "timeline_stage_count": 0,
+  "timeline_stages": []
+}

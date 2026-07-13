@@ -1,0 +1,22 @@
+{
+  "all_attainment": 0.0,
+  "all_met_count": 0,
+  "completed_count": 34,
+  "error_count": 6,
+  "ledger_path": "/root/sglang/experiments/pd_flip_suite_20260707_172536/03_stream_false_two_phase/stream_false_two_phase/trace_slo_ledger.jsonl",
+  "mode": "stream_false_two_phase",
+  "request_count": 40,
+  "router_url": "http://127.0.0.1:18001",
+  "run_elapsed_s": 218.04851395101286,
+  "run_started_wall": 1783417609.2225828,
+  "tpot_avg_attainment": 0.0,
+  "tpot_avg_met_count": 0,
+  "tpot_good_intervals": 0,
+  "tpot_interval_attainment": null,
+  "tpot_p95_attainment": 0.0,
+  "tpot_p95_met_count": 0,
+  "tpot_total_intervals": 0,
+  "trace_requests": 40,
+  "ttft_attainment": 0.5,
+  "ttft_met_count": 20
+}

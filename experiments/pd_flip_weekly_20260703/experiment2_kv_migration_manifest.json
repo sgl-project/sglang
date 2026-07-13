@@ -1,0 +1,122 @@
+[
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 647,
+    "origin_input_len": 640,
+    "output_len_before_migration": 8,
+    "page_count": 41,
+    "rid": "handoff-01",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 723,
+    "origin_input_len": 713,
+    "output_len_before_migration": 11,
+    "page_count": 46,
+    "rid": "handoff-02",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 799,
+    "origin_input_len": 786,
+    "output_len_before_migration": 14,
+    "page_count": 50,
+    "rid": "handoff-03",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 875,
+    "origin_input_len": 859,
+    "output_len_before_migration": 17,
+    "page_count": 55,
+    "rid": "handoff-04",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 951,
+    "origin_input_len": 932,
+    "output_len_before_migration": 20,
+    "page_count": 60,
+    "rid": "handoff-05",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1027,
+    "origin_input_len": 1005,
+    "output_len_before_migration": 23,
+    "page_count": 65,
+    "rid": "handoff-06",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1103,
+    "origin_input_len": 1078,
+    "output_len_before_migration": 26,
+    "page_count": 69,
+    "rid": "handoff-07",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1160,
+    "origin_input_len": 1151,
+    "output_len_before_migration": 10,
+    "page_count": 73,
+    "rid": "handoff-08",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1236,
+    "origin_input_len": 1224,
+    "output_len_before_migration": 13,
+    "page_count": 78,
+    "rid": "handoff-09",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1312,
+    "origin_input_len": 1297,
+    "output_len_before_migration": 16,
+    "page_count": 82,
+    "rid": "handoff-10",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1388,
+    "origin_input_len": 1370,
+    "output_len_before_migration": 19,
+    "page_count": 87,
+    "rid": "handoff-11",
+    "stream": true,
+    "time_stats_preserved": true
+  },
+  {
+    "http_worker_ipc": "source-output-channel",
+    "kv_committed_len": 1464,
+    "origin_input_len": 1443,
+    "output_len_before_migration": 22,
+    "page_count": 92,
+    "rid": "handoff-12",
+    "stream": true,
+    "time_stats_preserved": true
+  }
+]

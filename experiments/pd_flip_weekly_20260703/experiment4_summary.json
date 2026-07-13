@@ -1,0 +1,35 @@
+{
+  "baseline": {
+    "avg_tpot_s": 0.0051600000000000005,
+    "avg_ttft_s": 0.20775500000000002,
+    "combined_attainment": 0.73,
+    "p95_tpot_s": 0.0053,
+    "p95_ttft_s": 0.44932,
+    "requests": 100,
+    "tpot_attainment": 1.0,
+    "tpot_slo_seconds": 0.025,
+    "ttft_attainment": 0.73,
+    "ttft_slo_seconds": 0.25
+  },
+  "delta": {
+    "avg_tpot_s": 0.0007369999999999998,
+    "avg_ttft_s": -0.022828000000000043,
+    "combined_attainment": 0.06000000000000005,
+    "p95_tpot_s": 0.004334999999999996,
+    "p95_ttft_s": -0.09289000000000025,
+    "tpot_attainment": 0.0,
+    "ttft_attainment": 0.06000000000000005
+  },
+  "state_machine": {
+    "avg_tpot_s": 0.005897,
+    "avg_ttft_s": 0.18492699999999998,
+    "combined_attainment": 0.79,
+    "p95_tpot_s": 0.009634999999999996,
+    "p95_ttft_s": 0.35642999999999975,
+    "requests": 100,
+    "tpot_attainment": 1.0,
+    "tpot_slo_seconds": 0.025,
+    "ttft_attainment": 0.79,
+    "ttft_slo_seconds": 0.25
+  }
+}

@@ -1,0 +1,38 @@
+[
+  {
+    "run": "head_rdma_small_uncapped_4x200_split",
+    "status": "complete",
+    "row_count": 32,
+    "error_sum": 0
+  },
+  {
+    "run": "head_rdma_small_cap4x100_split",
+    "status": "complete",
+    "row_count": 32,
+    "error_sum": 0
+  },
+  {
+    "run": "head_rdma_small_cap2x200_split",
+    "status": "complete",
+    "row_count": 32,
+    "error_sum": 0
+  },
+  {
+    "run": "tail_rdma_small_uncapped_single_nic",
+    "status": "complete",
+    "row_count": 32,
+    "error_sum": 0
+  },
+  {
+    "run": "tail_rdma_small_cap100_single_nic",
+    "status": "complete",
+    "row_count": 32,
+    "error_sum": 0
+  },
+  {
+    "run": "tail_rdma_small_cap200_single_nic",
+    "status": "complete",
+    "row_count": 32,
+    "error_sum": 0
+  }
+]

@@ -1,0 +1,701 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+{
+  "actions": [
+    {
+      "elapsed_seconds": 0.0003097419976256788,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "draining": true,
+        "worker_id": "http://192.168.0.39:31000"
+      },
+      "response": {
+        "message": "worker http://192.168.0.39:31000 is draining",
+        "success": true,
+        "worker": {
+          "active_load": 0,
+          "bootstrap_port": null,
+          "draining": true,
+          "role": "decode",
+          "url": "http://192.168.0.39:31000",
+          "worker_id": "http://192.168.0.39:31000"
+        }
+      },
+      "step": "router_drain_source",
+      "success": true,
+      "target": "router:http://192.168.0.39:31000",
+      "url": "http://127.0.0.1:18000/pd_flip/router/worker/drain"
+    },
+    {
+      "elapsed_seconds": 0.001984130998607725,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "paused": true
+      },
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "message": "PD runtime admission paused",
+          "rid": null,
+          "role": "decode",
+          "status": {
+            "admission_paused": true,
+            "dp_rank": null,
+            "dual_queues_initialized": true,
+            "event_loop_dynamic": true,
+            "is_idle": true,
+            "pd_flip_admission_paused": true,
+            "role": "decode",
+            "runtime_role_switch_enabled": true,
+            "tp_rank": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "pause_source_admission",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/admission"
+    },
+    {
+      "elapsed_seconds": 0.018615184002555907,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "session_id": "pd-flip-node2-to-node3",
+        "target_url": "http://192.168.0.41:31000"
+      },
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "manifests": [],
+          "message": "source migration session started",
+          "rid": null,
+          "status": {
+            "dry_run": true,
+            "enabled": true,
+            "failed_reqs": 0,
+            "held_reqs": 0,
+            "last_error": "",
+            "pending_reqs": 0,
+            "prepare_only": false,
+            "released_reqs": 0,
+            "role": "source",
+            "session_id": "pd-flip-node2-to-node3",
+            "state": "source_started",
+            "transferred_reqs": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "start_decode_migration_source",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/migration/source/start"
+    },
+    {
+      "elapsed_seconds": 0.0023520779941463843,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "adopt_on_success": true,
+        "manifests": [],
+        "session_id": "pd-flip-node2-to-node3",
+        "source_url": "http://192.168.0.39:31000"
+      },
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "manifests": [],
+          "message": "target migration session prepared",
+          "rid": null,
+          "status": {
+            "dry_run": true,
+            "enabled": true,
+            "failed_reqs": 0,
+            "held_reqs": 0,
+            "last_error": "",
+            "pending_reqs": 0,
+            "prepare_only": false,
+            "released_reqs": 0,
+            "role": "target",
+            "session_id": "pd-flip-node2-to-node3",
+            "state": "target_prepared",
+            "transferred_reqs": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "prepare_decode_migration_target",
+      "success": true,
+      "target": "node3",
+      "url": "http://192.168.0.41:31000/pd_flip/migration/target/prepare"
+    },
+    {
+      "elapsed_seconds": 0.0019034650031244382,
+      "message": "",
+      "method": "GET",
+      "payload": null,
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "manifests": [],
+          "message": "",
+          "rid": null,
+          "status": {
+            "dry_run": true,
+            "enabled": true,
+            "failed_reqs": 0,
+            "held_reqs": 0,
+            "last_error": "",
+            "pending_reqs": 0,
+            "prepare_only": false,
+            "released_reqs": 0,
+            "role": "source",
+            "session_id": "pd-flip-node2-to-node3",
+            "state": "source_started",
+            "transferred_reqs": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "wait_decode_migration_source",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/migration/status"
+    },
+    {
+      "elapsed_seconds": 0.0016543940000701696,
+      "message": "",
+      "method": "GET",
+      "payload": null,
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "manifests": [],
+          "message": "",
+          "rid": null,
+          "status": {
+            "dry_run": true,
+            "enabled": true,
+            "failed_reqs": 0,
+            "held_reqs": 0,
+            "last_error": "",
+            "pending_reqs": 0,
+            "prepare_only": false,
+            "released_reqs": 0,
+            "role": "target",
+            "session_id": "pd-flip-node2-to-node3",
+            "state": "target_prepared",
+            "transferred_reqs": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "wait_decode_migration_target",
+      "success": true,
+      "target": "node3",
+      "url": "http://192.168.0.41:31000/pd_flip/migration/status"
+    },
+    {
+      "elapsed_seconds": 0.0018741639942163602,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "released_rids": [],
+        "session_id": "pd-flip-node2-to-node3"
+      },
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "manifests": [],
+          "message": "source migration session released",
+          "rid": null,
+          "status": {
+            "dry_run": true,
+            "enabled": true,
+            "failed_reqs": 0,
+            "held_reqs": 0,
+            "last_error": "",
+            "pending_reqs": 0,
+            "prepare_only": false,
+            "released_reqs": 0,
+            "role": "source",
+            "session_id": "pd-flip-node2-to-node3",
+            "state": "source_released",
+            "transferred_reqs": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "finish_decode_migration_source",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/migration/source/finish"
+    },
+    {
+      "elapsed_seconds": 0.001430482996511273,
+      "message": "",
+      "method": "GET",
+      "payload": null,
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "message": "ok",
+          "rid": null,
+          "role": "decode",
+          "status": {
+            "admission_paused": true,
+            "dp_rank": null,
+            "dual_queues_initialized": true,
+            "event_loop_dynamic": true,
+            "is_idle": true,
+            "pd_flip_admission_paused": true,
+            "role": "decode",
+            "runtime_role_switch_enabled": true,
+            "tp_rank": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "wait_source_idle",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/status"
+    },
+    {
+      "elapsed_seconds": 0.0017071420006686822,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "force": false,
+        "role": "prefill"
+      },
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "message": "PD runtime role switched to prefill.",
+          "rid": null,
+          "role": "prefill",
+          "status": {
+            "admission_paused": true,
+            "dp_rank": null,
+            "dual_queues_initialized": true,
+            "event_loop_dynamic": true,
+            "is_idle": true,
+            "pd_flip_admission_paused": true,
+            "role": "prefill",
+            "runtime_role_switch_enabled": true,
+            "tp_rank": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "set_source_runtime_role",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/set"
+    },
+    {
+      "elapsed_seconds": 0.0004739310097647831,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "bootstrap_port": 18998,
+        "draining": false,
+        "role": "prefill",
+        "worker_id": "http://192.168.0.39:31000"
+      },
+      "response": {
+        "message": "worker http://192.168.0.39:31000 role set to Prefill",
+        "success": true,
+        "worker": {
+          "active_load": 0,
+          "bootstrap_port": 18998,
+          "draining": false,
+          "role": "prefill",
+          "url": "http://192.168.0.39:31000",
+          "worker_id": "http://192.168.0.39:31000"
+        }
+      },
+      "step": "refresh_router_source_role",
+      "success": true,
+      "target": "router:http://192.168.0.39:31000",
+      "url": "http://127.0.0.1:18000/pd_flip/router/worker/role"
+    },
+    {
+      "elapsed_seconds": 0.0015883729938650504,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "paused": false
+      },
+      "response": [
+        {
+          "http_worker_ipc": null,
+          "message": "PD runtime admission resumed",
+          "rid": null,
+          "role": "prefill",
+          "status": {
+            "admission_paused": false,
+            "dp_rank": null,
+            "dual_queues_initialized": true,
+            "event_loop_dynamic": true,
+            "is_idle": true,
+            "pd_flip_admission_paused": false,
+            "role": "prefill",
+            "runtime_role_switch_enabled": true,
+            "tp_rank": 0
+          },
+          "success": true
+        }
+      ],
+      "step": "resume_source_admission",
+      "success": true,
+      "target": "node2",
+      "url": "http://192.168.0.39:31000/pd_flip/runtime_role/admission"
+    },
+    {
+      "elapsed_seconds": 0.0004981620004400611,
+      "message": "",
+      "method": "POST",
+      "payload": {
+        "draining": false,
+        "worker_id": "http://192.168.0.39:31000"
+      },
+      "response": {
+        "message": "worker http://192.168.0.39:31000 is admitting",
+        "success": true,
+        "worker": {
+          "active_load": 0,
+          "bootstrap_port": 18998,
+          "draining": false,
+          "role": "prefill",
+          "url": "http://192.168.0.39:31000",
+          "worker_id": "http://192.168.0.39:31000"
+        }
+      },
+      "step": "router_undrain_source",
+      "success": true,
+      "target": "router:http://192.168.0.39:31000",
+      "url": "http://127.0.0.1:18000/pd_flip/router/worker/drain"
+    }
+  ],
+  "direction": "d_to_p",
+  "message": "pd flip executed",
+  "metrics": [
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node0",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "prefill",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 0.0,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": -1.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "prefill",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "prefill",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "prefill",
+      "router_worker_id": "http://192.168.0.42:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "prefill",
+      "worker_url": "http://192.168.0.42:31000"
+    },
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node1",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "prefill",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 0.0,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": -1.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "prefill",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "prefill",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "prefill",
+      "router_worker_id": "http://192.168.0.40:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "prefill",
+      "worker_url": "http://192.168.0.40:31000"
+    },
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node2",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "decode",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 3.233,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": 0.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "decode",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "decode",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "decode",
+      "router_worker_id": "http://192.168.0.39:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "decode",
+      "worker_url": "http://192.168.0.39:31000"
+    },
+    {
+      "admission_paused": false,
+      "bootstrap_port": 18998,
+      "draining": false,
+      "is_idle": true,
+      "name": "node3",
+      "raw_loads": [
+        {
+          "cache_hit_rate": 0.0,
+          "disaggregation": {
+            "decode_prealloc_queue_reqs": 0,
+            "decode_retracted_queue_reqs": 0,
+            "decode_transfer_queue_reqs": 0,
+            "kv_transfer_latency_ms": 0.0,
+            "kv_transfer_speed_gb_s": 0.0,
+            "mode": "decode",
+            "prefill_bootstrap_queue_reqs": 0,
+            "prefill_inflight_queue_reqs": 0
+          },
+          "dp_rank": 0,
+          "gen_throughput": 0.0,
+          "max_running_requests": 2048,
+          "max_total_num_tokens": 640996,
+          "memory": {
+            "graph_gb": 3.233,
+            "kv_cache_gb": 41.951,
+            "token_capacity": 640996,
+            "weight_gb": 79.725
+          },
+          "num_running_reqs": 0,
+          "num_total_tokens": 0,
+          "num_used_tokens": 0,
+          "num_waiting_reqs": 0,
+          "num_waiting_uncached_tokens": 0,
+          "queues": {
+            "grammar": 0,
+            "paused": 0,
+            "retracted": 0,
+            "waiting": 0
+          },
+          "token_usage": 0.0,
+          "utilization": 0.0
+        }
+      ],
+      "raw_status": {
+        "http_worker_ipc": null,
+        "message": "ok",
+        "rid": null,
+        "role": "decode",
+        "status": {
+          "admission_paused": false,
+          "dp_rank": null,
+          "dual_queues_initialized": true,
+          "event_loop_dynamic": true,
+          "is_idle": true,
+          "pd_flip_admission_paused": false,
+          "role": "decode",
+          "runtime_role_switch_enabled": true,
+          "tp_rank": 0
+        },
+        "success": true
+      },
+      "router_active_load": 0,
+      "router_role": "decode",
+      "router_worker_id": "http://192.168.0.41:31000",
+      "running_reqs": 0,
+      "token_usage": 0.0,
+      "total_tokens": 0,
+      "waiting_reqs": 0,
+      "worker_role": "decode",
+      "worker_url": "http://192.168.0.41:31000"
+    }
+  ],
+  "migration_seconds": 0.024578173004556447,
+  "migration_target": "node3",
+  "source": "node2",
+  "success": true,
+  "target_role": "prefill",
+  "total_seconds": 0.07149123700219207
+}

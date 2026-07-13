@@ -130,6 +130,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationAbortReq,
     PDFlipMigrationOutputRelayReq,
     PDFlipMigrationSourceDeltaReq,
+    PDFlipMigrationSourceFallbackReq,
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
@@ -137,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetDeltaPrepareReq,
+    PDFlipMigrationTargetFallbackPrepareReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleSetReq,
@@ -783,6 +785,26 @@ async def prepare_pd_flip_migration_target_delta(
     obj: PDFlipMigrationTargetDeltaPrepareReq, request: Request
 ):
     return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target_delta(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/source/fallback")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def start_pd_flip_migration_source_fallback(
+    obj: PDFlipMigrationSourceFallbackReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_migration_source_fallback(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/target/fallback/prepare")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def prepare_pd_flip_migration_target_fallback(
+    obj: PDFlipMigrationTargetFallbackPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target_fallback(
         obj
     )
 

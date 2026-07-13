@@ -1,0 +1,20 @@
+{
+  "controller_message": "two-phase D->P migration failed: node2: KVTransferError(bootstrap_room=84819257): Failed due to an unknown reason from another rank; node3: migration target HiCache restore failed",
+  "controller_success": false,
+  "event_count": 6068,
+  "events_path": "/home/tiancij/pd-artifacts/20260713-095054-trace40/metrics/migration_events_run5.jsonl",
+  "migration_outcome": "aborted_or_failed",
+  "migration_request_sample_count": 2364,
+  "request_count": 0,
+  "request_error_count": 0,
+  "request_migration_join_count": 0,
+  "timeline_stage_count": 5,
+  "timeline_stages": [
+    "source_admission_paused",
+    "source_migration_started",
+    "migration_abort_or_failed",
+    "router_source_drained",
+    "cleanup_router_undrain"
+  ],
+  "worker_load_sample_count": 1867
+}

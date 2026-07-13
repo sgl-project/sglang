@@ -1,0 +1,20 @@
+﻿# Verification - 2026-07-09 13:21:58 +08:00
+
+Passed:
+- git diff --check -- touched files: exit 0, only CRLF warnings.
+- bash -n on cloud-100:
+  - /root/sglang/experiments/pd_flip_hicache_stitch_runner.sh
+  - /root/sglang/experiments/pd_flip_waiting_queue_full_link_runner.sh
+  - /root/sglang/scripts/playground/disaggregation/pd_flip_docker/run_worker.sh
+- docker pytest on cloud-100 with sglang-pd-switch:tianciJ:
+  - test/srt/test_disaggregation_fake_decode.py::TestFakePDFlipTargetMigration::test_pd_flip_target_hicache_stitch_sends_only_uncached_suffix
+  - test/srt/test_disaggregation_fake_decode.py::TestFakePDFlipTargetMigration::test_pd_flip_target_waits_for_hicache_restore_before_success
+  - test/srt/test_disaggregation_fake_decode.py::TestFakePDFlipTargetMigration::test_pd_flip_target_commits_hicache_restore_before_release
+  Result: 3 passed, 21 warnings in 18.99s.
+- docker py_compile on cloud-100:
+  - python/sglang/srt/managers/scheduler.py
+  - test/srt/test_disaggregation_fake_decode.py
+  Result: exit 0.
+
+Not completed:
+- Cluster request replay / TTFT / TPOT / SLO raw data: not produced, because cloud-099 was unreachable and Mooncake master was not reachable on 192.168.0.42:50051/8080.

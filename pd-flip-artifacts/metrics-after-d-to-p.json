@@ -1,0 +1,309 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+[
+  {
+    "admission_paused": false,
+    "bootstrap_port": 18998,
+    "draining": false,
+    "is_idle": true,
+    "name": "node0",
+    "raw_loads": [
+      {
+        "cache_hit_rate": 0.0,
+        "disaggregation": {
+          "decode_prealloc_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "kv_transfer_latency_ms": 0.0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "mode": "prefill",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0
+        },
+        "dp_rank": 0,
+        "gen_throughput": 0.0,
+        "max_running_requests": 2048,
+        "max_total_num_tokens": 640996,
+        "memory": {
+          "graph_gb": 0.0,
+          "kv_cache_gb": 41.951,
+          "token_capacity": 640996,
+          "weight_gb": 79.725
+        },
+        "num_running_reqs": 0,
+        "num_total_tokens": 0,
+        "num_used_tokens": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "queues": {
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "waiting": 0
+        },
+        "token_usage": 0.0,
+        "utilization": -1.0
+      }
+    ],
+    "raw_status": {
+      "http_worker_ipc": null,
+      "message": "ok",
+      "rid": null,
+      "role": "prefill",
+      "status": {
+        "admission_paused": false,
+        "dp_rank": null,
+        "dual_queues_initialized": true,
+        "event_loop_dynamic": true,
+        "is_idle": true,
+        "pd_flip_admission_paused": false,
+        "role": "prefill",
+        "runtime_role_switch_enabled": true,
+        "tp_rank": 0
+      },
+      "success": true
+    },
+    "router_active_load": 0,
+    "router_role": "prefill",
+    "router_worker_id": "http://192.168.0.42:31000",
+    "running_reqs": 0,
+    "token_usage": 0.0,
+    "total_tokens": 0,
+    "waiting_reqs": 0,
+    "worker_role": "prefill",
+    "worker_url": "http://192.168.0.42:31000"
+  },
+  {
+    "admission_paused": false,
+    "bootstrap_port": 18998,
+    "draining": false,
+    "is_idle": true,
+    "name": "node1",
+    "raw_loads": [
+      {
+        "cache_hit_rate": 0.0,
+        "disaggregation": {
+          "decode_prealloc_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "kv_transfer_latency_ms": 0.0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "mode": "prefill",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0
+        },
+        "dp_rank": 0,
+        "gen_throughput": 0.0,
+        "max_running_requests": 2048,
+        "max_total_num_tokens": 640996,
+        "memory": {
+          "graph_gb": 0.0,
+          "kv_cache_gb": 41.951,
+          "token_capacity": 640996,
+          "weight_gb": 79.725
+        },
+        "num_running_reqs": 0,
+        "num_total_tokens": 0,
+        "num_used_tokens": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "queues": {
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "waiting": 0
+        },
+        "token_usage": 0.0,
+        "utilization": -1.0
+      }
+    ],
+    "raw_status": {
+      "http_worker_ipc": null,
+      "message": "ok",
+      "rid": null,
+      "role": "prefill",
+      "status": {
+        "admission_paused": false,
+        "dp_rank": null,
+        "dual_queues_initialized": true,
+        "event_loop_dynamic": true,
+        "is_idle": true,
+        "pd_flip_admission_paused": false,
+        "role": "prefill",
+        "runtime_role_switch_enabled": true,
+        "tp_rank": 0
+      },
+      "success": true
+    },
+    "router_active_load": 0,
+    "router_role": "prefill",
+    "router_worker_id": "http://192.168.0.40:31000",
+    "running_reqs": 0,
+    "token_usage": 0.0,
+    "total_tokens": 0,
+    "waiting_reqs": 0,
+    "worker_role": "prefill",
+    "worker_url": "http://192.168.0.40:31000"
+  },
+  {
+    "admission_paused": false,
+    "bootstrap_port": 18998,
+    "draining": false,
+    "is_idle": true,
+    "name": "node2",
+    "raw_loads": [
+      {
+        "cache_hit_rate": 0.0,
+        "disaggregation": {
+          "decode_prealloc_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "kv_transfer_latency_ms": 0.0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "mode": "prefill",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0
+        },
+        "dp_rank": 0,
+        "gen_throughput": 0.0,
+        "max_running_requests": 2048,
+        "max_total_num_tokens": 640996,
+        "memory": {
+          "graph_gb": 3.233,
+          "kv_cache_gb": 41.951,
+          "token_capacity": 640996,
+          "weight_gb": 79.725
+        },
+        "num_running_reqs": 0,
+        "num_total_tokens": 0,
+        "num_used_tokens": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "queues": {
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "waiting": 0
+        },
+        "token_usage": 0.0,
+        "utilization": 0.0
+      }
+    ],
+    "raw_status": {
+      "http_worker_ipc": null,
+      "message": "ok",
+      "rid": null,
+      "role": "prefill",
+      "status": {
+        "admission_paused": false,
+        "dp_rank": null,
+        "dual_queues_initialized": true,
+        "event_loop_dynamic": true,
+        "is_idle": true,
+        "pd_flip_admission_paused": false,
+        "role": "prefill",
+        "runtime_role_switch_enabled": true,
+        "tp_rank": 0
+      },
+      "success": true
+    },
+    "router_active_load": 0,
+    "router_role": "prefill",
+    "router_worker_id": "http://192.168.0.39:31000",
+    "running_reqs": 0,
+    "token_usage": 0.0,
+    "total_tokens": 0,
+    "waiting_reqs": 0,
+    "worker_role": "prefill",
+    "worker_url": "http://192.168.0.39:31000"
+  },
+  {
+    "admission_paused": false,
+    "bootstrap_port": 18998,
+    "draining": false,
+    "is_idle": true,
+    "name": "node3",
+    "raw_loads": [
+      {
+        "cache_hit_rate": 0.0,
+        "disaggregation": {
+          "decode_prealloc_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "kv_transfer_latency_ms": 0.0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "mode": "decode",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0
+        },
+        "dp_rank": 0,
+        "gen_throughput": 0.0,
+        "max_running_requests": 2048,
+        "max_total_num_tokens": 640996,
+        "memory": {
+          "graph_gb": 3.233,
+          "kv_cache_gb": 41.951,
+          "token_capacity": 640996,
+          "weight_gb": 79.725
+        },
+        "num_running_reqs": 0,
+        "num_total_tokens": 0,
+        "num_used_tokens": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "queues": {
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "waiting": 0
+        },
+        "token_usage": 0.0,
+        "utilization": 0.0
+      }
+    ],
+    "raw_status": {
+      "http_worker_ipc": null,
+      "message": "ok",
+      "rid": null,
+      "role": "decode",
+      "status": {
+        "admission_paused": false,
+        "dp_rank": null,
+        "dual_queues_initialized": true,
+        "event_loop_dynamic": true,
+        "is_idle": true,
+        "pd_flip_admission_paused": false,
+        "role": "decode",
+        "runtime_role_switch_enabled": true,
+        "tp_rank": 0
+      },
+      "success": true
+    },
+    "router_active_load": 0,
+    "router_role": "decode",
+    "router_worker_id": "http://192.168.0.41:31000",
+    "running_reqs": 0,
+    "token_usage": 0.0,
+    "total_tokens": 0,
+    "waiting_reqs": 0,
+    "worker_role": "decode",
+    "worker_url": "http://192.168.0.41:31000"
+  }
+]

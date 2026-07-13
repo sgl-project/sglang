@@ -1,0 +1,12 @@
+{
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "Write a long, numbered technical checklist for validating distributed inference failover. Keep going until the token budget is exhausted.",
+      "role": "user"
+    }
+  ],
+  "model": "deepseek_v3.1_terminus",
+  "stream": false,
+  "temperature": 0.0
+}

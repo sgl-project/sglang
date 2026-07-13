@@ -7,7 +7,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
 # Values explicitly exported on the command line are per-run controls and take
 # precedence over the shared ENV_FILE. Preserve both set and set-to-empty values.
 override_names=(
-  ADMIN_API_KEY DIRECTION SOURCE_NAME PD_FLIP_CONTROLLER_USE_DOCKER
+  ADMIN_API_KEY DIRECTION SOURCE_NAME MIGRATION_TARGET_NAME
+  PD_FLIP_CONTROLLER_USE_DOCKER PD_FLIP_TRACE_SLO_LEDGER
   PD_FLIP_FIRST_MIGRATION_RATIO PD_FLIP_OBSERVATION_SECONDS PD_FLIP_SLO_THRESHOLD
   PD_FLIP_MIN_PREFILL_SLO_SAMPLES PD_FLIP_MIN_DECODE_SLO_SAMPLES
   PD_FLIP_ARTIFACT_DIR PD_FLIP_SESSION_JOURNAL_PATH PD_FLIP_SESSION_ID_PREFIX
@@ -38,6 +39,7 @@ esac
 ACTION="${1:-dry-run}"
 DIRECTION="${DIRECTION:-d_to_p}"
 SOURCE_NAME="${SOURCE_NAME:-}"
+MIGRATION_TARGET_NAME="${MIGRATION_TARGET_NAME:-}"
 
 base_args=(
   --router-url "http://${ROUTER_HOST}:${ROUTER_PORT}"
@@ -107,11 +109,31 @@ case "${ACTION}" in
       --iterations "${PD_FLIP_MONITOR_ITERATIONS}" \
       --poll-interval "${PD_FLIP_MONITOR_POLL_INTERVAL}"
     ;;
+  monitor-progressive)
+    if [[ -z "${PD_FLIP_TRACE_SLO_LEDGER:-}" ]]; then
+      echo "PD_FLIP_TRACE_SLO_LEDGER is required" >&2
+      exit 2
+    fi
+    progressive_args=(
+      monitor-progressive
+      --trace-slo-ledger "${PD_FLIP_TRACE_SLO_LEDGER}"
+      --iterations "${PD_FLIP_MONITOR_ITERATIONS}"
+      --poll-interval "${PD_FLIP_MONITOR_POLL_INTERVAL}"
+    )
+    if [[ -n "${SOURCE_NAME}" ]]; then
+      progressive_args+=(--source-name "${SOURCE_NAME}")
+    fi
+    if [[ -n "${MIGRATION_TARGET_NAME}" ]]; then
+      progressive_args+=(--migration-target-name "${MIGRATION_TARGET_NAME}")
+    fi
+    run_controller "${base_args[@]}" "${progressive_args[@]}"
+    ;;
   *)
-    echo "usage: run_controller.sh [metrics|dry-run|execute|monitor]" >&2
+    echo "usage: run_controller.sh [metrics|dry-run|execute|monitor|monitor-progressive]" >&2
     echo "       DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh dry-run" >&2
     echo "       DIRECTION=d_to_p SOURCE_NAME=node2 ./run_controller.sh execute" >&2
     echo "       ./run_controller.sh monitor" >&2
+    echo "       PD_FLIP_TRACE_SLO_LEDGER=/path/ledger.jsonl SOURCE_NAME=node2 MIGRATION_TARGET_NAME=node3 ./run_controller.sh monitor-progressive" >&2
     exit 2
     ;;
 esac

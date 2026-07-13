@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1040" viewBox="0 0 1900 1040">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:"Microsoft YaHei","Noto Sans CJK SC",Arial,sans-serif;fill:#20242a}.title{font-size:32px;font-weight:700}.sub{font-size:17px;fill:#525866}.box-title{font-size:17px;font-weight:700}.lat{font-size:22px;font-weight:700}.detail{font-size:12px;fill:#525866}.small{font-size:14px;fill:#525866}.arrow{stroke:#6d7785;stroke-width:2.1;fill:none;marker-end:url(#arrow)}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#6d7785"/></marker></defs>
+<text x="70" y="58" class="title">PD 状态机 D->P 全链路延迟</text>
+<text x="70" y="92" class="sub">run=01_waiting_queue_two_phase; total=12.742 s; controller migration=537.26 ms</text>
+<path class="arrow" d="M307,208.0 L321,208.0"/>
+<path class="arrow" d="M567,208.0 L581,208.0"/>
+<path class="arrow" d="M827,208.0 L841,208.0"/>
+<path class="arrow" d="M1087,208.0 L1101,208.0"/>
+<path class="arrow" d="M1226.0,264 C1226.0,326 1226.0,290 1226.0,350"/>
+<path class="arrow" d="M1105,408.0 L1091,408.0"/>
+<path class="arrow" d="M845,408.0 L831,408.0"/>
+<path class="arrow" d="M585,408.0 L571,408.0"/>
+<path class="arrow" d="M325,408.0 L311,408.0"/>
+<path class="arrow" d="M186.0,464 C186.0,526 186.0,490 186.0,550"/>
+<path class="arrow" d="M307,608.0 L321,608.0"/>
+<path class="arrow" d="M567,608.0 L581,608.0"/>
+<path class="arrow" d="M827,608.0 L841,608.0"/>
+<path class="arrow" d="M1087,608.0 L1101,608.0"/>
+<rect x="70" y="160" width="232" height="96" rx="8" fill="#f4f7fb" stroke="#3569b7" stroke-width="2"/>
+<text x="84" y="187" class="box-title">1. router 标记 source draining</text>
+<text x="84" y="218" class="lat" fill="#3569b7">0.28 ms</text>
+<text x="84" y="240" class="detail">router /worker/drain</text>
+<rect x="330" y="160" width="232" height="96" rx="8" fill="#eef7f1" stroke="#2f7d58" stroke-width="2"/>
+<text x="344" y="187" class="box-title">2. 暂停 source admission</text>
+<text x="344" y="218" class="lat" fill="#2f7d58">4.86 ms</text>
+<text x="344" y="240" class="detail">source /runtime_role/admission</text>
+<rect x="590" y="160" width="232" height="96" rx="8" fill="#fff7e8" stroke="#b86b00" stroke-width="2"/>
+<text x="604" y="187" class="box-title">3. 扫描 running / waiting</text>
+<text x="604" y="218" class="lat" fill="#b86b00">0.02 ms</text>
+<text x="604" y="240" class="detail">running=1; waiting=2; skipped=1</text>
+<rect x="850" y="160" width="232" height="96" rx="8" fill="#f5f1fb" stroke="#7655a6" stroke-width="2"/>
+<text x="864" y="187" class="box-title">4. 构造 manifest</text>
+<text x="864" y="218" class="lat" fill="#7655a6">0.09 ms</text>
+<text x="864" y="240" class="detail">running=1; waiting=1; total=2</text>
+<rect x="1110" y="160" width="232" height="96" rx="8" fill="#eef6f7" stroke="#237884" stroke-width="2"/>
+<text x="1124" y="187" class="box-title">5. 冻结源 waiting_queue</text>
+<text x="1124" y="218" class="lat" fill="#237884">0.01 ms</text>
+<text x="1124" y="240" class="detail">frozen=1</text>
+<rect x="1110" y="360" width="232" height="96" rx="8" fill="#f4f7fb" stroke="#3569b7" stroke-width="2"/>
+<text x="1124" y="387" class="box-title">6. target/prepare receiver</text>
+<text x="1124" y="418" class="lat" fill="#3569b7">8.44 ms</text>
+<text x="1124" y="440" class="detail">prepare=0.31 ms</text>
+<text x="1124" y="455" class="detail">receiver init max=3.89 ms</text>
+<rect x="850" y="360" width="232" height="96" rx="8" fill="#eef7f1" stroke="#2f7d58" stroke-width="2"/>
+<text x="864" y="387" class="box-title">7. KV 传输到 target held</text>
+<text x="864" y="418" class="lat" fill="#2f7d58">112.92 ms</text>
+<text x="864" y="440" class="detail">target=112.92 ms; source=104.79 ms</text>
+<text x="864" y="455" class="detail">controller=537.26 ms</text>
+<rect x="590" y="360" width="232" height="96" rx="8" fill="#fff7e8" stroke="#b86b00" stroke-width="2"/>
+<text x="604" y="387" class="box-title">8. 请求进入 transferred_held</text>
+<text x="604" y="418" class="lat" fill="#b86b00">0.00 ms</text>
+<text x="604" y="440" class="detail">held entries=2; waiting-origin=1</text>
+<rect x="330" y="360" width="232" height="96" rx="8" fill="#f5f1fb" stroke="#7655a6" stroke-width="2"/>
+<text x="344" y="387" class="box-title">9. target commit/adopt</text>
+<text x="344" y="418" class="lat" fill="#7655a6">2.77 ms</text>
+<text x="344" y="440" class="detail">held-&gt;adopt max=409.16 ms</text>
+<text x="344" y="455" class="detail">waiting=409.14 ms</text>
+<rect x="70" y="360" width="232" height="96" rx="8" fill="#eef6f7" stroke="#237884" stroke-width="2"/>
+<text x="84" y="387" class="box-title">10. source finish/release</text>
+<text x="84" y="418" class="lat" fill="#237884">3.98 ms</text>
+<text x="84" y="440" class="detail">xfer-&gt;finish max=420.58 ms</text>
+<text x="84" y="455" class="detail">waiting release=420.58 ms</text>
+<rect x="70" y="560" width="232" height="96" rx="8" fill="#f4f7fb" stroke="#3569b7" stroke-width="2"/>
+<text x="84" y="587" class="box-title">11. 等待 source idle</text>
+<text x="84" y="618" class="lat" fill="#3569b7">12.188 s</text>
+<text x="84" y="640" class="detail">controller wait/sleep after migration finish</text>
+<rect x="330" y="560" width="232" height="96" rx="8" fill="#eef7f1" stroke="#2f7d58" stroke-width="2"/>
+<text x="344" y="587" class="box-title">12. decode -&gt; prefill</text>
+<text x="344" y="618" class="lat" fill="#2f7d58">2.27 ms</text>
+<text x="344" y="640" class="detail">/runtime_role/set</text>
+<rect x="590" y="560" width="232" height="96" rx="8" fill="#fff7e8" stroke="#b86b00" stroke-width="2"/>
+<text x="604" y="587" class="box-title">13. router 刷新 role</text>
+<text x="604" y="618" class="lat" fill="#b86b00">0.34 ms</text>
+<text x="604" y="640" class="detail">router role=prefill</text>
+<rect x="850" y="560" width="232" height="96" rx="8" fill="#f5f1fb" stroke="#7655a6" stroke-width="2"/>
+<text x="864" y="587" class="box-title">14. 恢复 admission</text>
+<text x="864" y="618" class="lat" fill="#7655a6">1.88 ms</text>
+<text x="864" y="640" class="detail">paused=false</text>
+<rect x="1110" y="560" width="232" height="96" rx="8" fill="#eef6f7" stroke="#237884" stroke-width="2"/>
+<text x="1124" y="587" class="box-title">15. router undrain</text>
+<text x="1124" y="618" class="lat" fill="#237884">0.27 ms</text>
+<text x="1124" y="640" class="detail">draining=false</text>
+<rect x="70" y="800" width="1760" height="150" rx="8" fill="#f7f9fb" stroke="#c7d0db"/>
+<text x="95" y="834" class="box-title">读图说明</text>
+<text x="105" y="866" class="small">- 新增 waiting_queue 链路：扫描/筛选 -&gt; 构造 waiting manifest -&gt; 冻结源 waiting_queue -&gt; target transferred_held -&gt; commit 进入目标 waiting_queue -&gt; source release。</text>
+<text x="105" y="892" class="small">- 图上的 HTTP action 使用 controller elapsed_seconds；KV transfer、held-&gt;adopt、source release 使用 worker timing_debug 推导。</text>
+<text x="105" y="918" class="small">- waiting_manifest_count=0 时，图仍显示 waiting 阶段，但说明本次 trace 没制造出可迁移 waiting 请求。</text>
+</svg>

@@ -1,0 +1,16 @@
+{
+  "controller_message": "pd flip committed after two-phase migration",
+  "controller_success": true,
+  "event_count": 5135,
+  "events_path": "/root/sglang/experiments/pd_flip_1p3d_to_2p2d_20260708_124626/01_1p3d_to_2p2d_two_phase/migration_events.jsonl",
+  "migration_outcome": "no_migration_observed",
+  "request_count": 40,
+  "request_error_count": 0,
+  "timeline_stage_count": 3,
+  "timeline_stages": [
+    "router_source_drained",
+    "cleanup_router_undrain",
+    "source_admission_paused"
+  ],
+  "worker_load_sample_count": 1580
+}

@@ -1,0 +1,1 @@
+{"object":"error","message":"Invalid request: Disaggregated request received without bootstrap room id. req.rid='a10f62d199d44503bb3f21849b1a2fda'","type":"BadRequestError","param":null,"code":400}nHTTP_CODE=400n

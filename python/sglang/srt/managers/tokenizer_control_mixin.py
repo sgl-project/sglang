@@ -57,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationAbortReq,
     PDFlipMigrationReqOutput,
     PDFlipMigrationSourceDeltaReq,
+    PDFlipMigrationSourceFallbackReq,
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
@@ -64,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationTargetAbortReq,
     PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetDeltaPrepareReq,
+    PDFlipMigrationTargetFallbackPrepareReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleReqOutput,
@@ -180,6 +182,13 @@ class TokenizerControlMixin:
         ):
             return
         if getattr(self, "pd_flip_migration_bootstrap_server", None) is not None:
+            return
+
+        # Runtime role switching starts the regular disaggregation bootstrap
+        # server on decode nodes as well. Reuse it instead of binding the same
+        # bootstrap port a second time.
+        if getattr(self, "bootstrap_server", None) is not None:
+            self.pd_flip_migration_bootstrap_server = self.bootstrap_server
             return
 
         transfer_backend = TransferBackend(
@@ -969,6 +978,19 @@ class TokenizerControlMixin:
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def start_pd_flip_migration_source_fallback(
+        self: TokenizerManager, obj: PDFlipMigrationSourceFallbackReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def prepare_pd_flip_migration_target_fallback(
+        self: TokenizerManager, obj: PDFlipMigrationTargetFallbackPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
         return await self.pd_flip_migration_communicator(obj)
 
     async def prepare_pd_flip_migration_target_delta(

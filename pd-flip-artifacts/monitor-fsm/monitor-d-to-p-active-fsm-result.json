@@ -1,0 +1,136 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+{
+  "actions": [],
+  "iterations": 1,
+  "message": "no flip decision",
+  "snapshots": [
+    {
+      "decode_nodes": 2,
+      "decode_slo_attainment": 1.0,
+      "nodes": [
+        {
+          "name": "node0",
+          "raw_load": {
+            "num_running_reqs": 0,
+            "num_total_tokens": 0,
+            "num_waiting_reqs": 0,
+            "token_usage": 0.0
+          },
+          "role": "prefill",
+          "running_reqs": 0,
+          "timestamp": 87775.864565544,
+          "token_usage": 0.0,
+          "tpot": {
+            "good": 0,
+            "total": 0
+          },
+          "ttft": {
+            "good": 0,
+            "total": 0
+          },
+          "waiting_reqs": 0
+        },
+        {
+          "name": "node1",
+          "raw_load": {
+            "num_running_reqs": 0,
+            "num_total_tokens": 0,
+            "num_waiting_reqs": 0,
+            "token_usage": 0.0
+          },
+          "role": "prefill",
+          "running_reqs": 0,
+          "timestamp": 87775.890912668,
+          "token_usage": 0.0,
+          "tpot": {
+            "good": 0,
+            "total": 0
+          },
+          "ttft": {
+            "good": 0,
+            "total": 0
+          },
+          "waiting_reqs": 0
+        },
+        {
+          "name": "node2",
+          "raw_load": {
+            "num_running_reqs": 1,
+            "num_total_tokens": 7524,
+            "num_waiting_reqs": 0,
+            "token_usage": 0.0117
+          },
+          "role": "decode",
+          "running_reqs": 1,
+          "timestamp": 87775.926788732,
+          "token_usage": 0.0117,
+          "tpot": {
+            "good": 7450,
+            "total": 7450
+          },
+          "ttft": {
+            "good": 0,
+            "total": 2
+          },
+          "waiting_reqs": 0
+        },
+        {
+          "name": "node3",
+          "raw_load": {
+            "num_running_reqs": 0,
+            "num_total_tokens": 0,
+            "num_waiting_reqs": 0,
+            "token_usage": 0.0
+          },
+          "role": "decode",
+          "running_reqs": 0,
+          "timestamp": 87775.967632051,
+          "token_usage": 0.0,
+          "tpot": {
+            "good": 0,
+            "total": 0
+          },
+          "ttft": {
+            "good": 0,
+            "total": 1
+          },
+          "waiting_reqs": 0
+        }
+      ],
+      "prefill_nodes": 2,
+      "prefill_slo_attainment": null,
+      "timestamp": 87775.86455865
+    }
+  ],
+  "state_trace": [
+    {
+      "direction": null,
+      "migration_target": null,
+      "reason": "monitor_sampled",
+      "role_after": null,
+      "role_before": null,
+      "snapshot_index": 0,
+      "source": null,
+      "state": "safe"
+    }
+  ],
+  "success": true
+}

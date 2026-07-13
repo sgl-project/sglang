@@ -1,0 +1,859 @@
+﻿
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:25:[2026-07-09 0
+4:59:28] server_args=ServerArgs(model_path='/models/deepseek_v3.1_terminus', tokenizer_path='/models/deepseek_v3.1_term
+inus', tokenizer_mode='auto', tokenizer_backend='huggingface', tokenizer_worker_num=1, detokenizer_worker_num=1, skip_t
+okenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=None, i
+s_embedding=False, prefill_only_disable_kv_cache=False, enable_multimodal=None, revision=None, model_impl='auto', model
+_config_parser='auto', host='0.0.0.0', port=32000, fastapi_root_path='', grpc_mode=False, skip_server_warmup=False, war
+mups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, ssl_keyfile=None, ssl_certfile=None, ssl_
+ca_certs=None, ssl_keyfile_password=None, enable_ssl_refresh=False, enable_http2=False, dtype='auto', quantization=None
+, quantization_param_path=None, kv_cache_dtype='auto', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpo
+int_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quan
+t_profile=None, mem_fraction_static=0.88, max_running_requests=2, max_queued_requests=None, max_total_tokens=None, chun
+ked_prefill_size=8192, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_pol
+icy='fcfs', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_
+priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, sc
+hedule_conservativeness=1.0, page_size=1, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_po
+licy='lru', enable_prefill_delayer=False, prefill_delayer_max_delay_passes=30, prefill_delayer_token_usage_low_watermar
+k=None, prefill_delayer_forward_passes_buckets=None, prefill_delayer_wait_seconds_buckets=None, prefill_delayer_queue_m
+in_ratio=None, prefill_delayer_max_delay_ms=None, device='cuda', tp_size=8, pp_size=1, pp_max_micro_batch_size=None, pp
+_async_batch_depth=0, stream_interval=1, batch_notify_size=16, stream_response_default_include_usage=False, incremental
+_streaming_output=False, enable_streaming_session=False, random_seed=653032518, constrained_json_whitespace_pattern=Non
+e, constrained_json_disable_any_whitespace=False, watchdog_timeout=300, soft_watchdog_timeout=None, dist_timeout=None, 
+download_dir=None, model_checksum=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, load_snapshot_publish_interv
+al=15, use_ray=False, custom_sigquit_handler=None, log_level='info', log_level_http=None, log_requests=False, log_reque
+sts_level=2, log_requests_format='text', log_requests_target=None, uvicorn_access_log_exclude_prefixes=[], crash_dump_f
+older=None, show_time_cost=False, enable_metrics=True, grpc_http_sidecar_port=None, enable_mfu_metrics=False, enable_me
+trics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_cus
+tom_labels=None, extra_metric_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e
+_request_latency=None, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, decod
+e_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_forward_pass_metrics=False, f
+orward_pass_metrics_worker_id='', forward_pass_metrics_ipc_name=None, enable_trace=False, trace_modules='request', otlp
+_traces_endpoint='localhost:4317', export_metrics_to_file=False, export_metrics_to_file_dir=None, stat_loggers=None, ap
+i_key=None, admin_api_key=None, served_model_name='deepseek_v3.1_terminus', weight_version='default', chat_template=Non
+e, hf_chat_template_name=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False,
+ reasoning_parser=None, strip_thinking_cache=False, enable_strict_thinking=False, tool_call_parser=None, tool_server=No
+ne, sampling_defaults='model', asr_max_buffer_seconds=60, asr_max_concurrent_sessions=32, dp_size=1, load_balance_metho
+d='round_robin', attn_cp_size=1, moe_dp_size=1, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{
+}', preferred_sampling_params=None, enable_lora=None, enable_lora_overlap_loading=None, max_lora_rank=None, lora_target
+_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend=
+'csgmv', max_lora_chunk_size=16, experts_shared_outer_loras=None, lora_use_virtual_experts=False, lora_strict_loading=F
+alse, lora_drain_wait_threshold=0.0, attention_backend='fa3', decode_attention_backend='triton', prefill_attention_back
+end=None, sampling_backend='flashinfer', grammar_backend='xgrammar', radix_cache_backend=None, mm_attention_backend=Non
+e, fp8_gemm_runner_backend='auto', fp4_gemm_runner_backend='auto', dsa_prefill_backend=None, dsa_decode_backend=None, d
+sa_topk_backend='sgl-kernel', disable_flashinfer_autotune=False, mamba_backend='triton', speculative_algorithm=None, sp
+eculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_draft_load_format=None, speculative
+_num_steps=None, speculative_eagle_topk=None, speculative_num_draft_tokens=None, speculative_dflash_block_size=None, sp
+eculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_token_map=None, speculative_at
+tention_mode='prefill', speculative_draft_attention_backend=None, speculative_draft_window_size=None, speculative_moe_r
+unner_backend='auto', speculative_moe_a2a_backend=None, speculative_draft_model_quantization=None, speculative_skip_dp_
+mlp_sync=False, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_type
+='BFS', speculative_ngram_max_trie_depth=18, speculative_ngram_capacity=10000000, speculative_ngram_external_corpus_pat
+h=None, speculative_ngram_external_sam_budget=0, speculative_ngram_external_corpus_max_tokens=10000000, enable_multi_la
+yer_eagle=False, speculative_adaptive=False, speculative_adaptive_config=None, ep_size=1, moe_a2a_backend='none', moe_r
+unner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, enforce_disab
+le_flashinfer_allreduce_fusion=False, enable_aiter_allreduce_fusion=False, deepep_mode='auto', deepep_dispatcher_output
+_dtype='auto', ep_num_redundant_experts=0, ep_dispatch_algorithm=None, init_expert_location='trivial', enable_eplb=Fals
+e, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalancin
+g_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, ena
+ble_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=None, elastic_ep_backend=None, enable_elas
+tic_expert_backup=False, mooncake_ib_device=None, enable_deepep_waterfill=False, elastic_ep_rejoin=False, max_mamba_cac
+he_size=None, mamba_ssm_dtype=None, mamba_full_memory_ratio=0.9, mamba_scheduler_strategy='no_buffer', mamba_track_inte
+rval=256, linear_attn_backend='triton', linear_attn_decode_backend=None, linear_attn_prefill_backend=None, enable_hiera
+rchical_cache=True, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through', hicache_io_backend='kernel
+', hicache_mem_layout='page_first', hicache_storage_backend='mooncake', hicache_storage_prefetch_policy='timeout', hica
+che_storage_backend_extra_config=None, enable_hisparse=False, hisparse_config=None, enable_lmcache=False, lmcache_confi
+g_file=None, kt_weight_path=None, kt_method='AMXINT4', kt_cpuinfer=None, kt_threadpool_count=2, kt_num_gpu_experts=None
+, kt_max_deferred_experts_per_token=None, dllm_algorithm=None, dllm_algorithm_config=None, cpu_offload_gb=0, offload_gr
+oup_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', enable_mis=False, disable_radix_cache
+=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, debug_cuda_graph=
+False, cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(backend='full', max_bs=512, bs=[1, 2, 4, 8, 12, 16, 24, 32,
+ 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 2
+40, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], tc_compiler='eager'), pr
+efill=PhaseConfig(backend='disabled', max_bs=2048, bs=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160
+, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 
+1536, 1792, 2048], tc_compiler='eager')), cuda_graph_backend_decode=None, cuda_graph_backend_prefill=None, cuda_graph_m
+ax_bs_decode=None, cuda_graph_max_bs_prefill=None, cuda_graph_bs_decode=None, cuda_graph_bs_prefill=None, cuda_graph_tc
+_compiler=None, disable_cuda_graph=False, disable_prefill_cuda_graph=False, disable_decode_cuda_graph=False, prefill_cu
+da_graph_backend=None, decode_cuda_graph_backend=None, enable_layerwise_nvtx_marker=False, enable_nccl_nvls=False, enab
+le_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_tok
+enizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, en
+able_torch_symm_mem=False, pre_warm_nccl=False, disable_overlap_schedule=False, enable_mixed_chunk=False, enable_dp_att
+ention=False, enable_dp_attention_local_control_broadcast=False, enable_dp_lm_head=False, enable_two_batch_overlap=Fals
+e, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, enable_torch_c
+ompile_debug_mode=False, torch_compile_max_bs=32, torchao_config='', enable_p2p_check=False, triton_attention_reduce_in
+_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, de
+lete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, enable_draft_weights_cpu_bac
+kup=False, allow_auto_truncate=False, enable_custom_logit_processor=False, flashinfer_mla_disable_ragged=False, disable
+_shared_experts_fusion=False, enforce_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_ima
+ge_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, enable_return_routed_experts=Fa
+lse, enable_return_indexer_topk=False, enable_deepseek_v4_fp4_indexer=False, scheduler_recv_interval=1, numa_node=None,
+ enable_deterministic_inference=False, rl_on_policy_target=None, enable_attn_tp_input_scattered=False, disable_attn_tp_
+gather=False, gc_threshold=None, kv_canary='none', kv_canary_real_data='none', kv_canary_sweep_interval=0, enable_fused
+_qk_norm_rope=False, enable_precise_embedding_interpolation=False, enable_fused_moe_sum_all_reduce=False, enable_prefil
+l_cp=False, cp_strategy=None, enable_dsa_prefill_context_parallel=False, dsa_prefill_cp_mode='round-robin-split', enabl
+e_prefill_context_parallel=False, prefill_cp_mode='in-seq-split', enable_dynamic_batch_tokenizer=False, dynamic_batch_t
+okenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tensor
+_dump_layers=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='decode', dis
+aggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=19998, disaggregation_ib_device='mlx5_0', disagg
+regation_decode_enable_radix_cache=True, disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_tokens
+=512, disaggregation_decode_polling_interval=1, optimistic_prefill_retries=0, enable_pd_flip_state_machine=True, pd_fli
+p_window_seconds=1.0, pd_flip_slo_threshold=0.9, pd_flip_prefill_nodes=None, pd_flip_decode_nodes=None, pd_flip_prefill
+_slo_attainment=None, pd_flip_decode_slo_attainment=None, pd_flip_prepare_ack=False, pd_flip_commit_ack=False, pd_flip_
+abort=False, enable_pd_runtime_role_switch=True, pd_runtime_initial_role=None, encoder_only=False, language_only=False,
+ encoder_transfer_backend='zmq_to_scheduler', encoder_urls=[], encoder_bootstrap_port=8997, encoder_register_urls=[], e
+nable_adaptive_dispatch_to_encoder=False, custom_weight_loader=[], weight_loader_disable_mmap=False, weight_loader_pref
+etch_checkpoints=False, weight_loader_prefetch_num_threads=4, weight_loader_drop_cache_after_load=False, remote_instanc
+e_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_w
+eight_loader_send_weights_group_ports=None, remote_instance_weight_loader_backend='nccl', remote_instance_weight_loader
+_start_seed_via_transfer_engine=False, engine_info_bootstrap_port=6789, modelexpress_config=None, enable_pdmux=False, p
+dmux_config_path=None, sm_group_num=8, enable_broadcast_mm_inputs_process=False, enable_prefix_mm_cache=False, mm_enabl
+e_dp_encoder=False, mm_process_config={}, limit_mm_data_per_request=None, enable_mm_global_cache=False, decrypted_confi
+g_file=None, decrypted_draft_config_file=None, forward_hooks=None, enable_quant_communications=False, msprobe_dump_conf
+ig=None)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2229:[2026-07-09
+ 05:06:09 TP0] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2230:[2026-07-09
+ 05:06:09 TP2] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2231:[2026-07-09
+ 05:06:09 TP3] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2232:[2026-07-09
+ 05:06:09 TP6] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2233:[2026-07-09
+ 05:06:09 TP4] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2234:[2026-07-09
+ 05:06:09 TP1] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2235:[2026-07-09
+ 05:06:09 TP7] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2236:[2026-07-09
+ 05:06:09 TP5] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2237:[2026-07-09
+ 05:06:55 TP6] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2238:[2026-07-09
+ 05:06:55 TP6] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2239:[2026-07-09
+ 05:06:55 TP3] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2240:[2026-07-09
+ 05:06:55 TP3] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2249:[2026-07-09
+ 05:06:55 TP5] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2250:[2026-07-09
+ 05:06:55 TP5] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2251:[2026-07-09
+ 05:06:55 TP2] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2252:[2026-07-09
+ 05:06:55 TP2] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2259:[2026-07-09
+ 05:06:55 TP7] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2260:[2026-07-09
+ 05:06:55 TP7] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2265:[2026-07-09
+ 05:06:55 TP4] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2266:[2026-07-09
+ 05:06:55 TP4] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2273:[2026-07-09
+ 05:06:55 TP0] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2274:[2026-07-09
+ 05:06:55 TP0] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2275:[2026-07-09
+ 05:06:55 TP1] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2276:[2026-07-09
+ 05:06:55 TP1] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2285:E0709 05:08
+:55.107005  5257 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2286:W0709 05:08
+:55.108211   180 real_client.cpp:707] Failed to create client on port 12617, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2287:E0709 05:08
+:55.113096  5302 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2288:W0709 05:08
+:55.114254   177 real_client.cpp:707] Failed to create client on port 13079, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2289:E0709 05:08
+:55.137627  5504 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2290:W0709 05:08
+:55.138739   179 real_client.cpp:707] Failed to create client on port 14149, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2291:E0709 05:08
+:55.146046  5614 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2292:W0709 05:08
+:55.147137   176 real_client.cpp:707] Failed to create client on port 13148, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2293:E0709 05:08
+:55.158546  5802 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2294:W0709 05:08
+:55.159698   181 real_client.cpp:707] Failed to create client on port 13671, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2295:E0709 05:08
+:55.172811  5999 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2296:W0709 05:08
+:55.174034   178 real_client.cpp:707] Failed to create client on port 12463, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2297:E0709 05:08
+:55.189200  6246 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2298:W0709 05:08
+:55.190481   174 real_client.cpp:707] Failed to create client on port 13146, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2299:E0709 05:08
+:55.193341  6312 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2300:W0709 05:08
+:55.194482   175 real_client.cpp:707] Failed to create client on port 12993, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2333:E0709 05:10
+:55.211879  5259 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2334:W0709 05:10
+:55.212930   180 real_client.cpp:707] Failed to create client on port 13789, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2335:E0709 05:10
+:55.218053  5307 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2336:W0709 05:10
+:55.219141   177 real_client.cpp:707] Failed to create client on port 13029, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2337:E0709 05:10
+:55.242281  5510 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2338:W0709 05:10
+:55.243321   179 real_client.cpp:707] Failed to create client on port 13980, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2339:E0709 05:10
+:55.250653  5622 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2340:W0709 05:10
+:55.251668   176 real_client.cpp:707] Failed to create client on port 13337, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2341:E0709 05:10
+:55.263206  5808 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2342:W0709 05:10
+:55.264170   181 real_client.cpp:707] Failed to create client on port 13521, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2343:E0709 05:10
+:55.277766  6007 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2344:W0709 05:10
+:55.278802   178 real_client.cpp:707] Failed to create client on port 13865, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2345:E0709 05:10
+:55.293852  6254 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2346:W0709 05:10
+:55.294974   174 real_client.cpp:707] Failed to create client on port 14212, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2347:E0709 05:10
+:55.298091  6322 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2348:W0709 05:10
+:55.299048   175 real_client.cpp:707] Failed to create client on port 13207, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2381:E0709 05:12
+:55.316289  5261 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2382:W0709 05:12
+:55.317132   180 real_client.cpp:707] Failed to create client on port 12664, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2383:E0709 05:12
+:55.322696  5311 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2384:W0709 05:12
+:55.323539   177 real_client.cpp:707] Failed to create client on port 13508, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2385:E0709 05:12
+:55.346673  5516 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2386:W0709 05:12
+:55.347536   179 real_client.cpp:707] Failed to create client on port 12464, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2387:E0709 05:12
+:55.355113  5630 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2388:W0709 05:12
+:55.356117   176 real_client.cpp:707] Failed to create client on port 12534, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2389:E0709 05:12
+:55.367607  5816 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2390:W0709 05:12
+:55.368525   181 real_client.cpp:707] Failed to create client on port 12759, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2391:E0709 05:12
+:55.382135  6014 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2392:W0709 05:12
+:55.382941   178 real_client.cpp:707] Failed to create client on port 12363, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2393:E0709 05:12
+:55.398418  6262 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2394:W0709 05:12
+:55.399259   174 real_client.cpp:707] Failed to create client on port 12570, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2395:E0709 05:12
+:55.402444  6332 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2396:W0709 05:12
+:55.403369   175 real_client.cpp:707] Failed to create client on port 12840, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2429:E0709 05:14
+:55.420384  5263 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2430:W0709 05:14
+:55.421294   180 real_client.cpp:707] Failed to create client on port 13110, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2431:E0709 05:14
+:55.426935  5315 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2432:W0709 05:14
+:55.427964   177 real_client.cpp:707] Failed to create client on port 13106, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2433:E0709 05:14
+:55.451161  5521 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2434:W0709 05:14
+:55.452183   179 real_client.cpp:707] Failed to create client on port 12645, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2435:E0709 05:14
+:55.459326  5638 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2436:W0709 05:14
+:55.460285   176 real_client.cpp:707] Failed to create client on port 13968, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2437:E0709 05:14
+:55.471925  5824 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2438:W0709 05:14
+:55.472935   181 real_client.cpp:707] Failed to create client on port 13469, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2439:E0709 05:14
+:55.486268  6021 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2440:W0709 05:14
+:55.487286   178 real_client.cpp:707] Failed to create client on port 12767, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2441:E0709 05:14
+:55.502543  6269 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2442:W0709 05:14
+:55.503598   174 real_client.cpp:707] Failed to create client on port 13744, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2443:E0709 05:14
+:55.506683  6340 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud100.worker.waiting_queue_full_link.log:2444:W0709 05:14
+:55.507498   175 real_client.cpp:707] Failed to create client on port 13903, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:25:[2026-07-09 0
+4:59:28] server_args=ServerArgs(model_path='/models/deepseek_v3.1_terminus', tokenizer_path='/models/deepseek_v3.1_term
+inus', tokenizer_mode='auto', tokenizer_backend='huggingface', tokenizer_worker_num=1, detokenizer_worker_num=1, skip_t
+okenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=None, i
+s_embedding=False, prefill_only_disable_kv_cache=False, enable_multimodal=None, revision=None, model_impl='auto', model
+_config_parser='auto', host='0.0.0.0', port=32000, fastapi_root_path='', grpc_mode=False, skip_server_warmup=False, war
+mups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, ssl_keyfile=None, ssl_certfile=None, ssl_
+ca_certs=None, ssl_keyfile_password=None, enable_ssl_refresh=False, enable_http2=False, dtype='auto', quantization=None
+, quantization_param_path=None, kv_cache_dtype='auto', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpo
+int_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quan
+t_profile=None, mem_fraction_static=0.88, max_running_requests=2, max_queued_requests=None, max_total_tokens=None, chun
+ked_prefill_size=8192, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_pol
+icy='fcfs', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_
+priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, sc
+hedule_conservativeness=1.0, page_size=1, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_po
+licy='lru', enable_prefill_delayer=False, prefill_delayer_max_delay_passes=30, prefill_delayer_token_usage_low_watermar
+k=None, prefill_delayer_forward_passes_buckets=None, prefill_delayer_wait_seconds_buckets=None, prefill_delayer_queue_m
+in_ratio=None, prefill_delayer_max_delay_ms=None, device='cuda', tp_size=8, pp_size=1, pp_max_micro_batch_size=None, pp
+_async_batch_depth=0, stream_interval=1, batch_notify_size=16, stream_response_default_include_usage=False, incremental
+_streaming_output=False, enable_streaming_session=False, random_seed=117865763, constrained_json_whitespace_pattern=Non
+e, constrained_json_disable_any_whitespace=False, watchdog_timeout=300, soft_watchdog_timeout=None, dist_timeout=None, 
+download_dir=None, model_checksum=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, load_snapshot_publish_interv
+al=15, use_ray=False, custom_sigquit_handler=None, log_level='info', log_level_http=None, log_requests=False, log_reque
+sts_level=2, log_requests_format='text', log_requests_target=None, uvicorn_access_log_exclude_prefixes=[], crash_dump_f
+older=None, show_time_cost=False, enable_metrics=True, grpc_http_sidecar_port=None, enable_mfu_metrics=False, enable_me
+trics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_cus
+tom_labels=None, extra_metric_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e
+_request_latency=None, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, decod
+e_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_forward_pass_metrics=False, f
+orward_pass_metrics_worker_id='', forward_pass_metrics_ipc_name=None, enable_trace=False, trace_modules='request', otlp
+_traces_endpoint='localhost:4317', export_metrics_to_file=False, export_metrics_to_file_dir=None, stat_loggers=None, ap
+i_key=None, admin_api_key=None, served_model_name='deepseek_v3.1_terminus', weight_version='default', chat_template=Non
+e, hf_chat_template_name=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False,
+ reasoning_parser=None, strip_thinking_cache=False, enable_strict_thinking=False, tool_call_parser=None, tool_server=No
+ne, sampling_defaults='model', asr_max_buffer_seconds=60, asr_max_concurrent_sessions=32, dp_size=1, load_balance_metho
+d='round_robin', attn_cp_size=1, moe_dp_size=1, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{
+}', preferred_sampling_params=None, enable_lora=None, enable_lora_overlap_loading=None, max_lora_rank=None, lora_target
+_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend=
+'csgmv', max_lora_chunk_size=16, experts_shared_outer_loras=None, lora_use_virtual_experts=False, lora_strict_loading=F
+alse, lora_drain_wait_threshold=0.0, attention_backend='fa3', decode_attention_backend='triton', prefill_attention_back
+end=None, sampling_backend='flashinfer', grammar_backend='xgrammar', radix_cache_backend=None, mm_attention_backend=Non
+e, fp8_gemm_runner_backend='auto', fp4_gemm_runner_backend='auto', dsa_prefill_backend=None, dsa_decode_backend=None, d
+sa_topk_backend='sgl-kernel', disable_flashinfer_autotune=False, mamba_backend='triton', speculative_algorithm=None, sp
+eculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_draft_load_format=None, speculative
+_num_steps=None, speculative_eagle_topk=None, speculative_num_draft_tokens=None, speculative_dflash_block_size=None, sp
+eculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_token_map=None, speculative_at
+tention_mode='prefill', speculative_draft_attention_backend=None, speculative_draft_window_size=None, speculative_moe_r
+unner_backend='auto', speculative_moe_a2a_backend=None, speculative_draft_model_quantization=None, speculative_skip_dp_
+mlp_sync=False, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_type
+='BFS', speculative_ngram_max_trie_depth=18, speculative_ngram_capacity=10000000, speculative_ngram_external_corpus_pat
+h=None, speculative_ngram_external_sam_budget=0, speculative_ngram_external_corpus_max_tokens=10000000, enable_multi_la
+yer_eagle=False, speculative_adaptive=False, speculative_adaptive_config=None, ep_size=1, moe_a2a_backend='none', moe_r
+unner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, enforce_disab
+le_flashinfer_allreduce_fusion=False, enable_aiter_allreduce_fusion=False, deepep_mode='auto', deepep_dispatcher_output
+_dtype='auto', ep_num_redundant_experts=0, ep_dispatch_algorithm=None, init_expert_location='trivial', enable_eplb=Fals
+e, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalancin
+g_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, ena
+ble_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=None, elastic_ep_backend=None, enable_elas
+tic_expert_backup=False, mooncake_ib_device=None, enable_deepep_waterfill=False, elastic_ep_rejoin=False, max_mamba_cac
+he_size=None, mamba_ssm_dtype=None, mamba_full_memory_ratio=0.9, mamba_scheduler_strategy='no_buffer', mamba_track_inte
+rval=256, linear_attn_backend='triton', linear_attn_decode_backend=None, linear_attn_prefill_backend=None, enable_hiera
+rchical_cache=True, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through', hicache_io_backend='kernel
+', hicache_mem_layout='page_first', hicache_storage_backend='mooncake', hicache_storage_prefetch_policy='timeout', hica
+che_storage_backend_extra_config=None, enable_hisparse=False, hisparse_config=None, enable_lmcache=False, lmcache_confi
+g_file=None, kt_weight_path=None, kt_method='AMXINT4', kt_cpuinfer=None, kt_threadpool_count=2, kt_num_gpu_experts=None
+, kt_max_deferred_experts_per_token=None, dllm_algorithm=None, dllm_algorithm_config=None, cpu_offload_gb=0, offload_gr
+oup_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', enable_mis=False, disable_radix_cache
+=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, debug_cuda_graph=
+False, cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(backend='full', max_bs=512, bs=[1, 2, 4, 8, 12, 16, 24, 32,
+ 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 2
+40, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], tc_compiler='eager'), pr
+efill=PhaseConfig(backend='disabled', max_bs=2048, bs=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160
+, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 
+1536, 1792, 2048], tc_compiler='eager')), cuda_graph_backend_decode=None, cuda_graph_backend_prefill=None, cuda_graph_m
+ax_bs_decode=None, cuda_graph_max_bs_prefill=None, cuda_graph_bs_decode=None, cuda_graph_bs_prefill=None, cuda_graph_tc
+_compiler=None, disable_cuda_graph=False, disable_prefill_cuda_graph=False, disable_decode_cuda_graph=False, prefill_cu
+da_graph_backend=None, decode_cuda_graph_backend=None, enable_layerwise_nvtx_marker=False, enable_nccl_nvls=False, enab
+le_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_tok
+enizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, en
+able_torch_symm_mem=False, pre_warm_nccl=False, disable_overlap_schedule=False, enable_mixed_chunk=False, enable_dp_att
+ention=False, enable_dp_attention_local_control_broadcast=False, enable_dp_lm_head=False, enable_two_batch_overlap=Fals
+e, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, enable_torch_c
+ompile_debug_mode=False, torch_compile_max_bs=32, torchao_config='', enable_p2p_check=False, triton_attention_reduce_in
+_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, de
+lete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, enable_draft_weights_cpu_bac
+kup=False, allow_auto_truncate=False, enable_custom_logit_processor=False, flashinfer_mla_disable_ragged=False, disable
+_shared_experts_fusion=False, enforce_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_ima
+ge_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, enable_return_routed_experts=Fa
+lse, enable_return_indexer_topk=False, enable_deepseek_v4_fp4_indexer=False, scheduler_recv_interval=1, numa_node=None,
+ enable_deterministic_inference=False, rl_on_policy_target=None, enable_attn_tp_input_scattered=False, disable_attn_tp_
+gather=False, gc_threshold=None, kv_canary='none', kv_canary_real_data='none', kv_canary_sweep_interval=0, enable_fused
+_qk_norm_rope=False, enable_precise_embedding_interpolation=False, enable_fused_moe_sum_all_reduce=False, enable_prefil
+l_cp=False, cp_strategy=None, enable_dsa_prefill_context_parallel=False, dsa_prefill_cp_mode='round-robin-split', enabl
+e_prefill_context_parallel=False, prefill_cp_mode='in-seq-split', enable_dynamic_batch_tokenizer=False, dynamic_batch_t
+okenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tensor
+_dump_layers=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='decode', dis
+aggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=19998, disaggregation_ib_device='mlx5_0', disagg
+regation_decode_enable_radix_cache=True, disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_tokens
+=512, disaggregation_decode_polling_interval=1, optimistic_prefill_retries=0, enable_pd_flip_state_machine=True, pd_fli
+p_window_seconds=1.0, pd_flip_slo_threshold=0.9, pd_flip_prefill_nodes=None, pd_flip_decode_nodes=None, pd_flip_prefill
+_slo_attainment=None, pd_flip_decode_slo_attainment=None, pd_flip_prepare_ack=False, pd_flip_commit_ack=False, pd_flip_
+abort=False, enable_pd_runtime_role_switch=True, pd_runtime_initial_role=None, encoder_only=False, language_only=False,
+ encoder_transfer_backend='zmq_to_scheduler', encoder_urls=[], encoder_bootstrap_port=8997, encoder_register_urls=[], e
+nable_adaptive_dispatch_to_encoder=False, custom_weight_loader=[], weight_loader_disable_mmap=False, weight_loader_pref
+etch_checkpoints=False, weight_loader_prefetch_num_threads=4, weight_loader_drop_cache_after_load=False, remote_instanc
+e_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_w
+eight_loader_send_weights_group_ports=None, remote_instance_weight_loader_backend='nccl', remote_instance_weight_loader
+_start_seed_via_transfer_engine=False, engine_info_bootstrap_port=6789, modelexpress_config=None, enable_pdmux=False, p
+dmux_config_path=None, sm_group_num=8, enable_broadcast_mm_inputs_process=False, enable_prefix_mm_cache=False, mm_enabl
+e_dp_encoder=False, mm_process_config={}, limit_mm_data_per_request=None, enable_mm_global_cache=False, decrypted_confi
+g_file=None, decrypted_draft_config_file=None, forward_hooks=None, enable_quant_communications=False, msprobe_dump_conf
+ig=None)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2278:[2026-07-09
+ 05:04:44 TP6] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2279:[2026-07-09
+ 05:04:44 TP4] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2280:[2026-07-09
+ 05:04:44 TP0] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2281:[2026-07-09
+ 05:04:44 TP2] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2282:[2026-07-09
+ 05:04:44 TP5] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2283:[2026-07-09
+ 05:04:44 TP7] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2284:[2026-07-09
+ 05:04:44 TP1] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2285:[2026-07-09
+ 05:04:44 TP3] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2286:[2026-07-09
+ 05:05:30 TP0] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2287:[2026-07-09
+ 05:05:30 TP0] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2292:[2026-07-09
+ 05:05:30 TP6] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2293:[2026-07-09
+ 05:05:30 TP6] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2294:[2026-07-09
+ 05:05:30 TP3] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2295:[2026-07-09
+ 05:05:30 TP3] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2304:[2026-07-09
+ 05:05:30 TP1] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2305:[2026-07-09
+ 05:05:30 TP1] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2306:[2026-07-09
+ 05:05:30 TP4] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2307:[2026-07-09
+ 05:05:30 TP4] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2316:[2026-07-09
+ 05:05:30 TP7] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2317:[2026-07-09
+ 05:05:30 TP7] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2322:[2026-07-09
+ 05:05:30 TP2] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2323:[2026-07-09
+ 05:05:30 TP2] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2328:[2026-07-09
+ 05:05:30 TP5] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2329:[2026-07-09
+ 05:05:30 TP5] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2334:E0709 05:07
+:30.716576  5255 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2335:W0709 05:07
+:30.717994   174 real_client.cpp:707] Failed to create client on port 12495, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2336:E0709 05:07
+:30.747779  5409 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2337:W0709 05:07
+:30.749320   180 real_client.cpp:707] Failed to create client on port 12393, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2338:E0709 05:07
+:30.753522  5456 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2339:W0709 05:07
+:30.754832   177 real_client.cpp:707] Failed to create client on port 12310, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2340:E0709 05:07
+:30.780447  5711 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2341:W0709 05:07
+:30.781958   175 real_client.cpp:707] Failed to create client on port 13781, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2342:E0709 05:07
+:30.786850  5786 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2343:W0709 05:07
+:30.788196   178 real_client.cpp:707] Failed to create client on port 12423, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2344:E0709 05:07
+:30.805492  6052 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2345:W0709 05:07
+:30.806656   181 real_client.cpp:707] Failed to create client on port 13414, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2354:E0709 05:07
+:30.853965  6451 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2355:W0709 05:07
+:30.854934   176 real_client.cpp:707] Failed to create client on port 13543, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2372:E0709 05:07
+:30.955068  6662 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2375:W0709 05:07
+:30.956161   179 real_client.cpp:707] Failed to create client on port 13399, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2382:E0709 05:09
+:30.822310  5257 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2383:W0709 05:09
+:30.823884   174 real_client.cpp:707] Failed to create client on port 12866, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2384:E0709 05:09
+:30.853507  5412 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2385:W0709 05:09
+:30.854858   180 real_client.cpp:707] Failed to create client on port 14150, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2386:E0709 05:09
+:30.859004  5461 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2387:W0709 05:09
+:30.860013   177 real_client.cpp:707] Failed to create client on port 13840, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2388:E0709 05:09
+:30.886435  5717 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2389:W0709 05:09
+:30.887499   175 real_client.cpp:707] Failed to create client on port 14048, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2390:E0709 05:09
+:30.892071  5794 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2391:W0709 05:09
+:30.893285   178 real_client.cpp:707] Failed to create client on port 12657, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2392:E0709 05:09
+:30.910830  6057 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2393:W0709 05:09
+:30.911973   181 real_client.cpp:707] Failed to create client on port 13895, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2402:E0709 05:09
+:30.958551  6455 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2403:W0709 05:09
+:30.959568   176 real_client.cpp:707] Failed to create client on port 12983, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2420:E0709 05:09
+:31.060052  6664 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2423:W0709 05:09
+:31.061060   179 real_client.cpp:707] Failed to create client on port 12389, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2430:E0709 05:11
+:30.927762  5259 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2431:W0709 05:11
+:30.928887   174 real_client.cpp:707] Failed to create client on port 13105, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2432:E0709 05:11
+:30.958547  5416 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2433:W0709 05:11
+:30.959543   180 real_client.cpp:707] Failed to create client on port 14270, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2434:E0709 05:11
+:30.963702  5475 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2435:W0709 05:11
+:30.964808   177 real_client.cpp:707] Failed to create client on port 13603, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2436:E0709 05:11
+:30.991544  5722 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2437:W0709 05:11
+:30.992573   175 real_client.cpp:707] Failed to create client on port 12742, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2438:E0709 05:11
+:30.996825  5812 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2439:W0709 05:11
+:30.997740   178 real_client.cpp:707] Failed to create client on port 12639, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2440:E0709 05:11
+:31.015385  6062 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2441:W0709 05:11
+:31.016348   181 real_client.cpp:707] Failed to create client on port 13518, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2450:E0709 05:11
+:31.063150  6459 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2451:W0709 05:11
+:31.064109   176 real_client.cpp:707] Failed to create client on port 13213, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2468:E0709 05:11
+:31.164551  6666 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2471:W0709 05:11
+:31.165592   179 real_client.cpp:707] Failed to create client on port 14267, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2478:E0709 05:13
+:31.032508  5261 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2479:W0709 05:13
+:31.033497   174 real_client.cpp:707] Failed to create client on port 13278, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2480:E0709 05:13
+:31.063129  5420 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2481:W0709 05:13
+:31.064281   180 real_client.cpp:707] Failed to create client on port 14068, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2482:E0709 05:13
+:31.068349  5487 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2483:W0709 05:13
+:31.069583   177 real_client.cpp:707] Failed to create client on port 13683, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2484:E0709 05:13
+:31.096362  5727 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2485:W0709 05:13
+:31.097429   175 real_client.cpp:707] Failed to create client on port 13055, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2486:E0709 05:13
+:31.101027  5820 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2487:W0709 05:13
+:31.101861   178 real_client.cpp:707] Failed to create client on port 13854, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2488:E0709 05:13
+:31.119568  6068 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2489:W0709 05:13
+:31.120417   181 real_client.cpp:707] Failed to create client on port 13905, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2498:E0709 05:13
+:31.167613  6463 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2499:W0709 05:13
+:31.168551   176 real_client.cpp:707] Failed to create client on port 12675, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2518:E0709 05:13
+:31.269112  6668 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud101.worker.waiting_queue_full_link.log:2519:W0709 05:13
+:31.270021   179 real_client.cpp:707] Failed to create client on port 14082, retry 4/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:25:[2026-07-09 0
+4:59:28] server_args=ServerArgs(model_path='/models/deepseek_v3.1_terminus', tokenizer_path='/models/deepseek_v3.1_term
+inus', tokenizer_mode='auto', tokenizer_backend='huggingface', tokenizer_worker_num=1, detokenizer_worker_num=1, skip_t
+okenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=None, i
+s_embedding=False, prefill_only_disable_kv_cache=False, enable_multimodal=None, revision=None, model_impl='auto', model
+_config_parser='auto', host='0.0.0.0', port=32000, fastapi_root_path='', grpc_mode=False, skip_server_warmup=False, war
+mups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, ssl_keyfile=None, ssl_certfile=None, ssl_
+ca_certs=None, ssl_keyfile_password=None, enable_ssl_refresh=False, enable_http2=False, dtype='auto', quantization=None
+, quantization_param_path=None, kv_cache_dtype='auto', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpo
+int_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quan
+t_profile=None, mem_fraction_static=0.88, max_running_requests=2, max_queued_requests=None, max_total_tokens=None, chun
+ked_prefill_size=8192, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_pol
+icy='fcfs', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_
+priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, sc
+hedule_conservativeness=1.0, page_size=1, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_po
+licy='lru', enable_prefill_delayer=False, prefill_delayer_max_delay_passes=30, prefill_delayer_token_usage_low_watermar
+k=None, prefill_delayer_forward_passes_buckets=None, prefill_delayer_wait_seconds_buckets=None, prefill_delayer_queue_m
+in_ratio=None, prefill_delayer_max_delay_ms=None, device='cuda', tp_size=8, pp_size=1, pp_max_micro_batch_size=None, pp
+_async_batch_depth=0, stream_interval=1, batch_notify_size=16, stream_response_default_include_usage=False, incremental
+_streaming_output=False, enable_streaming_session=False, random_seed=1038178546, constrained_json_whitespace_pattern=No
+ne, constrained_json_disable_any_whitespace=False, watchdog_timeout=300, soft_watchdog_timeout=None, dist_timeout=None,
+ download_dir=None, model_checksum=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, load_snapshot_publish_inter
+val=15, use_ray=False, custom_sigquit_handler=None, log_level='info', log_level_http=None, log_requests=False, log_requ
+ests_level=2, log_requests_format='text', log_requests_target=None, uvicorn_access_log_exclude_prefixes=[], crash_dump_
+folder=None, show_time_cost=False, enable_metrics=True, grpc_http_sidecar_port=None, enable_mfu_metrics=False, enable_m
+etrics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_cu
+stom_labels=None, extra_metric_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2
+e_request_latency=None, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, deco
+de_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_forward_pass_metrics=False, 
+forward_pass_metrics_worker_id='', forward_pass_metrics_ipc_name=None, enable_trace=False, trace_modules='request', otl
+p_traces_endpoint='localhost:4317', export_metrics_to_file=False, export_metrics_to_file_dir=None, stat_loggers=None, a
+pi_key=None, admin_api_key=None, served_model_name='deepseek_v3.1_terminus', weight_version='default', chat_template=No
+ne, hf_chat_template_name=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False
+, reasoning_parser=None, strip_thinking_cache=False, enable_strict_thinking=False, tool_call_parser=None, tool_server=N
+one, sampling_defaults='model', asr_max_buffer_seconds=60, asr_max_concurrent_sessions=32, dp_size=1, load_balance_meth
+od='round_robin', attn_cp_size=1, moe_dp_size=1, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='
+{}', preferred_sampling_params=None, enable_lora=None, enable_lora_overlap_loading=None, max_lora_rank=None, lora_targe
+t_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend
+='csgmv', max_lora_chunk_size=16, experts_shared_outer_loras=None, lora_use_virtual_experts=False, lora_strict_loading=
+False, lora_drain_wait_threshold=0.0, attention_backend='fa3', decode_attention_backend='triton', prefill_attention_bac
+kend=None, sampling_backend='flashinfer', grammar_backend='xgrammar', radix_cache_backend=None, mm_attention_backend=No
+ne, fp8_gemm_runner_backend='auto', fp4_gemm_runner_backend='auto', dsa_prefill_backend=None, dsa_decode_backend=None, 
+dsa_topk_backend='sgl-kernel', disable_flashinfer_autotune=False, mamba_backend='triton', speculative_algorithm=None, s
+peculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_draft_load_format=None, speculativ
+e_num_steps=None, speculative_eagle_topk=None, speculative_num_draft_tokens=None, speculative_dflash_block_size=None, s
+peculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_token_map=None, speculative_a
+ttention_mode='prefill', speculative_draft_attention_backend=None, speculative_draft_window_size=None, speculative_moe_
+runner_backend='auto', speculative_moe_a2a_backend=None, speculative_draft_model_quantization=None, speculative_skip_dp
+_mlp_sync=False, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_typ
+e='BFS', speculative_ngram_max_trie_depth=18, speculative_ngram_capacity=10000000, speculative_ngram_external_corpus_pa
+th=None, speculative_ngram_external_sam_budget=0, speculative_ngram_external_corpus_max_tokens=10000000, enable_multi_l
+ayer_eagle=False, speculative_adaptive=False, speculative_adaptive_config=None, ep_size=1, moe_a2a_backend='none', moe_
+runner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, enforce_disa
+ble_flashinfer_allreduce_fusion=False, enable_aiter_allreduce_fusion=False, deepep_mode='auto', deepep_dispatcher_outpu
+t_dtype='auto', ep_num_redundant_experts=0, ep_dispatch_algorithm=None, init_expert_location='trivial', enable_eplb=Fal
+se, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalanci
+ng_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, en
+able_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=None, elastic_ep_backend=None, enable_ela
+stic_expert_backup=False, mooncake_ib_device=None, enable_deepep_waterfill=False, elastic_ep_rejoin=False, max_mamba_ca
+che_size=None, mamba_ssm_dtype=None, mamba_full_memory_ratio=0.9, mamba_scheduler_strategy='no_buffer', mamba_track_int
+erval=256, linear_attn_backend='triton', linear_attn_decode_backend=None, linear_attn_prefill_backend=None, enable_hier
+archical_cache=True, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through', hicache_io_backend='kerne
+l', hicache_mem_layout='page_first', hicache_storage_backend='mooncake', hicache_storage_prefetch_policy='timeout', hic
+ache_storage_backend_extra_config=None, enable_hisparse=False, hisparse_config=None, enable_lmcache=False, lmcache_conf
+ig_file=None, kt_weight_path=None, kt_method='AMXINT4', kt_cpuinfer=None, kt_threadpool_count=2, kt_num_gpu_experts=Non
+e, kt_max_deferred_experts_per_token=None, dllm_algorithm=None, dllm_algorithm_config=None, cpu_offload_gb=0, offload_g
+roup_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', enable_mis=False, disable_radix_cach
+e=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, debug_cuda_graph
+=False, cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(backend='full', max_bs=512, bs=[1, 2, 4, 8, 12, 16, 24, 32
+, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 
+240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], tc_compiler='eager'), p
+refill=PhaseConfig(backend='disabled', max_bs=2048, bs=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 16
+0, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280,
+ 1536, 1792, 2048], tc_compiler='eager')), cuda_graph_backend_decode=None, cuda_graph_backend_prefill=None, cuda_graph_
+max_bs_decode=None, cuda_graph_max_bs_prefill=None, cuda_graph_bs_decode=None, cuda_graph_bs_prefill=None, cuda_graph_t
+c_compiler=None, disable_cuda_graph=False, disable_prefill_cuda_graph=False, disable_decode_cuda_graph=False, prefill_c
+uda_graph_backend=None, decode_cuda_graph_backend=None, enable_layerwise_nvtx_marker=False, enable_nccl_nvls=False, ena
+ble_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_to
+kenizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, e
+nable_torch_symm_mem=False, pre_warm_nccl=False, disable_overlap_schedule=False, enable_mixed_chunk=False, enable_dp_at
+tention=False, enable_dp_attention_local_control_broadcast=False, enable_dp_lm_head=False, enable_two_batch_overlap=Fal
+se, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, enable_torch_
+compile_debug_mode=False, torch_compile_max_bs=32, torchao_config='', enable_p2p_check=False, triton_attention_reduce_i
+n_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, d
+elete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, enable_draft_weights_cpu_ba
+ckup=False, allow_auto_truncate=False, enable_custom_logit_processor=False, flashinfer_mla_disable_ragged=False, disabl
+e_shared_experts_fusion=False, enforce_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_im
+age_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, enable_return_routed_experts=F
+alse, enable_return_indexer_topk=False, enable_deepseek_v4_fp4_indexer=False, scheduler_recv_interval=1, numa_node=None
+, enable_deterministic_inference=False, rl_on_policy_target=None, enable_attn_tp_input_scattered=False, disable_attn_tp
+_gather=False, gc_threshold=None, kv_canary='none', kv_canary_real_data='none', kv_canary_sweep_interval=0, enable_fuse
+d_qk_norm_rope=False, enable_precise_embedding_interpolation=False, enable_fused_moe_sum_all_reduce=False, enable_prefi
+ll_cp=False, cp_strategy=None, enable_dsa_prefill_context_parallel=False, dsa_prefill_cp_mode='round-robin-split', enab
+le_prefill_context_parallel=False, prefill_cp_mode='in-seq-split', enable_dynamic_batch_tokenizer=False, dynamic_batch_
+tokenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tenso
+r_dump_layers=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='decode', di
+saggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=19998, disaggregation_ib_device='mlx5_0', disag
+gregation_decode_enable_radix_cache=True, disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_token
+s=512, disaggregation_decode_polling_interval=1, optimistic_prefill_retries=0, enable_pd_flip_state_machine=True, pd_fl
+ip_window_seconds=1.0, pd_flip_slo_threshold=0.9, pd_flip_prefill_nodes=None, pd_flip_decode_nodes=None, pd_flip_prefil
+l_slo_attainment=None, pd_flip_decode_slo_attainment=None, pd_flip_prepare_ack=False, pd_flip_commit_ack=False, pd_flip
+_abort=False, enable_pd_runtime_role_switch=True, pd_runtime_initial_role=None, encoder_only=False, language_only=False
+, encoder_transfer_backend='zmq_to_scheduler', encoder_urls=[], encoder_bootstrap_port=8997, encoder_register_urls=[], 
+enable_adaptive_dispatch_to_encoder=False, custom_weight_loader=[], weight_loader_disable_mmap=False, weight_loader_pre
+fetch_checkpoints=False, weight_loader_prefetch_num_threads=4, weight_loader_drop_cache_after_load=False, remote_instan
+ce_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_
+weight_loader_send_weights_group_ports=None, remote_instance_weight_loader_backend='nccl', remote_instance_weight_loade
+r_start_seed_via_transfer_engine=False, engine_info_bootstrap_port=6789, modelexpress_config=None, enable_pdmux=False, 
+pdmux_config_path=None, sm_group_num=8, enable_broadcast_mm_inputs_process=False, enable_prefix_mm_cache=False, mm_enab
+le_dp_encoder=False, mm_process_config={}, limit_mm_data_per_request=None, enable_mm_global_cache=False, decrypted_conf
+ig_file=None, decrypted_draft_config_file=None, forward_hooks=None, enable_quant_communications=False, msprobe_dump_con
+fig=None)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2221:[2026-07-09
+ 05:06:31 TP3] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2222:[2026-07-09
+ 05:06:31 TP1] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2223:[2026-07-09
+ 05:06:31 TP6] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2224:[2026-07-09
+ 05:06:31 TP4] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2225:[2026-07-09
+ 05:06:31 TP7] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2226:[2026-07-09
+ 05:06:31 TP0] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2227:[2026-07-09
+ 05:06:31 TP2] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2228:[2026-07-09
+ 05:06:31 TP5] Allocating 90.09 GB host memory for hierarchical KV cache.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2229:[2026-07-09
+ 05:07:17 TP7] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2230:[2026-07-09
+ 05:07:17 TP7] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2235:[2026-07-09
+ 05:07:17 TP2] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2236:[2026-07-09
+ 05:07:17 TP2] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2241:[2026-07-09
+ 05:07:17 TP0] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2242:[2026-07-09
+ 05:07:17 TP0] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2247:[2026-07-09
+ 05:07:17 TP1] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2248:[2026-07-09
+ 05:07:17 TP1] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2253:[2026-07-09
+ 05:07:17 TP5] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2254:[2026-07-09
+ 05:07:17 TP5] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2259:[2026-07-09
+ 05:07:17 TP6] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2260:[2026-07-09
+ 05:07:17 TP6] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2265:[2026-07-09
+ 05:07:17 TP4] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2266:[2026-07-09
+ 05:07:17 TP4] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2271:[2026-07-09
+ 05:07:17 TP3] Creating storage backend 'mooncake' (sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.Mooncake
+Store)
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2272:[2026-07-09
+ 05:07:17 TP3] Mooncake Configuration loaded from env successfully.
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2277:E0709 05:09
+:17.265441  5255 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2278:W0709 05:09
+:17.266589   181 real_client.cpp:707] Failed to create client on port 14162, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2279:E0709 05:09
+:17.281950  5345 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2280:W0709 05:09
+:17.283124   176 real_client.cpp:707] Failed to create client on port 13437, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2281:E0709 05:09
+:17.304355  5535 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2282:W0709 05:09
+:17.305680   174 real_client.cpp:707] Failed to create client on port 13793, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2283:E0709 05:09
+:17.334308  5787 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2284:W0709 05:09
+:17.335390   175 real_client.cpp:707] Failed to create client on port 13334, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2285:E0709 05:09
+:17.363320  5986 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2286:W0709 05:09
+:17.364485   179 real_client.cpp:707] Failed to create client on port 13309, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2299:E0709 05:09
+:17.434641  6259 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2300:W0709 05:09
+:17.435608   180 real_client.cpp:707] Failed to create client on port 12391, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2309:E0709 05:09
+:17.535248  6460 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2312:W0709 05:09
+:17.536394   178 real_client.cpp:707] Failed to create client on port 12950, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2315:E0709 05:09
+:17.635505  6661 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2316:W0709 05:09
+:17.636642   177 real_client.cpp:707] Failed to create client on port 14063, retry 1/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2325:E0709 05:11
+:17.370337  5257 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2326:W0709 05:11
+:17.371470   181 real_client.cpp:707] Failed to create client on port 12765, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2327:E0709 05:11
+:17.387025  5349 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2328:W0709 05:11
+:17.388173   176 real_client.cpp:707] Failed to create client on port 13666, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2329:E0709 05:11
+:17.409628  5541 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2330:W0709 05:11
+:17.410678   174 real_client.cpp:707] Failed to create client on port 14097, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2331:E0709 05:11
+:17.439250  5791 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2332:W0709 05:11
+:17.440297   175 real_client.cpp:707] Failed to create client on port 13087, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2333:E0709 05:11
+:17.468860  5990 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2334:W0709 05:11
+:17.469945   179 real_client.cpp:707] Failed to create client on port 12642, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2347:E0709 05:11
+:17.539660  6261 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2350:W0709 05:11
+:17.540783   180 real_client.cpp:707] Failed to create client on port 12490, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2357:E0709 05:11
+:17.640725  6462 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2360:W0709 05:11
+:17.641993   178 real_client.cpp:707] Failed to create client on port 13309, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2363:E0709 05:11
+:17.740507  6663 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2364:W0709 05:11
+:17.741601   177 real_client.cpp:707] Failed to create client on port 14114, retry 2/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2373:E0709 05:13
+:17.475153  5259 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2374:W0709 05:13
+:17.476112   181 real_client.cpp:707] Failed to create client on port 12924, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2375:E0709 05:13
+:17.492022  5353 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2376:W0709 05:13
+:17.493240   176 real_client.cpp:707] Failed to create client on port 12725, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2377:E0709 05:13
+:17.514284  5547 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2378:W0709 05:13
+:17.515501   174 real_client.cpp:707] Failed to create client on port 12507, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2379:E0709 05:13
+:17.543907  5795 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2380:W0709 05:13
+:17.544920   175 real_client.cpp:707] Failed to create client on port 12464, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2381:E0709 05:13
+:17.573966  5994 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2382:W0709 05:13
+:17.575213   179 real_client.cpp:707] Failed to create client on port 13244, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2395:E0709 05:13
+:17.644728  6263 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2398:W0709 05:13
+:17.645690   180 real_client.cpp:707] Failed to create client on port 13911, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2405:E0709 05:13
+:17.745893  6464 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2408:W0709 05:13
+:17.746951   178 real_client.cpp:707] Failed to create client on port 13353, retry 3/20
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2411:E0709 05:13
+:17.845570  6665 master_client.cpp:339] Client not available
+experiments\pd_flip_hicache_stitch_partial_20260709_131714\cloud102.worker.waiting_queue_full_link.log:2412:W0709 05:13
+:17.846504   177 real_client.cpp:707] Failed to create client on port 12710, retry 3/20
+
+

@@ -1,0 +1,224 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="560" viewBox="0 0 1180 560" role="img" aria-label="Average TPOT Curve Comparison">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <text x="42" y="32" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700" fill="#0f172a">Average TPOT Curve Comparison</text>
+  <text x="42" y="512" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#475569">x axis: request index (trace-001 ... trace-100). Missing state-machine points are zero-chunk/no first-token requests and are intentionally left as gaps. Missing count: 17.</text>
+  <line x1="78.00" y1="464.00" x2="1108.00" y2="464.00" stroke="#e2e8f0" stroke-width="1" />
+  <text x="68.00" y="464.00" font-size="12" fill="#475569" text-anchor="end" dominant-baseline="middle">0.000s</text>
+  <line x1="78.00" y1="382.00" x2="1108.00" y2="382.00" stroke="#e2e8f0" stroke-width="1" />
+  <text x="68.00" y="382.00" font-size="12" fill="#475569" text-anchor="end" dominant-baseline="middle">0.005s</text>
+  <line x1="78.00" y1="300.00" x2="1108.00" y2="300.00" stroke="#e2e8f0" stroke-width="1" />
+  <text x="68.00" y="300.00" font-size="12" fill="#475569" text-anchor="end" dominant-baseline="middle">0.010s</text>
+  <line x1="78.00" y1="218.00" x2="1108.00" y2="218.00" stroke="#e2e8f0" stroke-width="1" />
+  <text x="68.00" y="218.00" font-size="12" fill="#475569" text-anchor="end" dominant-baseline="middle">0.015s</text>
+  <line x1="78.00" y1="136.00" x2="1108.00" y2="136.00" stroke="#e2e8f0" stroke-width="1" />
+  <text x="68.00" y="136.00" font-size="12" fill="#475569" text-anchor="end" dominant-baseline="middle">0.020s</text>
+  <line x1="78.00" y1="54.00" x2="1108.00" y2="54.00" stroke="#e2e8f0" stroke-width="1" />
+  <text x="68.00" y="54.00" font-size="12" fill="#475569" text-anchor="end" dominant-baseline="middle">0.025s</text>
+  <line x1="78.00" y1="54.00" x2="78.00" y2="464.00" stroke="#f1f5f9" stroke-width="1" />
+  <text x="78.00" y="490.00" font-size="12" fill="#475569" text-anchor="middle">1</text>
+  <line x1="275.68" y1="54.00" x2="275.68" y2="464.00" stroke="#f1f5f9" stroke-width="1" />
+  <text x="275.68" y="490.00" font-size="12" fill="#475569" text-anchor="middle">20</text>
+  <line x1="483.76" y1="54.00" x2="483.76" y2="464.00" stroke="#f1f5f9" stroke-width="1" />
+  <text x="483.76" y="490.00" font-size="12" fill="#475569" text-anchor="middle">40</text>
+  <line x1="691.84" y1="54.00" x2="691.84" y2="464.00" stroke="#f1f5f9" stroke-width="1" />
+  <text x="691.84" y="490.00" font-size="12" fill="#475569" text-anchor="middle">60</text>
+  <line x1="899.92" y1="54.00" x2="899.92" y2="464.00" stroke="#f1f5f9" stroke-width="1" />
+  <text x="899.92" y="490.00" font-size="12" fill="#475569" text-anchor="middle">80</text>
+  <line x1="1108.00" y1="54.00" x2="1108.00" y2="464.00" stroke="#f1f5f9" stroke-width="1" />
+  <text x="1108.00" y="490.00" font-size="12" fill="#475569" text-anchor="middle">100</text>
+  <line x1="78.00" y1="54.00" x2="78.00" y2="464.00" stroke="#334155" stroke-width="1.2" />
+  <line x1="78.00" y1="464.00" x2="1108.00" y2="464.00" stroke="#334155" stroke-width="1.2" />
+  <text x="20" y="259.00" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#334155" transform="rotate(-90 20 259.00)" text-anchor="middle">Avg TPOT seconds</text>
+  <line x1="78.00" y1="136.00" x2="1108.00" y2="136.00" stroke="#7c3aed" stroke-width="2" stroke-dasharray="8 6" />
+  <text x="1102.00" y="128.00" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#6d28d9" text-anchor="end">SLO = 0.02 s</text>
+  <path d="M 78.00 263.82 L 88.40 263.75 L 98.81 263.00 L 109.21 318.37 L 119.62 263.78 L 130.02 263.70 L 140.42 262.80 L 150.83 263.01 L 161.23 263.77 L 171.64 262.81 L 182.04 262.73 L 192.44 262.99 L 202.85 263.60 L 213.25 263.84 L 223.66 262.77 L 234.06 263.71 L 244.46 282.55 L 254.87 272.96 L 265.27 261.03 L 275.68 273.84 L 286.08 260.65 L 296.48 260.48 L 306.89 260.90 L 317.29 260.86 L 327.70 261.38 L 338.10 261.42 L 348.51 261.39 L 358.91 293.32 L 369.31 261.36 L 379.72 280.06 L 390.12 261.39 L 400.53 261.42 L 410.93 275.95 L 421.33 302.12 L 431.74 271.94 L 442.14 293.46 L 452.55 259.71 L 462.95 259.84 L 473.35 259.77 L 483.76 259.82 L 494.16 259.74 L 504.57 260.26 L 514.97 266.61 L 525.37 259.79 L 535.78 259.69 L 546.18 260.29 L 556.59 260.03 L 566.99 259.76 L 577.39 259.82 L 587.80 276.52 L 598.20 286.36 L 608.61 319.31 L 619.01 260.71 L 629.41 260.70 L 639.82 260.76 L 650.22 260.71 L 660.63 260.75 L 671.03 262.27 L 681.43 273.63 L 691.84 273.81 L 702.24 261.28 L 712.65 261.19 L 723.05 261.17 L 733.45 261.24 L 743.86 261.14 L 754.26 261.23 L 764.67 283.92 L 775.07 266.37 L 785.47 265.12 L 795.88 261.13 L 806.28 264.89 L 816.69 264.84 L 827.09 261.07 L 837.49 261.18 L 847.90 261.15 L 858.30 267.04 L 868.71 300.49 L 879.11 281.82 L 889.52 261.57 L 899.92 261.27 L 910.32 261.27 L 920.73 261.19 L 931.13 261.21 L 941.54 261.25 L 951.94 269.32 L 962.34 264.55 L 972.75 264.33 L 983.15 261.13 L 993.56 261.11 L 1003.96 261.10 L 1014.36 261.14 L 1024.77 265.15 L 1035.17 283.01 L 1045.58 293.04 L 1055.98 262.18 L 1066.38 260.84 L 1076.79 261.05 L 1087.19 260.91 L 1097.60 261.09 L 1108.00 261.11" fill="none" stroke="#2563eb" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" />
+  <path d="M 78.00 246.88 L 88.40 262.04 L 98.81 240.70 L 109.21 239.61 L 119.62 262.07 L 130.02 261.96 L 140.42 243.35 L 150.83 243.05 L 161.23 261.93 L 171.64 261.93 L 182.04 238.25 L 192.44 261.95 L 202.85 240.85 L 213.25 261.99 L 223.66 240.67 L 234.06 243.06 L 244.46 303.50 L 254.87 270.22 L 265.27 270.22 L 275.68 270.21 L 286.08 265.26 L 296.48 262.46 L 306.89 262.49 L 317.29 262.61 L 327.70 262.56 L 338.10 261.65 L 348.51 261.53 L 358.91 264.92 L 369.31 261.55 L 379.72 261.60 L 390.12 261.57 L 400.53 261.61 L 410.93 284.81 L 421.33 258.95 L 431.74 259.23 L 442.14 254.83 L 452.55 249.68 L 462.95 249.40 L 473.35 249.68 L 483.76 249.42 L 494.16 249.43 L 504.57 266.94 L 514.97 273.27 L 525.37 264.50 L 535.78 264.49 L 546.18 264.42 L 556.59 264.53 L 566.99 224.70 L 577.39 224.55 L 587.80 205.61 L 598.20 202.24 L 608.61 196.06 L 619.01 195.61 L 629.41 196.02 L 639.82 195.62 L 650.22 195.62 L 660.63 195.50 L 671.03 199.55 L 681.43 199.76 L 691.84 199.08 L 702.24 199.09 L 712.65 199.20 L 723.05 199.09 L 733.45 206.92 M 754.26 230.79 M 775.07 237.43 M 795.88 237.46 M 816.69 237.46 M 837.49 254.57 M 858.30 263.80 M 879.11 263.86 M 899.92 263.85 M 931.13 280.27 L 941.54 280.19 M 972.75 295.75 L 983.15 295.76 M 1003.96 301.89 M 1024.77 317.77 M 1045.58 320.33 M 1066.38 319.95 M 1087.19 294.31 L 1097.60 294.20 L 1108.00 294.16" fill="none" stroke="#dc2626" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" />
+  <circle cx="78.00" cy="263.82" r="2.1" fill="#2563eb"><title>trace-001: 0.0122</title></circle>
+<circle cx="88.40" cy="263.75" r="2.1" fill="#2563eb"><title>trace-002: 0.0122</title></circle>
+<circle cx="98.81" cy="263.00" r="2.1" fill="#2563eb"><title>trace-003: 0.0123</title></circle>
+<circle cx="109.21" cy="318.37" r="2.1" fill="#2563eb"><title>trace-004: 0.0089</title></circle>
+<circle cx="119.62" cy="263.78" r="2.1" fill="#2563eb"><title>trace-005: 0.0122</title></circle>
+<circle cx="130.02" cy="263.70" r="2.1" fill="#2563eb"><title>trace-006: 0.0122</title></circle>
+<circle cx="140.42" cy="262.80" r="2.1" fill="#2563eb"><title>trace-007: 0.0123</title></circle>
+<circle cx="150.83" cy="263.01" r="2.1" fill="#2563eb"><title>trace-008: 0.0123</title></circle>
+<circle cx="161.23" cy="263.77" r="2.1" fill="#2563eb"><title>trace-009: 0.0122</title></circle>
+<circle cx="171.64" cy="262.81" r="2.1" fill="#2563eb"><title>trace-010: 0.0123</title></circle>
+<circle cx="182.04" cy="262.73" r="2.1" fill="#2563eb"><title>trace-011: 0.0123</title></circle>
+<circle cx="192.44" cy="262.99" r="2.1" fill="#2563eb"><title>trace-012: 0.0123</title></circle>
+<circle cx="202.85" cy="263.60" r="2.1" fill="#2563eb"><title>trace-013: 0.0122</title></circle>
+<circle cx="213.25" cy="263.84" r="2.1" fill="#2563eb"><title>trace-014: 0.0122</title></circle>
+<circle cx="223.66" cy="262.77" r="2.1" fill="#2563eb"><title>trace-015: 0.0123</title></circle>
+<circle cx="234.06" cy="263.71" r="2.1" fill="#2563eb"><title>trace-016: 0.0122</title></circle>
+<circle cx="244.46" cy="282.55" r="2.1" fill="#2563eb"><title>trace-017: 0.0111</title></circle>
+<circle cx="254.87" cy="272.96" r="2.1" fill="#2563eb"><title>trace-018: 0.0116</title></circle>
+<circle cx="265.27" cy="261.03" r="2.1" fill="#2563eb"><title>trace-019: 0.0124</title></circle>
+<circle cx="275.68" cy="273.84" r="2.1" fill="#2563eb"><title>trace-020: 0.0116</title></circle>
+<circle cx="286.08" cy="260.65" r="2.1" fill="#2563eb"><title>trace-021: 0.0124</title></circle>
+<circle cx="296.48" cy="260.48" r="2.1" fill="#2563eb"><title>trace-022: 0.0124</title></circle>
+<circle cx="306.89" cy="260.90" r="2.1" fill="#2563eb"><title>trace-023: 0.0124</title></circle>
+<circle cx="317.29" cy="260.86" r="2.1" fill="#2563eb"><title>trace-024: 0.0124</title></circle>
+<circle cx="327.70" cy="261.38" r="2.1" fill="#2563eb"><title>trace-025: 0.0124</title></circle>
+<circle cx="338.10" cy="261.42" r="2.1" fill="#2563eb"><title>trace-026: 0.0124</title></circle>
+<circle cx="348.51" cy="261.39" r="2.1" fill="#2563eb"><title>trace-027: 0.0124</title></circle>
+<circle cx="358.91" cy="293.32" r="2.1" fill="#2563eb"><title>trace-028: 0.0104</title></circle>
+<circle cx="369.31" cy="261.36" r="2.1" fill="#2563eb"><title>trace-029: 0.0124</title></circle>
+<circle cx="379.72" cy="280.06" r="2.1" fill="#2563eb"><title>trace-030: 0.0112</title></circle>
+<circle cx="390.12" cy="261.39" r="2.1" fill="#2563eb"><title>trace-031: 0.0124</title></circle>
+<circle cx="400.53" cy="261.42" r="2.1" fill="#2563eb"><title>trace-032: 0.0124</title></circle>
+<circle cx="410.93" cy="275.95" r="2.1" fill="#2563eb"><title>trace-033: 0.0115</title></circle>
+<circle cx="421.33" cy="302.12" r="2.1" fill="#2563eb"><title>trace-034: 0.0099</title></circle>
+<circle cx="431.74" cy="271.94" r="2.1" fill="#2563eb"><title>trace-035: 0.0117</title></circle>
+<circle cx="442.14" cy="293.46" r="2.1" fill="#2563eb"><title>trace-036: 0.0104</title></circle>
+<circle cx="452.55" cy="259.71" r="2.1" fill="#2563eb"><title>trace-037: 0.0125</title></circle>
+<circle cx="462.95" cy="259.84" r="2.1" fill="#2563eb"><title>trace-038: 0.0124</title></circle>
+<circle cx="473.35" cy="259.77" r="2.1" fill="#2563eb"><title>trace-039: 0.0125</title></circle>
+<circle cx="483.76" cy="259.82" r="2.1" fill="#2563eb"><title>trace-040: 0.0124</title></circle>
+<circle cx="494.16" cy="259.74" r="2.1" fill="#2563eb"><title>trace-041: 0.0125</title></circle>
+<circle cx="504.57" cy="260.26" r="2.1" fill="#2563eb"><title>trace-042: 0.0124</title></circle>
+<circle cx="514.97" cy="266.61" r="2.1" fill="#2563eb"><title>trace-043: 0.0120</title></circle>
+<circle cx="525.37" cy="259.79" r="2.1" fill="#2563eb"><title>trace-044: 0.0125</title></circle>
+<circle cx="535.78" cy="259.69" r="2.1" fill="#2563eb"><title>trace-045: 0.0125</title></circle>
+<circle cx="546.18" cy="260.29" r="2.1" fill="#2563eb"><title>trace-046: 0.0124</title></circle>
+<circle cx="556.59" cy="260.03" r="2.1" fill="#2563eb"><title>trace-047: 0.0124</title></circle>
+<circle cx="566.99" cy="259.76" r="2.1" fill="#2563eb"><title>trace-048: 0.0125</title></circle>
+<circle cx="577.39" cy="259.82" r="2.1" fill="#2563eb"><title>trace-049: 0.0124</title></circle>
+<circle cx="587.80" cy="276.52" r="2.1" fill="#2563eb"><title>trace-050: 0.0114</title></circle>
+<circle cx="598.20" cy="286.36" r="2.1" fill="#2563eb"><title>trace-051: 0.0108</title></circle>
+<circle cx="608.61" cy="319.31" r="2.1" fill="#2563eb"><title>trace-052: 0.0088</title></circle>
+<circle cx="619.01" cy="260.71" r="2.1" fill="#2563eb"><title>trace-053: 0.0124</title></circle>
+<circle cx="629.41" cy="260.70" r="2.1" fill="#2563eb"><title>trace-054: 0.0124</title></circle>
+<circle cx="639.82" cy="260.76" r="2.1" fill="#2563eb"><title>trace-055: 0.0124</title></circle>
+<circle cx="650.22" cy="260.71" r="2.1" fill="#2563eb"><title>trace-056: 0.0124</title></circle>
+<circle cx="660.63" cy="260.75" r="2.1" fill="#2563eb"><title>trace-057: 0.0124</title></circle>
+<circle cx="671.03" cy="262.27" r="2.1" fill="#2563eb"><title>trace-058: 0.0123</title></circle>
+<circle cx="681.43" cy="273.63" r="2.1" fill="#2563eb"><title>trace-059: 0.0116</title></circle>
+<circle cx="691.84" cy="273.81" r="2.1" fill="#2563eb"><title>trace-060: 0.0116</title></circle>
+<circle cx="702.24" cy="261.28" r="2.1" fill="#2563eb"><title>trace-061: 0.0124</title></circle>
+<circle cx="712.65" cy="261.19" r="2.1" fill="#2563eb"><title>trace-062: 0.0124</title></circle>
+<circle cx="723.05" cy="261.17" r="2.1" fill="#2563eb"><title>trace-063: 0.0124</title></circle>
+<circle cx="733.45" cy="261.24" r="2.1" fill="#2563eb"><title>trace-064: 0.0124</title></circle>
+<circle cx="743.86" cy="261.14" r="2.1" fill="#2563eb"><title>trace-065: 0.0124</title></circle>
+<circle cx="754.26" cy="261.23" r="2.1" fill="#2563eb"><title>trace-066: 0.0124</title></circle>
+<circle cx="764.67" cy="283.92" r="2.1" fill="#2563eb"><title>trace-067: 0.0110</title></circle>
+<circle cx="775.07" cy="266.37" r="2.1" fill="#2563eb"><title>trace-068: 0.0121</title></circle>
+<circle cx="785.47" cy="265.12" r="2.1" fill="#2563eb"><title>trace-069: 0.0121</title></circle>
+<circle cx="795.88" cy="261.13" r="2.1" fill="#2563eb"><title>trace-070: 0.0124</title></circle>
+<circle cx="806.28" cy="264.89" r="2.1" fill="#2563eb"><title>trace-071: 0.0121</title></circle>
+<circle cx="816.69" cy="264.84" r="2.1" fill="#2563eb"><title>trace-072: 0.0121</title></circle>
+<circle cx="827.09" cy="261.07" r="2.1" fill="#2563eb"><title>trace-073: 0.0124</title></circle>
+<circle cx="837.49" cy="261.18" r="2.1" fill="#2563eb"><title>trace-074: 0.0124</title></circle>
+<circle cx="847.90" cy="261.15" r="2.1" fill="#2563eb"><title>trace-075: 0.0124</title></circle>
+<circle cx="858.30" cy="267.04" r="2.1" fill="#2563eb"><title>trace-076: 0.0120</title></circle>
+<circle cx="868.71" cy="300.49" r="2.1" fill="#2563eb"><title>trace-077: 0.0100</title></circle>
+<circle cx="879.11" cy="281.82" r="2.1" fill="#2563eb"><title>trace-078: 0.0111</title></circle>
+<circle cx="889.52" cy="261.57" r="2.1" fill="#2563eb"><title>trace-079: 0.0123</title></circle>
+<circle cx="899.92" cy="261.27" r="2.1" fill="#2563eb"><title>trace-080: 0.0124</title></circle>
+<circle cx="910.32" cy="261.27" r="2.1" fill="#2563eb"><title>trace-081: 0.0124</title></circle>
+<circle cx="920.73" cy="261.19" r="2.1" fill="#2563eb"><title>trace-082: 0.0124</title></circle>
+<circle cx="931.13" cy="261.21" r="2.1" fill="#2563eb"><title>trace-083: 0.0124</title></circle>
+<circle cx="941.54" cy="261.25" r="2.1" fill="#2563eb"><title>trace-084: 0.0124</title></circle>
+<circle cx="951.94" cy="269.32" r="2.1" fill="#2563eb"><title>trace-085: 0.0119</title></circle>
+<circle cx="962.34" cy="264.55" r="2.1" fill="#2563eb"><title>trace-086: 0.0122</title></circle>
+<circle cx="972.75" cy="264.33" r="2.1" fill="#2563eb"><title>trace-087: 0.0122</title></circle>
+<circle cx="983.15" cy="261.13" r="2.1" fill="#2563eb"><title>trace-088: 0.0124</title></circle>
+<circle cx="993.56" cy="261.11" r="2.1" fill="#2563eb"><title>trace-089: 0.0124</title></circle>
+<circle cx="1003.96" cy="261.10" r="2.1" fill="#2563eb"><title>trace-090: 0.0124</title></circle>
+<circle cx="1014.36" cy="261.14" r="2.1" fill="#2563eb"><title>trace-091: 0.0124</title></circle>
+<circle cx="1024.77" cy="265.15" r="2.1" fill="#2563eb"><title>trace-092: 0.0121</title></circle>
+<circle cx="1035.17" cy="283.01" r="2.1" fill="#2563eb"><title>trace-093: 0.0110</title></circle>
+<circle cx="1045.58" cy="293.04" r="2.1" fill="#2563eb"><title>trace-094: 0.0104</title></circle>
+<circle cx="1055.98" cy="262.18" r="2.1" fill="#2563eb"><title>trace-095: 0.0123</title></circle>
+<circle cx="1066.38" cy="260.84" r="2.1" fill="#2563eb"><title>trace-096: 0.0124</title></circle>
+<circle cx="1076.79" cy="261.05" r="2.1" fill="#2563eb"><title>trace-097: 0.0124</title></circle>
+<circle cx="1087.19" cy="260.91" r="2.1" fill="#2563eb"><title>trace-098: 0.0124</title></circle>
+<circle cx="1097.60" cy="261.09" r="2.1" fill="#2563eb"><title>trace-099: 0.0124</title></circle>
+<circle cx="1108.00" cy="261.11" r="2.1" fill="#2563eb"><title>trace-100: 0.0124</title></circle>
+  <circle cx="78.00" cy="246.88" r="2.1" fill="#dc2626"><title>trace-001: 0.0132</title></circle>
+<circle cx="88.40" cy="262.04" r="2.1" fill="#dc2626"><title>trace-002: 0.0123</title></circle>
+<circle cx="98.81" cy="240.70" r="2.1" fill="#dc2626"><title>trace-003: 0.0136</title></circle>
+<circle cx="109.21" cy="239.61" r="2.1" fill="#dc2626"><title>trace-004: 0.0137</title></circle>
+<circle cx="119.62" cy="262.07" r="2.1" fill="#dc2626"><title>trace-005: 0.0123</title></circle>
+<circle cx="130.02" cy="261.96" r="2.1" fill="#dc2626"><title>trace-006: 0.0123</title></circle>
+<circle cx="140.42" cy="243.35" r="2.1" fill="#dc2626"><title>trace-007: 0.0135</title></circle>
+<circle cx="150.83" cy="243.05" r="2.1" fill="#dc2626"><title>trace-008: 0.0135</title></circle>
+<circle cx="161.23" cy="261.93" r="2.1" fill="#dc2626"><title>trace-009: 0.0123</title></circle>
+<circle cx="171.64" cy="261.93" r="2.1" fill="#dc2626"><title>trace-010: 0.0123</title></circle>
+<circle cx="182.04" cy="238.25" r="2.1" fill="#dc2626"><title>trace-011: 0.0138</title></circle>
+<circle cx="192.44" cy="261.95" r="2.1" fill="#dc2626"><title>trace-012: 0.0123</title></circle>
+<circle cx="202.85" cy="240.85" r="2.1" fill="#dc2626"><title>trace-013: 0.0136</title></circle>
+<circle cx="213.25" cy="261.99" r="2.1" fill="#dc2626"><title>trace-014: 0.0123</title></circle>
+<circle cx="223.66" cy="240.67" r="2.1" fill="#dc2626"><title>trace-015: 0.0136</title></circle>
+<circle cx="234.06" cy="243.06" r="2.1" fill="#dc2626"><title>trace-016: 0.0135</title></circle>
+<circle cx="244.46" cy="303.50" r="2.1" fill="#dc2626"><title>trace-017: 0.0098</title></circle>
+<circle cx="254.87" cy="270.22" r="2.1" fill="#dc2626"><title>trace-018: 0.0118</title></circle>
+<circle cx="265.27" cy="270.22" r="2.1" fill="#dc2626"><title>trace-019: 0.0118</title></circle>
+<circle cx="275.68" cy="270.21" r="2.1" fill="#dc2626"><title>trace-020: 0.0118</title></circle>
+<circle cx="286.08" cy="265.26" r="2.1" fill="#dc2626"><title>trace-021: 0.0121</title></circle>
+<circle cx="296.48" cy="262.46" r="2.1" fill="#dc2626"><title>trace-022: 0.0123</title></circle>
+<circle cx="306.89" cy="262.49" r="2.1" fill="#dc2626"><title>trace-023: 0.0123</title></circle>
+<circle cx="317.29" cy="262.61" r="2.1" fill="#dc2626"><title>trace-024: 0.0123</title></circle>
+<circle cx="327.70" cy="262.56" r="2.1" fill="#dc2626"><title>trace-025: 0.0123</title></circle>
+<circle cx="338.10" cy="261.65" r="2.1" fill="#dc2626"><title>trace-026: 0.0123</title></circle>
+<circle cx="348.51" cy="261.53" r="2.1" fill="#dc2626"><title>trace-027: 0.0123</title></circle>
+<circle cx="358.91" cy="264.92" r="2.1" fill="#dc2626"><title>trace-028: 0.0121</title></circle>
+<circle cx="369.31" cy="261.55" r="2.1" fill="#dc2626"><title>trace-029: 0.0123</title></circle>
+<circle cx="379.72" cy="261.60" r="2.1" fill="#dc2626"><title>trace-030: 0.0123</title></circle>
+<circle cx="390.12" cy="261.57" r="2.1" fill="#dc2626"><title>trace-031: 0.0123</title></circle>
+<circle cx="400.53" cy="261.61" r="2.1" fill="#dc2626"><title>trace-032: 0.0123</title></circle>
+<circle cx="410.93" cy="284.81" r="2.1" fill="#dc2626"><title>trace-033: 0.0109</title></circle>
+<circle cx="421.33" cy="258.95" r="2.1" fill="#dc2626"><title>trace-034: 0.0125</title></circle>
+<circle cx="431.74" cy="259.23" r="2.1" fill="#dc2626"><title>trace-035: 0.0125</title></circle>
+<circle cx="442.14" cy="254.83" r="2.1" fill="#dc2626"><title>trace-036: 0.0128</title></circle>
+<circle cx="452.55" cy="249.68" r="2.1" fill="#dc2626"><title>trace-037: 0.0131</title></circle>
+<circle cx="462.95" cy="249.40" r="2.1" fill="#dc2626"><title>trace-038: 0.0131</title></circle>
+<circle cx="473.35" cy="249.68" r="2.1" fill="#dc2626"><title>trace-039: 0.0131</title></circle>
+<circle cx="483.76" cy="249.42" r="2.1" fill="#dc2626"><title>trace-040: 0.0131</title></circle>
+<circle cx="494.16" cy="249.43" r="2.1" fill="#dc2626"><title>trace-041: 0.0131</title></circle>
+<circle cx="504.57" cy="266.94" r="2.1" fill="#dc2626"><title>trace-042: 0.0120</title></circle>
+<circle cx="514.97" cy="273.27" r="2.1" fill="#dc2626"><title>trace-043: 0.0116</title></circle>
+<circle cx="525.37" cy="264.50" r="2.1" fill="#dc2626"><title>trace-044: 0.0122</title></circle>
+<circle cx="535.78" cy="264.49" r="2.1" fill="#dc2626"><title>trace-045: 0.0122</title></circle>
+<circle cx="546.18" cy="264.42" r="2.1" fill="#dc2626"><title>trace-046: 0.0122</title></circle>
+<circle cx="556.59" cy="264.53" r="2.1" fill="#dc2626"><title>trace-047: 0.0122</title></circle>
+<circle cx="566.99" cy="224.70" r="2.1" fill="#dc2626"><title>trace-048: 0.0146</title></circle>
+<circle cx="577.39" cy="224.55" r="2.1" fill="#dc2626"><title>trace-049: 0.0146</title></circle>
+<circle cx="587.80" cy="205.61" r="2.1" fill="#dc2626"><title>trace-050: 0.0158</title></circle>
+<circle cx="598.20" cy="202.24" r="2.1" fill="#dc2626"><title>trace-051: 0.0160</title></circle>
+<circle cx="608.61" cy="196.06" r="2.1" fill="#dc2626"><title>trace-052: 0.0163</title></circle>
+<circle cx="619.01" cy="195.61" r="2.1" fill="#dc2626"><title>trace-053: 0.0164</title></circle>
+<circle cx="629.41" cy="196.02" r="2.1" fill="#dc2626"><title>trace-054: 0.0163</title></circle>
+<circle cx="639.82" cy="195.62" r="2.1" fill="#dc2626"><title>trace-055: 0.0164</title></circle>
+<circle cx="650.22" cy="195.62" r="2.1" fill="#dc2626"><title>trace-056: 0.0164</title></circle>
+<circle cx="660.63" cy="195.50" r="2.1" fill="#dc2626"><title>trace-057: 0.0164</title></circle>
+<circle cx="671.03" cy="199.55" r="2.1" fill="#dc2626"><title>trace-058: 0.0161</title></circle>
+<circle cx="681.43" cy="199.76" r="2.1" fill="#dc2626"><title>trace-059: 0.0161</title></circle>
+<circle cx="691.84" cy="199.08" r="2.1" fill="#dc2626"><title>trace-060: 0.0162</title></circle>
+<circle cx="702.24" cy="199.09" r="2.1" fill="#dc2626"><title>trace-061: 0.0162</title></circle>
+<circle cx="712.65" cy="199.20" r="2.1" fill="#dc2626"><title>trace-062: 0.0161</title></circle>
+<circle cx="723.05" cy="199.09" r="2.1" fill="#dc2626"><title>trace-063: 0.0162</title></circle>
+<circle cx="733.45" cy="206.92" r="2.1" fill="#dc2626"><title>trace-064: 0.0157</title></circle>
+<circle cx="754.26" cy="230.79" r="2.1" fill="#dc2626"><title>trace-066: 0.0142</title></circle>
+<circle cx="775.07" cy="237.43" r="2.1" fill="#dc2626"><title>trace-068: 0.0138</title></circle>
+<circle cx="795.88" cy="237.46" r="2.1" fill="#dc2626"><title>trace-070: 0.0138</title></circle>
+<circle cx="816.69" cy="237.46" r="2.1" fill="#dc2626"><title>trace-072: 0.0138</title></circle>
+<circle cx="837.49" cy="254.57" r="2.1" fill="#dc2626"><title>trace-074: 0.0128</title></circle>
+<circle cx="858.30" cy="263.80" r="2.1" fill="#dc2626"><title>trace-076: 0.0122</title></circle>
+<circle cx="879.11" cy="263.86" r="2.1" fill="#dc2626"><title>trace-078: 0.0122</title></circle>
+<circle cx="899.92" cy="263.85" r="2.1" fill="#dc2626"><title>trace-080: 0.0122</title></circle>
+<circle cx="931.13" cy="280.27" r="2.1" fill="#dc2626"><title>trace-083: 0.0112</title></circle>
+<circle cx="941.54" cy="280.19" r="2.1" fill="#dc2626"><title>trace-084: 0.0112</title></circle>
+<circle cx="972.75" cy="295.75" r="2.1" fill="#dc2626"><title>trace-087: 0.0103</title></circle>
+<circle cx="983.15" cy="295.76" r="2.1" fill="#dc2626"><title>trace-088: 0.0103</title></circle>
+<circle cx="1003.96" cy="301.89" r="2.1" fill="#dc2626"><title>trace-090: 0.0099</title></circle>
+<circle cx="1024.77" cy="317.77" r="2.1" fill="#dc2626"><title>trace-092: 0.0089</title></circle>
+<circle cx="1045.58" cy="320.33" r="2.1" fill="#dc2626"><title>trace-094: 0.0088</title></circle>
+<circle cx="1066.38" cy="319.95" r="2.1" fill="#dc2626"><title>trace-096: 0.0088</title></circle>
+<circle cx="1087.19" cy="294.31" r="2.1" fill="#dc2626"><title>trace-098: 0.0103</title></circle>
+<circle cx="1097.60" cy="294.20" r="2.1" fill="#dc2626"><title>trace-099: 0.0104</title></circle>
+<circle cx="1108.00" cy="294.16" r="2.1" fill="#dc2626"><title>trace-100: 0.0104</title></circle>
+  <rect x="830" y="18" width="295" height="54" rx="6" fill="#ffffff" stroke="#cbd5e1" />
+  <line x1="846" y1="37" x2="886" y2="37" stroke="#2563eb" stroke-width="3" />
+  <text x="896" y="41" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#0f172a">no state machine</text>
+  <line x1="846" y1="58" x2="886" y2="58" stroke="#dc2626" stroke-width="3" />
+  <text x="896" y="62" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#0f172a">state machine</text>
+</svg>

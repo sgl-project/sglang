@@ -14,6 +14,135 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 
 
 class TestPDFlipMigrationAccounting(unittest.TestCase):
+    @staticmethod
+    def _scheduler_for_source_kv_manager():
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pd_flip_source_kv_manager = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
+            kv_manager=types.SimpleNamespace(
+                kv_args=types.SimpleNamespace(page_size=1)
+            )
+        )
+        scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
+            get_kvcache=lambda: types.SimpleNamespace(
+                start_layer=0,
+                end_layer=1,
+                page_size=1,
+                compression_ratios=None,
+            )
+        )
+        scheduler.server_args = types.SimpleNamespace(
+            disaggregation_ib_device=None
+        )
+        scheduler.ps = types.SimpleNamespace(gpu_id=0)
+        scheduler.model_config = types.SimpleNamespace(
+            get_total_num_kv_heads=lambda: 1
+        )
+        scheduler.transfer_backend = "fake"
+        return scheduler
+
+    def test_source_kv_manager_reuses_existing_prefill_manager(self):
+        scheduler = self._scheduler_for_source_kv_manager()
+        existing_manager = object()
+        scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
+            kv_manager=existing_manager
+        )
+
+        class ForbiddenManager:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("must not construct a second prefill manager")
+
+        with patch(
+            "sglang.srt.managers.scheduler.get_kv_class",
+            return_value=ForbiddenManager,
+        ):
+            manager = Scheduler._pd_flip_get_source_kv_manager(scheduler)
+
+        self.assertIs(manager, existing_manager)
+        self.assertIs(scheduler.pd_flip_source_kv_manager, existing_manager)
+
+    def test_source_kv_manager_prefill_queue_overrides_stale_cached_manager(self):
+        scheduler = self._scheduler_for_source_kv_manager()
+        stale_manager = object()
+        existing_manager = object()
+        scheduler.pd_flip_source_kv_manager = stale_manager
+        scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
+            kv_manager=existing_manager
+        )
+
+        manager = Scheduler._pd_flip_get_source_kv_manager(scheduler)
+
+        self.assertIs(manager, existing_manager)
+        self.assertIs(scheduler.pd_flip_source_kv_manager, existing_manager)
+
+    def test_source_kv_manager_constructs_legacy_fallback_without_prefill_queue(self):
+        scheduler = self._scheduler_for_source_kv_manager()
+        constructed_manager = object()
+
+        class Manager:
+            def __new__(cls, *args, **kwargs):
+                return constructed_manager
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.is_mla_backend",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_kv_class",
+                return_value=Manager,
+            ),
+        ):
+            manager = Scheduler._pd_flip_get_source_kv_manager(scheduler)
+
+        self.assertIs(manager, constructed_manager)
+        self.assertIs(scheduler.pd_flip_source_kv_manager, constructed_manager)
+
+    @staticmethod
+    def _completed_delta_session(state, *, failed=False):
+        return {
+            "state": state,
+            "source_entries": {
+                "rid-1": {
+                    "delta": {
+                        "noop": False,
+                        "transferred": not failed,
+                        "failed": failed,
+                    }
+                }
+            },
+            "delta_transferred_rids": set() if failed else {"rid-1"},
+            "delta_failed_rids": {"rid-1"} if failed else set(),
+        }
+
+    @staticmethod
+    def _completed_target_session(state, *, delta=False):
+        entry = {
+            "phase": "transferred",
+            "held": False,
+            "decode_req": types.SimpleNamespace(),
+        }
+        session = {
+            "state": state,
+            "target_entries": {"rid-1": entry},
+            "manifests": [{"rid": "rid-1"}],
+            "transferred_rids": {"rid-1"},
+            "failed_rids": set(),
+            "fallback_required_rids": set(),
+        }
+        if delta:
+            entry["delta"] = {
+                "noop": False,
+                "transferred": True,
+                "failed": False,
+            }
+            session.update(
+                delta_transferred_rids={"rid-1"},
+                delta_failed_rids=set(),
+            )
+        return session
+
     def _checker_with_held_req(self, held_req):
         tree_cache = types.SimpleNamespace(
             protected_size=lambda: 0,
@@ -565,6 +694,101 @@ class TestPDFlipMigrationAccounting(unittest.TestCase):
         self.assertEqual(allocator.freed, [0])
         self.assertTrue(senders[0].aborted)
         self.assertFalse(reqs[0].pd_flip_defer_kv_release)
+
+    def test_delta_pump_preserves_released_source_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_delta_session("source_released")
+
+        Scheduler._pd_flip_source_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "source_released")
+        self.assertEqual(session["delta_transferred_reqs"], 1)
+        self.assertEqual(session["delta_pending_reqs"], 0)
+
+    def test_delta_pump_preserves_aborted_source_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_delta_session("source_aborted")
+
+        Scheduler._pd_flip_source_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "source_aborted")
+        self.assertEqual(session["delta_transferred_reqs"], 1)
+        self.assertEqual(session["delta_pending_reqs"], 0)
+
+    def test_delta_pump_completes_nonterminal_source_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_delta_session("source_delta_started")
+
+        Scheduler._pd_flip_source_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "source_delta_transferred")
+
+    def test_delta_pump_fails_nonterminal_source_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_delta_session(
+            "source_delta_started", failed=True
+        )
+
+        Scheduler._pd_flip_source_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "source_failed")
+        self.assertEqual(session["failed_reqs"], 1)
+
+    def test_target_transfer_pump_preserves_active_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_target_session("active")
+
+        Scheduler._pd_flip_target_pump_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "active")
+        self.assertEqual(session["transferred_reqs"], 1)
+        self.assertEqual(session["pending_reqs"], 0)
+
+    def test_target_transfer_pump_preserves_aborted_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_target_session("target_aborted")
+
+        Scheduler._pd_flip_target_pump_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "target_aborted")
+        self.assertEqual(session["transferred_reqs"], 1)
+        self.assertEqual(session["pending_reqs"], 0)
+
+    def test_target_transfer_pump_completes_nonterminal_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_target_session("target_started")
+
+        Scheduler._pd_flip_target_pump_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "target_transferred")
+
+    def test_target_delta_pump_preserves_active_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_target_session("active", delta=True)
+
+        Scheduler._pd_flip_target_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "active")
+        self.assertEqual(session["delta_transferred_reqs"], 1)
+        self.assertEqual(session["delta_pending_reqs"], 0)
+
+    def test_target_delta_pump_preserves_aborted_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_target_session("target_aborted", delta=True)
+
+        Scheduler._pd_flip_target_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "target_aborted")
+        self.assertEqual(session["delta_transferred_reqs"], 1)
+        self.assertEqual(session["delta_pending_reqs"], 0)
+
+    def test_target_delta_pump_completes_nonterminal_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        session = self._completed_target_session("target_delta_started", delta=True)
+
+        Scheduler._pd_flip_target_pump_delta_transfer(scheduler, session)
+
+        self.assertEqual(session["state"], "target_delta_transferred")
 
 
 if __name__ == "__main__":

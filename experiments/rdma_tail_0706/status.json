@@ -1,0 +1,18 @@
+{
+  "runs": [
+    {
+      "run": "tail_rdma_small_1x100",
+      "status": "complete",
+      "rows": 32,
+      "samples": 640,
+      "error_sum": 0
+    },
+    {
+      "run": "tail_rdma_small_1x200",
+      "status": "complete",
+      "rows": 32,
+      "samples": 640,
+      "error_sum": 0
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "controller_message": "two-phase D->P migration timed out",
+  "controller_success": false,
+  "event_count": 19146,
+  "events_path": "/root/sglang/experiments/pd_flip_2p2d_to_3p1d_20260708_123441/01_waiting_queue_two_phase/migration_events.jsonl",
+  "migration_outcome": "aborted_or_failed",
+  "request_count": 40,
+  "request_error_count": 0,
+  "timeline_stage_count": 4,
+  "timeline_stages": [
+    "router_source_drained",
+    "cleanup_router_undrain",
+    "source_admission_paused",
+    "migration_abort_or_failed"
+  ],
+  "worker_load_sample_count": 5891
+}
