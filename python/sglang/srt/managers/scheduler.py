@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -1138,11 +1139,14 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
-        output_dsa_topk_indices_dim = 0
-        if self.spec_algorithm.is_eagle() and self.draft_worker is not None:
-            eagle_draft_worker = self.draft_worker.draft_worker
-            if getattr(eagle_draft_worker, "seed_dsa_topk_from_draft_extend", False):
-                output_dsa_topk_indices_dim = eagle_draft_worker.dsa_index_topk
+        # Keep the PD metadata schema identical on P and D even when only the
+        # decode node enables speculative decoding. A seedless prefill writes
+        # the invalid sentinel; decode then recomputes the first draft-step
+        # indices eagerly instead of interpreting the following buffer at the
+        # wrong wire position.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE

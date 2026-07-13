@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
@@ -31,6 +32,13 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def get_dsa_seed_metadata_dim(hf_config) -> int:
+    """Return the model-defined PD seed width, independent of local spec mode."""
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    return get_dsa_index_topk(hf_config)
 
 
 def is_dsv4_c128_online_enabled() -> bool:
