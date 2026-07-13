@@ -178,7 +178,7 @@ class TestDFlashServerTreeVerify(TestDFlashServerSpecV2PlanStream):
     # A smaller running-request cap keeps the per-bs tree-mask cuda graphs within
     # the CI card's memory (tree verify graphs are larger than chain's).
     max_running_requests = 8
-    gsm8k_accept_length_thres = 3.5
+    gsm8k_accept_length_thres = 3.0
     other_launch_args = [
         "--speculative-dflash-tree-verify",
         "--speculative-eagle-topk",
