@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
+"""Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
 from typing import Optional, Tuple
 
@@ -66,7 +66,7 @@ def expand_topk_with_shared_expert(
     return expanded_topk_ids, expanded_topk_weights
 
 
-class DeepEPWaterfillBalancer:
+class WaterfillBalancer:
     """Waterfill load balancer: shared expert fused as real routed expert (topk 8→9)."""
 
     MIN_BATCH_FOR_BALANCE = 64
@@ -192,7 +192,7 @@ class DeepEPWaterfillBalancer:
             return self._build_static_dispatch_plan(local_routed_counts)
 
         global_routed_counts, local_tokens_per_rank = (
-            DeepEPWaterfillBalancer._all_reduce_dynamic_rank_load(
+            WaterfillBalancer._all_reduce_dynamic_rank_load(
                 local_routed_counts, num_tokens
             )
         )
