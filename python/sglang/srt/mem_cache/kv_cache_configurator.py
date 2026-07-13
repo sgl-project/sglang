@@ -1473,6 +1473,7 @@ class KVCacheConfigurator:
                         device=self.device,
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
+                        req_to_token_pool=req_to_token_pool,
                     )
                 else:
                     if self.server_args.enable_hisparse:

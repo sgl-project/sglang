@@ -41,6 +41,7 @@ import dataclasses
 import logging
 import re
 import sys
+import time
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -132,6 +133,9 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+# Throttle for the unified-KV SWA bottleneck diagnostic (seconds).
+_last_swa_bottleneck_log = 0.0
 
 
 @lru_cache(maxsize=1)
@@ -2594,7 +2598,52 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        allocator = self.token_to_kv_pool_allocator
+        ok = allocator.available_size() >= num_tokens
+        if not ok and getattr(allocator.get_kvcache(), "_unified_kv", False):
+            self._log_unified_swa_bottleneck(allocator, num_tokens, selected_indices)
+        return ok
+
+    def _log_unified_swa_bottleneck(self, allocator, num_tokens, selected_indices):
+        """Diagnostic (unified-KV only): when check_decode_mem is short, compare
+        the SWA token bookkeeping against the real per-slot ring utilization.
+        Throttled to avoid log floods during retract storms."""
+        global _last_swa_bottleneck_log
+        now = time.monotonic()
+        if now - _last_swa_bottleneck_log < 1.0:
+            return
+        _last_swa_bottleneck_log = now
+        try:
+            full_avail = allocator.full_available_size()
+            swa_avail = allocator.swa_available_size()
+            reqs = (
+                self.reqs
+                if selected_indices is None
+                else [self.reqs[i] for i in selected_indices]
+            )
+            active_slots = len(
+                {
+                    int(r.req_pool_idx)
+                    for r in reqs
+                    if getattr(r, "req_pool_idx", None) is not None
+                }
+            )
+            unified = getattr(allocator.get_kvcache(), "unified_kv_pool", None)
+            if unified is not None:
+                num_slots = unified.num_slots
+                ring_util = active_slots * unified.swa_ring_size / max(
+                    unified.swa_pages, 1
+                )
+            else:
+                num_slots, ring_util = -1, -1.0
+            logger.warning(
+                "[SWA-BOTTLENECK] check_decode_mem short: "
+                f"need={num_tokens}, full_avail={full_avail}, swa_avail={swa_avail}, "
+                f"active_slots={active_slots}/{num_slots}, "
+                f"ring_util_upper={ring_util:.4f}"
+            )
+        except Exception as e:  # diagnostics must never break scheduling
+            logger.warning(f"[SWA-BOTTLENECK] logging failed: {e}")
 
     def retract_decode(
         self, server_args: ServerArgs

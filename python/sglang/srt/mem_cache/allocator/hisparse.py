@@ -356,6 +356,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    @property
+    def swa_ring_cost_tokens(self) -> int:
+        return self.logical_attn_allocator.swa_ring_cost_tokens
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 

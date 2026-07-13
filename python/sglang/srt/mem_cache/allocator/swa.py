@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -6,6 +8,8 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -29,6 +33,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: BaseSWAKVPool,
         need_sort: bool,
+        req_to_token_pool=None,
     ):
         assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
@@ -97,10 +102,46 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
         self._kvcache = kvcache
+
+        # Unified-KV (DSV4): SWA is a per-request ring addressed by state_slot
+        # (== req_pool_idx) + position inside the DSV4 kernels. The paged SWA
+        # indices / full_to_swa_index_mapping produced here are NOT consumed on
+        # that path, so treating SWA as a linearly-consumed token pool
+        # over-throttles admission and decode retract. Instead account for it as
+        # a fixed per-request ring slot; the real bound is concurrency
+        # (num_req_slots), already enforced by req_to_token_pool /
+        # max_running_requests.
+        self._unified = getattr(kvcache, "_unified_kv", False)
+        self._req_to_token_pool = req_to_token_pool
+        if self._unified:
+            ring_size = getattr(kvcache, "unified_swa_ring_size", self.page_size)
+            self._swa_ring_cost = (
+                (ring_size + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            logger.info(
+                "[SWA-BOOKKEEPING] unified ring accounting enabled: "
+                f"num_slots={getattr(kvcache, 'num_req_slots', '?')}, "
+                f"swa_ring_size={ring_size}, "
+                f"ring_cost_tokens={self._swa_ring_cost}, "
+                f"unified_swa_pages={getattr(kvcache, 'unified_swa_pages', '?')} | "
+                f"legacy paged size_swa={self._size_swa} (bypassed)"
+            )
+        else:
+            self._swa_ring_cost = 0
+
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
+    @property
+    def swa_ring_cost_tokens(self) -> int:
+        """Unified: paged SWA cost of one request's ring slot (0 otherwise)."""
+        return self._swa_ring_cost
+
     def available_size(self):
+        if self._unified:
+            # The SWA ring is pre-allocated per slot and reused by decode, so it
+            # never constrains token growth; full attention is the real limiter.
+            return self.full_attn_allocator.available_size()
         return min(
             self.full_attn_allocator.available_size(),
             self.swa_attn_allocator.available_size(),
@@ -110,6 +151,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.available_size()
 
     def swa_available_size(self):
+        if self._unified:
+            # Ring-based availability: free request slots * per-slot ring cost.
+            # Fall back to non-binding if the req pool wasn't wired in.
+            if self._req_to_token_pool is None:
+                return self.full_attn_allocator.available_size()
+            return self._req_to_token_pool.available_size() * self._swa_ring_cost
         return self.swa_attn_allocator.available_size()
 
     # Slot-conservation views for the leak invariant. On the non-shared allocator
@@ -164,10 +211,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
-        return (
+        full_ok = (
             num_full_pages
             <= self.full_attn_allocator.available_size() // self.page_size
-            and num_swa_pages
+        )
+        if self._unified:
+            # SWA ring rows are pre-allocated per slot; no per-token SWA paging.
+            return full_ok
+        return full_ok and (
+            num_swa_pages
             <= self.swa_attn_allocator.available_size() // self.page_size
         )
 
@@ -187,6 +239,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
+
+        if self._unified:
+            # Unified SWA ring is slot-addressed and not paged here: allocate only
+            # the full-attention KV and skip the vestigial SWA allocator / mapping
+            # (unused by the DSV4 kernels).
+            return self.full_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_new_pages,
+            )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
@@ -291,6 +357,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
         assert self.page_size > 1
+        if self._unified:
+            # See alloc_extend: unified SWA ring is slot-addressed, allocate full
+            # only and skip the vestigial SWA allocator / mapping.
+            return self.full_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc
+            )
+
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
