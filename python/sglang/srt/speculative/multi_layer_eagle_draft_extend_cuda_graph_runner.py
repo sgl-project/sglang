@@ -156,7 +156,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        self.padded_static_len = -1
 
         # Fixed window: every step extends each request by the same number of
         # tokens, which lets all steps share one buffer set.
@@ -301,7 +300,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             capture_hidden_mode=capture_mode,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            padded_static_len=self.padded_static_len,
             extend_start_loc=extend_start_loc,
             extend_num_tokens=self.num_tokens_per_req * bs,
             num_token_non_padded_cpu=self.num_tokens_per_req * bs,
@@ -391,7 +389,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 post_warmup_hook=post_warmup_hook,
             )
 
-    def replay(self, bs: int, seq_lens_sum: int, spec_info: EagleDraftExtendInput):
+    def replay(
+        self,
+        bs: int,
+        seq_lens_sum: Optional[int],
+        spec_info: EagleDraftExtendInput,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
         """Init this step's attention metadata for the prepared bucket and
         replay its graph. Buffers must already be populated by the composite
         runner's ``prepare`` (step 0) or by the previous step's in-graph chain
@@ -411,7 +415,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
-            seq_lens_cpu=buffers.seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
@@ -646,10 +650,15 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_accept_tokens
         )
 
+        # Refresh the host mirror only when published; hand replay None
+        # otherwise so no consumer reads a stale buffer.
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            self.seq_lens_cpu = buffers.seq_lens_cpu
+        else:
+            self.seq_lens_cpu = None
 
         # select_index[i] = i * window + num_correct_drafts[i]: the flat index
         # of request i's last accepted token. Used by the in-graph top-k gather
@@ -681,9 +690,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.raw_bs = raw_bs
         self.bs = bs
         self.raw_num_tokens = num_tokens
-        self.seq_lens_sum = (
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-        )
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        self.seq_lens_sum = seq_lens_sum
 
         self._prepare_extra(forward_batch)
 
@@ -693,7 +703,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         batch size."""
         runner = self.runners[step]
         runner.raw_bs = self.raw_bs
-        out = runner.replay(self.bs, self.seq_lens_sum, self._replay_spec_info)
+        out = runner.replay(
+            self.bs, self.seq_lens_sum, self._replay_spec_info, self.seq_lens_cpu
+        )
         raw_bs = self.raw_bs
         raw_num_tokens = self.raw_num_tokens
         logits_output = LogitsProcessorOutput(
