@@ -95,7 +95,7 @@ sgl-eval run aime25 \\
   ],
 
   dockerImages: {
-    h20:   "lmsysorg/sglang:latest",
+    h20:   "lmsysorg/sglang:v0.5.14",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
