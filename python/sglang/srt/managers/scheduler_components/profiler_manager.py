@@ -130,9 +130,7 @@ class SchedulerProfilerManager:
         # Only allow absolute paths under a known-safe root (default /tmp).
         safe_root = Path(os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")).resolve()
         if not str(resolved).startswith(str(safe_root)):
-            raise ValueError(
-                f"output_dir must be under {safe_root}, got: {output_dir}"
-            )
+            raise ValueError(f"output_dir must be under {safe_root}, got: {output_dir}")
         self.torch_profiler_output_dir = resolved
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
