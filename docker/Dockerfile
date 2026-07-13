@@ -470,6 +470,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
+# flashinfer>=0.6.14 no longer pulls the NVIDIA CUDA compiler components
+# (previously via its cuda-tile[tileiras] extra); CuTe-DSL runtime codegen needs
+# them at serving time. Pin them directly: cuda-tile>=1.5.0 routes the extra
+# through the cuda-toolkit metapackage, which conflicts with torch's pin.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 -m pip install \
+            "nvidia-cuda-crt>=13.2,<13.4" \
+            "nvidia-cuda-nvcc>=13.2,<13.4" \
+            "nvidia-cuda-tileiras>=13.2,<13.4" \
+            "nvidia-nvvm>=13.2,<13.4"; \
+    fi
+
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
 COPY --from=devtools_builder /tools/clang-format /usr/local/bin/
