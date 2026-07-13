@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -430,12 +431,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         if self.pp_rank > 0:
             torch.distributed.recv(
-                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+                data,
+                group_src=self.pp_rank - 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
-                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+                copy_of_data,
+                group_dst=self.pp_rank + 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
             self.work_list.append(send_work)
 
