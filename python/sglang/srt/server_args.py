@@ -210,6 +210,8 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    # Tencent HPC-ops (SM90+)
+    "hpc",
     # AMD specific
     "aiter",
     "wave",
@@ -261,6 +263,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "hpc",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [

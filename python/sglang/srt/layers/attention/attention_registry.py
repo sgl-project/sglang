@@ -319,7 +319,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 assert (
                     runner.server_args.attention_backend == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
-            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+            logger.info("Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
@@ -395,3 +395,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("hpc")
+def create_hpc_backend(runner):
+    from sglang.srt.layers.attention.hpc_backend import HpcAttnBackend
+
+    return HpcAttnBackend(runner)

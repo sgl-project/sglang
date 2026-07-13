@@ -145,6 +145,24 @@ class TestMoERunner(CustomTestCase):
                 "--disable-cuda-graph",
             ],
         },
+        "moe_runner_hpc": {
+            "model": "Qwen/Qwen3-30B-A3B",
+            "timeout": 3600,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "hpc",
+                "--quantization",
+                "fp8",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--disable-cuda-graph",
+                "--reasoning-parser",
+                "qwen3",
+            ],
+        },
         "moe_runner_speculative": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
@@ -194,7 +212,8 @@ class TestMoERunner(CustomTestCase):
             )
             metrics = run_eval(args)
             print(f"{metrics=}")
-            self.assertGreaterEqual(metrics["score"], 0.48)
+            score_threshold = config.get("score_threshold", 0.48)
+            self.assertGreaterEqual(metrics["score"], score_threshold)
         finally:
             kill_process_tree(process.pid)
 
