@@ -4,19 +4,19 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
     decode_attention_fwd_normal,
 )
-from sglang.srt.layers.attention.triton_ops.extend_attention import (
+from sglang.kernels.ops.attention.extend_attention import (
     _compact_extend_q_tiles_per_head,
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
     redundant_attention,
 )
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
@@ -322,7 +322,7 @@ class TestTritonAttention(CustomTestCase):
             self._test_extend_attention_once(19, 12331, 12, 4, value)
 
     def test_extend_attention_block_sizes(self):
-        from sglang.srt.layers.attention.triton_ops import extend_attention as ea
+        from sglang.kernels.ops.attention import extend_attention as ea
 
         if not ea._is_hip:
             self.skipTest("HIP-only block-size selection")
@@ -801,6 +801,63 @@ class TestTritonAttention(CustomTestCase):
         for S in seq_lens:
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
+
+    def test_decode_attention_large_batch_int64_offset(self):
+        """Regression for int32 Mid_O offset overflow (PR #28788).
+
+        Under deterministic inference, max_kv_splits ~= ceil(context_len / 256)
+        can be ~792 for long-context MLA models. Combined with CUDA-graph batch
+        sizes, batch * num_head * max_kv_splits * head_dim can exceed 2**31 and
+        int32 cur_batch * stride_mid_ob overflows into a GPU memory fault.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B = 64
+        H_Q = 128
+        H_KV = 1
+        D = 576
+        D_V = 512
+        max_kv_splits = 792
+        seq_len = 256
+        total_tokens = B * seq_len
+        sm_scale = 1.0 / (D**0.5)
+        num_kv_splits = torch.full(
+            (B,), max_kv_splits, dtype=torch.int32, device=device
+        )
+
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
+        kv_indptr = torch.arange(
+            0, (B + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+        )
+        kv_indices = torch.arange(total_tokens, device=device)
+        attn_logits = torch.empty(
+            (B, H_Q, max_kv_splits, D_V), dtype=torch.float32, device=device
+        )
+        attn_lse = torch.empty(
+            (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+        )
+
+        decode_attention_fwd(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            1.0,
+            1.0,
+            has_mla=True,
+        )
+
+        self.assertTrue(torch.isfinite(o).all())
 
     def _test_extend_attention_unified_vs_regular_once(self, B, N_CTX, H_Q, H_KV, D):
         """Test that unified kernel produces same results as 2-stage kernel."""
