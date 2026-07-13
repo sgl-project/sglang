@@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,10 @@ def should_deepgemm_weight_requant_ue8m0(
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight_block_size is not None
     ):
+        return False
+    # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
+    # only the grouped MoE GEMM consumes DeepGEMM layouts there.
+    if get_device_sm() == 120:
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False

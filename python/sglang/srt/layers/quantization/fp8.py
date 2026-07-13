@@ -1367,9 +1367,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     weight_block_size,
                     use_deepgemm_runner=will_use_deepgemm,
                 ):
-                    assert isinstance(
-                        layer, DeepEPMoE
-                    ), "DeepGemm MoE is only supported with DeepEPMoE"
+                    assert isinstance(layer, DeepEPMoE), (
+                        "UE8M0 weight requant for the DeepGEMM MoE runner is "
+                        "only supported with DeepEPMoE; block-FP8 experts with "
+                        "the standard dispatcher (e.g. SM120 TP-only) are not "
+                        "supported by --moe-runner-backend deep_gemm"
+                    )
                     requant_block_scale_ue8m0_for_deepgemm(
                         layer.w2_weight,
                         layer.w2_weight_scale_inv,

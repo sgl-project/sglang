@@ -137,9 +137,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            # SM120 DeepGEMM contiguous GEMM consumes standard-layout
-            # activations only.
-            self.use_swizzle = False
+            # The SM120 DeepGEMM contiguous GEMM consumes standard-layout
+            # activations only; other architectures keep the swizzled layout.
+            self.use_swizzle = not is_sm120_supported()
 
     def run(
         self,
@@ -624,9 +624,12 @@ def _pre_permute_standard_contig(
     dispose_tensor(hidden_states)
 
     # ep_scatter fills expert slots in blocks of 128. Sizing uses a static
-    # upper bound so no GPU->CPU sync is needed.
-    counts = torch.bincount(topk_ids.flatten(), minlength=num_experts)
-    counts_aligned = ((counts + 127) // 128 * 128).to(torch.int32)
+    # upper bound and the counts are accumulated on-device, so this stays
+    # free of GPU->CPU syncs.
+    flat_ids = topk_ids.flatten().to(torch.int64)
+    counts = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    counts.index_add_(0, flat_ids.clamp_min(0), (flat_ids >= 0).to(torch.int32))
+    counts_aligned = (counts + 127) // 128 * 128
     all_tokens = ceil_div(num_tokens * runner_config.top_k, 128) * 128 + (
         num_experts * 128
     )
@@ -690,6 +693,9 @@ def pre_permute_standard_to_deep_gemm(
     if (
         hidden_states.shape[0] >= _STANDARD_CONTIG_MIN_TOKENS
         and quant_info.w13_weight.dtype != torch.bfloat16
+        # Under EP the standard dispatcher maps non-local experts to -1,
+        # which the contiguous path does not handle; keep the masked path.
+        and runner_config.num_local_experts == runner_config.num_experts
     ):
         return _pre_permute_standard_contig(
             hidden_states, topk_ids, topk_weights, runner_config, running_state
@@ -753,7 +759,7 @@ def post_permute_deep_gemm_to_standard(
         gather_out = torch.empty(
             running_state["hidden_states_shape"],
             device=running_state["hidden_states_device"],
-            dtype=torch.bfloat16,
+            dtype=running_state["hidden_states_dtype"],
         )
         ep_gather(
             runner_output.hidden_states,
@@ -1009,10 +1015,6 @@ def _varlen_deep_gemm_silu_mul_quant(
 
     use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
     if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
-        use_jit_ep_activation = False
-    # JIT kernel requires num_threads (D//8) >= num_experts (E).
-    # On SM120 with TP>=2, hidden_dim is too small (e.g. TP=4: 512/8=64 < 256).
-    if use_jit_ep_activation and D // 8 < E:
         use_jit_ep_activation = False
 
     if use_jit_ep_activation:
