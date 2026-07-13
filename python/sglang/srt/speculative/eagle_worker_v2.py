@@ -338,6 +338,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_lm_head(self):
         import os as _os
+
         if _os.environ.get("SGLANG_ALLOW_PP_SPEC") and self.server_args.pp_size > 1:
             # PP+spec: the target's embedding lives on the first PP stage
             # (PPMissingLayer here on the last stage), so the draft keeps its

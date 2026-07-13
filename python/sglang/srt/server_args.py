@@ -6922,6 +6922,7 @@ class ServerArgs:
 
         if self.pp_size > 1:
             import os as _os
+
             if not _os.environ.get("SGLANG_ALLOW_PP_SPEC"):
                 assert (
                     self.disable_overlap_schedule and self.speculative_algorithm is None

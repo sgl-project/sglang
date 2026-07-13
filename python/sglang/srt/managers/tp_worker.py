@@ -308,6 +308,7 @@ class TpModelWorker(BaseTpWorker):
 
         # Sync random seed across TP workers
         import os as _os
+
         if (
             _os.environ.get("SGLANG_ALLOW_PP_SPEC")
             and is_draft_worker

@@ -604,6 +604,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.pp_size > 1:
             import os as _os
+
             if not (_os.environ.get("SGLANG_ALLOW_PP_SPEC") and self.is_draft_worker):
                 assert (
                     self.support_pp
@@ -770,6 +771,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.num_effective_layers = self.num_effective_layers * loop_num
 
         import os as _os
+
         if not _os.environ.get("SGLANG_ALLOW_PP_SPEC"):
             assert (
                 (not model_has_mtp_layers)
@@ -1294,8 +1296,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=(get_world_group().world_size > 1)
-            and not _pp_spec_draft_local,
+            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()

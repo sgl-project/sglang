@@ -772,6 +772,7 @@ class Scheduler(
             self.external_corpus_manager = None
             return
         import os as _os
+
         if (
             _os.environ.get("SGLANG_ALLOW_PP_SPEC")
             and self.server_args.pp_size > 1
@@ -1139,7 +1140,10 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states() and self.draft_worker is not None:
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and self.draft_worker is not None
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner

@@ -113,8 +113,7 @@ class ModelRunnerKVCacheMixin:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=(get_world_group().world_size > 1)
-            and not _pp_spec_draft_local,
+            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
 

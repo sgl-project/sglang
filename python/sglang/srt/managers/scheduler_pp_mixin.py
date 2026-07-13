@@ -1308,9 +1308,9 @@ class SchedulerPPMixin:
         parent_list = torch.arange(
             -1, parent_width - 1, dtype=torch.long, device=device
         ).repeat(bs, 1)
-        top_scores_index = torch.arange(
-            steps, dtype=torch.long, device=device
-        ).repeat(bs, 1)
+        top_scores_index = torch.arange(steps, dtype=torch.long, device=device).repeat(
+            bs, 1
+        )
 
         attn_backend = self.tp_worker.model_runner.attn_backend
         tree_mask_buf, position_buf = (
