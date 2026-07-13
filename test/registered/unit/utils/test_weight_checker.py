@@ -223,9 +223,10 @@ class TestPostprocessTensors(CustomTestCase):
             _build_check_entries(raw, set()), [("x.weight", True, RawComparable(w))]
         )
 
-    # --- non-persistent buffer skip ---
+    # --- skip set is honored (non-persistent buffers now arrive via the skip set,
+    # built by _skip_compare_names / _is_skip_weight_check) ---
 
-    def test_skips_cos_sin_cache_substring(self):
+    def test_skip_set_marks_raw_entry_not_compared(self):
         cache = torch.randn(8)
         plain = torch.randn(4)
         raw = {
@@ -233,33 +234,25 @@ class TestPostprocessTensors(CustomTestCase):
             "model.layers.0.weight": plain,
         }
         _assert_entries_close(
-            _build_check_entries(raw, set()),
+            _build_check_entries(raw, {"model.rotary_emb.cos_sin_cache"}),
             [
                 ("model.rotary_emb.cos_sin_cache", False, RawComparable(cache)),
                 ("model.layers.0.weight", True, RawComparable(plain)),
             ],
         )
 
-    def test_skips_inv_freq_substring(self):
-        t = torch.randn(4)
+    def test_skip_set_marks_quantized_entry_not_compared(self):
+        # Regression: the quantized branch must honor the skip set, not hard-code
+        # should_compare=True (so a skip_tensor_list can drop a quantized weight).
+        qweight, sf_fp32, _ = _build_fp8_quant_pair()
+        raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
+        quantized_set = {
+            "x.weight": QuantizedWeight(Fp8BlockComparable, "x.weight_scale_inv")
+        }
+        ref = Fp8BlockComparable(qweight, sf_fp32)
         _assert_entries_close(
-            _build_check_entries({"model.rotary_emb.inv_freq": t}, set()),
-            [("model.rotary_emb.inv_freq", False, RawComparable(t))],
-        )
-
-    def test_skips_weight_fp32_substring(self):
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_check_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", False, RawComparable(t))],
-        )
-
-    def test_substring_match_not_endswith(self):
-        # Pattern can appear anywhere in the name, not just at the end.
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_check_entries({"weird.cos_sin_cache.foo.bar": t}, set()),
-            [("weird.cos_sin_cache.foo.bar", False, RawComparable(t))],
+            _build_check_entries(raw, {"x.weight"}, quantized_set),
+            [("x.weight", False, ref)],
         )
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---

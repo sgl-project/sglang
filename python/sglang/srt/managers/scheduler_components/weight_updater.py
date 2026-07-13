@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 import traceback
@@ -18,10 +17,14 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -41,35 +44,27 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
 
 
-def _get_draft_model_runner(draft_worker):
-    # DFlash / FrozenKVMTP workers expose draft_model_runner directly
-    runner = getattr(draft_worker, "draft_model_runner", None)
-    if runner is not None:
-        return runner
-    # EAGLEWorkerV2: _draft_worker.draft_runner
-    inner = getattr(draft_worker, "_draft_worker", None)
-    if inner is not None:
-        runner = getattr(inner, "draft_runner", None)
-        if runner is not None:
-            return runner
-    return None
-
-
-def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
-    merged_checksums = dict(target["checksums"])
-    for name, chk in draft["checksums"].items():
-        merged_checksums[f"draft.{name}"] = chk
-    h = hashlib.sha256()
-    for name in sorted(merged_checksums):
-        h.update(name.encode())
-        h.update(merged_checksums[name].encode())
-    target["checksums"] = merged_checksums
-    target["per_gpu_checksum"] = h.hexdigest()
-    return target
+def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
+    merged: Dict[str, str] = {}
+    parallelism_infos = []
+    for role, p in role_payloads:
+        for name, chk in p["checksums"].items():
+            # Add prefix for non-target roles
+            key = name if role == "" else f"{role}.{name}"
+            if key in merged:
+                raise ValueError(f"checksum key collision: {key}")
+            merged[key] = chk
+        parallelism_infos.append({"role": role or "target", **p["parallelism_info"]})
+    return {
+        "checksums": merged,
+        "per_gpu_checksum": overall_checksum(merged),
+        "parallelism_info": parallelism_infos,
+    }
 
 
 def _parse_runner_selector(selector: str) -> Set[str]:
@@ -95,6 +90,11 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    _weight_update_in_progress: bool = False
+    _weight_update_loaded: bool = False
+    # Runner selector for the open session, recorded at begin_weight_update and
+    # reused by end_weight_update so the same set is restored and finalized.
+    _weight_update_selector: str = "all"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -146,16 +146,29 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
-    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
-        """Resolve a {target, draft} selector to (role, ModelRunner) pairs, target
-        first. role is "" for the target runner; draft roles come from the draft
-        worker's iter_draft_runners()."""
+    def iter_weight_update_workers(
+        self, selector: str = "all"
+    ) -> List[Tuple[str, Any]]:
+        """Resolve a {target, draft, all} selector to (role, worker) pairs, target
+        first: the target worker and, when present, the draft worker. This is the
+        worker-level inclusion decision; each worker then contributes its own runners
+        via iter_runners()."""
         parsed = _parse_runner_selector(selector)
-        runners: List[Tuple[str, Any]] = []
+        workers: List[Tuple[str, Any]] = []
         if "target" in parsed:
-            runners.append(("", self.tp_worker.model_runner))
+            workers.append(("target", self.tp_worker))
         if "draft" in parsed and self.draft_worker is not None:
-            runners += self.draft_worker.iter_draft_runners()
+            workers.append(("draft", self.draft_worker))
+        return workers
+
+    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
+        """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs, target
+        first. Derived from iter_weight_update_workers: each selected worker yields its
+        own runners via iter_runners() — role "" for the target runner, draft roles
+        from the draft worker."""
+        runners: List[Tuple[str, Any]] = []
+        for _, worker in self.iter_weight_update_workers(selector):
+            runners += worker.iter_runners()
         return runners
 
     def update_weights_from_distributed(
@@ -163,6 +176,9 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
+        assert (
+            self._weight_update_in_progress
+        ), "update_weights_from_distributed requires an open begin_weight_update session"
         with self._observe_weight_load("distributed"):
             # The target (main) model owns this process's connection to the training
             # engine, so it receives the broadcast once; the received weights are then
@@ -186,6 +202,7 @@ class SchedulerWeightUpdaterManager:
                 )
                 logger.error(message)
             if success:
+                self._weight_update_loaded = True
                 self.flush_cache_after_weight_update(recv_req)
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
@@ -194,6 +211,9 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors, fanning out to the
         selected runners."""
+        assert (
+            self._weight_update_in_progress
+        ), "update_weights_from_tensor requires an open begin_weight_update session"
         with self._observe_weight_load("tensor"):
             monkey_patch_torch_reductions()
             named_tensors = MultiprocessingSerializer.deserialize(
@@ -208,6 +228,7 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
             if success:
+                self._weight_update_loaded = True
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -231,6 +252,37 @@ class SchedulerWeightUpdaterManager:
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
+
+    def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
+        """Begin a weight-update session: restore in-place-packed weights to a
+        loadable state on the selected runners (target and/or draft), so the draft
+        model is prepared identically to the target. The selector is recorded and
+        reused by end_weight_update so the same set is finalized."""
+        assert (
+            not self._weight_update_in_progress
+        ), "begin_weight_update called while a weight-update session is already open"
+        self._weight_update_selector = recv_req.selector
+        for _, runner in self.get_model_runners(recv_req.selector):
+            runner.begin_weight_update()
+        self._weight_update_in_progress = True
+        self._weight_update_loaded = False
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return BeginWeightUpdateReqOutput(success=True, message="Success")
+
+    def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
+        """End the weight-update session on the runners begin_weight_update opened
+        (its recorded selector): quant finalize on each, plus model.post_load_weights
+        only when load_weights was bypassed this session (e.g. P2P/RDMA).
+        """
+        assert (
+            self._weight_update_in_progress
+        ), "end_weight_update called without begin_weight_update"
+        run_post_load = not self._weight_update_loaded
+        for _, runner in self.get_model_runners(self._weight_update_selector):
+            runner.end_weight_update(run_post_load=run_post_load)
+        self._weight_update_in_progress = False
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return EndWeightUpdateReqOutput(success=True, message="Success")
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
@@ -319,27 +371,35 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(
-                action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
-            )
+            runners = self.get_model_runners(recv_req.selector)
 
-            if self.draft_worker is not None:
-                draft_runner = _get_draft_model_runner(self.draft_worker)
-                if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(
+            def _check(role, runner):
+                try:
+                    return runner.check_weights(
                         action=recv_req.action,
                         allow_quant_error=recv_req.allow_quant_error,
+                        skip_tensor_list=recv_req.skip_tensor_list,
                     )
-                    if payload is not None and draft_payload is not None:
-                        payload = _merge_checksum_payloads(payload, draft_payload)
+                except Exception as e:
+                    raise RuntimeError(f"[{role or 'target'}] {e}") from e
 
-            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
-            if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
+            if recv_req.action == "checksum":
+                payload = _merge_checksum_payloads(
+                    [(role, _check(role, runner)) for role, runner in runners]
                 )
-                payload = all_payloads
+            else:
+                for role, runner in runners:
+                    _check(role, runner)
+                payload = None
+
+            if payload is not None and torch.distributed.is_initialized():
+                tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+                if tp_size > 1:
+                    all_payloads = [None] * tp_size
+                    torch.distributed.all_gather_object(
+                        all_payloads, payload, group=self.tp_cpu_group
+                    )
+                    payload = all_payloads
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )

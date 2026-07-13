@@ -1636,6 +1636,27 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    # Which model runners this update session covers: "target" (main model only),
+    # "draft" (draft worker(s) only), or "all" (default). The selector is fixed for
+    # the whole begin -> update -> end session; end finalizes the same set.
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class SendWeightsToRemoteInstanceReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
@@ -1729,6 +1750,13 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
+    # Which runners to check; "all" is target plus any draft workers.
+    # Same convention as UpdateWeightsFrom*ReqInput.
+    selector: Literal["target", "draft", "all"] = "all"
+    # Substring matches against tensor names, skipped on every checked runner.
+    # Use when a job leaves some weights unupdated, e.g. an LLM-only RL job never
+    # touches the vision tower: ["visual.", "vision_tower."].
+    skip_tensor_list: Optional[List[str]] = None
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
