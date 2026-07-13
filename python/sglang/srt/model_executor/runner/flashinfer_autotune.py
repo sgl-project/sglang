@@ -176,15 +176,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             autotune_cache,
         )
 
-    # Gate on tp_size > 1 (not --enable-symm-mem): the reduce is a sub-ms gloo CPU
-    # collective and consistent tactics help broadly. Every TP rank must reach it in
-    # lockstep -- it is collective; warm caches already hold synced tactics.
     sync_autotune_group = set_autotune_process_group is not None and mr.tp_size > 1
     try:
         if sync_autotune_group:
             set_autotune_process_group(mr.tp_group.cpu_group)
-        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         mr.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(mr.device).stream(mr.forward_stream):
             maybe_skip_logits = contextlib.nullcontext()
