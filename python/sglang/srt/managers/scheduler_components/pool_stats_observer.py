@@ -294,12 +294,8 @@ class SchedulerPoolStatsObserver:
         # that evictable here would double-count against the ring and drive
         # swa_num_used / swa_token_usage negative. The ring holds nothing
         # evictable, so zero it out to keep the usage stats coherent.
-        _swa_alloc = getattr(
-            self.token_to_kv_pool_allocator,
-            "logical_attn_allocator",
-            self.token_to_kv_pool_allocator,
-        )
-        if getattr(_swa_alloc, "_unified", False):
+        _swa_kv = self.token_to_kv_pool_allocator.get_kvcache()
+        if getattr(_swa_kv, "_unified_kv", False):
             swa_evictable_size = 0
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size

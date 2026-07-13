@@ -137,9 +137,8 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
-        alloc = self.token_to_kv_pool_allocator
-        alloc = getattr(alloc, "logical_attn_allocator", alloc)
-        if getattr(alloc, "_unified", False):
+        kv = self.token_to_kv_pool_allocator.get_kvcache()
+        if getattr(kv, "_unified_kv", False):
             # Unified-KV DSV4: SWA is a fixed per-request ring, reused per request
             # and released together with the req_pool slot (which has its own
             # leak check). swa_available_size() is deliberately non-binding (it
@@ -366,7 +365,10 @@ class SchedulerInvariantChecker:
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
+        # DSV4-HiSparse nests the real SWA allocator under logical_attn_allocator,
+        # so unwrap first (no-op for a plain/flat allocator).
         alloc = self.token_to_kv_pool_allocator
+        alloc = getattr(alloc, "logical_attn_allocator", alloc)
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None

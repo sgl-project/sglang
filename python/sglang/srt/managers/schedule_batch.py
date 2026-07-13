@@ -2462,7 +2462,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         allocator = self.token_to_kv_pool_allocator
         ok = allocator.available_size() >= num_tokens
-        if not ok and getattr(allocator, "_unified", False):
+        if not ok and getattr(allocator.get_kvcache(), "_unified_kv", False):
             self._log_unified_swa_bottleneck(allocator, num_tokens, selected_indices)
         return ok
 
