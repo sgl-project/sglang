@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -1350,6 +1351,48 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
+class TestHandleCrashDumpEnv(CustomTestCase):
+    _COREDUMP_ENV_KEYS = (
+        "CUDA_ENABLE_COREDUMP_ON_EXCEPTION",
+        "CUDA_ENABLE_USER_TRIGGERED_COREDUMP",
+        "CUDA_COREDUMP_SHOW_PROGRESS",
+        "CUDA_COREDUMP_GENERATION_FLAGS",
+        "CUDA_COREDUMP_FILE",
+        "CUDA_COREDUMP_PIPE",
+    )
+
+    def _run_handler(self, crash_dump_folder, preset_env=None):
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.crash_dump_folder = crash_dump_folder
+        with patch.dict(os.environ, preset_env or {}):
+            for key in self._COREDUMP_ENV_KEYS:
+                if key not in (preset_env or {}):
+                    os.environ.pop(key, None)
+            ServerArgs._handle_crash_dump_env(server_args)
+
+    def test_creates_coredump_dir_when_auto_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_handler(tmp)
+            self.assertTrue(
+                os.path.isdir(os.path.join(tmp, socket.gethostname())),
+                "coredump dir not created for auto-set CUDA_COREDUMP_FILE",
+            )
+
+    def test_creates_coredump_dir_when_env_preset(self):
+        # Regression test: when CUDA_COREDUMP_FILE is preset, the coredump
+        # directory must still be created up front.
+        with tempfile.TemporaryDirectory() as tmp:
+            preset_dir = os.path.join(tmp, "preset-location")
+            self._run_handler(
+                tmp,
+                preset_env={"CUDA_COREDUMP_FILE": f"{preset_dir}/%h/core.cuda.%t.%p"},
+            )
+            self.assertTrue(
+                os.path.isdir(os.path.join(preset_dir, socket.gethostname())),
+                "coredump dir not created for preset CUDA_COREDUMP_FILE",
+            )
 
 
 class TestGrpcServerArgs(CustomTestCase):
