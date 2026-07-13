@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     get_recommended_splits = None
 
 from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend

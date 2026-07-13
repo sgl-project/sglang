@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import seqlens_expand_triton
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -21,9 +20,6 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_USE_FUSED_METADATA_GENERATION = (
-    envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
-)
 
 
 @dataclass
@@ -125,7 +121,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
-        if _USE_FUSED_METADATA_GENERATION and _is_cuda and not _is_hip:
+        if _is_cuda and not _is_hip:
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
             )
@@ -244,7 +240,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
-        if _USE_FUSED_METADATA_GENERATION and _is_cuda and not _is_hip:
+        if _is_cuda and not _is_hip:
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_target_verify_metadata,
             )
