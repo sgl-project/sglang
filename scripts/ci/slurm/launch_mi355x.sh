@@ -107,6 +107,11 @@ rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
 res = r.get("resources", {})
 def emit(k, v): print(f"{k}={v}")
 emit("IMAGE", rt["image"])
+# When true, the recipe's pinned image wins over the workflow's dynamically
+# resolved "latest" image (IMAGE_OVERRIDE). Used to hold a model on a known-good
+# image while a newer-image regression is investigated. Absent/false = prior
+# behavior (dynamic latest wins).
+emit("PIN_IMAGE", 1 if rt.get("pin_image") else 0)
 # Attention backend: single (`attention_backend`) or split
 # (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent so
 # the flag is dropped for a model that omits it.
@@ -161,9 +166,17 @@ if [[ -z "$RECIPE_VARS" ]]; then
     exit 1
 fi
 eval "$RECIPE_VARS"
-# Optional image override from workflow_dispatch input.
+# Optional image override from workflow_dispatch input / setup-resolved latest.
+# A recipe with `runtime.pin_image: true` keeps its pinned image (a known-good
+# pin wins over the dynamically resolved latest). An explicit manual
+# workflow_dispatch `image` input still wins over everything, so a human can
+# force any image for a one-off run.
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
-    IMAGE="$IMAGE_OVERRIDE"
+    if [[ "${PIN_IMAGE:-0}" == "1" && "${IMAGE_INPUT_EXPLICIT:-0}" != "1" ]]; then
+        echo "recipe pins image=$IMAGE; ignoring resolved override $IMAGE_OVERRIDE"
+    else
+        IMAGE="$IMAGE_OVERRIDE"
+    fi
 fi
 echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
 

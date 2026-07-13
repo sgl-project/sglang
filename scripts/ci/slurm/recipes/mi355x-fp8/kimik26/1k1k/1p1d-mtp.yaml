@@ -54,6 +54,12 @@ mtp:
 
 runtime:
   image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  # MITIGATION: hold Kimi-K2.6 on this known-good image. The newer (dynamically
+  # resolved "latest") MI35x images regressed non-MTP disagg GSM8K to ~0.88
+  # (this Jun-23 image = 0.941; see the image-vs-code bisect). pin_image makes
+  # this pinned image win over the workflow's resolved-latest so the scheduled
+  # nightly is green; remove once the image regression is fixed upstream.
+  pin_image: true
   # Kimi uses split attention backends (aiter prefill / triton decode), not a
   # single --attention-backend.
   prefill_attention_backend: aiter
