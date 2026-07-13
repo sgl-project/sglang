@@ -1,9 +1,11 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +43,16 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
     HEAD_V_DIM = 64
 
     CASES = make_gdn_cases("flashinfer")
+    FUSED_PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_fused_prefill_attention_block",
+        backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=4,
+        num_v_heads=8,
+        page_size=16,
+        prefix_lens=(0, 8),
+        extend_lens=(17, 9),
+    )
     CUDA_GRAPH_CASES = (
         GDNAttentionCase(
             name="runner_cuda_graph_gdn_decode_page_boundary",
@@ -221,6 +233,30 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                     head_k_dim=self.HEAD_K_DIM,
                     head_v_dim=self.HEAD_V_DIM,
                 )
+
+    def test_fused_prefill_attention_block(self):
+        """Exercise the fused prefill through the real attention/backend route."""
+        from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.linear.gdn_backend."
+                "get_linear_attn_prefill_backend",
+                return_value=LinearAttnKernelBackend.FLASHINFER,
+            ),
+            patch(
+                "sglang.jit_kernel.triton.gdn_prefill_fused.gdn_prefill_fused",
+                wraps=gdn_prefill_fused,
+            ) as fused_prefill,
+        ):
+            run_gdn_attention_case(
+                self,
+                self.FUSED_PREFILL_CASE,
+                head_k_dim=128,
+                head_v_dim=128,
+            )
+
+        fused_prefill.assert_called_once()
 
     # Layout-robustness. See dense/test_triton.py for the rationale.
     LAYOUT_ROBUSTNESS_CASES = (
