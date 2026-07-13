@@ -9,41 +9,49 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_target_cache_loc as get_target_cache_loc,
+)
+from sglang.kernels.ops.speculative.eagle import (
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    next_power_of_2,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
-)
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -52,6 +60,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -68,6 +77,9 @@ elif _is_hip:
     from sgl_kernel import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
+
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu
 
 
 logger = logging.getLogger(__name__)
@@ -192,12 +204,12 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
+    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
+    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
     return not server_args.enable_multi_layer_eagle
 
@@ -347,7 +359,7 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
@@ -571,20 +583,30 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+    fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
+        size,
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
@@ -600,7 +622,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
     """
-    if not get_global_server_args().enable_mamba_extra_buffer():
+    if not get_server_args().enable_mamba_extra_buffer():
         return
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None
@@ -655,7 +677,7 @@ def commit_mamba_states_after_verify(
             # we need to update the mamba state for the request at the crossing point.
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_global_server_args().mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
@@ -689,7 +711,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if batch.spec_algorithm.is_dflash():
+    if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

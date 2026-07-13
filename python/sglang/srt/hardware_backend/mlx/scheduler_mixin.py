@@ -234,7 +234,7 @@ class SchedulerMlxOverlapMixin:
             ):
                 pending_curr = pending_next
                 pending_next = None
-                self.cur_batch = pending_curr.schedule_batch
+                self.cur_batch_for_debug = pending_curr.schedule_batch
                 self.last_batch = pending_curr.schedule_batch
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                     self.invariant_checker.self_check_during_busy()
@@ -246,8 +246,12 @@ class SchedulerMlxOverlapMixin:
                 self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
                 pending_next = None
-            next_batch = self.get_next_batch_to_run()
-            self.cur_batch = next_batch
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            next_batch = plan.batch_to_run
+            self.cur_batch_for_debug = next_batch
             if next_batch:
                 pending_curr = _launch_fresh(next_batch)
                 self.result_queue.append(pending_curr)
