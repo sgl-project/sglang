@@ -718,6 +718,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             group_size=group_size,
         )
+        nvfp4_config.is_w4a16_nvfp4 = False
         nvfp4a16_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -726,6 +727,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        nvfp4a16_config.is_w4a16_nvfp4 = True
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -1894,8 +1896,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.use_a16 = getattr(quant_config, "is_w4a16_nvfp4", False)
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        if self.use_a16 and is_cuda():
+            capability = get_device_capability()
+            use_marlin_fallback = (8, 0) <= capability
+        elif moe_runner_backend.is_auto() and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -1907,8 +1913,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            not self.use_a16
+            and (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
         )
         self._cache_permute_indices = {}
 
@@ -1917,14 +1926,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe import get_moe_runner_backend
 
         """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+        return not self.use_a16 and get_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
         """Access the global enable_flashinfer_cutedsl_moe setting."""
         from sglang.srt.layers.moe import get_moe_runner_backend
 
-        return get_moe_runner_backend().is_flashinfer_cutedsl()
+        return not self.use_a16 and get_moe_runner_backend().is_flashinfer_cutedsl()
 
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
@@ -2443,7 +2452,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
-        if moe_runner_backend.is_auto():
+        if self.use_a16:
+            if moe_runner_backend.is_auto():
+                moe_runner_backend = MoeRunnerBackend.MARLIN
+            elif not moe_runner_backend.is_marlin():
+                raise ValueError(
+                    "ModelOpt W4A16 NVFP4 MoE requires the Marlin MoE backend. "
+                    "Use --moe-runner-backend marlin, or leave it as auto so "
+                    "the model override can select Marlin before model "
+                    "construction."
+                )
+        elif moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
             else:

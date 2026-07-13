@@ -291,7 +291,7 @@ __global__ void Marlin(
     int4* __restrict__ C_tmp,                 // fp32 tmp output buffer (for reduce)
     const int4* __restrict__ scales_ptr,      // fp16 quantization scales of shape
                                               // (k/groupsize)xn
-    const uint16_t* __restrict__ scale2_ptr,  // fp16 global scale (for nvfp4
+    const float* __restrict__ scale2_ptr,     // fp32 global scale (for nvfp4
                                               // only)
     const int4* __restrict__ zp_ptr,          // 4bit packed zero-points of shape
                                               // (k/groupsize)x(n/pack_factor)
@@ -333,11 +333,10 @@ __global__ void Marlin(
                                      has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
                                      has_zp && !is_zp_float && !(w_type == sglang::kU8);
 
-  scalar_t2 global_scale;
+  float global_scale_f32 = 1.0f;
 
   if constexpr (w_type == sglang::kFE2M1f) {
-    uint16_t val = scale2_ptr[0];
-    global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
+    global_scale_f32 = scale2_ptr[0];
   }
 
   constexpr bool has_act_order = group_blocks == 0;
@@ -1361,6 +1360,11 @@ __global__ void Marlin(
     // We first reorder in shared memory to guarantee the most efficient final
     // global write patterns
     auto write = [&](int idx, float c0, float c1, FragS& s) {
+      if constexpr (w_type == sglang::kFE2M1f) {
+        c0 *= global_scale_f32;
+        c1 *= global_scale_f32;
+      }
+
       scalar_t2 res = Dtype::nums2num2(Dtype::float2num(c0), Dtype::float2num(c1));
 
       // For per-column quantization we finally apply the scale here (only for
@@ -1368,10 +1372,6 @@ __global__ void Marlin(
       if constexpr (
           !has_act_order && group_blocks == -1 && w_type.size_bits() == 4 && (has_zp && dequant_skip_flop || !has_zp)) {
         res = __hmul2(res, s[0]);
-      }
-
-      if constexpr (w_type == sglang::kFE2M1f) {
-        res = __hmul2(res, global_scale);
       }
 
       if constexpr (m_block_size_8) {

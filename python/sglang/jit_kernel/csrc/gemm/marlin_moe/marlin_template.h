@@ -302,7 +302,7 @@ __global__ void Marlin(
     const int4* __restrict__ b_bias_ptr,
     const int4* __restrict__ scales_ptr,                     // fp16 quantization scales of shape
                                                              // (k/groupsize)xn
-    const uint16_t* __restrict__ scale2_ptr,                 // fp16 global scale (for nvfp4
+    const float* __restrict__ scale2_ptr,                    // fp32 global scale (for nvfp4
                                                              // only)
     const int4* __restrict__ zp_ptr,                         // 4bit packed zero-points of shape
                                                              // (k/groupsize)x(n/pack_factor)
@@ -362,7 +362,7 @@ __global__ void Marlin(
                                      has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
                                      has_zp && !is_zp_float && !(w_type == host::kU8);
 
-  scalar_t2 global_scale;
+  float global_scale_f32 = 1.0f;
 
   constexpr bool has_act_order = group_blocks == 0;
 
@@ -492,12 +492,11 @@ __global__ void Marlin(
 
       if (mul_topk_weights) {
         idx = idx < prob_m_top_k ? idx : 0;
-        scalar_t topk_weight_tmp = Dtype::float2num(topk_weights_ptr[idx]);
+        float topk_weight_tmp = topk_weights_ptr[idx];
         if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-          sh_block_topk_weights[threadIdx.x] = __hmul2(global_scale, Dtype::num2num2(topk_weight_tmp));
-        } else {
-          sh_block_topk_weights[threadIdx.x] = Dtype::num2num2(topk_weight_tmp);
+          topk_weight_tmp *= global_scale_f32;
         }
+        sh_block_topk_weights[threadIdx.x] = Dtype::num2num2(Dtype::float2num(topk_weight_tmp));
       }
     }
 
@@ -532,8 +531,7 @@ __global__ void Marlin(
     }
 
     if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-      uint16_t val = scale2_ptr[expert_id];
-      global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
+      global_scale_f32 = scale2_ptr[expert_id];
     }
 
     B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
@@ -1521,6 +1519,13 @@ __global__ void Marlin(
     // We first reorder in shared memory to guarantee the most efficient final
     // global write patterns
     auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {
+      if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
+        if (!mul_topk_weights) {
+          c0 *= global_scale_f32;
+          c1 *= global_scale_f32;
+        }
+      }
+
       scalar_t2 res = Dtype::nums2num2(Dtype::float2num(c0), Dtype::float2num(c1));
 
       // For per-column quantization we finally apply the scale here (only for
@@ -1534,11 +1539,6 @@ __global__ void Marlin(
         res = __hmul2(res, tmp_scale);
       }
 
-      if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-        if (!mul_topk_weights) {
-          res = __hmul2(res, global_scale);
-        }
-      }
       if (has_bias && last) {
         scalar_t2 tmp_bias = b_bias[0];
         if constexpr (m_block_size_8) {

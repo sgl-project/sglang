@@ -854,10 +854,25 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
 
+    quant_config = getattr(model_config.hf_config, "quantization_config", {}) or {}
+    quant_section = quant_config.get("quantization", quant_config)
+    quantized_layers = quant_section.get("quantized_layers", {})
+    has_w4a16_nvfp4 = any(
+        isinstance(layer_config, dict)
+        and layer_config.get("quant_algo", "").upper() == "W4A16_NVFP4"
+        for layer_config in quantized_layers.values()
+    )
+
     if (is_modelopt or model_config.quantization is None) and (
         server_args.moe_runner_backend == "auto"
     ):
-        if is_sm100_supported() and server_args.moe_a2a_backend == "none":
+        if has_w4a16_nvfp4 and is_cuda() and get_device_capability() >= (8, 0):
+            overrides["moe_runner_backend"] = "marlin"
+            logger.info(
+                "Use marlin as MoE runner backend for "
+                f"{model_arch} ModelOpt W4A16_NVFP4 checkpoint."
+            )
+        elif is_sm100_supported() and server_args.moe_a2a_backend == "none":
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
                 f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
