@@ -327,22 +327,9 @@ class KVCacheConfigurator:
                     extra_max_context_len=extra_max_context_len,
                 )
             else:
-                # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
-                # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
-                req_to_token_pool_cls = ReqToTokenPool
-                if _is_npu and is_deepseek_v4(self.model_config.hf_config):
-                    from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
-                        DSV4NPUReqToTokenPool,
-                    )
-
-                    req_to_token_pool_cls = DSV4NPUReqToTokenPool
-
-                req_to_token_pool = req_to_token_pool_cls(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
+                req_to_token_pool = self._build_default_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -1228,6 +1215,30 @@ class KVCacheConfigurator:
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+        )
+        return req_to_token_pool
+
+    def _build_default_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+    ) -> ReqToTokenPool:
+        # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
+        # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
+        req_to_token_pool_cls = ReqToTokenPool
+        if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUReqToTokenPool,
+            )
+
+            req_to_token_pool_cls = DSV4NPUReqToTokenPool
+
+        req_to_token_pool = req_to_token_pool_cls(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
         )
         return req_to_token_pool
 
