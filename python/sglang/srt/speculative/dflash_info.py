@@ -48,7 +48,7 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_req == -1:
             self.num_tokens_per_req = int(self.draft_token_num)
-        self.num_tokens_for_logprob_per_req = self.draft_token_num
+        self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
     def prepare_for_verify(
         self,
