@@ -14,7 +14,8 @@ from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUWNA16Int4MoEMethod,
 )
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsMoEScheme,
@@ -37,16 +38,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
-from sglang.srt.layers.moe.moe_runner.ascend import (
-    AscendQuantInfo,
-)
 
 __all__ = [
     "CompressedTensorsWNA16MoE",
@@ -723,6 +714,8 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
