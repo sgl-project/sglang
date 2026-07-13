@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -717,3 +718,14 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
         eagle_prepare_for_decode(batch)
+
+
+def get_plan_stream(
+    device: str,
+) -> Tuple[any, contextlib.AbstractContextManager]:
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()
