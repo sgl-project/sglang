@@ -591,7 +591,7 @@ class FlashAttentionBackend(AttentionBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
         # Eager (non-cuda-graph) path: max_seq_len_k only feeds Python-side
-        # page-table slicing and the scheduler_metadata heuristic — never the
+        # page-table slicing and the scheduler_metadata heuristic -- never the
         # kernel. Use the CPU mirror when published; otherwise the static
         # max_context_len bound (over-wide page table, slightly suboptimal
         # split heuristic, but no D2H sync).
@@ -2421,8 +2421,8 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor], seq_lens: torch.Tensor
     ) -> int:
         """Host-side max KV length: the CPU mirror when published, else a local
-        D2H. For cold paths (topk>1, draft-extend, eager) that need a host max --
-        not the dflash hot path (topk=1, device-side build)."""
+        D2H. Only for paths that accept a host sync (currently prefill-aware
+        SWA decode replay)."""
         src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
         return src.max().item()
 
