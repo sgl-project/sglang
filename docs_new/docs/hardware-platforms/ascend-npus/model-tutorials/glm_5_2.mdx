@@ -340,8 +340,8 @@ export HCCL_BUFFSIZE=1000
 export HCCL_OP_EXPANSION_MODE=AIV
 
 # Run command ifconfig on two nodes, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
 
 # DEEPEP
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
@@ -445,8 +445,8 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
-        export HCCL_SOCKET_IFNAME=lo
-        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
 
         # prefill node
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
@@ -484,8 +484,8 @@ do
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
         export TASK_QUEUE_ENABLE=0
 
-        export HCCL_SOCKET_IFNAME=lo
-        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
 
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
