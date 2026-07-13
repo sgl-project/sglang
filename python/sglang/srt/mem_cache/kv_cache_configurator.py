@@ -229,6 +229,24 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
+    def _resolve_memory_pool_config(
+        self: ModelRunner, pre_model_load_memory: int
+    ) -> MemoryPoolConfig:
+        """Profile GPU memory and resolve all pool parameters into a config."""
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        config = self.config_from_budget(available_bytes)
+        config.max_running_requests = self.resolve_max_num_reqs(
+            config.max_total_num_tokens
+        )
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.finalize_with_max_running_requests(config)
+        config.mem_fraction_static = self.server_args.mem_fraction_static
+        return config
+
     def config_from_budget(
         self: ModelRunner, budget_bytes: int, *, cap_tokens: Optional[int] = None
     ) -> MemoryPoolConfig:
