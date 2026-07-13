@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -56,6 +57,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
+    commit_mamba_states_after_verify,
     draft_tp_context,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
@@ -81,6 +83,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self._need_mamba_verify_commit = False
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -296,6 +299,46 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        # Hybrid linear-attention (mamba/KDA) targets keep per-step states in
+        # intermediate caches during TARGET_VERIFY; DSpark must commit the
+        # accepted-step state back to the persistent conv/ssm caches (matching
+        # EAGLE/DFlash), otherwise the next decode runs on stale KDA state and
+        # the output diverges from pure-target greedy decoding.
+        self._need_mamba_verify_commit = mambaish_config(
+            self.model_runner.model_config
+        ) is not None and hasattr(
+            self.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+
+    def _commit_mamba_state_after_accept(
+        self, *, batch: ScheduleBatch, accept, bs: int
+    ) -> None:
+        """Commit accepted per-step KDA/mamba states to the persistent caches.
+
+        Mirrors EAGLE's ``commit_mamba_states_after_verify`` but for the DSpark
+        linear (topk==1) proposal: the verify candidates are a contiguous chain
+        of ``verify_num_draft_tokens`` per request, so ``accept_index`` is a
+        plain ``[bs, stride]`` arange. Called before ``batch.seq_lens`` is
+        advanced, since the commit kernel reads the pre-verify seq lens.
+        """
+        if not self._need_mamba_verify_commit:
+            return
+        if batch.forward_mode.is_idle():
+            return
+        stride = int(self.verify_num_draft_tokens)
+        device = self.device
+        # accept_index[i, j] = i*stride + j  -> relative step index for request i.
+        accept_index = torch.arange(
+            bs * stride, dtype=torch.int64, device=device
+        ).view(bs, stride)
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch,
+            accept_lens=accept.commit_lens,
+            accept_index=accept_index,
+            draft_token_num=stride,
+        )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
@@ -637,6 +680,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        self._commit_mamba_state_after_accept(
+            batch=batch, accept=accept, bs=bs
         )
         if on_publish is not None:
             if confidence is not None:
