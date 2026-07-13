@@ -178,6 +178,14 @@ class DFlashDraftInputV2(SpecInput):
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
+        row_width = batch.req_to_token_pool.req_to_token.shape[1]
+        max_reserved_len = int(nxt_kv_lens_cpu_t.max().item())
+        assert max_reserved_len <= row_width, (
+            f"DFLASH/DSPARK draft over-allocation ({max_reserved_len}) exceeds "
+            f"req_to_token row width ({row_width}); widen the row to hold committed "
+            f"+ get_alloc_reserve_per_decode()."
+        )
+
         caller_stream = None
         if plan_stream is not None:
             caller_stream = torch.get_device_module(batch.device).current_stream()

@@ -51,6 +51,21 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+
+def _copy_prefix_seq_lens_cpu(
+    dst: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    seq_lens_cpu: Optional[torch.Tensor],
+) -> int:
+    src = seq_lens_cpu
+    if src is None:
+        src = prefix_lens.detach().to(device=dst.device, dtype=dst.dtype)
+    elif src.dtype != dst.dtype:
+        src = src.to(dtype=dst.dtype)
+    dst.copy_(src)
+    return int(dst.sum().item())
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -1441,22 +1456,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
-            # Non-windowed path uses the shared overallocated mapping directly.
-            # Backend planning only needs a safe upper bound for the committed
-            # prefix lengths, not the full allocator reservation length.
+            # TARGET_VERIFY attention backends interpret seq_lens_cpu as the
+            # committed prefix and add the fixed draft width internally when
+            # planning metadata. Keep this mirror prefix-only; using allocator
+            # reservation or prefix + block double-counts the verify width.
             draft_seq_lens = prefix_lens
-            if batch.seq_lens_cpu is not None:
-                # Host bound = committed prefix + one verify block.
-                seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                seq_lens_cpu.add_(block_size)
-                draft_seq_lens_sum = int(seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                # GPU-only backend: reserved is a safe over-estimate.
-                seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
-                draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
-            else:
-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+            draft_seq_lens_sum = _copy_prefix_seq_lens_cpu(
+                seq_lens_cpu, prefix_lens, batch.seq_lens_cpu
+            )
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -1519,14 +1526,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        base_seq_lens_cpu = (
+            seq_lens_cpu_backup
+            if seq_lens_cpu_backup is not None
+            else batch.seq_lens.cpu()
+        )
+        batch.seq_lens_cpu = base_seq_lens_cpu
+        batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
