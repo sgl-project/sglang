@@ -393,7 +393,7 @@ mod tests {
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
 
         // Request removed (no lingering state to be mistaken for success)...
-        assert!(table.get(&RequestId(1)).is_none());
+        assert!(!table.contains_key(&RequestId(1)));
         // ...and the scheduler was told to abort it.
         assert!(matches!(
             tm_rx.try_recv(),

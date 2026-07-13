@@ -317,10 +317,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init();
 
-    // Two tokenizers over the same `tokenizer.json`: dynamo for the detok shards'
-    // incremental decode, and the HuggingFace `tokenizers` lib for the encode pool
-    // (dynamo can't add BOS — see `tokenizer::HfEncoder`). Both `None` only under
-    // `skip_tokenizer_init`, so their Some/None state stays in lockstep.
+    // Two tokenizer instances over the same `tokenizer.json`: default options for
+    // the detok shards' incremental decode, and `add_special_tokens=true` for the
+    // encode pool. Both `None` only under `skip_tokenizer_init`, so their Some/None
+    // state stays in lockstep.
     let dyn_tokenizer = tokenizer::load_tokenizer(
         cfg.tokenizer_path.as_deref(),
         cfg.revision.as_deref(),
@@ -360,8 +360,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
     // there is none and ingress never routes to the pool, so we skip it.
     if let Some(enc) = hf_encoder {
-        // HF encoder (adds BOS), independent of the dynamo tokenizer the detok
-        // shards use; both are present together (same `skip_tokenizer_init` gate).
+        // HF encoder (adds BOS), independently configured from the tokenizer the
+        // detok shards use; both are present together (same skip-init gate).
         let tokenizer = Arc::new(tokenizer::HfEncoder::new(enc));
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so

@@ -2,8 +2,8 @@
 //! executor). Each worker pulls a `Request` from the shared `flume` receiver,
 //! fills `input_ids`, and moves the request back to the TokenizerManager inbox.
 //!
-//! The text→ids step is behind [`TextTokenizer`], implemented by
-//! [`DynamoTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
+//! The text→ids step is behind [`TextTokenizer`], implemented by [`HfEncoder`]
+//! over dynamo-tokenizers' HuggingFace backend.
 //! A non-skip server requires a real tokenizer (enforced at startup); under
 //! `skip_tokenizer_init` the pool isn't spawned at all.
 //!
@@ -51,17 +51,16 @@ pub fn load_tokenizer(
     Ok(Some(tokenizer))
 }
 
-/// Load the HuggingFace `tokenizers` tokenizer used by the encode pool. Separate
-/// from [`load_tokenizer`] (dynamo) because the two libraries differ on special
-/// tokens: dynamo hard-codes `add_special_tokens=false`, so it drops the BOS the
-/// prompt's post-processor would add, whereas [`HfEncoder`] passes `true` to match
-/// the Python server's `tokenizer.encode(text)`. Loads the same `tokenizer.json`;
+/// Load the plain HuggingFace tokenizer used by the encode pool, configured once
+/// with `add_special_tokens=true` to match the Python server's
+/// `tokenizer.encode(text)`. This construction path intentionally does not select
+/// fastokens or add a `CachedTokenizer` wrapper. Loads the same `tokenizer.json`;
 /// `None` under `skip_tokenizer_init`.
 pub fn load_encoder(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
     skip_tokenizer_init: bool,
-) -> Result<Option<tokenizers::Tokenizer>, String> {
+) -> Result<Option<dynamo_tokenizers::Tokenizer>, String> {
     if skip_tokenizer_init {
         return Ok(None);
     }
@@ -71,8 +70,13 @@ pub fn load_encoder(
 
     let file = resolve_model_file(path, revision, "tokenizer.json")
         .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&file)
-        .map_err(|e| format!("encoder load failed ({file}): {e}"))?;
+    let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
+        &file,
+        dynamo_tokenizers::TokenizerOptions {
+            add_special_tokens: true,
+        },
+    )
+    .map_err(|e| format!("encoder load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded encoder (add_special_tokens=true)");
     Ok(Some(tokenizer))
 }
@@ -110,18 +114,19 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Real encoder over the HuggingFace `tokenizers` library. Encodes with
-/// `add_special_tokens=true` so the prompt gets its BOS / post-processor special
-/// tokens — matching the Python server's `tokenizer.encode(text)`. dynamo's encoder
-/// passes `false`, dropping BOS; on models that prepend one (Llama, gemma, …) that
-/// silently changed the prompt and measurably cut accuracy (GSM8K gemma-2: 0.44 →
-/// 0.29). Decode still runs through dynamo's `DecodeStream` (see the detok shard).
+/// Real encoder over dynamo-tokenizers' plain HuggingFace backend. The inner
+/// tokenizer is constructed with `add_special_tokens=true`, so the prompt gets
+/// its BOS / post-processor special tokens — matching the Python server's
+/// `tokenizer.encode(text)`. On models that prepend one (Llama, Gemma, …), dropping
+/// BOS silently changed the prompt and measurably cut accuracy (GSM8K Gemma-2:
+/// 0.44 → 0.29). Decode still runs through the default-configured tokenizer used
+/// by the detok shard.
 pub struct HfEncoder {
-    inner: tokenizers::Tokenizer,
+    inner: dynamo_tokenizers::Tokenizer,
 }
 
 impl HfEncoder {
-    pub fn new(inner: tokenizers::Tokenizer) -> Self {
+    pub fn new(inner: dynamo_tokenizers::Tokenizer) -> Self {
         Self { inner }
     }
 }
@@ -135,10 +140,10 @@ impl TextTokenizer for HfEncoder {
         }
         let encoding = self
             .inner
-            .encode(text, true) // add_special_tokens=true → BOS etc., as Python does
+            .encode(text)
             .map_err(|e| Error::Tokenize(e.to_string()))?;
         // Vocab ids are non-negative and fit in i32.
-        Ok(encoding.get_ids().iter().map(|&id| id as i32).collect())
+        Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
     }
 }
 
@@ -184,5 +189,127 @@ impl Runnable for TokenizerWorker {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dynamo_tokenizers::Encoding;
+    use tokenizers::{
+        AddedToken, Tokenizer as DirectHfTokenizer, models::wordlevel::WordLevel,
+        pre_tokenizers::whitespace::WhitespaceSplit, processors::template::TemplateProcessing,
+    };
+
+    use super::*;
+
+    struct TokenizerFixture {
+        _dir: tempfile::TempDir,
+        path: String,
+    }
+
+    fn tokenizer_fixture() -> TokenizerFixture {
+        let vocab = [
+            ("[UNK]", 0),
+            ("<s>", 1),
+            ("</s>", 2),
+            ("<|im_start|>", 3),
+            ("<|im_end|>", 4),
+            ("system", 5),
+            ("user", 6),
+            ("hello", 7),
+            ("world", 8),
+            ("again", 9),
+        ]
+        .into_iter()
+        .map(|(token, id)| (token.to_string(), id))
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("build word-level model");
+        let mut tokenizer = DirectHfTokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<s>", true),
+            AddedToken::from("</s>", true),
+            AddedToken::from("<|im_start|>", true),
+            AddedToken::from("<|im_end|>", true),
+        ]);
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("<s> $A </s>")
+                .expect("single-sequence template")
+                .special_tokens(vec![("<s>", 1), ("</s>", 2)])
+                .build()
+                .expect("build template processor"),
+        ));
+
+        let dir = tempfile::tempdir().expect("create fixture directory");
+        let path = dir.path().join("tokenizer.json");
+        tokenizer
+            .save(&path, false)
+            .expect("save tokenizer fixture");
+        TokenizerFixture {
+            _dir: dir,
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    #[test]
+    fn add_special_tokens_encoder_matches_direct_hf() {
+        let fixture = tokenizer_fixture();
+        let selected = load_encoder(Some(&fixture.path), None, false)
+            .expect("load encoder")
+            .expect("encoder enabled");
+        let direct = DirectHfTokenizer::from_file(&fixture.path).expect("load direct HF tokenizer");
+
+        let prompts = [
+            "<|im_start|> system <|im_end|> <|im_start|> user hello world <|im_end|>",
+            "<|im_start|> user hello again <|im_end|>",
+        ];
+
+        for prompt in prompts {
+            let expected = direct.encode(prompt, true).expect("direct HF encode");
+            for _ in 0..3 {
+                let actual = selected.encode(prompt).expect("selected encode");
+                assert!(
+                    matches!(actual, Encoding::Hf(_)),
+                    "add_special_tokens=true must select the plain HF backend"
+                );
+                assert_eq!(actual.token_ids(), expected.get_ids());
+            }
+        }
+
+        let expected_batch = direct
+            .encode_batch(prompts.to_vec(), true)
+            .expect("direct HF batch encode");
+        let actual_batch = selected
+            .encode_batch(&prompts)
+            .expect("selected batch encode");
+        assert_eq!(actual_batch.len(), expected_batch.len());
+        for (actual, expected) in actual_batch.iter().zip(&expected_batch) {
+            assert!(matches!(actual, Encoding::Hf(_)));
+            assert_eq!(actual.token_ids(), expected.get_ids());
+        }
+
+        let ids = actual_batch[0].token_ids();
+        let bos = direct.token_to_id("<s>").expect("BOS id");
+        let eos = direct.token_to_id("</s>").expect("EOS id");
+        assert_eq!(ids.first(), Some(&bos));
+        assert_eq!(ids.last(), Some(&eos));
+        assert_eq!(ids.iter().filter(|&&id| id == bos).count(), 1);
+        assert_eq!(ids.iter().filter(|&&id| id == eos).count(), 1);
+
+        let worker_encoder = HfEncoder::new(selected);
+        let worker_ids = worker_encoder.encode(prompts[0]).expect("worker encode");
+        assert_eq!(
+            worker_ids,
+            expected_batch[0]
+                .get_ids()
+                .iter()
+                .map(|&id| id as i32)
+                .collect::<Vec<_>>()
+        );
     }
 }
