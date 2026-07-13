@@ -817,10 +817,7 @@ class DefaultModelLoader(BaseModelLoader):
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
-            with temp_set_env(
-                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-            ):
+            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
@@ -1255,7 +1252,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 per_token_group_quant_fp8,
             )
 
