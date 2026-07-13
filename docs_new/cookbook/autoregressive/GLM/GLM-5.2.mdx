@@ -1,6 +1,6 @@
 ---
 title: GLM-5.2
-description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X."
+description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H20, H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X."
 tag: NEW
 ---
 
@@ -53,7 +53,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 2-1-3 = 2); high-throughput has no spec.
+  Speed numbers are measured with `--random-range-ratio 1.0` and `--flush-cache`; each benchmark card shows the SGLang version used. B200/GB300 FP8 spec cells measured on `main @ 09ca4fc` pin the EAGLE acceptance length via `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 2-1-3 = 2); other cells use their recorded setup.
 </Note>
 
 ## Playground
@@ -66,7 +66,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench.
+**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. The checkpoints share **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. Z.ai publishes **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`); PhalaCloud publishes a Hopper **W4AFP8** build (`PhalaCloud/GLM-5.2-W4AFP8`); and NVIDIA publishes a Blackwell **NVFP4** build (`nvidia/GLM-5.2-NVFP4`). BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. The W4AFP8 and NVFP4 builds reduce the routed-expert weight footprint while keeping dense and shared-expert paths at higher precision.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -88,6 +88,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/PhalaCloud/GLM-5.2-W4AFP8">GLM-5.2-W4AFP8</a></strong></td>
+      <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · W4AFP8</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/GLM-5.2-NVFP4">GLM-5.2-NVFP4</a></strong></td>
       <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · NVFP4</td>
       <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
@@ -97,7 +102,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95` (the checkpoint's `generation_config.json` defaults; informational — do not hardcode in client code).
 
-**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2) · [GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
+**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2) · [GLM-5.2-W4AFP8](https://huggingface.co/PhalaCloud/GLM-5.2-W4AFP8) · [GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
 
 ## 2. Configuration Tips
 
