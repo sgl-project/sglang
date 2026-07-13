@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=91, stage="base-b", runner_config="1-gpu-large")
 
 STDOUT_FILENAME = "post_capture_kv_sizing_stdout.log"
 STDERR_FILENAME = "post_capture_kv_sizing_stderr.log"

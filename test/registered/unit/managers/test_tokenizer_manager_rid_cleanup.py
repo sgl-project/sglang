@@ -27,7 +27,7 @@ from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqI
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
