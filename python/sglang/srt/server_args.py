@@ -2957,7 +2957,7 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
@@ -5450,19 +5450,19 @@ class ServerArgs:
         MoE layer on one (DP) rank. Single source of truth for both the
         standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
         budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_bs is
+        capture, and decode/verify bounds; num_tokens_per_req is
         speculative_num_draft_tokens under speculative decoding, else 1.
         """
         if self.speculative_algorithm:
-            num_tokens_per_bs = self.speculative_num_draft_tokens or 1
+            num_tokens_per_req = self.speculative_num_draft_tokens or 1
         else:
-            num_tokens_per_bs = 1
+            num_tokens_per_req = 1
         prefill_tokens = self.max_prefill_tokens
         cg_config = self.cuda_graph_config
         if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
             prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_bs
+        decode_tokens = decode_max_bs * num_tokens_per_req
         return max(prefill_tokens, decode_tokens)
 
     def max_prefill_buffer_tokens(self) -> int:
@@ -5483,7 +5483,7 @@ class ServerArgs:
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
-        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
         from sglang.srt.arg_groups.overrides import resolved_view
 
         view = resolved_view(self)

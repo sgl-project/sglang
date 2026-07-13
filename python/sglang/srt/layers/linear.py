@@ -588,7 +588,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv/mlp).
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -731,8 +731,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         """
         Handle special case for models where MLP layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -832,12 +832,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(
-                    loaded_weight=loaded_weight,
-                    shard_id=0,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                )
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint "
+                        "merged-column checkpoint load, got shape "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                if loaded_shard_id is None:
+                    # The checkpoint tensor is already fused-in-checkpoint, so a
+                    # scalar scale applies to the entire merged matrix. Fill
+                    # every logical slot so later reductions only see valid
+                    # scale values.
+                    shard_ids = range(param.data.shape[0])
+                else:
+                    shard_ids = loaded_shard_id
+
+                for shard_id in shard_ids:
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight,
+                        shard_id=shard_id,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
+                    )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
                 self._load_merged_block_scale(param, loaded_weight)
@@ -1007,8 +1023,8 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         """
         Handle special case for models where QKV layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -1084,7 +1100,19 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
-                param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
+                # The checkpoint tensor is already fused-in-checkpoint, so a scalar
+                # scale applies to the entire QKV matrix. Fill every logical
+                # slot so later reductions only see valid scale values.
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint QKV "
+                        "checkpoint load when loaded_shard_id is None, got "
+                        f"shape {tuple(loaded_weight.shape)}"
+                    )
+                for shard_id in param.qkv_idxs:
+                    param.load_qkv_weight(
+                        loaded_weight=loaded_weight, shard_id=shard_id
+                    )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight)
@@ -1156,7 +1184,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv/mlp).
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
