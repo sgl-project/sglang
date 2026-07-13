@@ -664,7 +664,8 @@ def compute_mamba_state_slice_blocks(
     ``conv_shard_groups`` is None) keep the single contiguous slice.
     """
     use_subdims = (
-        conv_shard_groups is not None and sum(conv_shard_groups) == src_dim * src_attn_tp_size
+        conv_shard_groups is not None
+        and sum(conv_shard_groups) == src_dim * src_attn_tp_size
     )
 
     if src_attn_tp_size > dst_attn_tp_size:

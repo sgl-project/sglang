@@ -712,9 +712,7 @@ def compute_head_slice_params(
         # (tp_rank // num_kv_head_replicas), so map by integer division not modulo.
         dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
         unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
-        src_head_start = (
-            unique_dst_head_idx * dst_heads_per_rank
-        ) % src_heads_per_rank
+        src_head_start = (unique_dst_head_idx * dst_heads_per_rank) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
         dst_head_start = 0
 

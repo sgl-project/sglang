@@ -1216,16 +1216,18 @@ class MooncakeKVManager(CommonKVManager):
             )
             # One block for single-axis states; three (q/k/v) for GDN conv_state
             # on the scatter path.
-            for src_dim_start, dst_dim_start, num_dims_to_send in (
-                compute_mamba_state_slice_blocks(
-                    src_dim=src_dim,
-                    dst_dim=dst_dim,
-                    src_attn_tp_size=self.attn_tp_size,
-                    dst_attn_tp_size=dst_attn_tp_size,
-                    dst_tp_rank_in_group=dst_tp_rank_in_group,
-                    local_tp_rank_in_group=local_tp_rank_in_group,
-                    conv_shard_groups=conv_shard_groups,
-                )
+            for (
+                src_dim_start,
+                dst_dim_start,
+                num_dims_to_send,
+            ) in compute_mamba_state_slice_blocks(
+                src_dim=src_dim,
+                dst_dim=dst_dim,
+                src_attn_tp_size=self.attn_tp_size,
+                dst_attn_tp_size=dst_attn_tp_size,
+                dst_tp_rank_in_group=dst_tp_rank_in_group,
+                local_tp_rank_in_group=local_tp_rank_in_group,
+                conv_shard_groups=conv_shard_groups,
             ):
                 src_dim_offset = src_dim_start * src_bytes_per_dim
                 dst_dim_offset = dst_dim_start * dst_bytes_per_dim
