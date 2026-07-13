@@ -51,6 +51,9 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.model_executor.model_runner_components.layer_setup import (
+        ModelLayerInfo,
+    )
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
     )
@@ -75,6 +78,7 @@ class KVCacheConfigurator:
     model_config: ModelConfig
     server_args: ServerArgs
     kv_cache_dtype: torch.dtype
+    page_size: int
     spec_algorithm: SpeculativeAlgorithm
     is_draft_worker: bool
     post_capture_kv_active: bool
@@ -88,9 +92,22 @@ class KVCacheConfigurator:
     start_layer: int
     end_layer: int
     num_effective_layers: int
+    forward_stream: Any
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+
+    @property
+    def layer_info(self) -> ModelLayerInfo:
+        from sglang.srt.model_executor.model_runner_components.layer_setup import (
+            ModelLayerInfo,
+        )
+
+        return ModelLayerInfo(
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            num_effective_layers=self.num_effective_layers,
+        )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         raise NotImplementedError("populated in kvc-migrate-method-bodies")
