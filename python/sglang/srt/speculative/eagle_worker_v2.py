@@ -396,7 +396,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if (
+            check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            or self.server_args.disable_draft_cuda_graph
+        ):
             return
 
         if self.server_args.model_impl == "mindspore":
