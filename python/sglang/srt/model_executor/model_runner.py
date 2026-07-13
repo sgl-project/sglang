@@ -129,8 +129,8 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
-    RemoteInstanceWeightTransport,
+from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transporter import (
+    RemoteInstanceWeightTransporter,
 )
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
     WeightExporter,
@@ -313,7 +313,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
-        self.init_remote_instance_weight_transport()
+        self.init_remote_instance_weight_transporter()
 
         self.msprobe_debugger = None
         if server_args.msprobe_dump_config is not None:
@@ -550,8 +550,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_model=lambda: self.model,
         )
 
-    def init_remote_instance_weight_transport(self):
-        self.remote_instance_weight_transport = RemoteInstanceWeightTransport(
+    def init_remote_instance_weight_transporter(self):
+        self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             server_args=self.server_args,
             get_model=lambda: self.model,
             tp_rank=self.tp_rank,
@@ -595,7 +595,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_weight_transport.init_engine()
+            self.remote_instance_weight_transporter.init_engine()
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -658,7 +658,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
 
-        self.remote_instance_weight_transport.maybe_register_and_publish_weight_info()
+        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1142,8 +1142,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
-            remote_instance_weight_loader_transfer_engine=self.remote_instance_weight_transport.engine,
-            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_weight_transport.session_id,
+            remote_instance_weight_loader_transfer_engine=self.remote_instance_weight_transporter.engine,
+            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_weight_transporter.session_id,
             modelexpress_url=self.server_args.modelexpress_url,
             modelexpress_transport=self.server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
@@ -1193,7 +1193,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_weight_transport.weight_info = (
+                self.remote_instance_weight_transporter.weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
