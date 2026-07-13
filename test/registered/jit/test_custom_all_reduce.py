@@ -41,7 +41,11 @@ from sglang.jit_kernel.all_reduce import (
 )
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
+from sglang.jit_kernel.utils import (
+    cache_once,
+    get_ci_test_range,
+    should_run_full_tests,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -286,12 +290,13 @@ if __name__ == "__main__":
     # timeout: measured on a slow CI runner (radixark-wk03, warm JIT cache) the
     # in-CI reduced sweep takes 98s @ 2 GPUs and 209s @ 4 GPUs, and the 8-GPU
     # invocation was killed by the default 600s budget at 23/24 tests while
-    # still making steady progress. 900s covers it; run_suite's 1200s per-file
-    # limit stays the overall backstop.
+    # still making steady progress. 900s covers it; run_suite's per-file limit
+    # stays the overall backstop. The nightly full sweep runs ~7x the reduced
+    # parametrizations per world size, so it gets a proportional budget.
     multigpu_pytest_main(
         __name__,
         __file__,
         num_gpus=(2, 4, 8),
         pre_launch_fn=_precompile_kernels,
-        timeout=900,
+        timeout=3600 if should_run_full_tests() else 900,
     )
