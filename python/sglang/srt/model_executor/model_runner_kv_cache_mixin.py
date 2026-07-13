@@ -186,68 +186,9 @@ class ModelRunnerKVCacheMixin:
     def _init_unified_mamba_pools(
         self: ModelRunner, *, max_num_reqs: int, max_total_num_tokens: int
     ) -> UnifiedPoolBundle:
-        """Build the shared-KV-pool stack for a hybrid-Mamba model:
-        one byte buffer split between the full-attn MHA KV pool and the
-        per-request Mamba state pool, with virtual slot ids above the
-        allocator."""
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_pools
-
-        config = self.mambaish_config
-        assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
-        # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
-        # the mamba sub-pool stays page=1.
-        assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
-
-        mamba_layer_ids = [
-            i
-            for i in config.mamba2_cache_params.layers
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-        full_attention_layer_ids = [
-            i
-            for i in config.full_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-
-        bundle = init_unified_mamba_pools(
-            device=self.device,
-            kv_cache_dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
-            head_dim=self.model_config.head_dim,
-            page_size=self.page_size,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            is_draft_worker=self.is_draft_worker,
-            use_mla_backend=self.use_mla_backend,
-            mamba_layer_ids=mamba_layer_ids,
-            full_attention_layer_ids=full_attention_layer_ids,
-            mamba2_cache_params=config.mamba2_cache_params,
-            model_context_len=self.model_config.context_len,
-            extra_max_context_len=extra_max_context_len,
-            max_total_num_tokens=max_total_num_tokens,
-            max_mamba_cache_size=self.server_args.max_mamba_cache_size,
-            max_num_reqs=max_num_reqs,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
-            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
-            mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
-            # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
-            # barrier so eager compaction serializes after the in-flight forward's
-            # v2p/KV reads. Near-no-op in normal mode.
-            forward_stream=self.forward_stream,
-            # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
-            lazy_compaction=_should_enable_lazy_compaction(),
+        return self.kv_cache_configurator._init_unified_mamba_pools(
+            max_num_reqs=max_num_reqs, max_total_num_tokens=max_total_num_tokens
         )
-        return bundle
 
     def _init_unified_swa_pools(self: ModelRunner, max_num_reqs: int):
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
