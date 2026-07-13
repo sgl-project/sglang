@@ -466,6 +466,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ) -> None:
+        # `disable_flashinfer_ragged` keeps the parent-class signature so
+        # callers that hold a FlashInferMLAAttnBackend reference (e.g. the
+        # hybrid linear-attention wrapper) can delegate uniformly; this
+        # backend decides the ragged fallback itself and forces it on.
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
