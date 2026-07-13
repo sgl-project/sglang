@@ -32,7 +32,7 @@ import pickle
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -2711,3 +2711,201 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
+
+
+@dataclass
+class RankParallelismConfig:
+    """
+    Complete parallelism configuration for a single inference rank.
+
+    This configuration captures all the parallelism settings needed to recreate
+    a model shard outside of sglang. It supports:
+    - TP/PP/EP for model parallelism
+    - MoE-TP/Attn-TP/Attn-DP for MoE and DP attention.
+    """
+
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    attn_tp_size: int = 1
+    attn_tp_rank: int = 0
+    attn_dp_size: int = 1
+    attn_dp_rank: int = 0
+    attn_cp_size: int = 1
+    attn_cp_rank: int = 0
+    moe_dp_size: int = 1
+    moe_dp_rank: int = 0
+
+    world_size: int = 1
+    global_rank: int = 0
+    local_rank: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RankParallelismConfig":
+        """Create from dictionary, filtering unknown fields."""
+
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+    @classmethod
+    def from_parallel_state(cls, local_rank: int = 0) -> "RankParallelismConfig":
+        """Extract current parallelism settings from the global parallel state."""
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Import dp_attention lazily to avoid circular imports
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_rank,
+            get_attention_cp_size,
+            get_attention_dp_rank,
+            get_attention_dp_size,
+            get_attention_tp_rank,
+            get_attention_tp_size,
+        )
+
+        return cls(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            pp_size=get_pipeline_model_parallel_world_size(),
+            pp_rank=get_pipeline_model_parallel_rank(),
+            ep_size=get_moe_expert_parallel_world_size(),
+            ep_rank=get_moe_expert_parallel_rank(),
+            moe_tp_size=get_moe_tensor_parallel_world_size(),
+            moe_tp_rank=get_moe_tensor_parallel_rank(),
+            attn_tp_size=get_attention_tp_size(),
+            attn_tp_rank=get_attention_tp_rank(),
+            attn_dp_size=get_attention_dp_size(),
+            attn_dp_rank=get_attention_dp_rank(),
+            attn_cp_size=get_attention_cp_size(),
+            attn_cp_rank=get_attention_cp_rank(),
+            moe_dp_size=get_moe_data_parallel_world_size(),
+            moe_dp_rank=get_moe_data_parallel_rank(),
+            world_size=(
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            ),
+            global_rank=(
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            ),
+            local_rank=local_rank,
+        )
+
+
+# Globals on parallel_state module to save/restore
+_PS_GLOBALS = ("_TP", "_PP", "_MOE_EP", "_MOE_TP", "_ATTN_TP", "_ATTN_CP", "_MOE_DP")
+# Globals on dp_attention module to save/restore
+_DA_GLOBALS = ("_ATTN_DP_RANK", "_ATTN_DP_SIZE", "_ENABLE_DP_ATTENTION_FLAG")
+
+
+class ParallelismContext:
+    """
+    Context manager for creating model replicas with specific parallelism settings.
+
+    Temporarily sets global variables to allow creating model shards outside of a
+    real distributed environment.
+    Usage:
+        with ParallelismContext(RankParallelismConfig.from_dict(parallelism_info)):
+            model = get_model(...)
+    """
+
+    def __init__(self, parallelism_config: RankParallelismConfig):
+        self.config = parallelism_config
+        self._original_globals: Dict[str, Any] = {}
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers import dp_attention
+
+        self._parallel_state = parallel_state
+        self._dp_attention = dp_attention
+
+    class _StubGroupCoordinator:
+        """Lightweight stand-in for GroupCoordinator used by ParallelismContext."""
+
+        def __init__(self, world_size: int, rank_in_group: int):
+            self.world_size = world_size
+            self.rank_in_group = rank_in_group
+            self.rank = rank_in_group
+            self.local_rank = rank_in_group
+            self.ranks = list(range(world_size))
+            self.device_group = None
+            self.cpu_group = None
+            self.unique_name = ""
+
+        @property
+        def first_rank(self):
+            return self.ranks[0]
+
+        @property
+        def last_rank(self):
+            return self.ranks[-1]
+
+        @property
+        def is_first_rank(self):
+            return self.rank == self.first_rank
+
+        @property
+        def is_last_rank(self):
+            return self.rank == self.last_rank
+
+        @property
+        def next_rank(self):
+            return self.ranks[(self.rank_in_group + 1) % self.world_size]
+
+        @property
+        def prev_rank(self):
+            return self.ranks[(self.rank_in_group - 1) % self.world_size]
+
+    def __enter__(self):
+        conf = self.config
+        # Save original globals
+        for name in _PS_GLOBALS:
+            self._original_globals[name] = getattr(self._parallel_state, name, None)
+        for name in _DA_GLOBALS:
+            self._original_globals[name] = getattr(self._dp_attention, name, None)
+
+        # Build and set stub group coordinators on parallel_state
+        _ps_new_values = {
+            "_TP": self._StubGroupCoordinator(conf.tp_size, conf.tp_rank),
+            "_PP": self._StubGroupCoordinator(conf.pp_size, conf.pp_rank),
+            "_MOE_EP": self._StubGroupCoordinator(conf.ep_size, conf.ep_rank),
+            "_MOE_TP": self._StubGroupCoordinator(conf.moe_tp_size, conf.moe_tp_rank),
+            "_ATTN_TP": self._StubGroupCoordinator(
+                conf.attn_tp_size, conf.attn_tp_rank
+            ),
+            "_ATTN_CP": self._StubGroupCoordinator(
+                conf.attn_cp_size, conf.attn_cp_rank
+            ),
+            "_MOE_DP": self._StubGroupCoordinator(conf.moe_dp_size, conf.moe_dp_rank),
+        }
+        for name, value in _ps_new_values.items():
+            setattr(self._parallel_state, name, value)
+
+        # Set dp_attention scalar globals
+        self._dp_attention._ATTN_DP_RANK = conf.attn_dp_rank
+        self._dp_attention._ATTN_DP_SIZE = conf.attn_dp_size
+        self._dp_attention._ENABLE_DP_ATTENTION_FLAG = conf.attn_dp_size > 1
+
+        logger.info(f"[ParallelismContext] Activated: {conf}")
+        return self
+
+    def __exit__(self, *args):
+        # Restore original globals
+        for name in _PS_GLOBALS:
+            setattr(self._parallel_state, name, self._original_globals.get(name))
+        for name in _DA_GLOBALS:
+            setattr(self._dp_attention, name, self._original_globals.get(name))
+
+        logger.info("[ParallelismContext] Deactivated")
+        return False
