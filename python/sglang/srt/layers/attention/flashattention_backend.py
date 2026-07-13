@@ -2163,9 +2163,13 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=self.device,
                     ),
+                    # Merged prefix + draft table: replay uses the static
+                    # max_context_len bound for max_seq_len_k, so the width
+                    # must cover max_context_len + num_draft_tokens (checked
+                    # by assert_buffer_fits in the swa-spec merge).
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len,
+                        self.max_context_len + self.speculative_num_draft_tokens,
                         dtype=torch.int32,
                         device=self.device,
                     ),
