@@ -1187,9 +1187,13 @@ class GroupCoordinator:
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> Optional[torch.Tensor]:
         """
-        NOTE: We assume that the input tensor is on the same device across
-        all the ranks.
+        NOTE: We assume that the input tensor has the same shape and is on the
+        same device across all the ranks.
         NOTE: `dst` is the local rank of the destination rank.
+
+        Returns the concatenated tensor on `dst`, `None` elsewhere. Uses grouped
+        pynccl send/recv when available so it is CUDA-graph capturable (unlike
+        `torch.distributed.gather`).
         """
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -1203,6 +1207,11 @@ class GroupCoordinator:
             dim += input_.dim()
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
             return self.xpu_communicator.gather(input_, self.rank_in_group, dst, dim)
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and pynccl_comm.available and not input_.is_cpu:
+            return self._gather_pynccl(input_, dst, dim)
+
         # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
@@ -1217,6 +1226,46 @@ class GroupCoordinator:
         else:
             output_tensor = None
         return output_tensor
+
+    def _gather_pynccl(
+        self, input_: torch.Tensor, dst: int, dim: int
+    ) -> Optional[torch.Tensor]:
+        """CUDA-graph-safe gather via grouped pynccl send/recv.
+
+        Every rank contributes an identically shaped ``input_`` (same assumption
+        as the ``torch.distributed.gather`` path). ``dim`` must be non-negative.
+        The destination rebuilds the same layout as ``torch.cat(gather_list, dim)``.
+        """
+        world_size = self.world_size
+        pynccl_comm = self.pynccl_comm
+        input_ = input_.contiguous()
+        with pynccl_comm.change_state(enable=True):
+            if self.rank_in_group == dst:
+                # recv_buf[i] receives rank i's (contiguous) contribution.
+                recv_buf = torch.empty(
+                    (world_size,) + tuple(input_.shape),
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                pynccl_comm.group_start()
+                for src in range(world_size):
+                    if src == dst:
+                        recv_buf[src].copy_(input_)
+                    else:
+                        pynccl_comm.recv(recv_buf[src], src)
+                pynccl_comm.group_end()
+                # (world, *shape) -> concat along `dim` (all_gather ordering).
+                output_shape = (
+                    tuple(input_.shape[:dim])
+                    + (world_size * input_.shape[dim],)
+                    + tuple(input_.shape[dim + 1 :])
+                )
+                return recv_buf.movedim(0, dim).reshape(output_shape)
+            else:
+                pynccl_comm.group_start()
+                pynccl_comm.send(input_, dst)
+                pynccl_comm.group_end()
+                return None
 
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """Broadcast the input tensor.
