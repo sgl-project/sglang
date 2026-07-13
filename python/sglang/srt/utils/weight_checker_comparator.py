@@ -161,7 +161,16 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
+    if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+        if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
+            # The TRT-LLM pack is an in-place, shape-preserving pure function
+            # of the canonical bytes, and snapshot and compare both observe
+            # the packed state, so packed-vs-packed raw compare is exact.
+            return None
+        raise NotImplementedError(
+            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
+        )
+    if isinstance(quant_method, ModelOptFp4LinearMethod):
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )
