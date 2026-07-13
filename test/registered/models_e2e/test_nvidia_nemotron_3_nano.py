@@ -27,6 +27,11 @@ class TestNvidiaNemotron3Nano30BFP8(LMEvalMixin, DefaultServerBase):
     other_args = [
         "--tp-size",
         "2",
+        # FlashInfer trtllm allreduce fusion on flashinfer 0.6.14 degrades
+        # gsm8k for this model (strict-match 0.84 -> 0.78); the ground truth
+        # was calibrated with fusion disabled. Keep it off until the fusion
+        # numerics regression is resolved.
+        "--enforce-disable-flashinfer-allreduce-fusion",
     ] + NEMOTRON_3_NANO_THINKING_ARGS
 
 
