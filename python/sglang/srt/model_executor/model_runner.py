@@ -1606,8 +1606,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
+        if (
+            self.server_args.elastic_ep_backend == "mooncake"
+            or self.server_args.attn_cp_size > 1
+        ):
             # Mooncake does not support `monitored_barrier`
+            # In attention CP mode, `monitored_barrier` can advance rank 0
+            # through extra point-to-point steps on the same CPU process group,
+            # so later CP/CUDA graph capture collectives can see different
+            # sequence numbers across ranks.
             dist.barrier(group=get_tp_group().cpu_group)
         else:
             # Handle the case where some ranks do not finish loading.
