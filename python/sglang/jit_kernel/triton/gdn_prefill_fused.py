@@ -3,16 +3,16 @@
 Fuses the GDN extend prologue chain ``fused_qkv_split_gdn_prefill`` ->
 ``fused_gdn_gating`` -> ``l2norm_fwd_qk`` into a single kernel whose 1D grid is
 range-partitioned by program id into four roles (q-norm rows, k-norm rows,
-v-copy, gating). Each role body is a clone of the corresponding standalone
-kernel, with q/k loads addressed directly into the packed ``mixed_qkv`` — the
-raw (un-normalized) q/k intermediates never reach global memory.
+v-copy, gating). The norm and gating roles share value-only numerical helpers
+with their standalone kernels while retaining layout-specific loads/stores.
+The q/k loads address the packed ``mixed_qkv`` directly, so the raw
+(un-normalized) q/k intermediates never reach global memory.
 
-Clone discipline (do NOT "clean up" without re-proving the 0-ULP matrix in
+Numerical discipline (do NOT "clean up" without re-proving the 0-ULP matrix in
 test_gdn_prefill_flashinfer_opts.py):
 
-1. The gating body must use ``tl.exp``/``tl.log`` (fast paths) for softplus and
-   ``-exp(A_log)``, then ``libdevice.exp`` for FlashInfer's alpha — swapping
-   either exponential silently breaks bit-parity with the standalone kernels.
+1. L2 normalization and GDN gating formulas live in ``fla_math``. The role
+   bodies here own only their layout-specific loads, masks, and stores.
 2. The norm role's 0-ULP equality under manual-pointer loads (vs the original
    block-ptr loads) is a Triton lowering property pinned by CI, not a language
    contract; a Triton upgrade that breaks it must fail the 0-ULP matrix test.
@@ -27,7 +27,11 @@ from typing import Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+from sglang.jit_kernel.triton.fla_math import (
+    gdn_gating_values,
+    l2norm_row_values,
+)
 
 
 @triton.jit
@@ -44,9 +48,8 @@ def _norm_body_packed(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    # Clone of fla.l2norm._l2norm_row_block (fp32 reduce, DIVISION form, eps
-    # inside sqrt, bf16 round on store) with the load addressed into packed
-    # mixed_qkv: row r -> token r // H, head r % H, col c ->
+    # The load is addressed into packed mixed_qkv: row r -> token r // H,
+    # head r % H, col c ->
     # mixed_qkv[tok, base_col + head * HEAD_QK_DIM + c].
     rows = i_t * BT + tl.arange(0, BT)
     cols = tl.arange(0, BD)
@@ -59,8 +62,7 @@ def _norm_body_packed(
         + (base_col + head[:, None] * HEAD_QK_DIM + cols[None, :])
     )
     b_x = tl.load(p_x, mask=m, other=0.0).to(tl.float32)
-    b_var = tl.sum(b_x * b_x, axis=1)
-    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    b_y = l2norm_row_values(b_x, eps)
     p_y = y + rows[:, None] * HEAD_QK_DIM + cols[None, :]
     tl.store(p_y, b_y.to(y.dtype.element_ty), mask=m)
 
@@ -100,9 +102,9 @@ def _gating_body_matched(
     threshold: tl.constexpr,
     BT_G: tl.constexpr,
 ):
-    # fused_gdn_gating_kernel math on a matched BT_G x NUM_V_HEADS tile
-    # (elementwise, lane-remap-invariant => bit-identical to the nw=1 original;
-    # the literal nw=1-shaped clone floods 96.9%-idle CTAs and erases the win).
+    # Shared fused_gdn_gating math on a matched BT_G x NUM_V_HEADS tile.
+    # It is elementwise and lane-remap-invariant, so it stays bit-identical to
+    # the nw=1 original without flooding the GPU with mostly-idle CTAs.
     t_off = i_g * BT_G + tl.arange(0, BT_G)[:, None]
     head_off = tl.arange(0, NUM_V_HEADS)[None, :]
     mask = t_off < seq_len
@@ -111,17 +113,11 @@ def _gating_body_matched(
     blk_a = tl.load(a + t_off * stride_a + head_off, mask=mask)
     blk_b = tl.load(b + t_off * stride_b + head_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off)
-    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
-    softplus_x = tl.where(
-        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    blk_alpha, blk_beta_output = gdn_gating_values(
+        blk_A_log, blk_a, blk_b, blk_bias, beta, threshold, True
     )
-    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    blk_alpha = libdevice.exp(blk_g)
     tl.store(alpha + off, blk_alpha.to(alpha.dtype.element_ty), mask=mask)
-    # beta quirk kept verbatim from fused_gdn_gating_kernel: the sigmoid is
-    # rounded to b's dtype (bf16) before the fp32 store.
-    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+    tl.store(beta_output + off, blk_beta_output, mask=mask)
 
 
 @triton.jit

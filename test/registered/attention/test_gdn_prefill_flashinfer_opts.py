@@ -313,9 +313,9 @@ def _fused_ref_chain(mixed_qkv, a, b, A_log, dt_bias):
 def test_gdn_prefill_fused_bitexact(total_tokens: int):
     """The axis-stacked fused kernel must be bit-identical (0-ULP) to the real
     split -> gating -> l2norm chain on all five outputs. This is the
-    load-bearing guard for the fused kernel's clone discipline AND for Triton-upgrade
-    lowering drift (the manual-pointer norm loads equal the block-ptr original
-    as a lowering property, not a language contract)."""
+    load-bearing guard for layout-specific lowering and Triton-upgrade drift
+    (the manual-pointer norm loads equal the block-ptr original as a lowering
+    property, not a language contract)."""
     from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
 
     mixed_qkv, a, b, A_log, dt_bias = _make_fused_inputs(

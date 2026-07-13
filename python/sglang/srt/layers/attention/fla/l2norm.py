@@ -9,6 +9,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.triton.fla_math import l2norm_row_values
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -55,14 +56,12 @@ def l2norm_fwd_kernel1(
 def _l2norm_row_block(
     x, y, eps, i_t, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr
 ):
-    # Must stay byte-identical to l2norm_fwd_kernel's D<=512 branch (fp32
-    # reduce, division form — not * rstd — eps inside sqrt, round-to-nearest
-    # store in the input dtype): the fused q/k variant's 0-ULP contract
-    # depends on it.
+    # The fused q/k variant's 0-ULP contract also depends on this block-pointer
+    # load and round-to-nearest store in the input dtype. The numerical formula
+    # itself is shared with the packed fused kernel.
     p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_var = tl.sum(b_x * b_x, axis=1)
-    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    b_y = l2norm_row_values(b_x, eps)
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
