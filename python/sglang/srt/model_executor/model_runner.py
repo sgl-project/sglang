@@ -470,6 +470,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kv_cache_dtype=self.kv_cache_dtype,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
+            post_capture_kv_active=self.post_capture_kv_active,
             dflash_draft_num_layers=self.spec_aux_config.dflash_draft_num_layers,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,

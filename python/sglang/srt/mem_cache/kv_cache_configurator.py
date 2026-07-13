@@ -77,6 +77,7 @@ class KVCacheConfigurator:
     kv_cache_dtype: torch.dtype
     spec_algorithm: SpeculativeAlgorithm
     is_draft_worker: bool
+    post_capture_kv_active: bool
     dflash_draft_num_layers: Optional[int]
     is_hybrid_swa: bool
     is_hybrid_swa_compress: bool
