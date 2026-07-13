@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -63,38 +63,87 @@ def get_draft_kv_pool(
     return draft_runner.token_to_kv_pool
 
 
+def _normalize_hicache_kv_pool(pool: Any):
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+
+def _get_hicache_bytes_per_token(pool: Any) -> Optional[int]:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.base import (
+        get_effective_hicache_host_layer_num,
+    )
+
+    pool = _normalize_hicache_kv_pool(pool)
+    if isinstance(pool, MHATokenToKVPool):
+        host_layer_num = get_effective_hicache_host_layer_num(pool)
+        return (
+            (pool.head_dim + pool.v_head_dim)
+            * pool.head_num
+            * host_layer_num
+            * pool.store_dtype.itemsize
+        )
+    if isinstance(pool, MLATokenToKVPool):
+        host_layer_num = get_effective_hicache_host_layer_num(pool)
+        return pool.kv_cache_dim * host_layer_num * pool.store_dtype.itemsize
+    return None
+
+
+def _get_hicache_component_bytes_per_token(
+    *, target_kv_pool: Any, draft_kv_pool: Any
+) -> dict[str, int]:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.base import (
+        get_effective_hicache_host_layer_num,
+    )
+
+    target_kv_pool = _normalize_hicache_kv_pool(target_kv_pool)
+    target_bytes = _get_hicache_bytes_per_token(target_kv_pool)
+    if target_bytes is None:
+        return {}
+
+    components = {"target KV": target_bytes}
+    if isinstance(target_kv_pool, DSATokenToKVPool):
+        indexer_elements = (
+            target_kv_pool.index_head_dim
+            + target_kv_pool.index_head_dim // target_kv_pool.quant_block_size * 4
+        )
+        components["DSA indexer"] = (
+            indexer_elements
+            * get_effective_hicache_host_layer_num(target_kv_pool)
+            * target_kv_pool.index_k_with_scale_buffer_dtype.itemsize
+        )
+
+    if draft_kv_pool is not None:
+        draft_bytes = _get_hicache_bytes_per_token(draft_kv_pool)
+        if draft_bytes is not None:
+            components["draft KV"] = draft_bytes
+    return components
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache: BasePrefixCache,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
+    draft_kv_pool: Any,
     server_args: ServerArgs,
     enable_hierarchical_cache: bool,
-    page_size: int,
 ) -> None:
     """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
     if not enable_hierarchical_cache:
         return
 
-    draft_kv_pool = get_draft_kv_pool(
-        draft_worker=draft_worker,
-        spec_algorithm=spec_algorithm,
-        server_args=server_args,
-    )
     if draft_kv_pool is None:
         return
 
     from sglang.srt.mem_cache.memory_pool import (
-        HybridLinearKVPool,
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
     from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        pool = pool.full_kv_pool
+    pool = _normalize_hicache_kv_pool(draft_kv_pool)
 
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
@@ -102,9 +151,10 @@ def maybe_register_hicache_draft(
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
         host_size=0,
-        page_size=page_size,
+        page_size=primary.page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
+        host_page_num=primary.page_num,
     )
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
@@ -136,6 +186,7 @@ def build_kv_cache(
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
+    draft_kv_pool: Any = None,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -226,6 +277,38 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
     )
+
+    if enable_hierarchical_cache and not is_hybrid_swa and not is_hybrid_ssm:
+        target_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        components = _get_hicache_component_bytes_per_token(
+            target_kv_pool=target_kv_pool,
+            draft_kv_pool=draft_kv_pool,
+        )
+        if components:
+            from sglang.srt.mem_cache.pool_host.base import (
+                build_hicache_memory_plan,
+            )
+
+            fixed_host_size = (
+                server_args.hicache_size if server_args.hicache_size > 0 else None
+            )
+            ratio_page_num = (
+                None
+                if fixed_host_size is not None
+                else int(
+                    _normalize_hicache_kv_pool(target_kv_pool).size
+                    * server_args.hicache_ratio
+                )
+                // params.page_size
+                + 1
+            )
+            plan = build_hicache_memory_plan(
+                page_size=params.page_size,
+                component_bytes_per_token=components,
+                host_size_gb=fixed_host_size,
+                page_num=ratio_page_num,
+            )
+            params.hicache_host_page_num = plan.page_num
 
     tree_cache = create_tree_cache(
         TreeCacheBuildContext(

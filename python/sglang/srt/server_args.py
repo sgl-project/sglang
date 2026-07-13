@@ -2105,7 +2105,7 @@ class ServerArgs:
     ] = 2.0
     hicache_size: A[
         int,
-        "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        "The total per-rank host-memory budget in gigabytes for HiCache target KV, DSA indexer, and draft KV pools. Overrides hicache_ratio when set.",
     ] = 0
     hicache_write_policy: A[
         str,

@@ -428,6 +428,15 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
+        draft_kv_pool = (
+            kv_cache_builder.get_draft_kv_pool(
+                draft_worker=self.draft_worker,
+                spec_algorithm=self.spec_algorithm,
+                server_args=self.server_args,
+            )
+            if self.enable_hierarchical_cache
+            else None
+        )
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -448,6 +457,7 @@ class Scheduler(
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            draft_kv_pool=draft_kv_pool,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -485,11 +495,9 @@ class Scheduler(
         # Register draft KV pool (when spec + HiCache co-enabled).
         kv_cache_builder.maybe_register_hicache_draft(
             tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
+            draft_kv_pool=draft_kv_pool,
             server_args=self.server_args,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
-            page_size=self.page_size,
         )
 
         # Init running status

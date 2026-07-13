@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import Optional
 
 import psutil
 import torch
@@ -76,6 +77,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        host_page_num: Optional[int] = None,
     ):
         super().__init__(
             device_pool,
@@ -86,6 +88,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            host_page_num=host_page_num,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
@@ -121,7 +124,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
     def get_ksize_per_token(self):
@@ -944,7 +947,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
         self.v_head_dim = self.device_pool.v_head_dim
         return (
             (self.head_dim + self.v_head_dim)
