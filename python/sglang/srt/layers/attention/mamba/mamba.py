@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
+    PAD_SLOT_ID,
     mamba_chunk_scan_combined,
     selective_state_update,
 )
@@ -685,6 +686,12 @@ class MambaMixer2(torch.nn.Module):
                     self.conv1d.bias,
                     self.activation,
                     conv_state_indices=state_indices_tensor_d,
+                )
+                # The Triton convolution skips padding slots without writing
+                # their output rows. Zero them before they enter the SSM.
+                hidden_states_B_C_d = hidden_states_B_C_d.masked_fill(
+                    (state_indices_tensor_d == PAD_SLOT_ID).unsqueeze(-1),
+                    0,
                 )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
