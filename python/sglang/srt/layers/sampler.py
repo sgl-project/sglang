@@ -394,12 +394,12 @@ class Sampler(nn.Module):
                 # all_gather collective.
                 world_size = torch.distributed.get_world_size(self.tp_sync_group)
                 gathered = torch.empty(
-                    (world_size,) + tuple(batch_next_token_ids.shape),
+                    (world_size, *batch_next_token_ids.shape),
                     dtype=batch_next_token_ids.dtype,
                     device=batch_next_token_ids.device,
                 )
                 torch.distributed.all_gather_into_tensor(
-                    gathered, batch_next_token_ids, group=self.tp_sync_group
+                    gathered, batch_next_token_ids.contiguous(), group=self.tp_sync_group
                 )
                 # In-place update so callers holding the same tensor see the sync.
                 batch_next_token_ids.copy_(torch.min(gathered, dim=0).values)
