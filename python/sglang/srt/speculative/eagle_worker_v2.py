@@ -275,7 +275,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
-        self.dsa_index_n_heads = getattr(hf_config, "index_n_heads", None)
         self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
@@ -283,21 +282,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def get_dsa_seed_topk_shape(self, num_tokens: int) -> Tuple[int, ...]:
         """Return the platform-native shape of a draft DSA top-k seed.
 
-        CUDA DSA reduces indexer scores across index heads and publishes one
-        top-k list per token, while npu's TND lightning indexer preserves the
-        query/index-head dimension for sparse attention.
+        CUDA DSA publishes one top-k list per token. Ascend sparse attention
+        expects TND sparse indices whose N dimension matches the index KV cache;
+        that cache uses one MQA head, independently of ``index_n_heads``.
         """
         if self.dsa_index_topk is None:
             raise ValueError(
                 "DSA top-k seed reuse requires `index_topk` in the model config."
             )
         if _is_npu:
-            if self.dsa_index_n_heads is None:
-                raise ValueError(
-                    "NPU DSA top-k seed reuse requires `index_n_heads` in the "
-                    "model config."
-                )
-            return (num_tokens, self.dsa_index_n_heads, self.dsa_index_topk)
+            return (num_tokens, 1, self.dsa_index_topk)
         return (num_tokens, self.dsa_index_topk)
 
     def _rebuild_topk1_chain_buffers(self) -> None:
@@ -909,11 +903,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Return a lazily-grown eager draft-extend DSA seed buffer."""
         required_shape = self.get_dsa_seed_topk_shape(num_tokens)
         buf = self.dsa_extend_topk_buf
-        if (
-            buf is None
-            or buf.shape[0] < num_tokens
-            or tuple(buf.shape[1:]) != required_shape[1:]
-        ):
+        if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
                 required_shape,
                 -1,
