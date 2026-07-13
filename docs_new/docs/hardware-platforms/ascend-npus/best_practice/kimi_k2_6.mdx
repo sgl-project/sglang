@@ -6,6 +6,8 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for Kimi-K2.6 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Kimi-K2.6 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
@@ -141,7 +143,7 @@ done
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -319,7 +321,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -339,7 +341,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -519,7 +521,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -542,7 +544,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 12799` = `int(128000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -719,7 +721,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -739,7 +741,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -914,7 +916,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -937,7 +939,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1052,7 +1054,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name image \
     --backend sglang-oai-chat \
@@ -1165,7 +1167,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name image \
     --backend sglang-oai-chat \
@@ -1281,7 +1283,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1392,7 +1394,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

@@ -58,7 +58,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils.device_info import get_num_sms
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
