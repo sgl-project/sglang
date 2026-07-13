@@ -376,6 +376,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
         # Initialize decode attention backend
@@ -513,6 +514,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            can_cuda_graph
+            and not forward_batch.forward_mode.is_idle()
+            and self.seed_dsa_topk_from_draft_extend
+            and draft_input.dsa_topk_indices is None
+        ):
+            can_cuda_graph = False
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (

@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -1152,6 +1153,12 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # The PD metadata wire schema must match on P and D even when only D
+        # enables spec decoding; a seedless prefill writes the invalid sentinel.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1164,6 +1171,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1209,6 +1217,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -3302,6 +3311,9 @@ class Scheduler(
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info.future_dsa_topk_indices_available = (
+                        batch.spec_info.dsa_topk_indices is not None
+                    )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
