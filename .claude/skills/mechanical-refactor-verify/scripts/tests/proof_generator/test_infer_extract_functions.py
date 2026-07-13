@@ -89,6 +89,52 @@ def test_infer_extract_function_with_returned_local(repo: Path) -> None:
     assert ex["signature"] == "    def _build_pool(self, *, n):\n"
 
 
+def test_infer_extract_function_keeps_leading_comment_in_body(repo: Path) -> None:
+    """A block whose first line is a comment extracts with that comment in the body, not
+    absorbed into the authored signature (which is the def header through its colon only).
+    """
+    _write(
+        repo,
+        **{
+            "kv.py": (
+                "class C:\n"
+                "    def dispatch(self, n):\n"
+                "        if self.flag:\n"
+                "            # pick the pool class for this backend\n"
+                "            cls = PoolA\n"
+                "            pool = cls(n)\n"
+                "        return pool\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "kv.py": (
+                "class C:\n"
+                "    def dispatch(self, n):\n"
+                "        if self.flag:\n"
+                "            pool = self._build_pool(n=n)\n"
+                "        return pool\n"
+                "\n"
+                "    def _build_pool(self, *, n):\n"
+                "        # pick the pool class for this backend\n"
+                "        cls = PoolA\n"
+                "        pool = cls(n)\n"
+                "        return pool\n"
+            )
+        },
+    )
+    commit = _commit(repo, "extract _build_pool with a leading comment")
+    recipe = infer_recipe(commit, str(repo))
+    assert len(recipe.extract_functions) == 1
+    ex = recipe.extract_functions[0]
+    assert ex["signature"] == "    def _build_pool(self, *, n):\n"
+    assert ex["body"].lstrip().startswith("# pick the pool class")
+    assert build_repro(recipe, repo_root=str(repo)).run() == ""
+
+
 def test_infer_extract_function_no_return_text_when_body_is_whole_helper(
     repo: Path,
 ) -> None:

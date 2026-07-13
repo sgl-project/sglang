@@ -693,8 +693,14 @@ def _infer_extract_functions(
                 continue
             if not helper.body:
                 continue
-            body_first = helper.body[0].lineno
-            header_text = "".join(after_lines[helper.lineno - 1 : body_first - 1])
+            # The signature is the def header only (through its colon), not everything up to
+            # the first statement -- a leading comment sits between them and belongs to the
+            # extracted body, not the authored signature.
+            helper_text = "".join(after_lines[helper.lineno - 1 : helper.end_lineno])
+            header_len = rr._def_header_end(helper_text)
+            header_text = "".join(
+                after_lines[helper.lineno - 1 : helper.lineno - 1 + header_len]
+            )
             # F is the one sibling function that changed and now calls the helper.
             candidates = []
             for cont, node in before_defs:
