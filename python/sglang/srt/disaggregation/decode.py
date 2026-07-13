@@ -1059,14 +1059,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.last_node = self.tree_cache.root_node
                     decode_req.req.swa_uuid_for_lock = None
 
-                if self._uses_dsv4_decode_radix_cache():
-                    # DSV4 compressed sidecars cannot rebuild SWA tombstones
-                    # from decode-radix protected prefix pages: those pages are
-                    # owned by the radix tree, not freshly allocated by this req.
-                    decode_req.req.swa_evicted_seqlen = max(
-                        decode_req.req.swa_evicted_seqlen, prefix_len
-                    )
-
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
@@ -1678,6 +1670,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        if self._uses_dsv4_decode_radix_cache():
+            # DSV4 compressed sidecars are not yet safe to reinsert from decode
+            # workers. Use decode radix only for prefix reuse; release will free
+            # the request-owned delta after cache_protected_len and drop the lock.
+            req.skip_radix_cache_insert = True
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
