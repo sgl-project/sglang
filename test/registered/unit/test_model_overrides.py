@@ -1345,6 +1345,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 disable_overlap_schedule=False,
                 page_size=None,
                 linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -1426,11 +1427,76 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )["mamba_radix_cache_strategy"],
             "extra_buffer",
         )
-        # extra-buffer support requires the triton linear-attn backend
-        self.assertFalse(
-            supports_mamba_cache_extra_buffer(
-                SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
-            )
+        for arch in ("Qwen3NextForCausalLM", "KimiLinearForCausalLM"):
+            for base_backend, prefill_backend, expected in (
+                ("triton", None, True),
+                ("triton", "triton", True),
+                ("triton", "flashinfer", False),
+                ("triton", "flashkda", False),
+                ("triton", "cutedsl", False),
+                ("cutedsl", "triton", False),
+            ):
+                with self.subTest(
+                    arch=arch,
+                    base_backend=base_backend,
+                    prefill_backend=prefill_backend,
+                ):
+                    self.assertEqual(
+                        supports_mamba_cache_extra_buffer(
+                            SimpleNamespace(
+                                linear_attn_backend=base_backend,
+                                linear_attn_prefill_backend=prefill_backend,
+                            ),
+                            arch,
+                        ),
+                        expected,
+                    )
+
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "KimiLinearForCausalLM",
+                    linear_attn_prefill_backend="flashkda",
+                )
+            ),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "no_buffer",
+                "disable_overlap_schedule": True,
+            },
+        )
+
+    def test_mamba_radix_cache_prefill_backend_validation(self):
+        from sglang.srt.server_args import ServerArgs
+
+        for arch, prefill_backend in (
+            ("KimiLinearForCausalLM", "flashkda"),
+            ("KimiLinearForCausalLM", "cutedsl"),
+            ("Qwen3NextForCausalLM", "flashinfer"),
+            ("Qwen3NextForCausalLM", "cutedsl"),
+        ):
+            with self.subTest(arch=arch, prefill_backend=prefill_backend):
+                extra_buffer_view = SimpleNamespace(
+                    linear_attn_backend="triton",
+                    linear_attn_prefill_backend=prefill_backend,
+                )
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    f"extra_buffer is not supported for {arch}",
+                ):
+                    ServerArgs._validate_mamba_extra_buffer(
+                        None, extra_buffer_view, arch
+                    )
+
+        no_buffer_view = SimpleNamespace(
+            page_size=1,
+            disable_overlap_schedule=True,
+            attention_backend="triton",
+            linear_attn_backend="triton",
+            linear_attn_prefill_backend="flashkda",
+        )
+        ServerArgs._validate_mamba_no_buffer(
+            None, no_buffer_view, "KimiLinearForCausalLM"
         )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
