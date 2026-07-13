@@ -95,6 +95,51 @@ class KVCacheConfigurator:
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         raise NotImplementedError("populated in kvc-migrate-method-bodies")
 
+    def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        # KV pool budget = currently-free GPU memory minus the non-static runtime
+        # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
+        # already resident (model weights, etc.) is thus charged against it.
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+        slack_gb = pre_model_load_memory * (1 - self.server_args.mem_fraction_static)
+        if self.mambaish_config is not None and self.post_capture_kv_active:
+            # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
+            slack_gb = max(
+                slack_gb,
+                self.server_args.mamba_pre_capture_reserve_mb(
+                    get_device_memory_capacity(self.device)
+                )
+                / 1024,
+            )
+        rest_memory = available_gpu_memory - slack_gb
+        if self.mambaish_config is not None:
+            rest_memory = self._handle_max_mamba_cache(rest_memory)
+
+        # Loaded weights (target + draft) can exceed the static budget
+        if rest_memory <= 0:
+            minimum_mem_fraction_static = (
+                1 - available_gpu_memory / pre_model_load_memory
+            )
+            suggested_mem_fraction_static = (
+                math.ceil(minimum_mem_fraction_static * 1000) / 1000
+            )
+            raise ValueError(
+                f"Loaded weights leave no GPU memory for the KV cache under "
+                f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
+                f"Raise --mem-fraction-static above "
+                f"{suggested_mem_fraction_static:.3f} "
+                f"(minimum viable = 1 - available/pre = "
+                f"{minimum_mem_fraction_static:.4f}). If using speculative "
+                f"decoding, draft weights are now counted."
+            )
+
+        return int(rest_memory * (1 << 30))  # return in bytes
+
     def _calculate_mamba_ratio(self) -> int:
         if self.server_args.disable_radix_cache:
             return 1
