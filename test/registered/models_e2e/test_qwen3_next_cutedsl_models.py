@@ -13,7 +13,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=250, stage="base-c", runner_config="4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=250, stage="base-c", runner_config="4-gpu-b200")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
