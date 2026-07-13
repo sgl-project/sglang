@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=400, stage="extra-b", runner_config="deepep-4-gpu-h100")
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
@@ -66,7 +66,7 @@ class TestReturnRoutedExperts(CustomTestCase):
             "deepep",
             # Force normal-mode dispatch: deepep auto routes decode through
             # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
-            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs-decode.
             "--deepep-mode",
             "normal",
         ]

@@ -359,7 +359,7 @@ class StreamingSession(BasePrefixCache):
             return False
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.fill_len
+                req.req_pool_idx, : req.extend_range.end
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
@@ -437,6 +437,9 @@ class StreamingSession(BasePrefixCache):
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
         self._free_slot_mamba(slot)
+
+    def release_radix_session(self, session_id: str) -> None:
+        self.inner.release_radix_session(session_id)
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.

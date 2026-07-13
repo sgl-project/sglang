@@ -9,9 +9,14 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -63,20 +68,33 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 
 
 def is_dsa_enable_prefill_cp():
-    return get_global_server_args().enable_dsa_prefill_context_parallel
+    return get_server_args().enable_dsa_prefill_context_parallel
 
 
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+    )
+
+
+# Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
+# MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
+# inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
+# this surface (no feature flag); each adds its own extra carve-outs at its call
+# site (e.g. the indexer also excludes DSA prefill context parallelism).
+def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
+    return (
+        is_cuda()
+        and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        and forward_batch.forward_mode.is_extend_without_speculative()
     )
 
 
@@ -271,3 +289,29 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
+def fp8_mqa_logits_make_fused_kv(
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    block_kv: int,
+    head_dim: int,
+) -> torch.Tensor:
+    num_phys_blocks = kv_fp8.shape[0]
+    per_token_size = head_dim + 4
+    block_bytes = block_kv * per_token_size
+    scale_offset = block_kv * head_dim
+
+    fused = torch.zeros(
+        num_phys_blocks, block_bytes, dtype=torch.uint8, device=kv_fp8.device
+    )
+    for blk in range(num_phys_blocks):
+        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)
+        fused[blk, scale_offset:] = (
+            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
+        )
+    return fused.view(num_phys_blocks, block_kv, 1, per_token_size)

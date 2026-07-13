@@ -33,19 +33,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
-from sglang.srt.distributed import (
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -463,9 +456,8 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
+            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -479,7 +471,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "ascend_memcache", "eic", "nixl", "simm"]
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "ascend_memcache",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                ]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -570,16 +570,16 @@ class HiCacheController:
             storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
-            self.tp_rank = get_attention_tp_rank()
-            self.tp_size = get_attention_tp_size()
+            self.tp_rank = get_parallel().attn_tp_rank
+            self.tp_size = get_parallel().attn_tp_size
             self.dp_rank = get_attention_dp_rank()
         else:
-            self.tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_parallel().tp_rank
+            self.tp_size = get_parallel().tp_size
             self.dp_rank = 0
 
-        self.pp_rank = get_pipeline_model_parallel_rank()
-        self.pp_size = get_pipeline_model_parallel_world_size()
+        self.pp_rank = get_parallel().pp_rank
+        self.pp_size = get_parallel().pp_size
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -676,7 +676,14 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        # Kernel write-back keeps host indices on CPU only for page_first AND only
+        # when the staged JIT write-back kernel is available (it stages through
+        # device memory and accepts CPU destination indices). Otherwise we fall back
+        # to the plain transfer kernel, whose CUDA/HIP implementation requires
+        # device-resident destination indices -- so the indices must be moved to the
+        # device first. Without the can_use_write_back_jit check this crashes on
+        # backends where the JIT kernel is unavailable, with
+        # "Destination indices must be a CUDA tensor".
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
@@ -998,18 +1005,12 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
+        page_hashes = self.get_hash_str(
+            tokens_to_fetch, last_hash, page_size=self.page_size
+        )
 
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * STORAGE_BATCH_SIZE
-        ):
-            end = min(start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch))
-            batch_tokens = tokens_to_fetch[start:end]
-            batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
-                batch_hashes.append(last_hash)
+        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])

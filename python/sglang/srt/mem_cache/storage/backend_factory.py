@@ -187,6 +187,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "ascend_memcache":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "mori":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -236,4 +238,10 @@ StorageBackendFactory.register_backend(
     "simm",
     "sglang.srt.mem_cache.storage.simm.hicache_simm",
     "HiCacheSiMM",
+)
+
+StorageBackendFactory.register_backend(
+    "mori",
+    "sglang.srt.mem_cache.storage.umbp.umbp_store",
+    "UMBPStore",
 )

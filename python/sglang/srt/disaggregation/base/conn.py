@@ -18,9 +18,12 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # DeepSeek-V4 online C128 request-scoped state.
+    C128_STATE = "c128_state"
 
 
 @dataclasses.dataclass
@@ -46,6 +49,7 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    is_hybrid_mla_backend: bool
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -100,7 +104,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -109,6 +112,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod
@@ -156,7 +160,6 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,
