@@ -159,6 +159,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
+    is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
@@ -471,7 +472,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             page_size=self.page_size,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
-            post_capture_kv_active=self.post_capture_kv_active,
+            post_capture_kv_active=is_post_capture_kv_active(
+                server_args=self.server_args, is_draft_worker=self.is_draft_worker
+            ),
             dflash_draft_num_layers=self.spec_aux_config.dflash_draft_num_layers,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.configs.hybrid_arch import (
@@ -64,12 +65,109 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_memory_pool import UnifiedPoolBundle
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def is_post_capture_kv_active(
+    *, server_args: ServerArgs, is_draft_worker: bool
+) -> bool:
+    return (
+        server_args.post_capture_kv_sizing_planned()
+        and current_platform.is_cuda()
+        and not is_draft_worker
+    )
+
+
+class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
+    max_total_num_tokens: int
+    full_max_total_num_tokens: Optional[int]
+    swa_max_total_num_tokens: Optional[int]
+    capped_max_running_requests: Optional[int]
+
+
+def compute_post_capture_kv_resize(
+    model_runner: ModelRunner,
+) -> PostCaptureKVResize:
+    """Resize the KV pool after capture and return the new sizes for the
+    orchestrator to assign. Takes the live ModelRunner because it reads
+    post-capture GPU memory + the pool objects it must resize in place."""
+    pool = model_runner.token_to_kv_pool
+    torch.cuda.synchronize()
+    free_gb = get_available_gpu_memory(
+        model_runner.device,
+        model_runner.gpu_id,
+        distributed=get_world_group().world_size > 1,
+        cpu_group=get_world_group().cpu_group,
+    )
+    headroom_gb = model_runner.pre_model_load_memory * (
+        1 - model_runner.mem_fraction_static
+    )
+    decode_cuda_graph_config = model_runner.server_args.cuda_graph_config.decode
+    decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
+    running_requests = int(model_runner.max_running_requests or decode_max_bs or 1)
+    eager_decode_gap = (
+        model_runner.server_args.disaggregation_mode != "prefill"
+        and decode_cuda_graph_config.backend != Backend.DISABLED
+        and decode_max_bs < running_requests
+    )
+    if eager_decode_gap:
+        logger.warning(
+            "Post-capture KV sizing: decode CUDA graph max_bs=%d < "
+            "max_running_requests=%d; reserving activation headroom",
+            decode_max_bs,
+            running_requests,
+        )
+    if eager_decode_gap or mambaish_config(model_runner.model_config) is not None:
+        headroom_gb = max(
+            headroom_gb,
+            model_runner.server_args.mamba_pre_capture_reserve_mb(
+                get_device_memory_capacity(model_runner.device)
+            )
+            / 1024,
+        )
+    budget_bytes = (
+        int(max(0.0, free_gb - headroom_gb) * (1 << 30))
+        + pool.post_capture_backed_bytes
+    )
+    config = model_runner.kv_cache_configurator.config_from_budget(
+        budget_bytes, cap_tokens=model_runner.max_total_num_tokens
+    )
+    pool.finalize_backing(config)
+    model_runner.token_to_kv_pool_allocator.resize(config)
+
+    capped_max_running_requests = None
+    if model_runner.max_running_requests is not None:
+        # Re-calculate max_running_requests for the now smaller pool
+        capped_reqs = min(
+            model_runner.max_running_requests,
+            model_runner.kv_cache_configurator.resolve_max_num_reqs(
+                config.max_total_num_tokens
+            ),
+        )
+        if capped_reqs < model_runner.max_running_requests:
+            logger.warning(
+                "Post-capture KV sizing: max_running_requests %d -> %d",
+                model_runner.max_running_requests,
+                capped_reqs,
+            )
+            capped_max_running_requests = capped_reqs
+    logger.info(
+        "Post-capture KV sizing: max_total_num_tokens=%d, free memory=%.2f GB",
+        config.max_total_num_tokens,
+        get_available_gpu_memory(model_runner.device, model_runner.gpu_id),
+    )
+    return PostCaptureKVResize(
+        max_total_num_tokens=config.max_total_num_tokens,
+        full_max_total_num_tokens=config.full_max_total_num_tokens,
+        swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+        capped_max_running_requests=capped_max_running_requests,
+    )
 
 
 class ModelRunnerKVCacheMixin:
@@ -94,91 +192,26 @@ class ModelRunnerKVCacheMixin:
             is_dsa_model, is_dsv4_model, current_platform
         )
 
-    @property
-    def post_capture_kv_active(self: ModelRunner) -> bool:
-        return (
-            self.server_args.post_capture_kv_sizing_planned()
-            and current_platform.is_cuda()
-            and not self.is_draft_worker
-        )
-
-    def post_capture_resize_kv_pool(self: ModelRunner) -> None:
-        """Resize the KV pool after capture."""
-        pool = self.token_to_kv_pool
-        torch.cuda.synchronize()
-        free_gb = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-        headroom_gb = self.pre_model_load_memory * (1 - self.mem_fraction_static)
-        decode_cuda_graph_config = self.server_args.cuda_graph_config.decode
-        decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
-        running_requests = int(self.max_running_requests or decode_max_bs or 1)
-        eager_decode_gap = (
-            self.server_args.disaggregation_mode != "prefill"
-            and decode_cuda_graph_config.backend != Backend.DISABLED
-            and decode_max_bs < running_requests
-        )
-        if eager_decode_gap:
-            logger.warning(
-                "Post-capture KV sizing: decode CUDA graph max_bs=%d < "
-                "max_running_requests=%d; reserving activation headroom",
-                decode_max_bs,
-                running_requests,
-            )
-        if eager_decode_gap or mambaish_config(self.model_config) is not None:
-            headroom_gb = max(
-                headroom_gb,
-                self.server_args.mamba_pre_capture_reserve_mb(
-                    get_device_memory_capacity(self.device)
-                )
-                / 1024,
-            )
-        budget_bytes = (
-            int(max(0.0, free_gb - headroom_gb) * (1 << 30))
-            + pool.post_capture_backed_bytes
-        )
-        config = self.config_from_budget(
-            budget_bytes, cap_tokens=self.max_total_num_tokens
-        )
-        pool.finalize_backing(config)
-        self.token_to_kv_pool_allocator.resize(config)
-
-        # Set the new pool size
-        self.max_total_num_tokens = config.max_total_num_tokens
+    def post_capture_resize_kv_pool(self: ModelRunner):
+        resize = compute_post_capture_kv_resize(self)
+        self.max_total_num_tokens = resize.max_total_num_tokens
         if self.is_hybrid_swa:
-            self.full_max_total_num_tokens = config.full_max_total_num_tokens
-            self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+            self.full_max_total_num_tokens = resize.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = resize.swa_max_total_num_tokens
         if self.memory_pool_config is not None:
-            self.memory_pool_config.max_total_num_tokens = config.max_total_num_tokens
+            self.memory_pool_config.max_total_num_tokens = resize.max_total_num_tokens
             self.memory_pool_config.full_max_total_num_tokens = (
-                config.full_max_total_num_tokens
+                resize.full_max_total_num_tokens
             )
             self.memory_pool_config.swa_max_total_num_tokens = (
-                config.swa_max_total_num_tokens
+                resize.swa_max_total_num_tokens
             )
-        if self.max_running_requests is not None:
-            # Re-calculate max_running_requests for the now smaller pool
-            capped_reqs = min(
-                self.max_running_requests,
-                self.resolve_max_num_reqs(config.max_total_num_tokens),
-            )
-            if capped_reqs < self.max_running_requests:
-                logger.warning(
-                    "Post-capture KV sizing: max_running_requests %d -> %d",
-                    self.max_running_requests,
-                    capped_reqs,
+        if resize.capped_max_running_requests is not None:
+            self.max_running_requests = resize.capped_max_running_requests
+            if self.memory_pool_config is not None:
+                self.memory_pool_config.max_running_requests = (
+                    resize.capped_max_running_requests
                 )
-                self.max_running_requests = capped_reqs
-                if self.memory_pool_config is not None:
-                    self.memory_pool_config.max_running_requests = capped_reqs
-        logger.info(
-            "Post-capture KV sizing: max_total_num_tokens=%d, free memory=%.2f GB",
-            config.max_total_num_tokens,
-            get_available_gpu_memory(self.device, self.gpu_id),
-        )
 
     def _init_unified_mamba_pools(
         self: ModelRunner, *, max_num_reqs: int, max_total_num_tokens: int
