@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -427,6 +428,57 @@ class Cosmos3GatedMLP(nn.Module):
         return out
 
 
+class Cosmos3DenseMLP(nn.Module):
+    """Dense MLP with a squared-ReLU activation: ``down(relu(up(x)) ** 2)``."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
+        super().__init__()
+        self.up_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        up, _ = self.up_proj(x)
+        up = F.relu(up)
+        out, _ = self.down_proj(up * up)
+        return out
+
+
+def _build_mlp(
+    hidden_act: str,
+    hidden_size: int,
+    intermediate_size: int,
+    prefix: str,
+    quant_config: QuantizationConfig | None,
+) -> nn.Module:
+    mlp_cls = Cosmos3DenseMLP if hidden_act == "relu2" else Cosmos3GatedMLP
+    return mlp_cls(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        prefix=prefix,
+        quant_config=quant_config,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Cosmos3 UND Causal Attention
 # -----------------------------------------------------------------------------
@@ -441,6 +493,7 @@ class Cosmos3CausalAttention(nn.Module):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
+        qk_norm: bool = True,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ):
@@ -449,6 +502,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.qk_norm = qk_norm
         self.tp_size = get_tp_world_size()
         if num_attention_heads % self.tp_size != 0:
             raise ValueError(
@@ -482,9 +536,10 @@ class Cosmos3CausalAttention(nn.Module):
             prefix=add_prefix("to_out", prefix),
         )
 
-        # Per-head QK norm.
-        self.norm_q = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k = RMSNorm(head_dim, eps=1e-6)
+        # Per-head QK norm (optional; some backbones omit it on text).
+        if qk_norm:
+            self.norm_q = RMSNorm(head_dim, eps=1e-6)
+            self.norm_k = RMSNorm(head_dim, eps=1e-6)
 
     def forward(
         self,
@@ -521,12 +576,13 @@ class Cosmos3CausalAttention(nn.Module):
             :,
         ]
 
-        q = F.rms_norm(
-            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
-        )
-        k = F.rms_norm(
-            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
-        )
+        if self.qk_norm:
+            q = F.rms_norm(
+                q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
+            )
+            k = F.rms_norm(
+                k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+            )
         q, k = _apply_qwen3_rope_from_cache(q, k, cos_sin_cache)
 
         out = F.scaled_dot_product_attention(
@@ -692,6 +748,8 @@ class Cosmos3UndDecoderLayer(nn.Module):
         head_dim: int,
         intermediate_size: int,
         rms_norm_eps: float,
+        hidden_act: str,
+        qk_norm: bool,
         layer_idx: int,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -704,12 +762,14 @@ class Cosmos3UndDecoderLayer(nn.Module):
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
+            qk_norm=qk_norm,
             prefix=add_prefix("self_attn", prefix),
             quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = Cosmos3GatedMLP(
+        self.mlp = _build_mlp(
+            hidden_act=hidden_act,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             prefix=add_prefix("mlp", prefix),
@@ -758,6 +818,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         head_dim: int,
         intermediate_size: int,
         rms_norm_eps: float,
+        hidden_act: str,
         layer_idx: int,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -777,7 +838,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = Cosmos3GatedMLP(
+        self.mlp = _build_mlp(
+            hidden_act=hidden_act,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             prefix=add_prefix("mlp", prefix),
@@ -839,6 +901,8 @@ class Cosmos3LanguageModel(nn.Module):
         rms_norm_eps: float,
         rope_theta: float,
         mrope_section: tuple[int, int, int],
+        hidden_act: str,
+        qk_norm: bool,
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
@@ -864,6 +928,8 @@ class Cosmos3LanguageModel(nn.Module):
                     head_dim=head_dim,
                     intermediate_size=intermediate_size,
                     rms_norm_eps=rms_norm_eps,
+                    hidden_act=hidden_act,
+                    qk_norm=qk_norm,
                     layer_idx=i,
                     prefix=f"layers.{i}",
                     quant_config=quant_config,
@@ -951,6 +1017,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.sound_latent_fps = arch.sound_latent_fps
         self.temporal_compression_factor_sound = arch.temporal_compression_factor_sound
         self.rms_norm_eps = arch.rms_norm_eps
+        self.hidden_act = arch.hidden_act
+        self.rope_theta = arch.rope_theta
+
+        # The checkpoint may override the activation (and thus the MLP weight
+        # layout), so bind the arch-derived mappings on the instance.
+        self.param_names_mapping = arch.param_names_mapping
+        self.reverse_param_names_mapping = arch.reverse_param_names_mapping
+        self.lora_param_names_mapping = arch.lora_param_names_mapping
 
         # Ulysses sequence parallelism. When CFG-parallel is also enabled
         # the SP group only spans ranks that share a CFG context (cond or
@@ -975,6 +1049,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             rms_norm_eps=arch.rms_norm_eps,
             rope_theta=arch.rope_theta,
             mrope_section=arch.mrope_section,
+            hidden_act=arch.hidden_act,
+            qk_norm=arch.qk_norm_for_text,
             quant_config=quant_config,
         )
 
@@ -1047,6 +1123,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     head_dim=arch.head_dim,
                     intermediate_size=arch.intermediate_size,
                     rms_norm_eps=arch.rms_norm_eps,
+                    hidden_act=arch.hidden_act,
                     layer_idx=i,
                     prefix=f"gen_layers.{i}",
                     quant_config=quant_config,
@@ -1602,9 +1679,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         rotary_emb = self.language_model.rotary_emb
         if rotary_emb.inv_freq.is_meta:
             dim = rotary_emb.head_dim
-            rope_theta = 5000000.0  # From config
             inv_freq = 1.0 / (
-                rope_theta
+                self.rope_theta
                 ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
             )
             rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
