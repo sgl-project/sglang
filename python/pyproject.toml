@@ -33,6 +33,7 @@ dependencies = [
   "flash-attn-4==4.0.0b15",
   "flashinfer_python[cu13]==0.6.14", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
+  "instanttensor>=0.1.9",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",

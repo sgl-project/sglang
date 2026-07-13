@@ -1036,6 +1036,46 @@ def fastsafetensors_weights_iterator(
             loader.close()
 
 
+def instanttensor_weights_iterator(
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files
+    using instanttensor library."""
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            "Please install instanttensor via `pip install instanttensor`"
+        ) from e
+
+    process_group = None
+    if torch.distributed.is_initialized():
+        world_group = get_world_group()
+        if world_group.world_size > 1:
+            process_group = world_group.device_group
+
+    device = torch.cuda.current_device()
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with instanttensor.safe_open(
+        hf_weights_files, framework="pt", device=device, process_group=process_group
+    ) as f:
+        # Since InstantTensor 0.1.9, tensors are cloned internally by default,
+        # so no extra clone is needed here.
+        yield from tqdm(
+            f.tensors(),
+            desc="Loading safetensors using InstantTensor loader",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+            total=len(f.keys()),
+            mininterval=1.0,
+        )
+
+
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
