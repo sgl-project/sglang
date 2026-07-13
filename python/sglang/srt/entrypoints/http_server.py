@@ -1160,7 +1160,7 @@ async def update_weights_from_disk(
 
 @app.post("/pull_weights")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pull_weights(obj: PullWeightsReqInput, request: Request):
+async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
     """Have every host of this deployment pull published weight deltas into its
     local checkpoint (materialized from the model path on first use)."""
     success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)

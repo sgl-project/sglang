@@ -171,7 +171,7 @@ class SchedulerWeightUpdaterManager:
             )
             success = all(ok for ok, _ in results)
             message = "; ".join(msg for ok, msg in results if not ok) or message
-        return PullWeightsReqOutput(success, message)
+        return PullWeightsReqOutput(success=success, message=message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
