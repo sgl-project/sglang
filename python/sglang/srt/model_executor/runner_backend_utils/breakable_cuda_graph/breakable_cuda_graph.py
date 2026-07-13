@@ -176,12 +176,6 @@ def _copy_output(dst: Any, src: Any) -> Any:
     and dicts of tensors. Returns dst if in-place copy succeeded,
     otherwise returns src.
     """
-    # A break fn that writes directly into its capture-time output buffer (e.g.
-    # the CuteDSL GDN direct-write epilogue) returns the very tensor it was given,
-    # so the copy would be self-to-self — skip it.
-    if dst is src:
-        return dst
-
     if torch.is_tensor(dst) and torch.is_tensor(src):
         dst.copy_(src)
         return dst
