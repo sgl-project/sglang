@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 
@@ -37,3 +38,22 @@ def test_dsv4_decode_radix_prefix_unchanged_when_disabled():
     queue = _make_queue(page_size=64, enable_decode_radix=False)
 
     assert queue._dsv4_safe_prefix_len(383) == 383
+
+
+def test_allow_radix_cache_insert_once_bypasses_skip_once():
+    req = SimpleNamespace(
+        skip_radix_cache_insert=True,
+        allow_radix_cache_insert_once=True,
+    )
+    tree_cache = SimpleNamespace(num_cache_unfinished_req=0)
+
+    def cache_unfinished_req(_req, **_kwargs):
+        tree_cache.num_cache_unfinished_req += 1
+
+    tree_cache.cache_unfinished_req = cache_unfinished_req
+
+    maybe_cache_unfinished_req(req, tree_cache)
+    maybe_cache_unfinished_req(req, tree_cache)
+
+    assert tree_cache.num_cache_unfinished_req == 1
+    assert req.allow_radix_cache_insert_once is False
