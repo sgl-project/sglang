@@ -366,15 +366,11 @@ def process_images(images, image_processor, model_cfg):
     return new_images
 
 
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def dp_encoder_num_patches(grid_thw) -> int:
     """Canonical per-image load metric for DP-encoder load balancing.
 
-    The scheduler-side owner assignment (:func:`assign_dp_encoder_owner_ranks`)
-    and the vision-model runner (:func:`run_dp_sharded_mrope_vision_model`) MUST
-    both derive the per-image load from this single definition. If they diverged,
-    the ranks could disagree on ownership and the pre-sharded ``pixel_values``
-    would no longer line up with the runner's reassembly order.
+    Both the scheduler-side owner assignment and the vision-model runner derive
+    per-image load from this single definition so ownership can never diverge.
     """
     return int(math.prod(grid_thw))
 
@@ -382,20 +378,11 @@ def dp_encoder_num_patches(grid_thw) -> int:
 def assign_dp_encoder_owner_ranks(sizes: List[int], tp_size: int) -> List[int]:
     """Return the owning attention-TP rank for each item.
 
-    This is the single, authoritative DP-encoder ownership decision. It is
-    computed ONCE per request in the scheduler (over the request's full image
-    set) and then stored on each item as a persistent tag
-    (``dp_encoder_owner_rank``). Because ownership is an intrinsic per-item
-    property that never changes, every later consumer -- the pre-H2D feature
-    drop and the vision-model runner -- simply reads the tag instead of
-    recomputing a load-balancing assignment. This is what makes the scheme
-    correct under chunked prefill, per-image caching, and retraction: the exact
-    subset of items encoded in any given ViT call may vary, but the owner of
-    each item is fixed, so the drop side and the runner can never disagree.
-
-    ``sizes[i]`` is the per-item load metric (:func:`dp_encoder_num_patches`).
-    The result is fully deterministic given ``(sizes, tp_size)`` so every rank
-    agrees without communication.
+    The single, authoritative DP-encoder ownership decision, computed once per
+    request in the scheduler and stored as a persistent per-item tag. ``sizes``
+    is the per-item load metric (:func:`dp_encoder_num_patches`); the result is
+    deterministic given ``(sizes, tp_size)`` so every rank agrees without
+    communication.
     """
     shuffle_indices, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(sizes, tp_size)
     owner_ranks = [0] * len(sizes)
@@ -413,11 +400,10 @@ def _dp_encoder_owner_groups(
     """Group encoded items by their persistent owner tag (no load balancing).
 
     Returns the same ``(rank_image_order, gpu_sample_counts,
-    grouped_pixel_values_len)`` triple that the legacy load-balancing path
-    produces, but derived purely from the fixed owner tags of the *current*
-    encoded subset. Item indices within each rank stay ascending (iteration
-    order), which is exactly the order in which the locally-owned features are
-    concatenated into ``pixel_values``.
+    grouped_pixel_values_len)`` triple as the legacy path, but derived purely
+    from the fixed owner tags of the current encoded subset. Item indices within
+    each rank stay ascending, matching the order features are concatenated into
+    ``pixel_values``.
     """
     rank_image_order: List[List[int]] = [[] for _ in range(tp_size)]
     for i, rank in enumerate(owner_ranks):
@@ -433,20 +419,11 @@ class DpEncoderDispatch:
     """Process-wide selector for the DP-encoder sharding strategy.
 
     A single global instance (:func:`get_dp_encoder_dispatch`) is the one place
-    that decides *which* DP-encoder path is active, so the scheduler tagging, the
-    encode-path feature drop, and the vision-model runner all consult the same
-    switch instead of each re-reading ``server_args`` and re-deriving the TP
-    topology. All lookups are read-through (never cached): ``server_args`` and
-    the attention-TP getters are resolved lazily on each call, matching
-    :mod:`sglang.srt.runtime_context`, and every accessor degrades to the safe
-    legacy behavior (disabled / tp_size 1) if the runtime state is not ready.
-
-    Two strategies exist, both under ``mm_enable_dp_encoder``:
-
-    * owner-tag sharding (``shard_by_owner`` on): ownership decided once in the
-      scheduler, features dropped by owner pre-H2D, runner reuses the tags.
-    * legacy replication (``shard_by_owner`` off): inputs replicated, runner
-      recomputes the load-balancing assignment over the full ``pixel_values``.
+    that decides which DP-encoder path is active, so scheduler tagging, the
+    encode-path drop, and the runner consult the same switch. Lookups are
+    read-through (``server_args`` and TP getters resolved lazily each call) and
+    degrade to safe legacy behavior (disabled / tp_size 1) when runtime state is
+    not ready.
     """
 
     @staticmethod
@@ -499,6 +476,7 @@ def get_dp_encoder_dispatch() -> DpEncoderDispatch:
     return _dp_encoder_dispatch
 
 
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def get_dp_encoder_lb_assignment(
     sizes: list[int],
     num_gpus: int = 2,
@@ -619,26 +597,21 @@ def run_dp_sharded_mrope_vision_model(
     Args:
         vision_model (torch.nn.Module): Vision model.
         pixel_values (torch.Tensor): Image/Video input tensor. When
-            ``owner_ranks`` is ``None`` this must be the *full* concat of all
-            items' patches (the runner slices out this rank's shard). When
-            ``owner_ranks`` is provided, the caller has already dropped
-            non-local items' features pre-H2D, so ``pixel_values`` contains only
-            this rank's owned items, concatenated in ascending item-index order.
-        grid_thw_list: List of grid dimensions for *all* images in the encoded
-            subset (one row per item) -- used for output reassembly. When
-            ``owner_ranks`` is provided it must describe exactly these items
-            (``len(owner_ranks) == len(grid_thw_list)``).
+            ``owner_ranks`` is ``None`` this is the full concat of all items'
+            patches (runner slices out this rank's shard); when provided it is
+            already this rank's shard, in ascending item-index order.
+        grid_thw_list: Grid dimensions for all images in the encoded subset (one
+            row per item), used for output reassembly. When ``owner_ranks`` is
+            provided, ``len(owner_ranks) == len(grid_thw_list)``.
         rope_type: Type of rope used in the vision model.
                    Different rope types have different dimension to do ViT.
                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
                    "rope_2d" for 2D rope (e.g., Kimi-VL)
         owner_ranks: Optional per-item owner attention-TP rank (the persistent
-            ``dp_encoder_owner_rank`` tag assigned once in the scheduler). When
-            provided, the runner does NOT recompute any load-balancing
-            assignment; it groups the encoded subset purely by these fixed
-            tags and treats ``pixel_values`` as this rank's already-sharded
-            shard. Because the tags are intrinsic to each item, the drop side
-            and the runner can never disagree, even across chunks/retraction.
+            ``dp_encoder_owner_rank`` tag). When provided the runner groups the
+            encoded subset by these fixed tags instead of recomputing a
+            load-balancing assignment, treating ``pixel_values`` as this rank's
+            shard.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -670,14 +643,12 @@ def run_dp_sharded_mrope_vision_model(
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
 
-    # Ownership is decided exactly once, in the scheduler, and stored as a
-    # persistent per-item tag. When the encode path forwarded those tags
-    # (``owner_ranks``) we simply group the encoded subset by them -- the runner
-    # is NOT allowed to recompute a load-balancing assignment, so ownership can
-    # never diverge from the pre-H2D drop (this is what makes it safe under
-    # chunked prefill / per-image caching / retraction). Otherwise (legacy /
-    # video path with a full ``pixel_values``) we fall back to computing the
-    # assignment here over ``patches_per_image``.
+    # Ownership is decided once in the scheduler and stored as a persistent
+    # per-item tag. When the encode path forwards those tags (``owner_ranks``)
+    # we group the encoded subset by them rather than recomputing a load-
+    # balancing assignment, so ownership never diverges from the pre-H2D drop.
+    # Otherwise (legacy / video path with a full ``pixel_values``) we compute
+    # the assignment here.
     pixel_values_is_sharded = owner_ranks is not None
     if owner_ranks is not None:
         assert len(owner_ranks) == len(grid_thw_list), (

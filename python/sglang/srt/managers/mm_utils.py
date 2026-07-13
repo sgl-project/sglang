@@ -30,6 +30,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.mm_utils import (
+    assign_dp_encoder_owner_ranks,
+    dp_encoder_num_patches,
+    get_dp_encoder_dispatch,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -507,15 +512,10 @@ def _move_items_to_device(
 
 
 def _item_grid_thw_for_dp_encoder(item: MultimodalDataItem) -> Optional[List[int]]:
-    """Return the single ``image_grid_thw`` row (as ints) for an image item.
+    """Return an image item's single ``image_grid_thw`` row as ints.
 
-    Returns ``None`` when the item does not expose grid metadata suitable for
-    per-item DP-encoder sharding.
-
-    The item MUST have exactly one grid_thw row (shape (1, 3)) to be eligible
-    for per-item sharding. Multi-row items signal that the item-to-row mapping
-    is not 1:1 and would cause index mismatches with
-    `run_dp_sharded_mrope_vision_model`.
+    Returns ``None`` when grid metadata is missing or not a single (1, 3) row,
+    i.e. the item is not eligible for per-item DP-encoder sharding.
     """
     grid = getattr(item, "image_grid_thw", None)
     if grid is None:
@@ -540,46 +540,27 @@ def _dp_encoder_owner_rank(item: MultimodalDataItem) -> Optional[int]:
 
 
 def assign_dp_encoder_owners(items: List[MultimodalDataItem]) -> bool:
-    """Assign each image item its DP-encoder owner rank (scheduler side, once).
+    """Tag each image item with its persistent DP-encoder owner rank.
 
-    This is the single ownership decision for the whole request. It runs when
-    the request is admitted (before any prefill chunking), over the request's
-    *full* image-item set, and stores the result as a persistent per-item tag
-    (``dp_encoder_owner_rank``). The tag is intrinsic to the item and is never
-    recomputed, so:
+    Runs once in the scheduler over the request's full image set and stores the
+    result as ``dp_encoder_owner_rank``, so every later consumer (pre-H2D drop,
+    vision-model runner) reads the same fixed ownership without recomputing it.
 
-    * it survives retraction (``reset_for_retract`` does not touch ``mm_items``),
-      and
-    * every later ViT call -- which under chunked prefill / per-image caching
-      may encode only a *subset* of these items -- groups its subset by these
-      fixed tags. The pre-H2D feature drop and the vision-model runner therefore
-      read the same ownership and can never diverge.
-
-    Ownership is deterministic given ``(sizes, tp_size)``, so every rank computes
-    identical tags without communication.
-
-    Returns ``True`` if tags were assigned. Returns ``False`` (no tags; request
-    falls back to legacy full-replication, which is always safe) when owner-tag
-    sharding is disabled, TP size is 1, there are fewer than 2 image items, or
-    any image item lacks single-grid metadata.
+    Returns ``True`` if tags were assigned, ``False`` (safe legacy full-
+    replication) when sharding is disabled, TP size is 1, there are < 2 image
+    items, or any image item lacks single-grid metadata.
     """
     if not items:
         return False
-
-    from sglang.srt.multimodal.mm_utils import (
-        assign_dp_encoder_owner_ranks,
-        dp_encoder_num_patches,
-        get_dp_encoder_dispatch,
-    )
 
     dispatch = get_dp_encoder_dispatch()
     if not dispatch.shard_by_owner_enabled():
         return False
     tp_size = dispatch.tp_size()
 
-    # Stage 1: only shard image items with single-grid metadata. If any image
-    # item is unsuitable (video/audio/precomputed/multi-grid) we skip tagging
-    # entirely; the request then uses the legacy full-replication path.
+    # Only shard image items with single-grid metadata; if any image item is
+    # unsuitable (video/audio/precomputed/multi-grid) skip tagging entirely and
+    # fall back to legacy full-replication.
     image_items = [
         it for it in items if getattr(it, "modality", None) == Modality.IMAGE
     ]
@@ -602,23 +583,13 @@ def assign_dp_encoder_owners(items: List[MultimodalDataItem]) -> bool:
 def drop_nonlocal_features_for_dp_encoder(items: List[MultimodalDataItem]) -> bool:
     """Drop features for items this rank does not own (encode side, pre-H2D).
 
-    Runs in the model-forward encode path right before H2D, over the *exact*
-    set of items about to be encoded together. It reads the persistent owner
-    tags assigned once by :func:`assign_dp_encoder_owners` (never recomputes an
-    assignment), and sets ``item.feature = None`` for items owned by other
-    ranks so the subsequent ``_move_items_to_device`` only ships this rank's
-    shard to GPU.
+    Reads the persistent owner tags assigned once by
+    :func:`assign_dp_encoder_owners` and sets ``item.feature = None`` for items
+    owned by other ranks, so the following H2D copy only ships this rank's
+    shard. Metadata is preserved for the runner's reassembly.
 
-    This is safe under chunked prefill / per-image caching / retraction: a rank
-    only ever drops items it does not own, and ownership is fixed, so it never
-    drops a feature it will later need to encode. Metadata (hashes,
-    image_grid_thw, offsets, owner tag, ...) is preserved so the runner can
-    still group and reassemble in the original per-item order.
-
-    Returns ``True`` if sharding is active for this item list (all items tagged),
-    else ``False`` (features untouched; runner takes its legacy full-slice path).
-    Presence of owner tags already implies owner-tag sharding was enabled when
-    the request was admitted, so no re-check of the dispatch flag is needed.
+    Returns ``True`` if all items are tagged (sharding active), else ``False``
+    (features untouched; runner takes its legacy full-slice path).
     """
     if not items:
         return False
@@ -626,8 +597,6 @@ def drop_nonlocal_features_for_dp_encoder(items: List[MultimodalDataItem]) -> bo
     owner_ranks = [_dp_encoder_owner_rank(it) for it in items]
     if any(o is None for o in owner_ranks):
         return False
-
-    from sglang.srt.multimodal.mm_utils import get_dp_encoder_dispatch
 
     tp_rank = get_dp_encoder_dispatch().tp_rank()
     for item, owner in zip(items, owner_ranks):
@@ -645,38 +614,28 @@ def build_local_pixel_values_for_dp_encoder(
 ) -> Tuple[torch.Tensor, Optional[List[int]]]:
     """Concat the locally-owned item features into ``pixel_values``.
 
-    After :func:`drop_nonlocal_features_for_dp_encoder` has dropped non-local
-    items' ``feature`` to ``None`` on this rank, this helper concats only the
-    surviving (locally-owned) features, in ascending item order, into the
-    ``pixel_values`` consumed by
+    After :func:`drop_nonlocal_features_for_dp_encoder` dropped non-local
+    features, this concats the surviving (locally-owned) features in ascending
+    item order for
     :func:`sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model`.
 
-    Returns ``(pixel_values, owner_ranks)``. ``owner_ranks`` is the per-item
-    owner-rank list (one entry per item in ``items``) when DP-encoder sharding
-    is active for this exact item list -- the runner then groups by these tags
-    and treats ``pixel_values`` as this rank's shard. It is ``None`` when no
-    sharding applies (every item still carries its feature, so the runner takes
-    its legacy full-slice path over the complete ``pixel_values``).
-
-    When this rank owns no features, returns a typed ``(0, 0)`` empty tensor on
-    ``fallback_device``. In that case only ``shape[0]`` is read downstream, so
-    the trailing dim and device only matter for type propagation through the
-    runner's empty branch.
+    Returns ``(pixel_values, owner_ranks)``: ``owner_ranks`` is the per-item
+    owner list when sharding is active (runner groups by it), or ``None`` for
+    the legacy full-slice path. With no locally-owned features, returns a typed
+    ``(0, 0)`` empty tensor on ``fallback_device`` (only ``shape[0]`` is read).
 
     Args:
         items: Per-modality item list as passed to ``get_image_feature``.
         dtype: Target ViT dtype.
-        fallback_device: Device to use when this rank owns no features (must
-            match the visual model's device so the all-gather is collective-safe).
-        to_device: Optional explicit device for the concatenated tensor. When
+        fallback_device: Device used when this rank owns no features (must match
+            the visual model's device so the all-gather is collective-safe).
+        to_device: Optional explicit device for the concatenated tensor; when
             ``None`` the tensor stays on its current device (post-H2D).
     """
     owner_tags = [_dp_encoder_owner_rank(it) for it in items]
     sharded = bool(items) and all(o is not None for o in owner_tags)
 
     if sharded:
-        from sglang.srt.multimodal.mm_utils import get_dp_encoder_dispatch
-
         my_rank = get_dp_encoder_dispatch().tp_rank()
         owner_ranks: Optional[List[int]] = [int(o) for o in owner_tags]
         local_features = [
@@ -720,10 +679,8 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        # DP-encoder pre-H2D drop: over THIS exact item list, drop features for
-        # items owned by other ranks (using the persistent owner tags assigned
-        # once in the scheduler). No assignment is recomputed here, so the drop
-        # can never diverge from the runner's owner-tag grouping.
+        # DP-encoder pre-H2D drop: drop features for items owned by other ranks
+        # (using the persistent scheduler-assigned owner tags) before H2D.
         drop_nonlocal_features_for_dp_encoder(embedding_items_per_req)
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
@@ -799,10 +756,8 @@ def _get_chunked_embedding_by_item(
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        # DP-encoder pre-H2D drop over the exact cache-miss subset actually
-        # encoded in this chunk. Uses the persistent per-item owner tags (no
-        # recomputed assignment), so the drop matches the runner's owner-tag
-        # grouping even though this is only a subset of the request's images.
+        # DP-encoder pre-H2D drop over this chunk's cache-miss subset, using the
+        # persistent per-item owner tags so it matches the runner's grouping.
         drop_nonlocal_features_for_dp_encoder(miss_item_list)
         _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)

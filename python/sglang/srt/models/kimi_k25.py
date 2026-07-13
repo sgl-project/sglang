@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    build_local_pixel_values_for_dp_encoder,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -683,10 +684,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         # Non-local items' feature may have been dropped to None by the
         # DP-encoder pre-H2D sharding; concat only what we actually own.
-        from sglang.srt.managers.mm_utils import (
-            build_local_pixel_values_for_dp_encoder,
-        )
-
         pixel_values, dp_encoder_owner_ranks = build_local_pixel_values_for_dp_encoder(
             items,
             dtype=target_dtype,
