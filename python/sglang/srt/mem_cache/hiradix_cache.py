@@ -1559,7 +1559,9 @@ class HiRadixCache(RadixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, update_cache_stats=params.update_cache_stats
+        )
         if value:
             value = torch.cat(value)
         else:

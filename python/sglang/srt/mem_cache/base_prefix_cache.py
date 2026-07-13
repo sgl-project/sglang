@@ -45,6 +45,9 @@ class MatchPrefixParams:
 
     key: RadixKey
 
+    # Queue scans are probes and must not make an unserved prefix look hot.
+    update_cache_stats: bool = True
+
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None

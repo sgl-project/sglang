@@ -288,6 +288,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        self.schedule_low_priority_values_first = (
+            params.schedule_low_priority_values_first
+        )
 
         self.kv_event_queue = []
 
@@ -303,7 +306,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.eviction_strategy = get_eviction_strategy(
+            self.eviction_policy, self.schedule_low_priority_values_first
+        )
 
         self.evictable_leaves = set()
         self.reset()
@@ -316,6 +321,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        schedule_low_priority_values_first: bool = False,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -325,6 +331,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
+            schedule_low_priority_values_first=schedule_low_priority_values_first,
         )
         return RadixCache(params)
 
@@ -402,7 +409,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, update_cache_stats=params.update_cache_stats
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -647,25 +656,31 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, update_cache_stats: bool = True
+    ):
         access_time = time.monotonic()
-        node.last_access_time = access_time
+        if update_cache_stats:
+            node.last_access_time = access_time
 
         child_key = key.child_key(self.page_size)
 
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = access_time
+            if update_cache_stats:
+                child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self._inc_qos_aware_hit_count(new_node)
+                if update_cache_stats:
+                    self._inc_qos_aware_hit_count(new_node)
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self._inc_qos_aware_hit_count(child)
+                if update_cache_stats:
+                    self._inc_qos_aware_hit_count(child)
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
@@ -709,6 +724,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if self.eviction_policy == "qos-aware":
             node.hit_count += 1
 
+    def _merge_cache_priority(self, current: int, incoming: int) -> int:
+        if self.eviction_policy == "qos-aware" and self.schedule_low_priority_values_first:
+            return min(current, incoming)
+        return max(current, incoming)
+
     def _insert_helper(
         self,
         node: TreeNode,
@@ -723,7 +743,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
-        node.priority = max(node.priority, priority)
+        node.priority = self._merge_cache_priority(node.priority, priority)
         if len(key) == 0:
             return 0, node
 
@@ -740,11 +760,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
-                new_node.priority = max(new_node.priority, priority)
+                new_node.priority = self._merge_cache_priority(new_node.priority, priority)
                 self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
-                node.priority = max(node.priority, priority)
+                node.priority = self._merge_cache_priority(node.priority, priority)
                 self._inc_hit_count(node, chunked)
             if len(key):
                 child_key = key.child_key(self.page_size)

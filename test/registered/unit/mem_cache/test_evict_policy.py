@@ -163,6 +163,17 @@ class TestQoSAwareStrategy(unittest.TestCase):
         high_qos = _make_node(hit_count=2, priority=8, key=[1], last_access_time=1.0)
         self.assertLess(self._get_priority(low_qos), self._get_priority(high_qos))
 
+    def test_lower_qos_value_is_protected_when_configured(self):
+        strategy = QoSAwareStrategy(schedule_low_priority_values_first=True)
+        low_value = _make_node(hit_count=2, priority=1, key=[1], last_access_time=1.0)
+        high_value = _make_node(hit_count=2, priority=8, key=[1], last_access_time=1.0)
+        with patch(
+            "sglang.srt.mem_cache.evict_policy.time.monotonic", return_value=20.0
+        ):
+            self.assertGreater(
+                strategy.get_priority(low_value), strategy.get_priority(high_value)
+            )
+
     def test_default_qos_weight_is_one(self):
         zero_qos = _make_node(hit_count=2, priority=0, key=[1], last_access_time=1.0)
         one_qos = _make_node(hit_count=2, priority=1, key=[1], last_access_time=1.0)

@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.evict_policy import get_qos_weight
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
@@ -102,6 +103,7 @@ def match_prefix_for_req(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            update_cache_stats=False,
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
@@ -208,7 +210,9 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.QOS_LPM:
                 SchedulePolicy._sort_by_qos_longest_prefix(
-                    waiting_queue, temporary_deprioritized
+                    waiting_queue,
+                    temporary_deprioritized,
+                    self.schedule_low_priority_values_first,
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
@@ -320,14 +324,18 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_qos_longest_prefix(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        schedule_low_priority_values_first: bool,
     ) -> None:
         """Sorts by higher QoS priority, longer prefix match, then arrival time."""
 
         def sort_key(req: Req):
             is_deprioritized = req.rid in temporary_deprioritized
             prefix_key = -len(req.prefix_indices)
-            qos_weight = max(req.priority or 1, 1)
+            qos_weight = get_qos_weight(
+                req.priority, schedule_low_priority_values_first
+            )
             return (
                 is_deprioritized,
                 -qos_weight,

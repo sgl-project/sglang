@@ -65,8 +65,12 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
 }
 
 
-def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+def get_eviction_strategy(
+    eviction_policy: str, schedule_low_priority_values_first: bool = False
+) -> EvictionStrategy:
     policy = eviction_policy.lower()
+    if policy == "qos-aware":
+        return QoSAwareStrategy(schedule_low_priority_values_first)
     try:
         return _EVICTION_POLICY_FACTORIES[policy]()
     except KeyError:

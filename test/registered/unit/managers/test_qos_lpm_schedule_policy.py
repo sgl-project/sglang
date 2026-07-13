@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -13,13 +13,13 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestQoSLPMSchedulePolicy(unittest.TestCase):
-    def _policy(self, tree_cache):
+    def _policy(self, tree_cache, low_priority_values_first=False):
         return SchedulePolicy(
             policy="qos-lpm",
             tree_cache=tree_cache,
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
+            schedule_low_priority_values_first=low_priority_values_first,
         )
 
     def _req(self, rid, token_ids, priority, wait_time):
@@ -48,6 +48,36 @@ class TestQoSLPMSchedulePolicy(unittest.TestCase):
             [r.rid for r in waiting_queue],
             ["high-no-prefix", "low-long-prefix"],
         )
+
+    def test_lower_priority_value_scheduled_first_when_configured(self):
+        tree_cache = RadixCache.create_simulated()
+        waiting_queue = [
+            self._req("value-five", [5], 5, 1.0),
+            self._req("value-one", [1], 1, 2.0),
+        ]
+
+        self._policy(tree_cache, low_priority_values_first=True).calc_priority(
+            waiting_queue
+        )
+
+        self.assertEqual([r.rid for r in waiting_queue], ["value-one", "value-five"])
+
+    def test_repeated_schedule_probes_do_not_inflate_cache_hotness(self):
+        tree_cache = RadixCache.create_simulated(eviction_policy="qos-aware")
+        key = RadixKey([1, 2, 3])
+        tree_cache.insert(InsertParams(key=key, value=torch.tensor([1, 2, 3])))
+        node = tree_cache.match_prefix(
+            MatchPrefixParams(key=key, update_cache_stats=False)
+        ).last_device_node
+        initial_hit_count = node.hit_count
+        initial_access_time = node.last_access_time
+        waiting_queue = [self._req("waiting", [1, 2, 3], 1, 1.0)]
+
+        self._policy(tree_cache).calc_priority(waiting_queue)
+        self._policy(tree_cache).calc_priority(waiting_queue)
+
+        self.assertEqual(node.hit_count, initial_hit_count)
+        self.assertEqual(node.last_access_time, initial_access_time)
 
     def test_same_priority_longer_prefix_scheduled_first(self):
         tree_cache = RadixCache.create_simulated()

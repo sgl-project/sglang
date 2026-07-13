@@ -50,13 +50,28 @@ class PriorityStrategy(EvictionStrategy):
 class QoSAwareStrategy(EvictionStrategy):
     """QoS-aware eviction weighted by prefix hotness and request priority."""
 
+    def __init__(self, schedule_low_priority_values_first: bool = False):
+        self.schedule_low_priority_values_first = schedule_low_priority_values_first
+
     def get_priority(self, node: "TreeNode") -> Tuple[float, float]:
         prefix_len = max(len(node.key), 1)
         age = max(time.monotonic() - node.last_access_time, 0.0)
         recency_bonus = 1.0 / (1.0 + age)
         hotness = node.hit_count + recency_bonus / prefix_len
-        qos_weight = max(node.priority or 0, 1)
+        qos_weight = get_qos_weight(
+            node.priority, self.schedule_low_priority_values_first
+        )
         return (hotness * qos_weight, node.last_access_time)
+
+
+def get_qos_weight(
+    priority: int | None, schedule_low_priority_values_first: bool = False
+) -> float:
+    """Convert a positive QoS tier to a direction-aware protection weight."""
+    tier = max(float(priority or 0), 1.0)
+    if schedule_low_priority_values_first:
+        return 1.0 / tier
+    return tier
 
 
 class SLRUStrategy(EvictionStrategy):
