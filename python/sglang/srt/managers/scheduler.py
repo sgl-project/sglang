@@ -1148,7 +1148,7 @@ class Scheduler(
             if target_layer_ids:
                 return [int(x) for x in target_layer_ids]
 
-            from sglang.srt.speculative.dspark_components.dspark_utils import (
+            from sglang.srt.speculative.dspark_components.dspark_config import (
                 get_dspark_target_layer_ids,
             )
 

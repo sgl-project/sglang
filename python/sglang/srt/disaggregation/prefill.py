@@ -688,7 +688,7 @@ class SchedulerDisaggregationPrefillMixin:
         if batch:
             set_schedule_time_batch(batch)
 
-        return batch
+        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     def _prepare_dspark_hidden_capture_for_batch(
         self: Scheduler, batch: Optional[ScheduleBatch]

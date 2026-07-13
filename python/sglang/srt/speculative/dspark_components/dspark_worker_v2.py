@@ -17,7 +17,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -634,7 +633,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._draft_is_moe:
                     with self._draft_context():
                         self._proposer.run_idle_participation(batch)
-                self._run_idle_verify_participation(batch)
+                self._verify_executor.run_idle_participation(
+                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                )
             return self._decode_idle_result(on_publish=on_publish)
 
         prefill_tail_start_positions = getattr(
@@ -867,7 +868,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
-            new_seq_lens=new_seq_lens,
+            new_seq_lens=accept.new_seq_lens,
         )
 
     def _maybe_inject_pd_prefill_tail(

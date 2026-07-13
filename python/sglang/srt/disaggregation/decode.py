@@ -277,6 +277,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 class DecodeRequest:
     req: Req
     kv_receiver: CommonKVReceiver
+    is_rebootstrap: bool = False
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     dspark_hidden_dst_indices: Optional[List[int]] = None
@@ -1421,24 +1422,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 target_pp_ranks = list(
                     getattr(decode_req.kv_receiver, "target_pp_ranks", None) or [0]
                 )
-                pp_size = max(target_pp_ranks) + 1 if target_pp_ranks else 1
-                pp_slices = {}
-                slice_start = 0
+                prefill_info = getattr(decode_req.kv_receiver, "prefill_info", None)
+                pp_size = int(
+                    getattr(prefill_info, "pp_size", None)
+                    or (max(target_pp_ranks) + 1 if target_pp_ranks else 1)
+                )
+                target_pp_rank_set = {int(pp_rank) for pp_rank in target_pp_ranks}
+                pp_local_layer_ids = {}
                 for pp_rank in range(pp_size):
                     pp_start, pp_end = get_pp_indices(
                         self.scheduler.model_config.num_hidden_layers,
                         pp_rank,
                         pp_size,
                     )
-                    local_layer_ids = [
+                    pp_local_layer_ids[pp_rank] = [
                         layer_id
                         for layer_id in target_layer_ids
                         if pp_start <= layer_id < pp_end
                     ]
+                pp_slices = {}
+                slice_start = 0
+                for pp_rank in range(pp_size):
+                    local_layer_ids = pp_local_layer_ids[pp_rank]
                     slice_len = len(local_layer_ids) * int(
                         self.scheduler.model_config.hidden_size
                     )
-                    if slice_len > 0:
+                    if slice_len > 0 and pp_rank in target_pp_rank_set:
                         pp_slices[pp_rank] = {
                             "pp_rank": int(pp_rank),
                             "layer_ids": [int(x) for x in local_layer_ids],
@@ -1446,13 +1455,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             "slice_len": int(slice_len),
                             "dst_indices": None,
                         }
-                    slice_start += slice_len
-                if slice_start != len(target_layer_ids) * int(
-                    self.scheduler.model_config.hidden_size
-                ):
+                        slice_start += slice_len
+                expected_hidden_size = sum(
+                    len(pp_local_layer_ids.get(pp_rank, []))
+                    for pp_rank in target_pp_rank_set
+                ) * int(self.scheduler.model_config.hidden_size)
+                if slice_start != expected_hidden_size:
                     message = (
                         "DSpark PP slice layout does not cover all target layers: "
-                        f"target_layer_ids={target_layer_ids}, pp_size={pp_size}"
+                        f"target_layer_ids={target_layer_ids}, pp_size={pp_size}, "
+                        f"target_pp_ranks={target_pp_ranks}"
                     )
                     logger.error(message)
                     prepare_abort(
