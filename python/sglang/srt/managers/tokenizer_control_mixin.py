@@ -5,7 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
@@ -665,9 +665,7 @@ class TokenizerControlMixin:
 
     def _validate_lora_upsert_supported(
         self: TokenizerManager,
-        obj: Union[
-            LoadLoRAAdapterFromTensorsReqInput, LoadLoRAAdapterFromDistributedReqInput
-        ],
+        obj: LoadLoRAAdapterFromDistributedReqInput,
     ) -> None:
         """Upsert resolves lora_name -> lora_id through this process's registry.
 
@@ -699,32 +697,31 @@ class TokenizerControlMixin:
             assert (
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            if obj.upsert:
+                # In-place refresh is only wired up on the from_distributed
+                # route (the disaggregated RL weight-sync path). Reject
+                # explicitly instead of dying later on the duplicate check
+                # with a fresh uuid.
+                raise ValueError(
+                    "upsert is not supported on the from_tensors route; use "
+                    "/load_lora_adapter_from_distributed to refresh an adapter in place."
+                )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
             )
 
             async with self.lora_update_lock:
-                self._validate_lora_upsert_supported(obj)
-                # With upsert, a same-name adapter keeps its lora_id so the
-                # backend refreshes it in place instead of failing the
-                # duplicate check; otherwise this resolves to a fresh ref.
-                new_adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
-                        lora_name=obj.lora_name,
-                        lora_path="__tensor__",
-                        pinned=obj.pinned,
-                    ),
-                    upsert=obj.upsert,
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path="__tensor__",
+                    pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
 
                 if result.success:
-                    if reused:
-                        await self.lora_registry.refresh(new_adapter)
-                    else:
-                        await self.lora_registry.register(new_adapter)
+                    await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
                 if self.server_args.max_loaded_loras is not None:
                     while (
