@@ -640,9 +640,8 @@ def build_kda_attention_fixture(
         device=device,
     )
     # KDA gate input is per-head-channel ([T, HV*K] raw); beta is per-head ([T, HV]).
-    # For extend, the production model unflattens gate to [1, T, HV, K] and
-    # sigmoid-then-unsqueezes beta to [1, T, HV] before calling the attn layer.
-    # For decode, both stay flat and beta is sigmoid'd inside the fused kernel.
+    # Extend supplies the shapes consumed by chunk KDA. Decode and target verify
+    # keep raw gates because their fused recurrent kernel applies the activations.
     a_raw = torch.randn(
         case.num_input_tokens,
         case.num_v_heads * head_k_dim,
@@ -652,7 +651,7 @@ def build_kda_attention_fixture(
     b_raw = torch.randn(
         case.num_input_tokens, case.num_v_heads, dtype=dtype, device=device
     )
-    if case.forward_mode.is_decode():
+    if case.forward_mode.is_decode() or case.forward_mode.is_target_verify():
         a = a_raw
         b = b_raw.unsqueeze(0)
     else:
@@ -904,7 +903,7 @@ def make_kda_random_inputs(
         dtype=dtype,
         device=device,
     )
-    if case.forward_mode.is_decode():
+    if case.forward_mode.is_decode() or case.forward_mode.is_target_verify():
         a = a_raw
         b = b_raw.unsqueeze(0)
     else:

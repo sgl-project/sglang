@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -41,6 +42,7 @@ class KDAKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonKDAKernel()
+        self.verify_kernel = triton_kernel
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
@@ -97,7 +99,8 @@ class KDAKernelDispatcher:
 
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__} "
+            f"extend={self.extend_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -188,6 +191,35 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
 
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
@@ -197,6 +229,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
 
     def forward_decode(
         self,
@@ -303,6 +338,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -385,3 +423,74 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         return core_attn_out
+
+    def _forward_target_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ):
+        assert isinstance(mixed_qkv, torch.Tensor)
+        if getattr(layer, "lower_bound", None) is not None:
+            raise NotImplementedError("KDA target verify does not support lower_bound")
+        seq_len = mixed_qkv.shape[0]
+
+        forward_metadata = self.forward_metadata
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
+        retrieve_next_token = forward_metadata.retrieve_next_token
+        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
+        ssm_states = mamba_cache_params.temporal
+        intermediate_state_cache = mamba_cache_params.intermediate_ssm
+        intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[
+            0
+        ].transpose(-1, -2)
+
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = seq_len // draft_token_num
+        intermediate_state_indices = self.verify_intermediate_state_indices[:batch_size]
+
+        mixed_qkv = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2)
+        mixed_qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_state_indices=cache_indices[:batch_size],
+            intermediate_conv_window=intermediate_conv_window_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+        mixed_qkv = mixed_qkv.transpose(1, 2).reshape(seq_len, -1)
+
+        q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.view(1, seq_len, layer.num_q_heads, layer.head_q_dim)
+        k = k.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
+        v = v.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        return self.kernel_dispatcher.target_verify(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=draft_token_num,
+            retrieve_parent_token=retrieve_parent_token,
+        )

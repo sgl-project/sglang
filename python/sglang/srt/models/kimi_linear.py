@@ -52,6 +52,15 @@ from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
+def _prepare_kda_gate_inputs(forget_gate, beta, forward_mode, head_dim):
+    # Chunk KDA expects a shaped raw gate and activated beta; the recurrent
+    # decode/verify kernel applies both activations internally.
+    if not (forward_mode.is_decode() or forward_mode.is_target_verify()):
+        forget_gate = forget_gate.unflatten(-1, (-1, head_dim)).unsqueeze(0)
+        beta = beta.float().sigmoid()
+    return forget_gate, beta.unsqueeze(0)
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -382,16 +391,9 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
-        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
-        # For decode: gate activation is handled inside fused_recurrent kernel.
-        if not forward_batch.forward_mode.is_decode():
-            forget_gate = forget_gate.unflatten(
-                -1, (-1, self.head_dim)
-            )  # [T, H*K] -> [T, H, K]
-            beta = beta.float().sigmoid()
-            forget_gate = forget_gate.unsqueeze(0)
-        beta = beta.unsqueeze(0)
+        forget_gate, beta = _prepare_kda_gate_inputs(
+            forget_gate, beta, forward_batch.forward_mode, self.head_dim
+        )
 
         core_attn_out = self.attn(
             forward_batch,

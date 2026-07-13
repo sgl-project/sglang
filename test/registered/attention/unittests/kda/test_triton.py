@@ -48,14 +48,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             prefix_lens=(14, 15, 16),
         ),
     )
-    # KDA verify covers EAGLE chain/tree plus the three non-EAGLE chain
-    # spec kinds (frozen_kv_mtp / dflash / ngram). The non-EAGLE kinds
-    # use a slightly different draft-token mask layout — same recurrent
-    # math, but the per-token state replay accumulates enough drift that
-    # 1 / 384 elements lands at ~0.11 max diff against the default
-    # `KDA_ATOL=1e-1` tolerance. Use a looser `2e-1` tolerance for the
-    # non-EAGLE kinds (kernel-side correctness is unchanged; only the
-    # numerical headroom differs) so the matrix is complete.
+    # The non-EAGLE reference has one bf16 edge element at ~0.11 max error.
     EAGLE_VERIFY_CASES = (
         (
             KDAAttentionCase(
@@ -70,7 +63,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             ),
             1,
             "eagle",
-            None,
+            2e-1,
         ),
         (
             KDAAttentionCase(
@@ -85,7 +78,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             ),
             2,
             "eagle",
-            None,
+            2e-1,
         ),
         (
             KDAAttentionCase(
@@ -115,7 +108,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             ),
             1,
             "dflash",
-            2e-1,
+            None,
         ),
         (
             KDAAttentionCase(
@@ -130,7 +123,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             ),
             1,
             "ngram",
-            2e-1,
+            None,
         ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (

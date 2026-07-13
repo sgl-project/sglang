@@ -102,7 +102,10 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    is_kda: bool = False,
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
@@ -112,11 +115,13 @@ def conv_window_dedup_enabled(
     verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
     columns can need different values from different parent chains -> fall back to
     the dense layout. NPU/CPU also keep the dense layout (their kernels assume
-    contiguous per-step windows). See ``MambaPool.__init__``.
+    contiguous per-step windows). KDA uses reversed conv-state axes, which cannot
+    share this view. See ``MambaPool.__init__``.
     """
     return (
         not is_npu
         and not is_cpu
+        and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
 
@@ -526,13 +531,13 @@ class MambaPool:
                 # consume the view through its strides.
                 #
                 # Dedup the sliding-window conv-intermediate only when it is safe:
-                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
+                # CUDA + a linear non-KDA draft chain (topk <= 1). NPU/CPU, KDA,
+                # and EAGLE tree verify (topk > 1) keep the dense layout -- see
                 # `conv_window_dedup_enabled` for the full rationale. The
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
@@ -572,9 +577,7 @@ class MambaPool:
                         self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
                 else:
-                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
-                    # [dim, K-1] window per draft token.
-                    # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                    # Dense layout preserves each backend's conv-state axes.
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(

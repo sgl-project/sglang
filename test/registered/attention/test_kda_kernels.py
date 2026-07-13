@@ -2,6 +2,10 @@ import unittest
 
 import torch
 
+from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
+)
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
@@ -14,6 +18,12 @@ from sglang.srt.layers.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
+from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.kimi_linear import _prepare_kda_gate_inputs
 from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -113,6 +123,37 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
         )
         return core_attn_out, ssm_states[self.cache_indices]
 
+    def test_target_verify_uses_recurrent_gate_inputs(self):
+        raw_gate = torch.randn(
+            self.token_num,
+            self.local_num_heads * self.head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        raw_beta = torch.randn(
+            self.token_num,
+            self.local_num_heads,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+
+        gate, beta = _prepare_kda_gate_inputs(
+            raw_gate, raw_beta, ForwardMode.TARGET_VERIFY, self.head_dim
+        )
+        torch.testing.assert_close(gate, raw_gate, rtol=0, atol=0)
+        torch.testing.assert_close(beta, raw_beta.unsqueeze(0), rtol=0, atol=0)
+
+        gate, beta = _prepare_kda_gate_inputs(
+            raw_gate, raw_beta, ForwardMode.EXTEND, self.head_dim
+        )
+        self.assertEqual(
+            gate.shape,
+            (1, self.token_num, self.local_num_heads, self.head_dim),
+        )
+        torch.testing.assert_close(
+            beta, raw_beta.float().sigmoid().unsqueeze(0), rtol=0, atol=0
+        )
+
     def run_kda(self):
         b = self.beta.float().sigmoid()
         # Reference gate activation using torch ops:
@@ -147,6 +188,39 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
         )
         self.assertTrue(torch.allclose(last_state, last_state_ref))
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDATargetVerify(unittest.TestCase):
+    def test_flashkda_prefill_uses_triton_verify(self):
+        dispatcher = KDAKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.FLASHKDA,
+        )
+
+        self.assertNotIsInstance(dispatcher.extend_kernel, TritonKDAKernel)
+        self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
+
+    def test_kda_conv_windows_keep_dense_layout(self):
+        shape = KimiLinearStateShape.create(
+            tp_world_size=1,
+            num_heads=2,
+            head_dim=8,
+            conv_kernel_size=4,
+        )
+        pool = MambaPool(
+            size=2,
+            spec_state_size=2,
+            cache_params=KimiLinearCacheParams(layers=[0], shape=shape),
+            mamba_layer_ids=[0],
+            device="cuda",
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+        )
+
+        conv_windows = pool.mamba_cache.intermediate_conv_window[0]
+        self.assertEqual(conv_windows.shape, (1, 3, 3, 3, 48))
+        self.assertTrue(conv_windows.is_contiguous())
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

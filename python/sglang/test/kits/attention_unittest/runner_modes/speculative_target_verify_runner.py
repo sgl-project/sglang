@@ -1035,6 +1035,9 @@ def run_kda_eagle_verify_case(
         actual = run_kda_forward(fixture, fixture.forward_batch, inputs)
 
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    _, actual_ssm_state = _clone_kda_cache(fixture)
+    _, expected_ssm_state = initial_state
+    torch.testing.assert_close(actual_ssm_state, expected_ssm_state, rtol=0, atol=0)
 
 
 def _prepare_kda_verify_batch(case, batch, *, topk: int, device: str) -> None:
