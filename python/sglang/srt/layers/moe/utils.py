@@ -266,9 +266,8 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 2. Default on NPU → BF16
-    if _is_npu:
-        return DispatcherOutputDtype.BF16
+    # 2. Ascend dispatch defaults to BF16
+    return DispatcherOutputDtype.BF16
 
 
 def initialize_moe_config(server_args: ServerArgs):

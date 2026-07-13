@@ -294,5 +294,9 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             w2_weight_scale=layer.w2_weight_scale,
             w13_weight_offset=layer.w13_weight_offset,
             w2_weight_offset=layer.w2_weight_offset,
+            w13_scale_bias=layer.w13_scale_bias,
+            w2_scale_bias=layer.w2_scale_bias,
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)

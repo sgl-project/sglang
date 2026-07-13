@@ -183,7 +183,10 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            layer.w13_scheme, layer.w2_scheme = self.get_moe_scheme(layer, prefix)
+            moe_schemes = self.get_moe_scheme(layer, prefix)
+            if moe_schemes is None:
+                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
+            layer.w13_scheme, layer.w2_scheme = moe_schemes
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
                 layer.w2_scheme.kernel,
@@ -230,24 +233,38 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
         ]
-        # Suffixes for the two weight groups
-        w13_suffixes = [".0.gate_proj.weight", ".0.up_proj.weight"]
-        w2_suffix = ".0.down_proj.weight"
-
-        # Look up scheme names from the quant description
-        w13_names = [
-            self.quant_description.get(prefix + suf, "") for suf in w13_suffixes
+        w13_keys = [
+            prefix + ".0.gate_proj.weight",
+            prefix + ".0.up_proj.weight",
         ]
-        w2_name = self.quant_description.get(prefix + w2_suffix, "")
+        w2_key = prefix + ".0.down_proj.weight"
+        w13_entries = {
+            key: self.quant_description[key]
+            for key in w13_keys
+            if key in self.quant_description
+        }
+        if not w13_entries or w2_key not in self.quant_description:
+            missing_groups = []
+            if not w13_entries:
+                missing_groups.append(f"W13 ({', '.join(w13_keys)})")
+            if w2_key not in self.quant_description:
+                missing_groups.append(f"W2 ({w2_key})")
+            raise ValueError(
+                f"Missing ModelSlim MoE quantization description for layer {prefix}: "
+                + ", ".join(missing_groups)
+            )
+
+        w13_names = list(w13_entries.values())
+        w2_name = self.quant_description[w2_key]
 
         # For w13, gate_proj and up_proj must agree on the scheme
-        unique_w13 = set(name for name in w13_names if name)  # ignore empty/missing
+        unique_w13 = set(w13_names)
         if len(unique_w13) > 1:
-            logger.warning(
-                f"Mismatched quantization for gate_proj/up_proj in {prefix}: "
-                f"{w13_names}. Using the first found scheme."
+            raise ValueError(
+                f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
+                f"{w13_entries}"
             )
-        w13_scheme_name = next((name for name in w13_names if name), "")
+        w13_scheme_name = w13_names[0]
 
         # Map scheme names to classes
         scheme_map = dict(
@@ -263,11 +280,14 @@ class ModelSlimConfig(QuantizationConfig):
             return cls(self, weight_group)
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
-        logger.info_once(
-            f"Using {scheme_map[w13_scheme_name].__name__} for gate_up_proj"
-        )
         w2_scheme = instantiate(w2_name, weight_group="w2")
-        logger.info_once(f"Using {scheme_map[w2_name].__name__} for down_proj")
+        if w13_scheme is None or w2_scheme is None:
+            raise ValueError(
+                f"Unsupported ModelSlim MoE schemes for layer {prefix}: "
+                f"gate/up={w13_names}, down_proj='{w2_name}'"
+            )
+        logger.info_once(f"Using {type(w13_scheme).__name__} for gate_up_proj")
+        logger.info_once(f"Using {type(w2_scheme).__name__} for down_proj")
 
         return w13_scheme, w2_scheme
 
@@ -432,5 +452,9 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight_scale=layer.w2_weight_scale,
             w13_weight_offset=layer.w13_weight_offset,
             w2_weight_offset=layer.w2_weight_offset,
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)

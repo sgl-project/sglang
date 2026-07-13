@@ -955,6 +955,10 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_dequant,
             w2_weight=layer.w2_dequant,
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)
 

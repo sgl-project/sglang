@@ -160,6 +160,10 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             w2_weight_scale=layer.w2_scales,
             w13_weight_offset=layer.w13_qzeros,
             w2_weight_offset=layer.w2_qzeros,
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)
 
