@@ -657,9 +657,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
-                    dsa_topk_indices = getattr(
-                        batch.spec_info, "dsa_topk_indices", None
-                    )
+                    dsa_topk_indices = batch.spec_info.dsa_topk_indices
                     if dsa_topk_indices is not None:
                         req.output_dsa_topk_indices = dsa_topk_indices[i].cpu().clone()
                     else:

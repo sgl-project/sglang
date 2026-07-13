@@ -146,7 +146,7 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
-            dsa_topk_indices=getattr(draft_input, "dsa_topk_indices", None),
+            dsa_topk_indices=draft_input.dsa_topk_indices,
         )
 
 
@@ -399,10 +399,10 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
-        if getattr(draft_input, "future_dsa_topk_indices_available", False):
+        if draft_input.future_dsa_topk_indices_available:
             assert self.dsa_topk_indices_buf is not None
             draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
-        elif hasattr(draft_input, "dsa_topk_indices"):
+        else:
             draft_input.dsa_topk_indices = None
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(

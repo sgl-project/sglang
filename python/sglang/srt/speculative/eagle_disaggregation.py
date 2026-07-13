@@ -52,9 +52,7 @@ def build_eagle_disagg_draft_input(
     ).to(batch.device)
 
     dsa_topk_indices = None
-    dsa_indices_list = [
-        getattr(req, "output_dsa_topk_indices", None) for req in batch.reqs
-    ]
+    dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
         dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
         if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():

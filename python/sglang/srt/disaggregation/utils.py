@@ -424,7 +424,7 @@ class MetadataBuffers:
                 req.hidden_states_tensor
             )
             if self.output_dsa_topk_indices is not None:
-                dsa_topk_indices = getattr(req, "output_dsa_topk_indices", None)
+                dsa_topk_indices = req.output_dsa_topk_indices
                 if dsa_topk_indices is not None:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
                         dsa_topk_indices

@@ -71,7 +71,8 @@ def _forward_dsa_indexer_for_mha(
     layer_id: int,
 ) -> None:
     """Fill the indexer K cache and publish an MTP seed when requested."""
-    seed_buf = getattr(forward_batch.spec_info, "dsa_seed_topk_capture", None)
+    spec_info = forward_batch.spec_info
+    seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
     topk_indices = indexer(
         x=hidden_states,
         q_lora=q_lora,
@@ -85,7 +86,7 @@ def _forward_dsa_indexer_for_mha(
     if topk_indices is None:
         raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
 
-    select = forward_batch.spec_info.dsa_seed_topk_select
+    select = spec_info.dsa_seed_topk_select
     src = topk_indices if select is None else topk_indices[select]
     seed_buf[: src.shape[0]].copy_(src)
 
