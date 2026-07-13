@@ -247,7 +247,7 @@ class KVCacheConfigurator:
         )
 
     def _init_pools(
-        self: ModelRunner,
+        self,
         *,
         max_total_num_tokens: int,
         max_running_requests: int,
@@ -997,7 +997,7 @@ class KVCacheConfigurator:
         )
 
     def _init_unified_mamba_pools(
-        self: ModelRunner, *, max_num_reqs: int, max_total_num_tokens: int
+        self, *, max_num_reqs: int, max_total_num_tokens: int
     ) -> UnifiedPoolBundle:
         """Build the shared-KV-pool stack for a hybrid-Mamba model:
         one byte buffer split between the full-attn MHA KV pool and the
@@ -1063,7 +1063,7 @@ class KVCacheConfigurator:
         return bundle
 
     def _init_unified_swa_pools(
-        self: ModelRunner,
+        self,
         *,
         max_num_reqs: int,
         full_max_total_num_tokens: Optional[int],
@@ -1157,7 +1157,7 @@ class KVCacheConfigurator:
         )
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
-        self: ModelRunner,
+        self,
         is_dsa_model: bool,
         is_dsv4_model: bool,
         current_platform,
@@ -1329,7 +1329,7 @@ class KVCacheConfigurator:
         return max_num_reqs
 
     def _resolve_memory_pool_config(
-        self: ModelRunner, pre_model_load_memory: int
+        self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
         from sglang.srt.model_executor.pool_configurator import (
@@ -1347,7 +1347,7 @@ class KVCacheConfigurator:
         return config
 
     def config_from_budget(
-        self: ModelRunner, budget_bytes: int, *, cap_tokens: Optional[int] = None
+        self, budget_bytes: int, *, cap_tokens: Optional[int] = None
     ) -> MemoryPoolConfig:
         """Turn a KV byte budget into a pool config via the configurator, re-applying
         the external token constraints (user cap, page alignment, PP sync) and the
