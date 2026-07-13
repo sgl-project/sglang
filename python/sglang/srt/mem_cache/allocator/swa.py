@@ -409,3 +409,50 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(
             kv_cache_cpu, indices, mamba_indices=mamba_indices
         )
+
+
+class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    """Single-pool allocator for models whose every layer is sliding-window attention."""
+
+    def __init__(
+        self,
+        size_swa: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: BaseSWAKVPool,
+        need_sort: bool,
+    ):
+        assert page_size == 1
+        assert isinstance(kvcache, BaseSWAKVPool)
+
+        self.page_size = page_size
+        self.dtype = dtype
+        self.device = device
+        self.need_sort = need_sort
+        self._size_full = self._size_swa = size_swa
+
+        self.swa_attn_allocator = TokenToKVPoolAllocator(
+            size_swa,
+            dtype,
+            device,
+            kvcache.swa_kv_pool,
+            need_sort,
+        )
+        self.full_attn_allocator = self.swa_attn_allocator
+
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.arange(size_swa + page_size, dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=device),
+            ]
+        )
+
+        self.free_pages = None
+        self.release_pages = None
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+        self._kvcache = kvcache
+        self.swa_attn_allocator.clear()
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
