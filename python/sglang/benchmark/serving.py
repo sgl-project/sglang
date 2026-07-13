@@ -956,8 +956,8 @@ class BenchmarkMetrics:
     total_input: int
     total_input_text: int
     total_input_vision: int
-    total_output: int
-    total_output_retokenized: int
+    total_output: float
+    total_output_retokenized: float
 
     # Throughput (req/s and tok/s)
     request_throughput: float
@@ -1004,6 +1004,111 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    measurement_duration: float = 0.0
+    steady_state_duration: float = 0.0
+    steady_state_concurrency_threshold: int = 0
+
+
+def _get_steady_state_window(
+    outputs: List[RequestFuncOutput], concurrency_ratio: float
+) -> Tuple[Optional[float], Optional[float], int]:
+    """Return the continuous high-concurrency measurement window."""
+    if not 0 < concurrency_ratio <= 1:
+        raise ValueError("steady-state concurrency ratio must be in (0, 1]")
+
+    successful = [output for output in outputs if output.success and output.latency > 0]
+    if not successful:
+        return None, None, 0
+
+    events: Dict[float, int] = {}
+    for output in successful:
+        events[output.start_time] = events.get(output.start_time, 0) + 1
+        end_time = output.start_time + output.latency
+        events[end_time] = events.get(end_time, 0) - 1
+
+    event_times = sorted(events)
+    concurrency = 0
+    intervals: List[Tuple[float, float, int]] = []
+    for i, event_time in enumerate(event_times[:-1]):
+        concurrency += events[event_time]
+        next_time = event_times[i + 1]
+        if next_time > event_time:
+            intervals.append((event_time, next_time, concurrency))
+
+    peak_concurrency = max((interval[2] for interval in intervals), default=0)
+    threshold = max(1, int(np.ceil(peak_concurrency * concurrency_ratio)))
+    steady_intervals = [interval for interval in intervals if interval[2] >= threshold]
+    if not steady_intervals:
+        return None, None, threshold
+
+    return steady_intervals[0][0], steady_intervals[-1][1], threshold
+
+
+def _output_tokens_in_window(
+    outputs: List[RequestFuncOutput],
+    output_lens: List[int],
+    retokenized_output_lens: List[int],
+    window_start: float,
+    window_end: float,
+) -> Tuple[float, float, List[Tuple[float, float]]]:
+    """Count output tokens in a time window and return weighted token events."""
+    output_tokens = 0.0
+    retokenized_tokens = 0.0
+    token_events: List[Tuple[float, float]] = []
+
+    for output, output_len, retokenized_len in zip(
+        outputs, output_lens, retokenized_output_lens
+    ):
+        if not output.success or output.latency <= 0:
+            continue
+        token_times = [output.start_time + output.ttft]
+        for itl in output.itl:
+            token_times.append(token_times[-1] + itl)
+
+        timestamps_in_window = [
+            token_time
+            for token_time in token_times
+            if window_start <= token_time <= window_end
+        ]
+        fraction_in_window = len(timestamps_in_window) / len(token_times)
+        output_tokens += output_len * fraction_in_window
+        retokenized_tokens += retokenized_len * fraction_in_window
+        event_weight = output_len / len(token_times)
+        token_events.extend(
+            (token_time, event_weight) for token_time in timestamps_in_window
+        )
+
+    return output_tokens, retokenized_tokens, token_events
+
+
+def _steady_state_output_throughput(
+    outputs: List[RequestFuncOutput],
+    output_lens: List[int],
+    retokenized_output_lens: List[int],
+    concurrency_ratio: float,
+) -> Tuple[float, float, float, int]:
+    """Measure output throughput after trimming ramp-up and drain."""
+    steady_start, steady_end, threshold = _get_steady_state_window(
+        outputs, concurrency_ratio
+    )
+    if steady_start is None or steady_end is None:
+        return 0.0, 0.0, 0.0, threshold
+
+    steady_duration = steady_end - steady_start
+    output_tokens, retokenized_tokens, _ = _output_tokens_in_window(
+        outputs,
+        output_lens,
+        retokenized_output_lens,
+        steady_start,
+        steady_end,
+    )
+
+    return (
+        output_tokens / steady_duration,
+        retokenized_tokens / steady_duration,
+        steady_duration,
+        threshold,
+    )
 
 
 async def get_request(
@@ -1054,6 +1159,7 @@ def calculate_metrics(
     backend: str,
     accept_length: Optional[float] = None,
     plot_throughput: bool = False,
+    steady_state_concurrency_ratio: Optional[float] = None,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1118,7 +1224,7 @@ def calculate_metrics(
     max_concurrent_requests = 0
 
     successful_outputs = [output for output in outputs if output.success]
-    if successful_outputs:
+    if successful_outputs and steady_state_concurrency_ratio is None:
         min_start_time = min(output.start_time for output in successful_outputs)
         max_end_time = max(
             output.start_time + output.latency for output in successful_outputs
@@ -1178,21 +1284,169 @@ def calculate_metrics(
             else:
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
+    if steady_state_concurrency_ratio is None:
+        measurement_duration = dur_s
+        measured_completed = completed
+        measured_total_input = total_input
+        measured_total_input_text = total_input_text
+        measured_total_input_vision = total_input_vision
+        measured_total_output = sum(output_lens)
+        measured_total_output_retokenized = sum(retokenized_output_lens)
+        measured_output_throughput = sum(output_lens) / dur_s
+        measured_output_throughput_retokenized = sum(retokenized_output_lens) / dur_s
+        measured_concurrency = np.sum(e2e_latencies) / dur_s
+        steady_state_duration = 0.0
+        steady_state_concurrency_threshold = 0
+    else:
+        steady_start, steady_end, steady_state_concurrency_threshold = (
+            _get_steady_state_window(outputs, steady_state_concurrency_ratio)
+        )
+        if steady_start is None or steady_end is None:
+            raise ValueError("No steady-state measurement window could be determined")
+
+        measurement_duration = steady_end - steady_start
+        steady_state_duration = measurement_duration
+        (
+            measured_total_output,
+            measured_total_output_retokenized,
+            steady_token_events,
+        ) = _output_tokens_in_window(
+            outputs, output_lens, retokenized_output_lens, steady_start, steady_end
+        )
+        measured_output_throughput = measured_total_output / measurement_duration
+        measured_output_throughput_retokenized = (
+            measured_total_output_retokenized / measurement_duration
+        )
+
+        measured_indices = [
+            i
+            for i, output in enumerate(outputs)
+            if output.success
+            and steady_start <= output.start_time + output.latency <= steady_end
+        ]
+        measured_completed = len(measured_indices)
+        measured_total_input = 0
+        measured_total_input_text = 0
+        measured_total_input_vision = 0
+        itls = []
+        tpots = []
+        ttfts = []
+        e2e_latencies = []
+        retokenized_itls = []
+
+        if input_requests is not None:
+            measured_input_indices = [
+                i
+                for i, output in enumerate(outputs)
+                if output.success and steady_start <= output.start_time <= steady_end
+            ]
+            for i in measured_input_indices:
+                measured_total_input += input_requests[i].prompt_len
+                measured_total_input_text += input_requests[i].text_prompt_len
+                measured_total_input_vision += input_requests[i].vision_prompt_len
+
+        for i in measured_indices:
+            output = outputs[i]
+            output_len = output_lens[i]
+            if output_len > 1:
+                tpots.append((output.latency - output.ttft) / (output_len - 1))
+            if use_retokenized_itl:
+                for k, itl in enumerate(output.itl):
+                    num_tokens = len(
+                        tokenizer.encode(
+                            output.text_chunks[k], add_special_tokens=False
+                        )
+                    )
+                    adjusted_itl = itl / num_tokens
+                    retokenized_itls.extend([adjusted_itl] * num_tokens)
+            else:
+                itls.extend(output.itl)
+            ttfts.append(output.ttft)
+            e2e_latencies.append(output.latency)
+
+        measured_concurrency = (
+            sum(
+                max(
+                    0.0,
+                    min(output.start_time + output.latency, steady_end)
+                    - max(output.start_time, steady_start),
+                )
+                for output in successful_outputs
+            )
+            / measurement_duration
+        )
+
+        concurrency_events: Dict[float, int] = {}
+        for output in successful_outputs:
+            overlap_start = max(output.start_time, steady_start)
+            overlap_end = min(output.start_time + output.latency, steady_end)
+            if overlap_start < overlap_end:
+                concurrency_events[overlap_start] = (
+                    concurrency_events.get(overlap_start, 0) + 1
+                )
+                concurrency_events[overlap_end] = (
+                    concurrency_events.get(overlap_end, 0) - 1
+                )
+        active_requests = 0
+        for event_time in sorted(concurrency_events):
+            active_requests += concurrency_events[event_time]
+            max_concurrent_requests = max(max_concurrent_requests, active_requests)
+
+        duration_seconds = max(1, int(np.ceil(measurement_duration)))
+        tokens_per_second = np.zeros(duration_seconds)
+        concurrent_requests_per_second = np.zeros(duration_seconds)
+        for token_time, token_weight in steady_token_events:
+            second_bucket = min(int(token_time - steady_start), duration_seconds - 1)
+            tokens_per_second[second_bucket] += token_weight
+        for output in successful_outputs:
+            overlap_start = max(output.start_time, steady_start)
+            overlap_end = min(output.start_time + output.latency, steady_end)
+            if overlap_start >= overlap_end:
+                continue
+            start_bucket = int(overlap_start - steady_start)
+            end_bucket = min(int(overlap_end - steady_start), duration_seconds - 1)
+            concurrent_requests_per_second[start_bucket : end_bucket + 1] += 1
+        max_output_tokens_per_s = float(np.max(tokens_per_second))
+
+        if plot_throughput:
+            if TERM_PLOTLIB_AVAILABLE:
+                import termplotlib as tpl
+
+                fig = tpl.figure()
+                fig.plot(
+                    np.arange(len(tokens_per_second)),
+                    tokens_per_second,
+                    title="Steady-state output tokens per second",
+                    xlabel="Time in steady-state window (s)",
+                )
+                fig.plot(
+                    np.arange(len(concurrent_requests_per_second)),
+                    concurrent_requests_per_second,
+                    title="Steady-state concurrent requests per second",
+                    xlabel="Time in steady-state window (s)",
+                )
+                fig.show()
+            else:
+                print("tip: install termplotlib and gnuplot to plot the metrics")
+
     itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
-        completed=completed,
-        total_input=total_input,
-        total_input_text=total_input_text,
-        total_input_vision=total_input_vision,
-        total_output=sum(output_lens),
-        total_output_retokenized=sum(retokenized_output_lens),
-        request_throughput=completed / dur_s,
-        input_throughput=total_input / dur_s,
-        output_throughput=sum(output_lens) / dur_s,
-        output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
-        total_throughput=(total_input + sum(output_lens)) / dur_s,
-        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
-        / dur_s,
+        completed=measured_completed,
+        total_input=measured_total_input,
+        total_input_text=measured_total_input_text,
+        total_input_vision=measured_total_input_vision,
+        total_output=measured_total_output,
+        total_output_retokenized=measured_total_output_retokenized,
+        request_throughput=measured_completed / measurement_duration,
+        input_throughput=measured_total_input / measurement_duration,
+        output_throughput=measured_output_throughput,
+        output_throughput_retokenized=measured_output_throughput_retokenized,
+        total_throughput=(measured_total_input + measured_total_output)
+        / measurement_duration,
+        total_throughput_retokenized=(
+            measured_total_input + measured_total_output_retokenized
+        )
+        / measurement_duration,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
@@ -1219,9 +1473,12 @@ def calculate_metrics(
         p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
         p95_e2e_latency_ms=np.percentile(e2e_latencies, 95) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
-        concurrency=np.sum(e2e_latencies) / dur_s,
+        concurrency=measured_concurrency,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        measurement_duration=measurement_duration,
+        steady_state_duration=steady_state_duration,
+        steady_state_concurrency_threshold=steady_state_concurrency_threshold,
     )
 
     return metrics, output_lens
@@ -1558,6 +1815,7 @@ async def benchmark(
         backend=backend,
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
+        steady_state_concurrency_ratio=args.steady_state_concurrency_ratio,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -1608,6 +1866,18 @@ async def benchmark(
                 "Output token throughput (tok/s):", metrics.output_throughput
             )
         )
+        if args.steady_state_concurrency_ratio is not None:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Steady-state duration (s):", metrics.steady_state_duration
+                )
+            )
+            print(
+                "{:<40} {:<10}".format(
+                    "Steady-state min concurrency:",
+                    metrics.steady_state_concurrency_threshold,
+                )
+            )
         print(
             "{:<40} {:<10.2f}".format(
                 "Peak output token throughput (tok/s):",
@@ -1676,8 +1946,19 @@ async def benchmark(
         total_device = total_host = total_storage = 0
         storage_backend_name = None
         has_details = False
+        cache_window_start = cache_window_end = None
+        if args.steady_state_concurrency_ratio is not None:
+            cache_window_start, cache_window_end, _ = _get_steady_state_window(
+                outputs, args.steady_state_concurrency_ratio
+            )
         for o in outputs:
             if not o.success:
+                continue
+            if (
+                cache_window_start is not None
+                and cache_window_end is not None
+                and not (cache_window_start <= o.start_time <= cache_window_end)
+            ):
                 continue
             total_prompt_tokens += o.prompt_len
             total_cached += o.cached_tokens
@@ -1746,7 +2027,8 @@ async def benchmark(
             # Information
             "server_info": server_info,
             # Results
-            "duration": benchmark_duration,
+            "duration": metrics.measurement_duration,
+            "benchmark_duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
@@ -1756,6 +2038,10 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "steady_state_duration": metrics.steady_state_duration,
+            "steady_state_concurrency_threshold": (
+                metrics.steady_state_concurrency_threshold
+            ),
             "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
@@ -1880,6 +2166,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "plot_throughput"):
         args.plot_throughput = False
+
+    if not hasattr(args, "steady_state_concurrency_ratio"):
+        args.steady_state_concurrency_ratio = None
 
     if not hasattr(args, "top_logprobs_num"):
         args.top_logprobs_num = 0
@@ -2427,6 +2716,15 @@ def cli_main():
         "--plot-throughput",
         action="store_true",
         help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
+    )
+    parser.add_argument(
+        "--steady-state-concurrency-ratio",
+        type=float,
+        default=None,
+        help="Trim benchmark ramp-up and drain from output throughput. The steady "
+        "window begins at this fraction of observed peak request concurrency "
+        "and ends when concurrency finally falls below it. Disabled by default; "
+        "set to a value in (0, 1], for example 0.8, to enable it.",
     )
     # TODO unify all these
     parser.add_argument(
