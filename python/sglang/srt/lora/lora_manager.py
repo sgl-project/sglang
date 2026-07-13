@@ -163,6 +163,12 @@ class LoRAManager:
             and not self.enable_dp_attention
         )
 
+    @property
+    def prefill_cuda_graph_max_bs(self) -> Optional[int]:
+        """Request-count cap for LoRA batches replaying the prefill CUDA
+        graph; None until init_prefill_cuda_graph_batch_info() ran."""
+        return self.lora_backend.prefill_cuda_graph_max_bs
+
     def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         """Whether this batch can be served from the static prefill CUDA graph
         LoRA metadata.
@@ -182,9 +188,14 @@ class LoRAManager:
         # eager), desyncing collectives; keep LoRA prefill on the eager path.
         if self.enable_dp_attention:
             return False
+        # Restrict to extend modes that are NOT also decode-CUDA-graph modes
+        # (TARGET_VERIFY, DLLM_EXTEND): those are owned by the decode static
+        # batch info path in prepare_lora_batch, so letting them pass here
+        # would let a prefill graph replay read buffers that were never
+        # refreshed for the batch.
         if (
             not forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_cuda_graph()
         ):
             return False
         if forward_batch.extend_num_tokens is None:

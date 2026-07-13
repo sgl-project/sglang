@@ -287,6 +287,34 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Auto: scale request slots with the chunked prefill size.
                 max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
             self._capture_req_slots = min(max_req, self.max_bs)
+
+        # --- LoRA ------------------------------------------------------
+        # BCG/Full capture the transformer body with LoRA kernels recorded
+        # (they always launch under --enable-lora and no-op at rank 0), so
+        # the LoRA batch metadata they read must live in static buffers
+        # refreshed in place per batch. ModelRunner.init_prefill_cuda_graph
+        # routes unsupported LoRA configs (backend without support, MoE LoRA,
+        # DP attention) to the eager runner before this point.
+        self._capture_lora = model_runner.server_args.enable_lora and isinstance(
+            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+        )
+        if self._capture_lora:
+            model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
+                max_num_tokens=self.max_num_tokens
+            )
+            # The LoRA static metadata has a fixed segment-slot count; the
+            # capture batch (and hence any replayable batch) must fit in it,
+            # so clamp Full's request slots rather than fail capture.
+            lora_max_bs = model_runner.lora_manager.prefill_cuda_graph_max_bs
+            if self._capture_req_slots > lora_max_bs:
+                logger.info(
+                    "Clamping full prefill CUDA graph request slots from %d to %d "
+                    "to fit the LoRA backend's static segment slots.",
+                    self._capture_req_slots,
+                    lora_max_bs,
+                )
+                self._capture_req_slots = lora_max_bs
+
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
             if self._is_full_backend
@@ -353,21 +381,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             params = list(inspect.signature(self.layer_model.forward).parameters)
             self._input_embeds_arg_idx = (
                 params.index("input_embeds") if "input_embeds" in params else None
-            )
-
-        # --- LoRA ------------------------------------------------------
-        # BCG/Full capture the transformer body with LoRA kernels recorded
-        # (they always launch under --enable-lora and no-op at rank 0), so
-        # the LoRA batch metadata they read must live in static buffers
-        # refreshed in place per batch. ModelRunner.init_prefill_cuda_graph
-        # routes unsupported LoRA configs (backend without support, MoE LoRA)
-        # to the eager runner before this point.
-        self._capture_lora = model_runner.server_args.enable_lora and isinstance(
-            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
-        )
-        if self._capture_lora:
-            model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
-                max_num_tokens=self.max_num_tokens
             )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
@@ -626,11 +639,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
-        # A LoRA-enabled batch may only replay the graph when its metadata was
-        # prepared into the static prefill LoRA buffers (same predicate used
-        # by prepare_lora_batch); anything else falls back to eager prefill.
-        # This also covers runners captured without LoRA support (tc_piecewise).
-        if forward_batch.lora_ids is not None and not (
+        # Under --enable-lora, a batch may only replay the graph when its
+        # metadata was prepared into the static prefill LoRA buffers (same
+        # predicate used by prepare_lora_batch); anything else falls back to
+        # eager prefill. This also covers runners captured without LoRA
+        # support (tc_piecewise). Keyed off enable_lora, NOT lora_ids:
+        # init_new sets lora_ids to a list of Nones even without LoRA.
+        if self.model_runner.server_args.enable_lora and not (
             self._capture_lora
             and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
                 forward_batch
