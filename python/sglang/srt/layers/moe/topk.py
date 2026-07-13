@@ -181,10 +181,18 @@ if _is_cuda:
 if _is_cuda or _is_hip or _is_xpu:
     from sglang.kernels.ops.moe import topk_softmax
 
-    try:
-        from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
-    except ImportError:
-        pass
+    if _is_xpu:
+        # sgl-kernel-xpu ships an AOT topk_sigmoid; the CUDA JIT variant relies on
+        # tvm_ffi + nvcc which aren't available in the XPU CI/runtime image.
+        try:
+            from sgl_kernel import topk_sigmoid
+        except ImportError:
+            pass
+    else:
+        try:
+            from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
+        except ImportError:
+            pass
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
