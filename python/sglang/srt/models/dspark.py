@@ -368,23 +368,14 @@ class DSparkDraftMixin:
                 "DSpark draft requires markov_rank > 0, "
                 f"got markov_rank={dspark_config.markov_rank}."
             )
-        if dspark_config.speculators_convention:
-            raise ValueError(
-                "This checkpoint was trained with the speculators "
-                "(github.com/vllm-project/speculators) DSpark convention "
-                '(speculators_model_type="dspark" in its config), which '
-                "block-drafting in this file does not yet support: DeepSpec "
-                "trains block slot k to predict anchor+k+1 with every slot "
-                "trained, while speculators trains slot j to predict "
-                "anchor+j with slot 0 loss-masked, so every "
-                "run_markov_block slot is read one position early here, "
-                "degrading accept length to ~1 regardless of the "
-                "underlying model's real speculative quality. Loading this "
-                "checkpoint would silently produce near-zero speedup "
-                "rather than an error, so it is refused here instead. See "
-                "sgl-project/sglang#30261 (comment by jessiewei7, "
-                "2026-07-09) for the confirmed diagnosis and reproduction."
-            )
+        # speculators-trained checkpoints (dspark_config.speculators_convention)
+        # use a `gamma + 1`-wide draft block with the anchor as a separate
+        # bonus token, rather than DeepSpec's `gamma`-wide anchor-first block.
+        # That width difference is handled downstream in dspark_draft.py's
+        # DraftBlockProposer/DsparkDraftSampler (see `bonus_anchor` there),
+        # not in this model class -- run_markov_block itself is unaffected
+        # either way, since the caller always hands it exactly `gamma` real
+        # draft-hidden slots regardless of which convention produced them.
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)

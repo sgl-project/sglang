@@ -70,6 +70,7 @@ class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
     verify_num_draft_tokens: int
     mask_token_id: int
+    speculators_convention: bool
 
 
 def resolve_runtime_config(
@@ -122,6 +123,7 @@ def resolve_runtime_config(
         gamma=gamma,
         verify_num_draft_tokens=gamma + 1,
         mask_token_id=mask_token_id,
+        speculators_convention=draft_config.speculators_convention,
     )
 
 
@@ -183,6 +185,51 @@ def _get_dspark_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _get_speculators_config(config: Any) -> dict:
+    cfg = _cfg_get(config, "speculators_config", None)
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg
+    try:
+        return dict(cfg)
+    except Exception:
+        return {}
+
+
+def _resolve_speculators_proposal_gamma(config: Any) -> Optional[int]:
+    """speculators checkpoints carry their real draft length in
+    speculators_config.proposal_methods[i].speculative_tokens -- prefer this
+    over block_size (which counts the anchor+gamma block width, off by one
+    from gamma for speculators-trained checkpoints; see the comment on
+    speculators_convention below)."""
+    cfg = _get_speculators_config(config)
+    proposal_methods = cfg.get("proposal_methods") or []
+    if not isinstance(proposal_methods, (list, tuple)) or not proposal_methods:
+        return None
+
+    default_method = cfg.get("default_proposal_method")
+    selected = None
+    if default_method is not None:
+        for method in proposal_methods:
+            if _cfg_get(method, "proposal_type", None) == default_method:
+                selected = method
+                break
+    if selected is None:
+        selected = proposal_methods[0]
+
+    speculative_tokens = _cfg_get(selected, "speculative_tokens", None)
+    if speculative_tokens is None:
+        return None
+    gamma = int(speculative_tokens)
+    if gamma < 1:
+        raise ValueError(
+            "DSpark speculators_config speculative_tokens must be positive, "
+            f"got {gamma}."
+        )
+    return gamma
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
@@ -266,8 +313,49 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
             f"DSpark mask_token_id must be non-negative, got {mask_token_id}."
         )
 
+    # speculators (github.com/vllm-project/speculators)-trained DSpark
+    # checkpoints use a different block-slot convention than the
+    # DeepSpec-trained ones this file was originally written against:
+    # DeepSpec trains block slot k to predict anchor+k+1, with the anchor
+    # itself (slot 0) also a real, trained prediction -- the draft block is
+    # exactly `gamma` slots wide, anchor-first. speculators instead trains
+    # the anchor as a separate, untrained conditioning token and slot j
+    # (j=1..gamma) to predict anchor+j -- the draft block is `gamma + 1`
+    # slots wide, with slot 0 (the anchor) excluded from both the sampled
+    # draft tokens and block-accept verification. Feeding a speculators
+    # checkpoint through the DeepSpec-width path reads every real slot one
+    # position early, degrading accept length to ~1 regardless of the
+    # underlying model's real speculative quality.
+    #
+    # This mirrors vLLM's validated `dspark_bonus_anchor` fix
+    # (vllm-project/vllm#47093 -- vllm/transformers_utils/configs/
+    # speculators/algos.py + vllm/v1/worker/gpu/spec_decode/dspark/
+    # speculator.py's `sample_from_anchor` flag) rather than unconditionally
+    # widening every DSpark block: DeepSpec-trained checkpoints
+    # (speculators_convention=False) keep exactly the behavior they had
+    # before this field existed. Diagnosed by jessiewei7 on
+    # sgl-project/sglang#30261 (2026-07-09); the width fix itself lives in
+    # dspark_draft.py's DraftBlockProposer and DsparkDraftSampler (see
+    # `bonus_anchor` there) -- this function only resolves the config-level
+    # facts (the flag, and the correct gamma to use for such checkpoints).
+    speculators_model_type = _cfg_get(draft_hf_config, "speculators_model_type", None)
+    speculators_convention = (
+        isinstance(speculators_model_type, str)
+        and speculators_model_type.lower() == "dspark"
+    )
+
+    # speculators checkpoints ship their authoritative draft length as
+    # speculators_config.proposal_methods[i].speculative_tokens, not as
+    # block_size (which means the full anchor+gamma block width there, off
+    # by one from gamma for exactly the reason above). Prefer this over
+    # base.block_size when present -- it's the checkpoint's own stated
+    # value for "how many real draft tokens", not something inferred by
+    # subtracting one from block_size and hoping the convention holds.
+    speculators_gamma = _resolve_speculators_proposal_gamma(draft_hf_config)
     gamma = (
-        int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
+        int(prefixed_block_size)
+        if prefixed_block_size is not None
+        else speculators_gamma if speculators_gamma is not None else base.block_size
     )
 
     if prefixed_target_layer_ids is not None:
@@ -283,24 +371,6 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         ]
     else:
         target_layer_ids = base.target_layer_ids
-
-    # speculators (github.com/vllm-project/speculators)-trained DSpark
-    # checkpoints use a different block-slot convention than the
-    # DeepSpec-trained ones this file was written against: DeepSpec trains
-    # block slot k to predict anchor+k+1 (every slot trained), while
-    # speculators trains slot j to predict anchor+j with slot 0 loss-masked
-    # (its first slot is never trained to predict anything useful). Every
-    # `run_markov_block` slot is therefore read one position early for a
-    # speculators checkpoint, degrading accept length to ~1 regardless of
-    # the underlying model's real speculative quality. Detected here, not
-    # silently corrected, until the shift is implemented and validated
-    # end-to-end (it isn't yet) -- see sgl-project/sglang#30261 (comment by
-    # jessiewei7, 2026-07-09) for the confirmed diagnosis and reproduction.
-    speculators_model_type = _cfg_get(draft_hf_config, "speculators_model_type", None)
-    speculators_convention = (
-        isinstance(speculators_model_type, str)
-        and speculators_model_type.lower() == "dspark"
-    )
 
     return DSparkDraftConfig(
         num_hidden_layers=base.num_hidden_layers,
