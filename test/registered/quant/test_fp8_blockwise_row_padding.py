@@ -11,7 +11,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,

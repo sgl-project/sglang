@@ -727,14 +727,14 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: List[int],
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        extend_seq_lens_cpu = [num_tokens_per_bs] * batch_size
+        extend_seq_lens_cpu = [num_tokens_per_req] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
-        num_tokens = num_tokens_per_bs * batch_size
+        num_tokens = num_tokens_per_req * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -889,13 +889,13 @@ class DeepseekV4HipRadixBackend(
                 seq_lens_cpu=seq_lens_cpu.tolist(),
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
-            num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
+            num_tokens_per_req = self.draft_extend_num_tokens_per_req
             if out_cache_loc is not None:
                 # Pad the real write locations to the captured token count so
                 # raw_out_loc reflects the actual replay out_cache_loc.
                 out_cache_loc = torch.nn.functional.pad(
                     out_cache_loc,
-                    pad=(0, num_tokens_per_bs * bs - len(out_cache_loc)),
+                    pad=(0, num_tokens_per_req * bs - len(out_cache_loc)),
                     mode="constant",
                     value=0,
                 )
@@ -904,7 +904,7 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
-                num_tokens_per_bs=num_tokens_per_bs,
+                num_tokens_per_req=num_tokens_per_req,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=True,
             )
@@ -1012,7 +1012,7 @@ class DeepseekV4HipRadixBackend(
                 ],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
-        self.draft_extend_num_tokens_per_bs = (
+        self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
 

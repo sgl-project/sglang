@@ -22,11 +22,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
-from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
 
 
 @triton.jit
