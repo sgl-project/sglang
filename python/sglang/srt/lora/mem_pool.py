@@ -441,6 +441,46 @@ class LoRAMemoryPool:
         q_per_rank = divide(q_dim_total, effective_tp_size)
         return q_per_rank + 2 * head_dim
 
+    def _column_parallel_out_partition(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> Optional[int]:
+        """actual per-rank output dim of a non-MoE column-parallel base module.
+
+        """
+        cache = getattr(self, "_col_parallel_out_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_col_parallel_out_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            ops = getattr(m, "output_size_per_partition", None)
+            if ops is not None and ops > 0:
+                return ops
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        cache[key] = found
+        return found
+
     def get_lora_B_shape(
         self,
         module_name: str,
@@ -463,10 +503,27 @@ class LoRAMemoryPool:
             self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
         )
         if (
+            module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+            and not self.is_moe_module(module_name)
+        ):
+            # prefer base module's actual per-rank output dim over based on global tp_size
+            # column-parallel bases may be fully replicated (dense/shared gate_up if --moe-dense-tp-size 1)
+            probed_out = self._column_parallel_out_partition(
+                module_name, base_model, layer_idx
+            )
+            if probed_out is not None:
+                output_dim = probed_out
+            elif effective_tp_size > 1:
+                output_dim = self._column_parallel_lora_b_per_rank_dim(
+                    module_name, output_dim, effective_tp_size
+                )
+        elif (
             effective_tp_size > 1
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
+            # MoE modules keep the moe_tp_size sharding path.
             output_dim = self._column_parallel_lora_b_per_rank_dim(
                 module_name, output_dim, effective_tp_size
             )
