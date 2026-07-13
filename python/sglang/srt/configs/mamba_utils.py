@@ -75,6 +75,8 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         # For VL models, dtype is in text_config
         text_config = getattr(config, "text_config", config)
         config_conv_dtype = getattr(text_config, "dtype", None)
+        if config_conv_dtype is None:
+            config_conv_dtype = getattr(text_config, "torch_dtype", None)
         if isinstance(config_conv_dtype, str):
             config_conv_dtype = dtype_map.get(config_conv_dtype)
         if isinstance(config_conv_dtype, torch.dtype):
