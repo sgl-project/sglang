@@ -194,10 +194,12 @@ class BaseReasoningFormatDetector:
                 # so it isn't emitted as reasoning content (it would otherwise
                 # leak the tag and mis-classify the following normal text).
                 hold = _trailing_partial_token_len(current_text, tokens_to_check)
-                emit = (
-                    current_text[: len(current_text) - hold] if hold else current_text
+                # Guard hold != 0: `[:-0]` is empty, not the whole string.
+                emit, self._buffer = (
+                    (current_text[:-hold], current_text[-hold:])
+                    if hold
+                    else (current_text, "")
                 )
-                self._buffer = current_text[len(current_text) - hold :] if hold else ""
                 if not emit:
                     return StreamingParseResult()
                 return StreamingParseResult(reasoning_text=emit)
@@ -210,8 +212,12 @@ class BaseReasoningFormatDetector:
             # opening that split across this chunk boundary is still detected on
             # the next increment instead of leaking into normal text.
             hold = _trailing_partial_token_len(current_text, tokens_to_check)
-            emit = current_text[: len(current_text) - hold] if hold else current_text
-            self._buffer = current_text[len(current_text) - hold :] if hold else ""
+            # Guard hold != 0: `[:-0]` is empty, not the whole string.
+            emit, self._buffer = (
+                (current_text[:-hold], current_text[-hold:])
+                if hold
+                else (current_text, "")
+            )
             if not emit:
                 return StreamingParseResult()
             return StreamingParseResult(normal_text=emit)
