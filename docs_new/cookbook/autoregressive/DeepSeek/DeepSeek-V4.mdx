@@ -103,6 +103,61 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
   </ul>
 </div>
 
+## Deployment with Prefill/Decode Disaggregated Serving
+
+Use [SRT Slurm](https://github.com/NVIDIA/srt-slurm) to deploy separate SGLang prefill and decode workers on a Slurm cluster. Select a workload and serving strategy below, validate the official recipe with a dry run, and then submit the job. Each recipe describes the complete serving topology and the benchmark workload that runs against it.
+
+<Info>
+  The current recipe matrix covers **DeepSeek-V4-Pro on GB300** with 1K/1K and 8K/1K input/output workloads. DeepSeek-V4-Flash and other hardware platforms are not included yet.
+</Info>
+
+<Accordion title="Install and configure SRT Slurm">
+
+Before you begin, make sure your GB300 Slurm cluster has Enroot/Pyxis configured, Python 3.10 or newer is available, and the compute nodes can access the model weights and container images.
+
+Clone the tool and recipe repositories as sibling directories, then install SRT Slurm in a virtual environment:
+
+```bash Command
+git clone https://github.com/NVIDIA/srt-slurm.git
+git clone https://github.com/NVIDIA/srt-slurm-recipes.git
+
+cd srt-slurm
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip uv
+uv pip install -e .
+```
+
+Run the one-time setup for the GB300 Grace architecture:
+
+```bash Command
+make setup ARCH=aarch64
+```
+
+The setup downloads the NATS and ETCD binaries and creates `srtslurm.yaml`. Update that file with your Slurm account, partition, time limit, and other cluster-specific settings. See the [SRT Slurm installation guide](https://github.com/NVIDIA/srt-slurm/blob/main/docs/installation.md) for the complete configuration reference.
+
+</Accordion>
+
+Pick a workload and strategy to generate an `srtctl` command. Run the **Dry Run** form first to validate the recipe without submitting a job, then switch to **Submit** when the configuration is ready.
+
+import { SrtSlurmDeployment } from "/src/snippets/_srt_slurm_deployment.jsx";
+import { srtSlurmConfig } from "/src/snippets/configs/deepseek-ai/deepseek-v4-srt-slurm.jsx";
+
+<SrtSlurmDeployment config={srtSlurmConfig} />
+
+<Note>
+  The picker highlights three common operating points. Browse the complete official recipe directories for [1K/1K](https://github.com/NVIDIA/srt-slurm-recipes/tree/main/recipes/multi-node/DeepSeek-V4-Pro/GB300/1k1k/sglang/disagg) and [8K/1K](https://github.com/NVIDIA/srt-slurm-recipes/tree/main/recipes/multi-node/DeepSeek-V4-Pro/GB300/8k1k/sglang/disagg) to explore additional scaling configurations.
+</Note>
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong>:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Dry Run / Submit</strong> — switches between validating the selected YAML and submitting it to Slurm.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the generated <code>srtctl</code> command.</li>
+    <li><strong>View YAML ↗</strong> — opens the selected recipe in the NVIDIA SRT Slurm recipes repository.</li>
+  </ul>
+</div>
+
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
