@@ -18,6 +18,13 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
+# Ratio of auxiliary-state slots to concurrently running requests on hybrid /
+# linear-attention models. Each running request holds one live slot
+# (MlxAuxiliaryStateReqToTokenPool.alloc), and the headroom covers radix-held
+# snapshots. Used for BOTH the default pool sizing and the concurrency bound
+# in _resolve_max_running_requests so the two cannot drift apart.
+MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 4
+
 
 class _DummyKVCache(KVCache):
     """Scheduler-facing KV cache that allocates no GPU memory.
@@ -127,19 +134,42 @@ class MlxModelRunnerStub(ModelRunner):
         value is split per dp worker and capped by the KV pool capacity. When
         the flag is unset, fall back to a capacity-based default.
 
+        On hybrid / linear-attention models the concurrency is additionally
+        bounded by the auxiliary-state pool: each running request allocates one
+        slot out of ``max_mamba_cache_size`` (asserting when exhausted), so a
+        cap the pool cannot back would crash mid-serving instead of failing
+        at startup. Mirrors the base resolver's mamba bound and zero-reject.
+
         Requires ``self.max_total_num_tokens`` to already be set.
         """
         capacity_cap = self.max_total_num_tokens // 2
         requested = self.server_args.max_running_requests
         if requested is None:
-            return min(capacity_cap, 4096)
+            requested_per_worker = None
+            resolved = min(capacity_cap, 4096)
+        else:
+            requested_per_worker = requested // self.dp_size
+            resolved = min(requested_per_worker, capacity_cap)
 
-        requested_per_worker = requested // self.dp_size
-        resolved = min(requested_per_worker, capacity_cap)
-        if resolved < requested_per_worker:
+        aux_state_size = self.server_args.max_mamba_cache_size
+        if self.mambaish_config is not None and aux_state_size is not None:
+            ratio = MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+            resolved = min(resolved, aux_state_size // ratio)
+            if resolved <= 0:
+                raise RuntimeError(
+                    f"MLX auxiliary-state cache is too small to serve any "
+                    f"requests: max_mamba_cache_size={aux_state_size} backs "
+                    f"only {aux_state_size // ratio} concurrent requests "
+                    f"({ratio} slots per request). Increase "
+                    f"--max-mamba-cache-size to at least {ratio}, or leave it "
+                    f"unset to size the pool from the concurrency cap."
+                )
+
+        if requested_per_worker is not None and resolved < requested_per_worker:
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache capacity.",
+                "(per dp worker) due to the available KV cache or "
+                "auxiliary-state capacity.",
                 requested_per_worker,
                 resolved,
             )
@@ -186,7 +216,10 @@ class MlxModelRunnerStub(ModelRunner):
         if self.mambaish_config is not None:
             auxiliary_state_size = self.server_args.max_mamba_cache_size
             if auxiliary_state_size is None:
-                auxiliary_state_size = self.max_running_requests * 4
+                auxiliary_state_size = (
+                    self.max_running_requests
+                    * MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+                )
             self.req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
                 size=self.max_running_requests,
                 max_context_len=self.model_config.context_len,
