@@ -1116,6 +1116,16 @@ class ServerArgs:
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
     reasoning_parser: Optional[str] = None
+    default_chat_template_kwargs: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Default chat template kwargs applied to every request when not "
+            "overridden per-request. Keys must match what the model's chat template "
+            "expects (e.g. enable_thinking, thinking, reasoning_effort). Per-request "
+            "chat_template_kwargs takes precedence.",
+            type_parser=json.loads,
+        ),
+    ] = None
     strip_thinking_cache: A[
         bool,
         "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",
@@ -2840,6 +2850,13 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
+
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
