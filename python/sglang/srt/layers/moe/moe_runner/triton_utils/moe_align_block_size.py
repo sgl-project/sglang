@@ -82,13 +82,13 @@ def moe_align_block_size(
     # RDNA (gfx11xx/gfx12xx) always uses the JIT kernel: it hardcodes WARP_SIZE=32
     # for both host and device compile passes, avoiding the host/device WARP_SIZE
     # split that the sgl-kernel C++ moe_align_kernel.cu has on RDNA fat builds.
-    use_jit_align = _is_rdna
+    use_jit_align = False
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
-        use_jit_align = (
-            use_jit_align or lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
-        )
+        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+    if _is_rdna:
+        use_jit_align = True
     if use_jit_align:
         from sglang.jit_kernel.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
