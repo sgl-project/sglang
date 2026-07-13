@@ -134,9 +134,9 @@ def test_infer_extract_function_no_return_text_when_body_is_whole_helper(
     assert ex["call"] == "        self._emit()\n"
 
 
-def test_infer_extract_function_rejects_edited_body(repo: Path) -> None:
-    """A helper whose body was edited (not a verbatim cut) does not infer an extract_function,
-    so the residual surfaces the bundled change instead of a false pass."""
+def test_infer_extract_function_edited_body_does_not_pass(repo: Path) -> None:
+    """A helper whose body was edited (not a verbatim cut) never yields a false pass: the
+    reproduction's byte-diff surfaces the bundled change as a non-empty residual."""
     _write(
         repo,
         **{
@@ -165,10 +165,62 @@ def test_infer_extract_function_rejects_edited_body(repo: Path) -> None:
             )
         },
     )
-    _commit(repo, "extract _emit but change the arg")
-    recipe = infer_recipe("HEAD", str(repo))
-    assert recipe.extract_functions == []
-    assert recipe.supported is False
+    commit = _commit(repo, "extract _emit but change the arg")
+    recipe = infer_recipe(commit, str(repo))
+    residual = build_repro(recipe, repo_root=str(repo)).run()
+    assert residual != ""
+
+
+def test_infer_extract_function_when_block_and_call_share_closing_paren(
+    repo: Path,
+) -> None:
+    """The removed block and its replacement call both end in a lone ``)``; the prefix/suffix
+    split must not absorb that shared line, or the extracted body loses its final line.
+    """
+    _write(
+        repo,
+        **{
+            "kv.py": (
+                "class C:\n"
+                "    def dispatch(self, n):\n"
+                "        if self.flag:\n"
+                "            pool = make_pool(\n"
+                "                a=n,\n"
+                "                b=self.b,\n"
+                "            )\n"
+                "        return pool\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "kv.py": (
+                "class C:\n"
+                "    def dispatch(self, n):\n"
+                "        if self.flag:\n"
+                "            pool = self._build_pool(\n"
+                "                n=n,\n"
+                "            )\n"
+                "        return pool\n"
+                "\n"
+                "    def _build_pool(self, *, n):\n"
+                "        pool = make_pool(\n"
+                "            a=n,\n"
+                "            b=self.b,\n"
+                "        )\n"
+                "        return pool\n"
+            )
+        },
+    )
+    commit = _commit(repo, "extract _build_pool")
+    recipe = infer_recipe(commit, str(repo))
+    assert len(recipe.extract_functions) == 1
+    ex = recipe.extract_functions[0]
+    assert ex["body"].rstrip().endswith(")")
+    assert ex["return_text"] == "        return pool"
+    assert build_repro(recipe, repo_root=str(repo)).run() == ""
 
 
 def test_emitted_script_passes_on_extract_function(repo: Path, tmp_path: Path) -> None:

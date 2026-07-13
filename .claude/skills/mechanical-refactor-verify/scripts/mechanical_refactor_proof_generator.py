@@ -608,9 +608,28 @@ def _iter_defs_with_container(
     return out
 
 
+def _statements_parse(lines: list[str]) -> bool:
+    """Whether ``lines`` (dedented to their own minimum indent) parse as complete Python
+    statements -- used to keep a prefix/suffix split from cutting through the middle of a
+    multi-line statement."""
+    text = "".join(lines)
+    if not text.strip():
+        return True
+    indents = [len(ln) - len(ln.lstrip(" ")) for ln in lines if ln.strip()]
+    dedented = rr.dedent(text, min(indents)) if indents else text
+    try:
+        ast.parse(dedented)
+        return True
+    except SyntaxError:
+        return False
+
+
 def _common_prefix_suffix(a: list[str], b: list[str]) -> tuple[int, int]:
     """Longest common leading and trailing run of identical lines between two line lists,
-    kept non-overlapping -- isolates the single contiguous region where they differ."""
+    kept non-overlapping -- isolates the single contiguous region where they differ. The
+    greedy match is then shrunk (suffix first, then prefix) until the differing middle of
+    *both* lists parses as complete statements, so a boundary line the removed block and its
+    replacement happen to share (e.g. a lone ``)``) is not absorbed mid-statement."""
     prefix = 0
     while prefix < len(a) and prefix < len(b) and a[prefix] == b[prefix]:
         prefix += 1
@@ -621,22 +640,17 @@ def _common_prefix_suffix(a: list[str], b: list[str]) -> tuple[int, int]:
         and a[-1 - suffix] == b[-1 - suffix]
     ):
         suffix += 1
+    while suffix > 0 and not (
+        _statements_parse(a[prefix : len(a) - suffix])
+        and _statements_parse(b[prefix : len(b) - suffix])
+    ):
+        suffix -= 1
+    while prefix > 0 and not (
+        _statements_parse(a[prefix : len(a) - suffix])
+        and _statements_parse(b[prefix : len(b) - suffix])
+    ):
+        prefix -= 1
     return prefix, suffix
-
-
-def _uniform_reindent(text: str, shift: int) -> str:
-    """Shift every non-blank line's indent by ``shift`` spaces (dedent when negative), on
-    newline-preserving lines. A faithful mirror of the primitive's reindent for blocks without
-    multi-line string interiors; a mismatch just yields no split (never a false positive).
-    """
-    if shift == 0:
-        return text
-    lines = rr._split_keepends(text)
-    if shift < 0:
-        pad = " " * -shift
-        return "".join(ln[-shift:] if ln[:-shift] == pad else ln for ln in lines)
-    pad = " " * shift
-    return "".join(pad + ln if ln.strip() else ln for ln in lines)
 
 
 def _call_names_in(node: ast.AST) -> set[str]:
@@ -679,11 +693,8 @@ def _infer_extract_functions(
                 continue
             if not helper.body:
                 continue
-            sig_indent = helper.col_offset
             body_first = helper.body[0].lineno
             header_text = "".join(after_lines[helper.lineno - 1 : body_first - 1])
-            hbody_lines = after_lines[body_first - 1 : helper.end_lineno]
-            hbody_text = "".join(hbody_lines)
             # F is the one sibling function that changed and now calls the helper.
             candidates = []
             for cont, node in before_defs:
@@ -714,16 +725,24 @@ def _infer_extract_functions(
                 continue
             body_indent = len(block[0]) - len(block[0].lstrip(" "))
             body_text = "".join(block)
-            expected = _uniform_reindent(body_text, sig_indent + 4 - body_indent)
+            # Detect the authored `return <name>` structurally, by statement count -- the
+            # formatter reflows lines differently at the helper's shallower indent, so a
+            # byte comparison of the reindented body would spuriously fail; the repro's
+            # byte-diff (which runs the formatter) is the real arbiter.
+            try:
+                block_stmts = ast.parse(rr.dedent(body_text, body_indent)).body
+            except SyntaxError:
+                continue
+            helper_stmts = helper.body
             return_text: str | None = None
-            if hbody_text == expected:
-                return_text = None
-            elif hbody_text.startswith(expected):
-                tail = hbody_text[len(expected) :]
-                return_text = tail.strip("\n") or None
-                if return_text is None:
-                    continue
-            else:
+            if len(helper_stmts) == len(block_stmts) + 1 and isinstance(
+                helper_stmts[-1], ast.Return
+            ):
+                ret = helper_stmts[-1]
+                return_text = "".join(
+                    after_lines[ret.lineno - 1 : ret.end_lineno]
+                ).strip("\n")
+            elif len(helper_stmts) != len(block_stmts):
                 continue
             recipe.extract_functions.append(
                 {
