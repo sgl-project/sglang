@@ -287,11 +287,14 @@ class RMSNorm(MultiPlatformOp):
                 or get_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
-            return rms_norm_batch_invariant(
+            out = rms_norm_batch_invariant(
                 x,
                 self.weight.data,
                 self.variance_epsilon,
             )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         if self.cast_x_before_out_mul and residual is None:
             # Use HF-semantics kernel (cast to dtype before weight multiply).
             if (

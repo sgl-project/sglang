@@ -62,7 +62,6 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
 
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
-
     input_ids: torch.Tensor
     input_embeds: torch.Tensor
     req_pool_indices: torch.Tensor
@@ -328,6 +327,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
 class PrefillInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
+    num_token_non_padded: torch.Tensor
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     mamba_track_seqlens: Optional[torch.Tensor]
@@ -351,6 +351,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_tokens,), dtype=cache_loc_dtype)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -376,6 +377,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         return cls(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
+            num_token_non_padded=num_token_non_padded,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
