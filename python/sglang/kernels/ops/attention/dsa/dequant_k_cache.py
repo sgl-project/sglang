@@ -590,3 +590,67 @@ def _gather_dequant_requant_fp8_paged_kernel(
 
 if __name__ == "__main__":
     raise Exception("UT is in quant_k_cache.py")
+
+
+@triton.jit
+def _concat_cast_kv_fp8_pad_kernel(
+    out_ptr,
+    k_ptr,
+    kr_ptr,
+    num_tokens,
+    k_stride,
+    kr_stride,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+):
+    """Row program: real rows write cast(k)||cast(k_rope); pad-band rows
+    write zeros (the -1-sentinel landing pad the kernel's clamp maps to)."""
+    row = tl.program_id(0).to(tl.int64)
+    offs_n = tl.arange(0, NOPE)
+    offs_r = tl.arange(0, ROPE)
+    head = NOPE + ROPE
+    if row < num_tokens:
+        v_n = tl.load(k_ptr + row * k_stride + offs_n)
+        tl.store(out_ptr + row * head + offs_n, v_n.to(tl.float8e4nv))
+        v_r = tl.load(kr_ptr + row * kr_stride + offs_r)
+        tl.store(out_ptr + row * head + NOPE + offs_r, v_r.to(tl.float8e4nv))
+    else:
+        zero_n = tl.zeros([NOPE], dtype=tl.float32).to(tl.float8e4nv)
+        zero_r = tl.zeros([ROPE], dtype=tl.float32).to(tl.float8e4nv)
+        tl.store(out_ptr + row * head + offs_n, zero_n)
+        tl.store(out_ptr + row * head + NOPE + offs_r, zero_r)
+
+
+def concat_cast_kv_fp8_pad(
+    out: torch.Tensor,
+    k: torch.Tensor,
+    k_rope: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Fused non-prefix Q8KV8 KV prep: cast-concat k (nope latent) and k_rope
+    directly into the persistent fp8 kv_buf and zero the trailing pad band —
+    replaces the bf16 `_cat` materialization + `.copy_` cast + `.zero_()`
+    tail (3 kernels + one [tokens, 576] bf16 alloc).  Same bf16->fp8
+    store-cast the gather kernel uses (bit-identical bytes).
+
+    ``out``: [total_rows, 576] fp8 slice (total_rows = num_tokens + pad band);
+    ``k``: [num_tokens, NOPE] bf16 view; ``k_rope``: [num_tokens, ROPE] bf16.
+    """
+    total_rows, head = out.shape
+    nope = k.shape[-1]
+    rope = k_rope.shape[-1]
+    assert head == nope + rope and out.dtype == torch.float8_e4m3fn
+    k2 = k.view(num_tokens, nope)
+    kr2 = k_rope.view(num_tokens, rope)
+    assert k2.stride(-1) == 1 and kr2.stride(-1) == 1
+    _concat_cast_kv_fp8_pad_kernel[(total_rows,)](
+        out,
+        k2,
+        kr2,
+        num_tokens,
+        k2.stride(0),
+        kr2.stride(0),
+        NOPE=nope,
+        ROPE=rope,
+    )
+    return out
