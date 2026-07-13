@@ -702,57 +702,6 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
-        if nonpaged_plan is not None:
-            assert isinstance(q_indexer, torch.Tensor)
-            logits = self._forward_nonpaged_indexer(
-                q_indexer=q_indexer,
-                weights=weights,
-                c4_indexer=c4_indexer,
-                token_to_kv_pool=token_to_kv_pool,
-                plan=nonpaged_plan,
-            )
-        else:
-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=c4_indexer.layer_id,
-            )
-            assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
-            _meta = indexer_metadata.deep_gemm_metadata
-            if isinstance(_meta, list):
-                # SM120: the DeepGEMM indexer-metadata kernel caps at
-                # _SM120_INDEXER_M_CHUNK rows; run the paged indexer per chunk.
-                _m_total = _c4sl.shape[0]
-                _parts = []
-                for _i, _s in enumerate(range(0, _m_total, _SM120_INDEXER_M_CHUNK)):
-                    _e = min(_s + _SM120_INDEXER_M_CHUNK, _m_total)
-                    _parts.append(
-                        fn(
-                            q[_s:_e],
-                            c4_indexer_kv_cache,
-                            weights[_s:_e],
-                            _c4sl[_s:_e],
-                            page_table[_s:_e],
-                            _meta[_i],
-                            indexer_metadata.max_c4_seq_len,
-                            False,
-                        )
-                    )
-                logits = torch.cat(_parts, dim=0)
-            else:
-                logits = fn(
-                    q,
-                    c4_indexer_kv_cache,
-                    weights,
-                    _c4sl,
-                    page_table,
-                    _meta,
-                    indexer_metadata.max_c4_seq_len,
-                    False,
-                )
-
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             return
@@ -775,19 +724,8 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        def _run_indexer_and_topk(sl, meta_c):
-            q_sl = (q[0][sl], q[1][sl]) if isinstance(q, tuple) else q[sl]
+        def _topk_transform(sl, logits):
             ri_sl = raw_indices[sl] if raw_indices is not None else None
-            logits = fn(
-                q_sl,
-                c4_indexer_kv_cache,
-                weights[sl],
-                _c4sl[sl],
-                page_table[sl],
-                meta_c,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
             if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
                 topk_transform_512_pytorch_vectorized(
                     logits,
@@ -816,14 +754,50 @@ class C4IndexerBackendMixin:
                     ri_sl,
                 )
 
-        _meta = indexer_metadata.deep_gemm_metadata
-        if isinstance(_meta, list):
-            m_total = _c4sl.shape[0]
-            for _i, _s in enumerate(range(0, m_total, _SM120_INDEXER_M_CHUNK)):
-                _e = min(_s + _SM120_INDEXER_M_CHUNK, m_total)
-                _run_indexer_and_topk(slice(_s, _e), _meta[_i])
+        if nonpaged_plan is not None:
+            assert isinstance(q_indexer, torch.Tensor)
+            logits = self._forward_nonpaged_indexer(
+                q_indexer=q_indexer,
+                weights=weights,
+                c4_indexer=c4_indexer,
+                token_to_kv_pool=token_to_kv_pool,
+                plan=nonpaged_plan,
+            )
+            _topk_transform(slice(0, _c4sl.shape[0]), logits)
         else:
-            _run_indexer_and_topk(slice(0, _c4sl.shape[0]), _meta)
+            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=c4_indexer.layer_id,
+            )
+            assert c4_indexer_kv_cache.dim() == 2
+            head_dim_with_sf = 68 if use_fp4_indexer else 132
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+            )
+
+            def _run_paged(sl, meta_c):
+                q_sl = (q[0][sl], q[1][sl]) if isinstance(q, tuple) else q[sl]
+                logits = fn(
+                    q_sl,
+                    c4_indexer_kv_cache,
+                    weights[sl],
+                    _c4sl[sl],
+                    page_table[sl],
+                    meta_c,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+                _topk_transform(sl, logits)
+
+            _meta = indexer_metadata.deep_gemm_metadata
+            if isinstance(_meta, list):
+                # SM120: the DeepGEMM indexer-metadata kernel caps at
+                # _SM120_INDEXER_M_CHUNK rows; run indexer + topk per chunk.
+                m_total = _c4sl.shape[0]
+                for _i, _s in enumerate(range(0, m_total, _SM120_INDEXER_M_CHUNK)):
+                    _e = min(_s + _SM120_INDEXER_M_CHUNK, m_total)
+                    _run_paged(slice(_s, _e), _meta[_i])
+            else:
+                _run_paged(slice(0, _c4sl.shape[0]), _meta)
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
