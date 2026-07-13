@@ -1257,7 +1257,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 per_token_group_quant_fp8,
             )
 
