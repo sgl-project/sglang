@@ -431,8 +431,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_hidden_states_before_norm: bool = False
 
     # Gate for reusing the first MTP draft step's indexer topk across steps;
-    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
-    reuse_mtp_topk_indices: Optional[bool] = False
+    # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
+    reuse_dsa_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
