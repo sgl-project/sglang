@@ -304,33 +304,31 @@ class KVCacheConfigurator:
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
-            max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
             if self.server_args.disaggregation_mode == "decode":
-                from sglang.srt.disaggregation.decode import (
-                    DecodeReqToTokenPool,
-                    HybridMambaDecodeReqToTokenPool,
-                )
-
                 # Extra slots for pre-allocated requests
                 pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
-                if config := self.mambaish_config:
+                if self.mambaish_config:
+                    from sglang.srt.disaggregation.decode import (
+                        HybridMambaDecodeReqToTokenPool,
+                    )
+
                     req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
+                        cache_params=self.mambaish_config.mamba2_cache_params,
                         mamba_layer_ids=(
                             [
                                 i
-                                for i in config.mamba2_cache_params.layers
+                                for i in self.mambaish_config.mamba2_cache_params.layers
                                 if self.start_layer <= i < self.end_layer
                             ]
                         ),
-                        speculative_num_draft_tokens=max_spec_draft_tokens,
+                        speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
@@ -339,6 +337,8 @@ class KVCacheConfigurator:
                         start_layer=self.start_layer,
                     )
                 else:
+                    from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
                     req_to_token_pool = DecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
@@ -347,7 +347,7 @@ class KVCacheConfigurator:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
-            elif config := self.mambaish_config:
+            elif self.mambaish_config:
                 req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -356,17 +356,17 @@ class KVCacheConfigurator:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
+                    cache_params=self.mambaish_config.mamba2_cache_params,
                     mamba_layer_ids=(
                         [
                             i
-                            for i in config.mamba2_cache_params.layers
+                            for i in self.mambaish_config.mamba2_cache_params.layers
                             if self.start_layer <= i < self.end_layer
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-                    speculative_num_draft_tokens=max_spec_draft_tokens,
+                    speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
