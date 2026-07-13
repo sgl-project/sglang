@@ -334,12 +334,15 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
   ships with no proof — because the generator reported `UNSUPPORTED` or a primitive could
   not express the exact insertion point, so the author reached for the softer label instead
   of a proof.
-- Real example from this repo's history: `kvc-move-mamba-ratio-constants` relocated
-  module-level constants unchanged into `kv_cache_configurator.py` but was labelled
-  `non_mechanical_provable`, because the constants had to land *above* an
-  `if TYPE_CHECKING:` guard and `move_symbol`/`move_assign` only anchored with `before=`,
-  which overshot past the guard. The relocation was fully mechanical; only the tool's
-  insertion-anchor was missing.
+- Real example from this repo's history: `kvc-move-lazy-compaction-gate` relocated the
+  module-level `_should_enable_lazy_compaction` unchanged into `kv_cache_configurator.py` but
+  was labelled `non_mechanical_provable`, because it had to land *above* an
+  `if TYPE_CHECKING:` guard and `move_symbol` only anchored with `before=`, which overshot
+  past the guard. The relocation was fully mechanical; only the tool's insertion-anchor was
+  missing — so the fix was to add a `move_symbol(after=)` anchor and prove it, not to keep
+  the softer label. (A sibling commit that moves a *contiguous block* of constants plus their
+  leading comment needs a block-move primitive the toolkit does not yet have — that one is
+  still awaiting an enhancement, which is the correct disposition, not a relabel.)
 - The rule, in order:
     1. A pure relocation **must** be `mechanical_provable` and carry a proof. The label is
        a claim about the change, not about how easy the tooling made it.
