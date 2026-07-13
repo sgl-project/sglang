@@ -5,8 +5,11 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
+
+_IS_GFX1250 = is_gfx1250_supported()
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -105,9 +108,11 @@ def try_fused_hc_post_pre(
     if (
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
         or not envs.SGLANG_OPT_USE_TRITON_FUSED_MHC.get()
-        or not is_gfx95_supported
+        or not (is_gfx95_supported or _IS_GFX1250)
         or x.shape[0] == 0
-        or x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
+        # gfx1250 runs the fused cross-layer path for ALL sizes (prefill+decode);
+        # there is no TileLang fallback available, so don't cap by M there.
+        or (x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD and not _IS_GFX1250)
         or x.dim() != 2
         or residual.dim() != 3
     ):
