@@ -14,14 +14,14 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-20ms) |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6K+1.5K | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in6k-out1k5-bs16) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-20ms) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6k+1.5k | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-50ms) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -39,7 +39,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 20ms
 
@@ -152,7 +152,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -268,7 +268,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 6K+1.5K
+**Dataset**: 6k+1.5k
 
 **TPOT**: 15.62ms
 

@@ -11,7 +11,7 @@ active parameters. It uses 256 routed experts (top-8) plus one shared expert, wi
 and DeepSeek Sparse Attention (DSA), and a built-in multi-token prediction (MTP) head for speculative decoding.
 The model features built-in bilingual (Chinese-English) capabilities with a unified pre-training framework, excelling at
 reasoning, math, code, and tool calling tasks. GLM-5.1 supports both Thinking mode (step-by-step reasoning) and Instruct
-mode (direct response), with a native context window of approximately 200K tokens.
+mode (direct response), with a native context window of approximately 200k tokens.
 
 This document demonstrates the deployment of GLM-5.1 on Ascend NPUs using SGLang, including single-node and multi-node
 deployment, feature configuration, and performance optimization.
@@ -78,7 +78,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the

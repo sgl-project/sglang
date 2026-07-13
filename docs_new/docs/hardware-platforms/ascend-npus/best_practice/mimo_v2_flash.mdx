@@ -14,15 +14,15 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16K+1K | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32K+1K | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16K+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32K+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
@@ -40,7 +40,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 16K+1
+**Dataset**: 16k+1
 
 **TTFT**: 5s
 
@@ -226,7 +226,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 16K+1K
+**Dataset**: 16k+1k
 
 **TPOT**: 20ms
 
@@ -412,7 +412,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 32K+1
+**Dataset**: 32k+1
 
 **TTFT**: 5s
 
@@ -598,7 +598,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 32K+1K
+**Dataset**: 32k+1k
 
 **TPOT**: 20ms
 
