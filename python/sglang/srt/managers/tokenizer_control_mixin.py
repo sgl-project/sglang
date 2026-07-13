@@ -5,7 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import fastapi
 
@@ -663,6 +663,26 @@ class TokenizerControlMixin:
                 error_message=str(e),
             )
 
+    def _validate_lora_upsert_supported(
+        self: TokenizerManager,
+        obj: Union[
+            LoadLoRAAdapterFromTensorsReqInput, LoadLoRAAdapterFromDistributedReqInput
+        ],
+    ) -> None:
+        """Upsert resolves lora_name -> lora_id through this process's registry.
+
+        With multiple tokenizer workers each HTTP worker process holds its own
+        registry, so the resolution depends on which worker the router picks:
+        a worker that never served the original load would mint a fresh id and
+        die on the backend duplicate check. Fail loudly instead.
+        """
+        if obj.upsert and self.server_args.tokenizer_worker_num > 1:
+            raise ValueError(
+                "LoRA upsert is not supported with tokenizer_worker_num > 1: "
+                "each HTTP worker resolves lora_name against its own registry, "
+                "making upsert nondeterministic across workers."
+            )
+
     async def load_lora_adapter_from_tensors(
         self: TokenizerManager,
         obj: LoadLoRAAdapterFromTensorsReqInput,
@@ -685,16 +705,26 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path="__tensor__",
-                    pinned=obj.pinned,
+                self._validate_lora_upsert_supported(obj)
+                # With upsert, a same-name adapter keeps its lora_id so the
+                # backend refreshes it in place instead of failing the
+                # duplicate check; otherwise this resolves to a fresh ref.
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path="__tensor__",
+                        pinned=obj.pinned,
+                    ),
+                    upsert=obj.upsert,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
 
                 if result.success:
-                    await self.lora_registry.register(new_adapter)
+                    if reused:
+                        await self.lora_registry.refresh(new_adapter)
+                    else:
+                        await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
                 if self.server_args.max_loaded_loras is not None:
                     while (
@@ -756,32 +786,26 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                if obj.upsert:
-                    # Refresh an already-registered adapter in place; if not
-                    # registered, fall through to the normal register path.
-                    existing_id = await self.lora_registry.get_lora_id(obj.lora_name)
-                    if existing_id is not None:
-                        obj.lora_id = existing_id
-                        result = (await self.update_lora_adapter_communicator(obj))[0]
-                        if result.success:
-                            self.lora_ref_cache[obj.lora_name] = LoRARef(
-                                lora_id=existing_id,
-                                lora_name=obj.lora_name,
-                                lora_path="__distributed__",
-                                pinned=obj.pinned,
-                            )
-                        return result
-
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path="__distributed__",
-                    pinned=obj.pinned,
+                self._validate_lora_upsert_supported(obj)
+                # With upsert, a same-name adapter keeps its lora_id so the
+                # backend refreshes it in place instead of failing the
+                # duplicate check; otherwise this resolves to a fresh ref.
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path="__distributed__",
+                        pinned=obj.pinned,
+                    ),
+                    upsert=obj.upsert,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
 
                 if result.success:
-                    await self.lora_registry.register(new_adapter)
+                    if reused:
+                        await self.lora_registry.refresh(new_adapter)
+                    else:
+                        await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
                 if self.server_args.max_loaded_loras is not None:
                     while (
