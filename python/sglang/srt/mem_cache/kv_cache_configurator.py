@@ -420,7 +420,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
                     max_total_num_tokens=max_total_num_tokens,
                 )
-            elif config := self.mambaish_config:
+            elif self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:
                     extra_args = {
@@ -441,7 +441,7 @@ class KVCacheConfigurator:
                         if self.is_draft_worker
                         else [
                             i
-                            for i in config.full_attention_layer_ids
+                            for i in self.mambaish_config.full_attention_layer_ids
                             if self.start_layer <= i < self.end_layer
                         ]
                     ),
