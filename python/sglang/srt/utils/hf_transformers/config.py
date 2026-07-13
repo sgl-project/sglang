@@ -58,6 +58,52 @@ _LONGCAT_ARCHS = {
     "LongcatFlashNgramForCausalLM",
 }
 
+_DSPARK_DRAFT_ARCHS = {
+    "DSparkDraftModel",
+    "Qwen3DSparkModel",
+}
+
+
+def _looks_like_dspark_draft_config(config_dict: dict) -> bool:
+    architectures = config_dict.get("architectures") or []
+    if any(arch in _DSPARK_DRAFT_ARCHS for arch in architectures):
+        return True
+
+    speculators_config = config_dict.get("speculators_config") or {}
+    return (
+        isinstance(speculators_config, dict)
+        and speculators_config.get("algorithm") == "dspark"
+        and isinstance(config_dict.get("transformer_layer_config"), dict)
+    )
+
+
+def _lift_dspark_transformer_layer_config(config, config_dict: dict) -> None:
+    transformer_layer_config = config_dict.get("transformer_layer_config")
+    if not isinstance(transformer_layer_config, dict):
+        return
+
+    for key, value in transformer_layer_config.items():
+        if key == "model_type" or value is None:
+            continue
+        current = getattr(config, key, None)
+        if current is None:
+            setattr(config, key, value)
+
+
+def _try_load_dspark_draft_config(model, revision: Optional[str], **kwargs):
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if config_dict.get("model_type") is not None:
+        return None
+    if not _looks_like_dspark_draft_config(config_dict):
+        return None
+
+    config = PretrainedConfig.from_dict(config_dict)
+    _lift_dspark_transformer_layer_config(config, config_dict)
+    config._name_or_path = model
+    return config
+
 
 def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     config_dict, _ = PretrainedConfig.get_config_dict(
@@ -82,6 +128,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         **kwargs,
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_dspark_draft_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
