@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
+    ProjAndNormMode,
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
@@ -36,6 +37,8 @@ from sglang.srt.layers.gemma4_fused_ops import (
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -125,6 +128,32 @@ def pp_filter_load_weight(
         return True
 
     return False
+
+
+def get_k_eq_v_layers(text_config) -> Set[int]:
+    """Return set of layer indices where attention_k_eq_v applies (full-attention layers)."""
+    if not getattr(text_config, "attention_k_eq_v", False):
+        return set()
+    return {i for i, lt in enumerate(text_config.layer_types) if lt == "full_attention"}
+
+
+def _resolve_proj_mode(
+    layer_id: int,
+    *,
+    k_eq_v_layers: Set[int],
+    kv_shared_layers: Set[int],
+) -> ProjAndNormMode:
+    """Pick the projection + norm layout for one decoder layer.
+
+    Q-only wins over QK-only when a layer appears in both sets (KV
+    sharing borrows another layer's K/V cache, so the K projection
+    would be dead weight).
+    """
+    if layer_id in kv_shared_layers:
+        return ProjAndNormMode.Q_ONLY
+    if layer_id in k_eq_v_layers:
+        return ProjAndNormMode.QK_ONLY
+    return ProjAndNormMode.QKV_FULL
 
 
 class Gemma4Router(nn.Module):
@@ -283,6 +312,7 @@ class Gemma4Attention(nn.Module):
         max_position_embeddings: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        proj_mode: ProjAndNormMode = ProjAndNormMode.QKV_FULL,
     ) -> None:
         super().__init__()
 
@@ -321,15 +351,48 @@ class Gemma4Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=config.attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
+        # Single source of truth for this layer's projection + norm
+        # layout. See ProjAndNormMode.
+        self.proj_mode = proj_mode
+
+        # Build exactly the projection layer this layout needs.
+        self.q_proj = None
+        self.qk_proj = None
+        self.qkv_proj = None
+        if proj_mode is ProjAndNormMode.Q_ONLY:
+            # KV-sharing: K/V come from another layer's cache.
+            self.q_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=config.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("q_proj", prefix),
+            )
+        elif proj_mode is ProjAndNormMode.QK_ONLY:
+            # attention_k_eq_v: Q (shard 0) and K (shard 1) merged into
+            # one Linear; V is derived from K at runtime via the fused
+            # QK_ONLY norm kernel.
+            self.qk_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [
+                    self.total_num_heads * self.head_dim,  # Q
+                    self.total_num_kv_heads * self.head_dim,  # K
+                ],
+                bias=config.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("qk_proj", prefix),
+            )
+        else:
+            assert proj_mode is ProjAndNormMode.QKV_FULL
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=config.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -338,17 +401,21 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.q_norm = Gemma4RMSNorm(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-        )
-        self.k_norm = Gemma4RMSNorm(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-        )
-        self.v_norm = Gemma4RMSNorm(
-            self.head_dim, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=False
-        )
+        # Norms: Q-only layers have only q_norm in the checkpoint, so
+        # don't allocate k_norm / v_norm (they'd silently stay zero-init
+        # and waste memory).
+        self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        if proj_mode is ProjAndNormMode.Q_ONLY:
+            self.k_norm = None
+            self.v_norm = None
+        else:
+            self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.v_norm = Gemma4RMSNorm(
+                self.head_dim,
+                eps=config.rms_norm_eps,
+                scale_shift=0.0,
+                with_scale=False,
+            )
 
         if layer_type in config.rope_parameters:
             rope_parameters = dict(config.rope_parameters[layer_type])
@@ -358,12 +425,12 @@ class Gemma4Attention(nn.Module):
                 rope_theta=10000.0,
             )
 
-        # KV sharing logic
+        # KV sharing: proj_mode == Q_ONLY is the single source of truth.
+        # The caller (e.g. assistant MTP) may force this even when the
+        # config wouldn't.
         num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
         first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared_layers
-        self.is_kv_shared_layer = (
-            layer_id >= first_kv_shared_layer_idx and num_kv_shared_layers > 0
-        )
+        self.is_kv_shared_layer = proj_mode is ProjAndNormMode.Q_ONLY
 
         self.kv_shared_layer_index = None
         if num_kv_shared_layers > 0 and self.layer_id >= first_kv_shared_layer_idx:
@@ -410,71 +477,11 @@ class Gemma4Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-        # Preconditions for the fused path: tensors on CUDA or XPU (the kernel
-        # is pure Triton and lowers to both backends), q_norm/k_norm use the
-        # standard norm*weight (scale_shift==0) and v_norm has weight=ones
-        # (with_scale=False) — the canonical Gemma4 attention configuration.
-        is_kv_shared = (
-            self.is_kv_shared_layer and self.kv_shared_layer_index is not None
-        )
-        can_fuse_qkv_norm = (
-            (q.is_cuda or q.is_xpu)
-            and self.q_norm.scale_shift == 0.0
-            and self.k_norm.scale_shift == 0.0
-            and not self.v_norm.with_scale
-        )
-        if can_fuse_qkv_norm:
-            if is_kv_shared:
-                gemma_qkv_rmsnorm(
-                    q,
-                    None,
-                    None,
-                    self.q_norm.weight.data,
-                    None,
-                    num_q_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                    eps=self.q_norm.eps,
-                )
-                k = None
-                v = None
-            else:
-                gemma_qkv_rmsnorm(
-                    q,
-                    k,
-                    v,
-                    self.q_norm.weight.data,
-                    self.k_norm.weight.data,
-                    num_q_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                    eps=self.q_norm.eps,
-                )
-                # Match the original norm path's output shapes: q stays 2D,
-                # k/v become 3D so the subsequent `.flatten(-2, -1)` works.
-                # Use reshape (not view) since k/v are strided slice views of
-                # the qkv buffer and may not satisfy view's contiguity rules.
-                k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-                v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-        else:
-            q = q.unflatten(-1, (self.num_heads, self.head_dim))
-            q = self.q_norm(q)
-            q = q.flatten(-2, -1)
-            if is_kv_shared:
-                k = None
-                v = None
-            else:
-                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-                k = self.k_norm(k)
-                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-                v = self.v_norm(v)
-
-        # Apply rotary embedding
+        q, k, v = self._project_and_norm(hidden_states)
         use_fused_kv = False
+
+        # Apply rotary embedding. K is None for Q-only layers (KV-shared);
+        # rotary needs a key input so we pass a zero stand-in.
         if k is not None:
             k = k.flatten(-2, -1)
             # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
@@ -492,7 +499,6 @@ class Gemma4Attention(nn.Module):
             q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
-            # Rotary embedding requires a key input; use zeros since KV is shared from another layer
             dummy_k = torch.zeros_like(q[:, : self.kv_size])
             q, _ = self.rotary_emb(positions, q, dummy_k)
 
@@ -507,8 +513,118 @@ class Gemma4Attention(nn.Module):
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
         output, _ = self.o_proj(attn_output)
-
         return output
+
+    def _can_use_fused_norm(self, q: torch.Tensor) -> bool:
+        """The fused kernel assumes the canonical Gemma4 norm settings:
+        Q/K use the standard ``x * rrms * w`` form and V has unit scale.
+        Anything else falls back to per-tensor Gemma4RMSNorm modules."""
+        return (
+            q.is_cuda
+            and self.q_norm.scale_shift == 0.0
+            and (self.k_norm is None or self.k_norm.scale_shift == 0.0)
+            and (self.v_norm is None or not self.v_norm.with_scale)
+        )
+
+    def _project_and_norm(self, hidden_states: torch.Tensor):
+        """Return (q, k, v) ready for rotary + attention."""
+        if self.proj_mode is ProjAndNormMode.Q_ONLY:
+            return self._project_and_norm_q_only(hidden_states)
+        if self.proj_mode is ProjAndNormMode.QK_ONLY:
+            return self._project_and_norm_qk(hidden_states)
+        return self._project_and_norm_qkv(hidden_states)
+
+    def _project_and_norm_q_only(self, hidden_states: torch.Tensor):
+        """Q only project.
+
+        KV is read from another layer's cache; only Q is
+        projected and normalised. K/V are returned as ``None`` so the
+        downstream rotary code uses a dummy and the attention call
+        reads KV from cache.
+        """
+        q, _ = self.q_proj(hidden_states)
+        if self._can_use_fused_norm(q):
+            gemma_qkv_rmsnorm(
+                q,
+                None,
+                None,
+                self.q_norm.weight.data,
+                None,
+                num_q_heads=self.num_heads,
+                num_kv_heads=0,
+                head_dim=self.head_dim,
+                eps=self.q_norm.eps,
+                mode=ProjAndNormMode.Q_ONLY,
+            )
+        else:
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
+        return q, None, None
+
+    def _project_and_norm_qk(self, hidden_states: torch.Tensor):
+        """Q + K projection (V derived from K).
+
+        Uses the K_EQ_V mode of the fused norm kernel: K and V are allocated out-of-place from a single shared K input read.
+        """
+        qk, _ = self.qk_proj(hidden_states)
+        q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+        if self._can_use_fused_norm(q):
+            # K is a strided slice of the qk buffer; the kernel respects
+            # stride(0) so no .contiguous() copy is needed.
+            k_out, v_out = gemma_qkv_rmsnorm(
+                q,
+                k,
+                None,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.eps,
+                mode=ProjAndNormMode.QK_ONLY,
+            )
+            k = k_out.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v_out.reshape(-1, self.num_kv_heads, self.head_dim)
+        else:
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = self.v_norm(k)
+            k = self.k_norm(k)
+        return q, k, v
+
+    def _project_and_norm_qkv(self, hidden_states: torch.Tensor):
+        """Standard QKV projection with three independent shards."""
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self._can_use_fused_norm(q):
+            gemma_qkv_rmsnorm(
+                q,
+                k,
+                v,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.eps,
+                mode=ProjAndNormMode.QKV_FULL,
+            )
+            # Use reshape (not view) since k/v are strided slice views of
+            # the qkv buffer and may not satisfy view's contiguity rules.
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        else:
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            k = self.k_norm(k)
+            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = self.v_norm(v)
+        return q, k, v
 
 
 class Gemma4DecoderLayer(nn.Module):
@@ -518,6 +634,7 @@ class Gemma4DecoderLayer(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        proj_mode: ProjAndNormMode = ProjAndNormMode.QKV_FULL,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -542,6 +659,7 @@ class Gemma4DecoderLayer(nn.Module):
             head_dim=head_dim,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            proj_mode=proj_mode,
         )
 
         first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
@@ -758,6 +876,7 @@ class Gemma4TextModel(PreTrainedModel):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        kv_shared_layer_indices: Optional[Set[int]] = None,
     ) -> None:
         super().__init__(config=config)
         self.config = config
@@ -845,6 +964,21 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
+        # Resolve per-layer projection / norm layout.  The caller may
+        # override the config-derived KV-sharing set via
+        # kv_shared_layer_indices (MTP assistant passes every layer to
+        # read from the target's cache).
+        k_eq_v_layers = get_k_eq_v_layers(config)
+        if kv_shared_layer_indices is None:
+            n_shared = getattr(config, "num_kv_shared_layers", 0)
+            kv_shared_layer_indices = (
+                set(
+                    range(config.num_hidden_layers - n_shared, config.num_hidden_layers)
+                )
+                if n_shared > 0
+                else set()
+            )
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma4DecoderLayer(
@@ -852,6 +986,11 @@ class Gemma4TextModel(PreTrainedModel):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                proj_mode=_resolve_proj_mode(
+                    idx,
+                    k_eq_v_layers=k_eq_v_layers,
+                    kv_shared_layers=kv_shared_layer_indices,
+                ),
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -1166,13 +1305,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
-    def _get_k_eq_v_layers(self) -> set:
+    def _get_k_eq_v_layers(self) -> Set[int]:
         """Return set of layer indices where attention_k_eq_v applies (full-attention layers)."""
-        if not getattr(self.config, "attention_k_eq_v", False):
-            return set()
-        return {
-            i for i, lt in enumerate(self.config.layer_types) if lt == "full_attention"
-        }
+        return get_k_eq_v_layers(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1180,6 +1315,19 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # k_eq_v layers use MergedColumnParallelLinear (qk_proj) instead
+        # of QKVParallelLinear (qkv_proj).  Map checkpoint q_proj / k_proj
+        # to integer shard ids 0 and 1 respectively.  V is derived from K
+        # at runtime via the K_EQ_V fused norm, so there is no v shard
+        # and no v_proj weight in the checkpoint for these layers.
+        k_eq_v_stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qk_proj", "q_proj", 0),
+            ("qk_proj", "k_proj", 1),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
@@ -1253,16 +1401,12 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ):
                 continue
 
-            # attention_k_eq_v: full-attention layers have no v_proj in the
-            # checkpoint (K and V share weights).  When we see a k_proj weight
-            # for one of these layers, load it into both the "k" and "v" shards
-            # of the fused QKV so the forward produces v_raw == k_raw.
-            should_dup_k_to_v = (
-                ".k_proj." in name
-                and k_eq_v_layers
-                and (m := re.search(r"layers\.(\d+)\.", name)) is not None
-                and int(m.group(1)) in k_eq_v_layers
-            )
+            # Determine whether this weight belongs to a k_eq_v layer.
+            is_k_eq_v_layer = False
+            if k_eq_v_layers:
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m is not None:
+                    is_k_eq_v_layer = int(m.group(1)) in k_eq_v_layers
 
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
@@ -1317,7 +1461,17 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     loaded_params.add(name)
                     break
                 else:
-                    for param_name, weight_name, shard_id in stacked_params_mapping:
+                    # 3) Stacked dense projection weights.  k_eq_v layers
+                    #    pack only Q+K into qk_proj (V is derived at
+                    #    runtime from K via the K_EQ_V fused norm), so
+                    #    they need a different mapping than the standard
+                    #    qkv_proj layers.
+                    mapping = (
+                        k_eq_v_stacked_params_mapping
+                        if is_k_eq_v_layer
+                        else stacked_params_mapping
+                    )
+                    for param_name, weight_name, shard_id in mapping:
                         name = orig_name
                         if weight_name not in name:
                             continue
@@ -1327,8 +1481,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
-                        if should_dup_k_to_v:
-                            weight_loader(param, loaded_weight, "v")
                         loaded_params.add(name)
                         break
                     else:
