@@ -39,21 +39,6 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-
-def _compute_has_tf32_hc_prenorm():
-    if not ENABLE_JIT_DEEPGEMM:
-        return False
-    try:
-        from deep_gemm import tf32_hc_prenorm_gemm  # noqa: F401
-    except (ImportError, AttributeError):
-        return False
-    return True
-
-
-# The DSv4 hc-prenorm tf32 GEMM is a DeepGEMM extension; probe it like the
-# SM120 grouped GEMM above.
-HAS_TF32_HC_PRENORM = _compute_has_tf32_hc_prenorm()
-
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
     is_sm100_supported() or get_device_sm() == 120

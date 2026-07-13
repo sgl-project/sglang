@@ -4366,18 +4366,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-                    HAS_TF32_HC_PRENORM,
-                )
-
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(HAS_TF32_HC_PRENORM)
-                # SM120: use the CUDA paged-MQA-logits path (DeepGEMM metadata
-                # kernel) instead of the torch fallback. The torch fallback
-                # computes the indexer logits in eager torch ops and dominates
-                # decode (TPOT BS8 ~115ms -> ~15ms with the CUDA kernel).
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(False)
-                # SM120: route sparse-MLA prefill through the FlashInfer path;
-                # the unified sgl_kernel flash_mla_sparse_fwd is SM90a/SM100f-only.
                 envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
