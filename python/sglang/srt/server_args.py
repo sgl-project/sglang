@@ -6046,11 +6046,6 @@ class ServerArgs:
                 "--enable-cp-cache-layer-split is not supported with pipeline "
                 "parallelism (pp_size > 1) yet"
             )
-        if self.enable_prefill_context_parallel:
-            self.enable_prefill_context_parallel = False
-            self.enable_dsa_prefill_context_parallel = True
-            self.dsa_prefill_cp_mode = "round-robin-split"
-            self.prefill_cp_mode = "round-robin-split"
         if self.disaggregation_mode != "prefill":
             raise ValueError(
                 "--enable-cp-cache-layer-split is currently supported only on "
