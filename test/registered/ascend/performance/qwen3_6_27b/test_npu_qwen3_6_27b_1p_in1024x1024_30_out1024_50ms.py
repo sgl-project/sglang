@@ -48,11 +48,11 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    50,
+    60,
     "--max-mamba-cache-size",
     60,
     "--mem-fraction-static",
-    0.76,
+    0.74,
     "--cuda-graph-bs",
     2,
     4,
@@ -64,6 +64,7 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
     42,
     45,
     50,
+    60,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -80,6 +81,10 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
     "--speculative-num-draft-tokens",
     4,
     "--mm-enable-dp-encoder",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -87,18 +92,20 @@ class TestNPUQwen3_6_27B_1P_In1024x1024_30_Out1024_50ms(TestNpuPerformanceTestCa
     """Test NPU performance for Qwen3.6-27B 1p in1024x1024 30 out1024 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_MM_CUSTOM_GEN
+    dataset_type = AISBENCHMARK_DATASET_MM_CUSTOM_GEN
     model = QWEN3_6_27B_MODEL_PATH
     other_args = QWEN3_6_27B_1024_OTHER_ARGS
     envs = QWEN3_6_27B_1024_ENVS
-    dataset_name = "random"
-    max_concurrency = 48
-    num_prompts = 48
+    backend = "sglang-oai-chat"
+    dataset_name = "image"
+    max_concurrency = 60
+    num_prompts = 240
     input_len = 30
     output_len = 1024
     random_range_ratio = 1
     image_resolution = "1024x1024"
     image_count = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 800.8
 
