@@ -112,7 +112,7 @@ class LoRAManager:
         )
 
     def init_cuda_graph_batch_info(
-        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+        self, max_bs_in_cuda_graph: int, num_tokens_per_req: int
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
@@ -122,7 +122,7 @@ class LoRAManager:
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
-            num_tokens_per_bs=num_tokens_per_bs,
+            num_tokens_per_req=num_tokens_per_req,
         )
 
         # ===== TO BE REFACTORED ====
