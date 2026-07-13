@@ -118,6 +118,7 @@ class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(TestNpuPerfMultiNodePdMixTestCa
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 100
     output_token_throughput = 160
 
