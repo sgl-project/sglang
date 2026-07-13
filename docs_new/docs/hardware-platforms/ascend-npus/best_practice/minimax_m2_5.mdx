@@ -6,6 +6,8 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for MiniMax-M2.5 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [MiniMax-M2.5 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
@@ -124,7 +126,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -230,7 +232,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -341,7 +343,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -449,7 +451,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -553,7 +555,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
