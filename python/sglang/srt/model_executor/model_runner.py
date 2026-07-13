@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -133,7 +134,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -1631,10 +1631,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         for module in self.model.modules():
             if not isinstance(module, (TopK, HashTopK)):
                 continue
-            if (
-                not module.enable_deepep_waterfill
-                or module.deepep_waterfill_balancer is not None
-            ):
+            if not module.enable_waterfill or module.waterfill_balancer is not None:
                 continue
             if num_routed_experts is None:
                 num_routed_experts = getattr(
@@ -1642,14 +1639,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 if num_routed_experts is None:
                     raise ValueError(
-                        "DeepEP waterfill requires model config n_routed_experts."
+                        "Waterfill requires model config n_routed_experts."
                     )
             if balancer_cls is None:
-                from sglang.srt.layers.moe.deepep_waterfill import (
-                    DeepEPWaterfillBalancer,
-                )
+                from sglang.srt.layers.moe.waterfill import WaterfillBalancer
 
-                balancer_cls = DeepEPWaterfillBalancer
+                balancer_cls = WaterfillBalancer
             # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
             # Redundant experts therefore need to be included in the per-rank
             # expert count used for Waterfill's shared-expert slot remapping.
@@ -1660,7 +1655,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 routed_scaling_factor = module.topk_config.routed_scaling_factor
             else:
                 routed_scaling_factor = module.routed_scaling_factor
-            module.deepep_waterfill_balancer = balancer_cls(
+            module.waterfill_balancer = balancer_cls(
                 num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
@@ -1672,7 +1667,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_prepared += 1
         if num_prepared:
             log_info_on_rank0(
-                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
+                logger, f"Prepared {num_prepared} Waterfill TopK modules."
             )
 
     def _init_lplb_solvers(self):
