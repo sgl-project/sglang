@@ -34,6 +34,14 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     )
 
 
+def _should_enable_lazy_compaction() -> bool:
+    """Lazy compaction default — ON unless
+    `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
+    Centralized here so both unified-memory-pool factory call sites stay in sync.
+    """
+    return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
