@@ -64,8 +64,9 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -190,7 +191,15 @@ def use_rowwise_torch_scaled_mm():
         # torch._scaled_mm rowwise feature.
         # The condition is determined once as the operations
         # are time consuming.
-        return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+        device_capability = get_device_capability()
+        if (
+            device_capability is None
+            or len(device_capability) < 2
+            or device_capability[0] is None
+            or device_capability[1] is None
+        ):
+            return False
+        return device_capability >= (9, 4) and torch_release >= (2, 7)
     return False
 
 

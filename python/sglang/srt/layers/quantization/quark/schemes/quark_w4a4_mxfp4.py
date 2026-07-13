@@ -11,7 +11,8 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
-if _is_hip:
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+if _has_visible_hip_device:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
@@ -147,6 +148,19 @@ if _is_hip:
         return torch.ops.sglang.aiter_fused_gemm_split_cat(
             x, w, y, x_scale, w_scale, S1, S2
         )
+
+else:
+
+    def _raise_mxfp4_requires_visible_hip(*args, **kwargs):
+        del args, kwargs
+        raise NotImplementedError(
+            "Quark MXFP4 kernels require an AMD ROCm device visible at import time."
+        )
+
+    gemm_afp4wfp4 = _raise_mxfp4_requires_visible_hip
+    gemm_afp4wfp4_pre_quant = _raise_mxfp4_requires_visible_hip
+    dynamic_mxfp4_quant = _raise_mxfp4_requires_visible_hip
+    fused_gemm_afp4wfp4_split_cat = _raise_mxfp4_requires_visible_hip
 
 
 __all__ = ["QuarkW4A4MXFP4"]

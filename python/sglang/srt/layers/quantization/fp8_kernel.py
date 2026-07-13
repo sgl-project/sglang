@@ -53,7 +53,8 @@ _is_cpu = is_cpu()
 _is_musa = is_musa()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 
 if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
@@ -78,7 +79,7 @@ if _is_cuda or _is_musa:
         per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
     )
 
-if _is_hip:
+if _has_visible_hip_device:
     _has_vllm = False
     if _use_aiter:
         try:
@@ -122,8 +123,15 @@ logger = logging.getLogger(__name__)
 @lru_cache()
 def is_fp8_fnuz() -> bool:
     if _is_hip:
+        if not torch.cuda.is_available():
+            return False
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
-        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+        try:
+            return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+        except RuntimeError as err:
+            if "No HIP GPUs are available" in str(err):
+                return False
+            raise
     return False
 
 

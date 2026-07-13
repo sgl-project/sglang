@@ -31,12 +31,16 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
+else:
+    shuffle_weight = None
+    e8m0_shuffle = None
 
-if _is_hip:
+if _has_visible_hip_device:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None
@@ -218,6 +222,17 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         return online_mxfp4_moe_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if e8m0_shuffle is None:
+            raise NotImplementedError(
+                "Quark MXFP4 MoE post-load scale shuffle requires AITer with "
+                "an AMD ROCm device visible."
+            )
+        if _is_shuffle_moe_mxfp4 and shuffle_weight is None:
+            raise NotImplementedError(
+                "Quark MXFP4 MoE weight shuffle requires AITer with an AMD ROCm "
+                "device visible."
+            )
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)

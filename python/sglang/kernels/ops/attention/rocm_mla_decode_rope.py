@@ -20,6 +20,7 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+import torch
 import triton
 import triton.language as tl
 
@@ -29,7 +30,12 @@ from sglang.kernels.ops.attention.decode_attention import (
 
 
 def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    try:
+        return triton.runtime.driver.active.get_current_target().backend == "hip"
+    except RuntimeError:
+        return False
 
 
 _is_hip = is_hip()
