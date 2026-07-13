@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=35, stage="base-c", runner_config="4-gpu-b200")
 
 LAYER_NUM = 4
 PAGE_SIZE = 64

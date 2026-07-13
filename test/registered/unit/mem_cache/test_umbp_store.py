@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 # UMBPStore wraps mori's UMBP client (AMD/ROCm only). On machines without mori
 # (e.g. NVIDIA / CPU CI) the whole TestCase is skipped instead of failing at

@@ -16,7 +16,7 @@ from sglang.srt.entrypoints.search.exa_client import (
 from sglang.srt.entrypoints.tool import HarmonyBrowserTool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class ExaClientTestCase(unittest.TestCase):

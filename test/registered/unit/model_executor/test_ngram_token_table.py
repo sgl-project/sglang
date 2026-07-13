@@ -15,7 +15,7 @@ from sglang.srt.model_executor.ngram_token_table import (  # noqa: E402
     update_ngram_token_table_after_sampling,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _make_ngram_info(batch_size: int, skip_token_table_update=None):

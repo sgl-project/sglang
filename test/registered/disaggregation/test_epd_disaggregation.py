@@ -36,7 +36,7 @@ DEFAULT_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 
 
-register_cuda_ci(est_time=97, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=121, stage="base-c", runner_config="4-gpu-h100")
 
 
 @unittest.skipIf(

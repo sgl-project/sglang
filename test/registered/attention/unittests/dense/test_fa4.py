@@ -34,8 +34,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_dense_split_op_extend_case,
 )
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=31, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=27, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

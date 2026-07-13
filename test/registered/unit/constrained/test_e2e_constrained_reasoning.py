@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=82, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
 
 MODEL = "Qwen/Qwen3-0.6B"

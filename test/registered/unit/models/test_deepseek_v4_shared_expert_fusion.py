@@ -6,7 +6,7 @@ from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):

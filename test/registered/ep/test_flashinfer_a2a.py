@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=673, stage="base-c", runner_config="4-gpu-gb300")
 
 DEEPSEEK_V3_FP4_MODEL = "nvidia/DeepSeek-V3-0324-FP4"
 QWEN3_FP8_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
