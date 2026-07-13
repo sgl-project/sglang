@@ -7,6 +7,7 @@ Each collected request prints a performance log before validation.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import openai
 import pytest
 import requests
@@ -47,8 +49,11 @@ from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
+    action_gt_exists,
     compare_with_gt,
     extract_key_frames_from_video,
+    get_action_consistency_gt_candidates,
+    get_action_consistency_gt_remote_files,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
     get_consistency_threshold_path,
@@ -56,6 +61,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
+    load_action_consistency_gt,
     load_consistency_gt,
     save_consistency_failure_artifact,
     wait_for_req_perf_record,
@@ -81,6 +87,16 @@ _SERVER_FATAL_LOG_PATTERNS = (
     "Segmentation fault",
     "Aborted (core dumped)",
 )
+_CASE_LOG_SEPARATOR = "=" * 88
+
+
+def _print_case_log_separator(case_id: str, state: str) -> None:
+    print(
+        f"\n{_CASE_LOG_SEPARATOR}\n"
+        f"[server-test] {state}: {case_id}\n"
+        f"{_CASE_LOG_SEPARATOR}",
+        flush=True,
+    )
 
 
 @pytest.fixture
@@ -88,6 +104,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     _fixture_start_time = time.perf_counter()
     server_args = case.server_args
+    _print_case_log_separator(case.id, "BEGIN diffusion testcase")
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
@@ -203,6 +220,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"is not available in the installed version. "
                 f"Upgrade diffusers to enable this test."
             )
+        _print_case_log_separator(case.id, "FAILED during server startup")
         raise
 
     try:
@@ -241,6 +259,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"    }}\n"
                 f'{"=" * 60}\n'
             )
+        _print_case_log_separator(case.id, "END diffusion testcase")
 
 
 class DiffusionServerBase:
@@ -580,6 +599,10 @@ class DiffusionServerBase:
             )
             return
 
+        if case.server_args.modality == "action":
+            self._validate_action_consistency(case, content)
+            return
+
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
         output_format = case.sampling_params.output_format
@@ -714,6 +737,88 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
+    def _extract_action_array(
+        self,
+        payload: dict[str, Any],
+        expected_horizon: int,
+        expected_dim: int,
+    ) -> np.ndarray:
+        action = payload["data"][0]["action"]
+        values = action["values"]
+        assert action["shape"] == [expected_horizon, expected_dim]
+        array = np.asarray(values, dtype=np.float32)
+        assert array.shape == (expected_horizon, expected_dim)
+        assert np.isfinite(array).all()
+        return array
+
+    def _validate_action_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        payload = json.loads(content.decode("utf-8"))
+        expected_horizon = int(case.sampling_params.extras.get("action_horizon", 50))
+        expected_dim = int(case.sampling_params.extras.get("action_dim", 32))
+        output = self._extract_action_array(payload, expected_horizon, expected_dim)
+
+        num_gpus = case.server_args.num_gpus
+        if not action_gt_exists(case.id, num_gpus):
+            names = ", ".join(get_action_consistency_gt_candidates(case.id, num_gpus))
+            logger.error(f"""
+--- MISSING ACTION GROUND TRUTH DETECTED ---
+GT action JSON not found for '{case.id}'.
+
+Add the expected file to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming:
+  Action: {case.id}_{{n}}gpu.json
+
+For this case, expected file(s): {names}
+
+Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
+""")
+            pytest.fail(
+                f"GT action JSON not found for {case.id}. See logs for instructions to add GT."
+            )
+
+        gt_payload = load_action_consistency_gt(case.id, num_gpus)
+        gt = self._extract_action_array(gt_payload, expected_horizon, expected_dim)
+        abs_diff = np.abs(output - gt)
+        max_abs_diff = float(abs_diff.max())
+        mean_abs_diff = float(abs_diff.mean())
+        max_abs_threshold = float(
+            case.sampling_params.extras.get("action_max_abs_diff_threshold", 0.05)
+        )
+        mean_abs_threshold = float(
+            case.sampling_params.extras.get("action_mean_abs_diff_threshold", 0.005)
+        )
+
+        if max_abs_diff > max_abs_threshold or mean_abs_diff > mean_abs_threshold:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_action_consistency_gt_remote_files(
+                    case.id,
+                    num_gpus,
+                )
+            )
+            pytest.fail(
+                f"Action consistency check failed for {case.id}:\n"
+                f"  max_abs_diff={max_abs_diff:.6f} "
+                f"(threshold {max_abs_threshold:.6f})\n"
+                f"  mean_abs_diff={mean_abs_diff:.6f} "
+                f"(threshold {mean_abs_threshold:.6f})\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED action GT check "
+            "(shape=%sx%s, max_abs_diff=%.6f, mean_abs_diff=%.6f)",
+            case.id,
+            expected_horizon,
+            expected_dim,
+            max_abs_diff,
+            mean_abs_diff,
+        )
+
     def _save_gt_output(
         self,
         case: DiffusionTestCase,
@@ -735,6 +840,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
+
+        if case.server_args.modality == "action":
+            output_path = out_dir / f"{case.id}_{num_gpus}gpu.json"
+            output_path.write_bytes(content)
+            logger.info(f"Saved GT action JSON: {output_path}")
+            return
 
         if is_video:
             # realtime consistency uses websocket raw frames to avoid lossy mp4 drift
@@ -1199,6 +1310,24 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         - test_diffusion_generation[qwen_image_edit]
         - etc.
         """
+        try:
+            self._test_diffusion_generation_impl(case, diffusion_server)
+        except pytest.skip.Exception:
+            _print_case_log_separator(case.id, "SKIPPED diffusion testcase")
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            _print_case_log_separator(case.id, "FAILED diffusion testcase")
+            raise
+        else:
+            _print_case_log_separator(case.id, "PASSED diffusion testcase")
+
+    def _test_diffusion_generation_impl(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ):
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 

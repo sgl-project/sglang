@@ -1092,7 +1092,7 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring", "c128_state"):
+            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1219,6 +1219,15 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
+        if state_type == "minimax_index_k":
+            if self.pp_size is not None and self.pp_size > 1:
+                raise RuntimeError(
+                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                )
+            if peer_info.decode_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "PD disagg: heterogeneous TP not supported for MiniMax sparse index yet."
+                )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
         if (
@@ -1383,8 +1392,16 @@ class MoriKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.conclude_state: Optional[KVPoll] = None

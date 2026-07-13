@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -334,7 +334,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
+            get_server_args().flashinfer_mxfp4_moe_precision
         )
         # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
         # entry points depending on the GPU:
@@ -857,6 +857,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_bias = Parameter(
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
+                return
+            # Fallback if the TP-sharded layer cannot be AMX-packed
+            from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+            w13_weight = MXFP4QuantizeUtil.dequantize(
+                quantized_data=layer.w13_weight,
+                dtype=torch.bfloat16,
+                scale=layer.w13_weight_scale,
+                block_sizes=[32],
+            )
+            w2_weight = MXFP4QuantizeUtil.dequantize(
+                quantized_data=layer.w2_weight,
+                dtype=torch.bfloat16,
+                scale=layer.w2_weight_scale,
+                block_sizes=[32],
+            )
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
@@ -1085,32 +1108,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        if use_intel_amx_backend(layer):
-            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+        if _is_cpu:
+            if use_intel_amx_backend(layer):
+                from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-            topk_weights, topk_ids, _ = dispatch_output.topk_output
-            x, topk_weights = apply_topk_weights_cpu(
-                self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
-            )
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUQuantMethod.MXFP4,
-                layer.w13_weight_scale,  # w1_scale
-                layer.w2_weight_scale,  # w2_scale
-                None,  # w1_zp
-                None,  # w2_zp
-                None,  # block_size
-                getattr(layer, "w13_weight_bias", None),
-                getattr(layer, "w2_weight_bias", None),
-                layer.moe_runner_config.gemm1_alpha,
-                layer.moe_runner_config.gemm1_clamp_limit,
-                True,  # is_vnni
-            )
+                topk_weights, topk_ids, _ = dispatch_output.topk_output
+                x, topk_weights = apply_topk_weights_cpu(
+                    self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
+                )
+                output = torch.ops.sgl_kernel.fused_experts_cpu(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    CPUQuantMethod.MXFP4,
+                    layer.w13_weight_scale,  # w1_scale
+                    layer.w2_weight_scale,  # w2_scale
+                    None,  # w1_zp
+                    None,  # w2_zp
+                    None,  # block_size
+                    getattr(layer, "w13_weight_bias", None),
+                    getattr(layer, "w2_weight_bias", None),
+                    layer.moe_runner_config.gemm1_alpha,
+                    layer.moe_runner_config.gemm1_clamp_limit,
+                    True,  # is_vnni
+                )
+            else:
+                from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
+                output = moe_forward_native(
+                    layer,
+                    x,
+                    topk_output,
+                    self.moe_runner_config,
+                )
             return StandardCombineInput(hidden_states=output)
 
         if self.use_marlin:

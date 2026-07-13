@@ -5,6 +5,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -183,12 +190,12 @@ class EagleDraftWorkerBase(ABC):
         topk: int,
         num_steps: int,
     ):
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_draft_cache_locs_contiguous,
+        )
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
-        )
-        from sglang.srt.speculative.triton_ops.cache_locs import (
-            assign_draft_cache_locs_contiguous,
         )
 
         if not batch.forward_mode.is_idle():
@@ -202,16 +209,27 @@ class EagleDraftWorkerBase(ABC):
                     dtype=torch.int64,
                     device=batch.device,
                 )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
-                )
+                if _is_cpu:
+                    assign_draft_cache_locs_contiguous_cpu(
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
+                else:
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous[(bs,)](
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
             else:
                 # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
                 # Reduce out_cache_loc from the page-aligned tree region down to the
@@ -317,6 +335,14 @@ class BaseSpecWorker(ABC):
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Hook called by the batch-result processor when a request finishes.
+
+        Default no-op. DSpark overrides this to settle / censor its
+        block-accept estimator state for the finished request.
         """
         pass
 
