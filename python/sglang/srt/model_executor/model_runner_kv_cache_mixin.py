@@ -1146,7 +1146,7 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if self.pp_size > 1:
+        if self.server_args.pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
