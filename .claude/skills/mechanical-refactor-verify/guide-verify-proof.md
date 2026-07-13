@@ -64,6 +64,15 @@
       to see what a relocation recipe would cover.
     - A hidden provable part is not a judgement call: demand the split
       (`guide-split.md` §2.2) — do not approve the commit as-is.
+    - **A `non_mechanical_provable` commit whose body is a large verbatim block relocation
+      the primitives can express** — a cut+paste move (including one landing above an
+      `if TYPE_CHECKING:` guard, now anchorable with `move_symbol(after=)`), a module-level
+      constant move, or a verbatim inline-block extract (the generator now infers it as
+      `extract_function`) — is a **FINDING**, not an acceptable label. The generator being
+      unable to infer it, or a past tooling gap, does not license the softer label: demand
+      it be relabelled `mechanical_provable` with a hand-written `Repro`, or the primitive
+      enhanced (guide-split.md §2.7.6). Only a genuine non-relocation edit (signature
+      redesign, logic rewrite, de-self restructure) justifies the label.
 
 ## 2. Verify a single commit
 

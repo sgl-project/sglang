@@ -326,3 +326,29 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - Many small, independently reviewable commits beat one big prep mixing ten flavors of
   change.
 - Review order = commit order: prep → move → non-mechanical follow-ups.
+
+#### 2.7.6 Anti-pattern: the non-mechanical label as an escape hatch
+
+- Symptom: a commit whose body is a **pure relocation** (a cut+paste move, a module-level
+  constant move, a verbatim inline-block extract) is labelled `non_mechanical_provable` and
+  ships with no proof — because the generator reported `UNSUPPORTED` or a primitive could
+  not express the exact insertion point, so the author reached for the softer label instead
+  of a proof.
+- Real example from this repo's history: `kvc-move-mamba-ratio-constants` relocated
+  module-level constants unchanged into `kv_cache_configurator.py` but was labelled
+  `non_mechanical_provable`, because the constants had to land *above* an
+  `if TYPE_CHECKING:` guard and `move_symbol`/`move_assign` only anchored with `before=`,
+  which overshot past the guard. The relocation was fully mechanical; only the tool's
+  insertion-anchor was missing.
+- The rule, in order:
+    1. A pure relocation **must** be `mechanical_provable` and carry a proof. The label is
+       a claim about the change, not about how easy the tooling made it.
+    2. Generator says `UNSUPPORTED` but the change *is* a relocation → **hand-write the
+       `Repro`** from the same primitives (guide-construct-proof.md §2.3). Inference falling
+       short is not a licence to drop the proof.
+    3. A primitive genuinely cannot express the faithful edit (the missing `after=` anchor
+       above) → **enhance the primitive first**, then prove it. The fix for a tooling gap is
+       to close the gap, not to relabel the commit as unprovable.
+- Only a change that is genuinely *not* a relocation (a signature redesign, a logic rewrite,
+  a de-self restructure) earns `non_mechanical_provable`. If you cannot say which
+  non-relocation edit justifies the label, the label is wrong.

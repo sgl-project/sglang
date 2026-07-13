@@ -91,6 +91,14 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_pr
 - **New-module extract of scattered defs**: `extract_symbols_to_new_module` under the
   audited header; a constant that relocated into the header is dropped from the source.
   A contiguous-tail source still uses `extract_to_new_module`.
+- **Inline-block extract-function** (intra-file): a new helper whose verbatim body is a
+  block cut from a sibling function, that function's block replaced by a call — inferred as
+  `extract_function`, authoring only the signature, the call, and (when the block ends in
+  `lhs = expr` returned by the helper) a `return lhs`. A body edited on the way out (a
+  de-self / restructure) does not infer — the residual surfaces it.
+- **A move landing just above an `if TYPE_CHECKING:` guard**: anchored with
+  `move_symbol(after=<preceding symbol>)` rather than a `before=` that would overshoot past
+  the guard.
 - **A source file the commit deletes** once its defs relocated: `delete_file`.
 - **The module-level import diff**, realised directly from the target: gained names added
   (a wholly new module's statement verbatim, wrapping kept, or one name folded into an
@@ -109,14 +117,20 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_pr
       statement-level reorder; reshapes belong in prepare;
     - **a new-module extract whose symbols are not all top-level in the source** — a
       method still inside a class; prepare must de-self it out first;
-    - **an extract drawing from more than one source file**, and an **inline-block
-      extract-function** — compose `extract_function` by hand (the body must be unchanged;
-      a de-self / restructure is a separate semantic commit).
+    - **an extract drawing from more than one source file** — compose `extract_function` by
+      hand. An inline-block extract-function within one file is inferred (§2.2.1), but only
+      when the body is a verbatim cut; a de-self / restructure on the way out is a separate
+      semantic commit and does not infer.
 
 ### 2.3 Hand-write the `Repro` when inference falls short
 
 - Compose the transform from the same primitives (`spec-reproduction-utils.md` §3).
 - The same byte-diff then certifies it.
+- **`UNSUPPORTED`, or a primitive that cannot express the exact edit, is never a reason to
+  relabel a relocation as `non_mechanical_provable`.** If the change is a relocation, it
+  gets a proof: hand-write the `Repro` here, or (when a primitive genuinely lacks the needed
+  form, e.g. an insertion anchor) enhance the primitive first, then prove it. See
+  guide-split.md §2.7.6.
 
 ```python
 import sys
