@@ -1132,43 +1132,7 @@ class ModelRunnerKVCacheMixin:
         return self.kv_cache_configurator._apply_token_constraints(token_capacity)
 
     def resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
-        """Compute max concurrent requests (per dp worker) from the finalized
-        token capacity."""
-        # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-
-        max_num_reqs = self.server_args.max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
-        else:
-            requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
-
-        if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
-            )
-
-            if max_num_reqs <= 0:
-                raise RuntimeError(
-                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
-                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
-                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
-                    f"Try: (1) reduce --max-running-requests, "
-                    f"(2) increase --mem-fraction-static, or "
-                    f"(3) use GPUs with more memory."
-                )
-        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
-            logger.warning(
-                "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache capacity.",
-                requested_per_worker,
-                max_num_reqs,
-            )
-        return max_num_reqs
+        return self.kv_cache_configurator.resolve_max_num_reqs(token_capacity)
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""
