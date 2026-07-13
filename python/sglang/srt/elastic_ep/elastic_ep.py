@@ -279,8 +279,9 @@ def elastic_expanded_world_enabled() -> bool:
 def _refresh_ep_members() -> None:
     from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
 
-    if EPBuffer._buffer is not None:
-        EPBuffer._buffer.update_ep_member()
+    buffer = EPBuffer.get_existing_buffer()
+    if buffer is not None:
+        buffer.update_ep_member()
 
 
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01

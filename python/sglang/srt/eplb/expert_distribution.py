@@ -326,7 +326,7 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend != "none":
+        if server_args.moe_a2a_backend == "deepep":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
@@ -338,6 +338,8 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
+        # Non-DeepEP a2a backends (flashinfer / nixl / mooncake / megamoe) and
+        # no-a2a path dispatch through the standard topk select_experts.
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
@@ -751,11 +753,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             utilization_rate_gpu = torch.mean(
                 compute_utilization_rate(gpu_physical_count)
             )
+            should_track_history = not math.isclose(
+                self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+            )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                print(f"hi {self._rank=} {utilization_rate_gpu=}")
                 outputs["metrics"] = ExpertDistributionMetrics(
                     eplb_balancedness=utilization_rate_gpu,
                 )
+                if should_track_history:
+                    self._history.append(utilization_rate_gpu.item())
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
@@ -809,7 +815,7 @@ class _DequeCollection:
             d.clear()
 
     def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+        return {d.maxlen: sum(d) / len(d) for d in self._dequeues if len(d) > 0}
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):

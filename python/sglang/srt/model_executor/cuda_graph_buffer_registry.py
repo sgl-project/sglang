@@ -788,6 +788,7 @@ def build_prefill_registry(
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
+    enable_num_token_non_padded: bool = False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -876,6 +877,15 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
+    if enable_num_token_non_padded:
+        slots.append(
+            GraphSlot(
+                "num_token_non_padded",
+                lambda _bs2, _mt: (1,),
+                torch.int32,
+                axis="none",
+            )
+        )
 
     for slot in slots:
         bind = None

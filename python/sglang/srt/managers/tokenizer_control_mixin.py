@@ -33,7 +33,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -117,7 +116,6 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
