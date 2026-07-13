@@ -82,7 +82,7 @@ class MambaComponent(TreeComponent):
 
         # Full may extend beyond the latest Mamba state. Both lengths use
         # logical matches: device only without HiCache, device + host with it.
-        full_hit_len = result.full_logical_hit_length
+        full_hit_len = result.full_kv_hierarchical_hit_length
         mamba_boundary_len = (
             len(result.device_indices) + result.host_hit_length
         )

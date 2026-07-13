@@ -177,8 +177,8 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
-        full_logical_hit_length: Longest Full-KV match length across device and
-                                 host, independent of other components.
+        full_kv_hierarchical_hit_length: Longest Full-KV prefix available on either
+                                         device or host, independent of other components.
     """
 
     device_indices: torch.Tensor
@@ -190,7 +190,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
-    full_logical_hit_length: int = 0
+    full_kv_hierarchical_hit_length: int = 0
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -208,7 +208,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
-        full_logical_hit_length=0,
+        full_kv_hierarchical_hit_length=0,
     )
 
 
