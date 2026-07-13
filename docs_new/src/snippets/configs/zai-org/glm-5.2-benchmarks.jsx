@@ -7,6 +7,17 @@ export const benchmarks = [
   { match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   { match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
+  // ---- H20 + W4AFP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
+  {
+    match: { hw: "h20", variant: "default", quant: "w4afp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 10 },
+        ttft_ms: 4726.83, tpot_ms: 41.47, tokens_per_sec_per_gpu: 282.86 },
+      { workload: { dataset: "random", isl: 65536, osl: 3072, max_concurrency: 10 },
+        ttft_ms: 32037, tpot_ms: 49.09, tokens_per_sec_per_gpu: 546.02 },
+    ],
+  },
   // ---- B200 + FP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
   {
     // EAGLE MTP 5-1-6, mfs 0.8, no cuda-graph-max-bs. env SGLANG_SIMULATE_ACC_LEN=3.5
