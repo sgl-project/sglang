@@ -141,3 +141,53 @@ curl http://127.0.0.1:8000/v1/completions \
 ```
 
 > **Note:** `UCX_POSIX_USE_PROC_LINK=n` is required on Intel XPU to avoid UCX shared-memory transport issues.
+
+## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
+
+SGLang can temporarily release most of the GPU memory it holds — model weights
+and/or KV cache — and reclaim it later without restarting the process. This is
+the same `release_memory_occupation` / `resume_memory_occupation` feature
+available on CUDA, used for RL rollout/training hand-off and for freeing the
+device between inference bursts.
+
+This is backed by the [`torch_memory_saver`](https://github.com/fzyzcjy/torch_memory_saver)
+package — the same package used on CUDA — which gained an Intel XPU backend
+built natively on Level Zero (keeping virtual addresses fixed while
+releasing/re-committing physical pages via `zeVirtualMemUnmap` /
+`zeVirtualMemMap`).
+
+**Install `torch_memory_saver`.** Unlike CUDA (prebuilt wheel), the XPU backend
+is built from source against your local oneAPI + `torch+xpu` runtime (the `.so`
+links `libsycl.so.<N>`, which must match the installed `intel-sycl-rt`).
+`TMS_PLATFORM=xpu` forces the XPU backend, and `--no-build-isolation` lets the
+build import your installed `torch` so it can match the `libsycl` major to it:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+TMS_PLATFORM=xpu pip install --no-build-isolation \
+    git+https://github.com/fzyzcjy/torch_memory_saver.git
+```
+
+**Use it** by launching with `--enable-memory-saver` (the XPU backend is
+selected automatically); optionally add `--enable-weights-cpu-backup` to keep
+weights in host RAM across a release:
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
+    --trust-remote-code --device xpu --enable-memory-saver
+```
+
+```bash
+# Release GPU memory while idle, then reclaim it (server must be idle).
+curl -X POST http://127.0.0.1:30000/release_memory_occupation
+curl -X POST http://127.0.0.1:30000/resume_memory_occupation
+```
+
+The Python engine API (`engine.release_memory_occupation(tags=...)` /
+`engine.resume_memory_occupation(tags=...)`) and the `weights` / `kv_cache` tags
+behave the same as on CUDA. Pauseable CUDA-graph capture is not used on XPU, so
+the `cuda_graph` tag is a no-op there.
+
+> **Verifying memory was freed:** `torch.xpu.memory_allocated()` reflects the
+> allocator's accounting and does **not** drop when physical pages are released.
+> Query actual device memory via sysman (`ZES_ENABLE_SYSMAN=1`) instead.

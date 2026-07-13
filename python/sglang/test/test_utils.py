@@ -2485,7 +2485,11 @@ def get_gpu_memory_gb():
     if is_cuda():
         return torch.cuda.device_memory_used() / 1024**3
     elif is_xpu():
-        return torch.xpu.memory_allocated() / 1024**3
+        # Use mem_get_info (real device free/total), NOT memory_allocated(): the
+        # latter is the allocator's bookkeeping and does not drop when the XPU
+        # memory saver releases physical pages via zeVirtualMemUnmap.
+        free, total = torch.xpu.mem_get_info()
+        return (total - free) / 1024**3
     else:
         return 0
 
