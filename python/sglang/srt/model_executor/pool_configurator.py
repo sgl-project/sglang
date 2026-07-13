@@ -245,7 +245,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
-            indexer_dtype_size = torch._utils._element_size(mr.dtype)
+            indexer_dtype_size = torch._utils._element_size(mr.model_dtype)
 
             main_pool_bytes = (
                 (num_dense + num_sparse) * 2 * kv_heads * head_dim * kv_size
@@ -536,7 +536,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.context_len = mr.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
-        if mr.pp_size > 1:
+        if mr.ps.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={mr.pp_group.rank_in_group} "
                 f"layers=[{mr.start_layer},{mr.end_layer}) "
