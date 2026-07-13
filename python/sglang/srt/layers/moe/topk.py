@@ -983,6 +983,64 @@ def grouped_topk_cpu(
     )
 
 
+def grouped_topk_xpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    num_experts = gating_output.shape[1]
+    experts_per_group = (
+        num_experts // num_expert_group if num_expert_group else num_experts
+    )
+    correction_bias = torch.zeros(
+        gating_output.shape[1], dtype=gating_output.dtype, device=gating_output.device
+    )
+
+    if (
+        _is_xpu
+        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
+        and experts_per_group <= 32
+        and is_power_of_two(num_experts)
+    ):
+        from sgl_kernel import moe_fused_gate
+
+        return moe_fused_gate(
+            gating_output.to(torch.float32),
+            correction_bias.to(torch.float32),
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize=renormalize,
+            scoring_func="softmax",
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
+            apply_routed_scaling_factor_on_output=bool(
+                apply_routed_scaling_factor_on_output
+            ),
+        )
+
+    # use default implementation
+    return grouped_topk_gpu(
+        gating_output,
+        gating_output,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
@@ -1666,6 +1724,30 @@ def biased_grouped_topk_gpu(
                 correction_bias,
             )
             return topk_values * scaling, topk_indices
+        elif (
+            _is_xpu
+            # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
+            and experts_per_group <= 32
+            and is_power_of_two(num_experts)
+        ):
+            from sgl_kernel import moe_fused_gate
+
+            return moe_fused_gate(
+                gating_output.to(torch.float32),
+                correction_bias.to(torch.float32),
+                num_expert_group,
+                topk_group,
+                topk,
+                renormalize=renormalize,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                apply_routed_scaling_factor_on_output=bool(
+                    apply_routed_scaling_factor_on_output
+                ),
+            )
 
         else:
             return biased_grouped_topk_impl(
@@ -1717,7 +1799,7 @@ if _is_cpu and _is_cpu_amx_available:
     fused_topk = fused_topk_cpu
 else:
     biased_grouped_topk = biased_grouped_topk_gpu
-    grouped_topk = grouped_topk_gpu
+    grouped_topk = grouped_topk_xpu if _is_xpu else grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
 
 
