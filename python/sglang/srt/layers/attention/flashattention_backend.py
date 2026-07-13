@@ -918,9 +918,9 @@ class FlashAttentionBackend(AttentionBackend):
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
-                # max_seq_len_q reaches the kernel — use the device max, not the
-                # static max_seq_len_k bound (which only feeds page-table sizing).
-                metadata.max_seq_len_q = int(forward_batch.extend_seq_lens.max().item())
+                # max_seq_len_q reaches the kernel -- needs the real host max,
+                # not the static max_seq_len_k bound.
+                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
             # Setup local attention if enabled
@@ -934,7 +934,9 @@ class FlashAttentionBackend(AttentionBackend):
                 if seq_lens_cpu is not None:
                     max_pf = int(seq_lens_cpu[:batch_size].max().item())
                 else:
-                    max_pf = eager_max_k
+                    # Ratchet needs a true upper bound; a local D2H beats
+                    # poisoning it with max_context_len forever.
+                    max_pf = int(forward_batch.seq_lens[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
 
@@ -2052,6 +2054,8 @@ class FlashAttentionBackend(AttentionBackend):
 
             # Worst-case FULL_MASK tree-mask scratch (bool). build_tree_kernel
             # fills it in-place, so the GPU-only path needs no seq_lens_sum.
+            # Costs max_num_tokens * max_context_len bytes (can reach 100s of
+            # MB at long context) and is fully memset every verify step.
             if not self.skip_prefill:
                 self.cuda_graph_custom_mask = torch.zeros(
                     max_num_tokens
@@ -2163,10 +2167,8 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=self.device,
                     ),
-                    # Merged prefix + draft table: replay uses the static
-                    # max_context_len bound for max_seq_len_k, so the width
-                    # must cover max_context_len + num_draft_tokens (checked
-                    # by assert_buffer_fits in the swa-spec merge).
+                    # Width covers the static max_seq_len_k bound + draft
+                    # columns (checked by assert_buffer_fits at the merge).
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
                         self.max_context_len + self.speculative_num_draft_tokens,
@@ -2503,7 +2505,12 @@ class FlashAttentionBackend(AttentionBackend):
                     # metadata.cu_seqlens_q already set in capture
                     # metadata.cu_seqlens_k is not needed
 
-                    metadata.max_seq_len_k = self.max_context_len
+                    # Tight page-table bound when the CPU mirror is free.
+                    metadata.max_seq_len_k = (
+                        seq_lens_cpu.max().item()
+                        if seq_lens_cpu is not None
+                        else self.max_context_len
+                    )
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
@@ -2664,7 +2671,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
-                metadata.max_seq_len_k = self.max_context_len
+                # Tight page-table bound when the CPU mirror is free.
+                metadata.max_seq_len_k = (
+                    seq_lens_cpu.max().item()
+                    if seq_lens_cpu is not None
+                    else self.max_context_len
+                )
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -2750,7 +2762,12 @@ class FlashAttentionBackend(AttentionBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = self.max_context_len
+            # Tight page-table bound when the CPU mirror is free.
+            metadata.max_seq_len_k = (
+                seq_lens_cpu.max().item()
+                if seq_lens_cpu is not None
+                else self.max_context_len
+            )
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
