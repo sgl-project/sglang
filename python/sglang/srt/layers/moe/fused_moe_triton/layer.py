@@ -25,7 +25,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -89,13 +88,12 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
     ):
-        if a2a_backend.is_mori():
-            group = get_tp_group()
-        else:
-            group = get_tp_group().device_group
-
         return MaybeTboDeepEPDispatcher(
-            group=group,
+            group=(
+                get_tp_group().device_group
+                if not a2a_backend.is_mori()
+                else get_tp_group()
+            ),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
             num_experts=moe_runner_config.num_experts,

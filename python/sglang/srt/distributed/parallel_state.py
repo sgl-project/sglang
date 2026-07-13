@@ -45,7 +45,6 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -1516,6 +1515,7 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
