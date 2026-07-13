@@ -421,7 +421,12 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q.to(k.dtype), k)
+            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+            # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
+            # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
+            # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
+            # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
+            qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -441,7 +446,7 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale * k_scale
 
             if logit_cap > 0:
@@ -478,8 +483,8 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            acc = acc * re_scale[:, None] + tl.dot(p, v.to(tl.float32), out_dtype=tl.float32) * v_scale
 
             e_max = n_e_max
 
@@ -583,8 +588,8 @@ def _fwd_kernel(
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            acc = acc * re_scale[:, None] + tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
 
             e_max = n_e_max
 
@@ -996,7 +1001,12 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+            # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
+            # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
+            # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
+            # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
+            qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -1016,7 +1026,7 @@ def _fwd_kernel_unified(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
 
             qk *= sm_scale_withk
 
