@@ -14,10 +14,12 @@ non-zero unless the diff is empty (PASS).
 
 Handles a method moved onto an existing class (call sites lowered), a method moved to a
 module-level free function (call sites requalified), a free-function-source move to an
-existing module (callers repath their import), and a new-file extract -- where the prep
+existing module (callers repath their import), a new-file extract -- where the prep
 commit staged the whole module body (scaffolding plus def) as a trailing block in the
-source, so the move cuts that tail into the new file (extract_to_new_module). A rename or a
-statement-level reorder relocates no def and is reported unsupported. Runnable directly:
+source, so the move cuts that tail into the new file (extract_to_new_module) -- and an
+intra-file inline-block extract-function (a new helper whose verbatim body is a block carved
+from a sibling function, that block replaced by a call). A rename or a statement-level
+reorder relocates no def and is reported unsupported. Runnable directly:
 
     python3 mechanical_refactor_proof_generator.py <commit>
     python3 mechanical_refactor_proof_generator.py <base>..<tip> \
@@ -298,6 +300,7 @@ class Recipe:
     moves: list = field(default_factory=list)
     assign_moves: list = field(default_factory=list)
     extracts: list = field(default_factory=list)
+    extract_functions: list = field(default_factory=list)
     scatter_extracts: list = field(default_factory=list)
     lowerings: list = field(default_factory=list)
     repaths: list = field(default_factory=list)
@@ -586,6 +589,158 @@ def _scatter_extract_layout(dst_after: str, symbols: list[str]) -> dict | None:
         return None
     header = "".join(lines[: rr._def_span(sym_nodes[0])[0] - 1])
     return {"header": header, "order": [node.name for node in sym_nodes]}
+
+
+def _iter_defs_with_container(
+    tree: ast.AST,
+) -> list[tuple[str | None, ast.AST]]:
+    """(container_class_name_or_None, def_node) for every module-level function and every
+    method one class deep -- the two nesting depths an extract_function helper can land at.
+    """
+    out: list[tuple[str | None, ast.AST]] = []
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append((None, node))
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append((node.name, child))
+    return out
+
+
+def _common_prefix_suffix(a: list[str], b: list[str]) -> tuple[int, int]:
+    """Longest common leading and trailing run of identical lines between two line lists,
+    kept non-overlapping -- isolates the single contiguous region where they differ."""
+    prefix = 0
+    while prefix < len(a) and prefix < len(b) and a[prefix] == b[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < len(a) - prefix
+        and suffix < len(b) - prefix
+        and a[-1 - suffix] == b[-1 - suffix]
+    ):
+        suffix += 1
+    return prefix, suffix
+
+
+def _uniform_reindent(text: str, shift: int) -> str:
+    """Shift every non-blank line's indent by ``shift`` spaces (dedent when negative), on
+    newline-preserving lines. A faithful mirror of the primitive's reindent for blocks without
+    multi-line string interiors; a mismatch just yields no split (never a false positive).
+    """
+    if shift == 0:
+        return text
+    lines = rr._split_keepends(text)
+    if shift < 0:
+        pad = " " * -shift
+        return "".join(ln[-shift:] if ln[:-shift] == pad else ln for ln in lines)
+    pad = " " * shift
+    return "".join(pad + ln if ln.strip() else ln for ln in lines)
+
+
+def _call_names_in(node: ast.AST) -> set[str]:
+    """Names invoked as ``self.<name>(...)`` or ``<name>(...)`` anywhere under ``node``."""
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            if isinstance(sub.func, ast.Attribute):
+                names.add(sub.func.attr)
+            elif isinstance(sub.func, ast.Name):
+                names.add(sub.func.id)
+    return names
+
+
+def _infer_extract_functions(
+    recipe: Recipe, files: dict[str, dict], commit: str, root: str
+) -> None:
+    """Infer intra-file extract_function ops: a new helper ``H`` whose body is a verbatim block
+    cut from another function ``F`` of the same file, with ``F``'s block replaced by a call to
+    ``H`` (optionally an ``lhs = self.H(...)`` assignment mirrored by a ``return lhs`` the helper
+    appends). The relocated body is byte-checked; only the header/call/return are authored. A
+    body whose reindent does not reconstruct the helper (a bundled edit) yields no op, so the
+    residual surfaces it instead of a false pass."""
+    for path, f in files.items():
+        if f.get("new") or f.get("deleted"):
+            continue
+        before_text = _git_output(["show", f"{commit}^:{path}"], root)
+        after_text = _git_output(["show", f"{commit}:{path}"], root)
+        try:
+            before_tree = ast.parse(before_text)
+            after_tree = ast.parse(after_text)
+        except SyntaxError:
+            continue
+        before_lines = rr._split_keepends(before_text)
+        after_lines = rr._split_keepends(after_text)
+        before_defs = _iter_defs_with_container(before_tree)
+        before_keys = {(c, n.name) for c, n in before_defs}
+        for container, helper in _iter_defs_with_container(after_tree):
+            if (container, helper.name) in before_keys:
+                continue
+            if not helper.body:
+                continue
+            sig_indent = helper.col_offset
+            body_first = helper.body[0].lineno
+            header_text = "".join(after_lines[helper.lineno - 1 : body_first - 1])
+            hbody_lines = after_lines[body_first - 1 : helper.end_lineno]
+            hbody_text = "".join(hbody_lines)
+            # F is the one sibling function that changed and now calls the helper.
+            candidates = []
+            for cont, node in before_defs:
+                after_node = next(
+                    (
+                        n
+                        for c, n in _iter_defs_with_container(after_tree)
+                        if c == cont and n.name == node.name
+                    ),
+                    None,
+                )
+                if after_node is None or node.name == helper.name:
+                    continue
+                b_lines = before_lines[node.lineno - 1 : node.end_lineno]
+                a_lines = after_lines[after_node.lineno - 1 : after_node.end_lineno]
+                if b_lines == a_lines:
+                    continue
+                if helper.name not in _call_names_in(after_node):
+                    continue
+                candidates.append((b_lines, a_lines))
+            if len(candidates) != 1:
+                continue
+            f_before, f_after = candidates[0]
+            prefix, suffix = _common_prefix_suffix(f_before, f_after)
+            block = f_before[prefix : len(f_before) - suffix]
+            call_lines = f_after[prefix : len(f_after) - suffix]
+            if not block or not call_lines:
+                continue
+            body_indent = len(block[0]) - len(block[0].lstrip(" "))
+            body_text = "".join(block)
+            expected = _uniform_reindent(body_text, sig_indent + 4 - body_indent)
+            return_text: str | None = None
+            if hbody_text == expected:
+                return_text = None
+            elif hbody_text.startswith(expected):
+                tail = hbody_text[len(expected) :]
+                return_text = tail.strip("\n") or None
+                if return_text is None:
+                    continue
+            else:
+                continue
+            recipe.extract_functions.append(
+                {
+                    "src": path,
+                    "dst": path,
+                    "name": helper.name,
+                    "signature": header_text,
+                    "body": body_text,
+                    "body_indent": body_indent,
+                    "call": "".join(call_lines),
+                    "return_text": return_text,
+                    "into_class": container,
+                    "before": _next_sibling_def_name(
+                        after_tree, helper.name, container
+                    ),
+                }
+            )
 
 
 def infer_recipe(commit: str, root: str) -> Recipe:
@@ -961,6 +1116,11 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             if key not in before_tc:
                 recipe.typechecking_additions.append({"path": path, "text": stmt})
 
+    # An intra-file helper carved out of a sibling function's body (its block replaced by a
+    # call) is an extract_function -- inferred only when no cross-file move already explains it.
+    if not recipe.moves:
+        _infer_extract_functions(recipe, files, commit, root)
+
     # A move source the commit deletes (its defs all relocated, leaving only scaffolding) is
     # removed after the moves; move_symbol only cuts defs, it does not delete the emptied file.
     move_srcs = {mv["src"] for mv in recipe.moves}
@@ -968,7 +1128,12 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         if f.get("deleted") and path in move_srcs:
             recipe.deletes.append(path)
 
-    if not recipe.moves and not recipe.extracts and not recipe.scatter_extracts:
+    if (
+        not recipe.moves
+        and not recipe.extracts
+        and not recipe.scatter_extracts
+        and not recipe.extract_functions
+    ):
         recipe.supported = False
         if not recipe.notes:
             recipe.notes.append(
@@ -1041,6 +1206,23 @@ def _recipe_ops(recipe: Recipe) -> list:
                 "move_assign",
                 (am["name"],),
                 {"src": am["src"], "dst": am["dst"], "before": am.get("before")},
+            )
+        )
+    for ex in recipe.extract_functions:
+        ops.append(
+            (
+                "extract_function",
+                (ex["src"], ex["dst"]),
+                {
+                    "name": ex["name"],
+                    "signature": ex["signature"],
+                    "body": ex["body"],
+                    "body_indent": ex["body_indent"],
+                    "call": ex["call"],
+                    "return_text": ex["return_text"],
+                    "into_class": ex["into_class"],
+                    "before": ex["before"],
+                },
             )
         )
     for ex in recipe.extracts:
@@ -1158,7 +1340,12 @@ def generate_range(
             recipe = infer_recipe(commit, root)
             script = recipe_to_script(recipe, subject)
             (scripts_dir / f"{commit[:9]}.py").write_text(script)
-            relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
+            relocates = bool(
+                recipe.moves
+                or recipe.extracts
+                or recipe.scatter_extracts
+                or recipe.extract_functions
+            )
             supported = recipe.supported and relocates
             notes = recipe.notes
             if supported:
