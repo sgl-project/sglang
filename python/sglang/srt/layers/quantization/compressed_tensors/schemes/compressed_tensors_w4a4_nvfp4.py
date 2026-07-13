@@ -139,7 +139,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
-        output_shape = [x.shape[0], w_n]
+        # Preserve all leading dims for 3D+ inputs (e.g. [batch, seq, hidden])
+        output_shape = list(x.shape[:-1]) + [w_n]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
@@ -169,4 +170,4 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         )
         if bias is not None:
             out = out + bias
-        return out.view(*output_shape)
+        return out.reshape(*output_shape)

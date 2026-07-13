@@ -140,11 +140,21 @@ def cutlass_scaled_fp4_mm(
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # Handle 3D tensors (e.g. [batch, seq, hidden]) by flattening to 2D for CUTLASS
+    orig_shape = a.shape
+    if a.ndim == 3:
+        a = a.reshape(-1, a.shape[-1])
+        block_scale_a = block_scale_a.reshape(-1, block_scale_a.shape[-1])
+    if b.ndim == 3:
+        b = b.reshape(-1, b.shape[-1])
+        block_scale_b = block_scale_b.reshape(-1, block_scale_b.shape[-1])
     assert a.ndim == 2 and b.ndim == 2
     m, n = a.shape[0], b.shape[0]
     out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     module = _jit_nvfp4_scaled_mm_module()
     module.cutlass_scaled_fp4_mm(out, a, b, block_scale_a, block_scale_b, alpha)
+    if len(orig_shape) == 3:
+        out = out.reshape(orig_shape[0], -1, n)
     return out
 
 
