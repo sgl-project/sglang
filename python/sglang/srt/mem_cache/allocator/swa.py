@@ -305,13 +305,35 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return alloc_full_indices
 
+    def _filter_unreleased_indices(
+        self, allocator, indices: torch.Tensor
+    ) -> torch.Tensor:
+        if indices.numel() == 0 or self.page_size == 1:
+            return indices
+
+        unavailable_pages = []
+        if allocator.free_pages.numel() > 0:
+            unavailable_pages.append(allocator.free_pages)
+        if allocator.release_pages.numel() > 0:
+            unavailable_pages.append(allocator.release_pages)
+        if not unavailable_pages:
+            return indices
+
+        pages = indices // self.page_size
+        unavailable_pages = torch.cat(unavailable_pages)
+        return indices[~torch.isin(pages, unavailable_pages)]
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
+            full_free_index = self._filter_unreleased_indices(
+                self.full_attn_allocator, free_index
+            )
+            if full_free_index.numel() > 0:
+                self.full_attn_allocator.free(full_free_index)
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
@@ -340,7 +362,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        swa_indices = self._filter_unreleased_indices(
+            self.swa_attn_allocator, swa_indices
+        )
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
