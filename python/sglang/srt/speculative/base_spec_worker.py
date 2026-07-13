@@ -295,7 +295,9 @@ class BaseSpecWorker(ABC):
         return self._target_worker
 
     @property
-    def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
+    def draft_worker(self) -> Optional[EagleDraftWorkerBase | TpModelWorker]:
+        # dflash / dspark drive the draft model through a plain TpModelWorker;
+        # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
 
     @property
