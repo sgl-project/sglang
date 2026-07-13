@@ -161,9 +161,6 @@ from sglang.srt.model_executor.model_runner_components.weight_exporter import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    ModelRunnerKVCacheMixin,
-)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
@@ -246,7 +243,7 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
-class ModelRunner(ModelRunnerKVCacheMixin):
+class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
