@@ -46,9 +46,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
-    compute_post_capture_kv_resize,
-)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -91,27 +88,6 @@ class ModelRunnerKVCacheMixin:
         return self.kv_cache_configurator._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
         )
-
-    def post_capture_resize_kv_pool(self: ModelRunner):
-        resize = compute_post_capture_kv_resize(self)
-        self.max_total_num_tokens = resize.max_total_num_tokens
-        if self.is_hybrid_swa:
-            self.full_max_total_num_tokens = resize.full_max_total_num_tokens
-            self.swa_max_total_num_tokens = resize.swa_max_total_num_tokens
-        if self.memory_pool_config is not None:
-            self.memory_pool_config.max_total_num_tokens = resize.max_total_num_tokens
-            self.memory_pool_config.full_max_total_num_tokens = (
-                resize.full_max_total_num_tokens
-            )
-            self.memory_pool_config.swa_max_total_num_tokens = (
-                resize.swa_max_total_num_tokens
-            )
-        if resize.capped_max_running_requests is not None:
-            self.max_running_requests = resize.capped_max_running_requests
-            if self.memory_pool_config is not None:
-                self.memory_pool_config.max_running_requests = (
-                    resize.capped_max_running_requests
-                )
 
     def _init_unified_mamba_pools(
         self: ModelRunner, *, max_num_reqs: int, max_total_num_tokens: int
