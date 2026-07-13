@@ -1745,6 +1745,16 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = False
+    enable_pp_spec_decode: A[
+        bool,
+        Arg(
+            help="Enable pipeline parallelism + speculative decoding (EAGLE/MTP). "
+            "Experimental: requires --disable-overlap-schedule, topk=1, "
+            "single-node, no DP attention, no EP/A2A. "
+            "The draft model runs only on the last PP stage.",
+            resolvable=True,
+        ),
+    ] = False
     speculative_adaptive: A[
         bool,
         "Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
@@ -6928,9 +6938,37 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            if self.enable_pp_spec_decode:
+                # PP + speculative decoding: experimental, restricted scope
+                assert self.disable_overlap_schedule, (
+                    "PP + speculative decoding requires --disable-overlap-schedule"
+                )
+                assert self.speculative_algorithm is not None, (
+                    "PP + speculative decoding requires a speculative algorithm"
+                )
+                assert self.speculative_eagle_topk == 1, (
+                    "PP + speculative decoding currently supports topk=1 only"
+                )
+                assert self.nnodes == 1, (
+                    "PP + speculative decoding is single-node only"
+                )
+                assert not self.enable_dp_attention, (
+                    "PP + speculative decoding does not support DP attention"
+                )
+                assert self.moe_a2a_backend == "none", (
+                    "PP + speculative decoding does not support EP/A2A"
+                )
+                logger.warning(
+                    "PP + speculative decoding is experimental. "
+                    "Current restrictions: topk=1, non-overlap schedule, "
+                    "single-node, no DP attention, no EP/A2A. "
+                    "The draft model runs only on the last PP stage."
+                )
+            else:
+                assert (
+                    self.disable_overlap_schedule
+                    and self.speculative_algorithm is None
+                ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

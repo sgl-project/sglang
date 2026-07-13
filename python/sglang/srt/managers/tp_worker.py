@@ -255,6 +255,14 @@ class TpModelWorker(BaseTpWorker):
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
+
+        # PP + spec: the draft model is NOT pipeline-partitioned. It runs as
+        # a single-stage model on the last PP stage's GPU. Override pp_size
+        # and pp_rank so the draft model runner sees a single-stage topology
+        # for weight loading, layer partitioning, and memory measurement.
+        if is_draft_worker and self.pp_size > 1:
+            self.pp_size = 1
+            self.pp_rank = 0
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -307,12 +315,18 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        if is_draft_worker and server_args.pp_size > 1:
+            # PP+spec: the draft worker exists only on the last PP stage, so a
+            # world-group broadcast would deadlock (first-stage ranks never
+            # join). The seed was already synced during target worker init.
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule

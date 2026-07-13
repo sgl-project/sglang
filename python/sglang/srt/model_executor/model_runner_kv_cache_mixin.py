@@ -105,10 +105,17 @@ class ModelRunnerKVCacheMixin:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # PP+spec draft worker: skip distributed memory sync (only exists on
+        # last PP stage; world-group sync would deadlock).
+        _pp_spec_draft = (
+            getattr(self, "is_draft_worker", False)
+            and self.server_args.enable_pp_spec_decode
+            and self.server_args.pp_size > 1
+        )
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft,
             cpu_group=get_world_group().cpu_group,
         )
 

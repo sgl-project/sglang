@@ -604,9 +604,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            if not (self.is_draft_worker and server_args.enable_pp_spec_decode):
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self._model_update_group = {}
@@ -771,14 +772,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
+        if not (
+            self.server_args.enable_pp_spec_decode
+            and self.is_draft_worker
+        ):
+            assert (
+                (not model_has_mtp_layers)
+                or (self.spec_algorithm.is_none())
+                or (
+                    (not self.spec_algorithm.is_none())
+                    and (self.num_effective_layers == model_num_layers)
+                )
+            ), "PP is not compatible with MTP models."
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -1286,10 +1291,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
+        # PP+spec draft worker: skip distributed memory sync (only exists on
+        # last PP stage; world-group sync would deadlock).
+        _pp_spec_draft = (
+            self.is_draft_worker
+            and self.server_args.enable_pp_spec_decode
+            and self.server_args.pp_size > 1
+        )
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()

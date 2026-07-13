@@ -336,6 +336,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
 
+        # PP+spec: the target's embedding lives on the first PP stage
+        # (PPMissingLayer on the last stage). The draft keeps its own
+        # embedding weights and shares only the target's lm_head.
+        if (
+            self.server_args.enable_pp_spec_decode
+            and self.server_args.pp_size > 1
+            and embed is None
+        ):
+            # Use the draft's own embedding (loaded from checkpoint)
+            draft_embed, _ = self.draft_runner.model.get_embed_and_head()
+            embed = draft_embed
+            assert embed is not None, (
+                "PP+spec: draft model embedding is None after loading. "
+                "The draft checkpoint must contain embedding weights."
+            )
+            assert head is not None, (
+                "PP+spec: target lm_head is None on the last PP stage. "
+                "This should not happen — lm_head belongs to the last stage."
+            )
+
         def maybe_share_target_lm_head():
             if (
                 target_lm_head is not None
