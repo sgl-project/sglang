@@ -156,7 +156,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        self.padded_static_len = -1
 
         # Fixed window: every step extends each request by the same number of
         # tokens, which lets all steps share one buffer set.
@@ -301,7 +300,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             capture_hidden_mode=capture_mode,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            padded_static_len=self.padded_static_len,
             extend_start_loc=extend_start_loc,
             extend_num_tokens=self.num_tokens_per_req * bs,
             num_token_non_padded_cpu=self.num_tokens_per_req * bs,
