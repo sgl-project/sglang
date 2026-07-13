@@ -680,6 +680,10 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                if req.return_sampling_mask:
+                    self.batch_result_processor.add_sampling_mask_return_values(
+                        i, req, logits_output
+                    )
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()

@@ -10,6 +10,7 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -35,7 +36,6 @@ from sglang.srt.layers.quantization.fp4_utils import (
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
@@ -1620,7 +1620,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
-            from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )

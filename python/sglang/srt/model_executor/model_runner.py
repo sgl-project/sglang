@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -133,7 +134,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -842,14 +842,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return None
         return getattr(hf_config, "index_topk", None)
 
-    def decode_num_tokens_per_bs(
+    def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
             if num_draft_tokens is None:
                 num_draft_tokens = self.server_args.speculative_num_draft_tokens
-            return self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            return self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                 num_draft_tokens, self.is_draft_worker
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
@@ -857,9 +857,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_bs = self.decode_num_tokens_per_bs()
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
-        return max(capture_bs) * num_tokens_per_bs
+        num_tokens_per_req = self.decode_num_tokens_per_req()
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+        return max(capture_bs) * num_tokens_per_req
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -1631,10 +1631,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         for module in self.model.modules():
             if not isinstance(module, (TopK, HashTopK)):
                 continue
-            if (
-                not module.enable_deepep_waterfill
-                or module.deepep_waterfill_balancer is not None
-            ):
+            if not module.enable_waterfill or module.waterfill_balancer is not None:
                 continue
             if num_routed_experts is None:
                 num_routed_experts = getattr(
@@ -1642,14 +1639,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 if num_routed_experts is None:
                     raise ValueError(
-                        "DeepEP waterfill requires model config n_routed_experts."
+                        "Waterfill requires model config n_routed_experts."
                     )
             if balancer_cls is None:
-                from sglang.srt.layers.moe.deepep_waterfill import (
-                    DeepEPWaterfillBalancer,
-                )
+                from sglang.srt.layers.moe.waterfill import WaterfillBalancer
 
-                balancer_cls = DeepEPWaterfillBalancer
+                balancer_cls = WaterfillBalancer
             # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
             # Redundant experts therefore need to be included in the per-rank
             # expert count used for Waterfill's shared-expert slot remapping.
@@ -1660,7 +1655,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 routed_scaling_factor = module.topk_config.routed_scaling_factor
             else:
                 routed_scaling_factor = module.routed_scaling_factor
-            module.deepep_waterfill_balancer = balancer_cls(
+            module.waterfill_balancer = balancer_cls(
                 num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
@@ -1672,7 +1667,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_prepared += 1
         if num_prepared:
             log_info_on_rank0(
-                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
+                logger, f"Prepared {num_prepared} Waterfill TopK modules."
             )
 
     def _init_lplb_solvers(self):
@@ -2239,7 +2234,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         Phase 2 (dense LoRA batch metadata) is handled later in
         CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        because it needs capture-time parameters (max_bs, num_tokens_per_req)
         that are only available at that stage.
         """
         from sglang.srt.lora.layers import FusedMoEWithLoRA
@@ -2645,20 +2640,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         role = "draft" if self.is_draft_worker else "target"
         if self.spec_algorithm.is_speculative():
             capture_name = f"{role} verify"
-            num_tokens_per_bs = (
-                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            num_tokens_per_req = (
+                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                     self.server_args.speculative_num_draft_tokens,
                     self.is_draft_worker,
                 )
             )
         else:
             capture_name = f"{role} decode"
-            num_tokens_per_bs = 1
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+            num_tokens_per_req = 1
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
             f"Capture {capture_name} {graph_backend[self.device]} begin. "
-            f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
+            f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
             f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
 

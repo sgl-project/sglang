@@ -104,8 +104,8 @@ def _all_gather_dsa_trtllm_fp8_kv(
 _is_hip = is_hip()
 
 if _is_hip:
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
     try:
         from aiter import (  # noqa: F401
