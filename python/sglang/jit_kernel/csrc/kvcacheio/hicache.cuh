@@ -82,43 +82,69 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
 #else
 // NVIDIA CUDA PTX inline assembly (original code)
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp;
   asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
   return uint1{tmp};
+#else
+  return uint1{__builtin_nontemporal_load(&src->x)};
+#endif
 }
 
 SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp0, tmp1;
   asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
   return uint2{tmp0, tmp1};
+#else
+  native_uint2 tmp = __builtin_nontemporal_load(reinterpret_cast<const native_uint2*>(src));
+  return __builtin_bit_cast(uint2, tmp);
+#endif
 }
 
 SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
+#ifndef USE_ROCM
   uint32_t tmp0, tmp1, tmp2, tmp3;
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
                : "l"(src));
   return uint4{tmp0, tmp1, tmp2, tmp3};
+#else
+  native_uint4 tmp = __builtin_nontemporal_load(reinterpret_cast<const native_uint4*>(src));
+  return __builtin_bit_cast(uint4, tmp);
+#endif
 }
 
 SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#ifndef USE_ROCM
   uint32_t tmp = value.x;
   asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#else
+  __builtin_nontemporal_store(value.x, &dst->x);
+#endif
 }
 
 SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#ifndef USE_ROCM
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#else
+  __builtin_nontemporal_store(__builtin_bit_cast(native_uint2, value), reinterpret_cast<native_uint2*>(dst));
+#endif
 }
 
 SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#ifndef USE_ROCM
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   uint32_t tmp2 = value.z;
   uint32_t tmp3 = value.w;
   asm volatile(
       "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#else
+  __builtin_nontemporal_store(__builtin_bit_cast(native_uint4, value), reinterpret_cast<native_uint4*>(dst));
+#endif
 }
 #endif  // USE_ROCM
 

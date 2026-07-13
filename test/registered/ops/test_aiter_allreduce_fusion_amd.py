@@ -418,7 +418,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 )
             )
             stack.enter_context(
-                mock.patch.object(comm, "get_global_server_args", lambda: server_args)
+                mock.patch.object(comm, "get_server_args", lambda: server_args)
             )
             from sglang.srt.runtime_context import get_flags
 

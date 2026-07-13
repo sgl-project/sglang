@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 import numpy as np
 import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
-    can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
 )
 from sglang.jit_kernel.hicache import (
@@ -1683,25 +1683,37 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
-    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        """Return True if per-page strides are multiples of *page_size_bytes*.
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+_is_mps = is_mps()
+if _is_cuda or _is_hip:
+    from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
 
-        When O_DIRECT is used with any file-based NIXL backend, every data pointer
-        passed to the kernel must be page-aligned.  In zero-copy mode the
-        pointer for KV page ``p`` is:
+logger = logging.getLogger(__name__)
 
-            base_ptr + p * page_size * layer_num * kv_cache_dim * itemsize
 
-        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
-        stride must itself be a multiple of the OS page size.
-        """
-        if self.layout not in ("page_first", "page_first_direct"):
-            return False
-        stride = (
-            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
-        )
-        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
-        return base_aligned and stride % page_size_bytes == 0
+from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host.base import (
+    _WRITE_BACK_STAGING_PAGE_CHUNK,
+    HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    sync_fixed_hicache_size,
+    synchronized,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    get_allocator_from_storage,
+)
+from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 
 class MambaPoolHost(HostKVCache):
@@ -3290,7 +3302,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.layer_num = device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -3423,6 +3435,10 @@ class DSAIndexerPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
+        host_layer = self._host_layer_index(layer_id)
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -3430,7 +3446,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
-                    src=self.index_k_with_scale_buffer[layer_id],
+                    src=self.index_k_with_scale_buffer[host_layer],
                     dst=device_pool.index_k_with_scale_buffer[layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
@@ -3442,7 +3458,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst=device_pool.index_k_with_scale_buffer[layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
-                    layer_id=layer_id,
+                    layer_id=host_layer,
                     item_size=self.indexer_page_stride_size,
                     src_layout_dim=self.indexer_layout_dim,
                 )
@@ -3451,7 +3467,7 @@ class DSAIndexerPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    src_layers=[self.index_k_with_scale_buffer[host_layer]],
                     dst_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
@@ -3463,7 +3479,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_ptrs=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
-                    layer_id=layer_id,
+                    layer_id=host_layer,
                     page_size=1,
                 )
             else:
@@ -3471,9 +3487,57 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        host_layer = self._host_layer_index(layer_id)
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        if use_kernel:
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=device_pool.index_k_with_scale_buffer[layer_id],
+                    dst=self.index_k_with_scale_buffer[host_layer],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                )
+            elif self.layout == "page_first":
+                raise ValueError(
+                    "Layer-sharded DSA indexer HiCache backup with page_first "
+                    "layout is not supported without a per-layer LF->PF kernel."
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
+                    dst_layers=[self.index_k_with_scale_buffer[host_layer]],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
+            else:
+                raise ValueError(
+                    "Layer-sharded direct DSA indexer backup only supports "
+                    f"layer_first layout, got {self.layout}"
+                )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
