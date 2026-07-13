@@ -197,6 +197,7 @@ class KimiK2Detector(BaseFormatDetector):
                         tool_index=local_tool_index,
                         name=function_name,
                         parameters=function_args,
+                        tool_call_id=function_id,
                     )
                 )
                 local_tool_index += 1
@@ -328,6 +329,9 @@ class KimiK2Detector(BaseFormatDetector):
                                 else None
                             ),
                             parameters=argument_diff,
+                            # Capture the model-emitted id on the name-carrying
+                            # delta so kimi_k2_raw_id can round-trip it (RL).
+                            tool_call_id=function_id if name_just_resolved else None,
                         )
                     )
                     if argument_diff:
@@ -467,3 +471,23 @@ class KimiK2Detector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "kimi"
+
+
+class KimiK2RawIdDetector(KimiK2Detector):
+    """
+    Variant of KimiK2Detector that preserves the model-emitted tool_call_id verbatim.
+
+    The default kimi_k2 path renumbers ids via `history_tool_calls_cnt + tool_index`
+    in the serving layer so that multi-turn conversations get globally unique,
+    monotonically increasing ids (see PR #10600). That is the right behavior for
+    chat use cases.
+
+    RL training has the opposite requirement: the trajectory must round-trip the
+    exact tool_call_id the model produced (e.g. `functions.foo:5`), so that the
+    follow-up tool result turn references the same id the policy emitted. This
+    subclass exists purely as a marker so the serving layer can branch on the
+    parser name and use `ToolCallItem.tool_call_id` directly. Parsing logic
+    is identical to KimiK2Detector.
+    """
+
+    pass
