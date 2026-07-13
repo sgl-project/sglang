@@ -219,9 +219,15 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
+    "ascend",
+    "fa3",
+    "fa4",
+    "flashinfer",
+    "triton",
+]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -1655,7 +1661,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1691,6 +1697,37 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_block_size: A[
+        Optional[int],
+        "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
+    ] = None
+    speculative_dspark_sps_table_path: A[
+        Optional[str],
+        "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
+        "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
+        "scheduler (cap-accept / compact). Omit for an uninitialized flat "
+        "constant-SPS table: the budget degenerates to verify-all (zero throughput "
+        "gain by itself).",
+    ] = None
+    speculative_dspark_confidence_sts_path: A[
+        Optional[str],
+        "DSPARK only. Optional path to a per-position STS (sequential temperature "
+        "scaling) calibration JSON, fit offline with sglang.benchmark.dspark_sts_fit. "
+        "Calibrates the confidence-head survival probabilities the ragged-verify "
+        "scheduler consumes. Omit to use identity (no calibration); losslessness is "
+        "unaffected either way.",
+    ] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: A[
+        bool,
+        "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "
+        "the total verify-token count reaches the cuda-graph tier the forward is "
+        "already padded to: round the dp-max scheduled total up to the captured "
+        "token bucket and let the top-k allocator admit that many real draft tokens "
+        "(confidence-ordered). This recovers the padding the forward pays for anyway "
+        "-- both the cuda-graph bucket round-up and the dp cross-rank max -- turning "
+        "it into extra real verification at the same step time. Off by default; when "
+        "off the schedule is byte-for-byte unchanged.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -2410,9 +2447,9 @@ class ServerArgs:
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
     ] = 1
-    optimistic_prefill_retries: A[
+    optimistic_prefill_attempts: A[
         int,
-        "Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        "Number of optimistic prefill forward passes that skip the bootstrap wait.",
     ] = 0
 
     # -------------------------------------------------------------------------
@@ -3458,6 +3495,21 @@ class ServerArgs:
         """
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
+
+        # Breakable is the general CUDA default, but it is not compatible with
+        # multimodal prefill. Models on this allowlist have had their decoder
+        # prefill validated under tc_piecewise; the vision encoder remains
+        # eager outside the captured LM forward.
+        if (
+            self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+        ):
+            logger.info(
+                "Using tc_piecewise CUDA graph for validated multimodal "
+                "decoder prefill."
+            )
+            self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+
         if self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
@@ -5225,10 +5277,31 @@ class ServerArgs:
         if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
+            original_chunked_prefill_size = self.chunked_prefill_size
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                f"DP attention is enabled. chunked prefill size is adjusted "
+                f"from {original_chunked_prefill_size} to {self.chunked_prefill_size}."
             )
+
+            # The prefill CUDA graph max_bs was derived from the pre-DP-division
+            # chunked_prefill_size in _handle_gpu_memory_settings (which runs
+            # before this handler). Re-clamp it (and the captured shape list) to
+            # the per-DP-rank chunked_prefill_size so breakable CUDA graph
+            # capture never exceeds the MoE all-to-all's max_num_tokens budget,
+            # which is also sized from the DP-adjusted chunked_prefill_size.
+            prefill_cfg = self.cuda_graph_config.prefill
+            if (
+                prefill_cfg.backend != Backend.DISABLED
+                and prefill_cfg.max_bs is not None
+                and prefill_cfg.max_bs > self.chunked_prefill_size
+                and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
+            ):
+                prefill_cfg.max_bs = self.chunked_prefill_size
+                if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
+                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
+                        prefill_cfg.max_bs
+                    )
 
         # The dp-lm-head validation moved to the resolution pipeline
         # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
@@ -6159,9 +6232,10 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                if attention_backend not in ["fa3", "triton"]:
+                deepseek_deterministic_attention_backends = ["fa3", "triton"]
+                if attention_backend not in deepseek_deterministic_attention_backends:
                     raise ValueError(
-                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {deepseek_deterministic_attention_backends} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
@@ -6351,21 +6425,21 @@ class ServerArgs:
 
         # Handle optimistic prefill validation
         if (
-            self.optimistic_prefill_retries > 0
+            self.optimistic_prefill_attempts > 0
             and self.disaggregation_mode == "prefill"
         ):
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
             elif self.enable_hierarchical_cache:
                 logger.warning("Optimistic prefill does not support hierarchical cache")
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
             elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
                     "Optimistic prefill does not support models that use "
                     "mamba radix cache."
                 )
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
 
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -7480,6 +7554,7 @@ class ServerArgs:
             return None
         if not host or not (0 < port < 65536):
             return None
+
         return {
             "publisher": cfg.publisher,
             "endpoint_host": host,
