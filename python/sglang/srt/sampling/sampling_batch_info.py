@@ -31,6 +31,8 @@ class SamplingBatchInfo:
     # Whether all requests use greedy sampling
     is_all_greedy: bool
 
+    is_any_greedy: bool
+
     # Whether any requests use top_p sampling
     need_top_p_sampling: bool
 
@@ -197,6 +199,7 @@ class SamplingBatchInfo:
             min_ps=min_ps,
             sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
@@ -437,6 +440,7 @@ class SamplingBatchInfo:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
+        self.is_any_greedy |= other.is_any_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
