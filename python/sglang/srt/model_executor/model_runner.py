@@ -2730,6 +2730,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
+        if (
+            self.server_args.enable_lora
+            and not self.lora_manager.supports_prefill_cuda_graph
+        ):
+            logger.warning(
+                "Disable prefill CUDA graph because the current LoRA "
+                "configuration does not support it (unsupported LoRA backend "
+                "or MoE LoRA)."
+            )
+            self.prefill_cuda_graph_runner = self.eager_runner
+            return
+
         # Disable prefill CUDA graph for non-language models
         if not hasattr(self.model, "model"):
             logger.warning(

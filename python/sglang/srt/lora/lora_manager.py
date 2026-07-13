@@ -136,6 +136,55 @@ class LoRAManager:
             init_lora_two_stream_resources(self.device)
         # ===== END TO BE REFACTORED ====
 
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate static LoRA batch metadata for the prefill CUDA graph.
+
+        Called during PrefillCudaGraphRunner.__init__() (before capture) when
+        the prefill graph backend captures LoRA kernels. Sized by the largest
+        captured prefill token bucket.
+        """
+        self.lora_backend.init_prefill_cuda_graph_batch_info(
+            max_num_tokens=max_num_tokens
+        )
+
+    @property
+    def supports_prefill_cuda_graph(self) -> bool:
+        """Whether LoRA kernels can be captured into the prefill CUDA graph.
+
+        MoE LoRA is excluded for now: its intermediate CUDA graph buffers are
+        sized by the decode batch size, not by prefill token buckets.
+        """
+        return (
+            self.lora_backend.supports_prefill_cuda_graph
+            and not self.lora_backend.is_moe_lora
+        )
+
+    def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch can be served from the static prefill CUDA graph
+        LoRA metadata.
+
+        Used both by prepare_lora_batch (to pick the in-place update path) and
+        by PrefillCudaGraphRunner.can_run_graph (to reject LoRA batches whose
+        metadata was not prepared in the static buffers). The two must stay
+        consistent: a graph replay with LoRA enabled must only happen for a
+        batch whose metadata went through the in-place path.
+        """
+        max_bs = self.lora_backend.prefill_cuda_graph_max_bs
+        max_tokens = self.lora_backend.prefill_cuda_graph_max_tokens
+        if max_bs is None or max_tokens is None:
+            return False
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            return False
+        if forward_batch.extend_num_tokens is None:
+            return False
+        return (
+            forward_batch.batch_size <= max_bs
+            and forward_batch.extend_num_tokens <= max_tokens
+        )
+
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
     ):
@@ -326,6 +375,12 @@ class LoRAManager:
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        # Extend batches eligible for the prefill CUDA graph update the static
+        # prefill batch info in place instead of allocating fresh metadata, so
+        # kernels captured in the prefill graph read current values at replay.
+        use_prefill_cuda_graph = (
+            not use_cuda_graph and self.can_use_prefill_cuda_graph(forward_batch)
+        )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
@@ -346,6 +401,7 @@ class LoRAManager:
             lora_ranks=lora_ranks,
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices

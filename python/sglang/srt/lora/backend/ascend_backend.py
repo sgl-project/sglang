@@ -237,6 +237,7 @@ class AscendLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
