@@ -367,11 +367,9 @@ class TestDSAIndexer(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [total_len - q_len] * batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [total_len - q_len] * batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[total_len - q_len] * batch_size,
                 extend_seq_lens=torch.tensor([q_len] * batch_size, device=self.device),
-                extend_seq_lens_cpu=torch.tensor([q_len] * batch_size, device="cpu"),
+                extend_seq_lens_cpu=[q_len] * batch_size,
             )
         else:  # ForwardMode.DECODE
             decode_len = 1

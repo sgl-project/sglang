@@ -140,13 +140,14 @@ class FlashInferFusedAllReduceParams:
         world_size: int,
         use_fp32_lamport: bool = False,
         max_token_num: int = 1024,
+        fp32_acc: bool = True,
     ):
         self.rank = rank
         self.world_size = world_size
         self.use_fp32_lamport = use_fp32_lamport
         self.trigger_completion_at_end = True
         self.launch_with_pdl = True
-        self.fp32_acc = True
+        self.fp32_acc = fp32_acc
         self.max_token_num = max_token_num
 
     def get_trtllm_fused_allreduce_kwargs(self):
@@ -1135,6 +1136,12 @@ def main():
         help="Disable oneshot mode for FlashInfer operations",
     )
     parser.add_argument(
+        "--fp32-acc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use FP32 accumulation in FlashInfer fused all-reduce (default: enabled).",
+    )
+    parser.add_argument(
         "--warmup", type=int, default=5, help="Number of warmup iterations"
     )
     parser.add_argument(
@@ -1238,6 +1245,7 @@ def main():
                 rank=rank,
                 world_size=world_size,
                 max_token_num=max_num_token,
+                fp32_acc=args.fp32_acc,
             )
 
     # Collect all results for markdown export
