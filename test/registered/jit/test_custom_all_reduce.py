@@ -147,8 +147,14 @@ def _precompile_kernels(num_gpus: List[int]) -> None:
         f"host={socket.gethostname()} jit_cache_dir={cache_dir} "
         f"exists={cache_dir.is_dir()} custom_all_reduce_entries={len(cached)}"
     )
-    for name in cached:
+    # Long-lived runners accumulate hundreds of entries (old tvm-ffi versions,
+    # handshake modules); list only the pull/push kernel entries this test
+    # actually reuses, capped, to keep the CI log readable.
+    pull_push = [n for n in cached if "_pull_" in n or "_push_" in n]
+    for name in pull_push[:16]:
         _diag(f"  cached: {name}")
+    if len(pull_push) > 16:
+        _diag(f"  ... and {len(pull_push) - 16} more pull/push entries")
     tic = time.perf_counter()
     ctx = multiprocessing.get_context("spawn")
     procs: list[tuple[torch.dtype, int, SpawnProcess]] = []
@@ -277,9 +283,15 @@ if __name__ == "__main__":
     # Only sweep the common world sizes (2, 4, 8) by default: testing every
     # count in 2..8 serially overruns the per-file CI time budget, and 3/5/6/7
     # are rare in practice. Use --num-gpu to exercise them explicitly.
+    # timeout: measured on a slow CI runner (radixark-wk03, warm JIT cache) the
+    # in-CI reduced sweep takes 98s @ 2 GPUs and 209s @ 4 GPUs, and the 8-GPU
+    # invocation was killed by the default 600s budget at 23/24 tests while
+    # still making steady progress. 900s covers it; run_suite's 1200s per-file
+    # limit stays the overall backstop.
     multigpu_pytest_main(
         __name__,
         __file__,
         num_gpus=(2, 4, 8),
         pre_launch_fn=_precompile_kernels,
+        timeout=900,
     )
