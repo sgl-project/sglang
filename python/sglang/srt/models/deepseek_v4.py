@@ -680,6 +680,15 @@ class MQALayer(MqaAttentionBase):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
+        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+            # Quantize the nope payload from bf16-rounded values (the fused
+            # kernel quantizes from fp32 registers; the bf16 rounding moves
+            # values across fp8 bins relative to bf16-sourced consumers).
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            attn_backend.store_cache(
+                layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
+            )
+            return
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
