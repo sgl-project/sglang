@@ -909,12 +909,18 @@ def setup_state_kv_args(
                     token_to_kv_pool.get_c128_state_buf_infos()
                 )
                 if c128_ptrs:
+                    c128_layout = (
+                        token_to_kv_pool.get_c128_state_transfer_layout()
+                        if hasattr(token_to_kv_pool, "get_c128_state_transfer_layout")
+                        else None
+                    )
                     append_state_component(
                         kv_args,
                         StateType.C128_STATE,
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        data_layout=c128_layout,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (

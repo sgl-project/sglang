@@ -181,17 +181,15 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
-            "enable_dsa_cache_layer_split",
+            "cp_cache_layer_split",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
-            "cp_kv_layer_split",
         ]
         for field in required_fields:
             self.assertIn(field, payload)
-        self.assertFalse(payload["enable_dsa_cache_layer_split"])
+        self.assertFalse(payload["cp_cache_layer_split"])
         self.assertEqual(payload["prefill_http_port"], 30000)
-        self.assertFalse(payload["cp_kv_layer_split"])
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -283,15 +281,14 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.system_dp_rank = 0
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
-        mgr.cp_kv_layer_split = False
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
+        mgr.kv_args.cp_cache_layer_split = False
 
         mgr.server_args = MagicMock()
         mgr.server_args.kv_cache_dtype = "auto"
         mgr.server_args.load_balance_method = "follow_bootstrap_room"
-        mgr.server_args.enable_dsa_cache_layer_split = False
         mgr.server_args.port = 30000
 
         return mgr

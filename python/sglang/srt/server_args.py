@@ -100,19 +100,7 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
-CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS = (
-    "DeepseekV4ForCausalLM",
-    "DeepseekV4ForCausalLMNextN",
-)
-CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS = ("file", "mooncake")
-MIMO_V2_MODEL_ARCHS = (
-    "MiMoV2ForCausalLM",
-    "MiMoV2FlashForCausalLM",
-)
-LLAMA4_MODEL_ARCHS = (
-    "Llama4ForConditionalGeneration",
-    "Llama4ForCausalLM",
-)
+CP_CACHE_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS = ("file", "mooncake")
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -1064,10 +1052,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
-    # Split DSA GPU KV/indexer cache layers across CP ranks.
-    enable_dsa_cache_layer_split: A[
+    # Split model cache layers across CP ranks.
+    enable_cp_cache_layer_split: A[
         bool,
-        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
+        Arg(
+            help="Split selected GPU cache layers across context-parallel ranks to reduce per-rank cache memory. Model-specific support is required.",
+            aliases=["--enable-dsa-cache-layer-split"],
+        ),
         NS("parallel"),
     ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = (
@@ -1076,11 +1067,6 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
     prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
-    enable_cp_kv_layer_split: A[
-        bool,
-        "Prefill CP KV layer split: shard KV cache by transformer layer across attention-CP ranks on prefill-only servers (experimental).",
-        NS("parallel"),
-    ] = False
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
@@ -3413,7 +3399,7 @@ class ServerArgs:
         # canonical CP mirrors to the right legacy runtime aliases before
         # LayerSplit adjusts CUDA graph settings.
         self._handle_legacy_cp_arguments()
-        self._handle_cp_kv_layer_split()
+        self._handle_cp_cache_layer_split()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -4771,12 +4757,6 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
-            raise ValueError(
-                "--enable-dsa-cache-layer-split is only supported for DSA "
-                "(DeepSeek Sparse Attention) models."
-            )
-
         if self.enable_cp_decode_attn_tp:
             from sglang.srt.layers.cp.cp_decode_attn_tp import (
                 CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
@@ -4890,52 +4870,6 @@ class ServerArgs:
                     assert (
                         self.disaggregation_mode != "decode"
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
-                if (
-                    self.enable_dsa_cache_layer_split
-                    and self.disaggregation_mode != "prefill"
-                ):
-                    if self.disaggregation_mode == "decode":
-                        raise ValueError(
-                            "--enable-dsa-cache-layer-split is not supported on "
-                            "decode workers. This flag is a prefill-CP "
-                            "optimization; decode receives full cache shards "
-                            "through PD transfer."
-                        )
-                    raise ValueError(
-                        "--enable-dsa-cache-layer-split is only supported on PD "
-                        "prefill workers. Non-PD workers also run decode and "
-                        "require ordinary local decode cache semantics."
-                    )
-                if self.enable_dsa_cache_layer_split and (
-                    not self.enable_prefill_cp or self.cp_strategy != "interleave"
-                ):
-                    raise ValueError(
-                        "--enable-dsa-cache-layer-split requires "
-                        "--enable-prefill-cp and --cp-strategy interleave "
-                        "(or legacy --enable-nsa-prefill-context-parallel with "
-                        "--nsa-prefill-cp-mode round-robin-split)."
-                    )
-                # Layer split relies on the mooncake all-CP-rank KV/indexer
-                # transfer path. mori/nixl support is a temporary limitation
-                # and will be added later by the community.
-                if (
-                    self.enable_dsa_cache_layer_split
-                    and self.disaggregation_transfer_backend != "mooncake"
-                ):
-                    raise ValueError(
-                        "--enable-dsa-cache-layer-split currently only supports "
-                        "the mooncake transfer backend (mooncake / mooncake_tcp). "
-                        f"Got --disaggregation-transfer-backend "
-                        f"{self.disaggregation_transfer_backend!r}. mori/nixl "
-                        "support will be added later by the community."
-                    )
-                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
-                    raise ValueError(
-                        "--enable-dsa-cache-layer-split is not supported with "
-                        "pipeline parallelism (pp_size > 1) yet. It requires "
-                        "prefill context parallelism, and CP + PP has not been "
-                        "validated for this feature."
-                    )
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -6069,80 +6003,111 @@ class ServerArgs:
 
         init_cp_strategy(self)
 
-    def _handle_cp_kv_layer_split(self):
-        if not self.enable_cp_kv_layer_split:
+    def _handle_cp_cache_layer_split(self):
+        if not self.enable_cp_cache_layer_split:
             return
 
-        if (
+        has_concrete_model_config = (
             self.model_path.lower() not in ("none", "dummy")
             and parse_connector_type(self.model_path) != ConnectorType.INSTANCE
-        ):
-            model_arch = self.get_model_config().hf_config.architectures[0]
-            if model_arch not in CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS:
-                supported = ", ".join(CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS)
+        )
+        is_dsv4_layer_split = not has_concrete_model_config
+        if has_concrete_model_config:
+            hf_config = self.get_model_config().hf_config
+            model_arch = hf_config.architectures[0]
+            from sglang.srt.configs.model_config import (
+                is_deepseek_dsa,
+                is_deepseek_v4,
+            )
+
+            is_dsv4_layer_split = is_deepseek_v4(hf_config)
+            if not (is_dsv4_layer_split or is_deepseek_dsa(hf_config)):
                 raise ValueError(
-                    "--enable-cp-kv-layer-split is not supported for model arch "
-                    f"{model_arch!r}. Supported architectures: {supported}."
+                    "--enable-cp-cache-layer-split is not supported for model arch "
+                    f"{model_arch!r}."
                 )
 
-        backend = self.hicache_storage_backend
-        if (
-            backend is not None
-            and backend not in CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS
-        ):
-            supported = ", ".join(CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS)
+        # Shared constraints for all cache layer-split implementations.
+        if not self.enable_prefill_cp:
             raise ValueError(
-                f"--enable-cp-kv-layer-split + --hicache-storage-backend={backend!r} "
-                f"is not yet supported. Supported backends under CP KV LayerSplit: {supported}."
-            )
-
-        if not self.enable_dsa_prefill_context_parallel:
-            raise ValueError(
-                "--enable-cp-kv-layer-split requires "
-                "--enable-prefill-cp --cp-strategy interleave "
-                "(or the deprecated --enable-dsa-prefill-context-parallel / "
-                "--enable-nsa-prefill-context-parallel aliases)"
+                "--enable-cp-cache-layer-split requires --enable-prefill-cp "
+                "--cp-strategy interleave"
             )
         if self.attn_cp_size <= 1:
-            raise ValueError("--enable-cp-kv-layer-split requires --attn-cp-size > 1")
-        if self.dsa_prefill_cp_mode != "round-robin-split":
             raise ValueError(
-                "--enable-cp-kv-layer-split requires "
-                "--cp-strategy interleave "
-                "(deprecated mode name: round-robin-split)"
+                "--enable-cp-cache-layer-split requires --attn-cp-size > 1"
             )
+        if self.cp_strategy != "interleave":
+            raise ValueError(
+                "--enable-cp-cache-layer-split requires --cp-strategy interleave"
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--enable-cp-cache-layer-split is not supported with pipeline "
+                "parallelism (pp_size > 1) yet"
+            )
+        if self.enable_prefill_context_parallel:
+            self.enable_prefill_context_parallel = False
+            self.enable_dsa_prefill_context_parallel = True
+            self.dsa_prefill_cp_mode = "round-robin-split"
+            self.prefill_cp_mode = "round-robin-split"
         if self.disaggregation_mode != "prefill":
             raise ValueError(
-                "--enable-cp-kv-layer-split is currently supported only on "
+                "--enable-cp-cache-layer-split is currently supported only on "
                 "prefill-only servers. Set --disaggregation-mode prefill."
             )
         if self.enable_hisparse:
             raise ValueError(
-                "--enable-cp-kv-layer-split is incompatible with --enable-hisparse"
+                "--enable-cp-cache-layer-split is incompatible with --enable-hisparse"
             )
         if self.prefill_only_disable_kv_cache:
             raise ValueError(
-                "--enable-cp-kv-layer-split is incompatible with "
+                "--enable-cp-cache-layer-split is incompatible with "
                 "--prefill-only-disable-kv-cache"
-            )
-        if self.enable_prefill_context_parallel:
-            raise ValueError(
-                "--enable-cp-kv-layer-split is only supported with "
-                "--enable-dsa-prefill-context-parallel, not "
-                "--enable-prefill-context-parallel"
             )
         if self.speculative_algorithm is not None:
             raise ValueError(
-                "--enable-cp-kv-layer-split is not validated with speculative "
+                "--enable-cp-cache-layer-split is not validated with speculative "
                 "decoding yet"
             )
         if is_hip():
             raise ValueError(
-                "--enable-cp-kv-layer-split is currently supported only on CUDA"
+                "--enable-cp-cache-layer-split is currently supported only on CUDA"
             )
+        if self.disaggregation_transfer_backend != "mooncake":
+            raise ValueError(
+                "--enable-cp-cache-layer-split currently supports PD transfer only "
+                "with --disaggregation-transfer-backend mooncake"
+            )
+        backend = self.hicache_storage_backend
+        if (
+            backend is not None
+            and backend not in CP_CACHE_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS
+        ):
+            supported = ", ".join(CP_CACHE_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS)
+            raise ValueError(
+                f"--enable-cp-cache-layer-split + --hicache-storage-backend={backend!r} "
+                f"is not yet supported. Supported backends: {supported}."
+            )
+
+        cuda_graph_config = getattr(self, "cuda_graph_config", None)
+        if (
+            cuda_graph_config is not None
+            and cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "Disabling prefill CUDA graph because "
+                "--enable-cp-cache-layer-split is enabled."
+            )
+            cuda_graph_config.prefill.backend = Backend.DISABLED
+
+        if not is_dsv4_layer_split:
+            return
+
+        # DeepSeek V4-specific implementation constraints.
         if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
             raise ValueError(
-                "--enable-cp-kv-layer-split requires the Compressor V2 path"
+                "--enable-cp-cache-layer-split requires the Compressor V2 path"
             )
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -6150,30 +6115,9 @@ class ServerArgs:
 
         if is_unified_kv_triton():
             raise ValueError(
-                "--enable-cp-kv-layer-split is incompatible with "
+                "--enable-cp-cache-layer-split is incompatible with "
                 "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton"
             )
-        if self.disaggregation_transfer_backend not in ("mooncake", "nixl"):
-            raise ValueError(
-                "--enable-cp-kv-layer-split currently supports PD transfer only "
-                "with --disaggregation-transfer-backend mooncake or nixl"
-            )
-
-        cuda_graph_config = getattr(self, "cuda_graph_config", None)
-        if cuda_graph_config is not None:
-            if cuda_graph_config.decode.backend != Backend.DISABLED:
-                logger.warning(
-                    "Disabling decode CUDA graph because --enable-cp-kv-layer-split "
-                    "is currently prefill-only."
-                )
-                cuda_graph_config.decode.backend = Backend.DISABLED
-            if cuda_graph_config.prefill.backend != Backend.DISABLED:
-                logger.warning(
-                    "Disabling prefill CUDA graph because --enable-cp-kv-layer-split "
-                    "is currently prefill-only."
-                )
-                cuda_graph_config.prefill.backend = Backend.DISABLED
-        self.disable_cuda_graph = True
 
     def _handle_dwdp(self):
         if self.dwdp_size <= 1:

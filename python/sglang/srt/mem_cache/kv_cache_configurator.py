@@ -39,9 +39,9 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.cp_kv_layer_split import should_use_cp_kv_layer_split_pool
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_pool import (
-    CpKvLayerSplitDeepSeekV4TokenToKVPool,
+from sglang.srt.layers.cp.utils import is_cp_cache_layer_split_enabled
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -927,9 +927,9 @@ class KVCacheConfigurator:
         else:
             if (
                 not self.is_draft_worker
-                and should_use_cp_kv_layer_split_pool(self.server_args)
+                and is_cp_cache_layer_split_enabled(self.server_args)
             ):
-                pool_cls = CpKvLayerSplitDeepSeekV4TokenToKVPool
+                pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool
             else:
                 pool_cls = DeepSeekV4TokenToKVPool
             c4_state_pool_size = c4_state_pool_size
@@ -965,16 +965,15 @@ class KVCacheConfigurator:
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
         )
-        if pool_cls is CpKvLayerSplitDeepSeekV4TokenToKVPool:
+        if pool_cls is CpCacheLayerSplitDeepSeekV4TokenToKVPool:
             token_to_kv_pool = pool_cls(
                 cp_rank=get_parallel().attn_cp_rank,
                 cp_size=get_parallel().attn_cp_size,
-                model_num_hidden_layers=len(self.model_config.compress_ratios),
-                cp_kv_layer_split_staging_context_len=self.model_config.context_len,
-                cp_kv_layer_split_staging_chunked_prefill_size=(
+                cp_cache_layer_split_staging_context_len=self.model_config.context_len,
+                cp_cache_layer_split_staging_chunked_prefill_size=(
                     self.server_args.chunked_prefill_size
                 ),
-                cp_kv_layer_split_staging_max_prefill_tokens=(
+                cp_cache_layer_split_staging_max_prefill_tokens=(
                     self.server_args.max_prefill_tokens
                 ),
                 **pool_kwargs,
@@ -1645,7 +1644,7 @@ class KVCacheConfigurator:
 
         if (
             not self.is_draft_worker
-            and should_use_cp_kv_layer_split_pool(self.server_args)
+            and is_cp_cache_layer_split_enabled(self.server_args)
         ):
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(

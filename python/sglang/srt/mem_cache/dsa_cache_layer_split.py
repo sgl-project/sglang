@@ -36,7 +36,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import (
+    CpCacheLayerSplitPoolBase,
+)
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
@@ -53,7 +55,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
+class LayerSplitDSATokenToKVPool(CpCacheLayerSplitPoolBase, DSATokenToKVPool):
     """DSA KV pool that shards layers across CP ranks with owner-broadcast reads."""
 
     def __init__(
@@ -66,49 +68,31 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         assert (
             layer_shard_rank is not None and layer_shard_size > 1
         ), "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+
+        layer_num = kwargs.get("layer_num")
+        if layer_num is None and len(args) > 5:
+            layer_num = args[5]
+        assert layer_num is not None, "LayerSplitDSATokenToKVPool requires layer_num"
+        start_layer = kwargs.get("start_layer")
+        if start_layer is None and len(args) > 10:
+            start_layer = args[10]
+        start_layer = start_layer or 0
+
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            cp_rank=layer_shard_rank,
+            cp_size=layer_shard_size,
+            layer_shard_start_layer=start_layer,
+            layer_shard_layer_num=layer_num,
+            **kwargs,
+        )
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
-        my_start, _ = self._owned_local_layer_range()
-        self.layer_shard_start = self.start_layer + my_start
-
-    # ---- layer ownership helpers ------------------------------------------
-
-    def _local_layer_idx(self, layer_id: int) -> int:
-        return layer_id - self.start_layer
-
-    def _owned_local_layer_range(self) -> tuple[int, int]:
-        return get_layer_shard_range(
-            self.layer_shard_rank, self.layer_shard_size, self.layer_num
-        )
-
-    def _is_layer_owned(self, layer_id: int) -> bool:
-        local_idx = self._local_layer_idx(layer_id)
-        owned_start, owned_end = self._owned_local_layer_range()
-        return owned_start <= local_idx < owned_end
-
-    def _get_layer_owner_rank(self, layer_id: int) -> int:
-        return get_layer_owner(
-            self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
-        )
-
-    def _log_layer_shard_plan(self) -> None:
-        partitions = []
-        for rank in range(self.layer_shard_size):
-            st, ed = get_layer_shard_range(rank, self.layer_shard_size, self.layer_num)
-            partitions.append(f"r{rank}:[{st},{ed})")
-        my_start, my_end = self._owned_local_layer_range()
-        logger.info(
-            "Layer shard plan (continuous): "
-            f"layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
-            f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
-            f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
-            f"partitions={'; '.join(partitions)}"
-        )
+        self.layer_shard_start, _ = self._owned_global_layer_range()
 
     # ---- broadcast plumbing -----------------------------------------------
 

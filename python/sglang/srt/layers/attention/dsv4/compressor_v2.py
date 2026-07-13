@@ -12,9 +12,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
-    cp_kv_layer_split_pre_compressor_skip,
-    is_cp_kv_layer_split_deepseek_v4_pool,
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    cp_cache_layer_split_pre_compressor_skip,
+    is_cp_cache_layer_split_deepseek_v4_pool,
     maybe_prefetch_cp_kv_extra,
     maybe_prefetch_cp_kv_indexer,
 )
@@ -222,8 +222,10 @@ class CompressorBackendMixin:
             is_unified_kv_triton,
         )
 
-        is_cp_kv_layer_split = is_cp_kv_layer_split_deepseek_v4_pool(token_to_kv_pool)
-        skip_non_owner_write = cp_kv_layer_split_pre_compressor_skip(
+        is_cp_cache_layer_split = is_cp_cache_layer_split_deepseek_v4_pool(
+            token_to_kv_pool
+        )
+        skip_non_owner_write = cp_cache_layer_split_pre_compressor_skip(
             token_to_kv_pool,
             layer_id,
             forward_batch,
@@ -262,17 +264,14 @@ class CompressorBackendMixin:
                     _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
                     assert compress_kv_pool is not None
                     kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                    if is_cp_kv_layer_split:
+                    if is_cp_cache_layer_split:
                         page_size = compress_kv_pool.page_size
                     else:
                         page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
                     if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                        # The v2 compressor writes directly into the raw C4 KV tensor.
-                        # HiSparse C4 therefore needs the physical C4 location here.
-                        # The compress kernel requires an int32 write location.
-                        out_loc = compress_kv_pool.translate_loc_to_hisparse_device(
+                        out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
                             out_loc
-                        ).to(torch.int32)
+                        )
                 self._forward_compress_all_in_one(
                     kv_score_buffer=state_pool.kv_score_buffer.kv_score,
                     kv_score_input=kv_score_input,

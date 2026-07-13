@@ -10,21 +10,24 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import index_buf_accessor
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_layout import (
-    build_cp_kv_layer_split_deepseek_v4_pool_layout,
-    shard_cp_kv_layer_split_c4,
-    shard_cp_kv_layer_split_c4_indexer,
-    shard_cp_kv_layer_split_c128,
-    shard_cp_kv_layer_split_swa,
+from sglang.srt.mem_cache.cp_cache_layer_split.broadcast import (
+    BroadcastSlots,
+    broadcast_inline,
+    get_pynccl_broadcast_comm,
 )
-from sglang.srt.mem_cache.cp_kv_layer_split.ownership import (
-    build_owned_layer_local_index_map,
-    kv_layer_owner,
-    owned_kv_layer_range,
-    owns_kv_layer,
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
+    build_cp_cache_layer_split_deepseek_v4_pool_layout,
+    shard_cp_cache_layer_split_c4,
+    shard_cp_cache_layer_split_c4_indexer,
+    shard_cp_cache_layer_split_c128,
+    shard_cp_cache_layer_split_swa,
 )
-from sglang.srt.mem_cache.cp_kv_layer_split.pool_base import CpKvLayerSplitPoolBase
-from sglang.srt.mem_cache.cp_kv_layer_split.staging import (
+from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import (
+    CpCacheLayerSplitPoolBase,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.staging import (
+    StagingBufferManager,
+    active_pages_for_indices,
     remap_indices_to_staging,
     remap_page_table_to_staging,
 )
@@ -34,6 +37,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV4_TRANSFER_C4_INDEXER_KV,
     DSV4_TRANSFER_C4_KV,
     DSV4_TRANSFER_C128_KV,
+    DSV4_TRANSFER_C128_STATE,
     DSV4_TRANSFER_INDEXER_STATE,
     DSV4_TRANSFER_SWA_KV,
     ONLINE_C128,
@@ -54,31 +58,34 @@ class _BatchActivePages:
     remapped: Optional[torch.Tensor] = None
 
 
-class CpKvLayerSplitDeepSeekV4TokenToKVPool(
-    CpKvLayerSplitPoolBase, DeepSeekV4TokenToKVPool
+class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
+    CpCacheLayerSplitPoolBase, DeepSeekV4TokenToKVPool
 ):
     """DeepSeek V4 pool that reads non-owned layer KV through staging buffers."""
+
+    requires_descriptor_matched_transfer = True
 
     def __init__(
         self,
         *,
         cp_rank: int,
         cp_size: int,
-        model_num_hidden_layers: int,
         **kwargs,
     ):
-        staging_context_len = kwargs.pop("cp_kv_layer_split_staging_context_len", None)
+        staging_context_len = kwargs.pop(
+            "cp_cache_layer_split_staging_context_len", None
+        )
         staging_chunked_prefill_size = kwargs.pop(
-            "cp_kv_layer_split_staging_chunked_prefill_size", None
+            "cp_cache_layer_split_staging_chunked_prefill_size", None
         )
         staging_max_prefill_tokens = kwargs.pop(
-            "cp_kv_layer_split_staging_max_prefill_tokens", None
+            "cp_cache_layer_split_staging_max_prefill_tokens", None
         )
 
-        self._shard_swa = shard_cp_kv_layer_split_swa()
-        self._shard_c4 = shard_cp_kv_layer_split_c4()
-        self._shard_c128 = shard_cp_kv_layer_split_c128()
-        self._shard_c4_indexer = shard_cp_kv_layer_split_c4_indexer()
+        self._shard_swa = shard_cp_cache_layer_split_swa()
+        self._shard_c4 = shard_cp_cache_layer_split_c4()
+        self._shard_c128 = shard_cp_cache_layer_split_c128()
+        self._shard_c4_indexer = shard_cp_cache_layer_split_c4_indexer()
 
         self._indexer_staging_layer_id: Optional[int] = None
         self._indexer_remapped_page_table: Optional[torch.Tensor] = None
@@ -111,53 +118,50 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         if pp_end is None:
             pp_end = pp_start + layer_num
 
-        layout = build_cp_kv_layer_split_deepseek_v4_pool_layout(
+        layout = build_cp_cache_layer_split_deepseek_v4_pool_layout(
             cp_rank,
             cp_size,
-            model_num_hidden_layers,
             pp_start,
             pp_end,
             kwargs["compression_ratios"],
         )
-        self.cp_kv_layer_split_layout = layout
-
-        owned_start, owned_end = owned_kv_layer_range(
-            cp_rank,
-            cp_size,
-            model_num_hidden_layers,
-            pp_start,
-            pp_end,
-        )
-        if self._shard_swa:
-            self._swa_global_to_local = build_owned_layer_local_index_map(
-                cp_rank,
-                cp_size,
-                model_num_hidden_layers,
-                pp_start,
-                pp_end,
-            )
-        else:
-            self._swa_global_to_local = {
-                layer_id: layer_id - pp_start for layer_id in range(pp_start, pp_end)
-            }
+        self.cp_cache_layer_split_layout = layout
 
         if layout.swa_layer_num == 0:
             logger.warning(
-                "CpKvLayerSplitDeepSeekV4TokenToKVPool: cp_rank=%s owns no SWA layers "
+                "CpCacheLayerSplitDeepSeekV4TokenToKVPool: cp_rank=%s owns no SWA layers "
                 "in PP slice [%s, %s)",
                 cp_rank,
                 pp_start,
                 pp_end,
             )
 
+        self._staging_context_len = staging_context_len
+        self._staging_chunked_prefill_size = staging_chunked_prefill_size
+        self._staging_max_prefill_tokens = staging_max_prefill_tokens
+        self._staging = StagingBufferManager()
+        self._broadcast_slots = BroadcastSlots(
+            ("swa", "extra", "indexer"), cp_rank=cp_rank
+        )
+
+        super().__init__(
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            layer_shard_start_layer=pp_start,
+            layer_shard_layer_num=pp_end - pp_start,
+            **kwargs,
+            cp_cache_layer_split_layout=layout,
+        )
+        if self._shard_swa:
+            self._swa_global_to_local = self._build_owned_layer_local_index_map()
+        else:
+            self._swa_global_to_local = {
+                layer_id: layer_id - pp_start for layer_id in range(pp_start, pp_end)
+            }
+        self._log_layer_shard_plan()
         logger.info(
-            "CpKvLayerSplitDeepSeekV4TokenToKVPool: cp_rank=%s cp_size=%s owns global "
-            "SWA [%s, %s) -> %s buffers, C4=%s, C128=%s, C4_INDEXER=%s, "
-            "C4_STATE=%s, C128_STATE=%s, C4_INDEXER_STATE=%s (PP [%s, %s))",
-            cp_rank,
-            cp_size,
-            owned_start,
-            owned_end,
+            "DSV4 Cache LayerSplit buffers: SWA=%s, C4=%s, C128=%s, "
+            "C4_INDEXER=%s, C4_STATE=%s, C128_STATE=%s, C4_INDEXER_STATE=%s",
             layout.swa_layer_num,
             layout.c4_layer_num,
             layout.c128_layer_num,
@@ -165,20 +169,6 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             layout.c4_state_layer_num,
             layout.c128_state_layer_num,
             layout.c4_indexer_state_layer_num,
-            pp_start,
-            pp_end,
-        )
-
-        super().__init__(
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            model_num_hidden_layers=model_num_hidden_layers,
-            broadcast_slot_kinds=("swa", "extra", "indexer"),
-            staging_context_len=staging_context_len,
-            staging_chunked_prefill_size=staging_chunked_prefill_size,
-            staging_max_prefill_tokens=staging_max_prefill_tokens,
-            **kwargs,
-            cp_kv_layer_split_layout=layout,
         )
         self._rebuild_compressed_layer_mapping_for_cp()
 
@@ -233,7 +223,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
 
     def _transfer_swa_layer_id(self, layer_id: int) -> bool:
         if self._shard_swa:
-            return self.owns_kv_layer_id(layer_id)
+            return self._is_layer_owned(layer_id)
         return self.cp_rank == 0
 
     def _transfer_core_layer_id(self, layer_id: int) -> bool:
@@ -245,13 +235,13 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         else:
             sharded = False
         if sharded:
-            return self.owns_kv_layer_id(layer_id)
+            return self._is_layer_owned(layer_id)
         return self.cp_rank == 0
 
     def _transfer_indexer_layer_id(self, layer_id: int) -> bool:
         sharded = self._shard_c4_indexer
         if sharded:
-            return self.owns_kv_layer_id(layer_id)
+            return self._is_layer_owned(layer_id)
         return self.cp_rank == 0
 
     def get_kv_transfer_layout(self) -> list:
@@ -315,7 +305,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
                 else None
             )
             for layer_id in range(self._stage_start, self._stage_end)
-            if self.compression_ratios[layer_id] != 0
+            if self.compression_ratios[layer_id] == 4
             and self._owns_attention_state_layer_id(layer_id)
         )
         layout.extend(
@@ -329,6 +319,19 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             and self._owns_indexer_state_layer_id(layer_id)
         )
         return layout
+
+    def get_c128_state_transfer_layout(self) -> list:
+        """Descriptors parallel to this rank's C128 state buffer list."""
+        return [
+            (
+                (DSV4_TRANSFER_C128_STATE, layer_id)
+                if self._transfer_core_layer_id(layer_id)
+                else None
+            )
+            for layer_id in range(self._stage_start, self._stage_end)
+            if self.compression_ratios[layer_id] == 128
+            and self._owns_attention_state_layer_id(layer_id)
+        ]
 
     def get_hicache_host_layer_mapping(self) -> dict[str, dict[int, int]]:
         """Per-family ``{pp_local_layer_id -> local_buffer_index}`` for HiCache."""
@@ -391,22 +394,17 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             "c4_indexer_state": c4_indexer_state_map,
         }
 
-    def owns_kv_layer_id(self, layer_id: int) -> bool:
-        return owns_kv_layer(
-            layer_id, self.cp_rank, self.cp_size, self.model_num_hidden_layers
-        )
-
     def _owns_swa_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_swa or self.owns_kv_layer_id(layer_id)
+        return not self._shard_swa or self._is_layer_owned(layer_id)
 
     def should_skip_swa_write(self, layer_id: int) -> bool:
         return not self._owns_swa_layer_id(layer_id)
 
     def _owns_c4_kv_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c4 or self.owns_kv_layer_id(layer_id)
+        return not self._shard_c4 or self._is_layer_owned(layer_id)
 
     def _owns_c128_kv_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c128 or self.owns_kv_layer_id(layer_id)
+        return not self._shard_c128 or self._is_layer_owned(layer_id)
 
     def _owns_extra_key_layer_id(self, layer_id: int) -> bool:
         item = self.layer_mapping[layer_id]
@@ -418,18 +416,18 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         return False
 
     def _owns_indexer_kv_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c4_indexer or self.owns_kv_layer_id(layer_id)
+        return not self._shard_c4_indexer or self._is_layer_owned(layer_id)
 
     def _owns_attention_state_layer_id(self, layer_id: int) -> bool:
         ratio = self.compression_ratios[layer_id]
         if ratio == 4:
-            return not self._shard_c4 or self.owns_kv_layer_id(layer_id)
+            return not self._shard_c4 or self._is_layer_owned(layer_id)
         if ratio == 128:
-            return not self._shard_c128 or self.owns_kv_layer_id(layer_id)
+            return not self._shard_c128 or self._is_layer_owned(layer_id)
         return False
 
     def _owns_indexer_state_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c4_indexer or self.owns_kv_layer_id(layer_id)
+        return not self._shard_c4_indexer or self._is_layer_owned(layer_id)
 
     def _broadcast_swa_layer_id(self, layer_id: int) -> bool:
         return self._shard_swa and self.cp_size > 1
@@ -455,11 +453,11 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             sharded = self._shard_c128
         else:
             sharded = False
-        return sharded and not self.owns_kv_layer_id(layer_id)
+        return sharded and not self._is_layer_owned(layer_id)
 
     def should_skip_indexer_compressor_write(self, layer_id: int) -> bool:
         sharded = self._shard_c4_indexer
-        return sharded and not self.owns_kv_layer_id(layer_id)
+        return sharded and not self._is_layer_owned(layer_id)
 
     def should_use_c4_extra_broadcast_overlap(self, layer_id: int) -> bool:
         item = self.layer_mapping[layer_id]
@@ -468,6 +466,62 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             and item.compress_ratio == 4
             and self._broadcast_extra_key_layer_id(layer_id)
         )
+
+    @staticmethod
+    def _pool_num_pages(pool) -> int:
+        # Paged KV allocators reserve page 0 for dummy/padded tokens and allocate
+        # real cache pages from 1..size//page_size.
+        return pool.size // pool.page_size + 1
+
+    def _active_pages_for_indices(
+        self,
+        indices: torch.Tensor,
+        page_size: int,
+        max_pages: int,
+    ) -> torch.Tensor:
+        return active_pages_for_indices(
+            indices, page_size, max_pages, get_pynccl_broadcast_comm()
+        )
+
+    def _compact_broadcast_for_read(
+        self,
+        layer_id: int,
+        indices: torch.Tensor,
+        source: Optional[torch.Tensor],
+        staging: torch.Tensor,
+        selected_pages: torch.Tensor,
+        page_size: int,
+        max_pages: int,
+        async_kind: Optional[str] = None,
+        remap_indices: bool = True,
+    ) -> torch.Tensor:
+        """Broadcast owner's compact active pages and optionally remap indices."""
+        if selected_pages.numel() > staging.shape[0]:
+            raise RuntimeError(
+                "CP Cache LayerSplit staging buffer is smaller than active page set: "
+                f"active_pages={selected_pages.numel()}, capacity={staging.shape[0]}"
+            )
+
+        active_pages = selected_pages.numel()
+        broadcast_pages = max(1, active_pages)
+        owner_cp = self._get_layer_owner_rank(layer_id)
+        if self.cp_rank == owner_cp:
+            assert source is not None
+            if active_pages > 0:
+                staging[:active_pages].copy_(source[selected_pages.to(torch.long)])
+            else:
+                staging[:1].copy_(source[:1])
+
+        pynccl_comm = get_pynccl_broadcast_comm()
+        if async_kind is not None:
+            self._broadcast_slots.start(
+                async_kind, layer_id, staging[:broadcast_pages], owner_cp, pynccl_comm
+            )
+        else:
+            broadcast_inline(staging[:broadcast_pages], owner_cp, pynccl_comm)
+        if not remap_indices:
+            return indices
+        return remap_indices_to_staging(indices, selected_pages, page_size, max_pages)
 
     def _bounded_full_token_staging_size(self) -> int:
         context_len = self._staging_context_len or self.swa_kv_pool.size
@@ -562,16 +616,6 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             cache.selected_pages = None
             cache.remapped = None
 
-    def is_any_family_sharded(self) -> bool:
-        return any(
-            (
-                self._shard_swa,
-                self._shard_c4,
-                self._shard_c128,
-                self._shard_c4_indexer,
-            )
-        )
-
     def _owner_compress_layer_item(self, layer_id: int) -> DeepSeekV4LayerItem:
         item = self.layer_mapping[layer_id]
         assert item is not None
@@ -580,11 +624,8 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             128,
         ), f"layer {layer_id} has no compressed KV (ratio={item.compress_ratio})"
         if not (self._stage_start <= layer_id < self._stage_end):
-            owner_cp = self._kv_owner_cp_rank(layer_id)
-            raise RuntimeError(
-                f"layer {layer_id} not in owner cp_rank={owner_cp} compress set"
-            )
-        owner_cp = self._kv_owner_cp_rank(layer_id)
+            raise RuntimeError(f"layer {layer_id} is outside the local PP stage")
+        owner_cp = self._get_layer_owner_rank(layer_id)
         family_sharded = (
             self._shard_c4 if item.compress_ratio == 4 else self._shard_c128
         )
@@ -592,11 +633,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             1
             for idx in range(self._stage_start, layer_id)
             if self.compression_ratios[idx] == item.compress_ratio
-            and (
-                not family_sharded
-                or kv_layer_owner(idx, self.cp_size, self.model_num_hidden_layers)
-                == owner_cp
-            )
+            and (not family_sharded or self._get_layer_owner_rank(idx) == owner_cp)
         )
         compress_kv_pool = (
             self.c4_kv_pool if item.compress_ratio == 4 else self.c128_kv_pool
@@ -610,7 +647,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
     def _async_kind_for(self, kind: str) -> Optional[str]:
         """Resolve a broadcast slot kind to its async/inline status."""
         if kind in ("swa", "extra", "indexer"):
-            if envs.SGLANG_CP_KV_LAYER_SPLIT_DSV4_DISABLE_ASYNC_BROADCAST.get():
+            if envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_ASYNC_BROADCAST.get():
                 return None
             return kind
         raise ValueError(f"unknown broadcast kind: {kind}")
@@ -628,8 +665,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
                 continue
             if (
                 not self._shard_c4_indexer
-                or kv_layer_owner(idx, self.cp_size, self.model_num_hidden_layers)
-                == owner_cp
+                or self._get_layer_owner_rank(idx) == owner_cp
             ):
                 local_id += 1
         raise RuntimeError(f"layer {layer_id} not in C4 indexer KV set")
@@ -662,7 +698,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             )
         selected_pages = swa_cache.selected_pages
         staging = self._get_swa_staging_buffer(selected_pages.numel())
-        owner_cp = self._kv_owner_cp_rank(layer_id)
+        owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
             owner_buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
@@ -719,7 +755,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         staging = self._get_extra_staging_buffer(
             item.compress_ratio, selected_pages.numel()
         )
-        owner_cp = self._kv_owner_cp_rank(layer_id)
+        owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
             owner_buf = pool.kv_buffer[owner_item.compress_layer_id]
@@ -773,7 +809,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             )
         selected_pages = c4_pt_cache.selected_pages
         staging = self._get_extra_staging_buffer(4, selected_pages.numel())
-        owner_cp = self._kv_owner_cp_rank(layer_id)
+        owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
             owner_buf = pool.kv_buffer[owner_item.compress_layer_id]
@@ -804,7 +840,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         self._indexer_remapped_layer_id = None
         if not self._broadcast_indexer_layer_id(layer_id):
             return
-        owner_cp = self._kv_owner_cp_rank(layer_id)
+        owner_cp = self._get_layer_owner_rank(layer_id)
         owner_local = self._c4_indexer_local_layer_id(layer_id, owner_cp)
         pool = self.c4_indexer_kv_pool
         max_pages = self._pool_num_pages(pool)
@@ -850,7 +886,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
             )
             if indices is None:
                 raise RuntimeError(
-                    f"CP KV LayerSplit missing compressed indices for layer {layer_id}"
+                    f"CP Cache LayerSplit missing compressed indices for layer {layer_id}"
                 )
             self._prefetch_extra_key_pages(layer_id, indices)
 

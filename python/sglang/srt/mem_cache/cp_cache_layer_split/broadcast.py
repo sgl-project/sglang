@@ -1,4 +1,4 @@
-"""Slot-keyed async broadcast plumbing for CP KV LayerSplit."""
+"""Slot-keyed async broadcast plumbing for CP Cache LayerSplit."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Iterable, Optional
 
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_cp_group
+from sglang.srt.distributed import get_attn_cp_group
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +27,11 @@ PYNCCL_PENDING_BROADCAST = object()
 
 def get_pynccl_broadcast_comm():
     """Return the attention-CP PyNCCL communicator used for KV broadcasts."""
-    group = get_attention_cp_group()
+    group = get_attn_cp_group()
     pynccl_comm = getattr(group, "pynccl_comm", None)
     if pynccl_comm is None or not getattr(pynccl_comm, "available", False):
         raise RuntimeError(
-            "CP KV LayerSplit requires an available PyNCCL communicator "
+            "CP Cache LayerSplit requires an available PyNCCL communicator "
             "on the attention-CP group for KV broadcasts."
         )
     return pynccl_comm
@@ -98,7 +98,7 @@ class BroadcastSlots:
             return
         if pending.layer_id != layer_id:
             raise RuntimeError(
-                "CP KV LayerSplit tried to finish an unexpected "
+                "CP Cache LayerSplit tried to finish an unexpected "
                 f"{kind} broadcast: pending_layer={pending.layer_id}, "
                 f"layer={layer_id}"
             )

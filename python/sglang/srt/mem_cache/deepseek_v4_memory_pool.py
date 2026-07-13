@@ -19,8 +19,8 @@ from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_layout import (
-    CpKvLayerSplitDeepSeekV4PoolLayout,
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
+    CpCacheLayerSplitDeepSeekV4PoolLayout,
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -38,6 +38,7 @@ DSV4_TRANSFER_C4_INDEXER_KV = "dsv4_c4_indexer_kv"
 DSV4_TRANSFER_C128_KV = "dsv4_c128_kv"
 DSV4_TRANSFER_SWA_KV = "dsv4_swa_kv"
 DSV4_TRANSFER_ATTENTION_STATE = "dsv4_attention_state"
+DSV4_TRANSFER_C128_STATE = "dsv4_c128_state"
 DSV4_TRANSFER_INDEXER_STATE = "dsv4_indexer_state"
 
 
@@ -490,7 +491,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
-        cp_kv_layer_split_layout: Optional[CpKvLayerSplitDeepSeekV4PoolLayout] = None,
+        cp_cache_layer_split_layout: Optional[
+            CpCacheLayerSplitDeepSeekV4PoolLayout
+        ] = None,
     ):
         super().__init__(
             swa_size,
@@ -571,11 +574,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_head_dim = indexer_head_dim
 
         stage_layer_num = len(stage_ratios)
-        if cp_kv_layer_split_layout is not None:
-            swa_buffers = cp_kv_layer_split_layout.swa_layer_num
-            c4_layer_num = cp_kv_layer_split_layout.c4_layer_num
-            c128_layer_num = cp_kv_layer_split_layout.c128_layer_num
-            c4_indexer_layer_num = cp_kv_layer_split_layout.c4_indexer_layer_num
+        if cp_cache_layer_split_layout is not None:
+            swa_buffers = cp_cache_layer_split_layout.swa_layer_num
+            c4_layer_num = cp_cache_layer_split_layout.c4_layer_num
+            c128_layer_num = cp_cache_layer_split_layout.c128_layer_num
+            c4_indexer_layer_num = cp_cache_layer_split_layout.c4_indexer_layer_num
         else:
             swa_buffers = stage_layer_num
             c4_layer_num = sum(1 for r in stage_ratios if r == 4)
@@ -977,7 +980,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layout.extend(
             (DSV4_TRANSFER_ATTENTION_STATE, layer_id)
             for layer_id in range(self._stage_start, self._stage_end)
-            if self.compression_ratios[layer_id] != 0
+            if self.compression_ratios[layer_id] == 4
         )
         layout.extend(
             (DSV4_TRANSFER_INDEXER_STATE, layer_id)
@@ -985,6 +988,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if self.compression_ratios[layer_id] == 4
         )
         return layout
+
+    def get_c128_state_transfer_layout(self) -> List[Tuple[str, int]]:
+        """Descriptors parallel to ``get_c128_state_buf_infos``."""
+        return [
+            (DSV4_TRANSFER_C128_STATE, layer_id)
+            for layer_id in range(self._stage_start, self._stage_end)
+            if self.compression_ratios[layer_id] == 128
+        ]
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size

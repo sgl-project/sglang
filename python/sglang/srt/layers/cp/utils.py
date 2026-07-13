@@ -33,7 +33,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -49,6 +49,12 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
 )
 
 
+def is_cp_cache_layer_split_enabled(server_args=None) -> bool:
+    """Whether CP Cache LayerSplit is enabled for this process."""
+    args = server_args if server_args is not None else get_server_args()
+    return bool(args.enable_cp_cache_layer_split)
+
+
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
 
@@ -59,7 +65,7 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
 
     return (
         not model_runner.is_draft_worker
-        and model_runner.server_args.enable_dsa_cache_layer_split
+        and is_cp_cache_layer_split_enabled(model_runner.server_args)
         and model_runner.use_mla_backend
         and is_deepseek_dsa(model_runner.model_config.hf_config)
     )
@@ -246,6 +252,7 @@ __all__ = [
     "cp_gather_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
+    "is_cp_cache_layer_split_enabled",
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",
     "get_glm_dsa_layer_split_effective_num_layers",

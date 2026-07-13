@@ -659,9 +659,13 @@ class MooncakeKVManager(CommonKVManager):
                 dst_item_lens,
             )
             if layers_params is None:
-                src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                    self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-                )
+                (
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
                 # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
                 # Use correct item lengths for K and V separately
                 if layers_current_pp_stage > len(dst_k_ptrs):
@@ -681,9 +685,7 @@ class MooncakeKVManager(CommonKVManager):
                     (
                         src_v_ptrs[layer_id],
                         dst_v_ptrs[layer_id],
-                        item_lens[
-                            layers_current_pp_stage + layer_id
-                        ],  # V item length
+                        item_lens[layers_current_pp_stage + layer_id],  # V item length
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ]
@@ -996,7 +998,7 @@ class MooncakeKVManager(CommonKVManager):
         if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
-            and not self.server_args.enable_dsa_cache_layer_split
+            and not self.kv_args.cp_cache_layer_split
         ):
             skip_state = True
 

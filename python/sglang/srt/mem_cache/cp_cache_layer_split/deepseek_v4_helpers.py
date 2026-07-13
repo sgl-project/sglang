@@ -11,29 +11,35 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_pool import (
-    CpKvLayerSplitDeepSeekV4TokenToKVPool,
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 
 
-def is_cp_kv_layer_split_deepseek_v4_pool(pool) -> bool:
-    return isinstance(pool, CpKvLayerSplitDeepSeekV4TokenToKVPool)
+def is_cp_cache_layer_split_deepseek_v4_pool(pool) -> bool:
+    return isinstance(pool, CpCacheLayerSplitDeepSeekV4TokenToKVPool)
 
 
-def _should_sync_cp_kv_layer_split(pool, forward_batch) -> bool:
-    if not is_cp_kv_layer_split_deepseek_v4_pool(pool):
+def maybe_reset_cp_cache_layer_split_active_pages(pool) -> None:
+    """Drop DSV4 per-forward active-page caches before a new forward."""
+    if is_cp_cache_layer_split_deepseek_v4_pool(pool):
+        pool.reset_batch_active_pages()
+
+
+def _should_sync_cp_cache_layer_split(pool, forward_batch) -> bool:
+    if not is_cp_cache_layer_split_deepseek_v4_pool(pool):
         return False
     # LayerSplit collectives are defined only for prefill CP extend. Decode,
     # warmup, and CUDA graph capture must not enter CP barriers or broadcasts.
     return forward_batch is not None and dsa_use_prefill_cp(forward_batch)
 
 
-def cp_kv_layer_split_pre_compressor_skip(
+def cp_cache_layer_split_pre_compressor_skip(
     pool, layer_id: int, forward_batch, *, is_indexer: bool
 ) -> bool:
     """Return whether this rank should skip the owner-only compressor write."""
-    if not is_cp_kv_layer_split_deepseek_v4_pool(pool):
+    if not is_cp_cache_layer_split_deepseek_v4_pool(pool):
         return False
     if not dsa_use_prefill_cp(forward_batch):
         pool.clear_staging_remap_for_read()
@@ -44,20 +50,20 @@ def cp_kv_layer_split_pre_compressor_skip(
 
 def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
     """Start current-layer SWA prefetch after the SWA write."""
-    if _should_sync_cp_kv_layer_split(pool, forward_batch):
+    if _should_sync_cp_cache_layer_split(pool, forward_batch):
         core_metadata = _get_core_attn_metadata()
         pool.prefetch_swa_layer(layer_id, core_metadata.swa_page_indices)
 
 
 def maybe_wait_cp_kv_swa_prefetch(pool, layer_id: int, forward_batch=None) -> None:
     """Wait for the current-layer SWA prefetch before attention consumes it."""
-    if _should_sync_cp_kv_layer_split(pool, forward_batch):
+    if _should_sync_cp_cache_layer_split(pool, forward_batch):
         pool.wait_swa_prefetch(layer_id)
 
 
 def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
     """Start current-layer C4/C128 KV prefetch after the compressor write."""
-    if _should_sync_cp_kv_layer_split(pool, forward_batch):
+    if _should_sync_cp_cache_layer_split(pool, forward_batch):
         if pool.should_use_c4_extra_broadcast_overlap(layer_id):
             core_metadata = _get_core_attn_metadata()
             pool.prefetch_extra_key_layer_from_page_table(
@@ -70,14 +76,14 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
 
 def maybe_prefetch_cp_kv_indexer(pool, layer_id: int, forward_batch=None) -> None:
     """Start current-layer C4 indexer KV prefetch after the indexer write."""
-    if _should_sync_cp_kv_layer_split(pool, forward_batch):
+    if _should_sync_cp_cache_layer_split(pool, forward_batch):
         attn_backend = get_attn_backend()
         if hasattr(attn_backend, "_maybe_upgrade_forward_metadata"):
             attn_backend._maybe_upgrade_forward_metadata()
         metadata = getattr(attn_backend, "forward_metadata", None)
         indexer_metadata = getattr(metadata, "indexer_metadata", None)
         if indexer_metadata is None:
-            raise RuntimeError("CP KV LayerSplit requires DSV4 indexer metadata")
+            raise RuntimeError("CP Cache LayerSplit requires DSV4 indexer metadata")
         pool.prefetch_index_k_layer(layer_id, indexer_metadata.page_table)
 
 
@@ -88,11 +94,11 @@ def _get_core_attn_metadata():
     metadata = getattr(attn_backend, "forward_metadata", None)
     core_metadata = getattr(metadata, "core_attn_metadata", None)
     if core_metadata is None:
-        raise RuntimeError("CP KV LayerSplit requires DSV4 core attention metadata")
+        raise RuntimeError("CP Cache LayerSplit requires DSV4 core attention metadata")
     return core_metadata
 
 
-def cp_kv_layer_split_resolve_store_swa_loc(
+def cp_cache_layer_split_resolve_store_swa_loc(
     pool,
     layer_id: int,
     forward_batch,
@@ -100,7 +106,7 @@ def cp_kv_layer_split_resolve_store_swa_loc(
     swa_k_shape0: int,
 ) -> Optional[torch.Tensor]:
     """Resolve SWA write locations, or ``None`` when this rank skips the write."""
-    raw_loc = maybe_all_gather_cp_kv_layer_split_raw_loc(
+    raw_loc = maybe_all_gather_cp_cache_layer_split_raw_loc(
         pool, out_cache_loc, forward_batch, swa_k_shape0
     )
     if pool.should_skip_swa_write(layer_id):
@@ -108,11 +114,11 @@ def cp_kv_layer_split_resolve_store_swa_loc(
     return pool.translate_loc_from_full_to_swa(raw_loc).to(torch.int32)
 
 
-def maybe_all_gather_cp_kv_layer_split_raw_loc(
+def maybe_all_gather_cp_cache_layer_split_raw_loc(
     pool, raw_loc: torch.Tensor, forward_batch, kv_num_tokens: int
 ) -> torch.Tensor:
     """Align SWA cache locations with the full-KV shape under DSA prefill CP."""
-    if not _should_sync_cp_kv_layer_split(pool, forward_batch):
+    if not _should_sync_cp_cache_layer_split(pool, forward_batch):
         return raw_loc
 
     if raw_loc.shape[0] == kv_num_tokens:
@@ -123,7 +129,7 @@ def maybe_all_gather_cp_kv_layer_split_raw_loc(
 
     if raw_loc.shape[0] * pool.cp_size != kv_num_tokens:
         raise RuntimeError(
-            "CP KV LayerSplit cannot align SWA cache locations with KV tensor: "
+            "CP Cache LayerSplit cannot align SWA cache locations with KV tensor: "
             f"raw_loc={raw_loc.shape[0]}, kv_num_tokens={kv_num_tokens}, "
             f"cp_size={pool.cp_size}"
         )

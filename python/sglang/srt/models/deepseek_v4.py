@@ -144,8 +144,8 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
-    is_cp_kv_layer_split_deepseek_v4_pool,
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
     maybe_prefetch_cp_kv_swa,
     maybe_wait_cp_kv_swa_prefetch,
 )
@@ -352,12 +352,9 @@ def _can_dsa_cp_split_for_deepseek_v4(
     if real_extend_tokens == 0:
         return False
     token_to_kv_pool = get_token_to_kv_pool()
-    # LayerSplit SWA is CP-sharded, so tiny padded prefill batches still need
+    # LayerSplit KV is CP-sharded, so tiny padded prefill batches still need
     # the CP path to broadcast/remap non-owned layers before attention reads.
-    can_force_tiny_cp = (
-        is_cp_kv_layer_split_deepseek_v4_pool(token_to_kv_pool)
-        and token_to_kv_pool.is_any_family_sharded()
-    )
+    can_force_tiny_cp = is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
     if not can_force_tiny_cp:
         return False
     return True
@@ -765,7 +762,7 @@ class MQALayer(MqaAttentionBase):
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        if is_cp_kv_layer_split_deepseek_v4_pool(
+        if is_cp_cache_layer_split_deepseek_v4_pool(
             token_to_kv_pool
         ) and token_to_kv_pool.should_skip_swa_write(self.layer_id):
             return
@@ -1010,7 +1007,7 @@ class MQALayer(MqaAttentionBase):
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         token_to_kv_pool = get_token_to_kv_pool()
         use_layer_split_prefill = (
-            is_cp_kv_layer_split_deepseek_v4_pool(token_to_kv_pool) and use_cp
+            is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool) and use_cp
         )
         do_fused_store = (unified and is_decode) or (
             not unified and self.use_fused_qk_norm_rope and not use_layer_split_prefill
@@ -1159,7 +1156,7 @@ class MQALayer(MqaAttentionBase):
             use_cp
             and self.indexer is not None
             and self.compressor is not None
-            and is_cp_kv_layer_split_deepseek_v4_pool(token_to_kv_pool)
+            and is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
             and token_to_kv_pool.should_use_c4_extra_broadcast_overlap(self.layer_id)
         )
 
@@ -1196,7 +1193,7 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> torch.Tensor:
         token_to_kv_pool = get_token_to_kv_pool()
-        use_layer_split_prefill = is_cp_kv_layer_split_deepseek_v4_pool(
+        use_layer_split_prefill = is_cp_cache_layer_split_deepseek_v4_pool(
             token_to_kv_pool
         ) and dsa_use_prefill_cp(forward_batch)
         if (

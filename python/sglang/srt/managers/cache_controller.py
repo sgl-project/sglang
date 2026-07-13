@@ -38,7 +38,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.cp_kv_layer_split import is_cp_kv_layer_split_pool
+from sglang.srt.mem_cache.cp_cache_layer_split import is_cp_cache_layer_split_pool
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -463,10 +463,10 @@ class HiCacheController:
             model_name, storage_backend_extra_config
         )
         if (
-            self.storage_config.cp_kv_layer_split
+            self.storage_config.cp_cache_layer_split
             and self.storage_config.attn_cp_size > 1
         ):
-            backup_primary_rank = get_attention_tp_rank()
+            backup_primary_rank = get_parallel().attn_tp_rank
         else:
             backup_primary_rank = self.storage_config.tp_rank
         self.backup_skip = (
@@ -613,7 +613,7 @@ class HiCacheController:
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )
-        cp_kv_layer_split = is_cp_kv_layer_split_pool(self.mem_pool_device)
+        cp_cache_layer_split = is_cp_cache_layer_split_pool(self.mem_pool_device)
         is_rank_replicated = is_mla_model or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
@@ -645,7 +645,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
-            cp_kv_layer_split=cp_kv_layer_split,
+            cp_cache_layer_split=cp_cache_layer_split,
             extra_config=storage_backend_extra_config,
         )
 

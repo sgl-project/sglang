@@ -275,7 +275,7 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
 class _DeepSeekV4HostLayerMappings:
     """Per-family ``{pp_local_id -> local_buffer_index}`` for DeepSeek V4 HiCache.
 
-    Under CP KV LayerSplit each map drops non-owned layers so the cache
+    Under CP Cache LayerSplit each map drops non-owned layers so the cache
     controller's per-entry ``layer_mapper`` returns ``None`` for them and skips
     the GPU<->host copy on this rank. Under the default non-sharded path the
     maps match the legacy ones 1:1; ``c4_indexer`` mirrors ``c4_kv`` and
@@ -294,7 +294,7 @@ class _DeepSeekV4HostLayerMappings:
 def _compute_deepseek_v4_host_layer_mappings(
     kvcache: Any,
 ) -> _DeepSeekV4HostLayerMappings:
-    # CP KV LayerSplit pool exposes the per-rank owned view explicitly.
+    # CP Cache LayerSplit pool exposes the per-rank owned view explicitly.
     if hasattr(kvcache, "get_hicache_host_layer_mapping"):
         raw = kvcache.get_hicache_host_layer_mapping()
         return _DeepSeekV4HostLayerMappings(
@@ -346,10 +346,12 @@ def _compute_deepseek_v4_host_layer_mappings(
     )
 
 
-def _state_pool_pp_locals_in_order(family_map: dict[int, int]) -> list[int]:
-    """PP-local layer IDs in local-buffer-index order, for state-pool list construction."""
+def _state_pool_global_layer_ids_in_order(
+    family_map: dict[int, int], start_layer: int
+) -> list[int]:
+    """Translate PP-local HiCache mapping keys for global state-pool lookup."""
     return [
-        pp_local
+        start_layer + pp_local
         for pp_local, _local_idx in sorted(family_map.items(), key=lambda kv: kv[1])
     ]
 
@@ -380,10 +382,11 @@ def build_deepseek_v4_hicache_stack(
     c4_state_mapping = mappings.c4_state
     c128_state_mapping = mappings.c128_state
     c4_indexer_state_mapping = mappings.c4_indexer_state
-    c4_state_pp_locals = _state_pool_pp_locals_in_order(c4_state_mapping)
-    c128_state_pp_locals = _state_pool_pp_locals_in_order(c128_state_mapping)
-    c4_indexer_state_pp_locals = _state_pool_pp_locals_in_order(
-        c4_indexer_state_mapping
+    c4_state_global_layer_ids = _state_pool_global_layer_ids_in_order(
+        c4_state_mapping, kvcache.start_layer
+    )
+    c4_indexer_state_global_layer_ids = _state_pool_global_layer_ids_in_order(
+        c4_indexer_state_mapping, kvcache.start_layer
     )
     num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
@@ -479,7 +482,7 @@ def build_deepseek_v4_hicache_stack(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
                 state_pools=[
                     kvcache.compress_state_pools[layer_id]
-                    for layer_id in c4_state_pp_locals
+                    for layer_id in c4_state_global_layer_ids
                 ],
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
@@ -490,7 +493,7 @@ def build_deepseek_v4_hicache_stack(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
                 state_pools=[
                     kvcache.indexer_compress_state_pools[layer_id]
-                    for layer_id in c4_indexer_state_pp_locals
+                    for layer_id in c4_indexer_state_global_layer_ids
                 ],
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,

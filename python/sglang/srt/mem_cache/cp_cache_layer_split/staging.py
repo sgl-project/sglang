@@ -1,4 +1,4 @@
-"""Staging buffers and index remap kernels for CP KV LayerSplit."""
+"""Staging buffers and index remap kernels for CP Cache LayerSplit."""
 
 from __future__ import annotations
 
@@ -79,7 +79,8 @@ def active_pages_for_indices(
     """Select pages touched by any CP rank; all ranks must call in the same order."""
     local_mask = build_active_pages_mask(indices, page_size, max_pages)
     local_mask = all_reduce_active_pages_mask(local_mask, pynccl_comm)
-    # TODO: avoid dynamic-shape overhead
+    # TODO: replace torch.nonzero with bounded GPU compaction to avoid a
+    # dynamic-shape CUDA synchronization in this hot read path.
     return torch.nonzero(local_mask, as_tuple=False).flatten()
 
 
