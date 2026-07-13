@@ -119,6 +119,9 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components import misc_utils
+from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
+    is_post_capture_kv_active,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
@@ -159,7 +162,6 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
-    is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
