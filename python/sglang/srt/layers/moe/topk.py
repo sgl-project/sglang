@@ -1641,31 +1641,26 @@ def biased_grouped_topk_gpu(
             and num_experts <= 256
             and topk <= 8
         ):
-            if not apply_routed_scaling_factor_on_output:
-                scaling = 1.0
-
-            num_tokens = gating_output.shape[0]
-
-            topk_values = torch.empty(
-                (num_tokens, topk), dtype=torch.float32, device=gating_output.device
-            )
-            topk_indices = torch.empty(
-                (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+            # Ungrouped biased sigmoid on XPU: dispatch to the native SYCL
+            # topk_sigmoid in the sgl_kernel (XPU) wheel. NOTE: do not use the
+            # module-level topk_sigmoid here — on XPU that name is the CUDA-only
+            # JIT kernel (jit_kernel/moe_topk_sigmoid.py), which crashes with
+            # "Could not find CUDA installation".
+            from sglang.srt.hardware_backend.xpu.kernels.topk import (
+                biased_grouped_topk_sigmoid_xpu,
             )
 
-            if num_tokens == 0:
-                return topk_values, topk_indices
-
-            topk_sigmoid(
-                topk_values,
-                topk_indices,
+            return biased_grouped_topk_sigmoid_xpu(
                 gating_output,
-                renormalize,
                 correction_bias,
+                topk,
+                renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
-            return topk_values * scaling, topk_indices
-
         else:
+            # Pure-torch fallback (also the XPU path for grouped routing,
+            # shared experts, or shapes the SYCL topk_sigmoid does not cover).
             return biased_grouped_topk_impl(
                 hidden_states,
                 gating_output,

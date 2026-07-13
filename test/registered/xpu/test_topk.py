@@ -96,6 +96,49 @@ class TestBiasedGroupedTopK(CustomTestCase):
                 routed_scaling_factor,
             )
 
+    # The native SYCL topk_sigmoid does not apply routed_scaling_factor itself;
+    # the XPU wrapper (biased_grouped_topk_sigmoid_xpu) applies it in Python when
+    # apply_routed_scaling_factor_on_output=True. Guard that adaptation matches
+    # the pure-torch reference — the default test above leaves it False.
+    def test_fast_biased_grouped_topk_scaling_on_output(self):
+        device = torch.device("xpu")
+        E, topk, routed_scaling_factor = 128, 6, 2.5
+        for M in (2, 1024):
+            torch.manual_seed(1024)
+            hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
+            gating_output = torch.randn(M, E, dtype=torch.bfloat16, device=device)
+            correction_bias = torch.randn(E, dtype=torch.float32, device=device)
+
+            ref_w, ref_ids = native_biased_grouped_topk(
+                hidden_states,
+                gating_output,
+                correction_bias,
+                topk,
+                True,  # renormalize
+                1,  # num_expert_group
+                1,  # topk_group
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=True,
+            )
+            w, ids = biased_grouped_topk_gpu(
+                hidden_states,
+                gating_output,
+                correction_bias,
+                topk,
+                True,  # renormalize
+                1,  # num_expert_group
+                1,  # topk_group
+                0,  # num_fused_shared_experts
+                routed_scaling_factor,
+                True,  # apply_routed_scaling_factor_on_output
+            )
+
+            res = torch.zeros(M, E, dtype=torch.float, device=device)
+            ref = torch.zeros(M, E, dtype=torch.float, device=device)
+            res.scatter_(1, ids.long(), w)
+            ref.scatter_(1, ref_ids.long(), ref_w)
+            torch.testing.assert_close(res, ref)
+
 
 if __name__ == "__main__":
     unittest.main()
