@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import logging
 import struct
@@ -8,10 +9,12 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
@@ -35,6 +38,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import NetworkAddress
 
 try:
     from nixl._bindings import (
@@ -54,6 +58,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
+TRANSFER_FAILED = b"TRANSFER_FAILED"
+DECODE_CONTROL_RECV_RETRY_DELAY = 0.1
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
 
@@ -182,6 +188,16 @@ class TransferInfo:
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
         )
+
+
+@dataclasses.dataclass
+class _PendingFailureNotification:
+    reason: str
+    deadline: float
+    expected_agents: int = 0
+    seen_agents: Set[str] = dataclasses.field(default_factory=set)
+    queued_endpoints: Set[Tuple[str, int]] = dataclasses.field(default_factory=set)
+    pending_batches: int = 0
 
 
 @dataclasses.dataclass
@@ -433,6 +449,18 @@ class NixlKVManager(CommonKVManager):
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
+            self._transfer_info_lock = threading.Lock()
+            self._failure_notification_lock = threading.Lock()
+            self._pending_failure_notifications: Dict[
+                int, _PendingFailureNotification
+            ] = {}
+            self._failure_notification_queue: Queue[
+                Tuple[int, str, List[Tuple[str, int]]]
+            ] = Queue()
+            threading.Thread(
+                target=self._failure_notification_worker,
+                daemon=True,
+            ).start()
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -455,11 +483,14 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self.propagated_failure_rooms: Set[int] = set()
+            self._transfer_failure_lock = threading.Lock()
+            self._staging_handler = None
+            self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             if self.enable_staging:
                 self._init_staging_decode_ctx()
-                self._staging_handler = None
-                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
-                self._start_decode_staging_thread()
+            # TRANSFER_FAILED uses this thread even when staging is disabled.
+            self._start_decode_control_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -538,21 +569,67 @@ class NixlKVManager(CommonKVManager):
 
         return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
 
-    def _start_decode_staging_thread(self):
-        """Start a thread on the decode side to recv STAGING_REQ from prefill via ZMQ."""
+    def _start_decode_control_thread(self):
+        """Receive control messages from prefill via ZMQ."""
 
-        def decode_staging_thread():
+        def decode_control_thread():
             while True:
-                msg = self.server_socket.recv_multipart()
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
+                try:
+                    msg = self.server_socket.recv_multipart()
+                except zmq.ZMQError as e:
+                    if e.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                        logger.debug("Decode control thread stopped")
+                        return
+                    if e.errno not in (zmq.EAGAIN, errno.EINTR):
+                        logger.exception("Decode control thread stopped unexpectedly")
+                        return
+                    logger.exception("Decode control receive failed")
+                    time.sleep(DECODE_CONTROL_RECV_RETRY_DELAY)
                     continue
-                logger.warning(
-                    "decode_staging_thread: unexpected message tag %s",
-                    msg[0][:20],
-                )
+                try:
+                    if msg[0] == b"STAGING_REQ":
+                        if self.enable_staging:
+                            self._handle_staging_req(msg)
+                        else:
+                            logger.warning("Ignoring STAGING_REQ: staging is disabled")
+                        continue
+                    if msg[0] == TRANSFER_FAILED:
+                        self._handle_transfer_failure(msg)
+                        continue
+                    logger.warning(
+                        "decode_control_thread: unexpected message tag %s",
+                        msg[0][:20],
+                    )
+                except Exception:
+                    logger.exception("Decode control message handling failed")
 
-        threading.Thread(target=decode_staging_thread, daemon=True).start()
+        threading.Thread(target=decode_control_thread, daemon=True).start()
+
+    def _record_propagated_failure(self, room: int, reason: str) -> None:
+        with self.failure_lock:
+            self.failure_records[room] = reason
+            self.propagated_failure_rooms.add(room)
+
+    def _handle_transfer_failure(self, msg: List[bytes]) -> None:
+        """Mark an active decode room failed from a prefill notification."""
+        try:
+            room = int(msg[1].decode("ascii"))
+            reason = msg[2].decode("utf-8") or "Prefill signaled transfer failure"
+        except (IndexError, UnicodeDecodeError, ValueError):
+            logger.warning("Ignoring malformed TRANSFER_FAILED notification")
+            return
+
+        with self._transfer_failure_lock:
+            status = self.request_status.get(room)
+            if status not in (KVPoll.WaitingForInput, KVPoll.Transferring):
+                logger.debug(
+                    "Ignoring TRANSFER_FAILED for terminal or unknown room %s", room
+                )
+                return
+
+            self._record_propagated_failure(room, reason)
+            self.update_status(room, KVPoll.Failed)
+        logger.debug("Prefill reported transfer failure for room %s: %s", room, reason)
 
     def _handle_staging_req(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -601,7 +678,8 @@ class NixlKVManager(CommonKVManager):
         if room in self._staging_ctx.prefetched_rooms:
             return
 
-        room_infos = self.transfer_infos.get(room, {})
+        with self._transfer_info_lock:
+            room_infos = self.transfer_infos.get(room, {}).copy()
         needs_staging = any(
             not tinfo.is_dummy()
             and tinfo.agent_name in self.decode_kv_args_table
@@ -620,7 +698,7 @@ class NixlKVManager(CommonKVManager):
 
         prefetch_staging_reqs(
             room,
-            self.transfer_infos,
+            {room: room_infos},
             self.kv_buffer_tensors,
             self.server_args.chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
@@ -630,6 +708,141 @@ class NixlKVManager(CommonKVManager):
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
+
+    def notify_decode_transfer_failure(
+        self, bootstrap_room: int, failure_reason: str
+    ) -> None:
+        """Queue a best-effort failure notification without blocking the scheduler."""
+        failure_reason = failure_reason or "Prefill signaled transfer failure"
+        with self._transfer_info_lock:
+            room_infos = self.transfer_infos.get(bootstrap_room, {}).copy()
+            with self._failure_notification_lock:
+                # Preserve the first reason because some endpoints may be queued
+                # before later failure paths report a different reason.
+                pending = self._pending_failure_notifications.setdefault(
+                    bootstrap_room,
+                    _PendingFailureNotification(
+                        reason=failure_reason,
+                        deadline=time.monotonic() + self.bootstrap_timeout,
+                    ),
+                )
+                endpoints = []
+                for agent_name, info in room_infos.items():
+                    pending.expected_agents = max(
+                        pending.expected_agents, info.required_dst_info_num
+                    )
+                    pending.seen_agents.add(agent_name)
+                    endpoint = (info.endpoint, info.dst_port)
+                    if endpoint not in pending.queued_endpoints:
+                        pending.queued_endpoints.add(endpoint)
+                        endpoints.append(endpoint)
+                self._queue_failure_notification_locked(
+                    bootstrap_room, pending.reason, endpoints
+                )
+
+    def _queue_failure_notification_locked(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        endpoints: List[Tuple[str, int]],
+    ) -> None:
+        if endpoints:
+            pending = self._pending_failure_notifications[bootstrap_room]
+            pending.pending_batches += 1
+            self._failure_notification_queue.put_nowait(
+                (bootstrap_room, failure_reason, sorted(endpoints))
+            )
+
+    def _capture_failed_room_registration(
+        self, bootstrap_room: int, agent_name: str, transfer_info: TransferInfo
+    ) -> bool:
+        """Capture a late decode endpoint after the prefill request has failed."""
+        with self._failure_notification_lock:
+            pending = self._pending_failure_notifications.get(bootstrap_room)
+            if pending is None:
+                return False
+            pending.expected_agents = max(
+                pending.expected_agents, transfer_info.required_dst_info_num
+            )
+            pending.seen_agents.add(agent_name)
+            endpoint = (transfer_info.endpoint, transfer_info.dst_port)
+            endpoints = []
+            if endpoint not in pending.queued_endpoints:
+                pending.queued_endpoints.add(endpoint)
+                endpoints.append(endpoint)
+            self._queue_failure_notification_locked(
+                bootstrap_room, pending.reason, endpoints
+            )
+            return True
+
+    def _prune_pending_failure_notifications(self) -> None:
+        now = time.monotonic()
+        with self._failure_notification_lock:
+            expired = [
+                (room, pending)
+                for room, pending in self._pending_failure_notifications.items()
+                if pending.deadline <= now
+            ]
+            for room, _ in expired:
+                self._pending_failure_notifications.pop(room, None)
+        for room, pending in expired:
+            if (
+                pending.expected_agents
+                and len(pending.seen_agents) >= pending.expected_agents
+            ):
+                logger.debug("Expired TRANSFER_FAILED tombstone for room %s", room)
+            else:
+                logger.warning(
+                    "Expired TRANSFER_FAILED tombstone for room %s after seeing "
+                    "%s of %s decode registrations",
+                    room,
+                    len(pending.seen_agents),
+                    pending.expected_agents,
+                )
+
+    def _failure_notification_worker(self) -> None:
+        while True:
+            try:
+                bootstrap_room, failure_reason, endpoints = (
+                    self._failure_notification_queue.get(timeout=1)
+                )
+            except Empty:
+                self._prune_pending_failure_notifications()
+                continue
+
+            payload = [
+                TRANSFER_FAILED,
+                str(bootstrap_room).encode("ascii"),
+                failure_reason.encode("utf-8"),
+            ]
+            try:
+                for endpoint, dst_port in endpoints:
+                    try:
+                        na = NetworkAddress(endpoint, dst_port)
+                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                            payload, flags=zmq.NOBLOCK
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to notify decode endpoint %s:%s that room %s failed",
+                            endpoint,
+                            dst_port,
+                            bootstrap_room,
+                        )
+            finally:
+                with self._failure_notification_lock:
+                    pending = self._pending_failure_notifications.get(bootstrap_room)
+                    if pending is not None:
+                        pending.pending_batches -= 1
+                    if (
+                        pending is not None
+                        and pending.expected_agents
+                        and len(pending.seen_agents) >= pending.expected_agents
+                        and pending.pending_batches == 0
+                    ):
+                        self._pending_failure_notifications.pop(bootstrap_room, None)
+                self._failure_notification_queue.task_done()
+                self._prune_pending_failure_notifications()
 
     def _prep_equal_tp_dlist(
         self,
@@ -1008,7 +1221,11 @@ class NixlKVManager(CommonKVManager):
                 if self.check_status(room) == KVPoll.Failed:
                     continue
 
-                assert room in self.transfer_infos
+                with self._transfer_info_lock:
+                    room_infos = self.transfer_infos.get(room)
+                    if room_infos is None:
+                        continue
+                    reqs_to_be_processed = list(room_infos.values())
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1020,8 +1237,6 @@ class NixlKVManager(CommonKVManager):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
 
                 self.update_status(room, KVPoll.Transferring)
-
-                reqs_to_be_processed = list(self.transfer_infos[room].values())
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1199,7 +1414,8 @@ class NixlKVManager(CommonKVManager):
                     self.update_status(room, KVPoll.Success)
                     # Drop per-room state on Success (parity with mooncake
                     # transfer_worker; staging prefetch sets are NIXL-only).
-                    self.transfer_infos.pop(room, None)
+                    with self._transfer_info_lock:
+                        self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
@@ -2342,7 +2558,8 @@ class NixlKVManager(CommonKVManager):
                             handle_staging_rsp,
                         )
 
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        with self._transfer_info_lock:
+                            handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
 
                 assert (
@@ -2359,24 +2576,30 @@ class NixlKVManager(CommonKVManager):
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
+                transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                with self._transfer_info_lock:
+                    required_dst_info_num = transfer_info.required_dst_info_num
+                    failed_room = self._capture_failed_room_registration(
+                        room, agent_name, transfer_info
                     )
+                    if not failed_room:
+                        room_infos = self.transfer_infos.setdefault(room, {})
+                        room_infos[agent_name] = transfer_info
+                        registration_complete = len(room_infos) == required_dst_info_num
+                        if registration_complete:
+                            self.req_to_decode_prefix_len[room] = next(
+                                (
+                                    info.decode_prefix_len
+                                    for info in room_infos.values()
+                                    if info.decode_prefix_len is not None
+                                ),
+                                0,
+                            )
+                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+                if failed_room:
+                    logger.debug("Captured late registration for failed room %s", room)
+                    continue
+                if registration_complete:
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -2455,11 +2678,9 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
-        super().clear()
-        if (
-            getattr(self.kv_mgr, "enable_staging", False)
-            and getattr(self.kv_mgr, "_staging_ctx", None) is not None
-        ):
+        with self.kv_mgr._transfer_info_lock:
+            super().clear()
+        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             self.kv_mgr._staging_ctx.prefetch_requested = {
                 key
@@ -2471,6 +2692,13 @@ class NixlKVSender(CommonKVSender):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+
+        notification_reason = failure_reason
+        if notification_reason is None and exc is not None:
+            notification_reason = str(exc)
+        self.kv_mgr.notify_decode_transfer_failure(
+            self.bootstrap_room, notification_reason or "NIXL KV transfer failed"
+        )
 
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
@@ -2486,6 +2714,13 @@ class NixlKVSender(CommonKVSender):
             raise KVTransferError(self.bootstrap_room, failure_reason)
         raise KVTransferError(
             self.bootstrap_room, "NIXL KVSender Exception", is_from_another_rank=True
+        )
+
+    def abort(self):
+        super().abort()
+        self._send_failed = True
+        self.kv_mgr.notify_decode_transfer_failure(
+            self.bootstrap_room, "Aborted by AbortReq."
         )
 
 
@@ -2582,13 +2817,33 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-                self.bootstrap_room
-            )
-            self.conclude_state = KVPoll.Success
-            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
-            return self.conclude_state  # type: ignore
+            with self.kv_mgr._transfer_failure_lock:
+                if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
+                    self.conclude_state = KVPoll.Failed
+                else:
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                    self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                        self.bootstrap_room
+                    )
+                    self.conclude_state = KVPoll.Success
+                    del self.kv_mgr.transfer_statuses[self.bootstrap_room]
+                return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
+
+    def clear(self) -> None:
+        with self.kv_mgr._transfer_failure_lock:
+            super().clear()
+            self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            with self.kv_mgr.failure_lock:
+                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+                self.kv_mgr.propagated_failure_rooms.discard(self.bootstrap_room)
+            rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
+            if rooms is not None:
+                rooms.discard(self.bootstrap_room)
+            if self.kv_mgr.enable_staging:
+                self.kv_mgr._staging_ctx.room_receivers.pop(self.bootstrap_room, None)
+                self.kv_mgr._staging_ctx.room_bootstrap.pop(self.bootstrap_room, None)
+                self.kv_mgr._chunk_writer_counts.pop(self.bootstrap_room, None)
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -2661,8 +2916,12 @@ class NixlKVReceiver(CommonKVReceiver):
     def failure_exception(self):
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        is_propagated = failure_reason is None
-        if is_propagated:
+            is_propagated = (
+                failure_reason is None
+                or self.bootstrap_room in self.kv_mgr.propagated_failure_rooms
+            )
+            self.kv_mgr.propagated_failure_rooms.discard(self.bootstrap_room)
+        if failure_reason is None:
             failure_reason = "NIXL KVReceiver Exception"
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
