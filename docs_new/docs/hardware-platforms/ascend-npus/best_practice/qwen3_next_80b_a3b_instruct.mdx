@@ -6,6 +6,8 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for Qwen3-Next-80B-A3B-Instruct on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-Next-80B-A3B-Instruct Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
@@ -125,7 +127,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -241,7 +243,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -357,7 +359,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

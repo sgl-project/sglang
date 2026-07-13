@@ -4,16 +4,16 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
