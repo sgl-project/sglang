@@ -718,7 +718,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             group_size=group_size,
         )
-        nvfp4_config.is_w4a16_nvfp4 = False
         nvfp4a16_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -726,8 +725,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             group_size=group_size,
             use_per_token_activation=False,
+            is_w4a16_nvfp4=True,
         )
-        nvfp4a16_config.is_w4a16_nvfp4 = True
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -1186,6 +1185,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Config class for FP4."""
 
+    is_w4a16_nvfp4: bool = False
+
     def __init__(
         self,
         is_checkpoint_nvfp4_serialized: bool = False,
@@ -1194,9 +1195,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
+        is_w4a16_nvfp4: bool = False,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
+        self.is_w4a16_nvfp4 = is_w4a16_nvfp4
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
                 "Detected nvfp4 checkpoint. Please note that the "

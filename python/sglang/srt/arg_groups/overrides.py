@@ -855,12 +855,22 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["quantization"] = quantization
 
     quant_config = getattr(model_config.hf_config, "quantization_config", {}) or {}
-    quant_section = quant_config.get("quantization", quant_config)
-    quantized_layers = quant_section.get("quantized_layers", {})
-    has_w4a16_nvfp4 = any(
-        isinstance(layer_config, dict)
-        and layer_config.get("quant_algo", "").upper() == "W4A16_NVFP4"
-        for layer_config in quantized_layers.values()
+    quant_section = (
+        quant_config.get("quantization", quant_config)
+        if isinstance(quant_config, dict)
+        else {}
+    )
+    if not isinstance(quant_section, dict):
+        quant_section = {}
+    quantized_layers = quant_section.get("quantized_layers", {}) or {}
+    has_w4a16_nvfp4 = (
+        any(
+            isinstance(layer_config, dict)
+            and layer_config.get("quant_algo", "").upper() == "W4A16_NVFP4"
+            for layer_config in quantized_layers.values()
+        )
+        if isinstance(quantized_layers, dict)
+        else False
     )
 
     if (is_modelopt or model_config.quantization is None) and (

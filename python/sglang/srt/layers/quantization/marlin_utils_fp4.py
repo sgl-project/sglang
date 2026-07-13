@@ -65,7 +65,7 @@ def nvfp4_marlin_process_scales(
         marlin_scales.size(0), -1
     )
     marlin_scales = marlin_scales * (2**7)
-    marlin_scales[marlin_scales < 2] = 0
+    marlin_scales[marlin_scales < 2.0] = 0
     marlin_scales = marlin_scales.view(torch.int16) << 1
     marlin_scales = marlin_scales.view(torch.float8_e4m3fn)
     return marlin_scales[:, 1::2].contiguous(), scale_factor
