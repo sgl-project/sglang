@@ -5,7 +5,7 @@ export const config = {
   modelName: "GLM-5.2",
 
   supportedHardware: [
-    "h200", "b200", "gb300", "b300",
+    "h20", "h200", "b200", "gb300", "b300",
     "mi355x", "mi325x", "mi300x",
   ],
 
@@ -17,6 +17,7 @@ export const config = {
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
     { id: "nvfp4", label: "NVFP4" },
+    { id: "w4afp8", label: "W4AFP8" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -32,6 +33,7 @@ export const config = {
     "default|fp8": "zai-org/GLM-5.2-FP8",
     "default|bf16": "zai-org/GLM-5.2",
     "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
+    "default|w4afp8": "PhalaCloud/GLM-5.2-W4AFP8",
   },
 
   placeholders: {
@@ -90,6 +92,7 @@ sgl-eval run aime25 \\
   ],
 
   dockerImages: {
+    h20:   "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
@@ -107,7 +110,7 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DSA prefill Context Parallelism (CP) splits the long-prefill attention across
-    // `cp` ranks — verified on Hopper (H200). On Blackwell the DSA-CP FP8 rope kernel
+    // `cp` ranks — verified on Hopper (H20&H200). On Blackwell the DSA-CP FP8 rope kernel
     // is not yet adapted, so keep CP off there for now.
     attention: {
       knobs: [
@@ -217,6 +220,65 @@ sgl-eval run aime25 \\
   },
 
   cells: [
+    // ====================================================================
+    // H20 + W4AFP8 (Hopper) — TP8. CP (DSA prefill) verified here.
+    // ====================================================================
+    {
+      match: { hw: "h20", variant: "default", quant: "w4afp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--mem-fraction-static 0.8",
+        "--disable-shared-experts-fusion",
+        "--quantization w4afp8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h20", variant: "default", quant: "w4afp8", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 1",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 2",
+        "--mem-fraction-static 0.8",
+        "--disable-shared-experts-fusion",
+        "--quantization w4afp8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h20", variant: "default", quant: "w4afp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.8",
+        "--disable-shared-experts-fusion",
+        "--quantization w4afp8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     // ====================================================================
     // H200 + FP8 (Hopper) — TP8. CP (DSA prefill) verified here.
     // ====================================================================
