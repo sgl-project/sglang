@@ -39,6 +39,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -181,6 +182,7 @@ class SchedulerBeamSearchProcessor:
         device: torch.device,
     ) -> None:
         """Create initial beam candidates for one request from prefill top-k tokens."""
+        logprobs = self._apply_custom_logit_processor(req, logprobs)
         topk_result = logprobs.topk(req.beam_candidates, dim=0, sorted=True)
         top_logprobs_val = topk_result.values.tolist()
         top_logprobs_idx = topk_result.indices.tolist()
@@ -395,20 +397,58 @@ class SchedulerBeamSearchProcessor:
         tail_len = min((max_len_tail_str + 1), len(tokens))
         return req.tokenizer.decode(tokens[-tail_len:])
 
+    @staticmethod
+    def _apply_custom_logit_processor(
+        req: Req, logprobs: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply one request's processor to its beam-search score rows."""
+        if not req.custom_logit_processor:
+            return logprobs
+
+        processor = CustomLogitProcessor.from_str(req.custom_logit_processor)
+        custom_params = dict(req.sampling_params.custom_params or {})
+        custom_params["__req__"] = req
+
+        processor_input = logprobs if logprobs.ndim == 2 else logprobs.unsqueeze(0)
+        processed = processor(processor_input, [custom_params])
+        return processed if logprobs.ndim == 2 else processed.squeeze(0)
+
+    def _apply_decode_custom_logit_processors(
+        self, batch: ScheduleBatch, logprobs: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply per-request processors to contiguous per-beam score slices."""
+        offset = 0
+        for req in batch.reqs:
+            if req.is_retracted:
+                continue
+
+            num_beams = len(req.beam_list.incomplete)
+            if num_beams == 0:
+                continue
+
+            beam_slice = logprobs[offset : offset + num_beams]
+            processed = self._apply_custom_logit_processor(req, beam_slice)
+            if processed is not beam_slice:
+                beam_slice.copy_(processed)
+            offset += num_beams
+
+        return logprobs
+
     def _extract_beam_topk_data(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (top_tokens, top_logprobs), each [total_beams, max_k], from decode logprobs.
 
         Unlike transformers (which scores full vocab), we take top-k first; this can
-        shrink the candidate pool and slightly affect quality. Custom logit processors
-        are not supported.
+        shrink the candidate pool and slightly affect quality.
         """
         max_k = max([req.beam_candidates for req in batch.reqs])
+        logprobs = result.logits_output.logprobs
+        if any(req.custom_logit_processor for req in batch.reqs):
+            logprobs = self._apply_decode_custom_logit_processors(batch, logprobs)
+
         # sorted=True is required so mixed beam_width requests select the right top-k.
-        beam_top_token_logprobs = result.logits_output.logprobs.topk(
-            max_k, dim=1, sorted=True
-        )
+        beam_top_token_logprobs = logprobs.topk(max_k, dim=1, sorted=True)
         return beam_top_token_logprobs.indices, beam_top_token_logprobs.values
 
     def _process_beam_search_expansion(

@@ -36,9 +36,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler_components.beam_search_processor import (
     SchedulerBeamSearchProcessor,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
 RELEASE_KV = (
@@ -76,6 +77,7 @@ def make_req(**overrides):
         beam_candidates=4,
         origin_input_ids=[1, 2, 3],
         stop_token_ids=set(),
+        custom_logit_processor=None,
         finished_reason=None,
         to_finish=None,
         tokenizer=Mock(),
@@ -87,6 +89,7 @@ def make_req(**overrides):
         stop_strs=[],
         stop_regex_strs=[],
         length_penalty=1.0,
+        custom_params=None,
     )
     for k, v in overrides.items():
         setattr(req, k, v)
@@ -103,7 +106,7 @@ def patch_methods(testcase, *attrs):
     return mocks
 
 
-class TestProcessPrefillResult(unittest.TestCase):
+class TestProcessPrefillResult(CustomTestCase):
     """process_beam_search_prefill_result: init / release / cache / stream."""
 
     def setUp(self):
@@ -143,7 +146,7 @@ class TestProcessPrefillResult(unittest.TestCase):
         self.release.assert_not_called()
 
 
-class TestProcessDecodeResult(unittest.TestCase):
+class TestProcessDecodeResult(CustomTestCase):
     """process_beam_search_decode_result: expansion / completion / kv / metrics."""
 
     def setUp(self):
@@ -221,7 +224,7 @@ class TestProcessDecodeResult(unittest.TestCase):
         self.m["_process_beam_search_expansion"].assert_not_called()
 
 
-class TestStaticMethods(unittest.TestCase):
+class TestStaticMethods(CustomTestCase):
     """sum_beam_completion_tokens + convert_beam_sequences_to_output."""
 
     def test_sum_beam_completion_tokens(self):
@@ -269,7 +272,7 @@ class TestStaticMethods(unittest.TestCase):
         self.assertEqual(out.sequences[1].finish_reason["type"], "stop")
 
 
-class TestProcessPrefillSingleReq(unittest.TestCase):
+class TestProcessPrefillSingleReq(CustomTestCase):
     """_process_beam_search_prefill_result_single_req routing."""
 
     def setUp(self):
@@ -321,7 +324,7 @@ class TestProcessPrefillSingleReq(unittest.TestCase):
         self.assertFalse(args[4])
 
 
-class TestBatchCheckPrefillStopConditions(unittest.TestCase):
+class TestBatchCheckPrefillStopConditions(CustomTestCase):
     def setUp(self):
         self.proc = make_proc()
 
@@ -344,7 +347,7 @@ class TestBatchCheckPrefillStopConditions(unittest.TestCase):
         self.assertEqual(r.cpu().tolist(), [True, False, False])
 
 
-class TestCreateCompletedAndInitialBeams(unittest.TestCase):
+class TestCreateCompletedAndInitialBeams(CustomTestCase):
     """_create_completed_beams_for_insufficient_candidates + _create_initial_beam_sequences."""
 
     def setUp(self):
@@ -425,7 +428,7 @@ class TestCreateCompletedAndInitialBeams(unittest.TestCase):
         self.assertEqual([b.tokens for b in bl.incomplete], [[200], [300], [400]])
 
 
-class TestCheckBeamFinished(unittest.TestCase):
+class TestCheckBeamFinished(CustomTestCase):
     """_check_beam_finished stop-condition cases."""
 
     def setUp(self):
@@ -480,7 +483,7 @@ class TestCheckBeamFinished(unittest.TestCase):
         self.assertIsNone(beam.finish_reason)
 
 
-class TestTailStr(unittest.TestCase):
+class TestTailStr(CustomTestCase):
     def test_tail_str_decodes_tail(self):
         proc = make_proc()
         req = make_req()
@@ -492,9 +495,14 @@ class TestTailStr(unittest.TestCase):
         self.assertTrue(req.tokenizer.decode.called)
 
 
-class TestExtractBeamTopkData(unittest.TestCase):
+class TestExtractBeamTopkData(CustomTestCase):
     def test_extract_sorted_topk(self):
-        batch = Mock(reqs=[Mock(beam_candidates=4), Mock(beam_candidates=8)])
+        batch = Mock(
+            reqs=[
+                Mock(beam_candidates=4, custom_logit_processor=None),
+                Mock(beam_candidates=8, custom_logit_processor=None),
+            ]
+        )
         result = Mock(logits_output=Mock(logprobs=torch.randn(6, 10, device=CPU)))
         tokens, logprobs = make_proc()._extract_beam_topk_data(batch, result)
         self.assertEqual(tokens.shape, (6, 8))
@@ -506,7 +514,82 @@ class TestExtractBeamTopkData(unittest.TestCase):
                 )
 
 
-class TestProcessBeamSearchExpansion(unittest.TestCase):
+class TestBeamSearchCustomLogitProcessor(CustomTestCase):
+    @staticmethod
+    def _processor_with_allowed_tokens(*allowed_tokens):
+        def apply(logprobs, custom_params):
+            processed = torch.full_like(logprobs, -float("inf"))
+            for row, token_id in enumerate(allowed_tokens):
+                processed[row, token_id] = 0.0
+            return processed
+
+        return Mock(side_effect=apply)
+
+    def test_prefill_processor_runs_before_initial_topk(self):
+        proc = make_proc()
+        req = make_req(
+            custom_logit_processor="serialized",
+            beam_list=BeamSearchList(),
+        )
+        req.sampling_params.custom_params = {"target": "prefill"}
+        processor = self._processor_with_allowed_tokens(7)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.beam_search_processor."
+                "CustomLogitProcessor.from_str",
+                return_value=processor,
+            ),
+            patch.object(
+                proc,
+                "_batch_check_prefill_generated_tokens_stop_conditions",
+                return_value=T([False, False, False, False], dtype=torch.bool),
+            ),
+            patch.object(proc, "_create_initial_beam_sequences") as create_initial,
+        ):
+            proc._process_beam_search_prefill_result_single_req(
+                req,
+                Mock(device=CPU),
+                torch.zeros(10, device=CPU),
+                CPU,
+            )
+
+        self.assertEqual(create_initial.call_args.args[2][0], 7)
+        params = processor.call_args.args[1][0]
+        self.assertEqual(params["target"], "prefill")
+        self.assertIs(params["__req__"], req)
+
+    def test_decode_processor_runs_on_each_requests_beam_slice(self):
+        proc = make_proc()
+        req = make_req(
+            beam_candidates=2,
+            custom_logit_processor="serialized",
+            beam_list=Mock(
+                incomplete=[
+                    BeamSearchSequence(tokens=[1]),
+                    BeamSearchSequence(tokens=[2]),
+                ]
+            ),
+        )
+        req.sampling_params.custom_params = {"target": "decode"}
+        processor = self._processor_with_allowed_tokens(4, 3)
+        batch = Mock(reqs=[req])
+        result = Mock(logits_output=Mock(logprobs=torch.zeros(2, 5, device=CPU)))
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.beam_search_processor."
+            "CustomLogitProcessor.from_str",
+            return_value=processor,
+        ):
+            tokens, _ = proc._extract_beam_topk_data(batch, result)
+
+        self.assertEqual(tokens[:, 0].tolist(), [4, 3])
+        params = processor.call_args.args[1][0]
+        self.assertEqual(params["target"], "decode")
+        self.assertIs(params["__req__"], req)
+
+
+class TestProcessBeamSearchExpansion(CustomTestCase):
     """_process_beam_search_expansion routing across finish conditions."""
 
     def setUp(self):
@@ -565,7 +648,7 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class TestExpandAndPruneBeams(unittest.TestCase):
+class TestExpandAndPruneBeams(CustomTestCase):
     """_expand_and_prune_beams: fast / eos / stop-str / insufficient paths."""
 
     def setUp(self):
@@ -694,7 +777,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         self.assertEqual(len(req.beam_list.incomplete), 0)
 
 
-class TestCreateCompletedBeamsForFinishedRequest(unittest.TestCase):
+class TestCreateCompletedBeamsForFinishedRequest(CustomTestCase):
     def test_appends_completed_with_finish_reason(self):
         proc = make_proc()
         existing = BeamSearchSequence(
@@ -730,7 +813,7 @@ class TestCreateCompletedBeamsForFinishedRequest(unittest.TestCase):
             self.assertEqual(beam.finish_reason, reason)
 
 
-class TestKVCacheHelpers(unittest.TestCase):
+class TestKVCacheHelpers(CustomTestCase):
     """KV-cache batch helpers: collect / handle / copy / cache-finished."""
 
     def test_batch_collect_range_kv_indices_with_prefix(self):
@@ -909,7 +992,7 @@ class TestKVCacheHelpers(unittest.TestCase):
         self.assertEqual(len(pool), 5)
 
 
-class TestCalculateBeamScore(unittest.TestCase):
+class TestCalculateBeamScore(CustomTestCase):
     def test_beam_score_with_penalties(self):
         f = P._calculate_beam_score
         self.assertAlmostEqual(f(-10.0, 5, 1.0), -2.0, places=5)
