@@ -1,23 +1,9 @@
-"""MI35x DeepSeek-V4-Pro FP4 + non-EP DP two-batch-overlap (TBO) test (8-GPU)
+"""MI35x DeepSeek-V4-Pro FP4 + non-EP DP two-batch-overlap (TBO) + MTP test (8-GPU)
 
 End-to-end accuracy test for DeepSeek-V4-Pro (1.6T) FP4 with the non-EP DP
 two-batch-overlap path on MI35x ROCm 7.2.
 
-TBO here is the DP-attention TP-MoE variant (moe_a2a_backend='none'): it overlaps
-one micro-batch's DP all_gatherv (pre-MoE gather) + reduce_scatterv (post-MoE
-combine) with the other micro-batch's attention + expert compute (prefill only).
-Enabled purely via `--enable-dp-attention` + `--enable-two-batch-overlap` (no opt-in
-env). This test guards that TBO does not regress GSM8K accuracy and that the DP TBO
-server launches + runs (exercises op_gather/op_moe/op_combine and the event+ref
-combine-buffer lifetime that fixed the reserved-memory OOM at mem0.9).
-
-Unlike the CPU-only server-args guard unit test (TestTwoBatchOverlapBackend), this
-runs the TBO forward on the real model — which only DeepSeek-V4 implements — so it
-needs the real 8-GPU model (a dummy model path would not exercise TBO). Uses the FP4
-Pro model (fp4 routed experts); do NOT force SGLANG_DSV4_FP4_EXPERTS=false here or
-the expert weights are read at the wrong (fp8) shape.
-
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp suite
 """
 
 import os
@@ -36,7 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=14400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp", nightly=True
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -45,6 +31,7 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+
 
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
@@ -67,7 +54,7 @@ FP4_ENV_VARS = {
 }
 
 
-class TestDeepseekV4ProFp4Tbo(CustomTestCase):
+class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V4_PRO_FP4_MODEL_PATH
@@ -93,6 +80,17 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
             "dsv4",
             "--kv-cache-dtype",
             "fp8_e4m3",
+            # MTP / EAGLE speculative decoding (NextN head from the base model).
+            # With spec on, target-verify batches also report is_extend(); the
+            # prefill TBO gate is is_extend_without_speculative() (PR #30238).
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
             "--max-running-requests",
             "512",
             "--cuda-graph-max-bs",
@@ -125,12 +123,12 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k_tbo(self):
+    def test_gsm8k_tbo_mtp(self):
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
             num_questions=1319,
-            parallel=512,
+            parallel=1319,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -140,11 +138,11 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k_tbo (deepseek-v4-pro-fp4 DP+TBO, {FLASHMLA_BACKEND})\n"
+                f"### test_gsm8k (deepseek-v4-pro-fp4 DP+TBO+MTP, {FLASHMLA_BACKEND})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
-        # TBO must not regress accuracy vs the non-TBO baseline (>0.91).
-        self.assertGreater(metrics["accuracy"], 0.91)
+            # TBO+MTP must not regress accuracy vs the non-TBO MTP baseline.
+            self.assertGreater(metrics["accuracy"], 0.91)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_hip
 
 from .utils import make_name
 
@@ -217,7 +218,7 @@ class CompressorPrefillPlan(NamedTuple):
         # return an empty plan here (downstream compressor then processes 0
         # tokens = no-op) instead of skipping TBO per-rank. Avoids the
         # c_plan.cuh RuntimeCheck(batch_size <= num_q_tokens) failure at B>=1.
-        if int(num_q_tokens) == 0:
+        if int(num_q_tokens) == 0 and is_hip():
             _dev = req_to_token.device
             return CompressorPrefillPlan(
                 compress_ratio,
