@@ -1166,20 +1166,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
-        # TODO: Move this online-quantization reporting out of ModelRunner.
-        quantized_layers = getattr(
-            getattr(self.model, "quant_config", None), "quantized_layers", None
+        ModelRunner.report_online_quantization(
+            model=self.model, server_args=self.server_args
         )
-        if (
-            self.server_args.quantization is not None
-            and isinstance(quantized_layers, tuple)
-            and len(quantized_layers) == 2
-        ):
-            layer_types, quantized_layers_count = quantized_layers
-            logger.info(
-                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
-            )
 
         maybe_register_debug_tensor_dump_hook(
             model=self.model,
@@ -1204,6 +1193,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         self._dist_barrier_after_load()
+
+    @staticmethod
+    def report_online_quantization(*, model, server_args: ServerArgs) -> None:
+        # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
+        quantized_layers = getattr(
+            getattr(model, "quant_config", None), "quantized_layers", None
+        )
+        if (
+            server_args.quantization is not None
+            and isinstance(quantized_layers, tuple)
+            and len(quantized_layers) == 2
+        ):
+            layer_types, quantized_layers_count = quantized_layers
+            logger.info(
+                f"Online {server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+            )
 
     def _prepare_moe_topk(self):
         balancer_cls = None
