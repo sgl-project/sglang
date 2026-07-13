@@ -1543,6 +1543,22 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class PullWeightsReqInput(BaseReq, kw_only=True):
+    # Host-local checkpoint dir the pulled weights land in; seeded from the
+    # server's model path when the published stream has no full version.
+    local_checkpoint_dir: str
+    # Shared dir the publisher writes weight_v{N:06d}/ version dirs under; each
+    # version is a full HF checkpoint or a delta against the previous version.
+    source_dir: str
+    # The version to bring the local checkpoint up to.
+    target_version: int
+
+
+class PullWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]

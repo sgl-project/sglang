@@ -29,6 +29,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -132,6 +134,44 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
             )
+
+    def pull_weights(self, recv_req: PullWeightsReqInput):
+        """Sync this host's local checkpoint up to recv_req.target_version.
+
+        Every rank runs the pull; a per-host file lock collapses co-located
+        ranks to one pull. Success is gathered across the TP group (all nodes),
+        so the reply only reports success once every host holds a verified
+        checkpoint.
+        """
+        from sglang.srt.weight_sync import local_checkpoint
+
+        server_args = self.tp_worker.model_runner.server_args
+        try:
+            local_checkpoint.pull(
+                local_checkpoint_dir=recv_req.local_checkpoint_dir,
+                base_dir=server_args.model_path,
+                source_dir=recv_req.source_dir,
+                target_version=recv_req.target_version,
+                pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
+            )
+            success, message = True, "Success."
+        except Exception:
+            success, message = False, traceback.format_exc()
+            logger.error(message)
+
+        tp_size = (
+            torch.distributed.get_world_size(group=self.tp_cpu_group)
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        if tp_size > 1:
+            results = [None] * tp_size
+            torch.distributed.all_gather_object(
+                results, (success, message), group=self.tp_cpu_group
+            )
+            success = all(ok for ok, _ in results)
+            message = "; ".join(msg for ok, msg in results if not ok) or message
+        return PullWeightsReqOutput(success, message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
