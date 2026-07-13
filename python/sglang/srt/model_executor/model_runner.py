@@ -219,13 +219,13 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
-from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -523,9 +523,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
-            self.local_omp_cpuid = init_threads_binding(
-                tp_rank=self.tp_rank, tp_size=self.tp_size
-            )
+            self.init_threads_binding()
 
         # Set float32 matmul precision
         if get_server_args().enable_tf32_matmul:
@@ -2809,6 +2807,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {capture_name} CUDA graph end. "
             f"elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
+        )
+
+    def init_threads_binding(self):
+        self.local_omp_cpuid = numa_utils.init_threads_binding(
+            tp_rank=self.tp_rank, tp_size=self.tp_size
         )
 
     def apply_torch_tp(self):
