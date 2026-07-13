@@ -73,6 +73,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             and batch.prompt_embeds_mask[0] is not None
         ):
             kwargs["attention_mask"] = batch.prompt_embeds_mask[0]
+            kwargs["text_seq_lens"] = batch.prompt_seq_lens[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "read"
@@ -91,6 +92,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             and batch.negative_prompt_embeds_mask[0] is not None
         ):
             kwargs["attention_mask"] = batch.negative_prompt_embeds_mask[0]
+            kwargs["text_seq_lens"] = batch.negative_prompt_seq_lens[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "skip"

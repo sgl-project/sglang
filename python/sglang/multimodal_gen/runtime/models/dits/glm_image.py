@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_world_size,
+    get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -481,6 +482,7 @@ class GlmImageAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_meta: Optional[Dict[str, Any]] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         kv_cache: Optional[GlmImageLayerKVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -566,6 +568,7 @@ class GlmImageAttention(torch.nn.Module):
             value,
             attn_mask=attention_mask,
             num_replicated_prefix=text_seq_length,
+            attn_mask_meta=attention_mask_meta,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -636,6 +639,7 @@ class GlmImageTransformerBlock(nn.Module):
             ]
         ] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_meta: Optional[Dict[str, Any]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         kv_cache: Optional[GlmImageLayerKVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -662,6 +666,7 @@ class GlmImageTransformerBlock(nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             attention_mask=attention_mask,
+            attention_mask_meta=attention_mask_meta,
             kv_cache=kv_cache,
             **attention_kwargs,
         )
@@ -907,6 +912,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         crop_coords: torch.Tensor,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        text_seq_lens: Optional[List[int]] = None,
         kv_caches: Optional[GlmImageKVCache] = None,
         kv_caches_mode: Optional[str] = None,
         freqs_cis: Optional[
@@ -926,7 +932,28 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
 
+        attention_impl = self.transformer_blocks[0].attn1.attn.attn_impl
+        use_ascend_varlen = (
+            current_platform.is_npu()
+            and getattr(attention_impl, "supports_varlen", False)
+            and (attention_mask is None or text_seq_lens is not None)
+        )
         if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
+            if use_ascend_varlen:
+                logger.info_once(
+                    f"GLM-Image DiT is using Ascend FA true batching (batch_size={batch_size})"
+                )
+            else:
+                logger.warning_once(
+                    "GLM-Image DiT is using the batch-1 microbatch fallback because "
+                    "Ascend variable-length FA is unavailable"
+                )
+        if (
+            current_platform.is_npu()
+            and batch_size > 1
+            and kv_caches is None
+            and not use_ascend_varlen
+        ):
 
             def slice_batch(value, index):
                 if (
@@ -959,6 +986,11 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         crop_coords=slice_batch(crop_coords, index),
                         attention_kwargs=attention_kwargs,
                         attention_mask=sample_attention_mask,
+                        text_seq_lens=(
+                            [text_seq_lens[index]]
+                            if text_seq_lens is not None
+                            else None
+                        ),
                         freqs_cis=freqs_cis,
                         guidance=slice_batch(guidance, index),
                     )
@@ -995,6 +1027,45 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ]
         hidden_states = hidden_states + prior_hidden_states
 
+        attention_mask_meta = None
+        if attention_mask is not None and use_ascend_varlen:
+            if len(text_seq_lens) != batch_size:
+                raise ValueError("text_seq_lens must contain one length per sample")
+            text_seq_length = encoder_hidden_states.shape[1]
+            image_seq_length = (
+                hidden_states.shape[1] * get_ulysses_parallel_world_size()
+            )
+            total_seq_length = text_seq_length + image_seq_length
+            valid_lengths = torch.tensor(
+                text_seq_lens,
+                dtype=torch.long,
+                device=hidden_states.device,
+            ).unsqueeze(1)
+            positions = torch.arange(
+                total_seq_length, device=hidden_states.device
+            ).unsqueeze(0).expand(batch_size, -1)
+            image_end = valid_lengths + image_seq_length
+            gather_indices = torch.where(
+                positions < valid_lengths,
+                positions,
+                torch.where(
+                    positions < image_end,
+                    text_seq_length + positions - valid_lengths,
+                    valid_lengths + positions - image_end,
+                ),
+            )
+            restore_indices = torch.empty_like(gather_indices)
+            restore_indices.scatter_(1, gather_indices, positions)
+            attention_mask_meta = {
+                "npu_varlen": {
+                    "gather_indices": gather_indices,
+                    "restore_indices": restore_indices,
+                    "actual_seq_lengths": [
+                        int(length) + image_seq_length for length in text_seq_lens
+                    ],
+                }
+            }
+
         temb = self.time_condition_embed(
             timestep, target_size, crop_coords, hidden_states.dtype
         )
@@ -1008,6 +1079,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 temb,
                 image_rotary_emb,
                 attention_mask,
+                attention_mask_meta,
                 attention_kwargs,
                 kv_cache=kv_caches[idx] if kv_caches is not None else None,
             )

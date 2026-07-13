@@ -67,6 +67,12 @@ class AscendFAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        schema = getattr(
+            getattr(torch.ops.npu.npu_fused_infer_attention_score, "default", None),
+            "_schema",
+            None,
+        )
+        self.supports_varlen = "actual_seq_lengths" in str(schema)
 
     def forward(
         self,
@@ -102,3 +108,32 @@ class AscendFAImpl(AttentionImpl):
         if return_softmax_lse:
             return output, lse
         return output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        actual_seq_lengths: list[int],
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        if not self.supports_varlen:
+            raise RuntimeError(
+                "npu_fused_infer_attention_score does not support actual_seq_lengths"
+            )
+        num_heads, num_key_value_heads = query.shape[2], key.shape[2]
+        query = query.transpose(1, 2).contiguous()
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
+            num_heads=num_heads,
+            num_key_value_heads=num_key_value_heads,
+            scale=self.softmax_scale,
+            input_layout="BNSD",
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths,
+        )
+        return output.transpose(1, 2)

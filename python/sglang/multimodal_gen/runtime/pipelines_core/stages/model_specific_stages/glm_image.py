@@ -717,7 +717,11 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             prompt_embeds_mask = torch.arange(
                 prompt_embeds.shape[1], device=device
             ).unsqueeze(0) < sequence_lengths_tensor.unsqueeze(1)
-        return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask
+        return (
+            prompt_embeds.to(device=device, dtype=dtype),
+            prompt_embeds_mask,
+            sequence_lengths,
+        )
 
     def encode_prompt(
         self,
@@ -755,8 +759,10 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            prompt_embeds, prompt_embeds_mask = self._get_glyph_embeds(
-                prompt, max_sequence_length, device, dtype
+            prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
+                self._get_glyph_embeds(
+                    prompt, max_sequence_length, device, dtype
+                )
             )
         else:
             prompt_embeds_mask = torch.ones(
@@ -764,9 +770,11 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 device=prompt_embeds.device,
                 dtype=torch.bool,
             )
+            prompt_seq_lens = [prompt_embeds.shape[1]] * prompt_embeds.shape[0]
 
         negative_prompt_embeds = None
         negative_prompt_embeds_mask = None
+        negative_prompt_seq_lens = None
         if do_classifier_free_guidance:
             negative_prompt = ""
             negative_prompt = (
@@ -787,10 +795,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     " the batch size of `prompt`."
                 )
 
-            negative_prompt_embeds, negative_prompt_embeds_mask = (
-                self._get_glyph_embeds(
-                    negative_prompt, max_sequence_length, device, dtype
-                )
+            (
+                negative_prompt_embeds,
+                negative_prompt_embeds_mask,
+                negative_prompt_seq_lens,
+            ) = self._get_glyph_embeds(
+                negative_prompt, max_sequence_length, device, dtype
             )
 
         return (
@@ -798,6 +808,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             negative_prompt_embeds,
             prompt_embeds_mask,
             negative_prompt_embeds_mask,
+            prompt_seq_lens,
+            negative_prompt_seq_lens,
         )
 
     def prepare_latents(
@@ -940,6 +952,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             negative_prompt_embeds,
             prompt_embeds_mask,
             negative_prompt_embeds_mask,
+            prompt_seq_lens,
+            negative_prompt_seq_lens,
         ) = self.encode_prompt(
             prompts,
             do_classifier_free_guidance,
@@ -1077,6 +1091,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.negative_prompt_embeds = [negative_prompt_embeds]
         batch.prompt_embeds_mask = [prompt_embeds_mask]
         batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
+        batch.prompt_seq_lens = [prompt_seq_lens]
+        batch.negative_prompt_seq_lens = [negative_prompt_seq_lens]
         batch.latents = latents
         batch.timesteps = timesteps
         batch.scheduler = scheduler
