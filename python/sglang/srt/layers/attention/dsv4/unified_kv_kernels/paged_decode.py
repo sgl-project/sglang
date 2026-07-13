@@ -56,9 +56,13 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils.common import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
@@ -878,12 +882,24 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
-    return _sparse_attn_v4_paged_decode_triton(
-        q,
-        unified_kv,
-        kv_indices,
-        kv_indptr,
-        attn_sink,
-        softmax_scale,
-        kv_scales=kv_scales,
-    )
+    if _is_gfx1250_supported:
+        return pa_decode_sparse(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            has_invalid=False,
+            kv_scales=kv_scales,
+        )
+    else:
+        return _sparse_attn_v4_paged_decode_triton(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            kv_scales=kv_scales,
+        )
