@@ -353,82 +353,16 @@ class KVCacheConfigurator:
         )
 
         if is_dsv4_model:
-            swa_page_size = self.server_args.page_size
-            if not _is_npu:
-                assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
-
-            if self.is_draft_worker:
-                from sglang.srt.models.deepseek_v4_nextn import (
-                    COMPRESS_RATIO_NEXTN_LAYER,
-                )
-
-                compression_ratios = [
-                    COMPRESS_RATIO_NEXTN_LAYER
-                ] * self.num_effective_layers
-            else:
-                compression_ratios = self.model_config.compress_ratios
-
-            # NPU + DSV4 → paged-state subclass: the fused compressor kernel
-            # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
-            # so the CUDA ring-buffer state path can't be shared. CUDA keeps
-            # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
-                    DSV4NPUTokenToKVPool,
-                    npu_state_pool_size,
-                )
-
-                pool_cls = DSV4NPUTokenToKVPool
-                # Recompute state pool sizes for the NPU paged formula (CUDA's
-                # ring sizes are dropped here). Tail-only allocation keeps the
-                # per-req-budget formula sufficient at any prefill length: long
-                # prompts allocate only ``tail+128`` (c4) / ``tail`` (c128)
-                # slots (tail = seq_len % 128), and decode is drained by
-                # sliding eviction in ``ScheduleBatch._evict_swa``.
-                c4_state_pool_size = npu_state_pool_size(
-                    ratio=4,
-                    page_size=self.server_args.page_size,
-                    max_num_reqs=max_running_requests,
-                )
-                c128_state_pool_size = npu_state_pool_size(
-                    ratio=128,
-                    page_size=self.server_args.page_size,
-                    max_num_reqs=max_running_requests,
-                )
-            else:
-                pool_cls = DeepSeekV4TokenToKVPool
-                c4_state_pool_size = c4_state_pool_size
-                c128_state_pool_size = c128_state_pool_size
-
-            token_to_kv_pool = pool_cls(
-                max_num_reqs=max_running_requests,
-                # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
-                # past max_running_requests (pre-alloc), so size to the real capacity.
-                num_req_slots=req_to_token_pool.req_to_token.shape[0],
-                swa_size=swa_max_total_num_tokens,
-                c4_size=c4_max_total_num_tokens,
-                c128_size=c128_max_total_num_tokens,
+            token_to_kv_pool = self._build_dsv4_kv_pool(
+                max_running_requests=max_running_requests,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+                c4_max_total_num_tokens=c4_max_total_num_tokens,
+                c128_max_total_num_tokens=c128_max_total_num_tokens,
                 c4_state_pool_size=c4_state_pool_size,
                 c128_state_pool_size=c128_state_pool_size,
-                page_size=self.server_args.page_size,
-                swa_page_size=swa_page_size,
-                sliding_window=self.model_config.window_size,
-                dtype=self.kv_cache_dtype,
                 c4_state_dtype=c4_state_dtype,
                 c128_state_dtype=c128_state_dtype,
-                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                indexer_head_dim=self.model_config.index_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                compression_ratios=compression_ratios,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                enable_hisparse=self.server_args.enable_hisparse,
-                online_mtp_max_draft_tokens=(
-                    self.server_args.max_speculative_num_draft_tokens or 0
-                ),
+                req_to_token_pool=req_to_token_pool,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
@@ -1241,6 +1175,98 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
         return req_to_token_pool
+
+    def _build_dsv4_kv_pool(
+        self,
+        *,
+        max_running_requests: int,
+        swa_max_total_num_tokens: Optional[int],
+        c4_max_total_num_tokens: int,
+        c128_max_total_num_tokens: int,
+        c4_state_pool_size: int,
+        c128_state_pool_size: int,
+        c4_state_dtype: Optional[torch.dtype],
+        c128_state_dtype: Optional[torch.dtype],
+        req_to_token_pool: ReqToTokenPool,
+    ) -> KVCache:
+        swa_page_size = self.server_args.page_size
+        if not _is_npu:
+            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+
+        if self.is_draft_worker:
+            from sglang.srt.models.deepseek_v4_nextn import (
+                COMPRESS_RATIO_NEXTN_LAYER,
+            )
+
+            compression_ratios = [
+                COMPRESS_RATIO_NEXTN_LAYER
+            ] * self.num_effective_layers
+        else:
+            compression_ratios = self.model_config.compress_ratios
+
+        # NPU + DSV4 → paged-state subclass: the fused compressor kernel
+        # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
+        # so the CUDA ring-buffer state path can't be shared. CUDA keeps
+        # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                DSV4NPUTokenToKVPool,
+                npu_state_pool_size,
+            )
+
+            pool_cls = DSV4NPUTokenToKVPool
+            # Recompute state pool sizes for the NPU paged formula (CUDA's
+            # ring sizes are dropped here). Tail-only allocation keeps the
+            # per-req-budget formula sufficient at any prefill length: long
+            # prompts allocate only ``tail+128`` (c4) / ``tail`` (c128)
+            # slots (tail = seq_len % 128), and decode is drained by
+            # sliding eviction in ``ScheduleBatch._evict_swa``.
+            c4_state_pool_size = npu_state_pool_size(
+                ratio=4,
+                page_size=self.server_args.page_size,
+                max_num_reqs=max_running_requests,
+            )
+            c128_state_pool_size = npu_state_pool_size(
+                ratio=128,
+                page_size=self.server_args.page_size,
+                max_num_reqs=max_running_requests,
+            )
+        else:
+            pool_cls = DeepSeekV4TokenToKVPool
+            c4_state_pool_size = c4_state_pool_size
+            c128_state_pool_size = c128_state_pool_size
+
+        token_to_kv_pool = pool_cls(
+            max_num_reqs=max_running_requests,
+            # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
+            # past max_running_requests (pre-alloc), so size to the real capacity.
+            num_req_slots=req_to_token_pool.req_to_token.shape[0],
+            swa_size=swa_max_total_num_tokens,
+            c4_size=c4_max_total_num_tokens,
+            c128_size=c128_max_total_num_tokens,
+            c4_state_pool_size=c4_state_pool_size,
+            c128_state_pool_size=c128_state_pool_size,
+            page_size=self.server_args.page_size,
+            swa_page_size=swa_page_size,
+            sliding_window=self.model_config.window_size,
+            dtype=self.kv_cache_dtype,
+            c4_state_dtype=c4_state_dtype,
+            c128_state_dtype=c128_state_dtype,
+            qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            indexer_head_dim=self.model_config.index_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            compression_ratios=compression_ratios,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            enable_hisparse=self.server_args.enable_hisparse,
+            online_mtp_max_draft_tokens=(
+                self.server_args.max_speculative_num_draft_tokens or 0
+            ),
+        )
+        return token_to_kv_pool
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
