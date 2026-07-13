@@ -389,7 +389,7 @@ class Sampler(nn.Module):
             if _is_xpu:
                 # oneCCL (xccl) all_reduce silently performs SUM for op=MIN/MAX
                 # on integer tensors, so MIN(id, id) returns 2*id and corrupts
-                # the synced token ids (SGLANGT-1357). Emulate the MIN with an
+                # the synced token ids. Emulate the MIN with an
                 # all_gather + torch.min, which only relies on the correct
                 # all_gather collective.
                 world_size = torch.distributed.get_world_size(self.tp_sync_group)
