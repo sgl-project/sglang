@@ -128,6 +128,19 @@ def maybe_register_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def is_supported_dsv4_decode_radix_mtp(
+    *, spec_algorithm: "SpeculativeAlgorithm", server_args: "ServerArgs"
+) -> bool:
+    return (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and not spec_algorithm.is_frozen_kv_mtp()
+        and server_args.speculative_eagle_topk == 1
+        and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+    )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -221,10 +234,15 @@ def build_kv_cache(
                         "cache / HiCache storage for this experimental path."
                     )
                 if not spec_algorithm.is_none():
-                    raise ValueError(
-                        "DeepSeek-V4 decode-side radix cache does not support "
-                        "speculative decoding / MTP yet."
-                    )
+                    if not is_supported_dsv4_decode_radix_mtp(
+                        spec_algorithm=spec_algorithm, server_args=server_args
+                    ):
+                        raise ValueError(
+                            "DeepSeek-V4 decode-side radix cache currently supports "
+                            "only the experimental EAGLE topk=1 online c128 MTP "
+                            "path. Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
+                            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+                        )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache does not support "
