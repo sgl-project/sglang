@@ -73,12 +73,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
     EvictParams,
+    MatchPrefixParams,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -639,15 +642,46 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
-        result = match_prefix_for_req(
-            self.tree_cache,
-            req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
-            include_req=True,
-        )
-        # Keep aggregated scheduling semantics while preserving the SWA lock
-        # boundary needed for the matching dec_lock_ref.
+        if self._uses_dsv4_decode_radix_cache():
+            # DSV4 prompt donation creates full-only leaves: the SWA component is
+            # intentionally tombstoned because decode only needs the long full
+            # prefix while the SWA tail is recomputed/transferred. Use the full
+            # match here; the generic SWA-window-safe match would truncate these
+            # full-only leaves to zero and force full KV transfer again.
+            result = self.tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(req.origin_input_ids, req.extra_key),
+                    cow_mamba=self.tree_cache.supports_mamba(),
+                    req=req,
+                    return_full_match=True,
+                )
+            )
+            if envs.SGLANG_RADIX_FORCE_MISS.get():
+                result = zero_match_result(self.tree_cache, result)
+            (
+                req.prefix_indices,
+                req.last_node,
+                req.last_host_node,
+                req.best_match_node,
+                req.host_hit_length,
+            ) = (
+                result.device_indices,
+                result.last_device_node,
+                result.last_host_node,
+                result.best_match_node,
+                result.host_hit_length,
+            )
+        else:
+            result = match_prefix_for_req(
+                self.tree_cache,
+                req,
+                req.origin_input_ids,
+                cow_mamba=self.tree_cache.supports_mamba(),
+                include_req=True,
+            )
+        # Always lock to match aggregated scheduling behavior. SWA locks only
+        # span the sliding window and return a boundary uuid; store it so the
+        # matching dec_lock_ref stops there instead of underflowing toward root.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         return self._build_decode_prefix_match(req, result)

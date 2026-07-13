@@ -66,6 +66,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    force_leaf_creation: bool = False
 
     # General
     chunked: bool = False

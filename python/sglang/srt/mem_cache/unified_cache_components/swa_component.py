@@ -590,6 +590,9 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.force_leaf_creation = getattr(
+            req, "force_radix_leaf_creation", False
+        )
         return None
 
     def free_out_of_window_slots(
