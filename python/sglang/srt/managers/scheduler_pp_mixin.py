@@ -1319,7 +1319,9 @@ class SchedulerPPMixin:
         seq_lens_sum = batch.seq_lens_sum
         if seq_lens_sum is None:
             if tree_mask_buf is None:
-                seq_lens_sum = bs * attn_backend.max_context_len
+                # Conservative upper bound; backend-agnostic (not every
+                # attention backend exposes max_context_len).
+                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
             else:
                 seq_lens_sum = 0  # preallocated buf -> kernel ignores it
 

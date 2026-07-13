@@ -137,7 +137,12 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-def _load_checkpoint_tensor(model_path: str, tensor_name: str) -> torch.Tensor:
+# Embedding weight names across checkpoint layouts (GLM/DeepSeek-V3 style
+# vs DeepSeek-V4 style).
+_EMBED_TENSOR_NAMES = ("model.embed_tokens.weight", "embed.weight")
+
+
+def _load_checkpoint_tensor(model_path: str, tensor_names: tuple) -> torch.Tensor:
     """Load one tensor from a local safetensors checkpoint (PP+spec path)."""
     import glob
     import json
@@ -148,19 +153,19 @@ def _load_checkpoint_tensor(model_path: str, tensor_name: str) -> torch.Tensor:
     index_path = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
-            shard_files = [json.load(f)["weight_map"][tensor_name]]
+            weight_map = json.load(f)["weight_map"]
+        for tensor_name in tensor_names:
+            if tensor_name in weight_map:
+                shard_path = os.path.join(model_path, weight_map[tensor_name])
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    return f.get_tensor(tensor_name)
     else:
-        shard_files = sorted(
-            os.path.basename(p)
-            for p in glob.glob(os.path.join(model_path, "*.safetensors"))
-        )
-    for shard_file in shard_files:
-        with safe_open(
-            os.path.join(model_path, shard_file), framework="pt", device="cpu"
-        ) as f:
-            if tensor_name in f.keys():
-                return f.get_tensor(tensor_name)
-    raise ValueError(f"{tensor_name} not found in checkpoint at {model_path}")
+        for shard_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    if tensor_name in f.keys():
+                        return f.get_tensor(tensor_name)
+    raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -376,7 +381,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.server_args.load_format != "dummy":
                 loaded_embed = _load_checkpoint_tensor(
                     model_path=self.draft_runner.model_config.model_path,
-                    tensor_name="model.embed_tokens.weight",
+                    tensor_names=_EMBED_TENSOR_NAMES,
                 )
                 embed.weight_loader(embed, loaded_embed)
             head = self.target_worker.model_runner.model.lm_head.weight
