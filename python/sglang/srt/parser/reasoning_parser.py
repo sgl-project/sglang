@@ -350,7 +350,13 @@ class Glm45Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         think_excluded_tokens = [
             "<tool_call>",
             "</tool_call>",
@@ -365,6 +371,8 @@ class Glm45Detector(BaseReasoningFormatDetector):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
             thinks_internally=True,
             reasoning_default="enable_thinking",
         )

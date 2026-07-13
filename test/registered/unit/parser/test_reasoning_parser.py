@@ -914,13 +914,19 @@ class TestReasoningParserAdvanced(CustomTestCase):
             messages=[
                 ChatCompletionMessageUserParam(role="user", content="Hi"),
                 ChatCompletionMessageGenericParam(
-                    role="assistant", content="Let me think..."
+                    role="assistant", content="<think>partial reasoning"
                 ),
             ],
             continue_final_message=True,
         )
-        parser = ReasoningParser("qwen3", request=request)
-        self.assertTrue(parser.detector.continue_final_message)
+
+        for model_type in ReasoningParser.DetectorMap:
+            with self.subTest(model_type=model_type):
+                parser = ReasoningParser(model_type, request=request)
+                self.assertTrue(parser.detector.continue_final_message)
+                self.assertEqual(
+                    parser.detector.previous_content, "<think>partial reasoning"
+                )
 
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """Test that force_nonempty_content is passed via chat_template_kwargs."""
