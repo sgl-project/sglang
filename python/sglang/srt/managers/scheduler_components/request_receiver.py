@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import pickle
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -15,6 +17,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -32,11 +35,6 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
-
-import os
-import pickle
-
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -197,7 +195,10 @@ class SchedulerRequestReceiver:
         # desync the NCCL forward collectives and hang.  Enabling it requires an
         # explicit acknowledgement so it can be used only for offline
         # single-batch micro-timing, never real traffic.
-        if envs.SGLANG_TP_REQ_SHM_RING.get() and not envs.SGLANG_TP_REQ_SHM_RING_ACK_UNSAFE.get():
+        if (
+            envs.SGLANG_TP_REQ_SHM_RING.get()
+            and not envs.SGLANG_TP_REQ_SHM_RING_ACK_UNSAFE.get()
+        ):
             import logging
 
             logging.getLogger(__name__).warning(

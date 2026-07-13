@@ -148,9 +148,7 @@ class RadixKey:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
             raw = (
-                self.token_ids[o + start : o + stop + 1]
-                if stop > start
-                else array("q")
+                self.token_ids[o + start : o + stop + 1] if stop > start else array("q")
             )
             return RadixKey(raw, self.extra_key, is_bigram=True)
         return RadixKey(self.token_ids[o + start : o + stop], self.extra_key)
