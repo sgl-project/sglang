@@ -36,6 +36,10 @@ from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import (
+    MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO,
+    MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP,
+    MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP,
+    MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY,
     _should_enable_lazy_compaction,
     calculate_mla_kv_cache_dim,
 )
@@ -67,13 +71,6 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-
-
-# the ratio of mamba cache pool size to max_running_requests
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
