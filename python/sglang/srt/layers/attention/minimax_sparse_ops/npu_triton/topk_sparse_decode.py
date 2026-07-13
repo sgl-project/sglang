@@ -552,6 +552,8 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     sm_scale: Optional[float] = None,
     num_topk_chunks: Optional[int] = None,
     max_num_topk_chunks: int = 8,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     """Sparse decode attention using BNSD KV cache and precomputed topk blocks.
 
@@ -709,8 +711,8 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=num_topk_chunks,
         CHUNK_SIZE_T=chunk_size_topk,
         HAS_SINK=sink is not None,
-        num_warps=_SPARSE_DECODE_NW,
-        num_stages=_SPARSE_DECODE_NS,
+        num_warps=_SPARSE_DECODE_NW if num_warps is None else num_warps,
+        num_stages=_SPARSE_DECODE_NS if num_stages is None else num_stages,
     )
 
     if not single_chunk:

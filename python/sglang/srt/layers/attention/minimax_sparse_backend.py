@@ -1209,6 +1209,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         cu_seqlens: torch.Tensor,
         seq_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
+        # Prefill main-attention (decode-kernel reused) launch tuning. Defaults are
+        # the decode-validated (4, 2); prefill is compute/memory-bound (total_q~8192)
+        # so re-tuning may help. A/B by editing these two -- the decode path
+        # (forward_decode) is unaffected (it does not go through this method).
+        # Sweep: num_warps in {2,4,8}, num_stages in {2,3}.
+        main_num_warps: int = 4,
+        main_num_stages: int = 2,
     ):
         """NPU block-sparse PREFILL via the ported triton decode kernels.
 
@@ -1424,6 +1431,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 block_size=page_size,
                 topk_idx=topk_idx,
                 sm_scale=head_dim**-0.5,
+                num_warps=main_num_warps,
+                num_stages=main_num_stages,
             )
 
         if _use_union:
