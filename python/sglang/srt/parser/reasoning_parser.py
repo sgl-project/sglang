@@ -562,6 +562,59 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         )
 
 
+class MiniMaxM3Detector(BaseReasoningFormatDetector):
+    """MiniMax-M3 detector. Format: (<mm:think>)*(.*)</mm:think>.
+
+    In multi-turn chats M3 prefixes earlier non-thinking turns with a bare
+    ``</mm:think>``, so a non-thinking reply may open with one stray closer; drop it unless thinking.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<mm:think>",
+            "</mm:think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+        self._lead_buffer = ""
+        self._checked_leading_close = False
+        self._force_nonempty_content = force_nonempty_content
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        if not self._in_reasoning and text.lstrip().startswith(self.think_end_token):
+            text = text.lstrip()[len(self.think_end_token) :]
+        ret = super().detect_and_parse(text)
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        # ``</mm:think>`` is a single token, so a stray leading closer arrives whole.
+        if not self._checked_leading_close and not self._in_reasoning:
+            self._lead_buffer += new_text
+            stripped = self._lead_buffer.lstrip()
+            if not stripped:
+                return StreamingParseResult()
+            self._checked_leading_close = True
+            if stripped.startswith(self.think_end_token):
+                new_text = stripped[len(self.think_end_token) :]
+            else:
+                new_text = self._lead_buffer
+            self._lead_buffer = ""
+            if not new_text:
+                return StreamingParseResult()
+        return super().parse_streaming_increment(new_text)
+
+
 class MistralDetector(BaseReasoningFormatDetector):
     """
     Detector for Mistral models with reasoning (e.g., Mistral-Small-4-119B-2603).
@@ -1157,6 +1210,7 @@ class ReasoningParser:
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
+        "minimax-m3": MiniMaxM3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
@@ -1181,6 +1235,8 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
         # Special cases where we override force_reasoning
         if model_type.lower() in {
             "qwen3-thinking",
@@ -1188,6 +1244,11 @@ class ReasoningParser:
             "minimax",
         }:
             force_reasoning = True
+
+        # M3 consumes the <mm:think> start tag only for thinking_mode=enabled
+        # (absent from output → must force); mirror serving_chat's M3 branch.
+        if model_type.lower() == "minimax-m3" and force_reasoning is None:
+            force_reasoning = chat_template_kwargs.get("thinking_mode") == "enabled"
 
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
         kwargs = {"stream_reasoning": stream_reasoning}
@@ -1203,7 +1264,6 @@ class ReasoningParser:
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content
 
-        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
 
