@@ -680,6 +680,7 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.is_hybrid_mla_backend = False
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -732,6 +733,9 @@ def setup_state_kv_args(
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
+            )
+            kv_args.is_hybrid_mla_backend = is_mla_backend(
+                token_to_kv_pool.full_kv_pool
             )
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
