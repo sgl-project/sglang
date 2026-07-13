@@ -164,5 +164,27 @@ class TestDFlashServerSpecV2PlanStream(TestDFlashServerSpecV2):
     overlap_plan_stream = True
 
 
+class TestDFlashServerTreeVerify(TestDFlashServerSpecV2PlanStream):
+    """DFLASH EAGLE-style tree verification (fused GPU tree builder).
+
+    Enables the draft tree on the spec-v2 overlap path via
+    --speculative-dflash-tree-verify + --speculative-eagle-topk 4. Uses triton
+    verify attention (the tree custom-mask path) and raises the accept-length
+    bound (a topk tree accepts more per verify step than the linear chain).
+    Reuses the chain gsm8k accuracy threshold (tree verify is greedy-lossless).
+    """
+
+    attention_backend = "triton"
+    # A smaller running-request cap keeps the per-bs tree-mask cuda graphs within
+    # the CI card's memory (tree verify graphs are larger than chain's).
+    max_running_requests = 8
+    gsm8k_accept_length_thres = 3.5
+    other_launch_args = [
+        "--speculative-dflash-tree-verify",
+        "--speculative-eagle-topk",
+        "4",
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
