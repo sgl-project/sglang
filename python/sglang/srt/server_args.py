@@ -60,6 +60,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
+from sglang.srt.true_on_policy.contracts import (
+    resolve_true_on_policy_runtime_policy,
+    validate_true_on_policy_contract,
+)
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -269,7 +273,7 @@ BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -2513,6 +2517,15 @@ class ServerArgs:
         bool,
         "Enable deterministic inference mode with batch invariant ops.",
     ] = False
+    enable_prefill_only_deterministic_inference: A[
+        bool,
+        "Enable prefill-only deterministic inference mode with batch invariant ops.",
+    ] = False
+    true_on_policy_contract: A[
+        Optional[str],
+        "Internal true-on-policy parity contract selected by the launcher. "
+        "Normal users should prefer the Miles true_on_policy switch.",
+    ] = None
     rl_on_policy_target: A[
         Optional[str],
         Arg(
@@ -5796,16 +5809,40 @@ class ServerArgs:
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
+        validate_true_on_policy_contract(self)
+
+        if self.enable_prefill_only_deterministic_inference:
+            self.enable_deterministic_inference = True
+
         if self.rl_on_policy_target is not None:
             logger.warning(
-                "Enable deterministic inference because of rl_on_policy_target."
+                "Enable deterministic inference because of legacy rl_on_policy_target."
+            )
+            self.enable_deterministic_inference = True
+
+        if self.true_on_policy_contract is not None:
+            logger.warning(
+                "Enable deterministic inference because of true_on_policy_contract."
             )
             self.enable_deterministic_inference = True
 
             # For VLM
             envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
-            # TODO remove this environment variable as a whole
-            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+
+            if (
+                resolve_true_on_policy_runtime_policy(
+                    self
+                ).disable_flashinfer_allreduce_fusion
+                and self.enable_flashinfer_allreduce_fusion
+            ):
+                self.enable_flashinfer_allreduce_fusion = False
+                logger.warning(
+                    "Disable flashinfer allreduce fusion because of "
+                    "true_on_policy_contract with TP rollout."
+                )
+
+        if self.enable_deterministic_inference:
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set("1")
 
         if self.enable_deterministic_inference:
             if self.enable_aiter_allreduce_fusion:

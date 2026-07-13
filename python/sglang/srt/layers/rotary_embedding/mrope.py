@@ -19,7 +19,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_linear_ramp_mask,
 )
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
@@ -215,7 +215,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.register_buffer("axis_map", axis_map, persistent=False)
         else:
             self.axis_map = None
-        if get_global_server_args().rl_on_policy_target is not None:
+        if is_true_on_policy_enabled():
             self._forward_method = self.forward_native
 
     def get_cos_sin_with_position(self, positions):
