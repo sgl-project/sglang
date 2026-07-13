@@ -291,6 +291,7 @@ def get_stacked_multiply(
     stacked_rank = {
         "qkv_proj": 3,
         "in_proj_qkvz": 4,  # GDN packed input projection
+        "in_proj_ba": 2,  # GDN beta/alpha packed input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "in_proj": 2,
@@ -342,6 +343,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "up_proj",
         "gate_up_proj",
         "down_proj",

@@ -320,8 +320,19 @@ class LoRAAdapter(nn.Module):
            expects four per-slice ``A`` blocks, so repeat ``lora_A`` 4× along
            the rank dim. ``lora_B`` is already full-output-dim and matches
            the buffer directly.
+
+        3. Qwen/PEFT split: ``in_proj_qkv`` contains the q/k/v output slices
+           and ``in_proj_z`` contains the z slice. Repeat the q/k/v A block
+           three times and concatenate z to form the four-slice fused A;
+           concatenate the corresponding B output slices.
+
+        4. Qwen/PEFT split: ``in_proj_b`` and ``in_proj_a`` are the two
+           output slices of the fused ``in_proj_ba`` projection. Concatenate
+           their A rank blocks and B output blocks in checkpoint order.
         """
         for weight_name in list(weights.keys()):
+            if weight_name not in weights:
+                continue
             if "in_proj_q." in weight_name:
                 k_name = weight_name.replace("in_proj_q", "in_proj_k")
                 v_name = weight_name.replace("in_proj_q", "in_proj_v")
@@ -347,6 +358,35 @@ class LoRAAdapter(nn.Module):
                 weights.pop(k_name)
                 weights.pop(v_name)
                 weights.pop(z_name)
+            elif "in_proj_qkv." in weight_name:
+                z_name = weight_name.replace("in_proj_qkv", "in_proj_z")
+                if z_name not in weights:
+                    continue
+                qkvz_name = weight_name.replace("in_proj_qkv", "in_proj_qkvz")
+                cat_dim = weights[weight_name].dim() - 2
+                if "lora_A" in weight_name:
+                    qkv_a = weights[weight_name]
+                    repeat_dims = [1] * qkv_a.dim()
+                    repeat_dims[cat_dim] = 3
+                    qkv_a = qkv_a.repeat(*repeat_dims)
+                    weights[qkvz_name] = torch.cat((qkv_a, weights[z_name]), cat_dim)
+                else:
+                    weights[qkvz_name] = torch.cat(
+                        (weights[weight_name], weights[z_name]), cat_dim
+                    )
+                weights.pop(weight_name)
+                weights.pop(z_name)
+            elif "in_proj_b." in weight_name:
+                a_name = weight_name.replace("in_proj_b", "in_proj_a")
+                if a_name not in weights:
+                    continue
+                ba_name = weight_name.replace("in_proj_b", "in_proj_ba")
+                cat_dim = weights[weight_name].dim() - 2
+                weights[ba_name] = torch.cat(
+                    (weights[weight_name], weights[a_name]), cat_dim
+                )
+                weights.pop(weight_name)
+                weights.pop(a_name)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
                 # Already-merged adapter: replicate the shared A across the 4
                 # stacked slots the buffer expects (q, k, v, z).
