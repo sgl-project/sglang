@@ -14,13 +14,13 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 11K+1.5K | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
+| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 11k+1.5k | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
+| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
 
 ## Optimal Configuration
 
@@ -38,7 +38,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: BF16
 
-**Dataset**: 11K+1.5K
+**Dataset**: 11k+1.5k
 
 **TPOT**: 8ms
 
@@ -135,7 +135,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50.1ms
 
