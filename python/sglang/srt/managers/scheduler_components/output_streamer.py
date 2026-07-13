@@ -278,7 +278,10 @@ class _GenerationStreamAccumulator:
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_block_accept_tokens: list = field(default_factory=list)
+    spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
+    spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
@@ -406,7 +409,10 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
+            self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
+            self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 
         if self.return_logprob:
             if (
@@ -499,11 +505,23 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
+        current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
-            for k, v in req.customized_info.items():
-                if k not in self.customized_info:
-                    self.customized_info[k] = []
-                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+            for key, req_values in req.customized_info.items():
+                if key not in self.customized_info:
+                    self.customized_info[key] = [
+                        [None] * len(prev_output_ids)
+                        for prev_output_ids in self.output_ids[:-1]
+                    ]
+                self.customized_info[key].append(
+                    [None] * current_output_len
+                    if req_values is None
+                    else req_values[send_token_offset : len(output_ids_)]
+                )
+
+        for per_request_values in self.customized_info.values():
+            if len(per_request_values) < len(self.output_ids):
+                per_request_values.append([None] * current_output_len)
 
     def to_payload(
         self, *, dp_rank: int, is_idle_batch: bool
@@ -516,7 +534,10 @@ class _GenerationStreamAccumulator:
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
+            spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,

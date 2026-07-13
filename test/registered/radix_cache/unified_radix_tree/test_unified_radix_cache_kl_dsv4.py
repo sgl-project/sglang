@@ -68,7 +68,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             "--chunked-prefill-size",
             "8192",
             "--mem-fraction-static",
-            "0.9",
+            "0.92",
             "--disable-shared-experts-fusion",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
@@ -112,7 +112,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
 class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
     TestUnifiedDeepSeekV4FlashHiCache
 ):
-    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+    """DeepSeek V4 Flash HiCache layout check: page_first_direct + direct."""
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
@@ -126,6 +126,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     l3_prefetch_page_size = 256
     l3_prefetch_prompt_pages = 4
+    max_running_requests = 4
 
     @classmethod
     def setUpClass(cls):
@@ -147,7 +148,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--chunked-prefill-size",
                 "8192",
                 "--mem-fraction-static",
-                "0.9",
+                "0.92",
                 "--disable-shared-experts-fusion",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
@@ -164,6 +165,8 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
                 "--swa-full-tokens-ratio",
                 "0.25",
+                "--max-running-requests",
+                str(cls.max_running_requests),
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",

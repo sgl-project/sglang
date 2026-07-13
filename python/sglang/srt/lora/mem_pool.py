@@ -17,10 +17,6 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
 )
 from sglang.srt.environ import envs
@@ -41,6 +37,7 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -95,7 +92,7 @@ def _get_moe_ep_context() -> Tuple[int, int]:
     """Return `(moe_ep_size, moe_ep_rank)`, or `(1, 0)` if the MoE EP group
     is not initialized (hermetic tests or pure-TP launches)."""
     try:
-        return get_moe_expert_parallel_world_size(), get_moe_expert_parallel_rank()
+        return get_parallel().moe_ep_size, get_parallel().moe_ep_rank
     except Exception:  # pragma: no cover - MoE EP group not initialized
         return 1, 0
 
@@ -107,7 +104,7 @@ def _get_moe_tp_context() -> Tuple[int, int]:
     MoE weights are NOT sharded along their inner dim even though attention
     weights are."""
     try:
-        return get_moe_tensor_parallel_world_size(), get_moe_tensor_parallel_rank()
+        return get_parallel().moe_tp_size, get_parallel().moe_tp_rank
     except Exception:  # pragma: no cover - MoE TP group not initialized
         return 1, 0
 
