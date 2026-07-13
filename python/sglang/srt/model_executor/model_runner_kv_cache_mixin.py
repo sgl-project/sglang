@@ -216,7 +216,7 @@ class ModelRunnerKVCacheMixin:
             int(max(0.0, free_gb - headroom_gb) * (1 << 30))
             + pool.post_capture_backed_bytes
         )
-        config = self._config_from_budget(
+        config = self.config_from_budget(
             budget_bytes, cap_tokens=self.max_total_num_tokens
         )
         pool.finalize_backing(config)
@@ -1169,7 +1169,7 @@ class ModelRunnerKVCacheMixin:
 
         self._init_pools()
 
-    def _config_from_budget(
+    def config_from_budget(
         self: ModelRunner, budget_bytes: int, *, cap_tokens: Optional[int] = None
     ) -> MemoryPoolConfig:
         """Turn a KV byte budget into a pool config via the configurator, re-applying
@@ -1181,13 +1181,15 @@ class ModelRunnerKVCacheMixin:
         )
 
         configurator = create_memory_pool_configurator(self)
-        config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
+        config = configurator.calculate_pool_sizes(
+            budget_bytes, self.server_args.page_size
+        )
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
-                max_tokens, self.page_size
+                max_tokens, self.server_args.page_size
             )
         return config
 
@@ -1200,7 +1202,7 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        config = self._config_from_budget(available_bytes)
+        config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
