@@ -11,7 +11,7 @@ def is_layers(n: str, m) -> bool:
     return is_module_list_entry_in(n, ("layers", "gen_layers"))
 
 
-def _build_cosmos3_param_names_mapping() -> dict:
+def _build_cosmos3_param_names_mapping(gated_mlp: bool = True) -> dict:
     """Map diffusers-format Cosmos3 weights to the sglang model namespace.
 
     Source keys (diffusers transformer ckpt) → target keys (sglang model):
@@ -20,23 +20,26 @@ def _build_cosmos3_param_names_mapping() -> dict:
         layers.X.input_layernorm_moe_gen.weight                -> gen_layers.X.input_layernorm.weight
         layers.X.self_attn.{to_q,to_k,to_v}.weight            -> language_model.layers.X.self_attn.to_qkv.weight (concat dim 0)
         layers.X.self_attn.{add_q,add_k,add_v}_proj.weight    -> gen_layers.X.cross_attention.to_qkv.weight (concat dim 0)
-        layers.X.mlp.{gate,up}_proj.weight                     -> language_model.layers.X.mlp.gate_up_proj.weight (concat dim 0)
-        layers.X.mlp_moe_gen.{gate,up}_proj.weight             -> gen_layers.X.mlp.gate_up_proj.weight (concat dim 0)
         norm_moe_gen.weight                                    -> norm_moe_gen.weight
         time_embedder.linear_{1,2}.weight                      -> (pass-through)
         proj_in.weight, proj_out.weight                        -> (pass-through)
         vae2llm.weight                                         -> proj_in.weight  (FP8 ckpt alias)
         llm2vae.weight                                         -> proj_out.weight (FP8 ckpt alias)
 
+    ``gated_mlp`` selects the MLP weight layout: SwiGLU checkpoints merge
+    ``mlp.{gate,up}_proj`` into a single ``gate_up_proj``; dense (squared-ReLU)
+    checkpoints ship only ``mlp.{up,down}_proj``, which flow through the
+    catch-all unchanged.
+
     GEN patterns (`*_moe_gen`, `add_*`, `to_add_out`, `norm_added_*`) must
     precede the UND catch-all so the catch-all can't claim GEN keys.
-    `norm.weight` and `lm_head.weight` are inherited from Qwen3-VL
-    pretraining and not used at inference; both are skipped.
-    Audio and action keys (``audio_proj_*``, ``action_proj_*``, modality
-    embeds) pass through unchanged.
+    `norm.weight` and `lm_head.weight` are inherited from the text-pretrained
+    backbone and not used at inference; both are skipped. Audio and action
+    keys (``audio_proj_*``, ``action_proj_*``, modality embeds) pass through
+    unchanged.
     """
-    return {
-        # Inherited from Qwen3-VL pretraining; unused at diffusion inference.
+    mapping = {
+        # Inherited from text pretraining; unused at diffusion inference.
         r"^lm_head\.weight$": "",
         r"^norm\.weight$": "",
         # Top-level norms / embeddings.
@@ -67,52 +70,61 @@ def _build_cosmos3_param_names_mapping() -> dict:
         r"^layers\.(\d+)\.self_attn\.norm_added_k\.(.*)$": r"gen_layers.\1.cross_attention.norm_k.\2",
         r"^layers\.(\d+)\.input_layernorm_moe_gen\.(.*)$": r"gen_layers.\1.input_layernorm.\2",
         r"^layers\.(\d+)\.post_attention_layernorm_moe_gen\.(.*)$": r"gen_layers.\1.post_attention_layernorm.\2",
+    }
+
+    if gated_mlp:
         # GEN MLP gate/up merge into MergedColumnParallelLinear gate_up_proj.
         # Must precede the mlp_moe_gen catch-all below.
-        r"^layers\.(\d+)\.mlp_moe_gen\.gate_proj\.(.*)$": (
+        mapping[r"^layers\.(\d+)\.mlp_moe_gen\.gate_proj\.(.*)$"] = (
             r"gen_layers.\1.mlp.gate_up_proj.\2",
             0,
             2,
-        ),
-        r"^layers\.(\d+)\.mlp_moe_gen\.up_proj\.(.*)$": (
+        )
+        mapping[r"^layers\.(\d+)\.mlp_moe_gen\.up_proj\.(.*)$"] = (
             r"gen_layers.\1.mlp.gate_up_proj.\2",
             1,
             2,
-        ),
-        r"^layers\.(\d+)\.mlp_moe_gen\.(.*)$": r"gen_layers.\1.mlp.\2",
-        # UND pathway: Q/K/V merge into to_qkv; remaining attention keys
-        # (to_out, norm_q, norm_k) and layernorms pass through the catch-all.
-        r"^layers\.(\d+)\.self_attn\.to_q\.(.*)$": (
-            r"language_model.layers.\1.self_attn.to_qkv.\2",
-            0,
-            3,
-        ),
-        r"^layers\.(\d+)\.self_attn\.to_k\.(.*)$": (
-            r"language_model.layers.\1.self_attn.to_qkv.\2",
-            1,
-            3,
-        ),
-        r"^layers\.(\d+)\.self_attn\.to_v\.(.*)$": (
-            r"language_model.layers.\1.self_attn.to_qkv.\2",
-            2,
-            3,
-        ),
+        )
+
+    # GEN MLP catch-all: dense up/down_proj pass through unchanged.
+    mapping[r"^layers\.(\d+)\.mlp_moe_gen\.(.*)$"] = r"gen_layers.\1.mlp.\2"
+
+    # UND pathway: Q/K/V merge into to_qkv; remaining attention keys
+    # (to_out, norm_q, norm_k) and layernorms pass through the catch-all.
+    mapping[r"^layers\.(\d+)\.self_attn\.to_q\.(.*)$"] = (
+        r"language_model.layers.\1.self_attn.to_qkv.\2",
+        0,
+        3,
+    )
+    mapping[r"^layers\.(\d+)\.self_attn\.to_k\.(.*)$"] = (
+        r"language_model.layers.\1.self_attn.to_qkv.\2",
+        1,
+        3,
+    )
+    mapping[r"^layers\.(\d+)\.self_attn\.to_v\.(.*)$"] = (
+        r"language_model.layers.\1.self_attn.to_qkv.\2",
+        2,
+        3,
+    )
+
+    if gated_mlp:
         # UND MLP gate/up merge into MergedColumnParallelLinear gate_up_proj.
         # Must precede the layers catch-all below.
-        r"^layers\.(\d+)\.mlp\.gate_proj\.(.*)$": (
+        mapping[r"^layers\.(\d+)\.mlp\.gate_proj\.(.*)$"] = (
             r"language_model.layers.\1.mlp.gate_up_proj.\2",
             0,
             2,
-        ),
-        r"^layers\.(\d+)\.mlp\.up_proj\.(.*)$": (
+        )
+        mapping[r"^layers\.(\d+)\.mlp\.up_proj\.(.*)$"] = (
             r"language_model.layers.\1.mlp.gate_up_proj.\2",
             1,
             2,
-        ),
-        # UND pathway: layernorms + remaining attention/mlp keys pass through
-        # under language_model.layers namespace.
-        r"^layers\.(\d+)\.(.*)$": r"language_model.layers.\1.\2",
-    }
+        )
+
+    # UND pathway: layernorms + remaining attention/mlp keys pass through
+    # under language_model.layers namespace.
+    mapping[r"^layers\.(\d+)\.(.*)$"] = r"language_model.layers.\1.\2"
+    return mapping
 
 
 @dataclass
@@ -137,6 +149,10 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     num_key_value_heads: int = 8  # GQA
     head_dim: int = 128
     intermediate_size: int = 12288
+    # "relu2" selects a dense squared-ReLU MLP; anything else is SwiGLU.
+    hidden_act: str = "silu"
+    # Per-head QK-norm on the UND self-attention (text) pathway.
+    qk_norm_for_text: bool = True
 
     # Latent space configuration
     latent_patch_size: int = 2
@@ -187,6 +203,10 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
         default_factory=lambda: {"vae2llm": "proj_in", "llm2vae": "proj_out"}
     )
 
+    @property
+    def gated_mlp(self) -> bool:
+        return self.hidden_act != "relu2"
+
     def __post_init__(self):
         super().__post_init__()
         # Diffusers configs nest the mrope sizes under `rope_scaling`; lift it.
@@ -196,6 +216,9 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
         self.num_channels_latents = self.out_channels
         # Patch latent dimension: (patch_size^2) * latent_channel
         self.patch_latent_dim = (self.latent_patch_size**2) * self.latent_channel
+        # The MLP weight layout depends on the activation, which the checkpoint
+        # may override; rebuild the mapping after arch values are applied.
+        self.param_names_mapping = _build_cosmos3_param_names_mapping(self.gated_mlp)
 
 
 @dataclass

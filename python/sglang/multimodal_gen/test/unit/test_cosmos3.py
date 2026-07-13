@@ -15,6 +15,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.registry import (
+    _PIPELINE_REGISTRY,
+    _discover_and_register_pipelines,
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
@@ -200,6 +202,42 @@ class TestCosmos3ParamNamesMapping(unittest.TestCase):
         self.assertNotIn("language_model", key)
 
 
+class TestCosmos3DenseParamNamesMapping(unittest.TestCase):
+    """Dense (squared-ReLU) checkpoints ship no gate_proj; up/down_proj must
+    pass through unmerged."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fn = staticmethod(
+            get_param_names_mapping(_build_cosmos3_param_names_mapping(gated_mlp=False))
+        )
+
+    def test_und_mlp_up_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.1.mlp.up_proj.weight")
+        self.assertEqual(key, "language_model.layers.1.mlp.up_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_und_mlp_down_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.1.mlp.down_proj.weight")
+        self.assertEqual(key, "language_model.layers.1.mlp.down_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_gen_mlp_up_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.2.mlp_moe_gen.up_proj.weight")
+        self.assertEqual(key, "gen_layers.2.mlp.up_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_gen_mlp_down_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.2.mlp_moe_gen.down_proj.weight")
+        self.assertEqual(key, "gen_layers.2.mlp.down_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_qkv_merge_still_applies(self):
+        key, idx, total = _apply(self.fn, "layers.0.self_attn.to_q.weight")
+        self.assertEqual(key, "language_model.layers.0.self_attn.to_qkv.weight")
+        self.assertEqual((idx, total), (0, 3))
+
+
 class TestCosmos3AdjustNumFrames(unittest.TestCase):
     """Verify VAE-aligned frame rounding in Cosmos3Config."""
 
@@ -338,6 +376,7 @@ class TestCosmos3ModelResolution(unittest.TestCase):
             "nvidia/Cosmos3-Super",
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",
+            "nvidia/Cosmos3-Edge",
         ):
             with self.subTest(model_path=model_path):
                 self.assertIsNone(get_non_diffusers_pipeline_name(model_path))
@@ -345,6 +384,31 @@ class TestCosmos3ModelResolution(unittest.TestCase):
                 self.assertIsNotNone(config_info)
                 self.assertIs(config_info.sampling_param_cls, Cosmos3SamplingParams)
                 self.assertIs(config_info.pipeline_config_cls, Cosmos3Config)
+
+    def test_class_name_detection_matches_legacy_and_new(self):
+        """Unregistered checkpoints resolve via ``_class_name``: both the legacy
+        ``Cosmos3OmniDiffusersPipeline`` and the current ``Cosmos3OmniPipeline``
+        map to the native Cosmos3 config."""
+        for idx, class_name in enumerate(
+            ("Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline")
+        ):
+            model_path = f"acme/mystery-ckpt-{idx}"
+            with self.subTest(class_name=class_name):
+                with mock.patch(
+                    "sglang.multimodal_gen.registry.maybe_download_model_index",
+                    return_value={"_class_name": class_name},
+                ):
+                    config_info = _get_config_info(model_path)
+                self.assertIsNotNone(config_info)
+                self.assertIs(config_info.pipeline_config_cls, Cosmos3Config)
+
+    def test_legacy_and_new_pipeline_names_both_registered(self):
+        """Both ``_class_name`` spellings resolve to a native pipeline class so
+        old (Nano/Super) and new (Edge) checkpoints load."""
+        _discover_and_register_pipelines()
+        for pipeline_name in ("Cosmos3OmniPipeline", "Cosmos3OmniDiffusersPipeline"):
+            with self.subTest(pipeline_name=pipeline_name):
+                self.assertIn(pipeline_name, _PIPELINE_REGISTRY)
 
 
 class TestCosmos3OpenAIProtocol(unittest.TestCase):
