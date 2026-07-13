@@ -1644,7 +1644,7 @@ class DeepseekV2AttentionMLA(
                 index_head_dim=get_dsa_index_head_dim(config),
                 rope_head_dim=qk_rope_head_dim,
                 index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
+                q_lora_rank=getattr(config, "indexer_q_lora_rank", q_lora_rank),
                 max_position_embeddings=max_position_embeddings,
                 rope_theta=rope_theta,
                 scale_fmt="ue8m0",
