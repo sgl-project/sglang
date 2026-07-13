@@ -252,6 +252,12 @@ def benchmark_config(
     return avg
 
 
+def validate_config(A, B, As, Bs, block_size, config, ref, out_dtype) -> bool:
+    out = w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype)
+    torch.get_device_module().synchronize()
+    return torch.allclose(out, ref, rtol=1e-2, atol=1e-2)
+
+
 def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     factor_for_scale = 1e-2
     device = get_device()
@@ -299,10 +305,25 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
         * factor_for_scale
     )
 
+    reference_config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": 32,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+    ref = w8a8_block_matmul(A, B, As, Bs, block_size, reference_config, out_dtype)
+    torch.get_device_module().synchronize()
+
     best_config = None
     best_time = float("inf")
+    incorrect_configs = 0
     for config in tqdm(search_space):
         try:
+            if not validate_config(A, B, As, Bs, block_size, config, ref, out_dtype):
+                incorrect_configs += 1
+                continue
             kernel_time = benchmark_config(
                 A,
                 B,
@@ -321,7 +342,10 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
             best_time = kernel_time
             best_config = config
     now = datetime.now()
-    print(f"{now.ctime()}] Completed tuning for batch_size={M}")
+    print(
+        f"{now.ctime()}] Completed tuning for batch_size={M}; "
+        f"skipped {incorrect_configs} incorrect configs"
+    )
     assert best_config is not None
     return best_config
 
@@ -382,7 +406,9 @@ def tune_on_gpu(args_dict):
 
     search_space = get_configs_compute_bound()
     search_space = [
-        config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
+        config
+        for config in search_space
+        if config["BLOCK_SIZE_K"] >= block_k and config["BLOCK_SIZE_K"] % block_k == 0
     ]
 
     start = time.perf_counter()

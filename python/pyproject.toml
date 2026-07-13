@@ -129,6 +129,8 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+tilelang = ["tilelang>=0.1.11"]
+
 http2 = [
   "granian>=2.6.0",
 ]
