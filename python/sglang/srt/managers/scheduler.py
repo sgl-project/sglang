@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     prepare_abort,
+    validate_pd_top_logprobs_num,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -2125,6 +2126,22 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and recv_req.return_logprob
+            ):
+                try:
+                    validate_pd_top_logprobs_num(recv_req.top_logprobs_num)
+                except ValueError as exc:
+                    error_msg = str(exc)
+                    logger.error(error_msg)
+                    recv_req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": error_msg}
+                    )
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

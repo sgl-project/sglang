@@ -32,6 +32,17 @@ if TYPE_CHECKING:
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
 
+# MetadataBuffers allocates fixed top-logprob slots per token for PD transfer.
+MAX_PD_TOP_LOGPROBS_NUM = 128
+
+
+def validate_pd_top_logprobs_num(top_logprobs_num: int) -> None:
+    if top_logprobs_num > MAX_PD_TOP_LOGPROBS_NUM:
+        raise ValueError(
+            f"top_logprobs_num {top_logprobs_num} exceeds the maximum "
+            f"{MAX_PD_TOP_LOGPROBS_NUM} supported by PD metadata buffers."
+        )
+
 
 def is_dsv4_c128_online_enabled() -> bool:
     """Return whether DSV4 C128 uses request-scoped online state."""
@@ -225,7 +236,7 @@ class MetadataBuffers:
         size: int,
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
-        max_top_logprobs_num: int = 128,
+        max_top_logprobs_num: int = MAX_PD_TOP_LOGPROBS_NUM,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
@@ -246,8 +257,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
