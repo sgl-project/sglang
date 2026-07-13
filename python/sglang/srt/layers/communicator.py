@@ -1383,7 +1383,7 @@ class CommunicateSummableTensorPairFn:
         """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
 
         After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
-        use_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
+        mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
         full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
         CP-local portion.
 

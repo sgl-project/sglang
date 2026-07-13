@@ -25,12 +25,12 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
 
@@ -90,8 +90,8 @@ def maybe_register_hicache_draft(
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
-    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
     from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -207,7 +207,7 @@ def build_kv_cache(
         # whole allocator pages and never free a partially-shared group.
         page_size=(
             token_to_kv_pool_allocator.page_size
-            if dcp_enabled()
+            if get_parallel().dcp_enabled
             or page_interleave_shard_size(token_to_kv_pool_allocator) > 1
             else page_size
         ),
