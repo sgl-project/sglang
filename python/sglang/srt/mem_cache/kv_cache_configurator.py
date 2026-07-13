@@ -366,24 +366,8 @@ class KVCacheConfigurator:
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
-                PoolCls = current_platform.get_dsa_kv_pool_cls()
-                token_to_kv_pool = PoolCls(
-                    max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    kv_cache_dim=calculate_mla_kv_cache_dim(
-                        model_config=self.model_config,
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        server_args=self.server_args,
-                    ),
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                token_to_kv_pool = self._build_oot_dsa_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
@@ -1265,6 +1249,28 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
+        )
+        return token_to_kv_pool
+
+    def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        PoolCls = current_platform.get_dsa_kv_pool_cls()
+        token_to_kv_pool = PoolCls(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            kv_cache_dim=calculate_mla_kv_cache_dim(
+                model_config=self.model_config,
+                kv_cache_dtype=self.kv_cache_dtype,
+                server_args=self.server_args,
+            ),
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
         )
         return token_to_kv_pool
 
