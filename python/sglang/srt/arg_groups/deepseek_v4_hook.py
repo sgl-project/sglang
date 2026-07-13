@@ -71,6 +71,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
+    if server_args.moe_runner_backend == "deep_gemm":
+        # The contiguous grouped-GEMM prefill path is only viable with the
+        # fused swiglu+quant kernel; the unfused fallback keeps a bf16
+        # [all_tokens, N] transient alive across the FC2 GEMM.
+        if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
+            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+
     # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
     if (
         server_args.moe_runner_backend == "auto"
