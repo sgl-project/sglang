@@ -1226,7 +1226,9 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
             is_multimodal=False,
             is_multimodal_piecewise_cuda_graph_supported=False,
         )
-        args.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
         with (
             patch("sglang.srt.server_args.is_hip", return_value=False),
             patch("sglang.srt.server_args.is_npu", return_value=False),
