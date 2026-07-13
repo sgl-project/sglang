@@ -22,6 +22,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
 )
 
 if is_cuda():
@@ -45,6 +46,7 @@ if is_musa():
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
+_is_xpu = is_xpu()
 
 # The aiter greedy_sample kernel can return an out-of-range token id (== vocab_size,
 # e.g. 151666 for MiniCPM-V) for all-NaN / all -inf logit rows on ROCm, which decodes
@@ -384,11 +386,29 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            if _is_xpu:
+                # oneCCL (xccl) all_reduce silently performs SUM for op=MIN/MAX
+                # on integer tensors, so MIN(id, id) returns 2*id and corrupts
+                # the synced token ids (SGLANGT-1357). Emulate the MIN with an
+                # all_gather + torch.min, which only relies on the correct
+                # all_gather collective.
+                world_size = torch.distributed.get_world_size(self.tp_sync_group)
+                gathered = torch.empty(
+                    (world_size,) + tuple(batch_next_token_ids.shape),
+                    dtype=batch_next_token_ids.dtype,
+                    device=batch_next_token_ids.device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    gathered, batch_next_token_ids, group=self.tp_sync_group
+                )
+                # In-place update so callers holding the same tensor see the sync.
+                batch_next_token_ids.copy_(torch.min(gathered, dim=0).values)
+            else:
+                torch.distributed.all_reduce(
+                    batch_next_token_ids,
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
 
     def compute_logprobs_only(
         self,
