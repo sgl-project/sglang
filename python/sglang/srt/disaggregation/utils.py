@@ -657,21 +657,38 @@ def compute_mamba_state_slice_blocks(
     dims == ``conv_shard_groups``, e.g. ``[key_dim, key_dim, value_dim]``) is
     head-sharded INDEPENDENTLY across attn-TP. In the SCATTER direction
     (1 prefill rank -> several decode ranks) a single contiguous slice straddles
-    the q/k/v boundaries and delivers wrong channels, so we emit one block per
-    sub-block. The AGGREGATION direction (several prefill ranks -> 1 decode rank)
-    is empirically correct and is left byte-identical.
+    the q/k/v boundaries and delivers wrong channels. The AGGREGATION direction
+    (several prefill ranks -> 1 decode rank) has the symmetric problem: a single
+    contiguous write interleaves the sub-blocks by writer. Both directions emit one
+    block per sub-block for conv_state; temporal_state and non-GDN states (when
+    ``conv_shard_groups`` is None) keep the single contiguous slice.
     """
-    if src_attn_tp_size > dst_attn_tp_size:
-        # Aggregation: this prefill rank ships its whole shard to a slice of the
-        # decode slot. Unchanged; conv_shard_groups deliberately ignored here.
-        writers_per_decode = src_attn_tp_size // dst_attn_tp_size
-        local_writer_idx = local_tp_rank_in_group % writers_per_decode
-        return [(0, local_writer_idx * src_dim, src_dim)]
-
-    # Scatter: 1 prefill rank feeds several decode ranks.
     use_subdims = (
         conv_shard_groups is not None and sum(conv_shard_groups) == src_dim * src_attn_tp_size
     )
+
+    if src_attn_tp_size > dst_attn_tp_size:
+        # Aggregation: several prefill ranks each write their shard into one decode slot.
+        writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+        local_writer_idx = local_tp_rank_in_group % writers_per_decode
+        if not use_subdims:
+            return [(0, local_writer_idx * src_dim, src_dim)]
+        # conv_state: a plain contiguous write would interleave the sub-blocks by
+        # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
+        # independently head-sharded sub-block at its grouped offset so the decode
+        # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
+        blocks: List[Tuple[int, int, int]] = []
+        src_off = 0
+        dst_off = 0
+        for full_sd in conv_shard_groups:
+            src_sub = full_sd // src_attn_tp_size
+            dst_sub = full_sd // dst_attn_tp_size
+            blocks.append((src_off, dst_off + local_writer_idx * src_sub, src_sub))
+            src_off += src_sub
+            dst_off += dst_sub
+        return blocks
+
+    # Scatter: 1 prefill rank feeds several decode ranks.
     if not use_subdims:
         src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
         return [(src_dim_start, 0, dst_dim)]
