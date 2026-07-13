@@ -138,8 +138,8 @@ from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -258,7 +258,6 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
-
 
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
@@ -768,29 +767,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             enable_batch_invariant_mode()
 
-        resolved_kv_cache_dtype, self.kv_cache_dtype = configure_kv_cache_dtype(
-            server_args=self.server_args,
-            model=self.model,
-            model_dtype=self.dtype,
-        )
-        if resolved_kv_cache_dtype is not None:
-            self._record_kv_cache_dtype(resolved_kv_cache_dtype)
-
-        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
-        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
-        if (
-            self.is_draft_worker
-            and self.spec_algorithm.is_dflash()
-            and self.server_args.speculative_draft_attention_backend == "fa4"
-            and self.kv_cache_dtype != self.dtype
-        ):
-            logger.info(
-                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
-                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
-                self.kv_cache_dtype,
-                self.dtype,
-            )
-            self.kv_cache_dtype = self.dtype
+        self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         hf_config = self.model_config.hf_text_config
@@ -2377,6 +2354,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.override(
                 "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
             )
+
+    def configure_kv_cache_dtype(self):
+        resolved_kv_cache_dtype, self.kv_cache_dtype = (
+            kv_cache_dtype.configure_kv_cache_dtype(
+                server_args=self.server_args,
+                model=self.model,
+                model_dtype=self.dtype,
+            )
+        )
+        if resolved_kv_cache_dtype is not None:
+            self._record_kv_cache_dtype(resolved_kv_cache_dtype)
+
+        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
+        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
+            and self.kv_cache_dtype != self.dtype
+        ):
+            logger.info(
+                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+                self.kv_cache_dtype,
+                self.dtype,
+            )
+            self.kv_cache_dtype = self.dtype
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
