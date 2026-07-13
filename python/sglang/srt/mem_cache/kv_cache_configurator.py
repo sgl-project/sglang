@@ -102,7 +102,6 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
-
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -111,6 +110,9 @@ if TYPE_CHECKING:
     )
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
         ModelLayerInfo,
+    )
+    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+        SpecAuxHiddenStateConfig,
     )
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
@@ -154,13 +156,17 @@ class KVCacheConfigurator:
     device: str
     gpu_id: int
     ps: ParallelState
+    pp_group: Any
     model_config: ModelConfig
     server_args: ServerArgs
     kv_cache_dtype: torch.dtype
+    model_dtype: torch.dtype
     page_size: int
+    sliding_window_size: Optional[int]
     spec_algorithm: SpeculativeAlgorithm
     is_draft_worker: bool
     post_capture_kv_active: bool
+    spec_aux_config: SpecAuxHiddenStateConfig
     dflash_draft_num_layers: Optional[int]
     is_hybrid_swa: bool
     is_hybrid_swa_compress: bool
