@@ -21,11 +21,13 @@ def _make_queue(*, page_size: int, enable_decode_radix: bool = True):
     queue.scheduler = SimpleNamespace(
         server_args=SimpleNamespace(
             disaggregation_decode_enable_radix_cache=enable_decode_radix
-        )
+        ),
+        running_batch=SimpleNamespace(reqs=[]),
     )
     queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
     queue.token_to_kv_pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
     queue.token_to_kv_pool.compression_ratios = [0, 4, 128]
+    queue.transfer_queue = SimpleNamespace(queue=[])
     return queue
 
 
@@ -49,6 +51,45 @@ def test_dsv4_decode_radix_prefix_unchanged_when_disabled():
     queue = _make_queue(page_size=64, enable_decode_radix=False)
 
     assert queue._dsv4_safe_prefix_len(383) == 383
+
+
+def test_dsv4_singleflight_waits_for_large_inflight_shared_prefix():
+    queue = _make_queue(page_size=256)
+    shared_prefix = list(range(5000))
+    inflight_req = SimpleNamespace(
+        origin_input_ids=shared_prefix + [1],
+        dsv4_decode_radix_cache_prompt_once=True,
+    )
+    waiting_req = SimpleNamespace(origin_input_ids=shared_prefix + [2])
+    queue.transfer_queue.queue = [SimpleNamespace(req=inflight_req)]
+
+    assert queue._should_wait_for_dsv4_inflight_prompt(
+        waiting_req,
+        prefix_len=0,
+        preallocated_reqs=[],
+    )
+    assert not queue._should_wait_for_dsv4_inflight_prompt(
+        waiting_req,
+        prefix_len=4096,
+        preallocated_reqs=[],
+    )
+
+
+def test_dsv4_singleflight_ignores_short_shared_prefix():
+    queue = _make_queue(page_size=256)
+    shared_prefix = list(range(1024))
+    inflight_req = SimpleNamespace(
+        origin_input_ids=shared_prefix + [1],
+        dsv4_decode_radix_cache_prompt_once=True,
+    )
+    waiting_req = SimpleNamespace(origin_input_ids=shared_prefix + [2])
+    queue.transfer_queue.queue = [SimpleNamespace(req=inflight_req)]
+
+    assert not queue._should_wait_for_dsv4_inflight_prompt(
+        waiting_req,
+        prefix_len=0,
+        preallocated_reqs=[],
+    )
 
 
 def test_allow_radix_cache_insert_once_bypasses_skip_once():

@@ -431,6 +431,73 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         alignment = math.lcm(page_size, max_compression_ratio)
         return (prefix_len // alignment) * alignment
 
+    def _dsv4_singleflight_min_prefix_len(self) -> int:
+        compression_ratios = getattr(self.token_to_kv_pool, "compression_ratios", [])
+        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
+        alignment = math.lcm(
+            self.token_to_kv_pool_allocator.page_size, max_compression_ratio
+        )
+        return max(4096, alignment)
+
+    @staticmethod
+    def _common_prefix_len(lhs: List[int], rhs: List[int], limit: int) -> int:
+        for prefix_len in range(limit):
+            if lhs[prefix_len] != rhs[prefix_len]:
+                return prefix_len
+        return min(len(lhs), len(rhs), limit)
+
+    def _dsv4_inflight_prompt_reqs(
+        self, preallocated_reqs: List[DecodeRequest]
+    ) -> List[Req]:
+        if not self._uses_dsv4_decode_radix_cache():
+            return []
+
+        inflight_reqs = [
+            decode_req.req
+            for decode_req in self.transfer_queue.queue
+            if getattr(decode_req.req, "dsv4_decode_radix_cache_prompt_once", False)
+        ]
+        inflight_reqs.extend(
+            req
+            for req in self.scheduler.running_batch.reqs
+            if getattr(req, "dsv4_decode_radix_cache_prompt_once", False)
+        )
+        inflight_reqs.extend(
+            decode_req.req
+            for decode_req in preallocated_reqs
+            if getattr(decode_req.req, "dsv4_decode_radix_cache_prompt_once", False)
+        )
+        return inflight_reqs
+
+    def _should_wait_for_dsv4_inflight_prompt(
+        self,
+        req: Req,
+        *,
+        prefix_len: int,
+        preallocated_reqs: List[DecodeRequest],
+    ) -> bool:
+        min_prefix_len = self._dsv4_singleflight_min_prefix_len()
+        for inflight_req in self._dsv4_inflight_prompt_reqs(preallocated_reqs):
+            if inflight_req is req:
+                continue
+            common_len = self._common_prefix_len(
+                req.origin_input_ids,
+                inflight_req.origin_input_ids,
+                min(len(req.origin_input_ids), len(inflight_req.origin_input_ids)),
+            )
+            safe_common_len = self._dsv4_safe_prefix_len(common_len)
+            if safe_common_len - prefix_len >= min_prefix_len:
+                return True
+        return False
+
+    def _release_decode_radix_match(self, req: Req) -> None:
+        self.tree_cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+        )
+        req.last_node = self.tree_cache.root_node
+        req.swa_uuid_for_lock = None
+
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
         swa_reserved = self.num_reserved_decode_tokens
@@ -1048,16 +1115,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     prefix_indices = prefix_indices[:prefix_len]
                     total_prefix_len = min(total_prefix_len, prefix_len)
 
+                if self._should_wait_for_dsv4_inflight_prompt(
+                    decode_req.req,
+                    prefix_len=prefix_len,
+                    preallocated_reqs=preallocated_reqs,
+                ):
+                    if locked_prefix_len > 0:
+                        self._release_decode_radix_match(decode_req.req)
+                    continue
+
                 decode_req.req.cache_protected_len = prefix_len
                 if locked_prefix_len > 0 and prefix_len == 0:
-                    self.tree_cache.dec_lock_ref(
-                        decode_req.req.last_node,
-                        DecLockRefParams(
-                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                        ),
-                    )
-                    decode_req.req.last_node = self.tree_cache.root_node
-                    decode_req.req.swa_uuid_for_lock = None
+                    self._release_decode_radix_match(decode_req.req)
 
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
@@ -1094,22 +1163,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
-                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(
-                        decode_req.req.last_node,
-                        DecLockRefParams(
-                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                        ),
-                    )
+                if prefix_len > 0:
+                    self._release_decode_radix_match(decode_req.req)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(
-                        decode_req.req.last_node,
-                        DecLockRefParams(
-                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                        ),
-                    )
+                if prefix_len > 0:
+                    self._release_decode_radix_match(decode_req.req)
                 break
 
             if uses_swa_tail_prealloc:
@@ -1126,13 +1185,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > swa_allocatable_tokens
                 ):
-                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(
-                            decode_req.req.last_node,
-                            DecLockRefParams(
-                                swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
-                            ),
-                        )
+                    if prefix_len > 0:
+                        self._release_decode_radix_match(decode_req.req)
                     break
 
             dst_kv_indices = self._pre_alloc(
