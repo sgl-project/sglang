@@ -276,14 +276,32 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - The body appears and disappears exactly once — on the move side. Fix by pushing the
   "add the body" work out of prep into the move.
 
-#### 2.7.3 When NOT to split (single commit)
+#### 2.7.3 Anti-pattern: the giant prep (relocating inside the source to stage the move)
+
+- Symptom: the prep's diff is **hundreds of lines** for a single function — because it
+  also moved the function to the source file's tail, rewrote it as a free function next
+  to a staged import/constant block, or reordered its neighbors so the move can cut one
+  contiguous block.
+- All of that staging is unnecessary: `extract_symbols_to_new_module` gathers symbols
+  **from wherever they sit** (§2.5) — the move needs no contiguity and no tail parking.
+- A prep's legitimate diff is the handful of lines the primitives cannot derive: the
+  `@staticmethod` decorator, the kwargs signature, `self.x` → parameter reads, an added
+  `return`, the class-qualified call site. For one function that is **tens of lines, not
+  hundreds** — a prep in the hundreds is the signal the relocation leaked into it.
+- Why it matters: every relocated-but-not-certified line in a prep is a line the machine
+  never checks and a reviewer must eyeball; parking blocks mid-file also leaves broken or
+  duplicated intermediate states (a staged import for a module that does not exist yet).
+- Fix: strip the prep back to the interface edits above, leave the body **in place**,
+  and let the certified move do all relocation.
+
+#### 2.7.4 When NOT to split (single commit)
 
 - Moving an **already** module-level free function.
 - Pure file rename / whole-file move.
 - Trivial field deletion, or `getattr(obj, "x", ...)` → direct attribute access.
 - A class-internal helper relocated next to another helper in the same module.
 
-#### 2.7.4 Which actions are mechanical vs not
+#### 2.7.5 Which actions are mechanical vs not
 
 - Boundary: building the component correctly the first time is mechanical; reshaping it
   *after* it exists is not.
