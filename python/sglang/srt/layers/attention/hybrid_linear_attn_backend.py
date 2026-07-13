@@ -742,7 +742,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
-        should_allreduce_fusion: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         # Page-major stores state strided; only the stride-aware Triton causal-conv
@@ -759,7 +758,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch=forward_batch,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
-            should_allreduce_fusion=should_allreduce_fusion,
         )
 
         if forward_batch.mamba_track_mask is not None:
@@ -842,6 +840,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def on_after_cuda_graph_warmup(self):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.on_after_cuda_graph_warmup()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
