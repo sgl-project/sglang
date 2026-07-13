@@ -375,10 +375,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
     @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
-
-    @property
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
         # draft KV is materialized from target hidden states, so there is no

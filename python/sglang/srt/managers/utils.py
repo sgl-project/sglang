@@ -44,6 +44,8 @@ class GenerationBatchResult:
     ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    num_block_accept_tokens: int = 0
+    num_cap_tokens: int = 0
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
@@ -67,6 +69,10 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+
+    block_accept_lens: Optional[torch.Tensor] = None
+
+    cap_lens: Optional[torch.Tensor] = None
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
@@ -134,6 +140,12 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = _async_d2h(self.block_accept_lens)
+
+        if self.cap_lens is not None:
+            self.cap_lens = _async_d2h(self.cap_lens)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
