@@ -1034,8 +1034,6 @@ def apply_qk_norm_rope(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and q.is_contiguous()
-        and k.is_contiguous()
         and q.shape[-1] == head_dim
         and q_norm.weight.shape[0] == head_dim
         and k_norm.weight.shape[0] == head_dim
@@ -1043,6 +1041,10 @@ def apply_qk_norm_rope(
         and rope_dim in (32, 64, 128, 256)
         and rope_dim % (head_dim // 32) == 0
     ):
+        # The fused kernel needs contiguous q/k. Callers that pass a chunked/non-contiguous view
+        # (e.g. from `qkv.chunk(...)`) still get the fused path without a model-side copy.
+        q = q.contiguous()
+        k = k.contiguous()
 
         # Keep the fused kernel contract 3D; q/k are flattened without copying.
         fused_qk_norm_rope_with_cos_sin_cache_inplace(
