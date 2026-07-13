@@ -87,11 +87,8 @@ class ModelRunnerKVCacheMixin:
             cpu_group=get_world_group().cpu_group,
         )
 
-        slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
-        if (
-            mambaish_config(self.model_config) is not None
-            and self.post_capture_kv_active
-        ):
+        slack_gb = pre_model_load_memory * (1 - self.server_args.mem_fraction_static)
+        if self.mambaish_config is not None and self.post_capture_kv_active:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
@@ -101,7 +98,7 @@ class ModelRunnerKVCacheMixin:
                 / 1024,
             )
         rest_memory = available_gpu_memory - slack_gb
-        if mambaish_config(self.model_config) is not None:
+        if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget
@@ -114,7 +111,7 @@ class ModelRunnerKVCacheMixin:
             )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
-                f"--mem-fraction-static={self.mem_fraction_static}. "
+                f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
                 f"Raise --mem-fraction-static above "
                 f"{suggested_mem_fraction_static:.3f} "
                 f"(minimum viable = 1 - available/pre = "
