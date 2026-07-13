@@ -167,17 +167,21 @@ class AiterRunnerCore(MoeRunnerCore):
         # gate_mode=INTERLEAVE so aiter dispatches the fp4_bf16 FlyDSL kernels.
         # Pass it unconditionally (not only swiglu_limit>0) so non-clamped models
         # (e.g. Qwen3.5 MXFP4, swiglu_limit==0) also select the a16w4 path.
-        # Import lazily/guarded: older aiter builds may lack this module.
-        try:
-            from aiter.ops.flydsl.moe_common import GateMode
+        # Import lazily/guarded once and cache on self: older aiter builds may
+        # lack this module, and this runs on every forward (hot path).
+        if not hasattr(self, "_gate_mode_class"):
+            try:
+                from aiter.ops.flydsl.moe_common import GateMode
 
+                self._gate_mode_class = GateMode
+            except ImportError:
+                self._gate_mode_class = None
+        if self._gate_mode_class is not None:
             extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
+                self._gate_mode_class.INTERLEAVE.value
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+                else self._gate_mode_class.SEPARATED.value
             )
-        except ImportError:
-            pass
         if quant_info.swiglu_limit > 0:
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:

@@ -253,7 +253,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             import os
 
             _use_itlv = (
-                int(os.environ.get("AITER_FP4BF16_USE_ITLV", "0"))
+                os.environ.get("AITER_FP4BF16_USE_ITLV", "0").lower()
+                in ("1", "true", "yes", "on")
                 and shuffle_weight_a16w4_gui_fp4 is not None
             )
             _w13_wshuf = (
