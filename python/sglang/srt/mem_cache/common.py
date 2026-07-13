@@ -6,6 +6,15 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+from sglang.kernels.ops.memory.common import (
+    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.kernels.ops.memory.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+    write_req_to_token_pool_triton,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
     maybe_write_dsv4_decode,
@@ -14,19 +23,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.triton_ops.common import (
-    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.common import (
-    get_last_loc_kernel as get_last_loc_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.common import (
-    get_last_loc_triton,
-    get_last_loc_triton_safe,
-    write_req_to_token_pool_triton,
-)
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
@@ -214,7 +212,7 @@ def get_last_loc_torch(
 
 def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     if server_args.speculative_algorithm is None:
         return 1
@@ -444,7 +442,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # DCP swaps in an allocator whose page_size is server_args.page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
+    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -658,7 +656,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
-    global_server_args = get_global_server_args()
+    global_server_args = get_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 

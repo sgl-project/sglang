@@ -1247,7 +1247,7 @@ click [Server Arguments](../../advanced_features/server_arguments).
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--lora-strict-loading`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Type: bool</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--lora-drain-wait-threshold`</td>
@@ -1638,7 +1638,8 @@ click [Server Arguments](../../advanced_features/server_arguments).
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-dispatcher-output-dtype`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`,<br/> `bf16`,<br/> `int8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`,<br/> `bf16`,<br/> `int8`<br/>(When enabling DeepEP for a quantized model, set the dispatcher output dtype according to your model’s quantization.
+If the value is int8, you must also set the environment variable:DEEP_NORMAL_MODE_USE_INT8_QUANT=1)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
     </tr>
     <tr>
@@ -1732,7 +1733,7 @@ click [Server Arguments](../../advanced_features/server_arguments).
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-deepep-waterfill`</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-waterfill`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag (set to enable)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
@@ -2894,7 +2895,7 @@ click [Server Arguments](../../advanced_features/server_arguments).
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-quant-communications`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag (set to enable)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag (set to enable)<br/>(When using DeepEP with a quantized model, you must set --deepep-dispatcher-output-dtype)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
     </tr>
   </tbody>
