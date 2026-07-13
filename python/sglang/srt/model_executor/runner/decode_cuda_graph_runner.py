@@ -565,8 +565,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors = None
         # pipeline parallelism
         if self.pp_size > 1:
+            # When the previous PP stage's output is SCATTERED (DeepEP or
+            # moe_dense_tp_size=1), hidden states at the PP boundary have
+            # num_tokens / attn_tp_size rows per rank, not num_tokens.
+            pp_hidden_tokens = num_tokens
+            if self.require_attn_tp_gather:
+                pp_hidden_tokens = num_tokens // self.attn_tp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         if self.require_mlp_tp_gather:
