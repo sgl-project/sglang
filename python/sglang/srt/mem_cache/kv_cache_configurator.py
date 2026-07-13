@@ -1582,7 +1582,7 @@ class KVCacheConfigurator:
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.override(
-                "kv_cache_configurator.max_mamba_cache_size",
+                "mamba_pool.per_dp_shard",
                 max_mamba_cache_size=server_args.max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
@@ -1605,7 +1605,7 @@ class KVCacheConfigurator:
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
             server_args.override(
-                "kv_cache_configurator.max_mamba_cache_size",
+                "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=server_args.max_running_requests
                 // self.ps.attn_dp_size,
             )
@@ -1639,7 +1639,7 @@ class KVCacheConfigurator:
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
-                    "kv_cache_configurator.max_mamba_cache_size",
+                    "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
                         mamba_budget_bytes // (per_req * (1 + D / ratio))
                     ),
@@ -1654,7 +1654,7 @@ class KVCacheConfigurator:
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.override(
-                    "kv_cache_configurator.max_mamba_cache_size",
+                    "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(mamba_budget_bytes // per_req),
                 )
 
