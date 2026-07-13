@@ -432,8 +432,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
     so the state decay is a per-K vector ``exp(g)`` rather than a scalar."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_h = i_hv // (HV // H)
 
     o_k = tl.arange(0, BK)
@@ -629,7 +628,7 @@ def fused_recurrent_kda_packed_decode(
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (NV, B * HV)
+    grid = (NV, B, HV)
     fused_recurrent_kda_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,

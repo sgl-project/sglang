@@ -420,6 +420,41 @@ class TestKDAPackedDecode(unittest.TestCase):
     def test_b128(self):
         self._check(B=128, H=16, HV=16, K=128, V=128)
 
+    def test_large_grid(self):
+        device = get_device()
+        B, H, HV, K, V = 4096, 20, 20, 64, 64
+        self.assertGreater(B * HV, 65535)
+        dtype = torch.bfloat16
+
+        mixed_qkv = torch.zeros(B, 2 * H * K + HV * V, dtype=dtype, device=device)
+        a = torch.zeros(B, HV * K, dtype=dtype, device=device)
+        b = torch.zeros(B, HV, dtype=dtype, device=device)
+        A_log = torch.zeros(HV, dtype=torch.float32, device=device)
+        dt_bias = torch.zeros(HV * K, dtype=torch.float32, device=device)
+        initial_state = torch.randn(1, HV, V, K, dtype=dtype, device=device)
+        initial_state_ref = initial_state.clone()
+        out = torch.empty(B, 1, HV, V, dtype=dtype, device=device)
+        cache_indices = torch.full((B,), -1, dtype=torch.int32, device=device)
+        cache_indices[-1] = 0
+
+        fused_recurrent_kda_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=K**-0.5,
+            initial_state=initial_state,
+            out=out,
+            ssm_state_indices=cache_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        torch.testing.assert_close(out, torch.zeros_like(out))
+        torch.testing.assert_close(
+            initial_state.float(), initial_state_ref.float() * 0.5, rtol=1e-3, atol=1e-3
+        )
+
     def test_asymmetric_heads(self):
         # Common KDA config with HV > H (grouped query).
         self._check(B=8, H=8, HV=16, K=128, V=128)
