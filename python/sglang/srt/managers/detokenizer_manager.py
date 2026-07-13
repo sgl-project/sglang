@@ -450,6 +450,8 @@ class DetokenizerManager(BeamSearchDetokenizerMixin, MultiHttpWorkerDetokenizerM
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
+            output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+            output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
