@@ -103,7 +103,7 @@ _is_hip = is_hip()
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     try:
         from aiter import (  # noqa: F401
@@ -134,16 +134,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
-
-
-# Reuse this workspace buffer across all DSA backend instances
-
-# Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
-# Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
-_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
-_USE_FUSED_METADATA_GENERATION = (
-    envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
-)
 
 
 @dataclass(frozen=True)
@@ -1381,7 +1371,7 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if _USE_FUSED_METADATA_GENERATION and is_cuda() and not _is_hip:
+            if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
@@ -1423,7 +1413,7 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if _USE_FUSED_METADATA_GENERATION and is_cuda() and not _is_hip:
+            if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
@@ -1521,7 +1511,7 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if _USE_FUSED_METADATA_GENERATION and is_cuda() and not _is_hip:
+            if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )

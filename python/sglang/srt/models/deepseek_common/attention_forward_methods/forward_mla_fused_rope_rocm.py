@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
