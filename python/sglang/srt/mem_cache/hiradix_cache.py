@@ -73,6 +73,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_hybrid_dsa_pool(kv_cache) -> bool:
+    return isinstance(kv_cache, HybridLinearKVPool) and isinstance(
+        kv_cache.full_kv_pool, DSATokenToKVPool
+    )
+
+
 class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
@@ -94,8 +100,32 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, HybridLinearKVPool):
-            # Linear recurrent state is per-request, so only the DSA layers need offloading.
-            self.token_to_kv_pool_host = None
+            full_kv_pool = self.kv_cache.full_kv_pool
+            if isinstance(full_kv_pool, DSATokenToKVPool):
+                self.token_to_kv_pool_host = None
+            elif isinstance(full_kv_pool, MHATokenToKVPool):
+                self.token_to_kv_pool_host = get_mha_host_pool_cls(full_kv_pool)(
+                    full_kv_pool,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            elif isinstance(full_kv_pool, MLATokenToKVPool):
+                self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                    full_kv_pool,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            else:
+                raise ValueError(
+                    "HiRadixCache does not support this HybridLinearKVPool's "
+                    f"inner pool: {type(full_kv_pool).__name__}"
+                )
         elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
@@ -135,7 +165,9 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, (DSATokenToKVPool, HybridLinearKVPool)):
+        if isinstance(self.kv_cache, DSATokenToKVPool) or _is_hybrid_dsa_pool(
+            self.kv_cache
+        ):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
@@ -789,9 +821,13 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, (DSATokenToKVPool, HybridLinearKVPool)) or (
-            isinstance(self.kv_cache, MiniMaxSparseKVPool)
-            and self.kv_cache.index_k_pool is not None
+        if (
+            isinstance(self.kv_cache, DSATokenToKVPool)
+            or _is_hybrid_dsa_pool(self.kv_cache)
+            or (
+                isinstance(self.kv_cache, MiniMaxSparseKVPool)
+                and self.kv_cache.index_k_pool is not None
+            )
         ):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
