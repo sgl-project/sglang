@@ -703,6 +703,121 @@ class KVCacheConfigurator:
         )
         return req_to_token_pool
 
+    def _build_token_to_kv_pool(
+        self,
+        *,
+        max_total_num_tokens: int,
+        max_running_requests: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+        c4_max_total_num_tokens: int,
+        c128_max_total_num_tokens: int,
+        c4_state_pool_size: int,
+        c128_state_pool_size: int,
+        c4_state_dtype: Optional[torch.dtype],
+        c128_state_dtype: Optional[torch.dtype],
+        is_dsa_model: bool,
+        is_dsv4_model: bool,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> KVCache:
+        # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,
+        # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
+        # default keeps upstream's per-layer layout. The Mamba state pool is routed
+        # separately via `mamba_envelope_layout` on the req-to-token pool above.
+        enable_page_major = self.server_args.enable_page_major_kv_layout
+        mha_pool_class = (
+            PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
+        )
+
+        if is_dsv4_model:
+            token_to_kv_pool = self._build_dsv4_kv_pool(
+                max_running_requests=max_running_requests,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+                c4_max_total_num_tokens=c4_max_total_num_tokens,
+                c128_max_total_num_tokens=c128_max_total_num_tokens,
+                c4_state_pool_size=c4_state_pool_size,
+                c128_state_pool_size=c128_state_pool_size,
+                c4_state_dtype=c4_state_dtype,
+                c128_state_dtype=c128_state_dtype,
+                req_to_token_pool=req_to_token_pool,
+            )
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+            if self.use_mla_backend and is_dsa_model:
+                token_to_kv_pool = self._build_oot_dsa_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+            elif self.use_mla_backend:
+                token_to_kv_pool = self._build_oot_mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    is_dsa_model=is_dsa_model,
+                )
+            else:
+                token_to_kv_pool = self._build_oot_mha_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        ):
+            if self.is_hybrid_swa:
+                token_to_kv_pool = self._build_ascend_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                )
+            elif self.use_mla_backend:
+                token_to_kv_pool = self._build_ascend_mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    is_dsa_model=is_dsa_model,
+                )
+            else:
+                token_to_kv_pool = self._build_ascend_mha_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+        elif self.use_mla_backend and is_dsa_model:
+            token_to_kv_pool = self._build_dsa_kv_pool(
+                max_total_num_tokens=max_total_num_tokens,
+            )
+        elif self.use_mla_backend and not self.mambaish_config:
+            assert not is_dsa_model
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                token_to_kv_pool = self._build_mla_fp4_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+            else:
+                token_to_kv_pool = self._build_mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+        else:
+            if self.is_hybrid_swa:
+                token_to_kv_pool = self._build_hybrid_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                    mha_pool_class=mha_pool_class,
+                )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                token_to_kv_pool = self._build_minimax_sparse_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+            elif self.mambaish_config:
+                token_to_kv_pool = self._build_hybrid_linear_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    req_to_token_pool=req_to_token_pool,
+                    mha_pool_class=mha_pool_class,
+                )
+            else:
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with fp4 KV cache"
+                    token_to_kv_pool = self._build_mha_fp4_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
+                    )
+                else:
+                    token_to_kv_pool = self._build_mha_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
+                        mha_pool_class=mha_pool_class,
+                    )
+        return token_to_kv_pool
+
     def _build_dsv4_kv_pool(
         self,
         *,
@@ -1151,121 +1266,6 @@ class KVCacheConfigurator:
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
             post_capture_active=self.post_capture_kv_active,
         )
-        return token_to_kv_pool
-
-    def _build_token_to_kv_pool(
-        self,
-        *,
-        max_total_num_tokens: int,
-        max_running_requests: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
-        c4_max_total_num_tokens: int,
-        c128_max_total_num_tokens: int,
-        c4_state_pool_size: int,
-        c128_state_pool_size: int,
-        c4_state_dtype: Optional[torch.dtype],
-        c128_state_dtype: Optional[torch.dtype],
-        is_dsa_model: bool,
-        is_dsv4_model: bool,
-        req_to_token_pool: ReqToTokenPool,
-    ) -> KVCache:
-        # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,
-        # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
-        # default keeps upstream's per-layer layout. The Mamba state pool is routed
-        # separately via `mamba_envelope_layout` on the req-to-token pool above.
-        enable_page_major = self.server_args.enable_page_major_kv_layout
-        mha_pool_class = (
-            PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
-        )
-
-        if is_dsv4_model:
-            token_to_kv_pool = self._build_dsv4_kv_pool(
-                max_running_requests=max_running_requests,
-                swa_max_total_num_tokens=swa_max_total_num_tokens,
-                c4_max_total_num_tokens=c4_max_total_num_tokens,
-                c128_max_total_num_tokens=c128_max_total_num_tokens,
-                c4_state_pool_size=c4_state_pool_size,
-                c128_state_pool_size=c128_state_pool_size,
-                c4_state_dtype=c4_state_dtype,
-                c128_state_dtype=c128_state_dtype,
-                req_to_token_pool=req_to_token_pool,
-            )
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_dsa_model:
-                token_to_kv_pool = self._build_oot_dsa_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-            elif self.use_mla_backend:
-                token_to_kv_pool = self._build_oot_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                    is_dsa_model=is_dsa_model,
-                )
-            else:
-                token_to_kv_pool = self._build_oot_mha_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-        elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
-        ):
-            if self.is_hybrid_swa:
-                token_to_kv_pool = self._build_ascend_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
-                )
-            elif self.use_mla_backend:
-                token_to_kv_pool = self._build_ascend_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                    is_dsa_model=is_dsa_model,
-                )
-            else:
-                token_to_kv_pool = self._build_ascend_mha_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-        elif self.use_mla_backend and is_dsa_model:
-            token_to_kv_pool = self._build_dsa_kv_pool(
-                max_total_num_tokens=max_total_num_tokens,
-            )
-        elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_dsa_model
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                token_to_kv_pool = self._build_mla_fp4_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-            else:
-                token_to_kv_pool = self._build_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-        else:
-            if self.is_hybrid_swa:
-                token_to_kv_pool = self._build_hybrid_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
-                    mha_pool_class=mha_pool_class,
-                )
-            elif is_minimax_sparse(self.model_config.hf_config):
-                token_to_kv_pool = self._build_minimax_sparse_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-            elif self.mambaish_config:
-                token_to_kv_pool = self._build_hybrid_linear_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                    req_to_token_pool=req_to_token_pool,
-                    mha_pool_class=mha_pool_class,
-                )
-            else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert (
-                        not enable_page_major
-                    ), "page-major KV layout is not supported with fp4 KV cache"
-                    token_to_kv_pool = self._build_mha_fp4_kv_pool(
-                        max_total_num_tokens=max_total_num_tokens,
-                    )
-                else:
-                    token_to_kv_pool = self._build_mha_kv_pool(
-                        max_total_num_tokens=max_total_num_tokens,
-                        mha_pool_class=mha_pool_class,
-                    )
         return token_to_kv_pool
 
     def _build_token_to_kv_pool_allocator(
