@@ -27,6 +27,7 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.req_trace import req_trace_enabled
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -602,6 +603,13 @@ class SchedulerMetricsReporter:
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
+        # Per-request trace: append the rids in this prefill batch so the batch
+        # can be correlated with the tokenize/detokenize/postprocess [RTRACE]
+        # lines. Gated by SGLANG_DEBUG_REQUEST_TRACE; enriches the existing line
+        # instead of emitting a duplicate one.
+        if req_trace_enabled() and batch is not None:
+            msg += f", rids={[req.rid for req in batch.reqs]}"
+
         if self.is_stats_logging_rank:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
@@ -845,6 +853,13 @@ class SchedulerMetricsReporter:
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+
+        # Per-request trace: append the rids in this decode batch (see the
+        # matching note in report_prefill_stats). NOTE: the decode line is
+        # throttled by decode_log_interval, so rids are shown once per interval,
+        # not every decode step; lower the interval for per-step rid visibility.
+        if req_trace_enabled():
+            msg += f", rids={[req.rid for req in batch.reqs]}"
 
         if self.is_stats_logging_rank:
             logger.info(msg)

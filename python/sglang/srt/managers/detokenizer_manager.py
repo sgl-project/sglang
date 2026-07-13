@@ -44,6 +44,7 @@ from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_paren
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
+from sglang.srt.utils.req_trace import req_trace
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -276,6 +277,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
+                req_trace("detokenize", "first", rid)
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=list(recv_obj.decode_ids[i]),
@@ -286,6 +288,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
+            if recv_obj.finished_reasons[i] is not None:
+                req_trace("detokenize", "finished", rid)
 
             read_ids.append(
                 self.trim_matched_stop(

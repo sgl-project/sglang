@@ -133,6 +133,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.req_trace import req_trace, req_trace_enabled
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -814,6 +815,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        req_trace("tokenize", "start", obj.rid)
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -960,6 +962,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        if req_trace_enabled():
+            req_trace(
+                "tokenize",
+                "end",
+                obj.rid,
+                extra=f"n_input_ids={len(input_ids) if input_ids is not None else 'NA'}",
+            )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -1356,6 +1365,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         time_stats = tokenized_obj.time_stats
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
+        req_trace("dispatch", "start", tokenized_obj.rid)
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1377,6 +1387,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self._dispatch_to_scheduler(batch_req)
+        if req_trace_enabled():
+            req_trace(
+                "dispatch",
+                "start",
+                [tokenized_obj.rid for tokenized_obj in tokenized_objs],
+            )
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -2094,8 +2110,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                req_trace("postprocess", "first", rid)
 
             if state.finished:
+                req_trace("postprocess", "finished", rid)
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
                         self.convert_to_span_attrs(state, recv_obj, i)
@@ -2928,6 +2946,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
+            req_trace("received", "start", rid)
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)

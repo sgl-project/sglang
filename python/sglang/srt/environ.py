@@ -221,6 +221,12 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # When on, every request emits per-stage lifecycle lines tagged with rid(s):
+    # received/tokenize/dispatch/postprocess (TokenizerManager) and detokenize
+    # (DetokenizerManager). Grep the logs for [RTRACE]. The scheduler
+    # prefill/decode stages instead append rids=[...] to their existing stats
+    # line (not an [RTRACE] line). See sglang.srt.utils.req_trace.
+    SGLANG_DEBUG_REQUEST_TRACE = EnvBool(False)
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
