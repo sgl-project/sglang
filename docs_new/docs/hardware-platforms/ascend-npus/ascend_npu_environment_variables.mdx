@@ -76,6 +76,18 @@ This document provides a list of commonly used environment variables and aims to
       <td>Needs to be enabled when the expert ID to be processed by <br/> DEEPEP contains -1.</td>
       <td><code>0</code></td>
     </tr>
+    <tr>
+      <td><code>DEEP_NORMAL_MODE_USE_INT8_QUANT</code></td>
+      <td>
+        <strong>Deprecated — will be removed in a future release.</strong>
+        <br/>
+        When set to <code>1</code>, quantizes intermediate activations to INT8 in
+        <br/>the DeepEP dispatch operator during normal mode, reducing communication
+        <br/>volume for W8A8-quantized MoE models. This variable will become a no-op;
+        <br/>the quantization behavior will be inferred automatically.
+      </td>
+      <td><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -23,6 +23,7 @@ if _is_cuda:
     from sglang.jit_kernel.nvfp4 import (
         cutlass_fp4_group_mm,
         scaled_fp4_experts_quant,
+        silu_and_mul_scaled_fp4_experts_quant_packed,
     )
 
 
@@ -129,7 +130,7 @@ def cutlass_fused_experts_fp8(
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
     es_up, es_down = enable_es
@@ -468,19 +469,15 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one half sized tensor.
-    intermediate = torch.empty(
-        (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
-    )
-    silu_and_mul(c1, intermediate)
-
-    int_fp4, int_blockscale = scaled_fp4_experts_quant(
-        intermediate,
+    # fused: SiLU + mul then FP4 quant (expert-packed)
+    int_fp4, int_blockscale = silu_and_mul_scaled_fp4_experts_quant_packed(
+        c1,
         a2_gscale,
         params.expert_offsets,
         params.blockscale_offsets,
         num_topk,
     )
+
     c2 = cutlass_fp4_group_mm(
         int_fp4,
         w2_fp4,
