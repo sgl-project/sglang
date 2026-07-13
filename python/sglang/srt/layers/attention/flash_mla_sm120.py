@@ -226,17 +226,7 @@ def _flash_mla_sm120_prefill(
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
     if src_pbs != _PBS_DST:
-        N_src = kv_u8.shape[0]
-        rmask = _ref_mask_buf.get(kv_u8.device)
-        if rmask is None or rmask.shape[0] < N_src:
-            rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
-            _ref_mask_buf[kv_u8.device] = rmask
-        rmask = rmask[:N_src]
-        rmask.zero_()
-        ref_pages = torch.clamp(idx.reshape(-1) // src_pbs, min=0, max=N_src - 1).to(
-            torch.long
-        )
-        rmask.index_fill_(0, ref_pages, 1)
+        rmask = _build_ref_page_mask(kv_u8, src_pbs, idx)
         kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs, rmask)
     else:
         kv_64 = kv_u8
@@ -365,10 +355,6 @@ _BYTES_PER_DST_PAGE = (
 
 _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
-# Pre-allocated buffer for page-split output per device (lazily sized).
-_split_buf = {}  # device -> tensor
-_ref_mask_buf = {}  # device -> per-source-page referenced mask
-
 
 @triton.jit
 def _page_split_kernel(
@@ -418,6 +404,28 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
+def _build_ref_page_mask(kv_u8, src_pbs, idx):
+    """Mark the source pages referenced by this step's sparse indices in a
+    grow-only per-device mask so the split kernel can skip the rest.
+    Static shapes -> CUDA-graph safe."""
+    from sglang.srt.runtime_context import get_resources
+
+    N_src = kv_u8.shape[0]
+    buffers = get_resources().buffers
+    rmask_key = f"flash_mla_sm120_refmask:{kv_u8.device}"
+    rmask = buffers.get(rmask_key)
+    if rmask is None or rmask.shape[0] < N_src:
+        rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
+        buffers[rmask_key] = rmask
+    rmask = rmask[:N_src]
+    rmask.zero_()
+    ref_pages = torch.clamp(idx.reshape(-1) // src_pbs, min=0, max=N_src - 1).to(
+        torch.long
+    )
+    rmask.index_fill_(0, ref_pages, 1)
+    return rmask
+
+
 def _split_kv_pages_to_64(
     kv_u8: torch.Tensor, src_pbs: int, ref_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -434,8 +442,13 @@ def _split_kv_pages_to_64(
     ratio = src_pbs // _PBS_DST
     num_dst_pages = N * ratio
 
+    from sglang.srt.runtime_context import get_resources
+
+    # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
-    buf = _split_buf.get(dev)
+    buffers = get_resources().buffers
+    key = f"flash_mla_sm120_split:{dev}"
+    buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         buf = torch.empty(
             num_dst_pages,
@@ -443,7 +456,7 @@ def _split_kv_pages_to_64(
             dtype=torch.uint8,
             device=dev,
         )
-        _split_buf[dev] = buf
+        buffers[key] = buf
     out = buf[:num_dst_pages]
 
     # Get raw 2D view of source
@@ -506,21 +519,8 @@ def _flash_mla_flashinfer(
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
     if src_pbs != _PBS_DST:
-        # Only split the source pages actually referenced by the sparse
-        # indices this step (mark them in a fixed-size mask so the split
-        # kernel can skip the rest). Avoids re-copying the whole KV pool
-        # (~105MB/layer) every decode step. Static shapes -> CUDA-graph safe.
-        N_src = kv_u8.shape[0]
-        rmask = _ref_mask_buf.get(kv_u8.device)
-        if rmask is None or rmask.shape[0] < N_src:
-            rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
-            _ref_mask_buf[kv_u8.device] = rmask
-        rmask = rmask[:N_src]
-        rmask.zero_()
-        ref_pages = torch.clamp(idx.reshape(-1) // src_pbs, min=0, max=N_src - 1).to(
-            torch.long
-        )
-        rmask.index_fill_(0, ref_pages, 1)
+        # Avoids re-copying the whole KV pool (~105MB/layer) every step.
+        rmask = _build_ref_page_mask(kv_u8, src_pbs, idx)
         kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs, rmask)
     else:
         kv_64 = kv_u8
