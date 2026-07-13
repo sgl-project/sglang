@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import contextlib
-import datetime
 import inspect
 import logging
 import time
@@ -25,9 +24,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
-import torch.distributed as dist
 
-from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -38,17 +35,14 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
-from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     bootstrap,
-    get_tp_group,
     get_world_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -124,7 +118,10 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    build_load_config,
+    dist_barrier_after_load,
     load_kv_cache_scales,
+    load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
@@ -152,7 +149,6 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_server_args
@@ -220,7 +216,6 @@ elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
 logger = logging.getLogger(__name__)
@@ -1119,7 +1114,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_cuda_arch()
 
-        self.load_config = ModelRunner.build_load_config(
+        self.load_config = build_load_config(
             server_args=self.server_args,
             tp_rank=self.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
@@ -1135,7 +1130,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args, tp_rank=self.tp_rank
         )
 
-        loaded = ModelRunner.load_model_with_memory_saver(
+        loaded = load_model_with_memory_saver(
             server_args=self.server_args,
             model_config=self.model_config,
             load_config=self.load_config,
@@ -1211,7 +1206,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        ModelRunner.dist_barrier_after_load(
+        dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.tp_rank,
         )
@@ -1290,111 +1285,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             set_global_lplb_solver(lid, solver)
         logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
-
-    @staticmethod
-    def build_load_config(
-        *,
-        server_args: ServerArgs,
-        tp_rank: int,
-        remote_instance_weight_transporter_engine: Any,
-        remote_instance_weight_transporter_session_id: str,
-        draft_model_idx: Optional[int],
-    ) -> LoadConfig:
-        from sglang.srt.configs.modelopt_config import ModelOptConfig
-
-        modelopt_config = ModelOptConfig(
-            quant=server_args.modelopt_quant,
-            checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
-            checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
-            export_path=server_args.modelopt_export_path,
-            quantize_and_serve=server_args.quantize_and_serve,
-        )
-
-        return LoadConfig(
-            load_format=server_args.load_format,
-            download_dir=server_args.download_dir,
-            model_loader_extra_config=server_args.model_loader_extra_config,
-            tp_rank=tp_rank,
-            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
-            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
-            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
-            remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
-            remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
-            remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
-            modelexpress_url=server_args.modelexpress_url,
-            modelexpress_transport=server_args.modelexpress_transport,
-            modelopt_config=modelopt_config,
-            rl_quant_profile=server_args.rl_quant_profile,
-            draft_model_idx=draft_model_idx,
-        )
-
-    @staticmethod
-    def load_model_with_memory_saver(
-        *,
-        server_args: ServerArgs,
-        model_config: ModelConfig,
-        load_config: LoadConfig,
-        device: str,
-        gpu_id: int,
-        memory_saver_adapter: Any,
-        is_draft_worker: bool,
-    ) -> LoadedModel:
-        # Remove monkey_patch when linear.py quant remove dependencies with vllm
-        monkey_patch_vllm_parallel_state()
-
-        enable_cpu_backup = server_args.enable_weights_cpu_backup or (
-            is_draft_worker and server_args.enable_draft_weights_cpu_backup
-        )
-        remote_instance_weight_info = None
-        with memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=enable_cpu_backup,
-        ):
-            loader = get_model_loader(
-                load_config=load_config,
-                model_config=model_config,
-            )
-            model = loader.load_model(
-                model_config=model_config,
-                device_config=DeviceConfig(device, gpu_id),
-            )
-            if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
-                remote_instance_weight_info = (
-                    loader.remote_instance_transfer_engine_weight_info
-                )
-        # Cache needs to be cleared after loading model weights (in the loader.load_model function).
-        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
-        if _is_npu:
-            torch.npu.empty_cache()
-        monkey_patch_vllm_parallel_state(reverse=True)
-
-        return LoadedModel(
-            loader=loader,
-            model=model,
-            remote_instance_weight_info=remote_instance_weight_info,
-        )
-
-    @staticmethod
-    def dist_barrier_after_load(
-        *, elastic_ep_backend: Optional[str], tp_rank: int
-    ) -> None:
-        if elastic_ep_backend == "mooncake":
-            # Mooncake does not support `monitored_barrier`
-            dist.barrier(group=get_tp_group().cpu_group)
-        else:
-            # Handle the case where some ranks do not finish loading.
-            try:
-                dist.monitored_barrier(
-                    group=get_tp_group().cpu_group,
-                    timeout=datetime.timedelta(
-                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
-                    ),
-                    wait_all_ranks=True,
-                )
-            except RuntimeError:
-                raise ValueError(
-                    f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-                ) from None
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device

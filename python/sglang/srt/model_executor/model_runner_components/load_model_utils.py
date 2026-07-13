@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
@@ -160,3 +163,104 @@ def maybe_register_debug_tensor_dump_hook(
             tp_rank,
             pp_rank,
         )
+
+
+def build_load_config(
+    *,
+    server_args: ServerArgs,
+    tp_rank: int,
+    remote_instance_weight_transporter_engine: Any,
+    remote_instance_weight_transporter_session_id: str,
+    draft_model_idx: Optional[int],
+) -> LoadConfig:
+    from sglang.srt.configs.modelopt_config import ModelOptConfig
+
+    modelopt_config = ModelOptConfig(
+        quant=server_args.modelopt_quant,
+        checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
+        checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
+        export_path=server_args.modelopt_export_path,
+        quantize_and_serve=server_args.quantize_and_serve,
+    )
+
+    return LoadConfig(
+        load_format=server_args.load_format,
+        download_dir=server_args.download_dir,
+        model_loader_extra_config=server_args.model_loader_extra_config,
+        tp_rank=tp_rank,
+        remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+        remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+        remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+        remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
+        remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
+        remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
+        modelexpress_url=server_args.modelexpress_url,
+        modelexpress_transport=server_args.modelexpress_transport,
+        modelopt_config=modelopt_config,
+        rl_quant_profile=server_args.rl_quant_profile,
+        draft_model_idx=draft_model_idx,
+    )
+
+
+def load_model_with_memory_saver(
+    *,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    device: str,
+    gpu_id: int,
+    memory_saver_adapter: Any,
+    is_draft_worker: bool,
+) -> LoadedModel:
+    # Remove monkey_patch when linear.py quant remove dependencies with vllm
+    monkey_patch_vllm_parallel_state()
+
+    enable_cpu_backup = server_args.enable_weights_cpu_backup or (
+        is_draft_worker and server_args.enable_draft_weights_cpu_backup
+    )
+    remote_instance_weight_info = None
+    with memory_saver_adapter.region(
+        GPU_MEMORY_TYPE_WEIGHTS,
+        enable_cpu_backup=enable_cpu_backup,
+    ):
+        loader = get_model_loader(
+            load_config=load_config,
+            model_config=model_config,
+        )
+        model = loader.load_model(
+            model_config=model_config,
+            device_config=DeviceConfig(device, gpu_id),
+        )
+        if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
+            remote_instance_weight_info = (
+                loader.remote_instance_transfer_engine_weight_info
+            )
+    # Cache needs to be cleared after loading model weights (in the loader.load_model function).
+    # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+    if _is_npu:
+        torch.npu.empty_cache()
+    monkey_patch_vllm_parallel_state(reverse=True)
+
+    return LoadedModel(
+        loader=loader,
+        model=model,
+        remote_instance_weight_info=remote_instance_weight_info,
+    )
+
+
+def dist_barrier_after_load(*, elastic_ep_backend: Optional[str], tp_rank: int) -> None:
+    if elastic_ep_backend == "mooncake":
+        # Mooncake does not support `monitored_barrier`
+        dist.barrier(group=get_tp_group().cpu_group)
+    else:
+        # Handle the case where some ranks do not finish loading.
+        try:
+            dist.monitored_barrier(
+                group=get_tp_group().cpu_group,
+                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                wait_all_ranks=True,
+            )
+        except RuntimeError:
+            raise ValueError(
+                f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+            ) from None
