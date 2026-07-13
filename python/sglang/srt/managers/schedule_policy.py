@@ -97,6 +97,7 @@ def match_prefix_for_req(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    update_cache_stats: bool = True,
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
@@ -104,7 +105,7 @@ def match_prefix_for_req(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
-            update_cache_stats=False,
+            update_cache_stats=update_cache_stats,
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
@@ -166,6 +167,7 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        enable_qos_aware_prefix_cache: bool = False,
         qos_lpm_shared_weight: float = 1.0,
         qos_lpm_delay_weight: float = 1.0,
         qos_lpm_priority_weight: float = 1.0,
@@ -177,6 +179,7 @@ class SchedulePolicy:
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.enable_qos_aware_prefix_cache = enable_qos_aware_prefix_cache
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         if min(
             qos_lpm_shared_weight,
@@ -212,7 +215,12 @@ class SchedulePolicy:
             and get_global_server_args().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_prefix_for_req(self.tree_cache, r, include_req=True)
+                match_prefix_for_req(
+                    self.tree_cache,
+                    r,
+                    include_req=True,
+                    update_cache_stats=not self.enable_qos_aware_prefix_cache,
+                )
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -299,7 +307,11 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             match_result = match_prefix_for_req(
-                self.tree_cache, r, prefix_ids, include_req=True
+                self.tree_cache,
+                r,
+                prefix_ids,
+                include_req=True,
+                update_cache_stats=not self.enable_qos_aware_prefix_cache,
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;

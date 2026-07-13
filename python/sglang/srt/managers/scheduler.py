@@ -1045,6 +1045,9 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_qos_aware_prefix_cache=(
+                self.server_args.enable_qos_aware_prefix_cache
+            ),
             qos_lpm_shared_weight=self.server_args.qos_lpm_shared_weight,
             qos_lpm_delay_weight=self.server_args.qos_lpm_delay_weight,
             qos_lpm_priority_weight=self.server_args.qos_lpm_priority_weight,

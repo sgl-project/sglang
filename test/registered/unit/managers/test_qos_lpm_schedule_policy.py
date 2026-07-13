@@ -21,6 +21,7 @@ class TestQoSLPMSchedulePolicy(unittest.TestCase):
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=low_priority_values_first,
+            enable_qos_aware_prefix_cache=True,
         )
 
     def _req(self, rid, token_ids, priority, wait_time):
@@ -62,6 +63,27 @@ class TestQoSLPMSchedulePolicy(unittest.TestCase):
         )
 
         self.assertEqual([r.rid for r in waiting_queue], ["value-one", "value-five"])
+
+    def test_disabled_gate_preserves_baseline_match_accounting(self):
+        tree_cache = RadixCache.create_simulated(eviction_policy="lru")
+        key = RadixKey([1, 2, 3])
+        tree_cache.insert(InsertParams(key=key, value=torch.tensor([1, 2, 3])))
+        waiting_queue = [self._req("baseline", [1, 2, 3], 1, 1.0)]
+        policy = SchedulePolicy(
+            policy="lpm",
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            enable_qos_aware_prefix_cache=False,
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.radix_cache.time.monotonic", return_value=123.0
+        ):
+            policy.calc_priority(waiting_queue)
+
+        self.assertEqual(waiting_queue[0].last_node.last_access_time, 123.0)
 
     def test_repeated_schedule_probes_do_not_inflate_cache_hotness(self):
         tree_cache = RadixCache.create_simulated(eviction_policy="qos-aware")
@@ -159,6 +181,7 @@ class TestQoSLPMSchedulePolicy(unittest.TestCase):
                 enable_hierarchical_cache=False,
                 enable_priority_scheduling=False,
                 schedule_low_priority_values_first=False,
+                enable_qos_aware_prefix_cache=True,
                 qos_lpm_dram_discount=1.5,
             )
 

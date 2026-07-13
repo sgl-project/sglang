@@ -719,6 +719,10 @@ class ServerArgs:
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
     ] = False
+    enable_qos_aware_prefix_cache: A[
+        bool,
+        "Enable QoS-aware prefix-cache accounting, scheduling, and eviction features.",
+    ] = False
     disable_priority_preemption: A[bool, "Disable priority scheduling preemption."] = (
         False
     )
@@ -6950,6 +6954,18 @@ class ServerArgs:
         self.validate_buckets_rule(
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
+
+        # QoS-aware prefix-cache features are opt-in so disabling the gate
+        # preserves the original SGLang scheduling and cache-accounting behavior.
+        if not self.enable_qos_aware_prefix_cache:
+            assert self.schedule_policy != "qos-lpm", (
+                "--schedule-policy qos-lpm requires "
+                "--enable-qos-aware-prefix-cache"
+            )
+            assert self.radix_eviction_policy != "qos-aware", (
+                "--radix-eviction-policy qos-aware requires "
+                "--enable-qos-aware-prefix-cache"
+            )
 
         # Check scheduling policy
         if self.enable_priority_scheduling:
