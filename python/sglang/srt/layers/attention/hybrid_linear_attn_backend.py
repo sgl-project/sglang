@@ -841,6 +841,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
+    def on_after_cuda_graph_warmup(self):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.on_after_cuda_graph_warmup()
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip

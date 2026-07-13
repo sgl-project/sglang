@@ -219,9 +219,15 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
+    "ascend",
+    "fa3",
+    "fa4",
+    "flashinfer",
+    "triton",
+]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -3489,6 +3495,21 @@ class ServerArgs:
         """
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
+
+        # Breakable is the general CUDA default, but it is not compatible with
+        # multimodal prefill. Models on this allowlist have had their decoder
+        # prefill validated under tc_piecewise; the vision encoder remains
+        # eager outside the captured LM forward.
+        if (
+            self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+        ):
+            logger.info(
+                "Using tc_piecewise CUDA graph for validated multimodal "
+                "decoder prefill."
+            )
+            self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+
         if self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
@@ -5256,10 +5277,31 @@ class ServerArgs:
         if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
+            original_chunked_prefill_size = self.chunked_prefill_size
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                f"DP attention is enabled. chunked prefill size is adjusted "
+                f"from {original_chunked_prefill_size} to {self.chunked_prefill_size}."
             )
+
+            # The prefill CUDA graph max_bs was derived from the pre-DP-division
+            # chunked_prefill_size in _handle_gpu_memory_settings (which runs
+            # before this handler). Re-clamp it (and the captured shape list) to
+            # the per-DP-rank chunked_prefill_size so breakable CUDA graph
+            # capture never exceeds the MoE all-to-all's max_num_tokens budget,
+            # which is also sized from the DP-adjusted chunked_prefill_size.
+            prefill_cfg = self.cuda_graph_config.prefill
+            if (
+                prefill_cfg.backend != Backend.DISABLED
+                and prefill_cfg.max_bs is not None
+                and prefill_cfg.max_bs > self.chunked_prefill_size
+                and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
+            ):
+                prefill_cfg.max_bs = self.chunked_prefill_size
+                if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
+                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
+                        prefill_cfg.max_bs
+                    )
 
         # The dp-lm-head validation moved to the resolution pipeline
         # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
@@ -6190,9 +6232,10 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                if attention_backend not in ["fa3", "triton"]:
+                deepseek_deterministic_attention_backends = ["fa3", "triton"]
+                if attention_backend not in deepseek_deterministic_attention_backends:
                     raise ValueError(
-                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {deepseek_deterministic_attention_backends} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
