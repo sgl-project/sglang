@@ -1,9 +1,8 @@
 # flash_mla
-# sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
-    URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/b6d6325733add3681dd19431093a867790f00a15.tar.gz
+    URL_HASH SHA256=bcec05dbcbc626235307042c486b8ce2652d0d8706427ed04843eab160e70bfa
 )
 FetchContent_Populate(repo-flashmla)
 
