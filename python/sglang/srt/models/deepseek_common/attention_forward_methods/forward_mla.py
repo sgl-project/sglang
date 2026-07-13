@@ -418,6 +418,26 @@ class DeepseekMLAForwardMixin:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
+        elif self.use_dsa:
+            # Custom DSA model: q_lora_rank=None but has indexer_q_lora_rank configured
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
+            else:
+                topk_indices = maybe_capture_indexer_topk(
+                    self.layer_id, prev_topk_indices
+                )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
