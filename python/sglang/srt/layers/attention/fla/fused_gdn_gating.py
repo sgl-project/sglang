@@ -9,8 +9,6 @@ from sglang.jit_kernel.triton.fla_math import gdn_gating_values
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
-# With EXP_GATE, g is stored as exp(g) — the multiplicative decay alpha the
-# FlashInfer GDN prefill kernel consumes.
 @triton.jit
 def fused_gdn_gating_kernel(
     g,
@@ -26,7 +24,6 @@ def fused_gdn_gating_kernel(
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
-    EXP_GATE: tl.constexpr,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
@@ -37,7 +34,7 @@ def fused_gdn_gating_kernel(
     blk_b = tl.load(b + i_b * stride_b + head_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     blk_g, blk_beta_output = gdn_gating_values(
-        blk_A_log, blk_a, blk_b, blk_bias, beta, threshold, EXP_GATE
+        blk_A_log, blk_a, blk_b, blk_bias, beta, threshold, False
     )
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
     tl.store(beta_output + off, blk_beta_output, mask=mask)
@@ -50,7 +47,6 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
-    exp_gate: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
@@ -73,7 +69,6 @@ def fused_gdn_gating(
         beta,
         threshold,
         8,
-        exp_gate,
         num_warps=1,
     )
     return g, beta_output

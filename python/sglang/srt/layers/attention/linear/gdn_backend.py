@@ -323,8 +323,10 @@ class GDNKernelDispatcher:
         no_prefix: bool = False,
     ) -> tuple:
         """Run GDN prefill without exposing backend tensor representations."""
-        if self.uses_flashinfer_prefill:
-            return self.extend_kernel.extend_packed(
+        if self.uses_flashinfer_prefill and self.extend_kernel.can_use_fused_prefill(
+            mixed_qkv, shape
+        ):
+            return self.extend_kernel.extend_fused(
                 mixed_qkv,
                 a,
                 b,
@@ -339,36 +341,6 @@ class GDNKernelDispatcher:
                 no_prefix=no_prefix,
             )
 
-        assert flashinfer_prep is None
-        return self._extend_prefill_separated(
-            mixed_qkv,
-            a,
-            b,
-            shape=shape,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            out=out,
-            no_prefix=no_prefix,
-        )
-
-    def _extend_prefill_separated(
-        self,
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        *,
-        shape: GDNQKVShape,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        no_prefix: bool = False,
-    ) -> tuple:
         query, key, value = split_gdn_prefill_qkv(mixed_qkv, shape)
         g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
         return self.extend(
@@ -380,8 +352,6 @@ class GDNKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            out=out,
-            no_prefix=no_prefix,
         )
 
     def extend(

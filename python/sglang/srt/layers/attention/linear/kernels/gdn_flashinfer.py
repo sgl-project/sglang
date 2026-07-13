@@ -18,7 +18,6 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
     MAX_FUSED_QKV_SPLIT_DIM,
     GDNQKVShape,
-    split_gdn_prefill_qkv,
 )
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
@@ -267,31 +266,83 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        prep: Optional[FlashInferGDNExtendPrep] = None,
-        no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
+        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 
-        q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
+        total_seq_len = q.shape[1]
+        num_v_heads = v.shape[2]
+        head_v_dim = v.shape[3]
 
-        return self._extend_core(
-            q_fi=q_fi,
-            k_fi=k_fi,
-            v_fi=v[0].contiguous(),
-            alpha_fi=torch.exp(g[0].to(torch.float32)),
-            beta_fi=beta[0].to(torch.float32),
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            out=out,
-            prep=prep,
-            no_prefix=no_prefix,
+        q_fi = l2norm_fwd(q[0].contiguous())
+        k_fi = l2norm_fwd(k[0].contiguous())
+        v_fi = v[0].contiguous()
+
+        # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
+        alpha_fi = torch.exp(g[0].to(torch.float32))
+        beta_fi = beta[0].to(torch.float32)
+
+        if self.use_state_pool:
+            # Negative indices (e.g. -1) are padding markers for slots not yet
+            # assigned to a real sequence; clamp them to 0 (the reserved dummy
+            # slot) so the FlashInfer kernel never reads out-of-bounds state.
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            # Pre-allocate bf16 output_state so the kernel compiles and writes the
+            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
+            # fp32->bf16 conversion in the scatter step.
+            output_state_fi = torch.empty_like(initial_state_fi)
+            output_fi, output_state_fi = self._prefill_fn(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                g=alpha_fi,
+                beta=beta_fi,
+                scale=None,
+                initial_state=initial_state_fi,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,  # already int32
+                use_qk_l2norm_in_kernel=False,
+                output_state=output_state_fi,
+            )
+        else:
+            # SM90: preserve original negative-index handling (remap to last slot).
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            ).to(torch.int64)
+            # State must be float32; kernel requires int64 cu_seqlens.
+            initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+            output_fi, output_state_fi = self._prefill_fn(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                g=alpha_fi,
+                beta=beta_fi,
+                scale=None,
+                initial_state=initial_state_fi,
+                output_final_state=True,
+                cu_seqlens=query_start_loc.to(torch.int64),
+                use_qk_l2norm_in_kernel=False,
+            )
+
+        # Write back state to pool
+        ssm_states.index_copy_(
+            0,
+            ssm_cache_indices,
+            output_state_fi.to(ssm_states.dtype),
         )
 
+        # Output: [seq, HV, V] -> [1, seq, HV, V]
+        core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
+
+        # Return (output, last_recurrent_state, h) to match Triton kernel interface.
+        # h=None since FlashInfer doesn't provide intermediate states.
+        return core_attn_out, None, None
+
     @staticmethod
-    def _can_use_fused(mixed_qkv: torch.Tensor, shape: GDNQKVShape) -> bool:
+    def can_use_fused_prefill(mixed_qkv: torch.Tensor, shape: GDNQKVShape) -> bool:
         return (
             shape.total_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and mixed_qkv.stride(1) == 1
@@ -300,7 +351,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             and shape.num_v_heads & (shape.num_v_heads - 1) == 0
         )
 
-    def extend_packed(
+    def extend_fused(
         self,
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
@@ -317,77 +368,33 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        """Use fused preparation when eligible, otherwise use ``extend``."""
-        if self._can_use_fused(mixed_qkv, shape):
-            from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
+        """Run the fused FlashInfer prefill path."""
+        from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
 
-            q_normed, k_normed, value, alpha, beta = gdn_prefill_fused(
-                mixed_qkv,
-                a,
-                b,
-                A_log,
-                dt_bias,
-                num_qk_heads=shape.num_q_heads,
-                num_v_heads=shape.num_v_heads,
-                head_qk_dim=shape.head_q_dim,
-                head_v_dim=shape.head_v_dim,
-            )
-            return self._extend_core(
-                q_fi=q_normed[0],
-                k_fi=k_normed[0],
-                v_fi=value[0],
-                alpha_fi=alpha[0],
-                beta_fi=beta[0],
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                out=out,
-                prep=prep,
-                no_prefix=no_prefix,
-            )
-
-        from sglang.srt.layers.attention.fla.fused_gdn_gating import (
-            fused_gdn_gating,
+        q_fi, k_fi, v_fi, alpha_fi, beta_fi = gdn_prefill_fused(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            num_qk_heads=shape.num_q_heads,
+            num_v_heads=shape.num_v_heads,
+            head_qk_dim=shape.head_q_dim,
+            head_v_dim=shape.head_v_dim,
         )
+        q_fi = q_fi[0]
+        k_fi = k_fi[0]
+        v_fi = v_fi[0]
+        alpha_fi = alpha_fi[0]
+        beta_fi = beta_fi[0]
 
-        query, key, value = split_gdn_prefill_qkv(mixed_qkv, shape)
-        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-        return self.extend(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            out=out,
-            prep=prep,
-            no_prefix=no_prefix,
-        )
-
-    def _extend_core(
-        self,
-        *,
-        q_fi: torch.Tensor,
-        k_fi: torch.Tensor,
-        v_fi: torch.Tensor,
-        alpha_fi: torch.Tensor,
-        beta_fi: torch.Tensor,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        out: Optional[torch.Tensor],
-        prep: Optional[FlashInferGDNExtendPrep],
-        no_prefix: bool,
-    ) -> tuple:
         total_seq_len = q_fi.shape[0]
         num_v_heads = v_fi.shape[1]
         head_v_dim = v_fi.shape[2]
 
         if prep is None:
-            # Fallback for direct extend() callers (e.g. unit tests); the hot
-            # path passes prep built once per forward.
+            # Fallback for direct extend_fused() callers; production passes
+            # prep built once per forward.
             prep = self.build_extend_prep(
                 cache_indices=cache_indices,
                 state_pool_size=ssm_states.shape[0],

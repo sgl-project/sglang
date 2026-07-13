@@ -56,9 +56,9 @@ def l2norm_fwd_kernel1(
 def _l2norm_row_block(
     x, y, eps, i_t, T: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr
 ):
-    # The fused q/k variant's 0-ULP contract also depends on this block-pointer
+    # The packed fused path's 0-ULP contract also depends on this block-pointer
     # load and round-to-nearest store in the input dtype. The numerical formula
-    # itself is shared with the packed fused kernel.
+    # itself is shared with that kernel.
     p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
     b_y = l2norm_row_values(b_x, eps)
@@ -129,52 +129,6 @@ def l2norm_fwd(
         )
 
     return y.view(x_shape_og)
-
-
-@triton.jit
-def l2norm_fwd_qk_kernel(
-    xq,
-    yq,
-    xk,
-    yk,
-    eps,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-):
-    i_t = tl.program_id(0)
-    # program_id(1) is CTA-uniform (0 -> q, 1 -> k), so the branch adds no warp
-    # divergence: each CTA handles one row-block of one tensor.
-    if tl.program_id(1) == 0:
-        _l2norm_row_block(xq, yq, eps, i_t, T, D, BT, BD)
-    else:
-        _l2norm_row_block(xk, yk, eps, i_t, T, D, BT, BD)
-
-
-def l2norm_fwd_qk(xq: torch.Tensor, xk: torch.Tensor, eps: float = 1e-6):
-    """L2-normalize q and k (last dim) in a single Triton launch.
-
-    Requires q/k of identical shape/dtype (GDN: num_q_heads == num_k_heads of
-    head_k_dim); the second grid axis selects the tensor. Bit-identical to two
-    separate ``l2norm_fwd`` calls (pinned by
-    test_gdn_prefill_flashinfer_opts.py).
-    """
-    assert xq.shape == xk.shape and xq.dtype == xk.dtype
-    shape_og = xq.shape
-    xq2 = xq.view(-1, shape_og[-1])
-    xk2 = xk.view(-1, shape_og[-1])
-    T, D = xq2.shape
-    assert D <= 512, "only the l2norm block-ptr (D<=512) branch is fused here"
-    yq = torch.empty_like(xq2)
-    yk = torch.empty_like(xk2)
-    assert yq.stride(-1) == 1 and yk.stride(-1) == 1
-    BD = min(65536 // xq2.element_size(), triton.next_power_of_2(D))
-    grid = (triton.cdiv(T, 16), 2)  # axis0 = row-block, axis1 = q/k
-    l2norm_fwd_qk_kernel[grid](
-        xq2, yq, xk2, yk, eps, T=T, D=D, BT=16, BD=BD, num_warps=8, num_stages=3
-    )
-    return yq.view(shape_og), yk.view(shape_og)
 
 
 class L2NormFunction(torch.autograd.Function):

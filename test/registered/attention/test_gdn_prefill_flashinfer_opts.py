@@ -1,19 +1,19 @@
 """Tests for the GDN FlashInfer prefill wrapper optimizations.
 
 Covered:
-- fused q/k l2norm (single launch, 0-ULP vs two l2norm_fwd calls)
-- direct-write output (extend(out=...) writes via FlashInfer's output= param)
-- hoisted layer-invariant prep (extend(prep=...) reuses pool-gather indices)
+- fused packed prologue (single launch, 0-ULP vs the established kernels)
+- direct-write output (extend_fused(out=...) writes via FlashInfer's output= param)
+- hoisted layer-invariant prep (extend_fused(prep=...) reuses pool-gather indices)
 """
 
 import math
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 if not torch.cuda.is_available():
@@ -33,7 +33,7 @@ if not is_flashinfer_gdn_prefill_available():
     pytest.skip("FlashInfer GDN prefill unavailable", allow_module_level=True)
 
 
-def _build_extend_inputs(num_seqs: int):
+def _build_extend_inputs(kernel: FlashInferGDNKernel, num_seqs: int):
     """Synthetic GDN extend inputs matching production layouts."""
     seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
     cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
@@ -65,16 +65,29 @@ def _build_extend_inputs(num_seqs: int):
     )
     dt = torch.clamp(dt, min=1e-4)
     dt_bias = dt + torch.log(-torch.expm1(-dt))
-    g_log = -A_log.exp().view(1, 1, num_v_heads) * F.softplus(
-        a.float() + dt_bias.view(1, 1, num_v_heads)
+    mixed_qkv = torch.cat(
+        [
+            q[0].reshape(total_tokens, -1),
+            k[0].reshape(total_tokens, -1),
+            v[0].reshape(total_tokens, -1),
+        ],
+        dim=-1,
     )
-    beta = torch.sigmoid(b.float())
+    shape = GDNQKVShape(
+        num_q_heads=num_k_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_q_dim=head_k_dim,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+    )
 
     # Mirror the production MambaSlotAllocator layout: slot 0 is the reserved
     # dummy pad target (negative indices clamp to it on SM100) and live
     # requests get slots 1..N. Using slot 0 for a live row would give
     # index_copy_ duplicate indices when a -1 pad row is present, which is
     # nondeterministic and never happens in production.
+    state_dtype = torch.bfloat16 if kernel.use_state_pool else torch.float32
     ssm_states = (
         torch.randn(
             num_seqs + 1,
@@ -82,17 +95,18 @@ def _build_extend_inputs(num_seqs: int):
             head_v_dim,
             head_k_dim,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=state_dtype,
         )
         * 0.05
     )
     cache_indices = torch.arange(1, num_seqs + 1, device="cuda", dtype=torch.int32)
     return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=g_log,
-        beta=beta,
+        mixed_qkv=mixed_qkv,
+        a=a[0],
+        b=b[0],
+        A_log=A_log,
+        dt_bias=dt_bias,
+        shape=shape,
         ssm_states=ssm_states,
         cache_indices=cache_indices,
         query_start_loc=cu_seqlens,
@@ -102,14 +116,15 @@ def _build_extend_inputs(num_seqs: int):
     )
 
 
-def _run(kernel, inp, *, out=None, prep=None, no_prefix=False):
+def _run_fused(kernel, inp, *, out=None, prep=None, no_prefix=False):
     ssm = inp["ssm_states"].clone()
-    o, s1, s2 = kernel.extend(
-        q=inp["q"],
-        k=inp["k"],
-        v=inp["v"],
-        g=inp["g"],
-        beta=inp["beta"],
+    o, s1, s2 = kernel.extend_fused(
+        inp["mixed_qkv"],
+        inp["a"],
+        inp["b"],
+        shape=inp["shape"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
         ssm_states=ssm,
         cache_indices=inp["cache_indices"],
         query_start_loc=inp["query_start_loc"],
@@ -123,14 +138,14 @@ def _run(kernel, inp, *, out=None, prep=None, no_prefix=False):
 
 
 @pytest.mark.parametrize("num_seqs", [1, 5, 64])
-def test_flashinfer_extend_direct_write(num_seqs: int):
-    """extend(out=...) must (1) produce bit-identical output and SSM-state
+def test_flashinfer_extend_fused_direct_write(num_seqs: int):
+    """extend_fused(out=...) must produce bit-identical output and state
     writeback as the fresh-allocation path, and (2) return a tensor aliasing
     the supplied buffer so the caller can skip its copy."""
     kernel = FlashInferGDNKernel()
-    inp = _build_extend_inputs(num_seqs)
+    inp = _build_extend_inputs(kernel, num_seqs)
 
-    o_ref, ssm_ref = _run(kernel, inp)
+    o_ref, ssm_ref = _run_fused(kernel, inp)
 
     out_buf = torch.empty(
         1,
@@ -140,7 +155,7 @@ def test_flashinfer_extend_direct_write(num_seqs: int):
         device="cuda",
         dtype=o_ref.dtype,
     )
-    o_buf, ssm_buf = _run(kernel, inp, out=out_buf)
+    o_buf, ssm_buf = _run_fused(kernel, inp, out=out_buf)
 
     assert (o_buf.float() - o_ref.float()).abs().max().item() == 0
     assert (ssm_buf - ssm_ref).abs().max().item() == 0
@@ -148,7 +163,7 @@ def test_flashinfer_extend_direct_write(num_seqs: int):
     assert (out_buf.squeeze(0) - o_buf.squeeze(0)).abs().max().item() == 0
 
     with pytest.raises(AssertionError):
-        _run(
+        _run_fused(
             kernel,
             inp,
             out=out_buf[:, :-1] if inp["total_tokens"] > 1 else out_buf.unsqueeze(0),
@@ -157,12 +172,12 @@ def test_flashinfer_extend_direct_write(num_seqs: int):
 
 @pytest.mark.parametrize("num_seqs", [1, 5, 64])
 @pytest.mark.parametrize("pad_last", [False, True])
-def test_flashinfer_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
-    """Precomputed (hoisted) prep passed via extend(prep=...) must yield
+def test_flashinfer_extend_fused_prep_hoist_equiv(num_seqs: int, pad_last: bool):
+    """Hoisted prep passed to extend_fused must yield
     bit-identical output AND ssm-state writeback vs the per-layer recompute
     path (prep=None), incl. -1 padding (clamped to reserved slot 0 on SM100)."""
     kernel = FlashInferGDNKernel()
-    inp = _build_extend_inputs(num_seqs)
+    inp = _build_extend_inputs(kernel, num_seqs)
     if pad_last:
         inp["cache_indices"][-1] = -1
 
@@ -183,81 +198,39 @@ def test_flashinfer_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
         ).to(torch.int64)
     assert torch.equal(ssm_cache_indices, expected)
 
-    o_ref, ssm_ref = _run(kernel, inp)
-    o_hoist, ssm_hoist = _run(kernel, inp, prep=prep)
+    o_ref, ssm_ref = _run_fused(kernel, inp)
+    o_hoist, ssm_hoist = _run_fused(kernel, inp, prep=prep)
 
     assert (o_hoist.float() - o_ref.float()).abs().max().item() == 0
     assert (ssm_hoist - ssm_ref).abs().max().item() == 0
 
 
 @pytest.mark.parametrize("num_seqs", [1, 5])
-def test_flashinfer_extend_no_prefix_gather_skip(num_seqs: int):
-    """extend(no_prefix=True) skips the SSM pool gather and zero-seeds in-kernel.
+def test_flashinfer_extend_fused_no_prefix_gather_skip(num_seqs: int):
+    """extend_fused(no_prefix=True) skips the pool gather and zero-seeds.
 
     (1) On a cleared pool (the real no-prefix state: freed slots are zeroed) it
     must be bit-identical to the gather path. (2) With poisoned pool rows it
     must IGNORE them — fresh prefills never read slot residue. A regression
     re-introducing the gather on the no_prefix path breaks (2)."""
     kernel = FlashInferGDNKernel()
-    inp = _build_extend_inputs(num_seqs)
+    inp = _build_extend_inputs(kernel, num_seqs)
     inp["ssm_states"].zero_()  # no-prefix reality: slots are cleared
 
-    o_gather, ssm_gather = _run(kernel, inp)
+    o_gather, ssm_gather = _run_fused(kernel, inp)
 
-    o_np, ssm_np = _run(kernel, inp, no_prefix=True)
+    o_np, ssm_np = _run_fused(kernel, inp, no_prefix=True)
     assert (o_np.float() - o_gather.float()).abs().max().item() == 0
     assert (ssm_np - ssm_gather).abs().max().item() == 0
 
     # Poison the live rows: no_prefix must not read them.
     inp["ssm_states"].fill_(float("nan"))
-    o_poison, _ = _run(kernel, inp, no_prefix=True)
+    o_poison, ssm_poison = _run_fused(kernel, inp, no_prefix=True)
     assert (o_poison.float() - o_gather.float()).abs().max().item() == 0
     assert not torch.isnan(o_poison.float()).any()
-
-
-@pytest.mark.parametrize("total_tokens", [1, 3, 127, 1024, 4096])
-def test_flashinfer_l2norm_qk_fusion_bitexact(total_tokens: int):
-    """The fused q/k l2norm must be bit-identical to its two-call reference."""
-    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_qk
-
-    num_k_heads, head_k_dim, dtype = 4, 128, torch.bfloat16
-    q = torch.randn(
-        1, total_tokens, num_k_heads, head_k_dim, device="cuda", dtype=dtype
-    )
-    k = torch.randn_like(q)
-
-    old_q = l2norm_fwd(q[0].contiguous())
-    old_k = l2norm_fwd(k[0].contiguous())
-    new_q, new_k = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
-    torch.cuda.synchronize()
-
-    assert (new_q.float() - old_q.float()).abs().max().item() == 0
-    assert (new_k.float() - old_k.float()).abs().max().item() == 0
-    assert new_q.dtype == dtype and new_k.dtype == dtype
-    assert tuple(new_q.shape) == (total_tokens, num_k_heads, head_k_dim)
-    assert tuple(new_k.shape) == (total_tokens, num_k_heads, head_k_dim)
-
-
-def test_flashinfer_l2norm_qk_fusion_launch_count():
-    """The FlashInfer q/k normalization fusion must use one launch, not two."""
-    from torch.profiler import ProfilerActivity, profile
-
-    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_qk
-
-    q = torch.randn(4096, 4, 128, device="cuda", dtype=torch.bfloat16).reshape(-1, 128)
-    k = torch.randn_like(q)
-
-    def count(name_substr, fn):
-        fn()
-        torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            fn()
-            torch.cuda.synchronize()
-        return sum(e.count for e in prof.key_averages() if name_substr in e.key)
-
-    old = count("l2norm_fwd_kernel", lambda: (l2norm_fwd(q), l2norm_fwd(k)))
-    new = count("l2norm_fwd_qk_kernel", lambda: l2norm_fwd_qk(q, k))
-    assert old == 2 and new == 1
+    active = inp["cache_indices"].to(torch.int64)
+    assert (ssm_poison[active] - ssm_gather[active]).abs().max().item() == 0
+    assert torch.isfinite(ssm_poison[active]).all()
 
 
 def _bits_equal(x: torch.Tensor, y: torch.Tensor) -> bool:
@@ -297,15 +270,16 @@ def _make_fused_inputs(total_tokens: int, seed: int, strided_ab: bool = False):
 
 
 def _fused_ref_chain(mixed_qkv, a, b, A_log, dt_bias):
-    """The real 3-kernel chain exactly as forward_extend runs it."""
+    """The established split, gating, and two-normalization chain."""
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 
     q, k, v = fused_qkv_split_gdn_prefill(mixed_qkv, 4, 4, 16, 128, 128, 128)
-    alpha, beta = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
-    q_norm, k_norm = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
-    return q_norm, k_norm, v[0], alpha, beta
+    g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+    q_norm = l2norm_fwd(q[0].contiguous())
+    k_norm = l2norm_fwd(k[0].contiguous())
+    return q_norm, k_norm, v[0], torch.exp(g), beta
 
 
 @pytest.mark.parametrize("total_tokens", [1, 7, 127, 1021, 1024, 16384])
@@ -343,31 +317,13 @@ def test_gdn_prefill_fused_bitexact(total_tokens: int):
     assert _bits_equal(beta, beta_ref)
 
 
-@pytest.mark.parametrize("force_fallback", [False, True])
-def test_flashinfer_extend_packed_matches_extend(force_fallback: bool):
-    """The atomic packed route must match the canonical log-g ``extend`` API.
-
-    This covers both the fused path and the FlashInfer-owned separated fallback,
-    including output aliasing and SSM-state writeback.
-    """
+def test_flashinfer_extend_fused_matches_extend():
+    """The fused route must match the canonical log-g ``extend`` API."""
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 
     kernel = FlashInferGDNKernel()
     T = 940
     mixed_qkv, a, b, A_log, dt_bias = _make_fused_inputs(T, seed=77)
-    packed_qkv = mixed_qkv
-    if force_fallback:
-        backing = torch.empty(
-            T,
-            mixed_qkv.shape[1] * 2,
-            device=mixed_qkv.device,
-            dtype=mixed_qkv.dtype,
-        )
-        backing[:, ::2].copy_(mixed_qkv)
-        packed_qkv = backing[:, ::2]
-        assert packed_qkv.stride(1) == 2
-        assert torch.equal(packed_qkv, mixed_qkv)
-
     shape = GDNQKVShape(
         num_q_heads=4,
         num_k_heads=4,
@@ -377,16 +333,14 @@ def test_flashinfer_extend_packed_matches_extend(force_fallback: bool):
         head_v_dim=128,
     )
     cu = torch.tensor([0, T], device="cuda", dtype=torch.int32)
-    pool = torch.zeros(2, 16, 128, 128, device="cuda", dtype=torch.bfloat16)
+    state_dtype = torch.bfloat16 if kernel.use_state_pool else torch.float32
+    pool = torch.zeros(2, 16, 128, 128, device="cuda", dtype=state_dtype)
     idx = torch.arange(1, 2, device="cuda", dtype=torch.int32)
 
     # Canonical public path: raw split, log-space gate, q/k normalized internally.
-    # Keep this input contiguous so the fallback test independently checks the
-    # stride-aware split used only by extend_packed.
     q_raw, k_raw, v_raw = split_gdn_prefill_qkv(mixed_qkv, shape)
     g_log, beta_e = fused_gdn_gating(A_log, a, b, dt_bias)
     pool_e = pool.clone()
-    out_e = torch.empty(1, T, 16, 128, device="cuda", dtype=torch.bfloat16)
     o_e, _, _ = kernel.extend(
         q=q_raw,
         k=k_raw,
@@ -396,14 +350,13 @@ def test_flashinfer_extend_packed_matches_extend(force_fallback: bool):
         ssm_states=pool_e,
         cache_indices=idx,
         query_start_loc=cu,
-        out=out_e,
     )
 
-    # Production path: packed/raw inputs remain atomic inside FlashInfer.
+    # Production fast path: packed/raw inputs remain atomic inside FlashInfer.
     pool_p = pool.clone()
     out_p = torch.empty(1, T, 16, 128, device="cuda", dtype=torch.bfloat16)
-    o_p, s1, s2 = kernel.extend_packed(
-        packed_qkv,
+    o_p, s1, s2 = kernel.extend_fused(
+        mixed_qkv,
         a,
         b,
         shape=shape,
@@ -419,30 +372,8 @@ def test_flashinfer_extend_packed_matches_extend(force_fallback: bool):
 
     assert _bits_equal(o_p[0], o_e[0])
     assert _bits_equal(pool_p, pool_e)
-    assert _bits_equal(out_p[0], out_e[0])
+    assert _bits_equal(out_p[0], o_e[0])
     assert o_p.data_ptr() == out_p.data_ptr()  # direct-write preserved
-
-
-def test_fused_gdn_gating_exp_gate_parity():
-    """fused_gdn_gating(exp_gate=True) must equal torch.exp of the log-space
-    output elementwise, with beta byte-identical. Guards the private in-kernel
-    exp fold used by the FlashInfer packed-prefill implementation."""
-    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-
-    T, Hv = 1024, 16
-    a = torch.randn(T, Hv, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(T, Hv, device="cuda", dtype=torch.bfloat16)
-    A_log = torch.log(
-        torch.empty(Hv, device="cuda", dtype=torch.float32).uniform_(0, 16)
-    )
-    dt_bias = torch.rand(Hv, device="cuda", dtype=torch.float32)
-
-    g_log, beta_log = fused_gdn_gating(A_log, a, b, dt_bias)
-    alpha, beta_exp = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
-    torch.cuda.synchronize()
-
-    assert torch.equal(beta_log, beta_exp)
-    assert (alpha - torch.exp(g_log)).abs().max().item() == 0
 
 
 if __name__ == "__main__":
