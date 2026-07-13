@@ -79,6 +79,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
+_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -351,6 +352,11 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        # Q8KV8 q-prep/indexer overlap handshake (see the fork site below):
+        # True between the alt-stream fork and its consumption in the born
+        # block; also suppresses the duplicate split/rope on that path.
+        self._q8kv8_qprep_overlap_pending = False
+
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
@@ -486,6 +492,47 @@ class DeepseekMLAForwardMixin:
                 if fuse_bmm_attention:
                     q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
                     fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
+
+                # Q8KV8 q-prep/indexer overlap (opt-in): the born-fp8 q-prep
+                # chain (split -> rope -> fused absorbed-bmm+cast, ~173us)
+                # and the indexer chain both fork from the q_a_layernorm
+                # output and never touch each other's tensors, so the q-prep
+                # can run on alt_stream underneath the indexer.  The fork
+                # must be enqueued BEFORE the indexer (a later wait_stream
+                # would serialize behind it).  The born predicate itself
+                # guarantees eager-only and the plain-rope branch (all fused
+                # /skip-rope variants make it return None), so applying rope
+                # here is exactly what the skipped block below would do.
+                if (
+                    _ENABLE_DSA_Q8KV8_QPREP_OVERLAP
+                    and _ENABLE_DSA_Q8KV8_BORN_FP8_Q
+                    and fusion_plan is None
+                    and self.alt_stream is not None
+                    and q_lora is not None
+                    and self.rotary_emb is not None
+                ):
+                    _born_backend_early = self._q8kv8_born_fp8_q_backend(
+                        forward_batch, llama_4_scaling
+                    )
+                    if _born_backend_early is not None:
+                        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+                        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                        _q_fp8 = _born_backend_early.q8kv8_acquire_born_q_buffer(
+                            q_nope.shape[0],
+                            self.num_local_heads,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            q_nope.device,
+                        )
+                        self.alt_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(self.alt_stream):
+                            absorbed_bmm_concat_cast_q_fp8(
+                                _q_fp8,
+                                q_nope,
+                                self.w_kc,
+                                q_pe,
+                                self.num_local_heads,
+                            )
+                        self._q8kv8_qprep_overlap_pending = True
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
@@ -654,6 +701,8 @@ class DeepseekMLAForwardMixin:
                 or self.use_dsa
                 or self.current_attention_backend == "triton"
             )
+            # Already applied at the q-prep/indexer overlap fork.
+            and not self._q8kv8_qprep_overlap_pending
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -666,15 +715,22 @@ class DeepseekMLAForwardMixin:
             # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
             # NaN-poisoned shape-only sentinel.
             num_tokens = q_nope.shape[0]
-            q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
-                num_tokens,
-                self.num_local_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                q_nope.device,
-            )
-            absorbed_bmm_concat_cast_q_fp8(
-                q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
-            )
+            if self._q8kv8_qprep_overlap_pending:
+                # q_fp8 was produced on alt_stream at the fork above; join so
+                # everything downstream (incl. the next layer's fork, which
+                # reuses the single born-q slot) orders after it.
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
+                self._q8kv8_qprep_overlap_pending = False
+            else:
+                q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
+                    num_tokens,
+                    self.num_local_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    q_nope.device,
+                )
+                absorbed_bmm_concat_cast_q_fp8(
+                    q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
+                )
             born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device

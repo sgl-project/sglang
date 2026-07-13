@@ -730,6 +730,13 @@ class Envs:
     # blocks contain only -1 pads, and -1 entries inside the consumed range
     # still take the in-kernel clamp+mask path.
     SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
+    # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
+    # chains fork independently from the q_a_layernorm output.  Requires
+    # SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q; eager-prefill-only via the born
+    # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
+    # WAR-safe.
+    SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
