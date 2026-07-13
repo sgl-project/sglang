@@ -613,34 +613,35 @@ class WeightsUpdater:
         updated = 0
         skipped = 0
         unknown_layers: list[str] = []
-        for layer_name, (lora_a, lora_b) in pairs.items():
-            layer, resolved_key = _resolve_lora_ipc_layer_dict_key(
-                layer_name, layer_dict, dit_module
-            )
-            if layer is None:
-                logger.warning(
-                    "Unknown LoRA layer name %s for target %s; skipping",
-                    layer_name,
-                    target_module,
+        with lora_pipeline._temporarily_disable_offload(target=target_module):
+            for layer_name, (lora_a, lora_b) in pairs.items():
+                layer, _resolved_key = _resolve_lora_ipc_layer_dict_key(
+                    layer_name, layer_dict, dit_module
                 )
-                unknown_layers.append(layer_name)
-                skipped += 1
-                continue
-            inferred_rank = int(lora_a.shape[0])
-            alpha = lora_alpha if lora_alpha is not None else inferred_rank
-            if lora_rank is not None and lora_rank != inferred_rank:
-                logger.warning(
-                    "LoRA rank mismatch for %s: payload=%d request=%d; using payload rank",
-                    layer_name,
-                    inferred_rank,
-                    lora_rank,
+                if layer is None:
+                    logger.warning(
+                        "Unknown LoRA layer name %s for target %s; skipping",
+                        layer_name,
+                        target_module,
+                    )
+                    unknown_layers.append(layer_name)
+                    skipped += 1
+                    continue
+                inferred_rank = int(lora_a.shape[0])
+                alpha = lora_alpha if lora_alpha is not None else inferred_rank
+                if lora_rank is not None and lora_rank != inferred_rank:
+                    logger.warning(
+                        "LoRA rank mismatch for %s: payload=%d request=%d; using payload rank",
+                        layer_name,
+                        inferred_rank,
+                        lora_rank,
+                    )
+                layer.lora_rank = inferred_rank
+                layer.lora_alpha = alpha
+                layer.set_lora_weights(
+                    lora_a, lora_b, merge_weights=True, clear_existing=True
                 )
-            layer.lora_rank = inferred_rank
-            layer.lora_alpha = alpha
-            layer.set_lora_weights(
-                lora_a, lora_b, merge_weights=True, clear_existing=True
-            )
-            updated += 1
+                updated += 1
 
         gc.collect()
         torch.cuda.empty_cache()
