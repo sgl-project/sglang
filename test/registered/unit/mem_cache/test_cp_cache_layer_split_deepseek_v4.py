@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cp_cache_layer_split import (
     build_cp_cache_layer_split_deepseek_v4_pool_layout,
     build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout,
@@ -33,38 +32,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-@contextmanager
-def _override_sharding_envs(
-    *,
-    disable_swa=False,
-    disable_c4=False,
-    disable_c128=False,
-    disable_c4_indexer=False,
-):
-    with ExitStack() as stack:
-        stack.enter_context(
-            envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_SWA_SHARDING.override(
-                disable_swa
-            )
-        )
-        stack.enter_context(
-            envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C4_SHARDING.override(
-                disable_c4
-            )
-        )
-        stack.enter_context(
-            envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C128_SHARDING.override(
-                disable_c128
-            )
-        )
-        stack.enter_context(
-            envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C4_INDEXER_SHARDING.override(
-                disable_c4_indexer
-            )
-        )
-        yield
-
-
 class TestCpCacheLayerSplitDeepSeekV4Layout(CustomTestCase):
     def test_pool_num_pages_includes_dummy_page(self):
         self.assertEqual(
@@ -82,10 +49,7 @@ class TestCpCacheLayerSplitDeepSeekV4Layout(CustomTestCase):
 
     def test_layout_counts_owned_layers_per_family(self):
         ratios = [0, 4, 4, 128] + [0] * 56
-        with _override_sharding_envs():
-            layout = build_cp_cache_layer_split_deepseek_v4_pool_layout(
-                0, 4, 0, 60, ratios
-            )
+        layout = build_cp_cache_layer_split_deepseek_v4_pool_layout(0, 4, 0, 60, ratios)
 
         self.assertEqual(layout.swa_layer_num, 15)
         self.assertEqual(layout.c4_layer_num, 2)
@@ -97,16 +61,13 @@ class TestCpCacheLayerSplitDeepSeekV4Layout(CustomTestCase):
 
     def test_worst_case_layout_is_max_across_cp_ranks(self):
         ratios = [0, 4, 128, 4] * 15 + [4]
-        with _override_sharding_envs():
-            layout = build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout(
-                4, 0, 61, ratios
-            )
-            rank_layouts = [
-                build_cp_cache_layer_split_deepseek_v4_pool_layout(
-                    rank, 4, 0, 61, ratios
-                )
-                for rank in range(4)
-            ]
+        layout = build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout(
+            4, 0, 61, ratios
+        )
+        rank_layouts = [
+            build_cp_cache_layer_split_deepseek_v4_pool_layout(rank, 4, 0, 61, ratios)
+            for rank in range(4)
+        ]
 
         self.assertEqual(
             layout.swa_layer_num, max(x.swa_layer_num for x in rank_layouts)
@@ -115,17 +76,6 @@ class TestCpCacheLayerSplitDeepSeekV4Layout(CustomTestCase):
         self.assertEqual(
             layout.c128_layer_num, max(x.c128_layer_num for x in rank_layouts)
         )
-
-    def test_replicated_c4_family_uses_stage_count(self):
-        ratios = [0, 4, 128, 4, 4, 128, 0, 4]
-        with _override_sharding_envs(disable_c4=True):
-            layout = build_cp_cache_layer_split_deepseek_v4_pool_layout(
-                1, 2, 0, 8, ratios
-            )
-
-        self.assertEqual(layout.c4_layer_num, 4)
-        self.assertEqual(layout.c4_state_layer_num, 4)
-        self.assertEqual(layout.c128_layer_num, 1)
 
 
 class TestCpCacheLayerSplitDeepSeekV4PoolInternals(CustomTestCase):
@@ -168,12 +118,8 @@ class TestCpCacheLayerSplitDeepSeekV4PoolInternals(CustomTestCase):
         )
 
         self.assertEqual(
-            build_map(fake, 4, True),
+            build_map(fake, 4),
             {0: 0, 2: 1, 3: 0, 5: 1},
-        )
-        self.assertEqual(
-            build_map(fake, 4, False),
-            {0: 0, 2: 1, 3: 2, 5: 3},
         )
 
 
@@ -228,14 +174,7 @@ class TestCpCacheLayerSplitStaging(CustomTestCase):
 def _make_fake_hicache_pool(
     *,
     compression_ratios,
-    swa_owned_global_ids,
-    swa_buffer_count,
-    c4_owned,
-    c128_owned,
-    c4_indexer_owned,
-    c4_attn_state_owned,
-    c128_attn_state_owned,
-    c4_indexer_state_owned,
+    owned_global_ids,
     stage_start=0,
     stage_end=None,
 ):
@@ -247,12 +186,12 @@ def _make_fake_hicache_pool(
     c128_local = 0
     for gid in range(stage_start, stage_end):
         ratio = compression_ratios[gid]
-        if ratio == 4 and gid in c4_owned:
+        if ratio == 4 and gid in owned_global_ids:
             layer_mapping[gid] = SimpleNamespace(
                 compress_ratio=4, compress_layer_id=c4_local
             )
             c4_local += 1
-        elif ratio == 128 and gid in c128_owned:
+        elif ratio == 128 and gid in owned_global_ids:
             layer_mapping[gid] = SimpleNamespace(
                 compress_ratio=128, compress_layer_id=c128_local
             )
@@ -264,20 +203,14 @@ def _make_fake_hicache_pool(
 
     fake = object.__new__(CpCacheLayerSplitDeepSeekV4TokenToKVPool)
     fake._swa_global_to_local = {
-        gid: i for i, gid in enumerate(sorted(swa_owned_global_ids))
+        gid: i for i, gid in enumerate(sorted(owned_global_ids))
     }
-    fake.swa_kv_pool = SimpleNamespace(kv_buffer=[None] * swa_buffer_count)
+    fake.swa_kv_pool = SimpleNamespace(kv_buffer=[None] * len(owned_global_ids))
     fake.layer_mapping = layer_mapping
     fake.compression_ratios = compression_ratios
     fake._stage_start = stage_start
     fake._stage_end = stage_end
-    fake._owns_c4_kv_layer_id = lambda gid: gid in c4_owned
-    fake._owns_c128_kv_layer_id = lambda gid: gid in c128_owned
-    fake._owns_indexer_kv_layer_id = lambda gid: gid in c4_indexer_owned
-    fake._owns_attention_state_layer_id = lambda gid: (
-        gid in c4_attn_state_owned or gid in c128_attn_state_owned
-    )
-    fake._owns_indexer_state_layer_id = lambda gid: gid in c4_indexer_state_owned
+    fake._is_layer_owned = lambda gid: gid in owned_global_ids
     return fake
 
 
@@ -285,56 +218,25 @@ class TestCpCacheLayerSplitDeepSeekV4HiCacheMapping(CustomTestCase):
     def test_mapping_keys_match_owned_sets_and_values_are_contiguous(self):
         fake = _make_fake_hicache_pool(
             compression_ratios=[0, 4, 128, 4],
-            swa_owned_global_ids={0, 1, 2, 3},
-            swa_buffer_count=2,
-            c4_owned={1, 3},
-            c128_owned=set(),
-            c4_indexer_owned={1, 3},
-            c4_attn_state_owned={1, 3},
-            c128_attn_state_owned=set(),
-            c4_indexer_state_owned={1, 3},
+            owned_global_ids={2, 3},
         )
         mapping = fake.get_hicache_host_layer_mapping()
 
         self.assertEqual(
             mapping,
             {
-                "swa": {0: 0, 1: 1},
-                "c4_kv": {1: 0, 3: 1},
-                "c128_kv": {},
-                "c4_indexer": {1: 0, 3: 1},
-                "c4_state": {1: 0, 3: 1},
-                "c128_state": {},
-                "c4_indexer_state": {1: 0, 3: 1},
+                "swa": {2: 0, 3: 1},
+                "c4_kv": {3: 0},
+                "c128_kv": {2: 0},
+                "c4_indexer": {3: 0},
+                "c4_state": {3: 0},
+                "c128_state": {2: 0},
+                "c4_indexer_state": {3: 0},
             },
         )
 
-    def test_c4_indexer_mapping_can_diverge_from_c4_kv(self):
-        fake = _make_fake_hicache_pool(
-            compression_ratios=[4, 4, 4, 4],
-            swa_owned_global_ids=set(),
-            swa_buffer_count=0,
-            c4_owned={0, 2},
-            c128_owned=set(),
-            c4_indexer_owned={0, 1, 2, 3},
-            c4_attn_state_owned={0, 2},
-            c128_attn_state_owned=set(),
-            c4_indexer_state_owned={0, 2},
-        )
-        mapping = fake.get_hicache_host_layer_mapping()
 
-        self.assertEqual(mapping["c4_kv"], {0: 0, 2: 1})
-        self.assertEqual(mapping["c4_indexer"], {0: 0, 1: 1, 2: 2, 3: 3})
-
-
-def _make_fake_transfer_pool(
-    *,
-    cp_rank,
-    shard_swa=True,
-    shard_c4=True,
-    shard_c128=True,
-    shard_c4_indexer=True,
-):
+def _make_fake_transfer_pool(*, cp_rank):
     cp_size = 2
     ratios = [0, 4, 4, 128, 4, 128, 0, 4]
     owned_swa_layers = range(0, 4) if cp_rank == 0 else range(4, 8)
@@ -346,10 +248,6 @@ def _make_fake_transfer_pool(
     fake._stage_start = 0
     fake._stage_end = len(ratios)
     fake.compression_ratios = ratios
-    fake._shard_swa = shard_swa
-    fake._shard_c4 = shard_c4
-    fake._shard_c128 = shard_c128
-    fake._shard_c4_indexer = shard_c4_indexer
     fake._swa_global_to_local = {
         layer_id: local_id for local_id, layer_id in enumerate(owned_swa_layers)
     }
@@ -388,50 +286,6 @@ class TestCpCacheLayerSplitDeepSeekV4TransferLayout(CustomTestCase):
             fake.get_c128_state_transfer_layout(),
             [(DSV4_TRANSFER_C128_STATE, 5)],
         )
-
-    def test_replicated_non_owner_layout_keeps_none_placeholders(self):
-        fake = _make_fake_transfer_pool(cp_rank=1, shard_c4=False)
-
-        self.assertEqual(
-            fake.get_kv_transfer_layout(),
-            [
-                None,
-                None,
-                None,
-                None,
-                (DSV4_TRANSFER_C4_INDEXER_KV, 4),
-                (DSV4_TRANSFER_C4_INDEXER_KV, 7),
-                (DSV4_TRANSFER_C128_KV, 5),
-            ],
-        )
-        self.assertEqual(
-            fake.get_state_transfer_layout(),
-            [
-                (DSV4_TRANSFER_SWA_KV, 4),
-                (DSV4_TRANSFER_SWA_KV, 5),
-                (DSV4_TRANSFER_SWA_KV, 6),
-                (DSV4_TRANSFER_SWA_KV, 7),
-                None,
-                None,
-                None,
-                None,
-                (DSV4_TRANSFER_INDEXER_STATE, 4),
-                (DSV4_TRANSFER_INDEXER_STATE, 7),
-            ],
-        )
-
-    def test_replicated_c128_state_has_single_sender(self):
-        rank0 = _make_fake_transfer_pool(cp_rank=0, shard_c128=False)
-        rank1 = _make_fake_transfer_pool(cp_rank=1, shard_c128=False)
-
-        self.assertEqual(
-            rank0.get_c128_state_transfer_layout(),
-            [
-                (DSV4_TRANSFER_C128_STATE, 3),
-                (DSV4_TRANSFER_C128_STATE, 5),
-            ],
-        )
-        self.assertEqual(rank1.get_c128_state_transfer_layout(), [None, None])
 
 
 if __name__ == "__main__":

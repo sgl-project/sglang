@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
     get_global_layer_shard_range,
 )
@@ -24,112 +22,6 @@ class CpCacheLayerSplitDeepSeekV4PoolLayout:
     c4_indexer_state_layer_num: int
 
 
-_V4_DISABLE_SHARDING_ENVS = {
-    "swa": envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_SWA_SHARDING,
-    "c4": envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C4_SHARDING,
-    "c128": envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C128_SHARDING,
-    "c4_indexer": envs.SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C4_INDEXER_SHARDING,
-}
-
-
-def _shard_family(family: str) -> bool:
-    return not _V4_DISABLE_SHARDING_ENVS[family].get()
-
-
-def shard_cp_cache_layer_split_swa() -> bool:
-    return _shard_family("swa")
-
-
-def shard_cp_cache_layer_split_c4() -> bool:
-    return _shard_family("c4")
-
-
-def shard_cp_cache_layer_split_c128() -> bool:
-    return _shard_family("c128")
-
-
-def shard_cp_cache_layer_split_c4_indexer() -> bool:
-    return _shard_family("c4_indexer")
-
-
-def cp_cache_layer_split_sharding_flags() -> dict[str, bool]:
-    return {family: _shard_family(family) for family in _V4_DISABLE_SHARDING_ENVS}
-
-
-def _num_stage_compress_layers(
-    start_layer: int,
-    end_layer_exclusive: int,
-    compression_ratios: list[int],
-    compress_ratio: int,
-) -> int:
-    return sum(
-        1
-        for layer_id in range(start_layer, end_layer_exclusive)
-        if compression_ratios[layer_id] == compress_ratio
-    )
-
-
-def _num_owned_compress_layers(
-    cp_rank: int,
-    cp_size: int,
-    start_layer: int,
-    end_layer_exclusive: int,
-    compression_ratios: list[int],
-    compress_ratio: int,
-) -> int:
-    owned_start, owned_end = get_global_layer_shard_range(
-        cp_rank,
-        cp_size,
-        start_layer,
-        end_layer_exclusive - start_layer,
-    )
-    return _num_stage_compress_layers(
-        owned_start,
-        owned_end,
-        compression_ratios,
-        compress_ratio,
-    )
-
-
-def _family_layer_count(
-    *,
-    sharded: bool,
-    cp_rank: int,
-    cp_size: int,
-    start_layer: int,
-    end_layer_exclusive: int,
-    compression_ratios: list[int],
-    compress_ratio: Optional[int] = None,
-) -> int:
-    """Count one DSV4 KV family for a pool layout."""
-    if compress_ratio is None:
-        if not sharded:
-            return end_layer_exclusive - start_layer
-        owned_start, owned_end = get_global_layer_shard_range(
-            cp_rank,
-            cp_size,
-            start_layer,
-            end_layer_exclusive - start_layer,
-        )
-        return owned_end - owned_start
-
-    if not sharded:
-        return _num_stage_compress_layers(
-            start_layer,
-            end_layer_exclusive,
-            compression_ratios,
-            compress_ratio,
-        )
-    return _num_owned_compress_layers(
-        cp_rank,
-        cp_size,
-        start_layer,
-        end_layer_exclusive,
-        compression_ratios,
-        compress_ratio,
-    )
-
-
 def build_cp_cache_layer_split_deepseek_v4_pool_layout(
     cp_rank: int,
     cp_size: int,
@@ -144,30 +36,30 @@ def build_cp_cache_layer_split_deepseek_v4_pool_layout(
             f"start_layer={start_layer}, end_layer={end_layer_exclusive}, "
             f"compression_ratios={len(compression_ratios)}"
         )
-    shard_swa = shard_cp_cache_layer_split_swa()
-    shard_c4 = shard_cp_cache_layer_split_c4()
-    shard_c128 = shard_cp_cache_layer_split_c128()
-    shard_c4_indexer = shard_cp_cache_layer_split_c4_indexer()
+    owned_start, owned_end = get_global_layer_shard_range(
+        cp_rank,
+        cp_size,
+        start_layer,
+        end_layer_exclusive - start_layer,
+    )
 
-    def _count(sharded: bool, compress_ratio: Optional[int] = None) -> int:
-        return _family_layer_count(
-            sharded=sharded,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            start_layer=start_layer,
-            end_layer_exclusive=end_layer_exclusive,
-            compression_ratios=compression_ratios,
-            compress_ratio=compress_ratio,
+    def _count(compress_ratio: int) -> int:
+        return sum(
+            1
+            for layer_id in range(owned_start, owned_end)
+            if compression_ratios[layer_id] == compress_ratio
         )
 
+    c4_layer_num = _count(4)
+    c128_layer_num = _count(128)
     return CpCacheLayerSplitDeepSeekV4PoolLayout(
-        swa_layer_num=_count(shard_swa),
-        c4_layer_num=_count(shard_c4, compress_ratio=4),
-        c128_layer_num=_count(shard_c128, compress_ratio=128),
-        c4_indexer_layer_num=_count(shard_c4_indexer, compress_ratio=4),
-        c4_state_layer_num=_count(shard_c4, compress_ratio=4),
-        c128_state_layer_num=_count(shard_c128, compress_ratio=128),
-        c4_indexer_state_layer_num=_count(shard_c4_indexer, compress_ratio=4),
+        swa_layer_num=owned_end - owned_start,
+        c4_layer_num=c4_layer_num,
+        c128_layer_num=c128_layer_num,
+        c4_indexer_layer_num=c4_layer_num,
+        c4_state_layer_num=c4_layer_num,
+        c128_state_layer_num=c128_layer_num,
+        c4_indexer_state_layer_num=c4_layer_num,
     )
 
 

@@ -33,7 +33,6 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.cp_cache_layer_split import (
     build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout,
-    cp_cache_layer_split_sharding_flags,
 )
 from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
     should_use_cp_cache_layer_split_pool,
@@ -665,11 +664,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.num_layers_ca4_state = layout.c4_state_layer_num
             self.num_layers_ca128_state = layout.c128_state_layer_num
             self.num_layers_ca4_indexer_state = layout.c4_indexer_state_layer_num
-            logger.info(
-                "CP Cache LayerSplit: sharding=%s, layout=%s",
-                cp_cache_layer_split_sharding_flags(),
-                layout,
-            )
+            logger.info("CP Cache LayerSplit layout=%s", layout)
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:

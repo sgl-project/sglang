@@ -14,10 +14,6 @@ from sglang.srt.mem_cache.cp_cache_layer_split.broadcast import (
 )
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
     build_cp_cache_layer_split_deepseek_v4_pool_layout,
-    shard_cp_cache_layer_split_c4,
-    shard_cp_cache_layer_split_c4_indexer,
-    shard_cp_cache_layer_split_c128,
-    shard_cp_cache_layer_split_swa,
 )
 from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import (
     CpCacheLayerSplitPoolBase,
@@ -78,11 +74,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             "cp_cache_layer_split_staging_max_prefill_tokens", None
         )
 
-        self._shard_swa = shard_cp_cache_layer_split_swa()
-        self._shard_c4 = shard_cp_cache_layer_split_c4()
-        self._shard_c128 = shard_cp_cache_layer_split_c128()
-        self._shard_c4_indexer = shard_cp_cache_layer_split_c4_indexer()
-
         self._clear_swa_read_state()
         self._clear_extra_read_state()
         self._clear_indexer_read_state()
@@ -136,12 +127,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             **kwargs,
             cp_cache_layer_split_layout=layout,
         )
-        if self._shard_swa:
-            self._swa_global_to_local = self._build_owned_layer_local_index_map()
-        else:
-            self._swa_global_to_local = {
-                layer_id: layer_id - pp_start for layer_id in range(pp_start, pp_end)
-            }
+        self._swa_global_to_local = self._build_owned_layer_local_index_map()
         self._log_layer_shard_plan()
         logger.info(
             "DSV4 Cache LayerSplit buffers: SWA=%s, C4=%s, C128=%s, "
@@ -178,60 +164,25 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                     ratio, enable_memory_saver
                 )
 
-    def _transfer_swa_layer_id(self, layer_id: int) -> bool:
-        if self._shard_swa:
-            return self._is_layer_owned(layer_id)
-        return self.cp_rank == 0
-
-    def _core_family_sharded(self, layer_id: int) -> bool:
-        ratio = self.compression_ratios[layer_id]
-        if ratio == 4:
-            return self._shard_c4
-        if ratio == 128:
-            return self._shard_c128
-        return False
-
-    def _transfer_core_layer_id(self, layer_id: int) -> bool:
-        if self._core_family_sharded(layer_id):
-            return self._is_layer_owned(layer_id)
-        return self.cp_rank == 0
-
-    def _transfer_indexer_layer_id(self, layer_id: int) -> bool:
-        if self._shard_c4_indexer:
-            return self._is_layer_owned(layer_id)
-        return self.cp_rank == 0
-
     def get_kv_transfer_layout(self) -> list:
         """Descriptors parallel to this rank's sharded V4 KV buffer list."""
         layout: list = []
         stage_layers = range(self._stage_start, self._stage_end)
 
         layout.extend(
-            (
-                (DSV4_TRANSFER_C4_KV, layer_id)
-                if self._transfer_core_layer_id(layer_id)
-                else None
-            )
+            (DSV4_TRANSFER_C4_KV, layer_id)
             for layer_id in stage_layers
             if self.compression_ratios[layer_id] == 4
             and self._owns_c4_kv_layer_id(layer_id)
         )
         layout.extend(
-            (
-                (DSV4_TRANSFER_C4_INDEXER_KV, layer_id)
-                if self._transfer_indexer_layer_id(layer_id)
-                else None
-            )
+            (DSV4_TRANSFER_C4_INDEXER_KV, layer_id)
             for layer_id in stage_layers
             if self.compression_ratios[layer_id] == 4
             and self._owns_indexer_kv_layer_id(layer_id)
         )
         layout.extend(
-            (
-                (DSV4_TRANSFER_C128_KV, layer_id)
-                if self._transfer_core_layer_id(layer_id)
-                else None
-            )
+            (DSV4_TRANSFER_C128_KV, layer_id)
             for layer_id in stage_layers
             if self.compression_ratios[layer_id] == 128
             and self._owns_c128_kv_layer_id(layer_id)
@@ -246,31 +197,16 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             key=lambda layer_id: self._swa_global_to_local[layer_id],
         )
         swa_layers = swa_layers[: len(self.swa_kv_pool.kv_buffer)]
-        layout.extend(
-            (
-                (DSV4_TRANSFER_SWA_KV, layer_id)
-                if self._transfer_swa_layer_id(layer_id)
-                else None
-            )
-            for layer_id in swa_layers
-        )
+        layout.extend((DSV4_TRANSFER_SWA_KV, layer_id) for layer_id in swa_layers)
 
         layout.extend(
-            (
-                (DSV4_TRANSFER_ATTENTION_STATE, layer_id)
-                if self._transfer_core_layer_id(layer_id)
-                else None
-            )
+            (DSV4_TRANSFER_ATTENTION_STATE, layer_id)
             for layer_id in range(self._stage_start, self._stage_end)
             if self.compression_ratios[layer_id] == 4
             and self._owns_attention_state_layer_id(layer_id)
         )
         layout.extend(
-            (
-                (DSV4_TRANSFER_INDEXER_STATE, layer_id)
-                if self._transfer_indexer_layer_id(layer_id)
-                else None
-            )
+            (DSV4_TRANSFER_INDEXER_STATE, layer_id)
             for layer_id in range(self._stage_start, self._stage_end)
             if self.compression_ratios[layer_id] == 4
             and self._owns_indexer_state_layer_id(layer_id)
@@ -280,11 +216,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
     def get_c128_state_transfer_layout(self) -> list:
         """Descriptors parallel to this rank's C128 state buffer list."""
         return [
-            (
-                (DSV4_TRANSFER_C128_STATE, layer_id)
-                if self._transfer_core_layer_id(layer_id)
-                else None
-            )
+            (DSV4_TRANSFER_C128_STATE, layer_id)
             for layer_id in range(self._stage_start, self._stage_end)
             if self.compression_ratios[layer_id] == 128
             and self._owns_attention_state_layer_id(layer_id)
@@ -352,27 +284,27 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         }
 
     def _owns_swa_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_swa or self._is_layer_owned(layer_id)
+        return self._is_layer_owned(layer_id)
 
     def should_skip_swa_write(self, layer_id: int) -> bool:
         return not self._owns_swa_layer_id(layer_id)
 
     def _owns_c4_kv_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c4 or self._is_layer_owned(layer_id)
+        return self._is_layer_owned(layer_id)
 
     def _owns_c128_kv_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c128 or self._is_layer_owned(layer_id)
+        return self._is_layer_owned(layer_id)
 
     def _owns_core_layer_id(self, layer_id: int) -> bool:
         if self.compression_ratios[layer_id] not in (4, 128):
             return False
-        return not self._core_family_sharded(layer_id) or self._is_layer_owned(layer_id)
+        return self._is_layer_owned(layer_id)
 
     def _owns_extra_key_layer_id(self, layer_id: int) -> bool:
         return self._owns_core_layer_id(layer_id)
 
     def _owns_indexer_kv_layer_id(self, layer_id: int) -> bool:
-        return not self._shard_c4_indexer or self._is_layer_owned(layer_id)
+        return self._is_layer_owned(layer_id)
 
     def _owns_attention_state_layer_id(self, layer_id: int) -> bool:
         return self._owns_core_layer_id(layer_id)
@@ -380,30 +312,15 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
     def _owns_indexer_state_layer_id(self, layer_id: int) -> bool:
         return self._owns_indexer_kv_layer_id(layer_id)
 
-    def _should_broadcast_swa(self) -> bool:
-        return self._shard_swa
-
-    def _broadcast_extra_key_layer_id(self, layer_id: int) -> bool:
-        return self._core_family_sharded(layer_id)
-
-    def _should_broadcast_indexer(self) -> bool:
-        return self._shard_c4_indexer
-
     def should_skip_core_compressor_write(self, layer_id: int) -> bool:
-        return self._core_family_sharded(layer_id) and not self._is_layer_owned(
-            layer_id
-        )
+        return not self._is_layer_owned(layer_id)
 
     def should_skip_indexer_compressor_write(self, layer_id: int) -> bool:
-        return self._shard_c4_indexer and not self._is_layer_owned(layer_id)
+        return not self._is_layer_owned(layer_id)
 
     def should_use_c4_extra_broadcast_overlap(self, layer_id: int) -> bool:
         item = self.layer_mapping[layer_id]
-        return (
-            item is not None
-            and item.compress_ratio == 4
-            and self._broadcast_extra_key_layer_id(layer_id)
-        )
+        return item is not None and item.compress_ratio == 4
 
     @staticmethod
     def _pool_num_pages(pool) -> int:
@@ -573,23 +490,16 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         self._indexer_remapped_page_table: Optional[torch.Tensor] = None
         self._indexer_remapped_layer_id: Optional[int] = None
 
-    def _build_owner_local_layer_map(
-        self, compress_ratio: int, sharded: bool
-    ) -> dict[int, int]:
+    def _build_owner_local_layer_map(self, compress_ratio: int) -> dict[int, int]:
         """Map each family layer to its local index in the owning rank's pool."""
         owner_offsets = [0] * self.cp_size
-        replicated_offset = 0
         result = {}
         for layer_id in range(self._stage_start, self._stage_end):
             if self.compression_ratios[layer_id] != compress_ratio:
                 continue
-            if sharded:
-                owner_cp = self._get_layer_owner_rank(layer_id)
-                result[layer_id] = owner_offsets[owner_cp]
-                owner_offsets[owner_cp] += 1
-            else:
-                result[layer_id] = replicated_offset
-                replicated_offset += 1
+            owner_cp = self._get_layer_owner_rank(layer_id)
+            result[layer_id] = owner_offsets[owner_cp]
+            owner_offsets[owner_cp] += 1
         return result
 
     def _owner_compress_layer_item(self, layer_id: int) -> DeepSeekV4LayerItem:
@@ -625,11 +535,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         """Start current-layer SWA page broadcast; caller waits before attention."""
         self.wait_layer_transfer(layer_id)
         self._clear_extra_read_state()
-        if not self._should_broadcast_swa():
-            self._swa_remapped_indices = indices
-            self._swa_remapped_layer_id = layer_id
-            return
-
         max_pages = self._pool_num_pages(self.swa_kv_pool)
         page_size = self.swa_kv_pool.page_size
         swa_cache = self._batch_active_pages["swa"]
@@ -670,10 +575,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         item = self.layer_mapping[layer_id]
         assert item is not None
         if item.compress_ratio not in (4, 128):
-            return
-        if not self._broadcast_extra_key_layer_id(layer_id):
-            self._extra_remapped_indices = indices
-            self._extra_remapped_layer_id = layer_id
             return
         owner_item = self._owner_compress_layer_item(layer_id)
         assert owner_item.compress_kv_pool is not None
@@ -732,9 +633,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         if item.compress_ratio != 4:
             return
         self._clear_extra_read_state()
-        if not self._broadcast_extra_key_layer_id(layer_id):
-            return
-
         owner_item = self._owner_compress_layer_item(layer_id)
         assert owner_item.compress_kv_pool is not None
         pool = owner_item.compress_kv_pool
@@ -774,8 +672,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         compress_ratio, _, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         self._clear_indexer_read_state()
-        if not self._should_broadcast_indexer():
-            return
         owner_cp = self._get_layer_owner_rank(layer_id)
         owner_local = self._c4_indexer_local_layer_id(layer_id)
         pool = self.c4_indexer_kv_pool
@@ -836,15 +732,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
 
     def _rebuild_compressed_layer_mapping_for_cp(self) -> None:
         """``compress_layer_id`` counts only layers owned by this CP rank."""
-        self._c4_owner_local_by_layer = self._build_owner_local_layer_map(
-            4, self._shard_c4
-        )
-        self._c128_owner_local_by_layer = self._build_owner_local_layer_map(
-            128, self._shard_c128
-        )
-        self._c4_indexer_owner_local_by_layer = self._build_owner_local_layer_map(
-            4, self._shard_c4_indexer
-        )
+        self._c4_owner_local_by_layer = self._build_owner_local_layer_map(4)
+        self._c128_owner_local_by_layer = self._build_owner_local_layer_map(128)
+        self._c4_indexer_owner_local_by_layer = self._build_owner_local_layer_map(4)
 
         c1_cnt = 0
         self.layer_mapping = [None] * len(self.compression_ratios)

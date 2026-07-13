@@ -457,13 +457,6 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
 
-    # CP Cache LayerSplit
-    # Per-family ablation knobs; omit --enable-cp-cache-layer-split to disable the feature.
-    SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_SWA_SHARDING = EnvBool(False)
-    SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C4_SHARDING = EnvBool(False)
-    SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C128_SHARDING = EnvBool(False)
-    SGLANG_CP_CACHE_LAYER_SPLIT_DSV4_DISABLE_C4_INDEXER_SHARDING = EnvBool(False)
-
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
