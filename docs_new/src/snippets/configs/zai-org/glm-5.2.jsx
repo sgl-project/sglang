@@ -8,6 +8,9 @@ export const config = {
     "h20", "h200", "b200", "gb300", "b300",
     "mi355x", "mi325x", "mi300x",
   ],
+  hardware: [
+    { id: "h20", label: "H20", vram: "96GB", vendor: "nvidia" },
+  ],
 
   // Single released checkpoint — no size/mode split.
   variants: [

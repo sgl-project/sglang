@@ -11,6 +11,7 @@ export const benchmarks = [
   {
     match: { hw: "h20", variant: "default", quant: "w4afp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.13.post1",
+    accuracy: { aime25_pct: null, gsm8k_pct: null },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 10 },
         ttft_ms: 4726.83, tpot_ms: 41.47, tokens_per_sec_per_gpu: 282.86 },
