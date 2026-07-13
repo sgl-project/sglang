@@ -128,7 +128,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             num_shots=8,
             data_path=None,
             num_questions=1319,
-            parallel=1319,
+            parallel=512,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
