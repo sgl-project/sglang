@@ -17,6 +17,8 @@ Two guards against passing vacuously:
 
 import os
 import re
+import shutil
+import tempfile
 import unittest
 
 import requests
@@ -132,8 +134,9 @@ class BCGLoRAServerMixin:
 
     @classmethod
     def setUpClass(cls):
-        cls.stdout_path = f"bcg_lora_{cls.lora_backend}_server.out"
-        cls.stderr_path = f"bcg_lora_{cls.lora_backend}_server.err"
+        cls.log_dir = tempfile.mkdtemp(prefix=f"bcg_lora_{cls.lora_backend}_")
+        cls.stdout_path = os.path.join(cls.log_dir, "server.out")
+        cls.stderr_path = os.path.join(cls.log_dir, "server.err")
         cls.stdout = open(cls.stdout_path, "w")
         cls.stderr = open(cls.stderr_path, "w")
         process = popen_launch_server(
@@ -167,10 +170,9 @@ class BCGLoRAServerMixin:
             f = getattr(cls, attr, None)
             if f is not None and not f.closed:
                 f.close()
-        for attr in ("stdout_path", "stderr_path"):
-            path = getattr(cls, attr, None)
-            if path and os.path.exists(path):
-                os.remove(path)
+        log_dir = getattr(cls, "log_dir", None)
+        if log_dir:
+            shutil.rmtree(log_dir, ignore_errors=True)
 
     def test_prefill_graph_replay_logged(self):
         # can_run_cuda_graph is True in the scheduler's per-batch prefill log
