@@ -62,11 +62,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     DecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
-    CausalVaeDecodingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams_hdmap_decode import (
     decode_hdmap_ab,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
+    CausalVaeDecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
