@@ -1,46 +1,45 @@
-"""Segment-streaming ASR over engine streaming sessions.
+"""Segment-streaming ASR: fixed-duration, disjoint audio segments.
 
-Chunked streaming (streaming_asr.py) re-transcribes a window of audio on
-every chunk, because bidirectional audio towers can't extend KV over one
-growing clip. Segment streaming takes the other trade: audio is cut into
-fixed-duration segments and each segment is submitted as one turn of an
-engine streaming session — user(audio) -> assistant(transcript) rounds
-in a single growing context. Prior turns' KV is reused, so each second
-of audio is encoded exactly once and per-segment cost is constant,
-instead of growing with the utterance.
+Chunked streaming (streaming_asr.py) re-transcribes a sliding window of
+audio on every chunk, because bidirectional audio towers can't extend KV
+over one growing clip. Segment streaming takes the other trade: audio is
+cut into fixed-duration, non-overlapping segments and each segment is
+transcribed independently; the per-segment texts are concatenated. Because
+the segments are disjoint, each second of audio is encoded exactly once
+(no re-encoded window), at the cost of accuracy at segment boundaries.
 
-Requires --enable-streaming-session. Mirrors vLLM's SupportsRealtime
-segment flow (its qwen3_asr_realtime model buffers the mic into 5 s
-segments and appends each as a resumable-request turn).
+Mirrors vLLM's qwen3_asr_realtime, which yields each segment as a
+standalone transcription prompt (bare template + that segment's audio).
+An earlier design threaded the segments through one growing engine
+streaming session; that re-fed each turn's transcript back as context,
+and the model re-emitted the previous transcript instead of transcribing
+the new segment, so segments 2..N all repeated segment 1. Independent
+per-segment requests avoid that (and share no meaningful KV across
+disjoint audio anyway).
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, Dict, Optional
 
 from sglang.srt.entrypoints.openai.streaming_asr import normalize_whitespace
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
-from sglang.srt.managers.io_struct import (
-    CloseSessionReqInput,
-    GenerateReqInput,
-    OpenSessionReqInput,
-)
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
 
 class SegmentStreamingASR:
-    """One utterance transcribed incrementally over a streaming session.
+    """One utterance transcribed as a sequence of independent segments.
 
-    Call ``transcribe_segment(wav)`` once per fixed-duration segment;
-    always ``close()`` when the utterance ends — including error paths —
-    to release the scheduler-side session. The engine session is opened
-    lazily on the first segment.
+    Call ``transcribe_segment(wav)`` once per fixed-duration segment; each
+    call is a standalone transcription request that returns that segment's
+    text and appends it to ``transcript``. ``close()`` is a no-op kept for
+    API symmetry with the streaming lifecycle.
     """
 
     def __init__(
@@ -54,36 +53,19 @@ class SegmentStreamingASR:
         self.adapter = adapter
         self.sampling_params = sampling_params
         self.routing_key = routing_key
-        self.session_id: Optional[str] = None
         self.transcript = ""
 
     async def transcribe_segment(self, wav_data: bytes) -> str:
-        """Submit one audio segment as a session turn; return its text."""
-        if self.session_id is None:
-            session_id = await self.tokenizer_manager.open_session(
-                OpenSessionReqInput(
-                    capacity_of_str_len=0,
-                    session_id=f"asr-seg-{uuid.uuid4().hex}",
-                    streaming=True,
-                )
-            )
-            if session_id is None:
-                raise RuntimeError(
-                    "Failed to open a streaming session for segment ASR; "
-                    "is the server running with --enable-streaming-session?"
-                )
-            self.session_id = session_id
-
-        # One user(audio) -> assistant round per segment; the session
-        # carries all previous rounds, so the model sees the full history
-        # and returns only the continuation.
+        """Transcribe one audio segment as a standalone request and return
+        its text. The prompt is the bare per-turn template plus this
+        segment's audio only — no prior segment's audio or transcript is
+        carried, so the model transcribes exactly this segment."""
         req = GenerateReqInput(
             text=self.adapter.prompt_template,
             audio_data=wav_data,
             sampling_params=self.sampling_params,
             stream=False,
             modalities=["audio"],
-            session_params={"id": self.session_id, "rid": None},
         )
         if self.routing_key is not None:
             req.routing_key = self.routing_key
@@ -92,9 +74,7 @@ class SegmentStreamingASR:
         async for ret in self.tokenizer_manager.generate_request(req):
             break
         if ret is None:
-            logger.warning(
-                "[segment_asr] empty response for session %s", self.session_id
-            )
+            logger.warning("[segment_asr] empty response")
             return ""
 
         text = normalize_whitespace(self.adapter.postprocess_text(ret.get("text", "")))
@@ -105,13 +85,5 @@ class SegmentStreamingASR:
         return text
 
     async def close(self) -> None:
-        """Release the scheduler-side session. Idempotent."""
-        if self.session_id is None:
-            return
-        session_id, self.session_id = self.session_id, None
-        try:
-            await self.tokenizer_manager.close_session(
-                CloseSessionReqInput(session_id=session_id)
-            )
-        except Exception:
-            logger.exception("[segment_asr] failed to close session %s", session_id)
+        """No session to release: each segment is an independent request."""
+        return

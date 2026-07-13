@@ -1,8 +1,10 @@
 """Unit tests for srt/entrypoints/openai/segment_streaming.py.
 
-Drives SegmentStreamingASR against a mocked TokenizerManager — verifies
-the streaming-session lifecycle (lazy open, per-turn request shape,
-idempotent close) without a server or GPU.
+Segment streaming transcribes each fixed-duration segment as an
+independent, standalone request (no engine session, no carried context),
+then concatenates the per-segment texts. These tests verify the per-turn
+request shape and transcript accumulation against a mocked
+TokenizerManager — no server or GPU.
 """
 
 import asyncio
@@ -23,86 +25,72 @@ class FakeAdapter:
 
 
 class FakeTokenizerManager:
-    """Records calls; returns scripted per-turn texts."""
+    """Records generate_request calls; returns scripted per-segment texts."""
 
-    def __init__(self, turn_texts, open_result="sess-1"):
+    def __init__(self, turn_texts):
         self.turn_texts = list(turn_texts)
-        self.open_result = open_result
-        self.open_calls = []
-        self.close_calls = []
         self.generate_calls = []
-
-    async def open_session(self, obj, request=None):
-        self.open_calls.append(obj)
-        return self.open_result
-
-    async def close_session(self, obj, request=None):
-        self.close_calls.append(obj)
 
     async def generate_request(self, obj, request=None):
         self.generate_calls.append(obj)
         yield {"text": self.turn_texts.pop(0)}
 
 
-def make_asr(tm):
+def make_asr(tm, routing_key=None):
     return SegmentStreamingASR(
         tokenizer_manager=tm,
         adapter=FakeAdapter(),
         sampling_params={"temperature": 0.0},
+        routing_key=routing_key,
     )
 
 
 class TestSegmentStreamingASR(CustomTestCase):
-    def test_session_opened_lazily_and_once(self):
+    def test_each_segment_is_an_independent_request(self):
         tm = FakeTokenizerManager(["hello", "world"])
         asr = make_asr(tm)
-        self.assertEqual(len(tm.open_calls), 0)
-        asyncio.run(self._two_segments(asr))
-        self.assertEqual(len(tm.open_calls), 1)
-        self.assertTrue(tm.open_calls[0].streaming)
+
+        async def run():
+            await asr.transcribe_segment(b"wav-1")
+            await asr.transcribe_segment(b"wav-2")
+
+        asyncio.run(run())
+        # One standalone request per segment, no session bookkeeping.
+        self.assertEqual(len(tm.generate_calls), 2)
         self.assertEqual(asr.transcript, "hello world")
 
-    async def _two_segments(self, asr):
-        await asr.transcribe_segment(b"wav-1")
-        await asr.transcribe_segment(b"wav-2")
-
-    def test_turn_request_shape(self):
+    def test_request_shape_carries_only_this_segment(self):
         tm = FakeTokenizerManager(["hi"])
         asr = make_asr(tm)
         asyncio.run(asr.transcribe_segment(b"wav-bytes"))
         (req,) = tm.generate_calls
         self.assertEqual(req.text, FakeAdapter.prompt_template)
         self.assertEqual(req.audio_data, b"wav-bytes")
-        self.assertEqual(req.session_params, {"id": "sess-1", "rid": None})
         self.assertEqual(req.modalities, ["audio"])
         self.assertFalse(req.stream)
+        # No session context is threaded between segments.
+        self.assertIsNone(req.session_params)
 
-    def test_open_failure_raises(self):
-        tm = FakeTokenizerManager(["x"], open_result=None)
+    def test_routing_key_propagated(self):
+        tm = FakeTokenizerManager(["hi"])
+        asr = make_asr(tm, routing_key="rk-1")
+        asyncio.run(asr.transcribe_segment(b"wav"))
+        (req,) = tm.generate_calls
+        self.assertEqual(req.routing_key, "rk-1")
+
+    def test_empty_response_returns_empty_and_keeps_transcript(self):
+        tm = FakeTokenizerManager([""])
         asr = make_asr(tm)
-        with self.assertRaisesRegex(RuntimeError, "enable-streaming-session"):
-            asyncio.run(asr.transcribe_segment(b"wav"))
+        out = asyncio.run(asr.transcribe_segment(b"wav"))
+        self.assertEqual(out, "")
+        self.assertEqual(asr.transcript, "")
 
-    def test_close_is_idempotent_and_releases_session(self):
-        tm = FakeTokenizerManager(["a"])
-        asr = make_asr(tm)
-
-        async def run():
-            await asr.transcribe_segment(b"wav")
-            await asr.close()
-            await asr.close()
-
-        asyncio.run(run())
-        self.assertEqual(len(tm.close_calls), 1)
-        self.assertEqual(tm.close_calls[0].session_id, "sess-1")
-        self.assertIsNone(asr.session_id)
-
-    def test_close_before_any_segment_is_noop(self):
+    def test_close_is_a_noop(self):
         tm = FakeTokenizerManager([])
         asr = make_asr(tm)
+        # No segment sent, nothing to release; must not raise or call the TM.
         asyncio.run(asr.close())
-        self.assertEqual(len(tm.open_calls), 0)
-        self.assertEqual(len(tm.close_calls), 0)
+        self.assertEqual(len(tm.generate_calls), 0)
 
     def test_whitespace_normalized_and_accumulated(self):
         tm = FakeTokenizerManager(["hello ,", " world ."])

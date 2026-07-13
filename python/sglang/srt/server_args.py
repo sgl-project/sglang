@@ -1147,7 +1147,7 @@ class ServerArgs:
     asr_streaming_mode: A[
         str,
         Arg(
-            help="Streaming ASR inference mode. 'chunked' re-transcribes a sliding window of audio each chunk with prefix rollback (default). 'segment' transcribes fixed audio segments as successive turns of an engine streaming session, reusing prior turns' KV so each second of audio is encoded once; requires --enable-streaming-session and an adapter that supports it (falls back to chunked otherwise).",
+            help="Streaming ASR inference mode. 'chunked' re-transcribes a sliding window of audio each chunk with prefix rollback (default). 'segment' transcribes fixed, disjoint audio segments independently and concatenates them, so each second of audio is encoded exactly once (no re-encoded window), at the cost of accuracy at segment boundaries; requires an adapter that supports it (falls back to chunked otherwise).",
             choices=["chunked", "segment"],
         ),
     ] = "chunked"
@@ -6424,10 +6424,6 @@ class ServerArgs:
             raise ValueError(
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
-            )
-        if self.asr_streaming_mode == "segment" and not self.enable_streaming_session:
-            raise ValueError(
-                "--asr-streaming-mode segment requires --enable-streaming-session."
             )
 
     def _handle_other_validations(self):
