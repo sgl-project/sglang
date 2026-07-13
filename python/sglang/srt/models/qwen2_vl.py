@@ -33,6 +33,7 @@ from einops import rearrange
 from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv3dLayer
@@ -50,8 +51,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_numpy
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
+
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +166,7 @@ class Qwen2VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -169,6 +174,7 @@ class Qwen2VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            output_ws=output_ws,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -292,6 +298,7 @@ class Qwen2VisionTransformer(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        max_context_len: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -337,6 +344,13 @@ class Qwen2VisionTransformer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
         )
+
+        self.max_context_len = max_context_len
+        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = None
+        if self.enable_cg:
+            self.cuda_graph_runner = ViTCudaGraphRunner(self)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -384,6 +398,9 @@ class Qwen2VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if self.enable_cg:
+            return self.forward_with_cuda_graph(x, grid_thw)
+
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -406,6 +423,33 @@ class Qwen2VisionTransformer(nn.Module):
         # adapter
         x = self.merger(x)
         return x
+
+    def forward_with_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        # compute position embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (
+            emb.cos().to(x.device, x.dtype),
+            emb.sin().to(x.device, x.dtype),
+        )
+
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw).to(x.device)
+
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings=position_embeddings,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=cu_seqlens,
+        )
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -462,6 +506,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
+            max_context_len=getattr(config, "max_position_embeddings", None),
         )
 
         self.model = Qwen2Model(
