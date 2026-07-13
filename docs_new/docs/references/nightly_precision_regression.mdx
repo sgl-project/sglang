@@ -55,6 +55,16 @@ Baselines are stored locally on disk and synced to a **HuggingFace dataset** so 
 | Dumper infrastructure | `python/sglang/srt/debug_utils/dumper.py` | Captures per-layer hidden states at runtime |
 | CI workflow | `.github/workflows/nightly-test-nvidia.yml` | Schedules the nightly job on 8×H200 |
 
+### Dumper and CUDA Graph
+
+The nightly test launches SGLang with `--disable-cuda-graph`,
+`--disable-piecewise-cuda-graph`, and `--disable-radix-cache` before enabling the
+Dumper through `POST /dumper/configure`. Keep these flags when adapting the
+workflow outside the test harness. The `DUMPER_*` path does not auto-disable
+cuda graph or warmup like the legacy `--debug-tensor-dump-output-folder` path,
+and HTTP configuration can enable dumping after graph capture has already
+happened.
+
 ---
 
 ## What Gets Dumped and Compared

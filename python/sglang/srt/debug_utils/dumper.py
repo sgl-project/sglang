@@ -237,6 +237,12 @@ class _Dumper:
     Then run the program:
     `DUMPER_ENABLE=1 python ...`
 
+    When using Dumper for precision debugging in SGLang, start the server with
+    `--disable-cuda-graph --skip-server-warmup` before enabling Dumper. Unlike
+    the legacy `--debug-tensor-dump-output-folder` path, `DUMPER_*` does not
+    auto-disable cuda graph or warmup, and HTTP configuration can enable dumping
+    after graph capture has already happened.
+
     Auto-cleanup old dumps before first write:
     `DUMPER_CLEANUP_PREVIOUS=1 python ...`
 

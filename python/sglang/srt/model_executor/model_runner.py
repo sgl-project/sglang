@@ -218,6 +218,7 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
+    log_warning_on_rank0,
     monkey_patch_p2p_access_check,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
@@ -295,6 +296,26 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 _UNSET: Any = object()
+
+
+def _warn_if_dumper_may_capture_cuda_graph_outputs(server_args):
+    cuda_graph_config = server_args.cuda_graph_config
+    if cuda_graph_config is None:
+        return
+
+    if (
+        cuda_graph_config.decode.backend == Backend.DISABLED
+        and cuda_graph_config.prefill.backend == Backend.DISABLED
+    ):
+        return
+
+    log_warning_on_rank0(
+        logger,
+        "Dumper is enabled or configurable while cuda graph is still enabled. "
+        "DUMPER_* captures may include cuda-graph-replayed tensors instead of "
+        "fresh eager tensors. For precision debugging, pass --disable-cuda-graph "
+        "and --skip-server-warmup before enabling Dumper.",
+    )
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -1595,6 +1616,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if dumper.may_enable:
+            _warn_if_dumper_may_capture_cuda_graph_outputs(self.server_args)
             dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
 
