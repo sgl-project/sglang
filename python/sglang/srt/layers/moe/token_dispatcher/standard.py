@@ -14,6 +14,8 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
     is_allocation_symmetric,
+    is_dp_max_padding,
+    mask_dp_pad_moe_topk_ids,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -38,6 +40,10 @@ from sglang.srt.utils.common import (
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+from sglang.srt.environ import envs as _envs
+
+_MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -211,9 +217,18 @@ class StandardDispatcher(BaseDispatcher):
                 )
             else:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_output = topk_output._replace(
-                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
-                    )
+                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # Drop dp-attention MAX_LEN pad rows from the dispatch:
+                    # pad rows carry stale hidden through the router and
+                    # their expert outputs are discarded downstream — pure
+                    # wasted compute (and a masked-grouped-GEMM workspace
+                    # blow-up when they collide on the same top-k).  Must
+                    # run POST-translation (a pre-translation -1 aliases to
+                    # the mapping table's last entry); -1 is the drop
+                    # sentinel both the triton and deep_gemm runners honor.
+                    if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                        mask_dp_pad_moe_topk_ids(topk_ids_local)
+                    topk_output = topk_output._replace(topk_ids=topk_ids_local)
                 elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                     raise NotImplementedError()
 

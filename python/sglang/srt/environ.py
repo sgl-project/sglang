@@ -666,6 +666,12 @@ class Envs:
     # load imbalance (they otherwise OOM saturated --moe-runner-backend
     # deep_gemm serving).  Costs one D2H sync per MoE layer.
     SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
+    # Drop dp-attention MAX_LEN pad rows from MoE dispatch (StandardDispatcher
+    # post-translation topk_ids -> -1): pad rows otherwise run the router on
+    # stale hidden values and burn expert compute whose outputs are discarded;
+    # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
+    # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
+    SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
