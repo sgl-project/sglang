@@ -562,11 +562,11 @@ class CompressorBackendMixin:
         layer_id: int,
     ) -> None:
         """HIP-specific forward path using PyTorch/Triton fallbacks."""
+        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
         from sglang.srt.layers.attention.dsv4.quant_k_cache import (
             quant_to_nope_fp8_rope_bf16_pack_triton,
         )
-        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
         from sglang.srt.layers.deepseek_v4_rope import fused_norm_rope_inplace_triton
 
         compress_ratio = compressor.ratio
