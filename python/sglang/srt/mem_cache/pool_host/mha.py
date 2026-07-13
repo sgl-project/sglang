@@ -941,6 +941,20 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     kernels derive copy sizes from each call's first tensor.
     """
 
+    def _init_write_back_staging_buffers(self):
+        # The inherited staged write-back kernel assumes K and V share a
+        # layout. This pool keeps K and V in separate buffers with different
+        # strides, and backup_from_device_all_layer dispatches the regular
+        # kernel once per buffer. Advertising staged-JIT support would leave
+        # host_indices on CPU, while those regular kernels require CUDA
+        # destination indices. This is a correctness fallback; adding staged
+        # JIT support here requires a separate kernel for each K/V stride.
+        self.staging_page_capacity = 0
+        self.staging_token_capacity = 0
+        self.staging_k_buffer = None
+        self.staging_v_buffer = None
+        self.can_use_write_back_jit = False
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim

@@ -79,6 +79,17 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             get_mha_host_pool_cls(asymmetric_pool), AsymmetricMHATokenToKVPoolHost
         )
 
+    def test_staged_write_back_jit_is_disabled(self):
+        host = _make_host("page_first")
+
+        host._init_write_back_staging_buffers()
+
+        self.assertFalse(host.can_use_write_back_jit)
+        self.assertEqual(host.staging_page_capacity, 0)
+        self.assertEqual(host.staging_token_capacity, 0)
+        self.assertIsNone(host.staging_k_buffer)
+        self.assertIsNone(host.staging_v_buffer)
+
     def test_kernel_load_splits_k_and_v_with_separate_strides(self):
         # Dispatch-only test: the CUDA kernel is mocked; this verifies that K and
         # V are sent as separate single-buffer calls with their own byte strides.
