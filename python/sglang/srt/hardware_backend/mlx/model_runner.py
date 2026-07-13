@@ -176,6 +176,11 @@ class MlxModelRunner:
         self._req_to_token_pool: ReqToTokenPool | None = None
         self._req_pool_idx: dict[str, int] = {}
         self._req_synced_offset: dict[str, int] = {}
+        # Requests whose scheduler row (req_pool_idx) has been released via the
+        # pre-release hook. Their KV was flushed while the row was still valid;
+        # the row may now be reused by another request, so it must never be read
+        # for these req_ids again. See sync_and_release_request().
+        self._req_released: set[str] = set()
 
         self._pool_size = self._compute_pool_size(pool_size)
         self._aot_kernels = self._build_aot_kernels()
@@ -265,6 +270,25 @@ class MlxModelRunner:
         if req_pool_idx is None or cache is None:
             return
         self._store_auxiliary_state(req_pool_idx, cache)
+
+    def sync_and_release_request(self, req_id: str) -> None:
+        """Final decode-KV flush before the scheduler frees this request's row.
+
+        Called from the scheduler's pre-release hook, while
+        ``req_to_token[req_pool_idx]`` still holds *this* request's slots. This
+        is the last point at which the row can be safely read, so any un-synced
+        decode KV is flushed to the shared pool here.
+
+        The request is then marked released: the row may be reassigned to
+        another request immediately after, so :meth:`_sync_decode_kv_to_pool`
+        refuses to read it again and :meth:`remove_request` only discards the
+        (now frozen) cache state instead of touching the reused row.
+        """
+        if req_id not in self._req_caches:
+            return
+        if not self.disable_radix_cache:
+            self._sync_decode_kv_to_pool(req_id)
+        self._req_released.add(req_id)
 
     def _select_auxiliary_state_track_len(
         self,
@@ -688,6 +712,11 @@ class MlxModelRunner:
         read them will flush them then.
         """
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
+            return
+        if req_id in self._req_released:
+            # The scheduler already freed this request's row (its final KV sync
+            # happened in the pre-release hook). Reading req_to_token now would
+            # dereference slots that belong to whichever request reused the row.
             return
         cache = self._req_caches.get(req_id)
         if cache is None:
@@ -1271,16 +1300,22 @@ class MlxModelRunner:
         return req_id in self._req_caches
 
     def remove_request(self, req_id: str):
-        """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
-            self._sync_decode_kv_to_pool(req_id)
+        """Discard request state.
 
+        This runs during stale-rid cleanup, which happens on a *later* batch —
+        by then the scheduler may have freed and reused this request's row, so
+        we must not read ``req_to_token`` for it here. The final decode-KV sync
+        already happened in :meth:`sync_and_release_request` (pre-release hook)
+        for finished requests; retracted requests intentionally have nothing to
+        flush because their slots are freed.
+        """
         self._req_token_ids.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
         if cache is not None:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
         self._req_synced_offset.pop(req_id, None)
+        self._req_released.discard(req_id)
 
     def clear(self):
         """Clear all request states."""
@@ -1290,5 +1325,6 @@ class MlxModelRunner:
         self._req_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()
+        self._req_released.clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()

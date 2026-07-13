@@ -125,12 +125,20 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point.
+
+        This is the pre-release hook: it runs while ``req.req_pool_idx`` still
+        maps to this request, immediately before the scheduler frees the row.
+        It is therefore the last safe point to read the row, so it is also where
+        the final decode-KV flush happens (:meth:`sync_and_release_request`).
+        Later stale-rid cleanup only discards state and never re-reads the row.
+        """
         if self._mlx_runner.has_request(req.rid):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.mamba_last_track_seqlen = None
+            self._mlx_runner.sync_and_release_request(req.rid)
 
     def _gather_prefill_prefix_slots(self, reqs) -> set[int]:
         """Union of prefix slot IDs for reqs that will start a fresh prefill.
