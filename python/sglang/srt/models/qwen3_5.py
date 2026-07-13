@@ -1118,6 +1118,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         "o_proj",
         "out_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "gate_up_proj",
         "down_proj",
         "lm_head",
@@ -1143,6 +1144,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             key_dim = config.linear_key_head_dim * config.linear_num_key_heads
             value_dim = config.linear_value_head_dim * config.linear_num_value_heads
             return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "in_proj_ba":
+            # b + a projections: one scalar per linear-attention value head each
+            return config.hidden_size, config.linear_num_value_heads * 2
         elif module_name == "gate_up_proj":
             # MoE: shared expert uses shared_expert_intermediate_size
             # Dense: regular MLP uses intermediate_size
