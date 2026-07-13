@@ -248,9 +248,6 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
@@ -269,9 +266,6 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.8",
         "--disable-shared-experts-fusion",
         "--quantization w4afp8",
