@@ -62,9 +62,9 @@ def _dflash_tree_verify_steps_kernel(
     offs_sq = tl.arange(0, TOPK_SQ)
 
     # Step 0: scores = probs[:, 0]; tokens = ids[:, 0]; parents = arange(-1, topk).
-    sc = tl.load(
-        probs_ptr + b * stride_p_b + 0 * stride_p_s + offs_k * stride_p_k
-    ).to(tl.float32)
+    sc = tl.load(probs_ptr + b * stride_p_b + 0 * stride_p_s + offs_k * stride_p_k).to(
+        tl.float32
+    )
     tl.store(out_scores_ptr + b * out_s_sb + 0 * out_s_r + offs_k, sc)
 
     tok0 = tl.load(ids_ptr + b * stride_i_b + 0 * stride_i_s + offs_k * stride_i_k)

@@ -195,7 +195,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     # The fused tree kernel indexes topk**2, so the tree branching factor must be a
     # power of 2 in {4, 8, 16}. Validate at launch for a clear error.
-    if _dflash_tree_verify and int(server_args.speculative_eagle_topk) not in (4, 8, 16):
+    if _dflash_tree_verify and int(server_args.speculative_eagle_topk) not in (
+        4,
+        8,
+        16,
+    ):
         raise ValueError(
             "--speculative-dflash-tree-verify requires --speculative-eagle-topk in "
             f"{{4, 8, 16}}, got {server_args.speculative_eagle_topk}."

@@ -957,12 +957,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     # lm_head is vocab-sharded across tp: gather each shard's local top-k
                     # (with global ids) and take the GLOBAL top-k over the tp_size*k cands.
                     gv = torch.empty(
-                        tp_size * chunk_len * k, dtype=local_vals.dtype, device=hs.device
+                        tp_size * chunk_len * k,
+                        dtype=local_vals.dtype,
+                        device=hs.device,
                     )
                     gi = torch.empty(
                         tp_size * chunk_len * k, dtype=local_ids.dtype, device=hs.device
                     )
-                    tp_group.all_gather_into_tensor(gv, local_vals.contiguous().view(-1))
+                    tp_group.all_gather_into_tensor(
+                        gv, local_vals.contiguous().view(-1)
+                    )
                     tp_group.all_gather_into_tensor(gi, local_ids.contiguous().view(-1))
                     allv = (
                         gv.view(tp_size, chunk_len, k)
@@ -1632,7 +1636,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         block_size = int(self.block_size)
-        vnt = int(self._verify_num_tokens)  # target verify token count (tree budget or block_size)
+        vnt = int(
+            self._verify_num_tokens
+        )  # target verify token count (tree budget or block_size)
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -1797,9 +1803,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # The draft sampler (argmax for chain, top-k for tree) is folded into the
         # draft decode cuda graph; on graph replay it has already written its output
         # buffers, so we skip the eager head GEMM and even materializing draft_hidden.
-        sampler_fast_path = (
-            self._draft_sampler is not None and draft_out.can_run_graph
-        )
+        sampler_fast_path = self._draft_sampler is not None and draft_out.can_run_graph
         draft_hidden = None
         if not sampler_fast_path:
             draft_hidden = draft_logits_output.hidden_states
