@@ -421,41 +421,10 @@ class KVCacheConfigurator:
                     max_total_num_tokens=max_total_num_tokens,
                 )
             elif self.mambaish_config:
-                extra_args = {}
-                if self.use_mla_backend:
-                    extra_args = {
-                        "kv_lora_rank": self.model_config.kv_lora_rank,
-                        "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
-                    }
-                token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.server_args.page_size,
-                    size=max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in self.mambaish_config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
-                    device=self.device,
-                    mamba_pool=req_to_token_pool.mamba_pool,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
-                    use_mla=self.use_mla_backend,
-                    start_layer=self.start_layer,
-                    full_kv_pool_class=mha_pool_class,
-                    post_capture_active=self.post_capture_kv_active,
-                    **extra_args,
+                token_to_kv_pool = self._build_hybrid_linear_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    req_to_token_pool=req_to_token_pool,
+                    mha_pool_class=mha_pool_class,
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1333,6 +1302,47 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
             start_layer=self.start_layer,
             end_layer=self.end_layer,
+        )
+        return token_to_kv_pool
+
+    def _build_hybrid_linear_kv_pool(
+        self,
+        *,
+        max_total_num_tokens: int,
+        req_to_token_pool: ReqToTokenPool,
+        mha_pool_class: type,
+    ) -> KVCache:
+        extra_args = {}
+        if self.use_mla_backend:
+            extra_args = {
+                "kv_lora_rank": self.model_config.kv_lora_rank,
+                "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+            }
+        token_to_kv_pool = HybridLinearKVPool(
+            page_size=self.server_args.page_size,
+            size=max_total_num_tokens,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            # if draft worker, we only need 1 attention layer's kv pool
+            full_attention_layer_ids=(
+                [0]
+                if self.is_draft_worker
+                else [
+                    i
+                    for i in self.mambaish_config.full_attention_layer_ids
+                    if self.start_layer <= i < self.end_layer
+                ]
+            ),
+            device=self.device,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            use_mla=self.use_mla_backend,
+            start_layer=self.start_layer,
+            full_kv_pool_class=mha_pool_class,
+            post_capture_active=self.post_capture_kv_active,
+            **extra_args,
         )
         return token_to_kv_pool
 
