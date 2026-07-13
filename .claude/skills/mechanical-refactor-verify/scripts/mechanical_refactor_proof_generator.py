@@ -471,6 +471,59 @@ def _next_sibling_assign_or_def(dst_tree: ast.AST, name: str) -> str | None:
     return None
 
 
+def _stmt_symbol_name(node: ast.AST) -> str | None:
+    """The name a top-level statement defines -- a def/class name, or a single-Name
+    assignment target -- else None (an ``if TYPE_CHECKING:`` guard, a tuple assign, ...).
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    if (
+        isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    ):
+        return node.targets[0].id
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    return None
+
+
+def _module_move_anchor(
+    dst_tree: ast.AST, name: str, into_class: str | None
+) -> tuple[str | None, str | None]:
+    """The ``(before, after)`` anchor for reinserting the moved def ``name``. Normally
+    ``before=<next sibling def>``. But when a module-level def lands immediately above an
+    unnameable statement (e.g. an ``if TYPE_CHECKING:`` guard) with a nameable statement
+    immediately above it, a ``before`` anchor would resolve to the next def *past* that block
+    and overshoot, so anchor with ``after=<preceding symbol>`` instead."""
+    before = _next_sibling_def_name(dst_tree, name, into_class)
+    if into_class is not None:
+        return before, None
+    body = list(getattr(dst_tree, "body", []))
+    idx = next(
+        (
+            i
+            for i, n in enumerate(body)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and n.name == name
+        ),
+        None,
+    )
+    if idx is None:
+        return before, None
+    following = body[idx + 1] if idx + 1 < len(body) else None
+    next_is_named_def = isinstance(
+        following, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    )
+    if following is None or next_is_named_def:
+        return before, None
+    preceding = body[idx - 1] if idx > 0 else None
+    prev_name = _stmt_symbol_name(preceding) if preceding is not None else None
+    if prev_name is None:
+        return before, None
+    return None, prev_name
+
+
 def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
     """Whether ``symbols`` sit at the end of the source as a contiguous block of defs/classes
     and the scaffolding leading into them -- the trailing block a prep commit stages for a
@@ -742,6 +795,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 leave_delegate, forwarded = stub
                 if forwarded != name:
                     delegate_name = forwarded
+        move_before, move_after = _module_move_anchor(dst_tree, name, into_class)
         recipe.moves.append(
             {
                 "name": name,
@@ -751,7 +805,8 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "from_class": src_class,
                 "dedent": src_indent - dst_indent,
                 "dst_order": dst_def.lineno if dst_def else 0,
-                "before": _next_sibling_def_name(dst_tree, name, into_class),
+                "before": move_before,
+                "after": move_after,
                 "drop_self_annotation": _self_annotation_dropped(src_def, dst_def),
                 "leave_delegate": leave_delegate,
                 "delegate_name": delegate_name,
@@ -821,6 +876,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             recipe.notes.append(f"{name}: cannot disambiguate moved def ({exc})")
             continue
         leave_delegate, forwarded = stub_info
+        move_before, move_after = _module_move_anchor(dst_tree, name, into_class)
         recipe.moves.append(
             {
                 "name": name,
@@ -830,7 +886,8 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "from_class": src_class,
                 "dedent": (src_def.col_offset or 0) - (dst_indent or 0),
                 "dst_order": dst_def.lineno if dst_def else 0,
-                "before": _next_sibling_def_name(dst_tree, name, into_class),
+                "before": move_before,
+                "after": move_after,
                 "drop_self_annotation": _self_annotation_dropped(src_def, dst_def),
                 "leave_delegate": leave_delegate,
                 "delegate_name": forwarded if forwarded != name else None,
@@ -972,6 +1029,7 @@ def _recipe_ops(recipe: Recipe) -> list:
                     "dedent": mv["dedent"],
                     "drop_self_annotation": mv["drop_self_annotation"],
                     "before": mv.get("before"),
+                    "after": mv.get("after"),
                     "leave_delegate": mv.get("leave_delegate"),
                     "delegate_name": mv.get("delegate_name"),
                 },

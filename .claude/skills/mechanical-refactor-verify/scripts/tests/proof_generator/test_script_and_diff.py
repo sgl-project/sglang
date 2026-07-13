@@ -125,6 +125,60 @@ def test_emitted_script_exits_nonzero_on_bundled_change(
     assert "RESIDUAL" in result.stdout
 
 
+def test_emitted_script_passes_on_move_above_typechecking_guard(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A module-level def relocated to just above an ``if TYPE_CHECKING:`` guard reproduces
+    via an inferred after= anchor and the emitted script exits 0."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "def keep():\n    return 0\n\n\ndef helper(x):\n    return x + 1\n"
+            ),
+            "util.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_is_hip = is_hip()\n"
+                "\n"
+                "if TYPE_CHECKING:\n"
+                "    from m import Thing\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    # After-state = the primitive's exact output (bare repo, no formatter to absorb blanks).
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n\n\n",
+            "util.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_is_hip = is_hip()\n"
+                "\n"
+                "def helper(x):\n"
+                "    return x + 1\n"
+                "\n"
+                "if TYPE_CHECKING:\n"
+                "    from m import Thing\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move helper above the TYPE_CHECKING guard")
+    script_path = _emit_runnable_script(
+        repo, tmp_path / "out", commit, "after-anchor move"
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script_path)], cwd=repo, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS" in result.stdout
+    assert "after='_is_hip'" in script_path.read_text()
+
+
 def test_per_file_diff_keeps_content_lines_starting_with_plus_signs(repo: Path) -> None:
     """An added content line beginning with '++' is collected, not mistaken for a header."""
     from mechanical_refactor_proof_generator import _per_file_diff

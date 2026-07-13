@@ -208,6 +208,19 @@ def _def_span(node: ast.AST) -> tuple[int, int]:
     return start, node.end_lineno
 
 
+def _symbol_named(node: ast.AST, name: str) -> bool:
+    """Whether a top-level statement defines the symbol ``name`` -- a def/class by its name,
+    or a module-level assignment by one of its target names (so ``_is_hip = is_hip()`` is
+    found by ``_is_hip``)."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name == name
+    if isinstance(node, ast.AnnAssign):
+        return isinstance(node.target, ast.Name) and node.target.id == name
+    if isinstance(node, ast.Assign):
+        return any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+    return False
+
+
 def _byte_slice(line: str, start: int | None, end: int | None) -> str:
     """Slice a line by UTF-8 byte offsets -- ast col_offsets count bytes, not characters."""
     return line.encode("utf-8")[start:end].decode("utf-8")
@@ -947,16 +960,23 @@ class Repro:
         dedent: int = 0,
         drop_self_annotation: bool = False,
         before: str | None = None,
+        after: str | None = None,
         leave_delegate: str | None = None,
         delegate_name: str | None = None,
     ) -> "Repro":
         """Cut ``def name`` (with decorators) from ``src`` and paste it into ``dst`` --
         immediately above the sibling def ``before`` when given (so the relocated def lands in
-        the chain's order), else at the end of ``into_class`` (or module level when None) --
-        dropping a move decorator and dedenting by ``dedent``. When ``drop_self_annotation``,
-        the moved method's ``self: Target`` annotation is dropped (redundant inside the class).
-        The body is moved verbatim; the formatter normalises the surrounding blank lines.
+        the chain's order), immediately below the top-level symbol ``after`` when given (a
+        sibling def/class or a module-level assignment target -- used to land the def just
+        before a following ``if TYPE_CHECKING:`` guard, which is not a nameable anchor), else
+        at the end of ``into_class`` (or module level when None) -- dropping a move decorator
+        and dedenting by ``dedent``. When ``drop_self_annotation``, the moved method's
+        ``self: Target`` annotation is dropped (redundant inside the class). The body is moved
+        verbatim; the formatter normalises the surrounding blank lines.
         """
+        assert (
+            before is None or after is None
+        ), "move_symbol: before and after are mutually exclusive"
 
         def op(root: Path) -> None:
             src_path = root / src
@@ -1079,7 +1099,18 @@ class Repro:
                     None,
                 )
                 assert target is not None, f"before={before!r} not found in {dst}"
-            if target is not None:
+            if after is not None:
+                anchor = next(
+                    (n for n in container if _symbol_named(n, after)),
+                    None,
+                )
+                assert anchor is not None, f"after={after!r} not found in {dst}"
+                at = anchor.end_lineno
+                _write_source(
+                    dst_path,
+                    "".join(dst_lines[:at] + [dst_nl, method_text] + dst_lines[at:]),
+                )
+            elif target is not None:
                 at = _def_span(target)[0] - 1
                 _write_source(
                     dst_path,

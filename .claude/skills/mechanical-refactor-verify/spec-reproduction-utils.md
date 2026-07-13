@@ -96,11 +96,15 @@
   relocation.
 
 - `move_symbol(name, *, src, dst, into_class, from_class, dedent, drop_self_annotation,
-  before, leave_delegate, delegate_name)`:
+  before, after, leave_delegate, delegate_name)`:
     - cuts a `def` or a whole `class` (with its methods) with its decorators; drops its own
       `@staticmethod`/`@classmethod`;
     - shifts indentation uniformly (negative `dedent` indents into a class);
-    - pastes at a class end, at module level, or above the named sibling `before`;
+    - pastes at a class end, at module level, above the named sibling `before`, or
+      immediately below the top-level symbol `after` (a sibling def/class or a module-level
+      assignment target — the anchor for landing a def just above a following
+      `if TYPE_CHECKING:` guard, which has no nameable anchor of its own); `before` and
+      `after` are mutually exclusive;
     - same-named defs need `from_class`; an ambiguous name or missing anchor raises;
     - `leave_delegate` **authors** a forwarding stub in the source (original header + one
       `return self.<attr>.<name>(...)`, `await`ed for async) — audit it like any header.

@@ -38,6 +38,56 @@ def test_infer_recipe_method_onto_class(repo: Path) -> None:
     assert recipe.import_additions == []
 
 
+def test_infer_recipe_move_before_typechecking_uses_after_anchor(repo: Path) -> None:
+    """A module-level def relocated to land just above an ``if TYPE_CHECKING:`` guard cannot
+    be anchored with before= (the next def sits past the guard), so the recipe anchors it with
+    after=<the preceding assignment>."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "def keep():\n    return 0\n\n\ndef helper(x):\n    return x + 1\n"
+            ),
+            "util.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_is_hip = is_hip()\n"
+                "\n"
+                "if TYPE_CHECKING:\n"
+                "    from m import Thing\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n",
+            "util.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_is_hip = is_hip()\n"
+                "\n"
+                "\n"
+                "def helper(x):\n"
+                "    return x + 1\n"
+                "\n"
+                "\n"
+                "if TYPE_CHECKING:\n"
+                "    from m import Thing\n"
+            ),
+        },
+    )
+    _commit(repo, "move helper above the TYPE_CHECKING guard")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert recipe.supported
+    assert len(recipe.moves) == 1
+    move = recipe.moves[0]
+    assert move["name"] == "helper" and move["dst"] == "util.py"
+    assert move["before"] is None
+    assert move["after"] == "_is_hip"
+
+
 def test_infer_recipe_free_function_move_uses_requalify(repo: Path) -> None:
     """A move to a module-level free function dedents and requalifies the call site
     (drops the qualifier), rather than lowering a receiver."""
