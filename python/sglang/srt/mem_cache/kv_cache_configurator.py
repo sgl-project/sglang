@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
 
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_index_head_dim,
@@ -151,7 +152,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_dtype: Optional[torch.dtype]
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
     gpu_id: int
@@ -170,13 +171,17 @@ class KVCacheConfigurator:
     is_hybrid_swa: bool
     is_hybrid_swa_compress: bool
     use_mla_backend: bool
-    mambaish_config: Optional[Any]
-    hybrid_gdn_config: Optional[Any]
     layer_info: ModelLayerInfo
     forward_stream: Any
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+    mambaish_config: Optional[Any] = field(init=False)
+    hybrid_gdn_config: Optional[Any] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.mambaish_config = mambaish_config(self.model_config)
+        self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
