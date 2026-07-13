@@ -555,13 +555,19 @@ class GlmImageAttention(torch.nn.Module):
                 batch_size,
                 text_seq_length,
             ), "the shape of text_attn_mask should match the text hidden states"
-            image_attn_mask = torch.ones(
-                batch_size,
-                image_seq_length,
-                dtype=text_attn_mask.dtype,
-                device=text_attn_mask.device,
-            )
-            attention_mask = torch.cat([text_attn_mask, image_attn_mask], dim=1)
+            if not (
+                isinstance(attention_mask_meta, dict)
+                and attention_mask_meta.get("npu_varlen") is not None
+            ):
+                image_attn_mask = torch.ones(
+                    batch_size,
+                    image_seq_length,
+                    dtype=text_attn_mask.dtype,
+                    device=text_attn_mask.device,
+                )
+                attention_mask = torch.cat(
+                    [text_attn_mask, image_attn_mask], dim=1
+                )
         hidden_states = self.attn(
             query,
             key,
@@ -1036,26 +1042,36 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states.shape[1] * get_ulysses_parallel_world_size()
             )
             total_seq_length = text_seq_length + image_seq_length
-            valid_lengths = torch.tensor(
-                text_seq_lens,
-                dtype=torch.long,
-                device=hidden_states.device,
-            ).unsqueeze(1)
-            positions = torch.arange(
-                total_seq_length, device=hidden_states.device
-            ).unsqueeze(0).expand(batch_size, -1)
-            image_end = valid_lengths + image_seq_length
-            gather_indices = torch.where(
-                positions < valid_lengths,
-                positions,
-                torch.where(
-                    positions < image_end,
-                    text_seq_length + positions - valid_lengths,
-                    valid_lengths + positions - image_end,
-                ),
+            has_text_padding = any(
+                length != text_seq_length for length in text_seq_lens
             )
-            restore_indices = torch.empty_like(gather_indices)
-            restore_indices.scatter_(1, gather_indices, positions)
+            if batch_size > 1 and not has_text_padding:
+                logger.info_once(
+                    "GLM-Image DiT is using the unpadded Ascend FA fast path"
+                )
+            gather_indices = None
+            restore_indices = None
+            if has_text_padding:
+                valid_lengths = torch.tensor(
+                    text_seq_lens,
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                ).unsqueeze(1)
+                positions = torch.arange(
+                    total_seq_length, device=hidden_states.device
+                ).unsqueeze(0).expand(batch_size, -1)
+                image_end = valid_lengths + image_seq_length
+                gather_indices = torch.where(
+                    positions < valid_lengths,
+                    positions,
+                    torch.where(
+                        positions < image_end,
+                        text_seq_length + positions - valid_lengths,
+                        valid_lengths + positions - image_end,
+                    ),
+                )
+                restore_indices = torch.empty_like(gather_indices)
+                restore_indices.scatter_(1, gather_indices, positions)
             attention_mask_meta = {
                 "npu_varlen": {
                     "gather_indices": gather_indices,

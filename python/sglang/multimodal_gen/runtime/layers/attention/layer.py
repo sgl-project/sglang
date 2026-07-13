@@ -1103,6 +1103,8 @@ class USPAttention(nn.Module):
     ) -> torch.Tensor:
         gather_indices = varlen_meta["gather_indices"]
         restore_indices = varlen_meta["restore_indices"]
+        if gather_indices is None:
+            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
         q = self._gather_sequence(q, gather_indices)
         k = self._gather_sequence(k, gather_indices)
         v = self._gather_sequence(v, gather_indices)
