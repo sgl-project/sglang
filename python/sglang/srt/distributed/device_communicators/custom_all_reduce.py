@@ -93,17 +93,6 @@ class CustomAllreduce:
         if full_nvlink is None:
             return  # fail to get nvlink status
 
-        if (
-            world_size == 2
-            and not full_nvlink
-            and max_size == self._MAX_CAR_SIZE
-            and not _is_hip
-        ):
-            # On PCIe-only 2-GPU groups the one-shot kernel stays ahead of the
-            # NCCL ring well past 8MB; prefill AllReduce messages otherwise
-            # fall back to NCCL. NVLink groups keep the default buffer size.
-            max_size = 128 * 1024 * 1024
-
         self.group = group
         self.max_size = max_size
         self.rank = rank
