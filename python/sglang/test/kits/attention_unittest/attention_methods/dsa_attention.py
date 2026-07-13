@@ -16,10 +16,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
 
-from ..mock_server_args import make_mock_server_args
 from .dense_attention import (
     DEFAULT_DEVICE,
     DEFAULT_HEAD_DIM,
@@ -310,7 +308,7 @@ class DSAMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -341,7 +339,6 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dtype="auto",
             max_running_requests=None,
             mem_fraction_static=0.8,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -352,7 +349,7 @@ class DSAMockModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
