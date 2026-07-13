@@ -1,6 +1,8 @@
 import functools
+import importlib
 import logging
 import math
+import threading
 from typing import Tuple
 
 import torch
@@ -17,52 +19,102 @@ from sglang.srt.layers.utils.common import strict_contiguous
 
 logger = logging.getLogger(__name__)
 
-# Tilelang isn't packaged on every platform (notably Ascend NPU images) but
-# this module is imported transitively from deepseek_v4.py — module-load
-# must succeed even when tilelang is missing. The kernels themselves still
-# require tilelang at runtime; we replace the package with a stub that lets
-# `@tilelang.jit` decorations and `tilelang.PassConfigKey.*` references parse
-# without ImportError, and any actual call into the kernels raises a clear
-# message at execution time instead of crashing on import.
-try:
-    import tilelang
-    import tilelang.language as T
+# This module is imported during model-registry discovery. Do not import the real
+# TileLang package here: it loads native CUDA stubs. The proxy below lets
+# module-level @tilelang.jit declarations parse, then imports and applies real
+# TileLang only when a TileLang MHC kernel is actually called.
+_real_tilelang = None
+_real_T = None
+_tilelang_load_lock = threading.Lock()
 
-    tilelang.set_log_level("WARNING")
 
-    pass_configs = {
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    }
-except ImportError:
+class _LazyTilelangAttr:
+    def __init__(self, path: Tuple[str, ...] = ()):
+        self.path = path
 
-    class _TilelangMissing:
-        """Stub so module-level @tilelang.jit and PassConfigKey accesses parse."""
+    def __getattr__(self, name):
+        return _LazyTilelangAttr((*self.path, name))
 
-        def __getattr__(self, name):
-            if name == "jit":
+    def __call__(self, *_args, **_kwargs):
+        return _LazyTilelangAttr(self.path)
 
-                def _jit(*_args, **_kwargs):
-                    def _wrap(fn):
-                        def _raise(*a, **k):
-                            raise RuntimeError(
-                                "tilelang is not installed; this kernel cannot run "
-                                "on the current platform"
-                            )
 
-                        return _raise
+def _resolve_lazy_tilelang_value(value):
+    if isinstance(value, _LazyTilelangAttr):
+        obj = _load_tilelang()
+        for name in value.path:
+            obj = getattr(obj, name)
+        return obj
+    if isinstance(value, dict):
+        return {
+            _resolve_lazy_tilelang_value(k): _resolve_lazy_tilelang_value(v)
+            for k, v in value.items()
+        }
+    # Keep list/tuple support so future TileLang jit kwargs such as out_idx=[...]
+    # can use lazy TileLang enum values without changing the proxy.
+    if isinstance(value, list):
+        return [_resolve_lazy_tilelang_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_lazy_tilelang_value(v) for v in value)
+    return value
 
-                    return _wrap
 
-                return _jit
-            return _TilelangMissing()
+def _load_tilelang():
+    global _real_tilelang, _real_T, tilelang, T
+    if _real_tilelang is None:
+        with _tilelang_load_lock:
+            if _real_tilelang is None:
+                try:
+                    new_tilelang = importlib.import_module("tilelang")
+                    new_T = importlib.import_module("tilelang.language")
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "tilelang is not installed; this kernel cannot run on the current platform"
+                    ) from exc
+                new_tilelang.set_log_level("WARNING")
+                tilelang = new_tilelang
+                T = new_T
+                _real_T = new_T
+                _real_tilelang = new_tilelang
+    return _real_tilelang
 
-        def __call__(self, *_args, **_kwargs):
-            return _TilelangMissing()
 
-    tilelang = _TilelangMissing()
-    T = _TilelangMissing()
-    pass_configs = None
+class _LazyTilelang:
+    PassConfigKey = _LazyTilelangAttr(("PassConfigKey",))
+    layout = _LazyTilelangAttr(("layout",))
+
+    def jit(self, func=None, **jit_kwargs):
+        def decorate(fn):
+            compiled = None
+            compile_lock = threading.Lock()
+
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                nonlocal compiled
+                if compiled is None:
+                    with compile_lock:
+                        if compiled is None:
+                            real_tilelang = _load_tilelang()
+                            real_kwargs = _resolve_lazy_tilelang_value(jit_kwargs)
+                            compiled = real_tilelang.jit(**real_kwargs)(fn)
+                return compiled(*args, **kwargs)
+
+            return wrapper
+
+        if callable(func):
+            return decorate(func)
+        return decorate
+
+    def __getattr__(self, name):
+        return _LazyTilelangAttr((name,))
+
+
+tilelang = _LazyTilelang()
+T = _LazyTilelangAttr()
+pass_configs = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+}
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -303,7 +355,7 @@ def mhc_pre_gemm_sqrsum_tilelang(
     hc_hidden_size: int,
     token_block: int = 32,
     hidden_block: int = 256,
-) -> tilelang.JITKernel:
+):
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
     assert hc_hidden_size % hidden_block == 0
@@ -368,7 +420,8 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     token_block: int = 32,
     hidden_block: int = 256,
     threads: int = 128,
-) -> Tuple[tilelang.JITKernel, tilelang.JITKernel]:
+):
+    _load_tilelang()
     assert hc_mult3 <= 32
     assert hc_hidden_size % hidden_block == 0
     assert hc_hidden_size % split_k == 0
@@ -936,7 +989,7 @@ def mhc_pre(
 )
 def mhc_post_tilelang(
     a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
-) -> tilelang.JITKernel:
+):
     n = T.dynamic("num_tokens")
     h = hidden
 
@@ -1029,7 +1082,7 @@ def mhc_fused_post_pre_fma_tilelang(
     n_thr: int = 256,
     tile_mix_outputs: int = 1,
     split_k: int = 1,
-) -> tilelang.JITKernel:
+):
     num_tokens = T.dynamic("num_tokens")
     split_k = T.dynamic("split_k")
 
