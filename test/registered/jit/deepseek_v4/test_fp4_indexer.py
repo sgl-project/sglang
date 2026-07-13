@@ -21,7 +21,7 @@ from sglang.srt.layers.deepseek_v4_rope import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
 
 HEAD_DIM = 128
@@ -148,7 +148,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     plan = CompressorDecodePlan.generate_legacy(
         compress_ratio, req_pool_indices, seq_lens
     )
-    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
     freqs_cis = precompute_freqs_cis(
         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
     ).to("cuda")

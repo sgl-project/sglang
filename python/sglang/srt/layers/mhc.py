@@ -1,9 +1,10 @@
 import functools
+import importlib
+import logging
 import math
+import threading
 from typing import Tuple
 
-import tilelang
-import tilelang.language as T
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
@@ -11,8 +12,100 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
-tilelang.set_log_level("WARNING")
+logger = logging.getLogger(__name__)
 
+# This module is imported during model-registry discovery. Do not import the real
+# TileLang package here: it loads native CUDA stubs. The proxy below lets
+# module-level @tilelang.jit declarations parse, then imports and applies real
+# TileLang only when a TileLang MHC kernel is actually called.
+_real_tilelang = None
+_real_T = None
+_tilelang_load_lock = threading.Lock()
+
+
+class _LazyTilelangAttr:
+    def __init__(self, path: Tuple[str, ...] = ()):
+        self.path = path
+
+    def __getattr__(self, name):
+        return _LazyTilelangAttr((*self.path, name))
+
+    def __call__(self, *_args, **_kwargs):
+        return _LazyTilelangAttr(self.path)
+
+
+def _resolve_lazy_tilelang_value(value):
+    if isinstance(value, _LazyTilelangAttr):
+        obj = _load_tilelang()
+        for name in value.path:
+            obj = getattr(obj, name)
+        return obj
+    if isinstance(value, dict):
+        return {
+            _resolve_lazy_tilelang_value(k): _resolve_lazy_tilelang_value(v)
+            for k, v in value.items()
+        }
+    # Keep list/tuple support so future TileLang jit kwargs such as out_idx=[...]
+    # can use lazy TileLang enum values without changing the proxy.
+    if isinstance(value, list):
+        return [_resolve_lazy_tilelang_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_lazy_tilelang_value(v) for v in value)
+    return value
+
+
+def _load_tilelang():
+    global _real_tilelang, _real_T, tilelang, T
+    if _real_tilelang is None:
+        with _tilelang_load_lock:
+            if _real_tilelang is None:
+                try:
+                    new_tilelang = importlib.import_module("tilelang")
+                    new_T = importlib.import_module("tilelang.language")
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "tilelang is not installed; this kernel cannot run on the current platform"
+                    ) from exc
+                new_tilelang.set_log_level("WARNING")
+                tilelang = new_tilelang
+                T = new_T
+                _real_T = new_T
+                _real_tilelang = new_tilelang
+    return _real_tilelang
+
+
+class _LazyTilelang:
+    PassConfigKey = _LazyTilelangAttr(("PassConfigKey",))
+    layout = _LazyTilelangAttr(("layout",))
+
+    def jit(self, func=None, **jit_kwargs):
+        def decorate(fn):
+            compiled = None
+            compile_lock = threading.Lock()
+
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                nonlocal compiled
+                if compiled is None:
+                    with compile_lock:
+                        if compiled is None:
+                            real_tilelang = _load_tilelang()
+                            real_kwargs = _resolve_lazy_tilelang_value(jit_kwargs)
+                            compiled = real_tilelang.jit(**real_kwargs)(fn)
+                return compiled(*args, **kwargs)
+
+            return wrapper
+
+        if callable(func):
+            return decorate(func)
+        return decorate
+
+    def __getattr__(self, name):
+        return _LazyTilelangAttr((name,))
+
+
+tilelang = _LazyTilelang()
+T = _LazyTilelangAttr()
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -257,7 +350,7 @@ def mhc_pre_gemm_sqrsum_tilelang(
     hc_hidden_size: int,
     token_block: int = 32,
     hidden_block: int = 256,
-) -> tilelang.JITKernel:
+):
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
     assert hc_hidden_size % hidden_block == 0
@@ -301,7 +394,6 @@ def mhc_pre_gemm_sqrsum_tilelang(
                 out_frag,
                 transpose_A=False,
                 transpose_B=True,
-                wg_wait=0,
                 clear_accum=False,
             )
         sqrsum_l = T.alloc_fragment(token_block, T.float32)
@@ -323,7 +415,8 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     token_block: int = 32,
     hidden_block: int = 256,
     threads: int = 128,
-) -> Tuple[tilelang.JITKernel, tilelang.JITKernel]:
+):
+    _load_tilelang()
     assert hc_mult3 <= 32
     assert hc_hidden_size % hidden_block == 0
     assert hc_hidden_size % split_k == 0
@@ -382,7 +475,6 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
                     clear_accum=False,
                 )
 
@@ -448,6 +540,66 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+
+
+def get_mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, ...]:
+    """One representative token count per distinct mhc_pre n_splits bucket over
+    [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    reps = {}
+    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+        num_tokens = min(grid * 64, max_num_tokens)
+        reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
+    return tuple(sorted(reps.values()))
+
+
+def prewarm_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+    n_splits_pre: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+):
+    """Compile the prenorm kernel for every n_splits bucket by replaying the
+    prenorm with the call's real weights. The compiled kernels are written to
+    the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
+    cache; later server runs hit the cache. Driven once per process from load_weights.
+    """
+    from sglang.srt.runtime_context import get_server_args
+
+    hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+    max_num_tokens = get_server_args().chunked_prefill_size
+    buckets = get_mhc_pre_token_count_representatives(
+        max_num_tokens, hc_mult * hidden_size
+    )
+
+    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    with torch.inference_mode():
+        for num_tokens in buckets:
+            mhc_pre(
+                residual.new_zeros(num_tokens, hc_mult, hidden_size),
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                n_splits_pre,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
 
 
 @tilelang.jit(
@@ -638,7 +790,6 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -827,7 +978,7 @@ def mhc_pre(
 )
 def mhc_post_tilelang(
     a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
-) -> tilelang.JITKernel:
+):
     n = T.dynamic("num_tokens")
     h = hidden
 
@@ -920,7 +1071,7 @@ def mhc_fused_post_pre_fma_tilelang(
     n_thr: int = 256,
     tile_mix_outputs: int = 1,
     split_k: int = 1,
-) -> tilelang.JITKernel:
+):
     num_tokens = T.dynamic("num_tokens")
     split_k = T.dynamic("split_k")
 
@@ -1393,3 +1544,60 @@ def mhc_fused_post_pre(
         comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
         layer_input_cur.view(*outer_shape, hidden_size),
     )
+
+
+def npu_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    rms_norm_eps: float,
+    hc_eps: float,
+    forward_batch=None,
+) -> tuple:
+    """NPU-accelerated hc_pre via the custom_ops kernel.
+
+    Returns (y, post, comb, norm_fused).  norm_fused is always False
+    because npu_hc_pre does not fold input_layernorm — the caller must
+    apply it separately.
+    """
+    shape, dtype = x.size(), x.dtype
+
+    # IDLE / empty short-circuit, mirroring the dsv4-flash source.
+    # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
+    # so the dummies must too — otherwise downstream comb/post-aware
+    # ops see a silent fp32 ↔ bf16 split between idle and non-idle
+    # batches.
+    is_idle = forward_batch is not None and forward_batch.forward_mode.is_idle()
+    if is_idle or x.shape[0] == 0:
+        bs = x.shape[0]
+        y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
+        post = torch.empty((bs, hc_mult), dtype=torch.float32, device=x.device)
+        comb = torch.empty(
+            (bs, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return y, post, comb, False
+
+    # Note the return order: (y, post, comb) — y is the (T, hidden)
+    # mixed activation, post / comb are the hc_post inputs. The
+    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+    # cast back to the input dtype before the downstream
+    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    y, post, comb = torch.ops.custom.npu_hc_pre(
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        norm_eps=rms_norm_eps,
+        hc_eps=hc_eps,
+    )
+    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
+    # not fold input_layernorm. Return norm_fused=False so the caller
+    # applies the layernorm itself, matching the deepgemm/torch paths.
+    return y.to(dtype), post, comb, False

@@ -18,10 +18,11 @@ NIXL also supports additional backends such as **AZURE_BLOB**, **GUSLI**, and **
 
 ## Overview
 
-The NIXL integration consists of two main files:
+The NIXL integration consists of these main files:
 
 - **`hicache_nixl.py`** - Main HiCache storage connector using NIXL
 - **`nixl_utils.py`** - Utility classes for backend selection, registration, and file management
+- **`nixl_cleaner.py`** - Background FILE-backend disk cleaner
 
 At runtime, HiCache uses NIXL as a transfer layer between host memory and either:
 
@@ -52,6 +53,11 @@ Owns the `(agent, mem_type, file_manager)` triple and exposes `host(...)` and `s
 
 The current implementation performs per-transfer registration for file / object targets and explicitly closes FILE descriptors after registration / transfer setup to avoid descriptor leaks.
 
+### L3 Cleaner (`nixl_cleaner.py`)
+For FILE-backed plugins, TP rank 0 starts a best-effort background cleaner that scans the bucketed storage directories and deletes the oldest logical cache-key groups when disk usage exceeds the configured high watermark. Deleted files are handled by the cache layer as ordinary storage misses and can be recomputed.
+
+Set the top-level `l3_cleaner_enabled` config key to `false` when an external cleaner is responsible for L3 cache eviction.
+
 ## Using NIXL as the HiCache Storage Backend
 
 ### 1. How Backend Plugin Selection Works
@@ -81,10 +87,12 @@ If a plugin is configured but its dependencies are missing, it will be skipped.
 For POSIX / GDS / GDS_MT file-based backends, the default storage location is `/tmp/hicache_storage`. However, you can customize where cached data is stored:
 
 ```bash
-export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/storage/dir
+# When specifying multiple storage directories. SGLang routes each cache object to one
+# directory with a stable hash.
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/storage/dir1,/path/to/storage/dir2,/path/to/storage/dir3
 ```
 
-This directory is used only for **FILE-backed** plugins. **OBJ-backed** plugins use object keys instead of local files.
+These directories are used only for **FILE-backed** plugins. **OBJ-backed** plugins use object keys instead of local files.
 
 ### 3. How to Provide Configuration for Backends
 
@@ -184,6 +192,72 @@ This method is convenient for testing / experimenting. For production or multi-p
 
 Also note that the flat inline config form is interpreted as plugin-specific parameters for the selected plugin.
 
+### 4. Validated Hybrid-Model Example
+
+The following setup was validated against a hybrid Mamba model with HiCache enabled:
+
+- model: `Qwen/Qwen3.5-9B`
+- storage backend: `nixl`
+- NIXL plugin: `POSIX`
+- HiCache layout: `page_first_direct`
+- model type: hybrid attention + Mamba sidecar cache (`KV + MAMBA`)
+
+Important details from this validation:
+
+- Use a real `.toml` file path with `--hicache-storage-backend-extra-config`.
+- For this validated path, the storage directory was provided through `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+- Use `--mamba-scheduler-strategy extra_buffer` to support page sizes larger than 1.
+
+Example TOML file:
+
+```toml
+[plugin.posix]
+active = true
+```
+
+Example serve command for a hybrid model:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
+
+~/ve_sgl_dev/bin/sglang serve \
+  --model-path /workspace/LLM_models/Qwen3.5-9B \
+  --served-model-name Qwen/Qwen3.5-9B \
+  --host 127.0.0.1 \
+  --tp 2 \
+  --reasoning-parser qwen3 \
+  --attention-backend triton \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-prefetch-policy wait_complete \
+  --page-size 256 \
+  --log-level info \
+  --disable-cuda-graph \
+  --hicache-storage-backend nixl \
+  --hicache-storage-backend-extra-config @/tmp/nixl.config.toml \
+  --mamba-scheduler-strategy extra_buffer
+```
+
+Expected behavior for this validated setup:
+
+- the server starts with `Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA`
+- NIXL logs show `Backend POSIX was instantiated`
+- the server logs `HiCacheNixl: registered hybrid host pool mamba zero_copy=...`
+- the storage directory contains KV files plus Mamba sidecar files such as `..._0_2_mamba_temporal` and `..._0_2_mamba_conv_0`
+- after restarting the server against the same storage directory, a repeated long prompt shows large `cached_tokens` in the response metadata
+
+Minimal end-to-end validation flow:
+
+1. Start the server with the TOML file shown above.
+2. Send a long prompt once to populate storage.
+3. Restart the server against the same `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+4. Send the same long prompt again and confirm that `meta_info.cached_tokens` is high.
+
+A reusable local validation script is available at `~/TestEnv/nixl_hicache_hybrid_e2e.py`; it starts this server, sends a long request, and checks both NIXL backend selection and Mamba sidecar storage files.
+
+
 
 ## Running Unit Tests
 
@@ -274,6 +348,7 @@ For MLA models, the NIXL backend now mirrors HF3FS's backend-local protection:
 ```text
 python/sglang/srt/mem_cache/storage/nixl/
 ├── hicache_nixl.py              # Main HiCache storage connector
+├── nixl_cleaner.py              # Background FILE-backend disk cleaner
 ├── nixl_utils.py                # NIXL utility classes
 ├── test_hicache_nixl_storage.py # Unit tests
 ├── nixl.config.toml.sample      # Example configuration
@@ -300,13 +375,14 @@ python/sglang/srt/mem_cache/storage/nixl/
 
 ### HiCache / NIXL Data Model
 
-- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`
+- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`. When multiple comma-separated directories are configured, each logical cache key is routed to one base directory with a stable hash and stored as `base_dir/<bucket>/<key>`.
 - **OBJ backends** use object keys directly
 - **MHA naming** includes TP rank and TP size, so each rank stores its own KV data
 - **MLA naming** omits TP rank, so all ranks refer to one shared logical KV object / file
 - In zero-copy mode:
   - **MHA** expands each logical page into `_k` and `_v` entries
   - **MLA** expands each logical page into a single `_k` entry because MLA stores one interleaved KV representation
+- The L3 cleaner groups physical files by the logical base key after removing TP-rank and zero-copy `_k` / `_v` suffixes. This keeps MHA, MLA, and DSA file cleanup aligned with the names emitted by `HiCacheNixl`.
 
 ### Zero-Copy Behavior
 
@@ -368,6 +444,9 @@ The following keys are placed at the **top level** of the config file (not insid
 | Key              | Type    | Default  | Description |
 | ---------------- | ------- | -------- | ----------- |
 | `use_direct_io`  | boolean | `true`   | Open cache files with `O_DIRECT` to bypass the OS page cache. Reduces memory pressure and improves NVMe throughput. Falls back to buffered I/O with a warning if `O_DIRECT` is unavailable on the current OS. Can also be overridden via the `SGLANG_HICACHE_NIXL_USE_DIRECT_IO` environment variable. |
+| `l3_cleaner_enabled` | boolean | `true` | Enable the built-in background cleaner for FILE-backed L3 storage. Set to `false` when using an external cleaner. |
+| `l3_cleaner_high_watermark` | float | `80.0` | Start cleanup when the built-in cleaner is enabled and the filesystem containing a configured storage directory reaches this disk-usage percentage. |
+| `l3_cleaner_low_watermark` | float | `70.0` | Stop cleanup after hot filesystems drop below this disk-usage percentage. Must be lower than `l3_cleaner_high_watermark`. |
 
 **Page-alignment and `O_DIRECT`**
 
@@ -387,6 +466,28 @@ active = true
 ```
 
 or via environment variable: `SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0`.
+
+To tune FILE-backend cleanup watermarks:
+
+```toml
+l3_cleaner_enabled = true
+l3_cleaner_high_watermark = 85.0
+l3_cleaner_low_watermark = 75.0
+
+[plugin.posix]
+use_uring = "true"
+active = true
+```
+
+To use an external cleaner instead of the built-in cleaner:
+
+```toml
+l3_cleaner_enabled = false
+
+[plugin.posix]
+use_uring = "true"
+active = true
+```
 
 
 ### 2. POSIX File System Backend (`plugin.posix`)

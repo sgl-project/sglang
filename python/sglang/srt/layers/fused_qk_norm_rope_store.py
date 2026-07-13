@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _fp8_fnuz = is_fp8_fnuz()
 
@@ -95,6 +95,8 @@ def _fused_qk_norm_rope_store_kernel(
     FP8_MAX: tl.constexpr,
     BYTES_PER_TOKEN: tl.constexpr,
     SWA_PAGE_SIZE: tl.constexpr,
+    BF16_STORE: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -206,7 +208,24 @@ def _fused_qk_norm_rope_store_kernel(
     VALUE_STRIDE: tl.constexpr = DIM_NOPE + ROPE_DIM * 2
     SCALE_BYTES: tl.constexpr = NUM_NOPE_TILES + 1
 
-    if HAS_SWA_STORE:
+    if HAS_SWA_STORE and BF16_STORE:
+        # unified_kv unified_kv: write the whole head_dim as plain bf16 into a
+        # [num_slots, head_dim] bf16 cache at row=loc (no fp8 / no scale).
+        loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
+        row_base = loc.to(tl.int64)[:, None] * swa_cache_stride_page
+        # nope
+        tl.store(
+            swa_cache_ptr + row_base + offs_d_full[None, :],
+            kv_normed.to(swa_cache_ptr.dtype.element_ty),
+            mask=src_mask[:, None] & nope_d_mask[None, :],
+        )
+        # pe
+        tl.store(
+            swa_cache_ptr + row_base + (NOPE_DIM + d_pe_offs[None, :]),
+            kv_pe.to(swa_cache_ptr.dtype.element_ty),
+            mask=src_mask[:, None],
+        )
+    elif HAS_SWA_STORE:
         loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
         page_id = loc // SWA_PAGE_SIZE
         page_off = loc % SWA_PAGE_SIZE
@@ -241,7 +260,14 @@ def _fused_qk_norm_rope_store_kernel(
             x_scaled = tile_data * inv_scale[:, None]
             x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX)
 
-            x_fp8_cast = x_fp8.to(tl.float8e4nv)
+            # Encode with the SAME fp8 type the decode bitcasts (read
+            # _KV_FP8_TY = float8e4b8 for e4m3fnuz / float8e4nv otherwise).
+            # An implicit/fn cast mis-encodes under fnuz (exponent bias 7 vs
+            # fnuz bias 8), so the fnuz read decodes every element 2x too small.
+            if IS_FNUZ:
+                x_fp8_cast = x_fp8.to(tl.float8e4b8)
+            else:
+                x_fp8_cast = x_fp8.to(tl.float8e4nv)
             x_fp8_bytes = x_fp8_cast.to(tl.uint8, bitcast=True)
             fp8_byte_offs = value_base[:, None] + tile_start + nope_tile_offs[None, :]
             tl.store(
@@ -288,15 +314,17 @@ def fused_qk_norm_rope_swa_store(
     swa_page_size: int = 128,
     q_out: Optional[torch.Tensor] = None,
     dtype: torch.dtype = torch.bfloat16,
+    bf16_store: bool = False,
 ) -> torch.Tensor:
-    """Fused Q norm + KV norm + RoPE + optional FP8 paged SWA store.
+    """Fused Q norm + KV norm + RoPE + optional SWA store.
 
     Args:
         q: [M, N] or [splitk, M, N] where N = num_local_heads * head_dim
         kv: [M, head_dim=512] mutated in-place (norm + RoPE)
-        swa_cache: paged SWA KV pool buffer [num_pages, bytes_per_page] uint8
+        swa_cache: paged SWA KV pool buffer [num_pages, bytes_per_page] uint8 OR a plain [num_slots, head_dim] bf16 cache
         swa_loc: [M] int32 pre-translated paged indices
         swa_page_size: tokens per SWA page (default 128)
+        bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
     """
     head_dim = kv.shape[1]
 
@@ -375,6 +403,8 @@ def fused_qk_norm_rope_swa_store(
         FP8_MAX=fp8_info.max,
         BYTES_PER_TOKEN=bytes_per_token,
         SWA_PAGE_SIZE=swa_page_size,
+        BF16_STORE=bf16_store,
+        IS_FNUZ=_fp8_fnuz,
         num_warps=num_warps,
     )
     return q_out

@@ -6,17 +6,9 @@ This module implements a fused kernel that combines:
 2. Dequant: FP8 to BF16 dequantization
 3. Attention: Compute attention scores and output
 
-Benefits for workloads without extra scope:
-- Eliminates intermediate buffer (gathered_kv) write/read
-- Reduces kernel launch overhead (1 kernel instead of 2)
-- Better cache utilization
-
 Supports:
 - DSV4 (d_qk=512): 7 tiles of 64, uint8 scales
 - All configs: with/without topk_length, with/without attn_sink
-
-OPTIMIZED VERSION: Reduced code duplication in dual-scope kernel by using
-a helper function for KV block processing.
 """
 
 from typing import Optional, Tuple
@@ -25,7 +17,22 @@ import torch
 import triton
 import triton.language as tl
 
-from .triton_mla_kernels_decode_common import _bucket_total_tokens
+from sglang.srt.utils.common import is_gfx942_supported
+
+# gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
+# gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
+_KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
+
+
+def _bucket_total_tokens(total_tokens: int) -> int:
+    """Round total_tokens up to the nearest power of 2 for autotune key stability."""
+    if total_tokens <= 0:
+        return 1
+    n = 1
+    while n < total_tokens:
+        n <<= 1
+    return n
+
 
 # ============================================================================
 # Constants for DSV4 layout
@@ -35,15 +42,93 @@ DSV4_D_NOPE = 448
 DSV4_D_ROPE = 64
 DSV4_D_V = 512
 DSV4_TILE_SIZE = 64
+
+# ============================================================================
+# Dispatch thresholds for split-K decision
+# ============================================================================
+# Dual-scope topk threshold.
+# Split-K is more beneficial for larger topk due to more work per token.
+DUAL_SCOPE_SPLITK_TOPK_THRESHOLD = 2048
+
+# Token thresholds for split-K vs no-splitk decision:
+# - Below these thresholds, split-K provides better GPU utilization.
+# - Above these thresholds, the combine kernel overhead dominates.
+NOSPLITK_TOKEN_THRESHOLD_LOW_TOPK = (
+    64  # For total_topk < DUAL_SCOPE_SPLITK_TOPK_THRESHOLD
+)
+
+# Small batch threshold: below this, split-K=4/8 for parallelism
+SMALL_BATCH_TOKEN_THRESHOLD = 8
+
+# Topk threshold for split-K value selection within the split-K path
+SPLITK_HIGH_TOPK_THRESHOLD = 512
+
+# ============================================================================
+# Shared split-K decision logic for dual-scope kernels
+# ============================================================================
+
+
+def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> int:
+    """Decide the split_k value for dual-scope attention.
+
+    Returns:
+        split_k value (0 means no split-K, use non-splitk kernel).
+    """
+    # Conditions under which split-K is beneficial:
+    use_splitk_for_small_bs = total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD and (
+        h_q >= 128 or total_topk >= 1024
+    )
+    use_splitk_for_h64_large_topk = (
+        h_q <= 64
+        and total_topk >= 1024
+        and total_tokens > SMALL_BATCH_TOKEN_THRESHOLD
+        and total_tokens <= 128
+    )
+    use_splitk_for_large_topk = (
+        total_tokens > NOSPLITK_TOKEN_THRESHOLD_LOW_TOPK
+        and total_topk >= DUAL_SCOPE_SPLITK_TOPK_THRESHOLD
+    )
+    # For large h_q, the non-splitk grid has very few blocks
+    # in the H dimension, leading to low GPU utilization.
+    use_splitk_for_large_hq = (
+        h_q > 64 and total_tokens > SMALL_BATCH_TOKEN_THRESHOLD and total_topk >= 256
+    )
+
+    if not (
+        use_splitk_for_small_bs
+        or use_splitk_for_h64_large_topk
+        or use_splitk_for_large_topk
+        or use_splitk_for_large_hq
+    ):
+        return 0  # No split-K
+
+    # Select split_k value based on workload characteristics.
+    # Higher topk benefits from more splits; lower topk needs fewer to
+    # avoid combine overhead.
+    if total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD:
+        if total_topk >= SPLITK_HIGH_TOPK_THRESHOLD and total_tokens <= 4:
+            return 8
+        return 4
+    elif use_splitk_for_large_hq:
+        if total_topk >= SPLITK_HIGH_TOPK_THRESHOLD:
+            return 4
+        return 2
+    elif use_splitk_for_h64_large_topk:
+        return 2
+    else:
+        return _select_split_k(total_topk, h_q, total_tokens)
+
+
 DSV4_NUM_TILES = 7
 DSV4_BYTES_PER_TOKEN_DATA = 576  # 448 nope + 128 rope
 DSV4_BYTES_PER_TOKEN_SCALE = 8  # 7 scales + 1 padding
-
 
 # ============================================================================
 # Helper: Process KV block and compute QK scores + accumulator update
 # This is the core computation shared by both single and dual scope kernels
 # ============================================================================
+
+
 @triton.jit
 def _process_kv_block_aggressive(
     # KV cache parameters
@@ -134,37 +219,37 @@ def _process_kv_block_aggressive(
 
     qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
-    nope_fp8_0 = nope_uint8_0.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_0 = nope_uint8_0.to(_KV_FP8_TY, bitcast=True)
     kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
     kv_0 = tl.where(valid_2d, kv_0, 0.0)
     qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
 
-    nope_fp8_1 = nope_uint8_1.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_1 = nope_uint8_1.to(_KV_FP8_TY, bitcast=True)
     kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
     kv_1 = tl.where(valid_2d, kv_1, 0.0)
     qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
 
-    nope_fp8_2 = nope_uint8_2.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_2 = nope_uint8_2.to(_KV_FP8_TY, bitcast=True)
     kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
     kv_2 = tl.where(valid_2d, kv_2, 0.0)
     qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
 
-    nope_fp8_3 = nope_uint8_3.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_3 = nope_uint8_3.to(_KV_FP8_TY, bitcast=True)
     kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
     kv_3 = tl.where(valid_2d, kv_3, 0.0)
     qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
 
-    nope_fp8_4 = nope_uint8_4.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_4 = nope_uint8_4.to(_KV_FP8_TY, bitcast=True)
     kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
     kv_4 = tl.where(valid_2d, kv_4, 0.0)
     qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
 
-    nope_fp8_5 = nope_uint8_5.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_5 = nope_uint8_5.to(_KV_FP8_TY, bitcast=True)
     kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
     kv_5 = tl.where(valid_2d, kv_5, 0.0)
     qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
 
-    nope_fp8_6 = nope_uint8_6.to(tl.float8e4nv, bitcast=True)
+    nope_fp8_6 = nope_uint8_6.to(_KV_FP8_TY, bitcast=True)
     kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
     kv_6 = tl.where(valid_2d, kv_6, 0.0)
     qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
@@ -198,20 +283,20 @@ def _process_kv_block_aggressive(
 # ============================================================================
 # DSV4 Fused Gather+Dequant+Attention Kernel (Single Scope)
 # ============================================================================
+
+
 @triton.autotune(
     configs=[
-        # Fused gather+dequant+attention kernel.
-        # Two axes: BLOCK_H × BLOCK_N, with BLOCK_N being the key perf knob
-        # for h_q=64 where fewer BLOCK_H values affect the grid.
-        # BLOCK_N=64: better for large topk (less register pressure per iter).
-        # BLOCK_N=128: better for small topk (fewer iterations).
-        # num_warps=4: fused kernel is compute-bound.
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk"],
 )
@@ -494,9 +579,8 @@ def _fused_gather_attn_dsv4_kernel(
     tl.store(lse_ptrs, lse, mask=mask_h)
 
 
-# Threshold for disabling AMD buffer_ops optimization
-# When KV cache size exceeds INT32_MAX, buffer_ops can cause int32 overflow
-# INT32_MAX = 2^31 - 1 = 2,147,483,647 bytes (~2GB)
+# Threshold for disabling buffer_ops optimization
+# When KV cache size exceeds this threshold, buffer_ops may overflow
 BUFFER_OPS_DISABLE_THRESHOLD = 2 * 1024 * 1024 * 1024  # 2GB
 
 
@@ -739,34 +823,26 @@ def fused_gather_attn_decode_dsv4(
     return output, lse
 
 
-# Uses helper function to eliminate code duplication
 # ============================================================================
 
 
 def _prune_dual_scope_configs(configs, named_args, **kwargs):
-    """Prune configs where BLOCK_H > h_q for the dual-scope kernel.
+    """Prune autotune configs for the dual-scope kernel.
 
-    When BLOCK_H > h_q, cdiv(h_q, BLOCK_H) = 1 regardless of BLOCK_H value,
-    so larger BLOCK_H gives the same grid but may have worse register allocation.
-    Keep only the smallest BLOCK_H that gives cdiv(h_q, BLOCK_H) = 1, plus
-    any BLOCK_H <= h_q configs.
-
-    For h_q=64: keep BLOCK_H <= 64 (removes BLOCK_H=128 which gives same grid)
-    For h_q=128: keep all (all give different grid sizes)
+    For h_q <= 64: restrict to BLOCK_H=16 only (BLOCK_H >= 32 causes
+    precision issues in online softmax due to different MFMA reduction orders).
+    For h_q > 64: prune BLOCK_H > h_q (same grid size, worse register usage).
     """
     h_q = named_args.get("h_q", 128)
-    pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= h_q]
+    if h_q <= 64:
+        pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= 16]
+    else:
+        pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= h_q]
     return pruned if pruned else configs
 
 
 @triton.autotune(
     configs=[
-        # Dual-scope fused gather+dequant+attention.
-        # Three axes: BLOCK_H × BLOCK_N × (warps, stages).
-        # - BLOCK_H: {16, 32, 64, 128} covers h_q=64 and h_q=128.
-        # - BLOCK_N: {64, 128}. BLOCK_N=64 better for large topk, 128 for small topk.
-        # - _prune_dual_scope_configs removes BLOCK_H > h_q configs (e.g. BLOCK_H=128
-        #   is pruned when h_q=64 since it gives the same grid as BLOCK_H=64).
         # warps=4: baseline configs
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
@@ -1173,47 +1249,22 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
     tl.store(lse_ptrs, lse, mask=mask_h)
 
 
-def _prune_splitk_configs(configs, named_args, **kwargs):
-    """Prune BLOCK_H=16 configs for large batch sizes to avoid CU oversubscription.
-
-    With h_q=128 and BLOCK_H=16, the grid has cdiv(128,16)=8 H-blocks.
-    At bs=32 with split_k=2, this creates 8*32*2=512 blocks (200% CU),
-    causing performance regression from oversubscription.
-
-    For small batch sizes (bucket <= 8), BLOCK_H=16 provides better
-    parallelism and is ~10% faster in CUDA graph replay.
-    """
-    total_tokens_bucket = named_args.get("total_tokens_bucket", 32)
-    if total_tokens_bucket > 8:
-        # Remove BLOCK_H=16 configs for large batch sizes
-        pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 32) > 16]
-        if pruned:
-            return pruned
-    return configs
-
-
 # ============================================================================
 # Split-K Kernel for Dual Scope
 # ============================================================================
+
+
 @triton.autotune(
     configs=[
-        # Split-K dual-scope fused kernel.
-        # - Split-K adds parallelism in K dim (2-8 splits).
-        # - BLOCK_N={64,128}: BLOCK_N=64 better for large topk_per_split.
-        # - num_warps=4: compute-bound fused kernel.
-        # - BLOCK_H={16,64}: covers h_q=64 and h_q=128.
+        # BLOCK_H=16 only (BLOCK_H >= 32 causes precision issues).
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        # BLOCK_H=32: critical for cc=32 with h_q=128 (gives 256 blocks with split_k=2)
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
-    prune_configs_by={"early_config_prune": _prune_splitk_configs},
 )
 @triton.jit
 def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
@@ -1654,58 +1705,12 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         or kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD
     )
 
-    # When force_no_splitk is set, skip the split-K decision and fall
-    # through to the non-splitk kernel path below.
-    use_splitk = not force_no_splitk
-
-    # Use Split-K for dual scope in these cases:
-    # 1. Small batch sizes with h_q=128 or large topk to increase GPU parallelism
-    # 2. Large topk (>= 2048) with medium/large batch sizes
-    # 3. NEW: h_q=64 + large topk (>=1024) + medium batch sizes (~21% improvement)
-    SPLITK_DUAL_SCOPE_TOPK_THRESHOLD = 2048
-    # For small bs, only use splitk when h_q=128 or total_topk >= 1024
-    use_splitk_for_small_bs = total_tokens <= 8 and (h_q >= 128 or total_topk >= 1024)
-    # NEW: For h_q=64 with large topk, splitk is beneficial for medium batch sizes
-    # Only for tokens <= 128 based on benchmarking (bs=64 shows 13% improvement)
-    use_splitk_for_h64_large_topk = (
-        h_q <= 64 and total_topk >= 1024 and total_tokens > 8 and total_tokens <= 128
+    split_k = (
+        0
+        if force_no_splitk
+        else _decide_splitk_dual_scope(total_tokens, h_q, total_topk)
     )
-    use_splitk_for_large_topk = (
-        total_tokens > 64 and total_topk >= SPLITK_DUAL_SCOPE_TOPK_THRESHOLD
-    )
-    # For h_q > 64 (e.g. h_q=128), the non-splitk grid has very few blocks
-    # in the H dimension, leading to low GPU utilization at medium batch sizes.
-    use_splitk_for_large_hq = h_q > 64 and total_tokens > 8 and total_topk >= 256
-    if use_splitk and (
-        use_splitk_for_small_bs
-        or use_splitk_for_h64_large_topk
-        or use_splitk_for_large_topk
-        or use_splitk_for_large_hq
-    ):
-        # Select split_k based on workload and total_topk.
-        # CUDA graph replay benchmarks show optimal split_k depends on both:
-        #   - High topk (>=512, c4 layers): more splits needed to parallelize
-        #   - Low topk (<512, c128 layers): fewer splits, less combine overhead
-        if total_tokens <= 8:
-            if total_topk >= 512 and total_tokens <= 4:
-                # High topk + very small bs: split_k=8 is 8-33% faster than sk=4
-                split_k = 8
-            else:
-                # split_k=4 gives 2x more blocks than split_k=2
-                split_k = 4
-        elif use_splitk_for_large_hq:
-            # For h_q > 64 with bs > 8:
-            if total_topk >= 512:
-                # High topk: split_k=4 for all medium/large bs
-                split_k = 4
-            else:
-                # Low topk: split_k=2 is sufficient
-                split_k = 2
-        elif use_splitk_for_h64_large_topk:
-            # For h_q=64 + large topk + medium bs, split_k=2 is optimal
-            split_k = 2
-        else:
-            split_k = _select_split_k(total_topk, h_q, total_tokens)
+    if split_k > 0:
         topk_per_split = (total_topk + split_k - 1) // split_k
 
         partial_output = torch.empty(
@@ -1926,21 +1931,20 @@ def fused_gather_attn_decode_dsv4_dual_scope(
 # Split-K Optimization for Large TopK (>= 8192)
 # ============================================================================
 SPLITK_TOPK_THRESHOLD = 8192
-SPLITK_DEFAULT = 4
 
 
 @triton.autotune(
     configs=[
-        # Split-K fused kernel for large topk (≥8192).
-        # - BLOCK_N={16,32}: small blocks for scattered FP8 KV access pattern.
-        # - num_warps=4: balanced for fused dequant+attention compute.
-        # - BLOCK_H={16,64}: covers h_q=64 and h_q=128.
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 16}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 16}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 32}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
 )
@@ -2390,11 +2394,7 @@ def _combine_splitk_kernel(
 
 @triton.autotune(
     configs=[
-        # Simple reduce kernel (weighted sum of 8 splits).
-        # - BLOCK_D=512: covers d_v=512 in one pass (no D-dimension loop).
-        # - num_warps=8: memory-bound reduce benefits from more warps.
-        # - split_k=8 is only used at very small batch sizes (≤4 tokens),
-        #   so BLOCK_H=16/32/64 covers the relevant parallelism range.
+        triton.Config({"BLOCK_H": 16, "BLOCK_D": 512}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_D": 512}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_D": 512}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_D": 512}, num_warps=8, num_stages=1),
@@ -2731,12 +2731,11 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
     the topk dimension. Larger split_k increases parallelism but also increases
     the overhead of the combine kernel.
 
-    Updated heuristics based on benchmarking with optimized BLOCK_N configs:
-    - For large topk (>= 16384): split_k=4 provides good balance with existing combine kernel
-    - For medium topk (8192-16383): split_k=4
-    - For small topk (< 8192): split_k=2
+    Heuristics:
+    - For large topk (>= SPLITK_TOPK_THRESHOLD): split_k=4
+    - For small topk (< SPLITK_TOPK_THRESHOLD): split_k=2
     """
-    if topk >= 8192:
+    if topk >= SPLITK_TOPK_THRESHOLD:
         return 4
     else:
         return 2
@@ -2745,12 +2744,13 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
 # ============================================================================
 # Low-overhead buffer pool for splitk operations
 # ============================================================================
+
+
 class SplitKBufferPool:
     """
     Pre-allocated buffer pool for split-K intermediate tensors.
 
-    Caches partial_output and partial_lse buffers to avoid repeated allocations.
-    Output buffers are always freshly allocated to ensure correctness.
+    Caches intermediate buffers to avoid repeated allocations.
     """
 
     _buffers = {}
@@ -2809,7 +2809,6 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
     to minimize Python overhead, which is significant for small batch sizes.
 
     The kernel computation is identical to the original version.
-    Output buffers are always freshly allocated to ensure correctness.
     """
     total_tokens, h_q, d_qk = q.shape
     topk_main = indices_main.shape[1]
@@ -2839,25 +2838,9 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
         indices_extra = indices_extra.contiguous()
 
     # Determine split_k
-    SPLITK_DUAL_SCOPE_TOPK_THRESHOLD = 2048
-    use_splitk_for_small_bs = total_tokens <= 8 and (h_q >= 128 or total_topk >= 1024)
-    use_splitk_for_h64_large_topk = (
-        h_q <= 64 and total_topk >= 1024 and total_tokens > 8 and total_tokens <= 128
-    )
-    use_splitk_for_large_topk = (
-        total_tokens > 64 and total_topk >= SPLITK_DUAL_SCOPE_TOPK_THRESHOLD
-    )
-    # For h_q > 64 (e.g. h_q=128), the non-splitk grid has very few blocks
-    # in the H dimension (cdiv(128,64)=2), leading to low GPU utilization
-    # at medium batch sizes.  Split-K doubles the parallelism.
-    use_splitk_for_large_hq = h_q > 64 and total_tokens > 8 and total_topk >= 256
+    split_k = _decide_splitk_dual_scope(total_tokens, h_q, total_topk)
 
-    if not (
-        use_splitk_for_small_bs
-        or use_splitk_for_h64_large_topk
-        or use_splitk_for_large_topk
-        or use_splitk_for_large_hq
-    ):
+    if split_k == 0:
         # Fall back to non-splitk version
         return fused_gather_attn_decode_dsv4_dual_scope(
             q,
@@ -2872,31 +2855,8 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             topk_length_extra,
             attn_sink,
             s_q,
+            force_no_splitk=True,
         )
-
-    # Select split_k based on workload and total_topk.
-    # CUDA graph replay benchmarks show optimal split_k depends on both:
-    #   - High topk (>=512, c4 layers): more splits needed to parallelize
-    #   - Low topk (<512, c128 layers): fewer splits, less combine overhead
-    if total_tokens <= 8:
-        if total_topk >= 512 and total_tokens <= 4:
-            # High topk + very small bs: split_k=8 is 8-33% faster than sk=4
-            split_k = 8
-        else:
-            # split_k=4 gives 2x more blocks than split_k=2
-            split_k = 4
-    elif use_splitk_for_large_hq:
-        # For h_q > 64 with bs > 8:
-        if total_topk >= 512:
-            # High topk: split_k=4 for all medium/large bs
-            split_k = 4
-        else:
-            # Low topk: split_k=2 is sufficient
-            split_k = 2
-    elif use_splitk_for_h64_large_topk:
-        split_k = 2
-    else:
-        split_k = _select_split_k(total_topk, h_q, total_tokens)
 
     topk_per_split = (total_topk + split_k - 1) // split_k
 
@@ -2907,8 +2867,7 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
     stride_po = buffers["stride_po"]
     stride_plse = buffers["stride_plse"]
 
-    # Reuse pre-allocated output buffers to avoid torch.empty() calls
-    # that would be captured in CUDA graphs (each adds ~7-8us replay overhead).
+    # Allocate output buffers
     output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
     lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 

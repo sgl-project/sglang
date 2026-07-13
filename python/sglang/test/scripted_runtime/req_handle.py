@@ -13,10 +13,10 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True)
 class ScriptedReqHandle:
     rid: str
-    context: "ScriptedContext"
+    context: ScriptedContext
 
     @property
-    def req(self) -> Optional["Req"]:
+    def req(self) -> Optional[Req]:
         return self.context.find_req_by_rid(self.rid)
 
     @property

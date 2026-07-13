@@ -6,6 +6,7 @@ export const GPTOSSDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
@@ -102,6 +103,7 @@ export const GPTOSSDeployment = () => {
         h100: { tp: 8 },
         h200: { tp: 8 },
         b200: { tp: 8 },
+        b300: { tp: 8 },
         mi300x: { tp: 8 },
         mi325x: { tp: 8 },
         mi355x: { tp: 8 }
@@ -111,6 +113,7 @@ export const GPTOSSDeployment = () => {
         h100: { tp: 1 },
         h200: { tp: 1 },
         b200: { tp: 1 },
+        b300: { tp: 1 },
         mi300x: { tp: 1 },
         mi325x: { tp: 1 },
         mi355x: { tp: 1 }
@@ -149,7 +152,7 @@ export const GPTOSSDeployment = () => {
     }
 
     if (speculative === 'enabled') {
-      cmd += 'SGLANG_ENABLE_SPEC_V2=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 ';
+      cmd += 'SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 ';
     }
 
     cmd += 'python -m sglang.launch_server \\\n';
@@ -168,6 +171,12 @@ export const GPTOSSDeployment = () => {
     // Add tool call parser if enabled
     if (toolcall === 'enabled') {
       cmd += ` \\\n  --tool-call-parser gpt-oss`;
+    }
+
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend triton`;
+      cmd += ` \\\n  --moe-runner-backend triton`;
+      cmd += ` \\\n  --enforce-disable-flashinfer-allreduce-fusion`;
     }
 
     // Add speculative decoding if enabled (MI30x handled above)

@@ -8,18 +8,18 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.quantization.int8_kernel import (
+from sglang.kernels.ops.quantization.int8_kernel import (
     per_token_group_quant_int8,
     per_token_quant_int8,
     sglang_per_token_group_quant_int8,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -673,7 +673,7 @@ def _set_triton_tma_allocator():
 
 # --- B TensorDescriptor cache (LRU) ---
 _B_DESC_CACHE_MAX = 64
-_B_DESC_CACHE: "OrderedDict[tuple, TensorDescriptor]" = OrderedDict()
+_B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
@@ -1237,6 +1237,92 @@ def fused_append_shared_experts(
 
 
 @triton.jit
+def _fused_append_remap_shared_experts_deepep_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    shared_id_base,  # runtime scalar: ep_rank * num_local_experts + num_local_routed
+    num_local_routed,  # runtime scalar: routed experts per rank (for gap-insertion)
+    scale_factor,  # runtime scalar: shared-expert weight
+    K: tl.constexpr,
+    S: tl.constexpr,
+):
+    """Append shared experts AND apply the DeepEP interleaved remap in one pass.
+
+    Equivalent to fused_append_shared_experts() immediately followed by
+    topk._remap_topk_for_deepep(), but the remap math runs on the rows already
+    loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
+    kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
+
+    Routed IDs:   e -> e + e // num_local_routed   (insert gaps for shared slots)
+    Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
+    Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
+    """
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    out_ids_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, K)
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k)
+
+    # DeepEP interleaved layout: shift each routed id past the shared slots that
+    # precede it. Matches `routed + routed // num_local_routed` exactly.
+    ids = ids + ids // num_local_routed
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
+    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws)
+
+    offs_s = tl.arange(0, S)
+    shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
+    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
+    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws)
+
+
+def fused_append_remap_shared_experts_deepep(
+    topk_ids,
+    topk_weights,
+    num_fused_shared_experts,
+    scale_factor,
+    shared_id_base,
+    num_local_routed,
+):
+    """Fused append + DeepEP remap (see kernel docstring).
+
+    Replaces the fused_append_shared_experts() + _remap_topk_for_deepep() pair on
+    the aiter/DeepEP-class path. Host computes the scalar remap params so the
+    kernel stays branch-free.
+    """
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    _fused_append_remap_shared_experts_deepep_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        out_ids,
+        out_weights,
+        shared_id_base,
+        num_local_routed,
+        scale_factor,
+        K=k,
+        S=s,
+        num_warps=1,
+    )
+    return out_ids, out_weights
+
+
+@triton.jit
 def _fused_append_shared_experts_with_weights_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
@@ -1244,10 +1330,12 @@ def _fused_append_shared_experts_with_weights_kernel(
     out_ids_ptr,
     out_weights_ptr,
     N_BASE,
+    scale,
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    APPLY_SIGMOID: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -1266,22 +1354,43 @@ def _fused_append_shared_experts_with_weights_kernel(
     mask_s = offs_s < S
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
+    if APPLY_SIGMOID:
+        # Fuse sigmoid(shared_gate) + dtype upcast (+ optional 1/ep_size scale)
+        # in-register so the raw bf16 logits stream straight into the fp32
+        # output, eliminating the standalone sigmoid and bf16->fp32 copy kernels.
+        shared_ws = tl.sigmoid(shared_ws.to(tl.float32)) * scale
 
     tl.store(out_ids_ptr + out_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts_with_weights(
-    topk_ids, topk_weights, shared_weights, num_fused_shared_experts, N=None
+    topk_ids,
+    topk_weights,
+    shared_weights,
+    num_fused_shared_experts,
+    N=None,
+    apply_sigmoid=False,
+    scale=1.0,
 ):
-    """Like fused_append_shared_experts but accepts per-token shared weights tensor."""
+    """Like fused_append_shared_experts but accepts per-token shared weights tensor.
+
+    When ``apply_sigmoid`` is True, ``shared_weights`` are treated as raw gate
+    logits: the kernel applies ``sigmoid`` (in fp32) and the optional ``scale``
+    in-register, so the caller can skip the separate ``sigmoid`` activation and
+    the bf16->fp32 cast. When False the legacy behavior is preserved exactly.
+    """
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
     if s <= 0:
         return topk_ids, topk_weights
 
-    shared_weights_2d = shared_weights.to(topk_weights.dtype)
+    # When fusing sigmoid in-kernel, keep the raw logits dtype (the kernel emits
+    # fp32 directly); otherwise match the output weight dtype as before.
+    shared_weights_2d = (
+        shared_weights if apply_sigmoid else shared_weights.to(topk_weights.dtype)
+    )
     if shared_weights_2d.ndim == 1:
         shared_weights_2d = shared_weights_2d.unsqueeze(-1)
     if shared_weights_2d.shape[1] < s:
@@ -1303,10 +1412,12 @@ def fused_append_shared_experts_with_weights(
         out_ids,
         out_weights,
         N_BASE=N,
+        scale=scale,
         K=k,
         S=s,
         BLOCK_K=block_k,
         BLOCK_S=block_s,
+        APPLY_SIGMOID=apply_sigmoid,
         num_warps=1,
     )
     return out_ids, out_weights
