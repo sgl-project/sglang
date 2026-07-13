@@ -86,7 +86,7 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
-    from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
+    from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
     # When num_heads is large (e.g. with DP attention where attention_tp_size=1), the
@@ -656,6 +656,16 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+
+        if (
+            spec_info is not None
+            and spec_info.ragged_verify_layout is not None
+            and forward_mode.is_target_verify()
+        ):
+            raise NotImplementedError(
+                "FlashInfer does not support ragged verify in cuda graph; "
+                "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+            )
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()

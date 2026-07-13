@@ -79,6 +79,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import (
 from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
     OmniDreamsPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -141,6 +142,7 @@ from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_720P_SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.omnidreams import OmniDreamsSamplingParams
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -672,6 +674,20 @@ def _register_configs():
             lambda path: "omnidreams" in path.lower() or "omni-dreams" in path.lower()
         ],
     )
+    # Pi0.5 / OpenPI / LeRobot action policies.
+    register_configs(
+        sampling_param_cls=Pi05SamplingParams,
+        pipeline_config_cls=Pi05PipelineConfig,
+        hf_model_paths=[
+            "lerobot/pi05_base",
+            "lerobot/pi05_libero_base",
+        ],
+        model_detectors=[
+            lambda hf_id: "pi05" in hf_id.lower(),
+            lambda hf_id: "pi0.5" in hf_id.lower(),
+        ],
+    )
+
     # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,

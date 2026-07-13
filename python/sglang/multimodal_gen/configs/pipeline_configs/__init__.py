@@ -43,6 +43,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
     OmniDreamsPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
@@ -75,6 +76,7 @@ __all__ = [
     "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
     "OmniDreamsPipelineConfig",
+    "Pi05PipelineConfig",
     "StableDiffusion3PipelineConfig",
     "WanT2V480PConfig",
     "WanI2V480PConfig",

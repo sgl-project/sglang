@@ -108,6 +108,7 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
+    seed = 1
     repeat_rate = 0.9
     tpot = 50
     output_token_throughput = 390.5859
