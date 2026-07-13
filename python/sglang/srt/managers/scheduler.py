@@ -771,10 +771,9 @@ class Scheduler(
             self.draft_worker = None
             self.external_corpus_manager = None
             return
-        import os as _os
 
         if (
-            _os.environ.get("SGLANG_ALLOW_PP_SPEC")
+            envs.SGLANG_ENABLE_PP_SPEC.get()
             and self.server_args.pp_size > 1
             and self.ps.pp_rank != self.server_args.pp_size - 1
         ):
@@ -3390,11 +3389,18 @@ class Scheduler(
                     batch.spec_info = None
                 else:
                     # Non-overlap: drive the V2 worker synchronously (no
-                    # future_map relay / on_publish).
+                    # future_map relay / on_publish). Only the PP+spec worker
+                    # takes pp_proxy_tensors; other spec workers keep their
+                    # signature (and pp_size == 1 has nothing to relay).
+                    kwargs = (
+                        {"pp_proxy_tensors": pp_proxy_tensors}
+                        if self.server_args.pp_size > 1
+                        else {}
+                    )
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
                         batch_result = self.model_worker.forward_batch_generation(
-                            batch, pp_proxy_tensors=pp_proxy_tensors
+                            batch, **kwargs
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;
                     # re-apply what must carry to the next iter.

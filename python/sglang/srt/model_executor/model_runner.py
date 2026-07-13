@@ -380,6 +380,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # PP+spec: the draft runner exists only on the last PP stage, so its
+        # memory profiling must stay rank-local (world-group reduces would
+        # deadlock against stages without a draft worker).
+        self.pp_spec_draft_local = (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and server_args.pp_size > 1
+        )
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -603,9 +611,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.pp_size > 1:
-            import os as _os
 
-            if not (_os.environ.get("SGLANG_ALLOW_PP_SPEC") and self.is_draft_worker):
+            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
                 assert (
                     self.support_pp
                 ), "Pipeline Parallel is not compatible with this model."
@@ -770,9 +777,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        import os as _os
-
-        if not _os.environ.get("SGLANG_ALLOW_PP_SPEC"):
+        if not envs.SGLANG_ENABLE_PP_SPEC.get():
             assert (
                 (not model_has_mtp_layers)
                 or (self.spec_algorithm.is_none())
@@ -1288,15 +1293,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
-        _pp_spec_draft_local = (
-            __import__("os").environ.get("SGLANG_ALLOW_PP_SPEC")
-            and getattr(self, "is_draft_worker", False)
-            and self.pp_size > 1
-        )
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft_local,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()

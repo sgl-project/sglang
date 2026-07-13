@@ -150,6 +150,12 @@ def _load_checkpoint_tensor(model_path: str, tensor_names: tuple) -> torch.Tenso
 
     from safetensors import safe_open
 
+    # The standard loader may have resolved a HF hub id into its own cache;
+    # this simplified reader only handles local checkpoint directories.
+    assert os.path.isdir(model_path), (
+        "PP+spec draft embedding loading requires --model-path to be a local "
+        f"checkpoint directory, got {model_path!r}"
+    )
     index_path = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
@@ -368,9 +374,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        import os as _os
 
-        if _os.environ.get("SGLANG_ALLOW_PP_SPEC") and self.server_args.pp_size > 1:
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
+            # This branch skips the hot-token-map / EAGLE3 head wiring below.
+            assert self.hot_token_id is None and not (
+                self.speculative_algorithm.is_eagle3()
+            ), "PP+spec does not support --speculative-token-map or EAGLE3 drafts yet"
             # PP+spec: the target's embedding lives on the first PP stage
             # (PPMissingLayer here on the last stage) and NextN/MTP layers
             # carry no embedding of their own in the checkpoint, so the

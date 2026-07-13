@@ -581,6 +581,8 @@ class SchedulerPPMixin:
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        # PP+spec: per-rid chain rows seeding the next verify round.
+        self._pp_spec_chain_by_rid: Dict[str, torch.Tensor] = {}
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1234,6 +1236,12 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+        # Chains are stored before finish flags are set (at result prep), so
+        # finished requests must be dropped here or the dict grows per request.
+        if self._pp_spec_chain_by_rid:
+            for req in batch.reqs:
+                if req.finished():
+                    self._pp_spec_chain_by_rid.pop(req.rid, None)
 
     def _pp_spec_store_bonus(
         self: Scheduler,
@@ -1249,8 +1257,6 @@ class SchedulerPPMixin:
         — the zero drafts just get rejected, costing acceptance not
         correctness. Keyed by rid (not batch position): the microbatch
         composition can change between rounds (finish / retract / merge)."""
-        if not hasattr(self, "_pp_spec_chain_by_rid"):
-            self._pp_spec_chain_by_rid = {}
         num_draft_tokens = self.server_args.speculative_num_draft_tokens
         if chain_tokens is not None:
             rows = chain_tokens.to(torch.int64).reshape(

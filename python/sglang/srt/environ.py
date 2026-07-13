@@ -691,6 +691,10 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (topk=1 chains, non-overlap schedule).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift

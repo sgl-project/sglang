@@ -105,15 +105,11 @@ class ModelRunnerKVCacheMixin:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
-        _pp_spec_draft_local = (
-            __import__("os").environ.get("SGLANG_ALLOW_PP_SPEC")
-            and getattr(self, "is_draft_worker", False)
-            and self.pp_size > 1
-        )
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft_local,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
 
