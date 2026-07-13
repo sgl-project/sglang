@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 def resolve_num_tokens_per_req(
     *,
-    phase: str,
+    phase: Literal["draft_decode", "draft_extend", "target_verify"],
     server_args: ServerArgs,
     spec_algorithm=None,
     is_draft_worker: bool = False,
@@ -100,7 +100,10 @@ def resolve_num_tokens_per_req(
 
     Runners and backends call this instead of re-deriving the width from
     server args; the per-forward dynamic width lives on
-    ``SpecInput.num_tokens_per_req``.
+    ``SpecInput.num_tokens_per_req``. The draft phases are currently only
+    defined for the EAGLE-family workers (their runners are the only
+    callers); "target_verify" is algorithm-generic via the per-algorithm
+    hook.
     """
     if phase == "draft_decode":
         return server_args.speculative_eagle_topk
