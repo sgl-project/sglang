@@ -119,7 +119,7 @@ class CustomSpecAlgo:
             )
         return self.factory(server_args)
 
-    def get_num_tokens_per_bs_for_target_verify(
+    def get_num_tokens_per_req_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is

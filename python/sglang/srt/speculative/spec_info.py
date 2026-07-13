@@ -210,7 +210,7 @@ class SpeculativeAlgorithm(Enum):
         elif self.is_ngram():
             _handle_ngram(server_args)
 
-    def get_num_tokens_per_bs_for_target_verify(
+    def get_num_tokens_per_req_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is
@@ -343,7 +343,7 @@ def create_dummy_verify_input(
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     custom_mask: torch.Tensor,
-    num_tokens_per_bs: int,
+    num_tokens_per_req: int,
     is_draft_worker: bool,
 ) -> Optional[SpecInput]:
     """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
@@ -395,7 +395,7 @@ def create_dummy_verify_input(
             retrieve_index=None,
             retrieve_next_token=None,
             retrieve_next_sibling=None,
-            draft_token_num=num_tokens_per_bs,
+            draft_token_num=num_tokens_per_req,
         )
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
