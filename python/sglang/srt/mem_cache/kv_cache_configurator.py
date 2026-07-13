@@ -51,6 +51,10 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.mem_cache.unified_memory_pool import (
+        UnifiedKVPool,
+        UnifiedPoolBundle,
+    )
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
         ModelLayerInfo,
     )
@@ -68,6 +72,13 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     memory_pool_config: MemoryPoolConfig
+
+
+class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool: KVCache
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
