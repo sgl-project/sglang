@@ -263,6 +263,37 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_require_reasoning_preserved_in_parallel_sampling(self):
+        """Regression for #30556: reasoning-aware required tool calling broke for n>1.
+
+        With n>1 the request is split per-sample via ``obj[i]`` (__getitem__).
+        That path used to forward every field except ``require_reasoning``, so
+        each sub-sample silently fell back to the default (False). Downstream
+        this made the scheduler build the reasoning grammar in GENERATION mode,
+        the model skipped thinking, and the guided tool JSON leaked into
+        ``reasoning_content`` with ``tool_calls=null``. The flag is a scalar
+        shared by the whole request, so every sub-sample must keep the original.
+        """
+        req = GenerateReqInput(
+            text="Call get_weather for San Francisco.",
+            sampling_params={"n": 2},  # parallel_sample_num = 2
+            require_reasoning=True,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertFalse(req.is_single)
+        self.assertTrue(req[0].require_reasoning)
+        self.assertTrue(req[1].require_reasoning)
+
+        # And it must not be force-set: when unset it stays the default (False).
+        req_off = GenerateReqInput(
+            text="Call get_weather for San Francisco.",
+            sampling_params={"n": 2},
+        )
+        req_off.normalize_batch_and_arguments()
+        self.assertFalse(req_off[0].require_reasoning)
+        self.assertFalse(req_off[1].require_reasoning)
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
