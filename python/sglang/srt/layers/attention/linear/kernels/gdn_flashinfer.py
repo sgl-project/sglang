@@ -11,11 +11,10 @@ Requires flashinfer >= 0.6.7.
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
     MAX_FUSED_QKV_SPLIT_DIM,
     GDNQKVShape,
@@ -27,18 +26,6 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
-
-
-def unwrap_direct_write_out(
-    out: Optional[torch.Tensor], *, expected_shape: Tuple[int, ...]
-) -> Optional[torch.Tensor]:
-    """Validate and unwrap a caller-supplied direct-write output buffer."""
-    if out is None:
-        return None
-    assert (
-        out.shape == expected_shape
-    ), f"direct-write out buffer {tuple(out.shape)} != expected {expected_shape}"
-    return out.squeeze(0)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -253,12 +240,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         state_pool_size: int,
     ) -> FlashInferGDNExtendPrep:
-        """Compute the layer-invariant extend metadata once per forward.
-
-        The pool-gather indices depend only on per-request cache slots,
-        identical across all GDN layers of a forward, so forward_extend builds
-        this once and reuses it for every per-layer extend() call.
-        """
+        """Compute layer-invariant state-gather indices once per forward."""
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
@@ -290,17 +272,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        """Generic GDN contract: raw q/k and log-space decay ``g``.
+        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 
-        Production FlashInfer prefill uses :meth:`extend_packed`, which folds
-        the exponential into gating without exposing alpha to the caller.
-        """
-        return self._extend_with_alpha(
-            q=q,
-            k=k,
-            v=v,
-            alpha=torch.exp(g.to(torch.float32)),
-            beta=beta,
+        q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
+
+        return self._extend_core(
+            q_fi=q_fi,
+            k_fi=k_fi,
+            v_fi=v[0].contiguous(),
+            alpha_fi=torch.exp(g[0].to(torch.float32)),
+            beta_fi=beta[0].to(torch.float32),
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -336,16 +317,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
-        """Run FlashInfer prefill from canonical packed, raw GDN inputs.
-
-        The fused path's normalized q/k and multiplicative alpha are consumed
-        immediately by ``_extend_core``. The ordinary fallback keeps the same
-        private alpha representation without exposing a caller-side protocol.
-        """
-        from sglang.srt.layers.attention.fla.fused_gdn_gating import (
-            fused_gdn_gating,
-        )
-
+        """Use fused preparation when eligible, otherwise use ``extend``."""
         if self._can_use_fused(mixed_qkv, shape):
             from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
 
@@ -374,44 +346,18 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 no_prefix=no_prefix,
             )
 
+        from sglang.srt.layers.attention.fla.fused_gdn_gating import (
+            fused_gdn_gating,
+        )
+
         query, key, value = split_gdn_prefill_qkv(mixed_qkv, shape)
-        alpha, beta = fused_gdn_gating(A_log, a, b, dt_bias, exp_gate=True)
-        return self._extend_with_alpha(
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+        return self.extend(
             q=query,
             k=key,
             v=value,
-            alpha=alpha,
+            g=g,
             beta=beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            out=out,
-            prep=prep,
-            no_prefix=no_prefix,
-        )
-
-    def _extend_with_alpha(
-        self,
-        *,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        out: Optional[torch.Tensor],
-        prep: Optional[FlashInferGDNExtendPrep],
-        no_prefix: bool,
-    ) -> tuple:
-        q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
-        return self._extend_core(
-            q_fi=q_fi,
-            k_fi=k_fi,
-            v_fi=v[0].contiguous(),
-            alpha_fi=alpha[0].to(torch.float32),
-            beta_fi=beta[0].to(torch.float32),
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -448,9 +394,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
         ssm_cache_indices = prep.ssm_cache_indices
 
-        output_buf = unwrap_direct_write_out(
-            out, expected_shape=(1, total_seq_len, num_v_heads, head_v_dim)
-        )
+        if out is not None:
+            expected_shape = (1, total_seq_len, num_v_heads, head_v_dim)
+            assert (
+                out.shape == expected_shape
+            ), f"direct-write out buffer {tuple(out.shape)} != expected {expected_shape}"
+        output_buf = out.squeeze(0) if out is not None else None
 
         # When no request in the batch has a prefix, skip the pool gather and
         # let the kernel zero-seed via initial_state=None. Bit-identical: freed
