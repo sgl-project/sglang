@@ -120,6 +120,7 @@ from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
+    compute_post_capture_kv_resize,
     is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -696,6 +697,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+
+    def post_capture_resize_kv_pool(self):
+        resize = compute_post_capture_kv_resize(self)
+        self.max_total_num_tokens = resize.max_total_num_tokens
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = resize.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = resize.swa_max_total_num_tokens
+        if self.memory_pool_config is not None:
+            self.memory_pool_config.max_total_num_tokens = resize.max_total_num_tokens
+            self.memory_pool_config.full_max_total_num_tokens = (
+                resize.full_max_total_num_tokens
+            )
+            self.memory_pool_config.swa_max_total_num_tokens = (
+                resize.swa_max_total_num_tokens
+            )
+        if resize.capped_max_running_requests is not None:
+            self.max_running_requests = resize.capped_max_running_requests
+            if self.memory_pool_config is not None:
+                self.memory_pool_config.max_running_requests = (
+                    resize.capped_max_running_requests
+                )
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
