@@ -87,6 +87,7 @@ class LoRAManager:
         )
 
         self.eviction_policy = server_args.lora_eviction_policy
+        self.enable_dp_attention: bool = server_args.enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
@@ -152,11 +153,14 @@ class LoRAManager:
         """Whether LoRA kernels can be captured into the prefill CUDA graph.
 
         MoE LoRA is excluded for now: its intermediate CUDA graph buffers are
-        sized by the decode batch size, not by prefill token buckets.
+        sized by the decode batch size, not by prefill token buckets. DP
+        attention is excluded because per-rank graph eligibility could
+        diverge across ranks (see can_use_prefill_cuda_graph).
         """
         return (
             self.lora_backend.supports_prefill_cuda_graph
             and not self.lora_backend.is_moe_lora
+            and not self.enable_dp_attention
         )
 
     def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -172,6 +176,11 @@ class LoRAManager:
         max_bs = self.lora_backend.prefill_cuda_graph_max_bs
         max_tokens = self.lora_backend.prefill_cuda_graph_max_tokens
         if max_bs is None or max_tokens is None:
+            return False
+        # Under DP attention this predicate depends on per-rank batch shapes
+        # and could diverge across ranks (some replaying the graph, some
+        # eager), desyncing collectives; keep LoRA prefill on the eager path.
+        if self.enable_dp_attention:
             return False
         if (
             not forward_batch.forward_mode.is_extend()
