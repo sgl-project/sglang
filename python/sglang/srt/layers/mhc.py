@@ -6,11 +6,72 @@ import threading
 from typing import Tuple
 
 import torch
+import triton
+import triton.language as tl
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
+<<<<<<< ours
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+=======
+>>>>>>> theirs
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils import is_cuda
+
+# TileLang is CUDA-only. On non-CUDA backends (e.g. ROCm/AMD) it is unavailable,
+# so import it optionally and fall back to a portable Triton implementation for
+# the kernels that provide one (currently hc_split_sinkhorn). This keeps mhc.py
+# importable -- and the DeepSeek-V4 mHC path runnable -- on backends without
+# TileLang.
+try:
+    import tilelang
+    import tilelang.language as T
+
+    from sglang.jit_kernel.utils import is_arch_support_pdl
+    from sglang.srt.layers.attention.nsa.utils import (
+        is_nsa_prefill_cp_round_robin_split,
+    )
+
+    _HAS_TILELANG = True
+except Exception:
+    T = None
+    _HAS_TILELANG = False
+
+    def is_arch_support_pdl() -> bool:
+        return False
+
+    def is_nsa_prefill_cp_round_robin_split(*args, **kwargs) -> bool:
+        return False
+
+    class _TileLangStub:
+        """Minimal stand-in so module-level decorators/annotations resolve when
+        TileLang is absent. The decorated TileLang kernels are never executed on
+        the non-TileLang path -- dispatch routes to the Triton fallback."""
+
+        JITKernel = object
+
+        class PassConfigKey:
+            TL_DISABLE_WARP_SPECIALIZED = "TL_DISABLE_WARP_SPECIALIZED"
+            TL_DISABLE_TMA_LOWER = "TL_DISABLE_TMA_LOWER"
+            TL_PTXAS_REGISTER_USAGE_LEVEL = "TL_PTXAS_REGISTER_USAGE_LEVEL"
+
+        @staticmethod
+        def set_log_level(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def jit(*dargs, **dkwargs):
+            # Supports both @tilelang.jit and @tilelang.jit(...).
+            if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
+                return dargs[0]
+
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+    tilelang = _TileLangStub()
+
+_IS_CUDA = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -184,13 +245,13 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     return hc_split_sinkhorn_kernel_
 
 
-def hc_split_sinkhorn(
+def _hc_split_sinkhorn_tilelang(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
 ):
     b, s, _ = mixes.size()
     pre = mixes.new_empty(b, s, hc_mult)
@@ -206,6 +267,136 @@ def hc_split_sinkhorn(
         comb.view(-1, hc_mult, hc_mult),
     )
     return pre, post, comb
+
+
+@triton.jit
+def _hc_split_sinkhorn_triton_kernel(
+    mixes_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    n,
+    eps,
+    HC: tl.constexpr,
+    ITERS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Portable fallback mirroring hc_split_sinkhorn_kernel_ (the TileLang path).
+
+    One program handles BLOCK_T tokens, each with an (HC, HC) combination tile.
+    Faithfully reproduces the truncated ``ITERS``-iteration Sinkhorn -- the
+    iteration count is part of the trained model definition, so this matches the
+    TileLang result rather than iterating to convergence.
+    """
+    pid = tl.program_id(0)
+    t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    tmask = t < n
+    mix_hc = (2 + HC) * HC
+
+    j = tl.arange(0, HC)
+    k = tl.arange(0, HC)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    row = t[:, None] * mix_hc
+
+    # pre = sigmoid(mixes[:HC] * scale0 + base[:HC]) + eps
+    b_pre = tl.load(base_ptr + j)[None, :]
+    m_pre = tl.load(mixes_ptr + row + j[None, :], mask=tmask[:, None], other=0.0)
+    pre = tl.sigmoid(m_pre * s0 + b_pre) + eps
+    tl.store(pre_ptr + t[:, None] * HC + j[None, :], pre, mask=tmask[:, None])
+
+    # post = 2 * sigmoid(mixes[HC:2HC] * scale1 + base[HC:2HC])
+    b_post = tl.load(base_ptr + (j + HC))[None, :]
+    m_post = tl.load(
+        mixes_ptr + row + (j + HC)[None, :], mask=tmask[:, None], other=0.0
+    )
+    post = 2.0 * tl.sigmoid(m_post * s1 + b_post)
+    tl.store(post_ptr + t[:, None] * HC + j[None, :], post, mask=tmask[:, None])
+
+    # comb[j, k] = mixes[2HC + j*HC + k] * scale2 + base[2HC + j*HC + k]
+    off = 2 * HC + j[None, :, None] * HC + k[None, None, :]
+    b_comb = tl.load(base_ptr + (2 * HC + j[:, None] * HC + k[None, :]))[None, :, :]
+    m_comb = tl.load(
+        mixes_ptr + row[:, :, None] + off, mask=tmask[:, None, None], other=0.0
+    )
+    comb = m_comb * s2 + b_comb
+
+    # row softmax, then alternating row/col normalization (Sinkhorn).
+    row_max = tl.max(comb, axis=2)[:, :, None]
+    comb = tl.exp(comb - row_max)
+    row_sum = tl.sum(comb, axis=2)[:, :, None]
+    comb = comb / row_sum + eps
+    col_sum = tl.sum(comb, axis=1)[:, None, :]
+    comb = comb / (col_sum + eps)
+
+    for _ in range(ITERS - 1):
+        row_sum = tl.sum(comb, axis=2)[:, :, None]
+        comb = comb / (row_sum + eps)
+        col_sum = tl.sum(comb, axis=1)[:, None, :]
+        comb = comb / (col_sum + eps)
+
+    cbase = t[:, None, None] * (HC * HC) + j[None, :, None] * HC + k[None, None, :]
+    tl.store(comb_ptr + cbase, comb, mask=tmask[:, None, None])
+
+
+def _hc_split_sinkhorn_triton(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    block_t: int = 64,
+):
+    b, s, _ = mixes.size()
+    n = b * s
+    mixes_flat = mixes.reshape(n, (2 + hc_mult) * hc_mult).contiguous()
+    pre = mixes.new_empty(n, hc_mult, dtype=torch.float32)
+    post = mixes.new_empty(n, hc_mult, dtype=torch.float32)
+    comb = mixes.new_empty(n, hc_mult, hc_mult, dtype=torch.float32)
+    grid = (triton.cdiv(n, block_t),)
+    _hc_split_sinkhorn_triton_kernel[grid](
+        mixes_flat,
+        hc_scale.contiguous(),
+        hc_base.contiguous(),
+        pre,
+        post,
+        comb,
+        n,
+        eps,
+        HC=hc_mult,
+        ITERS=sinkhorn_iters,
+        BLOCK_T=block_t,
+    )
+    return (
+        pre.view(b, s, hc_mult),
+        post.view(b, s, hc_mult),
+        comb.view(b, s, hc_mult, hc_mult),
+    )
+
+
+def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    # Prefer the tuned TileLang kernel on CUDA; use the portable Triton fallback
+    # on backends where TileLang is unavailable (e.g. ROCm/AMD).
+    if _HAS_TILELANG and _IS_CUDA:
+        return _hc_split_sinkhorn_tilelang(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
+    return _hc_split_sinkhorn_triton(
+        mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+    )
 
 
 @tilelang.jit(
