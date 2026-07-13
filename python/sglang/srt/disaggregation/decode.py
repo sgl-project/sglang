@@ -1672,8 +1672,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
         if self._uses_dsv4_decode_radix_cache():
             # DSV4 compressed sidecars are not yet safe to reinsert from decode
-            # workers. Use decode radix only for prefix reuse; release will free
-            # the request-owned delta after cache_protected_len and drop the lock.
+            # workers after generation starts. Allow exactly one unfinished
+            # insert in process_prebuilt(), where fill_ids still covers only
+            # the prompt KV received from prefill; later release will free the
+            # request-owned decode delta after cache_protected_len.
+            req.allow_radix_cache_insert_once = True
             req.skip_radix_cache_insert = True
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path

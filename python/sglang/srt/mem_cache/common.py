@@ -110,7 +110,10 @@ def free_swa_out_of_window_slots(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
-        return
+        if getattr(req, "allow_radix_cache_insert_once", False):
+            req.allow_radix_cache_insert_once = False
+        else:
+            return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
 
