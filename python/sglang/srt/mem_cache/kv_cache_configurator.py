@@ -402,17 +402,8 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                token_to_kv_pool = MLATokenToKVPoolFP4(
-                    max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
+                token_to_kv_pool = self._build_mla_fp4_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
                 )
             else:
                 token_to_kv_pool = MLATokenToKVPool(
@@ -1309,6 +1300,21 @@ class KVCacheConfigurator:
             end_layer=self.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             **pool_kwargs,
+        )
+        return token_to_kv_pool
+
+    def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        token_to_kv_pool = MLATokenToKVPoolFP4(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
         )
         return token_to_kv_pool
 
