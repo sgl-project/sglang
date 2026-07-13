@@ -124,7 +124,7 @@ def cutlass_fused_experts_fp8(
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
     es_up, es_down = enable_es

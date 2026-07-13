@@ -6,6 +6,8 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for DeepSeek-R1 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [DeepSeek-R1 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
@@ -191,7 +193,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -211,7 +213,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -318,7 +320,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -501,7 +503,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -524,7 +526,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -710,7 +712,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -733,7 +735,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -915,7 +917,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -938,7 +940,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1120,7 +1122,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1143,7 +1145,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1323,7 +1325,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1346,7 +1348,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
