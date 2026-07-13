@@ -122,7 +122,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
-    requires_device_weight_processing: bool = False
+    needs_device_weight_postprocess: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -482,23 +482,26 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
-        requires_device_weight_processing=_requires_device_weight_processing(
-            quant_config
-        ),
+        needs_device_weight_postprocess=_needs_device_weight_postprocess(quant_config),
         post_load_hooks=post_load_hooks,
     )
 
 
-def _requires_device_weight_processing(
+def _needs_device_weight_postprocess(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name == "fp8":
-        return not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
-    if quant_name == "mxfp4":
-        return not getattr(quant_config, "is_checkpoint_mxfp4_serialized", False)
-    return False
+    serialized_flag_by_quant_name = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    if serialized_flag is None:
+        return False
+    return not getattr(quant_config, serialized_flag, False)
 
 
 def _build_transformer_quant_adapters(
@@ -612,10 +615,12 @@ def _resolve_quant_config(
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None
     )
+    quant_ignore_remap_dict = getattr(arch_config, "quant_ignore_remap", None)
     quant_config = get_quant_config(
         hf_config,
         component_model_path,
         reverse_param_names_mapping=reverse_param_names_mapping_dict,
+        quant_ignore_remap=quant_ignore_remap_dict,
     )
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None
