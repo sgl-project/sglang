@@ -30,7 +30,7 @@ class TestEagle3IntelXPU(
     attention_backend = "intel_xpu"
     max_running_requests = 24
     gsm8k_num_examples = 1000
-    gsm8k_check_accept_len = False
+    gsm8k_check_accept_len = True
     extra_args = ("--max-total-tokens", "16384", "--disable-decode-cuda-graph")
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
@@ -46,6 +46,8 @@ class TestEagleLlama2IntelXPU(
     spec_tokens = 6
     gsm8k_check_accept_len = True
     gsm8k_num_examples = 1000
+    enable_return_hidden_states = True
+    extra_args = ("--max-total-tokens", "16384", "--disable-decode-cuda-graph")
 
 
 if __name__ == "__main__":

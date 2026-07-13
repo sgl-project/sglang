@@ -1080,22 +1080,31 @@ class XPUAttentionBackend(AttentionBackend):
         # buffers here don't carry, so reject it explicitly.
         is_verify = forward_mode.is_target_verify()
         is_draft_decode = forward_mode.is_decode_or_idle() and spec_info is not None
+        is_draft_extend = forward_mode.is_draft_extend_v2()
         assert (
-            forward_mode.is_decode_or_idle() or is_verify
-        ), "XPUAttentionBackend XPU graph only supports decode / target-verify modes"
+            forward_mode.is_decode_or_idle() or is_verify or is_draft_extend
+        ), "XPUAttentionBackend XPU graph only supports decode / target-verify / draft-extend modes"
         assert not (
-            (is_verify or is_draft_decode) and self.topk > 1
+            (is_verify or is_draft_decode or is_draft_extend) and self.topk > 1
         ), "XPUAttentionBackend XPU graph spec decoding supports topk <= 1 only"
 
         # Per-sequence query rows and the extra KV length beyond seq_lens:
         #  * target-verify packs `speculative_num_draft_tokens` query rows per req
         #    and attends over those draft positions (KV offset = num_draft_tokens);
+        #  * draft-extend (EAGLE v2) packs `num_tokens_per_req` query rows per req;
+        #    seq_lens already includes these tokens (KV offset = 0);
         #  * draft-decode emits one query row and attends one step further
         #    (KV offset = speculative_step_id + 1);
         #  * plain decode is the identity (1 row, no offset).
         if is_verify:
             q_len_per_req = self.speculative_num_draft_tokens
             kv_len_offset = self.speculative_num_draft_tokens
+        elif is_draft_extend:
+            # Draft extend: each req has num_tokens_per_req query tokens. Unlike
+            # target-verify, seq_lens already includes the extend tokens (standard
+            # extend convention), so no KV offset is applied.
+            q_len_per_req = spec_info.num_tokens_per_req
+            kv_len_offset = 0
         elif is_draft_decode:
             q_len_per_req = 1
             kv_len_offset = self.speculative_step_id + 1
@@ -1147,7 +1156,8 @@ class XPUAttentionBackend(AttentionBackend):
             else seq_lens.max().item()
         )
         # For spec modes the effective KV length includes the extra draft tokens
-        # (verify) or the current draft step (draft-decode); plain decode adds 0.
+        # (verify) or the current draft step (draft-decode); draft-extend and
+        # plain decode add 0 (seq_lens already includes extend tokens).
         metadata.max_seq_len_k = max_len + kv_len_offset
 
         kv_seqlens = (seq_lens + kv_len_offset).to(torch.int32)
@@ -1156,9 +1166,9 @@ class XPUAttentionBackend(AttentionBackend):
         metadata.cu_seqlens_k[0] = 0
         metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
 
-        # target-verify packs multiple query rows per request; rebuild cu_seqlens_q
-        # as a strided ramp (0, q, 2q, ...). Plain/draft decode keep the identity
-        # ramp already stored in the pre-allocated buffer.
+        # target-verify and draft-extend pack multiple query rows per request;
+        # rebuild cu_seqlens_q as a strided ramp (0, q, 2q, ...). Plain/draft
+        # decode keep the identity ramp already stored in the pre-allocated buffer.
         if q_len_per_req > 1:
             metadata.max_seq_len_q = q_len_per_req
             metadata.cu_seqlens_q[: bs + 1].copy_(
