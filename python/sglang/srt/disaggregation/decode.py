@@ -1676,6 +1676,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # until the prebuilt forward has finished; process_prebuilt() runs
             # before forward and must not free duplicate prompt pages still
             # referenced by the current batch's out_cache_loc.
+            req.dsv4_decode_radix_cache_prompt_len = req.kv_committed_len
             req.dsv4_decode_radix_cache_prompt_once = True
             req.skip_radix_cache_insert = True
         # Set prefix_indices so downstream consumers (init_next_round_input,
