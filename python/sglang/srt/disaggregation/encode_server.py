@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from multiprocessing import Queue
 from typing import Dict, List, Optional, Set, Tuple, Union
-from typing import Annotated, Any， Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Any, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
