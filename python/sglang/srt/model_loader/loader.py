@@ -83,6 +83,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
+from sglang.srt.model_loader.weight_utils import pin_h2d_copy_during_load
 from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
@@ -814,19 +815,22 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
-        if is_nvfp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-            ):
+        # During load, temporarily route "CPU src -> CUDA dst" copy_ through
+        # pin + async copy, covering all models and weight loaders.
+        with pin_h2d_copy_during_load():
+            if is_nvfp4_online:
+                # Scope exact FP4 quantization math to load-time conversion only;
+                # restore the original environment before serving starts.
+                with temp_set_env(
+                    TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
+                    FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                ):
+                    model.load_weights(weights)
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            else:
                 model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
-            model.load_weights(weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():

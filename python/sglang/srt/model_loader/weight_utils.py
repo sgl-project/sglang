@@ -6,6 +6,7 @@
 
 import collections
 import concurrent.futures
+import contextlib
 import fnmatch
 import glob
 import hashlib
@@ -1806,3 +1807,61 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
         return torch.cat(loaded_weight_pad, dim=output_dim)
     else:
         return loaded_weight
+
+
+# --- H2D copy speedup during weight loading (temporary pin) ---
+def _make_patched_copy(original_copy):
+    def patched_copy(self, src, *args, **kwargs):
+        # Only intercept "CPU (unpinned) src -> CUDA dst"; everything else
+        # passes through unchanged.
+        if not (
+            isinstance(src, torch.Tensor)
+            and self.is_cuda
+            and src.device.type == "cpu"
+            and not src.is_pinned()
+        ):
+            return original_copy(self, src, *args, **kwargs)
+
+        try:
+            pinned = src.pin_memory()  # temporary pin, freed after scope
+            original_copy(self, pinned, non_blocking=True)
+            return self
+        except Exception:
+            # Fall back to the original sync copy on any error for correctness.
+            return original_copy(self, src, *args, **kwargs)
+
+    return patched_copy
+
+
+@contextlib.contextmanager
+def pin_h2d_copy_during_load():
+    """H2D copy speedup during weight loading (temporary pin).
+
+    Background: during load, many worker threads concurrently run dst.copy_(src),
+    where src is a pageable CPU tensor mmap'd from safetensors. For a pageable
+    source, cudaMemcpyAsync must first memcpy the data on the CPU into a driver
+    staging pinned buffer (CPU-bound, contends on a global driver lock) before the
+    DMA. This staging phase is amplified several-fold under the performance
+    governor and is the real cause of slow loads (GPU transfer and bandwidth are
+    not the bottleneck).
+
+    Approach: temporarily monkey-patch torch.Tensor.copy_ around load_weights,
+    routing only "CPU src -> CUDA dst" copies through "temporary pin + non_blocking",
+    released right after.
+    - Single choke point: covers copy_ in all models and weight loaders, no
+      per-module changes needed.
+    - Temporary pin: pinned then freed right after the copy, so it won't blow up
+      page-locked memory like persistently pinning an entire shard would.
+    - Scoped: active only during load; restored on with-exit, so the inference
+      path's copy_ is unaffected.
+    """
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    original_copy = torch.Tensor.copy_
+    torch.Tensor.copy_ = _make_patched_copy(original_copy)
+    try:
+        yield
+    finally:
+        torch.Tensor.copy_ = original_copy
