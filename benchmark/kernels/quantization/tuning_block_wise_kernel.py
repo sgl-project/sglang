@@ -27,11 +27,11 @@ from tqdm import tqdm
 
 mp.set_start_method("spawn", force=True)
 
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     _w8a8_block_fp8_matmul,
     _w8a8_block_fp8_matmul_unrolledx4,
 )
-from sglang.srt.layers.quantization.int8_kernel import _w8a8_block_int8_matmul
+from sglang.kernels.ops.quantization.int8_kernel import _w8a8_block_int8_matmul
 from sglang.srt.utils import (
     get_device,
     get_device_core_count,
@@ -521,7 +521,9 @@ if __name__ == "__main__":
     parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument("--batch-sizes", nargs="+", type=int, required=False)
     parser.add_argument(
-        "--save-path", type=str, default="python/sglang/srt/layers/quantization/configs"
+        "--save-path",
+        type=str,
+        default="python/sglang/kernels/ops/quantization/configs",
     )
     args = parser.parse_args()
 
