@@ -431,24 +431,8 @@ class KVCacheConfigurator:
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    token_to_kv_pool = MHATokenToKVPoolFP4(
-                        max_total_num_tokens,
-                        page_size=self.server_args.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_parallel().attn_tp_size
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
+                    token_to_kv_pool = self._build_mha_fp4_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
                     )
                 else:
                     pool_cls = (
@@ -1343,6 +1327,24 @@ class KVCacheConfigurator:
             full_kv_pool_class=mha_pool_class,
             post_capture_active=self.post_capture_kv_active,
             **extra_args,
+        )
+        return token_to_kv_pool
+
+    def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        token_to_kv_pool = MHATokenToKVPoolFP4(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
         )
         return token_to_kv_pool
 
