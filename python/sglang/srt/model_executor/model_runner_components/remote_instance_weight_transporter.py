@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, kw_only=True)
-class RemoteInstanceWeightTransport:
+class RemoteInstanceWeightTransporter:
     server_args: ServerArgs
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
@@ -67,7 +67,7 @@ class RemoteInstanceWeightTransport:
             self.weight_info = register_memory_region(self.model, self.engine)
             self._register_to_engine_info_bootstrap()
 
-    def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransport):
+    def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
         The bootstrap server runs on node_rank==0. For multi-node setups, the
