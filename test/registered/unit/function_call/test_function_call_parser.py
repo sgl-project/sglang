@@ -2148,6 +2148,25 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsInstance(params["cities"], list)
         self.assertEqual(params["cities"], ["NYC"])
 
+    def test_anyof_array_parameter_conversion_null(self):
+        """
+        Test 'null' is converted correctly for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is represented by anyOf.
+        Purpose: Verify null values are parsed as 'None', not as strings.
+        """
+        text = """<tool_call>
+<function=get_current_time>
+<parameter=cities>
+null
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["cities"], None)
+
     def test_streaming_anyof_array_parameter_conversion(self):
         """
         Test streaming array parameter conversion for nullable anyOf schemas.
@@ -2230,6 +2249,63 @@ class TestQwen3CoderDetector(unittest.TestCase):
         # Should not crash
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertIsInstance(result, StreamingParseResult)
+
+    def test_nested_anyof_array_with_multiple_types_parameter_conversion(self):
+        """
+        Test several edge cases of parameter conversion for nullable anyOf schemas.
+        1) Test nested anyOf 'T | None' extracts 'T' correctly.
+        2) Test that order of null and non-null type doesn't affect schema parsing.
+        3) Test that list of multiple types (including dict) is parsed correctly.
+        """
+
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="process_optional_list",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "optional_items_to_process": {
+                            "anyOf": [
+                                {
+                                    "anyOf": [
+                                        # Note: here "null" is listed before the non-null type.
+                                        {"type": "null"},
+                                        {
+                                            "anyOf": [
+                                                {
+                                                    "type": "array",
+                                                    "items": {},
+                                                },
+                                                {"type": "null"},
+                                            ],
+                                        },
+                                    ],
+                                },
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                        }
+                    },
+                },
+            ),
+        )
+
+        text = """<tool_call>
+<function=process_optional_list>
+<parameter=optional_items_to_process>
+[true, null, {"enabled": false}]
+</parameter>
+</function>
+</tool_call>"""
+
+        result = self.detector.detect_and_parse(text, [tool])
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["optional_items_to_process"], list)
+        self.assertEqual(
+            params["optional_items_to_process"], [True, None, {"enabled": False}]
+        )
 
     # ==================== Structural tag (xgrammar builtin) ====================
     # Qwen3 Coder uses the new builtin structural tag path. supports_structural_tag()
