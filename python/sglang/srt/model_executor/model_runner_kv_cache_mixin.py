@@ -239,7 +239,7 @@ class ModelRunnerKVCacheMixin:
             # Re-calculate max_running_requests for the now smaller pool
             capped_reqs = min(
                 self.max_running_requests,
-                self._resolve_max_num_reqs(config.max_total_num_tokens),
+                self.resolve_max_num_reqs(config.max_total_num_tokens),
             )
             if capped_reqs < self.max_running_requests:
                 logger.warning(
@@ -1131,7 +1131,7 @@ class ModelRunnerKVCacheMixin:
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         return self.kv_cache_configurator._apply_token_constraints(token_capacity)
 
-    def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
+    def resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
@@ -1140,13 +1140,13 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.attn_dp_size
+            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
             max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
-        if mambaish_config(self.model_config) is not None:
+        if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
@@ -1237,7 +1237,7 @@ class ModelRunnerKVCacheMixin:
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self._config_from_budget(available_bytes)
-        config.max_running_requests = self._resolve_max_num_reqs(
+        config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
         configurator = create_memory_pool_configurator(self)
