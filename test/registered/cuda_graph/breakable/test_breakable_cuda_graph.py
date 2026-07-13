@@ -183,7 +183,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             return src * 3.0
 
         graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
+        stream = get_device_module().Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t = x + 1.0
             broken = scale(t)
