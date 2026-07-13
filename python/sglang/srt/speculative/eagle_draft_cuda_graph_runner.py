@@ -146,8 +146,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        # Static capture width: each request contributes topk candidate
-        # tokens per draft-decode step.
+        # Static capture width: topk candidate tokens per req per draft step.
         self.num_tokens_per_req = resolve_num_tokens_per_req(
             phase="draft_decode", server_args=model_runner.server_args
         )

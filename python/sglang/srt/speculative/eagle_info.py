@@ -44,11 +44,9 @@ class EagleVerifyInput(SpecInput):
         self.num_tokens_for_logprob_per_req = self.draft_token_num
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        # Keep this override on draft_token_num instead of the base
-        # field-reading implementation: the v2 worker re-stamps
-        # num_tokens_per_req = num_steps + 1 on every verify()
-        # (eagle_worker_v2.verify), which diverges from the real verify
-        # width for topk > 1 trees (draft_token_num). The DP-attention
+        # Keep this override on draft_token_num: eagle_worker_v2.verify()
+        # re-stamps num_tokens_per_req = num_steps + 1, which diverges from
+        # the real verify width for topk > 1 trees, and the DP-attention
         # global-token scaling must follow the actual tree width.
         return self.draft_token_num, self.draft_token_num
 

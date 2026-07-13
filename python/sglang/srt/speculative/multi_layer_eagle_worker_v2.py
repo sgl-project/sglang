@@ -520,8 +520,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            # Actual width of this draft-extend forward: the multi-layer chain
-            # fills num_steps + 1 rows per request.
+            # Actual width: the multi-layer chain fills num_steps + 1 rows/req.
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=1,
         )
