@@ -30,47 +30,33 @@ inline CommunicatorObj::CommunicatorObj(
   RuntimeCheck(push_workspaces.size() == world_size, "Bad push workspace count");
   RuntimeCheck(pull_workspaces.size() == world_size, "Bad pull workspace count");
   RuntimeCheck(pull_semaphores.size() == world_size, "Bad pull semaphore count");
-  constexpr auto set_or_check = [](int64_t& var, int64_t val) {
-    RuntimeCheck(val > 0, "Workspace sizes must be positive");
-    if (var == -1) {
-      var = val;
-    } else {
-      RuntimeCheck(var == val, "Inconsistent workspace sizes: ", var, " vs ", val);
-    }
-  };
-
-  int64_t pull_bytes = -1;
-  int64_t push_bytes = -1;
-  int64_t num_pull_blocks = -1;
+  // Shared symbolic sizes / device enforce consistency across ranks; the
+  // matchers also require contiguity (no strides given) and uint8 dtype.
+  auto push_bytes = SymbolicSize{"push_bytes"};
+  auto pull_bytes = SymbolicSize{"pull_bytes"};
+  auto num_pull_blocks = SymbolicSize{"num_pull_blocks"};
+  auto num_push_blocks = SymbolicSize{"num_push_blocks"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
   for (uint32_t i = 0; i < world_size; ++i) {
-    const auto& push_workspace = push_workspaces[i];
-    const auto& pull_workspace = pull_workspaces[i];
-    const auto& pull_semaphore = pull_semaphores[i];
-    RuntimeCheck(
-        push_workspace.IsContiguous() && pull_workspace.IsContiguous() && pull_semaphore.IsContiguous(),
-        "Workspaces must be contiguous");
-    RuntimeCheck(
-        push_workspace.ndim() == 2 && push_workspace.size(0) == 2 * world_size,
-        "Push workspace must be [2 * world_size, push_bytes]");
-    RuntimeCheck(pull_workspace.ndim() == 1, "Pull workspace must be 1-D");
-    RuntimeCheck(
-        pull_semaphore.ndim() == 2 && pull_semaphore.size(1) == sizeof(Semaphore),
-        "Pull semaphores must be [num_pull_blocks, sizeof(Semaphore)]");
-    RuntimeCheck(
-        is_type<uint8_t>(push_workspace.dtype()) && is_type<uint8_t>(pull_workspace.dtype()) &&
-            is_type<uint8_t>(pull_semaphore.dtype()),
-        "Workspaces must be uint8");
-    RuntimeCheck(
-        push_workspace.device().device_type == kDLCUDA && pull_workspace.device().device_type == kDLCUDA &&
-            pull_semaphore.device().device_type == kDLCUDA,
-        "Workspaces must be CUDA tensors");
-    set_or_check(push_bytes, push_workspace.size(1));
-    set_or_check(pull_bytes, pull_workspace.size(0));
-    set_or_check(num_pull_blocks, pull_semaphore.size(0));
-    this->push_workspaces[i] = static_cast<uint8_t*>(push_workspace.data_ptr());
-    this->pull_workspaces[i] = static_cast<uint8_t*>(pull_workspace.data_ptr());
-    this->pull_semaphores[i] = static_cast<Semaphore*>(pull_semaphore.data_ptr());
+    TensorMatcher({2 * world_size, push_bytes}).with_dtype<uint8_t>().with_device(device).verify(push_workspaces[i]);
+    TensorMatcher({pull_bytes})  //
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(pull_workspaces[i]);
+    TensorMatcher({num_pull_blocks, static_cast<int64_t>(sizeof(Semaphore))})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(pull_semaphores[i]);
+    this->push_workspaces[i] = static_cast<uint8_t*>(push_workspaces[i].data_ptr());
+    this->pull_workspaces[i] = static_cast<uint8_t*>(pull_workspaces[i].data_ptr());
+    this->pull_semaphores[i] = static_cast<Semaphore*>(pull_semaphores[i].data_ptr());
   }
+  TensorMatcher({num_push_blocks, static_cast<int64_t>(sizeof(Counter))})
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(push_counter);
+  RuntimeCheck(push_bytes.unwrap() > 0 && pull_bytes.unwrap() > 0, "Workspace sizes must be positive");
 
   if (pull_mc_workspace_ptr.has_value()) {
     this->pull_mc_workspace = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(pull_mc_workspace_ptr.value()));
@@ -78,24 +64,16 @@ inline CommunicatorObj::CommunicatorObj(
     this->pull_mc_workspace = nullptr;
   }
 
-  RuntimeCheck(push_counter.IsContiguous(), "Push counter must be contiguous");
-  RuntimeCheck(
-      push_counter.ndim() == 2 && push_counter.size(1) == sizeof(Counter),
-      "Push counter must be [num_push_blocks, sizeof(Counter)]");
-  RuntimeCheck(is_type<uint8_t>(push_counter.dtype()), "Push counter must be uint8");
-  RuntimeCheck(push_counter.device().device_type == kDLCUDA, "Push counter must be a CUDA tensor");
-  const int64_t num_push_blocks = push_counter.size(0);
-
   // push config
   this->push_counter = static_cast<Counter*>(push_counter.data_ptr());
-  this->push_bytes = push_bytes;
-  this->num_push_blocks = static_cast<uint32_t>(num_push_blocks);
+  this->push_bytes = push_bytes.unwrap();
+  this->num_push_blocks = static_cast<uint32_t>(num_push_blocks.unwrap());
 
   // pull config
-  this->pull_bytes = pull_bytes;
-  this->num_pull_blocks = static_cast<uint32_t>(num_pull_blocks);
-  this->num_multicast_blocks = static_cast<uint32_t>(num_pull_blocks);
-  this->total_pull_blocks = static_cast<uint32_t>(num_pull_blocks);
+  this->pull_bytes = pull_bytes.unwrap();
+  this->num_pull_blocks = static_cast<uint32_t>(num_pull_blocks.unwrap());
+  this->num_multicast_blocks = this->num_pull_blocks;
+  this->total_pull_blocks = this->num_pull_blocks;
 }
 
 inline void CommunicatorObj::config(std::map<std::string, uint32_t> config) {
