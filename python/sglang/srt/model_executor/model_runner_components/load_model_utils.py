@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import socket
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+import msgspec
 import torch
+import torch.distributed as dist
 
-from sglang.srt.configs.load_config import LoadFormat
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -24,6 +33,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
+
+
+class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
+    loader: Any
+    model: Any
+    remote_instance_weight_info: Optional[Any]
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(
