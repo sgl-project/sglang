@@ -198,6 +198,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 - `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
+- `record_execution_trace` (optional): Whether to additionally capture a PyTorch Execution Trace (ET) for graph-level debuggability, written next to the chrome trace as `*.et.json`. Only active on CUDA/ROCm/CPU/XPU (ignored on NPU and MPS). Default is `false`
 
 **Note on step ranges:** Profiling starts at `start_step` (inclusive) and continues for `num_steps` iterations. For example, with `start_step=3` and `num_steps=10`, profiling captures steps 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 (10 steps total, starting from step 3).
 
@@ -287,7 +288,8 @@ python -m sglang.profiler \
   --cpu \
   --gpu \
   --output-dir /tmp/profiles \
-  --merge-profiles # optional argument to merge profile traces (default=False)
+  --merge-profiles \
+  --export-et-trace # optional arguments: --merge-profiles merges traces, --export-et-trace also captures a PyTorch Execution Trace as *.et.json (both default=False)
 ```
 
 #### Output Files
