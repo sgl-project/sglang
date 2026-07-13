@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.quantization.utils import convert_to_channelwise
 from sglang.srt.utils import is_cuda
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
@@ -81,7 +81,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # INPUT SCALE
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
-                data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
             )
             layer.register_parameter("input_scale", input_scale)
 
@@ -90,7 +91,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 # as the weights
                 # AZP loaded as int8 but used as int32
                 input_zero_point = PerTensorScaleParameter(
-                    data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.int8),
+                    weight_loader=weight_loader,
                 )
                 layer.register_parameter("input_zero_point", input_zero_point)
 
@@ -104,14 +106,13 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # tensor scales (thus N scales being passed to the kernel),
         # requantize so we can always run per channel
         if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
+            weight = layer.weight
+            weight_scale = convert_to_channelwise(
+                layer.weight_scale, layer.logical_widths
             )
 
             layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         # If channelwise, scales are already lined up, so just transpose.
         elif self.strategy == QuantizationStrategy.CHANNEL:
