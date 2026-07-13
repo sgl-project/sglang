@@ -21,11 +21,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
-from sglang.srt.disaggregation.encode_http_server import (
-    handle_scheduler_receive_url_request,
-    launch_encoder,
-)
-from sglang.srt.disaggregation.encode_server import MMEncoder
+from sglang.srt.disaggregation.encode_server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -139,7 +135,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                             )
                         )
                     await asyncio.gather(*tasks)
-                    self.encoder.embedding_to_send.pop(request.req_id, None)
+                    self.encoder.discard_embedding(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
             elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
                 embedding_port = (
@@ -150,7 +146,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     prefill_host=request.prefill_host,
                     embedding_port=embedding_port,
                 )
-                self.encoder.embedding_to_send.pop(request.req_id, None)
+                self.encoder.discard_embedding(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
 
             return sglang_encoder_pb2.EncodeResponse()
@@ -175,7 +171,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     request.buffer_address if request.buffer_address else None
                 ),
             )
-            self.encoder.embedding_to_send.pop(request.req_id, None)
+            self.encoder.discard_embedding(request.req_id)
             return sglang_encoder_pb2.SendResponse()
 
         except Exception as e:
@@ -189,12 +185,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.SchedulerReceiveUrlRequest, context
     ) -> sglang_encoder_pb2.SchedulerReceiveUrlResponse:
         try:
-            await handle_scheduler_receive_url_request(
-                {
-                    "req_id": request.req_id,
-                    "receive_count": request.receive_count,
-                    "receive_url": request.receive_url,
-                }
+            await self.encoder.register_embedding_destinations(
+                request.req_id,
+                request.receive_count,
+                [request.receive_url],
             )
             return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
 
