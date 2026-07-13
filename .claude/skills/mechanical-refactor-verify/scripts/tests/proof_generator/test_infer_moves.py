@@ -523,3 +523,48 @@ def test_infer_recipe_constant_relocated_with_the_move(repo: Path) -> None:
     assert [am["name"] for am in recipe.assign_moves] == ["RATIO"]
     script = recipe_to_script(recipe, "move with constant")
     assert "move_assign" in script
+
+
+def test_infer_recipe_in_file_method_reorder(repo: Path) -> None:
+    """A method cut and re-inserted elsewhere in the same class (no other file gains it) infers
+    an in-file move_symbol (src == dst) anchored above its new next sibling."""
+    _write(
+        repo,
+        **{
+            "m.py": (
+                "class C:\n"
+                "    def a(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def b(self):\n"
+                "        return 2\n"
+                "\n"
+                "    def c(self):\n"
+                "        return 3\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "m.py": (
+                "class C:\n"
+                "    def c(self):\n"
+                "        return 3\n"
+                "\n"
+                "    def a(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def b(self):\n"
+                "        return 2\n"
+            )
+        },
+    )
+    commit = _commit(repo, "move c above a")
+    recipe = infer_recipe(commit, str(repo))
+    assert recipe.supported
+    assert len(recipe.moves) == 1
+    mv = recipe.moves[0]
+    assert mv["name"] == "c" and mv["src"] == "m.py" and mv["dst"] == "m.py"
+    assert mv["into_class"] == "C" and mv["before"] == "a"

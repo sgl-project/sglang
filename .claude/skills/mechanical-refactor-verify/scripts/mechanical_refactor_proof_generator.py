@@ -931,6 +931,12 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             (p for p, f in files.items() if name in def_names(f["added"]) and p != src),
             None,
         )
+        # A def cut and re-added within the same file (no other file gained it) is an
+        # in-file reorder -- a move_symbol whose src and dst are that file. A signature or
+        # body edit that happens to touch the def line is not a faithful move, but the
+        # reproduction's byte-diff surfaces it as a residual, so this never false-passes.
+        if dst is None and src is not None and name in def_names(files[src]["added"]):
+            dst = src
         if src is None or dst is None or dst in new_files:
             continue
         src_before = _git_output(["show", f"{commit}^:{src}"], root)
