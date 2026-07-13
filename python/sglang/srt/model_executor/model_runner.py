@@ -880,6 +880,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
+        # Init fuzzy KV realizer (radix-cache backend "fuzzy_match")
+        self.maybe_init_fuzzy_kv_realizer()
+
         if self.enable_hisparse:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -2566,6 +2569,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
 
+    def maybe_init_fuzzy_kv_realizer(self):
+        self.fuzzy_kv_realizer = None
+        if self.server_args.radix_cache_backend == "fuzzy_match":
+            from sglang.srt.mem_cache.fuzzy_match.realizer import FuzzyKVRealizer
+
+            self.fuzzy_kv_realizer = FuzzyKVRealizer(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                model=self.model,
+            )
+
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
@@ -3182,6 +3196,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+            # Realize fuzzy-matched donor KV (copy + RoPE correction) on the
+            # forward stream, before the extend dispatch below reads the pool.
+            if self.fuzzy_kv_realizer is not None and forward_batch.fuzzy_reqs:
+                self.fuzzy_kv_realizer.realize(fuzzy_reqs=forward_batch.fuzzy_reqs)
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.

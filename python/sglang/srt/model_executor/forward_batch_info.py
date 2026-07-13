@@ -369,6 +369,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
 
+    # Requests carrying a fuzzy KV match to realize before the forward pass
+    # (donor KV copy + RoPE correction). Set only by the fuzzy_match
+    # radix-cache backend; each req holds its own fuzzy state.
+    fuzzy_reqs: Optional[list] = None
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
@@ -654,10 +659,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # extend-mode-only fields are None on decode/idle
         if batch.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            fuzzy_reqs = None
         else:
             extend_seq_lens = batch.extend_lens
             extend_prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
+            # Fuzzy-matched donor KV must be realized (copied + RoPE-corrected)
+            # before this extend runs; only set by the fuzzy_match backend.
+            fuzzy_reqs = [
+                req for req in batch.reqs if req.cache_fuzzy_matched_len > 0
+            ] or None
 
         # Mirror the grammars-population behavior previously done in
         # ScheduleBatch.get_model_worker_batch.
@@ -705,6 +716,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
+            fuzzy_reqs=fuzzy_reqs,
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,

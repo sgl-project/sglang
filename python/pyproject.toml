@@ -94,6 +94,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+fuzzy-semantic = ["semblend>=0.3.12"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "addict==2.4.0",

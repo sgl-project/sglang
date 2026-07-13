@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
+    ReverseRotaryEmbedding,
     RotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.mrope import (
@@ -449,3 +450,57 @@ def get_rope_wrapper(
         partial_rotary_factor,
         device,
     )
+
+
+_REVERSE_ROPE_DICT: Dict[Tuple, ReverseRotaryEmbedding] = {}
+
+
+def get_reverse_rope(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+) -> ReverseRotaryEmbedding:
+    """Get a ReverseRotaryEmbedding for removing RoPE from cached K values.
+
+    Used in fuzzy prefix matching: when a cached KV segment at position P is
+    reused at position P', we first apply reverse RoPE to remove the original
+    positional encoding, then the attention layer applies RoPE at P'.
+
+    The API is identical to get_rope() for easy drop-in usage.
+    """
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if rope_scaling is not None:
+        rope_scaling_tuple = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
+        }
+        rope_scaling_args = tuple(rope_scaling_tuple.items())
+    else:
+        rope_scaling_args = None
+
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
+    key = (
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling_args,
+        dtype,
+    )
+    if key in _REVERSE_ROPE_DICT:
+        return _REVERSE_ROPE_DICT[key]
+
+    # For simplicity, always use ReverseRotaryEmbedding with forward_native.
+    # Scaling variants can be added later if needed.
+    rotary_emb = ReverseRotaryEmbedding(
+        head_size, rotary_dim, max_position, base, is_neox_style, dtype
+    )
+    _REVERSE_ROPE_DICT[key] = rotary_emb
+    return rotary_emb

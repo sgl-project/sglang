@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import (
+    apply_rotary_emb,
+    reverse_rotary_emb,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_server_args
@@ -566,3 +569,102 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
     @property
     def scaling_factor_to_offset(self) -> Dict[float, int]:
         return self._scaling_factor_to_offset
+
+
+class ReverseRotaryEmbedding(MultiPlatformOp):
+    """Reverse RoPE: removes positional embedding from cached K values.
+
+    This is a standalone class (not inheriting RotaryEmbedding) because:
+    1. Reverse RoPE is semantically different from forward RoPE
+    2. Inheriting from RotaryEmbedding caused bugs where forward_cuda
+       (which applies forward RoPE) was called instead of the reverse logic
+    3. No CUDA kernel exists for reverse RoPE - always falls back to native
+
+    Forward RoPE:  k_rot = k * cos + rotate_half(k) * sin
+    Reverse RoPE: k_orig = k_rot * cos - rotate_half(k_rot) * sin
+
+    This is used to reposition fuzzy-matched KV cache from original positions
+    to new positions. The K cache stored at position P has RoPE applied;
+    when reused at position P', we first reverse RoPE to get k_orig, then
+    the attention layer will apply RoPE at the new position.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+
+        # Compute cos/sin cache (same as RotaryEmbedding)
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        if not _is_cuda:
+            cache = cache.to(dtype)
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reverse RoPE on key only (query is passed through unchanged)."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for reverse rotary embedding"
+
+        if offsets is not None:
+            positions = positions + offsets
+
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        # Only reverse RoPE on K, Q is passed through unchanged
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        # Reverse RoPE: remove positional encoding
+        key_rot = reverse_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CUDA forward: fall back to native since no reverse RoPE kernel exists."""
+        return self.forward_native(
+            positions, query, key, offsets, fused_set_kv_buffer_arg
+        )
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        return s

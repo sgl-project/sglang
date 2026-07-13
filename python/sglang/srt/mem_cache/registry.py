@@ -198,6 +198,11 @@ def _create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = ctx.server_args.radix_cache_backend
+    if name == "fuzzy_match":
+        # In-tree backend registered on import (lazy to avoid the provider
+        # stack on unrelated startups).
+        import sglang.srt.mem_cache.fuzzy_match  # noqa: F401
+
     if name:
         factory = get_radix_cache_factory(name)
         if factory is None:
