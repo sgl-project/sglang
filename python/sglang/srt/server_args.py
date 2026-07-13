@@ -1116,6 +1116,16 @@ class ServerArgs:
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
     reasoning_parser: Optional[str] = None
+    default_chat_template_kwargs: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Default chat template kwargs applied to every request when not "
+            "overridden per-request. Keys must match what the model's chat template "
+            "expects (e.g. enable_thinking, thinking, reasoning_effort). Per-request "
+            "chat_template_kwargs takes precedence.",
+            type_parser=json.loads,
+        ),
+    ] = None
     strip_thinking_cache: A[
         bool,
         "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",
@@ -1977,9 +1987,9 @@ class ServerArgs:
         Optional[str],
         "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
     ] = None
-    enable_deepep_waterfill: A[
+    enable_waterfill: A[
         bool,
-        "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+        "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
     elastic_ep_rejoin: A[
         bool,
@@ -1992,7 +2002,7 @@ class ServerArgs:
     disable_shared_experts_fusion: A[
         bool,
         Arg(
-            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: Waterfill (--enable-waterfill) routes the shared expert as an extra MoE slot, so the shared expert is not separated from the MoE path when Waterfill is enabled.",
             resolvable=True,
         ),
     ] = False
@@ -2809,6 +2819,13 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
+
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -5492,6 +5509,10 @@ class ServerArgs:
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
         a2a_backend = resolved_view(self).moe_a2a_backend
+        if self.enable_waterfill:
+            self.enforce_shared_experts_fusion = True
+            logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
@@ -5508,11 +5529,6 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            if self.enable_deepep_waterfill:
-                self.enforce_shared_experts_fusion = True
-                logger.info(
-                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
-                )
 
         if a2a_backend == "mooncake":
             logger.warning(

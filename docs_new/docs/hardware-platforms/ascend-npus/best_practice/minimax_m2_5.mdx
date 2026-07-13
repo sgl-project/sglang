@@ -14,16 +14,16 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 24.44ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-24-44ms) |
-| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms) |
+| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 24.44ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-24-44ms) |
+| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiniMax-M2.5 | Atlas 800I A3 | 4 | PD Mixed | 32K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in32k-out1k-50ms) |
-| MiniMax-M2.5 | Atlas 800I A3 | 4 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms) |
-| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
+| MiniMax-M2.5 | Atlas 800I A3 | 4 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in32k-out1k-50ms) |
+| MiniMax-M2.5 | Atlas 800I A3 | 4 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms) |
+| MiniMax-M2.5 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -41,7 +41,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 32K+1K
+**Dataset**: 32k+1k
 
 **TPOT**: 50ms
 
@@ -151,7 +151,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 64K+1K (90% prefix cache hit rate)
+**Dataset**: 64k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -260,7 +260,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 24.44ms
 
@@ -371,7 +371,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 20ms
 
@@ -476,7 +476,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
