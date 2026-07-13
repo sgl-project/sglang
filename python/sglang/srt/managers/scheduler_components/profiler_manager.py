@@ -460,7 +460,7 @@ class SchedulerProfilerManager:
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
                     recv_req.profile_stages,
-                    recv_req.record_execution_trace,
+                    record_execution_trace=recv_req.record_execution_trace,
                 )
             else:
                 self._init_profile(

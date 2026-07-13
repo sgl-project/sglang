@@ -142,7 +142,8 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Whether to also capture a PyTorch Execution Trace (ET) alongside "
-        "the chrome trace, saved as *.et.json (CUDA/CPU only, not NPU).",
+        "the chrome trace, saved as *.et.json (CUDA/ROCm/CPU/XPU only, "
+        "ignored on NPU and MPS).",
     )
 
     args = parser.parse_args()
