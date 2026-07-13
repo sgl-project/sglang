@@ -158,7 +158,8 @@ def l2norm_fwd_qk(xq: torch.Tensor, xk: torch.Tensor, eps: float = 1e-6):
 
     Requires q/k of identical shape/dtype (GDN: num_q_heads == num_k_heads of
     head_k_dim); the second grid axis selects the tensor. Bit-identical to two
-    separate ``l2norm_fwd`` calls (pinned by test_gdn_prefill_cutedsl.py).
+    separate ``l2norm_fwd`` calls (pinned by
+    test_gdn_prefill_flashinfer_opts.py).
     """
     assert xq.shape == xk.shape and xq.dtype == xk.dtype
     shape_og = xq.shape

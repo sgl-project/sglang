@@ -13,10 +13,8 @@ from typing import Optional
 import torch
 
 from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
-from sglang.srt.layers.attention.linear.kernels.gdn_kernel_backend import (
-    GDNKernelBase,
-    unwrap_direct_write_out,
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,7 +28,7 @@ def _is_blackwell() -> bool:
     return major >= 10
 
 
-class CuteDSLGDNKernel(GDNKernelBase):
+class CuteDSLGDNKernel(LinearAttnKernelBase):
     """CuTe DSL kernel for GDN.
 
     Decode: ``cutedsl_fused_sigmoid_gating_delta_rule_update`` (SM90+).
@@ -49,6 +47,7 @@ class CuteDSLGDNKernel(GDNKernelBase):
         # still construct the kernel just for decode.
         self._extend_fn: Optional[callable] = None
         self._prepare_meta_fn: Optional[callable] = None
+        self._l2norm_fn: Optional[callable] = None
 
     def _ensure_extend_loaded(self, head_k_dim: int) -> None:
         if self._extend_fn is not None:
@@ -66,6 +65,7 @@ class CuteDSLGDNKernel(GDNKernelBase):
             raise RuntimeError(
                 f"CuTe DSL GDN prefill requires head_k_dim=128, got {head_k_dim}."
             )
+        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
         from sglang.srt.layers.attention.linear.kernels.gdn_blackwell import (
             chunk_gated_delta_rule_cutedsl,
             prepare_metadata_cutedsl,
@@ -73,6 +73,7 @@ class CuteDSLGDNKernel(GDNKernelBase):
 
         self._extend_fn = chunk_gated_delta_rule_cutedsl
         self._prepare_meta_fn = prepare_metadata_cutedsl
+        self._l2norm_fn = l2norm_fwd
         logger.info("Using CuTe DSL GDN prefill (Blackwell)")
 
     def decode(
@@ -106,36 +107,6 @@ class CuteDSLGDNKernel(GDNKernelBase):
             softplus_threshold=20.0,
         )
 
-    def build_extend_prep(
-        self,
-        *,
-        head_k_dim: int,
-        query_start_loc: torch.Tensor,
-        cache_indices: torch.Tensor,
-        ssm_states: torch.Tensor,
-        total_seq_len: int,
-    ) -> tuple:
-        """Compute the layer-invariant extend metadata once per forward.
-
-        All three quantities depend only on per-request data (query start
-        locations, cache slots, sequence structure), identical across all GDN
-        layers of a forward, so forward_extend builds this once and reuses it
-        for every per-layer extend() call. Must stay bit-identical to extend()'s
-        prep=None recompute.
-        """
-        self._ensure_extend_loaded(head_k_dim)
-        cu_seqlens = query_start_loc.to(torch.int32)
-        # Pool gather indices: remap padding (-1) to the last (sentinel) slot.
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0,
-            cache_indices,
-            ssm_states.shape[0] - 1,
-        ).to(torch.long)
-        chunk_indices, chunk_offsets = self._prepare_meta_fn(
-            cu_seqlens, total_seq_len, chunk_size=64
-        )
-        return cu_seqlens, ssm_cache_indices, chunk_indices, chunk_offsets
-
     def extend(
         self,
         q: torch.Tensor,
@@ -147,8 +118,6 @@ class CuteDSLGDNKernel(GDNKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        prep: Optional[tuple] = None,
         **kwargs,
     ) -> tuple:
         head_k_dim = k.shape[-1]
@@ -159,32 +128,25 @@ class CuteDSLGDNKernel(GDNKernelBase):
         head_v_dim = v.shape[3]
 
         # L2 norm Q/K outside the kernel (same as flashinfer path).
-        q_norm, k_norm = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
-        q_norm = q_norm.unsqueeze(0)
-        k_norm = k_norm.unsqueeze(0)
+        q_norm = self._l2norm_fn(q[0].contiguous()).unsqueeze(0)
+        k_norm = self._l2norm_fn(k[0].contiguous()).unsqueeze(0)
         v_in = v[0].contiguous().unsqueeze(0)
         # Kernel expects log-space float32 gate per (token, v-head).
         g_in = g[0].to(torch.float32).unsqueeze(0)
         beta_in = beta[0].to(torch.float32).unsqueeze(0)
 
-        if prep is None:
-            # Fallback for direct extend() callers (e.g. unit tests); the hot
-            # path passes prep built once per forward.
-            prep = self.build_extend_prep(
-                head_k_dim=head_k_dim,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
-                ssm_states=ssm_states,
-                total_seq_len=total_seq_len,
-            )
-        cu_seqlens, ssm_cache_indices, chunk_indices, chunk_offsets = prep
+        cu_seqlens = query_start_loc.to(torch.int32)
 
-        # Pool gather (prep's ssm_cache_indices already remap -1 padding to the
-        # sentinel slot).
+        # Pool gather: remap padding (-1) to the last (sentinel) slot.
+        ssm_cache_indices = torch.where(
+            cache_indices >= 0,
+            cache_indices,
+            ssm_states.shape[0] - 1,
+        ).to(torch.long)
         initial_state = ssm_states[ssm_cache_indices].contiguous()
 
-        core_attn_out = unwrap_direct_write_out(
-            out, expected_shape=(1, total_seq_len, num_v_heads, head_v_dim)
+        chunk_indices, chunk_offsets = self._prepare_meta_fn(
+            cu_seqlens, total_seq_len, chunk_size=64
         )
 
         output, final_state = self._extend_fn(
@@ -197,7 +159,6 @@ class CuteDSLGDNKernel(GDNKernelBase):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
-            core_attn_out=core_attn_out,
         )
 
         ssm_states.index_copy_(

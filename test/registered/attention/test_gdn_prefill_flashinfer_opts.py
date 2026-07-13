@@ -1,6 +1,6 @@
 """Tests for the GDN FlashInfer prefill wrapper optimizations.
 
-CuteDSL counterparts: test_gdn_prefill_cutedsl.py. Covered:
+Covered:
 - fused q/k l2norm (single launch, 0-ULP vs two l2norm_fwd calls)
 - direct-write output (extend(out=...) writes via FlashInfer's output= param)
 - hoisted layer-invariant prep (extend(prep=...) reuses pool-gather indices)
@@ -33,7 +33,7 @@ if not is_flashinfer_gdn_prefill_available():
 
 
 def _build_extend_inputs(num_seqs: int):
-    """Synthetic GDN extend inputs (same construction as the CuteDSL test)."""
+    """Synthetic GDN extend inputs matching production layouts."""
     seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
     cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
     cu_seqlens[1:] = seq_lens.to(device="cuda").cumsum(0)
@@ -214,6 +214,51 @@ def test_flashinfer_extend_no_prefix_gather_skip(num_seqs: int):
     o_poison, _ = _run(kernel, inp, no_prefix=True)
     assert (o_poison.float() - o_gather.float()).abs().max().item() == 0
     assert not torch.isnan(o_poison.float()).any()
+
+
+@pytest.mark.parametrize("total_tokens", [1, 3, 127, 1024, 4096])
+def test_flashinfer_l2norm_qk_fusion_bitexact(total_tokens: int):
+    """The fused q/k l2norm must be bit-identical to its two-call reference."""
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_qk
+
+    num_k_heads, head_k_dim, dtype = 4, 128, torch.bfloat16
+    q = torch.randn(
+        1, total_tokens, num_k_heads, head_k_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn_like(q)
+
+    old_q = l2norm_fwd(q[0].contiguous())
+    old_k = l2norm_fwd(k[0].contiguous())
+    new_q, new_k = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
+    torch.cuda.synchronize()
+
+    assert (new_q.float() - old_q.float()).abs().max().item() == 0
+    assert (new_k.float() - old_k.float()).abs().max().item() == 0
+    assert new_q.dtype == dtype and new_k.dtype == dtype
+    assert tuple(new_q.shape) == (total_tokens, num_k_heads, head_k_dim)
+    assert tuple(new_k.shape) == (total_tokens, num_k_heads, head_k_dim)
+
+
+def test_flashinfer_l2norm_qk_fusion_launch_count():
+    """The FlashInfer q/k normalization fusion must use one launch, not two."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_qk
+
+    q = torch.randn(4096, 4, 128, device="cuda", dtype=torch.bfloat16).reshape(-1, 128)
+    k = torch.randn_like(q)
+
+    def count(name_substr, fn):
+        fn()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            fn()
+            torch.cuda.synchronize()
+        return sum(e.count for e in prof.key_averages() if name_substr in e.key)
+
+    old = count("l2norm_fwd_kernel", lambda: (l2norm_fwd(q), l2norm_fwd(k)))
+    new = count("l2norm_fwd_qk_kernel", lambda: l2norm_fwd_qk(q, k))
+    assert old == 2 and new == 1
 
 
 def _bits_equal(x: torch.Tensor, y: torch.Tensor) -> bool:

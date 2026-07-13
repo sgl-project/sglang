@@ -180,14 +180,15 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Resolve the complete packed-prefill strategy once. Bind FlashInfer
-        # explicitly so an API rename fails during initialization instead of
-        # silently disabling the optimization.
-        self._extend_prefill_impl = (
-            self.extend_kernel.extend_packed
-            if prefill_backend.is_flashinfer()
-            else self._extend_prefill_separated
-        )
+        # Resolve the FlashInfer-only packed-prefill strategy and metadata
+        # hoist once. Other backends retain their original separated path and
+        # per-layer metadata behavior.
+        if prefill_backend.is_flashinfer():
+            self._extend_prefill_impl = self.extend_kernel.extend_packed
+            self._build_extend_prep_impl = self.extend_kernel.build_extend_prep
+        else:
+            self._extend_prefill_impl = self._extend_prefill_separated
+            self._build_extend_prep_impl = None
 
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
@@ -281,7 +282,11 @@ class GDNKernelDispatcher:
         ssm_states: torch.Tensor,
         total_seq_len: int,
     ) -> Optional[tuple]:
-        return self.extend_kernel.build_extend_prep(
+        if self._build_extend_prep_impl is None:
+            # Empty opaque metadata marks this forward as initialized without
+            # changing non-FlashInfer backend behavior.
+            return ()
+        return self._build_extend_prep_impl(
             head_k_dim=head_k_dim,
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
@@ -710,13 +715,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         actual_seq_len = mixed_qkv.shape[0]
         qkv_shape = _qkv_shape_from_layer(layer)
 
-        # Layer-invariant prep (pool-gather indices; for CuteDSL also cu_seqlens
-        # + chunk metadata), built on the first layer of each forward. Keyed by
-        # the memo generation above, NOT by state_cache_indices (a fresh arange
-        # per layer in the envelope pool). needs_state_gather and pool contiguity
-        # are layer-invariant, so layer-1's tensors are exact for all layers;
-        # build_extend_prep sees the same ssm_states_contig / state_cache_indices
-        # the kernel's extend receives.
+        # FlashInfer's layer-invariant pool-gather indices are built on the
+        # first layer of each forward. Other backends receive empty opaque
+        # metadata and preserve their original per-layer behavior. Keyed by the
+        # memo generation above, NOT by state_cache_indices (a fresh arange per
+        # layer in the envelope pool). needs_state_gather and pool contiguity
+        # are layer-invariant, so layer-1's tensors are exact for all layers.
         if self._extend_prep is None:
             self._extend_prep = self.kernel_dispatcher.build_extend_prep(
                 head_k_dim=layer.head_k_dim,
