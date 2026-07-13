@@ -1119,7 +1119,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_cuda_arch()
 
-        self.load_config = self._build_load_config()
+        self.load_config = self.build_load_config()
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
@@ -1129,7 +1129,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args, tp_rank=self.tp_rank
         )
 
-        self._load_model_with_memory_saver()
+        self.load_model_with_memory_saver()
 
         if not self.is_draft_worker:
             get_offloader().post_init()
@@ -1191,7 +1191,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        self._dist_barrier_after_load()
+        self.dist_barrier_after_load()
 
     def _prepare_moe_topk(self):
         balancer_cls = None
@@ -1268,7 +1268,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_global_lplb_solver(lid, solver)
         logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
-    def _build_load_config(self) -> LoadConfig:
+    def build_load_config(self) -> LoadConfig:
         # Prepare the model config
         from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -1298,7 +1298,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             draft_model_idx=self.draft_model_idx,
         )
 
-    def _load_model_with_memory_saver(self) -> None:
+    def load_model_with_memory_saver(self) -> None:
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -1328,7 +1328,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-    def _dist_barrier_after_load(self) -> None:
+    def dist_barrier_after_load(self) -> None:
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
