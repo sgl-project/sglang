@@ -132,7 +132,8 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
-    # Optional fields are appended after the stable registration prefix.
+    # Staging stays at frames 12-13 for wire compatibility; append new optional
+    # registration fields after it.
     staging: Optional[StagingRegisterInfo] = None
     dst_kv_data_layout: Optional[list] = None
     dst_state_data_layouts: Optional[List[list]] = None
@@ -623,10 +624,8 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices, dst_data_indices
         )
 
-        layers_params = None
-
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+        if self.kv_args.require_descriptor_matched_transfer:
             layers_params = self.build_descriptor_matched_transfer_params(
                 src_data_ptrs,
                 dst_data_ptrs,
@@ -635,61 +634,49 @@ class MooncakeKVManager(CommonKVManager):
                 dst_data_layout,
                 dst_item_lens,
             )
-            if layers_params is None:
-                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(
-                        src_data_ptrs, dst_data_ptrs, state_type
-                    )
-                )
-                layers_params = [
-                    (
-                        src_kv_ptrs[layer_id],
-                        dst_kv_ptrs[layer_id],
-                        item_lens[layer_id],
-                    )
-                    for layer_id in range(layers_current_pp_stage)
-                ]
-        else:
-            layers_params = self.build_descriptor_matched_transfer_params(
-                src_data_ptrs,
-                dst_data_ptrs,
-                item_lens,
-                src_data_layout,
-                dst_data_layout,
-                dst_item_lens,
+        elif self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
             )
-            if layers_params is None:
+            layers_params = [
                 (
-                    src_k_ptrs,
-                    src_v_ptrs,
-                    dst_k_ptrs,
-                    dst_v_ptrs,
-                    layers_current_pp_stage,
-                ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-                # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
-                # Use correct item lengths for K and V separately
-                if layers_current_pp_stage > len(dst_k_ptrs):
-                    logger.error(
-                        "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
-                        f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
-                    )
-                    return -1
-                layers_params = [
-                    (
-                        src_k_ptrs[layer_id],
-                        dst_k_ptrs[layer_id],
-                        item_lens[layer_id],  # K item length
-                    )
-                    for layer_id in range(layers_current_pp_stage)
-                ] + [
-                    (
-                        src_v_ptrs[layer_id],
-                        dst_v_ptrs[layer_id],
-                        item_lens[layers_current_pp_stage + layer_id],  # V item length
-                    )
-                    for layer_id in range(layers_current_pp_stage)
-                ]
-        assert layers_params is not None
+                    src_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    item_lens[layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+        else:
+            (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_current_pp_stage,
+            ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
+            # Use correct item lengths for K and V separately
+            if layers_current_pp_stage > len(dst_k_ptrs):
+                logger.error(
+                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
+                )
+                return -1
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    item_lens[layer_id],  # K item length
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    item_lens[layers_current_pp_stage + layer_id],  # V item length
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int

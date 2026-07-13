@@ -83,8 +83,8 @@ class KVArgs:
     # so decode must pull from every prefill CP rank. This is broader than
     # KVCache.layer_shard_enabled, which only marks contiguous layer ranges.
     cp_cache_layer_split: bool
-    # True when descriptor-matched cache transfer is required and incomplete
-    # descriptor metadata must fail instead of falling back to positional order.
+    # Prefill-side only: require descriptor-matched transfer and fail instead
+    # of falling back to positional order when descriptor metadata is incomplete.
     require_descriptor_matched_transfer: bool
     # Only used of npu, for kv buf groups
     kv_buf_groups: int

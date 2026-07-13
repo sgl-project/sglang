@@ -877,36 +877,31 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    @staticmethod
     def build_descriptor_matched_transfer_params(
-        self,
         src_data_ptrs,
         dst_data_ptrs,
         item_lens,
         src_data_layout,
         dst_data_layout,
         dst_item_lens=None,
-    ) -> Optional[List[Tuple[int, int, int]]]:
+    ) -> List[Tuple[int, int, int]]:
         """Build transfer params by descriptor instead of positional index.
 
-        Some CP Cache LayerSplit pools store only a subset of layers on each
-        prefill CP rank while decode stores the full layer set. Descriptor
-        matching keeps source buffers aligned with their real decode destination
-        buffers.
+        DeepSeek V4 LayerSplit compacts multiple cache families into per-rank
+        buffer lists whose count and positional order differ from decode's full
+        layout. Descriptors identify each buffer by family and layer so it is
+        transferred to the matching decode destination.
         """
-        require_descriptor_matched_transfer = bool(
-            self.kv_args.require_descriptor_matched_transfer
-        )
         if not src_data_layout or not dst_data_layout:
-            if require_descriptor_matched_transfer:
-                raise RuntimeError(
-                    "Descriptor-matched cache transfer requires descriptors on both "
-                    f"source and destination, got src={len(src_data_layout or [])}, "
-                    f"dst={len(dst_data_layout or [])}"
-                )
-            return None
+            raise RuntimeError(
+                "Descriptor-matched cache transfer requires descriptors on both "
+                f"source and destination, got src={len(src_data_layout or [])}, "
+                f"dst={len(dst_data_layout or [])}"
+            )
 
         dst_item_lens = dst_item_lens or []
-        if require_descriptor_matched_transfer and not dst_item_lens:
+        if not dst_item_lens:
             raise RuntimeError(
                 "Descriptor-matched cache transfer requires destination item sizes"
             )
@@ -915,21 +910,17 @@ class CommonKVManager(BaseKVManager):
             len(src_data_layout) != len(src_data_ptrs)
             or len(src_data_layout) != len(item_lens)
             or len(dst_data_layout) != len(dst_data_ptrs)
-            or (dst_item_lens and len(dst_data_layout) != len(dst_item_lens))
+            or len(dst_data_layout) != len(dst_item_lens)
         ):
-            if require_descriptor_matched_transfer:
-                raise RuntimeError(
-                    "Descriptor-matched cache transfer descriptor length mismatch: "
-                    f"src_layout={len(src_data_layout)}, "
-                    f"src_ptrs={len(src_data_ptrs)}, item_lens={len(item_lens)}, "
-                    f"dst_layout={len(dst_data_layout)}, dst_ptrs={len(dst_data_ptrs)}, "
-                    f"dst_item_lens={len(dst_item_lens)}"
-                )
-            return None
+            raise RuntimeError(
+                "Descriptor-matched cache transfer descriptor length mismatch: "
+                f"src_layout={len(src_data_layout)}, "
+                f"src_ptrs={len(src_data_ptrs)}, item_lens={len(item_lens)}, "
+                f"dst_layout={len(dst_data_layout)}, dst_ptrs={len(dst_data_ptrs)}, "
+                f"dst_item_lens={len(dst_item_lens)}"
+            )
 
         dst_by_key = {}
-        if not dst_item_lens:
-            dst_item_lens = [None] * len(dst_data_layout)
         for key, ptr, dst_item_len in zip(
             dst_data_layout, dst_data_ptrs, dst_item_lens
         ):
@@ -955,7 +946,7 @@ class CommonKVManager(BaseKVManager):
                 missing.append(key)
                 continue
             dst_ptr, dst_item_len = dst_match
-            if dst_item_len is not None and int(item_len) != int(dst_item_len):
+            if int(item_len) != int(dst_item_len):
                 raise RuntimeError(
                     "transfer descriptor item size mismatch for "
                     f"{key!r}: source={int(item_len)}, destination={int(dst_item_len)}"

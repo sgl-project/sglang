@@ -39,9 +39,12 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.layers.cp.utils import is_cp_cache_layer_split_enabled
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
     CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    get_cp_cache_layer_shard_info,
+    should_use_cp_cache_layer_split_pool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -925,10 +928,8 @@ class KVCacheConfigurator:
                 max_num_reqs=max_running_requests,
             )
         else:
-            if (
-                not self.is_draft_worker
-                and is_cp_cache_layer_split_enabled(self.server_args)
-            ):
+            layer_shard_rank, layer_shard_size = get_cp_cache_layer_shard_info(self)
+            if layer_shard_rank is not None:
                 pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool
             else:
                 pool_cls = DeepSeekV4TokenToKVPool
@@ -967,8 +968,8 @@ class KVCacheConfigurator:
         )
         if pool_cls is CpCacheLayerSplitDeepSeekV4TokenToKVPool:
             token_to_kv_pool = pool_cls(
-                cp_rank=get_parallel().attn_cp_rank,
-                cp_size=get_parallel().attn_cp_size,
+                cp_rank=layer_shard_rank,
+                cp_size=layer_shard_size,
                 cp_cache_layer_split_staging_context_len=self.model_config.context_len,
                 cp_cache_layer_split_staging_chunked_prefill_size=(
                     self.server_args.chunked_prefill_size
@@ -1119,12 +1120,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
-
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
-        ) = get_glm_dsa_cp_layer_shard_info(self)
+        ) = get_cp_cache_layer_shard_info(self)
         pool_kwargs = {}
         if self.server_args.enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
@@ -1642,10 +1641,7 @@ class KVCacheConfigurator:
             )
             token_capacity = tensor.item()
 
-        if (
-            not self.is_draft_worker
-            and is_cp_cache_layer_split_enabled(self.server_args)
-        ):
+        if should_use_cp_cache_layer_split_pool(self):
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

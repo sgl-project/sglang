@@ -1,8 +1,4 @@
-"""CP Cache LayerSplit public helpers.
-
-Keep V4 pool/helper imports on their submodule paths; re-exporting them here
-would reintroduce a circular import with ``deepseek_v4_memory_pool``.
-"""
+"""CP Cache LayerSplit public helpers."""
 
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
     CpCacheLayerSplitDeepSeekV4PoolLayout,

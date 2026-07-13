@@ -39,7 +39,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestDisaggregationWire(CustomTestCase):
+class TestDisaggregationWire(unittest.TestCase):
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),
@@ -100,64 +100,36 @@ class TestCpCacheLayerSplitTransferLayoutWire(CustomTestCase):
 
 class TestCpCacheLayerSplitDescriptorMatching(CustomTestCase):
     def _build_params(self, **kwargs):
-        mgr = SimpleNamespace(
-            kv_args=SimpleNamespace(
-                require_descriptor_matched_transfer=kwargs.pop(
-                    "require_descriptor_matched_transfer", True
-                )
-            )
+        params = dict(
+            src_data_ptrs=[100],
+            dst_data_ptrs=[200],
+            item_lens=[16],
+            src_data_layout=[("dsv4_c4_kv", 1)],
+            dst_data_layout=[("dsv4_c4_kv", 1)],
+            dst_item_lens=[16],
         )
-        return CommonKVManager.build_descriptor_matched_transfer_params(mgr, **kwargs)
+        params.update(kwargs)
+        return CommonKVManager.build_descriptor_matched_transfer_params(**params)
 
     def test_descriptor_matching_checks_destination_item_size(self):
         with self.assertRaisesRegex(RuntimeError, "item size mismatch"):
-            self._build_params(
-                src_data_ptrs=[100],
-                dst_data_ptrs=[200],
-                item_lens=[16],
-                src_data_layout=[("dsv4_c4_kv", 1)],
-                dst_data_layout=[("dsv4_c4_kv", 1)],
-                dst_item_lens=[32],
-            )
+            self._build_params(dst_item_lens=[32])
 
     def test_required_descriptor_matching_rejects_missing_layouts(self):
         with self.assertRaisesRegex(RuntimeError, "descriptors on both"):
             self._build_params(
-                src_data_ptrs=[100],
-                dst_data_ptrs=[200],
-                item_lens=[16],
                 src_data_layout=[],
                 dst_data_layout=[],
-                dst_item_lens=[16],
             )
-
-    def test_optional_descriptor_matching_allows_positional_fallback(self):
-        self.assertIsNone(
-            self._build_params(
-                src_data_ptrs=[100],
-                dst_data_ptrs=[200],
-                item_lens=[16],
-                src_data_layout=[],
-                dst_data_layout=[],
-                require_descriptor_matched_transfer=False,
-            )
-        )
 
     def test_descriptor_matching_returns_pointer_item_len_tuples(self):
         self.assertEqual(
-            self._build_params(
-                src_data_ptrs=[100],
-                dst_data_ptrs=[200],
-                item_lens=[16],
-                src_data_layout=[("dsv4_c4_kv", 1)],
-                dst_data_layout=[("dsv4_c4_kv", 1)],
-                dst_item_lens=[16],
-            ),
+            self._build_params(),
             [(100, 200, 16)],
         )
 
 
-class TestGroupConcurrentContiguous(CustomTestCase):
+class TestGroupConcurrentContiguous(unittest.TestCase):
     @staticmethod
     def _arr(values):
         return np.array(values, dtype=np.int32)

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
-from sglang.srt.mem_cache.cp_cache_layer_split.ownership import (
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
     get_global_layer_shard_range,
+    get_layer_owner,
+    get_layer_shard_range,
 )
 
 logger = logging.getLogger(__name__)
@@ -17,15 +18,15 @@ class CpCacheLayerSplitPoolBase:
 
     requires_descriptor_matched_transfer = False
 
-    def __init__(
+    def _init_cp_cache_layer_split(
         self,
-        *args,
+        *,
         cp_rank: int,
         cp_size: int,
         layer_shard_start_layer: int,
         layer_shard_layer_num: int,
-        **kwargs,
     ) -> None:
+        """Initialize the stage-local layer ownership state."""
         if cp_size <= 1:
             raise ValueError(f"Cache LayerSplit requires cp_size > 1, got {cp_size}")
         if not 0 <= cp_rank < cp_size:
@@ -41,7 +42,6 @@ class CpCacheLayerSplitPoolBase:
         self.cp_size = cp_size
         self._layer_shard_start_layer = layer_shard_start_layer
         self._layer_shard_layer_num = layer_shard_layer_num
-        super().__init__(*args, **kwargs)
 
     def _local_layer_idx(self, layer_id: int) -> int:
         local_layer_idx = layer_id - self._layer_shard_start_layer

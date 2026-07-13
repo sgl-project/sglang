@@ -67,104 +67,68 @@ class TestCpCacheLayerSplitServerArgs(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "not supported for model arch"):
                 args._handle_cp_cache_layer_split()
 
-    def test_disables_only_prefill_cuda_graph(self):
-        args = _make_layer_split_args()
-        args.cuda_graph_config = CudaGraphConfig(
-            decode=PhaseConfig(backend=Backend.FULL),
-            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
-        )
-
-        with patch("sglang.srt.server_args.is_hip", return_value=False):
-            args._handle_cp_cache_layer_split()
-
-        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-        self.assertFalse(args.disable_cuda_graph)
-
-    def test_dsa_uses_same_prefill_cuda_graph_behavior(self):
-        args = _make_layer_split_args(model_path="glm-dsa")
-        args.cuda_graph_config = CudaGraphConfig(
-            decode=PhaseConfig(backend=Backend.FULL),
-            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
-        )
-
-        with patch.object(
-            ServerArgs, "get_model_config", return_value=_dsa_model_config()
-        ), patch("sglang.srt.server_args.is_hip", return_value=False):
-            args._handle_cp_cache_layer_split()
-
-        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-        self.assertFalse(args.disable_cuda_graph)
-
-    def test_rejects_missing_prefill_cp(self):
-        args = _make_layer_split_args(enable_prefill_cp=False)
-
-        with self.assertRaisesRegex(ValueError, "enable-prefill-cp"):
-            args._handle_cp_cache_layer_split()
-
-    def test_rejects_non_prefill_server(self):
-        args = _make_layer_split_args(disaggregation_mode="null")
-
-        with self.assertRaisesRegex(ValueError, "prefill-only servers"):
-            args._handle_cp_cache_layer_split()
-
-    def test_rejects_attn_cp_size_one(self):
-        args = _make_layer_split_args(attn_cp_size=1)
-
-        with self.assertRaisesRegex(ValueError, "attn-cp-size > 1"):
-            args._handle_cp_cache_layer_split()
-
-    def test_rejects_non_interleave_cp_strategy(self):
-        args = _make_layer_split_args(cp_strategy="zigzag")
-
-        with self.assertRaisesRegex(ValueError, "cp-strategy interleave"):
-            args._handle_cp_cache_layer_split()
-
-    def test_rejects_pipeline_parallelism_for_dsv4_and_dsa(self):
+    def test_rejects_unsupported_shared_configurations(self):
         cases = (
-            ("dsv4", _make_layer_split_args(pp_size=2), None),
+            ("prefill_cp", {"enable_prefill_cp": False}, "enable-prefill-cp"),
+            ("cp_size", {"attn_cp_size": 1}, "attn-cp-size > 1"),
+            ("cp_strategy", {"cp_strategy": "zigzag"}, "cp-strategy interleave"),
+            ("pipeline_parallelism", {"pp_size": 2}, "pipeline parallelism"),
             (
-                "dsa",
-                _make_layer_split_args(model_path="glm-dsa", pp_size=2),
-                _dsa_model_config(),
+                "disaggregation_mode",
+                {"disaggregation_mode": "null"},
+                "prefill-only servers",
+            ),
+            (
+                "transfer_backend",
+                {"disaggregation_transfer_backend": "nixl"},
+                "mooncake",
+            ),
+            (
+                "hicache_backend",
+                {"hicache_storage_backend": "nixl"},
+                "Supported backends",
             ),
         )
 
-        for name, args, model_config in cases:
+        for name, overrides, error in cases:
+            args = _make_layer_split_args(**overrides)
+            with self.subTest(case=name), patch(
+                "sglang.srt.server_args.is_hip", return_value=False
+            ), self.assertRaisesRegex(ValueError, error):
+                args._handle_cp_cache_layer_split()
+
+    def test_disables_only_prefill_cuda_graph_for_dsv4_and_dsa(self):
+        cases = (
+            ("dsv4", "dummy", None),
+            ("dsa", "glm-dsa", _dsa_model_config()),
+        )
+
+        for name, model_path, model_config in cases:
+            args = _make_layer_split_args(model_path=model_path)
+            args.cuda_graph_config = CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL),
+                prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
+            )
             with self.subTest(model=name), patch.object(
-                ServerArgs,
-                "get_model_config",
-                return_value=model_config,
-            ), self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+                ServerArgs, "get_model_config", return_value=model_config
+            ), patch("sglang.srt.server_args.is_hip", return_value=False):
                 args._handle_cp_cache_layer_split()
 
-    def test_rejects_nixl_disaggregation_transfer_backend(self):
-        args = _make_layer_split_args()
-        args.disaggregation_transfer_backend = "nixl"
+            self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+            self.assertFalse(args.disable_cuda_graph)
 
-        with patch("sglang.srt.server_args.is_hip", return_value=False):
-            with self.assertRaisesRegex(ValueError, "mooncake"):
-                args._handle_cp_cache_layer_split()
-
-    def test_rejects_unified_kv_backend(self):
-        args = _make_layer_split_args()
+    def test_dsv4_rejects_unsupported_runtime_paths(self):
+        with envs.SGLANG_OPT_USE_COMPRESSOR_V2.override(False), patch(
+            "sglang.srt.server_args.is_hip", return_value=False
+        ), self.assertRaisesRegex(ValueError, "Compressor V2"):
+            _make_layer_split_args()._handle_cp_cache_layer_split()
 
         with patch("sglang.srt.server_args.is_hip", return_value=False), patch(
             "sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
             return_value=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "unified_kv_triton"):
-                args._handle_cp_cache_layer_split()
-
-    def test_rejects_compressor_v1(self):
-        args = _make_layer_split_args()
-
-        with envs.SGLANG_OPT_USE_COMPRESSOR_V2.override(False), patch(
-            "sglang.srt.server_args.is_hip", return_value=False
-        ):
-            with self.assertRaisesRegex(ValueError, "Compressor V2"):
-                args._handle_cp_cache_layer_split()
+        ), self.assertRaisesRegex(ValueError, "unified_kv_triton"):
+            _make_layer_split_args()._handle_cp_cache_layer_split()
 
     def test_dsa_skips_dsv4_only_compressor_v2_guard(self):
         args = _make_layer_split_args(
@@ -180,19 +144,6 @@ class TestCpCacheLayerSplitServerArgs(CustomTestCase):
             args._handle_cp_cache_layer_split()
 
         self.assertTrue(args.enable_cp_cache_layer_split)
-
-    def test_dsa_rejects_unsupported_hicache_storage_backend(self):
-        args = _make_layer_split_args(
-            model_path="glm-dsa",
-            disaggregation_transfer_backend="mooncake",
-            hicache_storage_backend="nixl",
-        )
-
-        with patch.object(
-            ServerArgs, "get_model_config", return_value=_dsa_model_config()
-        ), patch("sglang.srt.server_args.is_hip", return_value=False):
-            with self.assertRaisesRegex(ValueError, "Supported backends"):
-                args._handle_cp_cache_layer_split()
 
 
 if __name__ == "__main__":

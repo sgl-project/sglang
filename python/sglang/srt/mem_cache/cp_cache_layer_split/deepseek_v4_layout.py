@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.cp_cache_layer_split.ownership import (
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
     get_global_layer_shard_range,
 )
 

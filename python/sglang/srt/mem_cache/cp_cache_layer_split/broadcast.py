@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 import torch
 
 from sglang.srt.distributed import get_attn_cp_group
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,11 +16,8 @@ class PendingBroadcast:
     """State for one in-flight owner->peers broadcast."""
 
     stream: Optional[torch.cuda.Stream] = None
-    work: object = None
     layer_id: Optional[int] = None
-
-
-PYNCCL_PENDING_BROADCAST = object()
+    active: bool = False
 
 
 def get_pynccl_broadcast_comm():
@@ -37,20 +32,13 @@ def get_pynccl_broadcast_comm():
     return pynccl_comm
 
 
-def broadcast_inline(tensor: torch.Tensor, owner_cp: int, pynccl_comm) -> None:
-    """Enqueue a broadcast on the current stream without side-stream state."""
-    with pynccl_comm.change_state(enable=True):
-        pynccl_comm.broadcast(tensor, owner_cp)
-
-
 class BroadcastSlots:
     """Per-pool slot registry for in-flight LayerSplit broadcasts."""
 
-    def __init__(self, slot_kinds: Iterable[str], cp_rank: int) -> None:
+    def __init__(self, slot_kinds: Iterable[str]) -> None:
         self._slots: dict[str, PendingBroadcast] = {
             kind: PendingBroadcast() for kind in slot_kinds
         }
-        self._cp_rank = cp_rank
 
     def kinds(self) -> tuple[str, ...]:
         return tuple(self._slots.keys())
@@ -70,31 +58,45 @@ class BroadcastSlots:
         pynccl_comm,
     ) -> None:
         """Launch an async broadcast on this slot's side stream."""
-        self.clear(kind, next_layer_id=layer_id)
-        ready_event = torch.cuda.current_stream().record_event()
-        pending = self.pending(kind)
-        if pending.stream is None:
-            pending.stream = torch.cuda.Stream(device=tensor.device)
-        pending.stream.wait_event(ready_event)
-        with pynccl_comm.change_state(enable=True):
-            pynccl_comm.broadcast(tensor, owner_cp, stream=pending.stream)
-        pending.work = PYNCCL_PENDING_BROADCAST
-        pending.layer_id = layer_id
+        with self.launch(kind, layer_id, tensor.device):
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.broadcast(tensor, owner_cp)
 
-    def clear(self, kind: str, next_layer_id: Optional[int] = None) -> None:
+    @contextmanager
+    def launch(self, kind: str, layer_id: int, device: torch.device) -> Iterator[None]:
+        """Run work on a slot's side stream and track it until consumption."""
+        self.clear(kind)
+        pending = self.pending(kind)
+        device_module = torch.get_device_module(device)
+        if pending.stream is None:
+            pending.stream = device_module.Stream(device=device)
+        pending.stream.wait_stream(device_module.current_stream(device))
+        pending.layer_id = layer_id
+        pending.active = True
+        try:
+            with device_module.stream(pending.stream):
+                yield
+        except Exception:
+            self.clear(kind)
+            raise
+
+    def clear(self, kind: str) -> None:
         """Wait on the slot's side stream so the current stream can proceed."""
         pending = self.pending(kind)
-        if pending.work is None:
+        if not pending.active:
             return
         if pending.stream is not None:
-            torch.cuda.current_stream().wait_stream(pending.stream)
-        pending.work = None
+            device_module = torch.get_device_module(pending.stream.device)
+            device_module.current_stream(pending.stream.device).wait_stream(
+                pending.stream
+            )
         pending.layer_id = None
+        pending.active = False
 
     def finish(self, kind: str, layer_id: int) -> None:
         """Wait for the pending broadcast; ``layer_id`` must match."""
         pending = self.pending(kind)
-        if pending.work is None:
+        if not pending.active:
             return
         if pending.layer_id != layer_id:
             raise RuntimeError(

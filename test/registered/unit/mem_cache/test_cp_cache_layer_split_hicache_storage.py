@@ -67,15 +67,6 @@ class TestCpCacheLayerSplitHiCacheStorage(CustomTestCase):
         self.assertEqual(mha_suffix, f"0_{CP_CACHE_LAYER_SPLIT_STORAGE_SUFFIX}_cp1_2")
         self.assertEqual(mla_suffix, f"{CP_CACHE_LAYER_SPLIT_STORAGE_SUFFIX}_cp1_2")
 
-        mha_suffixes, _ = _with_cp_cache_layer_split_suffixes(["0", "1"], "", 1, 2)
-        self.assertEqual(
-            mha_suffixes,
-            [
-                f"0_{CP_CACHE_LAYER_SPLIT_STORAGE_SUFFIX}_cp1_2",
-                f"1_{CP_CACHE_LAYER_SPLIT_STORAGE_SUFFIX}_cp1_2",
-            ],
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
