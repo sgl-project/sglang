@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_hip, is_npu
 
 _is_hip = is_hip()
 
@@ -32,6 +32,9 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
+
+
+_is_npu = is_npu()
 
 
 def _should_enable_lazy_compaction() -> bool:
@@ -72,6 +75,7 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     memory_pool_config: MemoryPoolConfig
+    unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
 class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
@@ -121,7 +125,75 @@ class KVCacheConfigurator:
         )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
-        raise NotImplementedError("populated in kvc-migrate-method-bodies")
+        """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+            assert (
+                self.memory_pool_config is not None
+            ), "Draft worker requires memory_pool_config"
+            config = self.memory_pool_config
+        else:
+            config = self._resolve_memory_pool_config(pre_model_load_memory)
+
+        max_total_num_tokens = config.max_total_num_tokens
+        max_running_requests = config.max_running_requests
+        full_max_total_num_tokens = None
+        swa_max_total_num_tokens = None
+        if self.is_hybrid_swa:
+            full_max_total_num_tokens = config.full_max_total_num_tokens
+            swa_max_total_num_tokens = config.swa_max_total_num_tokens
+
+        # DSV4 compressed-attention pool sizes. Draft worker reuses target's
+        # full/swa sizes but does NOT own c4/c128/state pools (those live on
+        # the target rank only); zero them out regardless of what config holds.
+        if self.is_draft_worker:
+            c4_max_total_num_tokens = 0
+            c128_max_total_num_tokens = 0
+            c4_state_pool_size = 0
+            c128_state_pool_size = 0
+        else:
+            c4_max_total_num_tokens = config.c4_max_total_num_tokens
+            c128_max_total_num_tokens = config.c128_max_total_num_tokens
+            c4_state_pool_size = config.c4_state_pool_size
+            c128_state_pool_size = config.c128_state_pool_size
+
+        # Draft worker does not own the compression-state pools, but keep the
+        # dtype attributes initialized so _init_pools can share one code path.
+        c4_state_dtype: Optional[torch.dtype] = None
+        c128_state_dtype: Optional[torch.dtype] = None
+        if is_deepseek_v4(self.model_config.hf_config):
+            c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
+
+        pools = self._init_pools(
+            max_total_num_tokens=max_total_num_tokens,
+            max_running_requests=max_running_requests,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            c4_max_total_num_tokens=c4_max_total_num_tokens,
+            c128_max_total_num_tokens=c128_max_total_num_tokens,
+            c4_state_pool_size=c4_state_pool_size,
+            c128_state_pool_size=c128_state_pool_size,
+            c4_state_dtype=c4_state_dtype,
+            c128_state_dtype=c128_state_dtype,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
+        logger.info(
+            f"Memory pool end. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return KVCacheConfigResult(
+            max_total_num_tokens=max_total_num_tokens,
+            max_running_requests=max_running_requests,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            req_to_token_pool=pools.req_to_token_pool,
+            token_to_kv_pool=pools.token_to_kv_pool,
+            token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
+            memory_pool_config=config,
+            unified_memory_pool=pools.unified_memory_pool,
+        )
 
     def _init_pools(
         self: ModelRunner,
