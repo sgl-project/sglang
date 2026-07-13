@@ -451,9 +451,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if enable_dual_stream:
-                current_stream = torch.cuda.current_stream()
+                current_stream = torch.npu.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
+                with torch.npu.stream(self.alt_stream):
                     shared_output = self._forward_shared_experts(hidden_states)
                     shared_output.record_stream(self.alt_stream)
                     shared_event = self.alt_stream.record_event()
@@ -478,7 +478,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
         if enable_dual_stream:
-            torch.cuda.current_stream().wait_event(shared_event)
+            torch.npu.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
