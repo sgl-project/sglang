@@ -204,12 +204,27 @@ def build_kv_cache(
                     "device-resident cache and is incompatible with "
                     "--enable-hierarchical-cache."
                 )
-            # Compressed-KV SWA variants are not supported yet, even under unified.
+            # Compressed-KV SWA variants need model-specific sidecar guarantees.
+            # DSV4 has a conservative experimental L1-only path below.
             if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
-                )
+                if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache with "
+                        "DeepSeek-V4 (DSA compressed KV) is experimental. Set "
+                        "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1 to enable "
+                        "the conservative L1-only path."
+                    )
+                if enable_hierarchical_cache:
+                    raise ValueError(
+                        "DeepSeek-V4 decode-side radix cache currently supports "
+                        "only device-resident L1 cache. Disable hierarchical "
+                        "cache / HiCache storage for this experimental path."
+                    )
+                if not spec_algorithm.is_none():
+                    raise ValueError(
+                        "DeepSeek-V4 decode-side radix cache does not support "
+                        "speculative decoding / MTP yet."
+                    )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache does not support "
