@@ -112,7 +112,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         return 1.0 / latents_std, latents_mean
 
     def get_vae_decode_batch_size(self, latents):
-        return 1 if latents.shape[0] > 2 else latents.shape[0]
+        return 1
 
     def post_denoising_loop(self, latents, batch):
         if getattr(batch, "kv_caches", None) is not None:
