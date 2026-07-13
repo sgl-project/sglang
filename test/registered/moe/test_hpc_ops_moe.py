@@ -48,7 +48,7 @@ def _quant_blockwise(w: torch.Tensor, block: int = 128):
 
 @unittest.skipUnless(
     has_hpc_ops() and _sm90_or_newer(),
-    "requires HPC-Ops (pip install from https://github.com/Tencent/hpc-ops) and sm90+",
+    "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and sm90+",
 )
 class TestHpcOpsMoeBlockwise(CustomTestCase):
 
