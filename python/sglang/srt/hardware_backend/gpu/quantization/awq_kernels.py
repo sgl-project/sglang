@@ -42,7 +42,7 @@ if is_xpu():
         pass
 elif is_hip():
     try:
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
     except ImportError:
@@ -64,7 +64,7 @@ else:
         )
     except ImportError:
         try:
-            from sglang.srt.layers.quantization.awq.awq_triton import (
+            from sglang.kernels.ops.quantization.awq_triton import (
                 awq_dequantize_triton as awq_dequantize,
             )
         except ImportError:
