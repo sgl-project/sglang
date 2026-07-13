@@ -32,6 +32,7 @@ from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
+from functools import lru_cache
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -141,6 +142,19 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _ragged_verify_cap_accept() -> bool:
+    # The mode env is fixed at server launch; cache to keep it off the
+    # per-request metrics path.
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+
 
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
@@ -262,6 +276,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
+        self.incremental_streaming_output = server_args.incremental_streaming_output
+        self.enable_lora = server_args.enable_lora
+        self.enable_trace = server_args.enable_trace
+        self.allow_auto_truncate = server_args.allow_auto_truncate
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         set_global_server_args_for_tokenizer(server_args)
@@ -956,7 +975,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate input length
         if input_token_num >= self.context_len:
-            if self.server_args.allow_auto_truncate:
+            if self.allow_auto_truncate:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
@@ -977,7 +996,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.server_args.allow_auto_truncate:
+            if self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "
@@ -1432,7 +1451,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
-            if self.server_args.enable_lora and state.obj.lora_path:
+            if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
                 raise fastapi.HTTPException(
@@ -1479,9 +1498,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # With incremental streaming, each chunk is a delta — coalesce
             # multiple queued chunks to avoid dropping token ids.
-            incremental_stream = (
-                is_stream and self.server_args.incremental_streaming_output
-            )
+            incremental_stream = is_stream and self.incremental_streaming_output
             if incremental_stream and len(out_list) > 1:
                 out = self._coalesce_streaming_chunks(
                     out_list,
@@ -1749,8 +1766,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "tokenizer.update_weights", model_path=model_path, load_format=load_format
+        )
         self.model_path = model_path
 
     async def _wait_for_model_update_from_disk(
@@ -1905,8 +1923,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state,
                     state.obj.top_logprobs_num,
                     state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
-                    and not self.server_args.skip_tokenizer_init,
+                    state.obj.return_text_in_logprobs and not self.skip_tokenizer_init,
                     recv_obj,
                     i,
                 )
@@ -1971,9 +1988,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                incremental = (
-                    self.server_args.incremental_streaming_output and is_stream
-                )
+                incremental = is_stream and self.incremental_streaming_output
                 delta_text = recv_obj.output_strs[i]
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
@@ -2021,9 +2036,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
-                incremental = (
-                    self.server_args.incremental_streaming_output and is_stream
-                )
+                incremental = is_stream and self.incremental_streaming_output
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
@@ -2112,7 +2125,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if self.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             if out_dict is not None:
@@ -2367,6 +2380,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+                if (
+                    getattr(recv_obj, "spec_num_cap_tokens", None) is not None
+                    and len(recv_obj.spec_num_cap_tokens) > i
+                    and recv_obj.spec_num_cap_tokens[i] > 0
+                ):
+                    meta_info["spec_cap_length"] = (
+                        recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
+                    )
+                if (
+                    _ragged_verify_cap_accept()
+                    and getattr(recv_obj, "spec_num_block_accept_tokens", None)
+                    is not None
+                    and len(recv_obj.spec_num_block_accept_tokens) > i
+                ):
+                    meta_info["spec_block_accept_length"] = (
+                        recv_obj.spec_num_block_accept_tokens[i]
+                        / recv_obj.spec_verify_ct[i]
+                    )
+
                 # FIXME: backward-compat aliases, remove in next release.
                 meta_info["spec_accepted_drafts"] = num_correct_drafts
                 meta_info["spec_proposed_drafts"] = num_proposed_drafts
@@ -2384,6 +2416,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accept_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
+            if (
+                getattr(recv_obj, "spec_cap_lens_histogram", None)
+                and len(recv_obj.spec_cap_lens_histogram) > i
+                and recv_obj.spec_cap_lens_histogram[i]
+            ):
+                meta_info["spec_cap_lens_histogram"] = recv_obj.spec_cap_lens_histogram[
+                    i
+                ]
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
@@ -2778,7 +2818,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not obj.lora_path:
             return
 
-        if not self.server_args.enable_lora:
+        if not self.enable_lora:
             first_adapter = (
                 obj.lora_path
                 if isinstance(obj.lora_path, str)
@@ -2855,7 +2895,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         created_time = obj.received_time
 
         external_trace_header = None
-        if self.server_args.enable_trace:
+        if self.enable_trace:
             if obj.external_trace_header:
                 # When the request comes from the rust grpc server or Engine there isn't a
                 # real request object but we still need to propagate the trace context from
@@ -2888,7 +2928,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
-            if self.server_args.enable_trace:
+            if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
@@ -2961,7 +3001,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "mooncake",
                 ]:
                     time_stats_json = None
-                    if self.server_args.enable_trace:
+                    if self.enable_trace:
                         state = self.rid_to_state.get(obj.rid)
                         if state is not None:
                             time_stats_json = state.time_stats.encode_json()
@@ -2985,7 +3025,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Convert attributes to span attributes."""
         span_attrs = {}
 
-        if not self.server_args.enable_trace:
+        if not self.enable_trace:
             return span_attrs
 
         # Token usage attributes

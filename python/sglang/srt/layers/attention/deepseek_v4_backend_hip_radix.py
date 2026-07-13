@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
@@ -406,6 +407,14 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4HipRadixBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    # DSV4 TBO runs ONLY in eager prefill (prefill cuda-graph is disabled);
+    # decode/target-verify graphs are non-TBO (primary backend only). So the TBO
+    # child backends must not be driven through cuda-graph capture/replay — doing
+    # so rebuilds this backend's compressor/indexer metadata per replay step on
+    # both children and leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
+    # TboAttnBackend reads this to skip children in the *_graph paths only.
+    tbo_supports_cuda_graph = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -855,6 +864,12 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
+            if resolve_ragged_verify_layout(forward_batch) is not None:
+                raise NotImplementedError(
+                    "DSV4 ragged verify is not supported on the HIP backend "
+                    "(DeepseekV4HipRadixBackend) cuda-graph path; disable "
+                    "SGLANG_RAGGED_VERIFY_MODE or use a CUDA device."
+                )
             assert out_cache_loc is not None
             num_tokens_v = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
@@ -942,6 +957,12 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
+            if resolve_ragged_verify_layout(forward_batch) is not None:
+                raise NotImplementedError(
+                    "DSV4 ragged verify is not supported on the HIP backend "
+                    "(DeepseekV4HipRadixBackend); disable SGLANG_RAGGED_VERIFY_MODE "
+                    "or use a CUDA device."
+                )
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,

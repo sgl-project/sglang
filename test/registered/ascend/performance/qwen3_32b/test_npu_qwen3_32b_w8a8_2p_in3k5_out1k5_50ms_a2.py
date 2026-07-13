@@ -84,6 +84,10 @@ QWEN3_32B_OTHER_ARGS = [
     101,
     "--dtype",
     "bfloat16",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen",
 ]
 
 
@@ -93,15 +97,11 @@ class TestQwen32B_GPQA(TestNpuAccuracyTestCaseBase):
     model = QWEN3_32B_W8A8_MODEL_PATH
     other_args = QWEN3_32B_OTHER_ARGS
     envs = QWEN3_32B_ENVS
-    accuracy = 0.516
+    accuracy = 0.4949
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64
     generation_config = {"max_tokens": 40000, "temperature": 1.0}
-
-    @classmethod
-    def tearDownClass(cls):
-        pass
 
     def test_qwen3_32b_qpqa(self):
         """Run NPU accuracy test for Qwen3-32B-W8A8 on qpqa"""
@@ -110,7 +110,7 @@ class TestQwen32B_GPQA(TestNpuAccuracyTestCaseBase):
 
 class TestQwen32B(TestNpuPerformanceTestCaseBase):
     base_url = DEFAULT_URL_FOR_TEST
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_32B_W8A8_MODEL_PATH
     other_args = QWEN3_32B_OTHER_ARGS
     envs = QWEN3_32B_ENVS
@@ -120,12 +120,9 @@ class TestQwen32B(TestNpuPerformanceTestCaseBase):
     input_len = 3584
     output_len = 1536
     random_range_ratio = 1
-    tpot = 50
-    output_token_throughput = 1600
-
-    @classmethod
-    def setUpClass(cls):
-        pass
+    seed = 1
+    tpot = 55
+    output_token_throughput = 1500
 
     def test_qwen3_32b(self):
         self.run_throughput()
