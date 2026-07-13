@@ -11,16 +11,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Public weights are not released yet, so this test cannot run in CI. Once the
-# checkpoint is public, drop `disabled` and pick a runner (e.g.
-# stage="extra-b", runner_config="8-gpu-h200") like the Nemotron tests.
-register_cuda_ci(
-    est_time=300,
-    disabled="GigaChat 3.5 weights are not yet public",
-)
+register_cuda_ci(est_time=300, stage="extra-b", runner_config="8-gpu-h200")
 
-# Placeholder identifier; update to the real repo when weights are public.
-GIGACHAT35_FP8_MODEL = "ai-sage/GigaChat-3.5"
+GIGACHAT35_FP8_MODEL = "ai-sage/GigaChat3.5-432B-A28B"
 
 GIGACHAT35_FP8_ARGS = [
     "--tp-size",
@@ -30,18 +23,22 @@ GIGACHAT35_FP8_ARGS = [
     "--trust-remote-code",
     "--tool-call-parser",
     "gigachat35",
+    # GigaChat35's fused silu_and_mul_clamp JIT kernel can't be traced by the
+    # default tc_piecewise prefill CUDA-graph backend; disable prefill graph
+    "--cuda-graph-backend-prefill",
+    "disabled",
 ]
 
-# GigaChat 3.5 ships 3 NextN/MTP heads; serve them via multi-layer EAGLE.
+# GigaChat 3.5 ships 2 NextN/MTP heads
 MTP_ARGS = [
     "--speculative-algorithm",
     "EAGLE",
     "--speculative-num-steps",
-    "3",
+    "2",
     "--speculative-eagle-topk",
     "1",
     "--speculative-num-draft-tokens",
-    "4",
+    "3",
     "--max-running-requests",
     "200",
     "--mem-fraction-static",
@@ -82,8 +79,8 @@ class TestGigaChat35FP8MTP(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        # TODO: calibrate against the public GigaChat 3.5 checkpoint.
-        self.assertGreaterEqual(metrics["score"], 0.9)
+        # FP8 checkpoint scores ~0.97 on this config (8xH100)
+        self.assertGreaterEqual(metrics["score"], 0.93)
 
 
 if __name__ == "__main__":
