@@ -145,11 +145,32 @@ if TYPE_CHECKING:
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
+_is_shuffle_moe_mxfp4 = _has_visible_hip_device and is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
-if _is_hip:
+
+def _raise_aiter_mxfp4_requires_visible_hip(*args, **kwargs):
+    del args, kwargs
+    raise NotImplementedError(
+        "AITer MXFP4 kernels require an AMD ROCm device visible at import time."
+    )
+
+
+def _raise_aiter_mxfp4_import_error(*args, _err: ImportError, **kwargs):
+    del args, kwargs
+    raise ImportError("Failed to import AITer MXFP4 kernels.") from _err
+
+
+def _make_aiter_mxfp4_import_error(err: ImportError):
+    def _raise(*args, **kwargs):
+        return _raise_aiter_mxfp4_import_error(*args, _err=err, **kwargs)
+
+    return _raise
+
+
+if _has_visible_hip_device:
     # import aiter
     try:
         from aiter.ops.shuffle import (
@@ -161,7 +182,20 @@ if _is_hip:
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
-        dynamic_mxfp4_quant = e8m0_shuffle = err
+        _raise_import_error = _make_aiter_mxfp4_import_error(err)
+        dynamic_mxfp4_quant = _raise_import_error
+        e8m0_shuffle = _raise_import_error
+        shuffle_scale = _raise_import_error
+        shuffle_scale_a16w4 = _raise_import_error
+        shuffle_weight = _raise_import_error
+        shuffle_weight_a16w4 = _raise_import_error
+else:
+    dynamic_mxfp4_quant = _raise_aiter_mxfp4_requires_visible_hip
+    e8m0_shuffle = _raise_aiter_mxfp4_requires_visible_hip
+    shuffle_scale = _raise_aiter_mxfp4_requires_visible_hip
+    shuffle_scale_a16w4 = _raise_aiter_mxfp4_requires_visible_hip
+    shuffle_weight = _raise_aiter_mxfp4_requires_visible_hip
+    shuffle_weight_a16w4 = _raise_aiter_mxfp4_requires_visible_hip
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):

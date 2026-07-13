@@ -7,15 +7,26 @@ from typing import Any, Optional
 
 import torch
 
-try:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-except ImportError:
 
-    def raise_aiter_import_error(*args, **kwargs):
+def raise_aiter_import_error(*args, _err: Optional[ImportError] = None, **kwargs):
+    del args, kwargs
+    if _err is not None:
         raise ImportError(
-            "Failed to import aiter. Make sure AITER is installed and accessible."
-        )
+            "Failed to import AITer MXFP4 quantization kernels."
+        ) from _err
+    raise ImportError("AITer MXFP4 quantization requires an AMD ROCm device visible.")
 
+
+if torch.version.hip is not None and torch.cuda.is_available():
+    try:
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    except ImportError as err:
+        dynamic_mxfp4_quant = (
+            lambda *args, _err=err, **kwargs: raise_aiter_import_error(
+                *args, _err=_err, **kwargs
+            )
+        )
+else:
     dynamic_mxfp4_quant = raise_aiter_import_error
 from torch import nn
 
