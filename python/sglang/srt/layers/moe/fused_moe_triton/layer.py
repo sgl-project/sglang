@@ -345,7 +345,13 @@ class FusedMoE(torch.nn.Module):
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            (
+                isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+                # Marlin applies routed_scaling_factor during its output
+                # reduction, so folding it into top-k weights would scale
+                # ModelOpt NVFP4 routed experts twice.
+                and not get_moe_runner_backend().is_marlin()
+            )
             or (
                 isinstance(self.quant_method, Fp8MoEMethod)
                 and (
