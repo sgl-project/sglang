@@ -394,16 +394,24 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
-        if (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
-        ):
+        # Target and draft pools share one host-index tensor. Staged JIT
+        # write-back requires CPU indices, while the fallback kernels require
+        # CUDA indices, so mixed capability must fall back for every pool.
+        host_pools = [self.mem_pool_host]
+        if self.has_draft:
+            host_pools.append(self.mem_pool_host_draft)
+        can_use_write_back_jit = all(
+            pool.layout == "page_first"
+            and getattr(pool, "can_use_write_back_jit", False)
+            for pool in host_pools
+        )
+        if self.io_backend == "kernel" and can_use_write_back_jit:
             host_indices = op.host_indices
             device_indices = op.device_indices
             resolved_pool_transfers = op.pool_transfers
         else:
+            for pool in host_pools:
+                pool.can_use_write_back_jit = False
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
             )
