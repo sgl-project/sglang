@@ -1142,6 +1142,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`32`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--asr-streaming-mode`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Streaming ASR inference mode. <code>chunked</code> re-transcribes a sliding window of audio each chunk with prefix rollback (default). <code>segment</code> transcribes fixed, disjoint audio segments independently and concatenates them, so each second of audio is encoded exactly once (no re-encoded window), at the cost of accuracy at segment boundaries; requires an adapter that supports it (falls back to chunked otherwise). Applies to the SSE /v1/audio/transcriptions path; /v1/realtime stays chunked.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`chunked`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choices: `chunked`, `segment`</td>
+    </tr>
 </tbody>
 </table>
 
