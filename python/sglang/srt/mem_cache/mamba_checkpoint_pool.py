@@ -53,6 +53,9 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.utils.common import is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +251,12 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.store_from_pool(cache.temporal, active_slots, ckpt_slots)
         for i, c in enumerate(self.conv):
-            c[:, ckpt_slots] = cache.conv[i][:, active_slots]
+            src = cache.conv[i][:, active_slots]
+            if _is_npu:
+                # NPU active 池 conv 布局是 (win, dim)(ascendc 要求 dim 在最后),
+                # ckpt 池按原始 (dim, win) 存储,需转置后写入。
+                src = src.permute(0, 1, 3, 2)
+            c[:, ckpt_slots] = src
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
         """Dequantize temporal + copy conv from checkpoint slots into the active pool
@@ -256,7 +264,11 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
-            cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
+            src = c[:, ckpt_slots].to(cache.conv[i].dtype)
+            if _is_npu:
+                # 反向:ckpt 池是 (dim, win),active 池是 (win, dim)。
+                src = src.permute(0, 1, 3, 2)
+            cache.conv[i][:, active_slots] = src
 
     @staticmethod
     def estimate_mem_usage_bytes(
