@@ -425,6 +425,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         # gates SWA eviction timing and the SWA prefix-lock release.
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        # Actual width of the next draft-decode forward: topk tokens per req.
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)

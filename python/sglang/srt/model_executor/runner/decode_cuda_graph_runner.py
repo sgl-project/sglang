@@ -254,6 +254,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
+        # Static capture width: verify tree width under spec decoding,
+        # dLLM block size or 1 otherwise.
         self.num_tokens_per_req = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
         )

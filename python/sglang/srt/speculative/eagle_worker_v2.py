@@ -1527,6 +1527,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
+        # Actual width stamp for the topk-1 chain, where it equals
+        # draft_token_num; for topk > 1 trees the real verify width is
+        # draft_token_num, which the DP coefficient reads instead (see
+        # EagleVerifyInput.get_spec_adjust_token_coefficient).
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 

@@ -686,6 +686,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             num_correct_drafts=buffers.num_correct_drafts[:bs],
             num_accept_tokens=buffers.num_accept_tokens[:bs],
         )
+        # Actual width of the captured forward: mirrors the static capture
+        # width by construction.
         spec_info.num_tokens_per_req = self.num_tokens_per_req
         spec_info.num_tokens_for_logprob_per_req = 1
         spec_info.positions = buffers.positions[:padded_num_tokens]

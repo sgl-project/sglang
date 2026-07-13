@@ -114,6 +114,8 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
+        # Static capture width: each request contributes topk candidate
+        # tokens per draft-decode step.
         self.num_tokens_per_req = resolve_num_tokens_per_req(
             phase="draft_decode", server_args=model_runner.server_args
         )
@@ -272,6 +274,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             bonus_tokens=bonus_tokens,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        # Actual width of the next draft-decode forward: topk tokens per req.
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = positions
