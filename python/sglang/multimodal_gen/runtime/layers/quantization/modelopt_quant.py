@@ -25,7 +25,9 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    normalize_e4m3fn_to_e4m3fnuz,
 )
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight,
@@ -411,6 +413,24 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # On ROCm gfx942 (MI300X / MI325X) the native fp8 dtype is e4m3fnuz, so
+        # scaled_fp8_quant() emits e4m3fnuz activations. ModelOpt checkpoints
+        # (e.g. FLUX.2) ship e4m3fn weights, and the resulting e4m3fn x e4m3fnuz
+        # mix makes hipBLASLt reject torch._scaled_mm with
+        # HIPBLAS_STATUS_NOT_SUPPORTED. Reinterpret the weights as e4m3fnuz and
+        # double the (static) scales -- numerically identical -- so the GEMM
+        # runs on the native fp8 dtype instead of dequantizing to bf16.
+        if is_fp8_fnuz():
+            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+            )
+            layer.weight.data = weight
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            if input_scale is not None:
+                copy_or_rebind_param(layer, "input_scale", input_scale)
+
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
