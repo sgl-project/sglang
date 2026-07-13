@@ -22,9 +22,9 @@ MIMO_MODEL = "XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
 MIMO_DFLASH_MODEL = f"{MIMO_MODEL}/dflash"
 MIMO_LAUNCH_TIMEOUT = 3600
 
-# This model needs eight H20 GPUs. The test is intentionally in extra-b: it
+# This model needs eight H200 GPUs. The test is intentionally in extra-b: it
 # exercises the 1T MiMo backbone and its DFlash drafter end to end.
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
