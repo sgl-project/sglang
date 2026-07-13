@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -75,9 +76,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        PrefetchOperation,
-    )
     from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
@@ -1217,6 +1215,61 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+    def query_storage_hit_length(
+        self,
+        last_host_node: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        """Return how many suffix tokens are resident in the L3 storage backend.
+
+        Mirrors ``HiRadixCache.query_storage_hit_length`` so ``UnifiedRadixCache``
+        is a drop-in for the decode-side HiCache prefix-match path
+        (``disaggregation/decode_hicache_mixin._build_decode_prefix_match``),
+        which calls this unconditionally on the tree cache. When no L3 storage
+        backend is configured (L2-only: GPU + host DRAM) this returns 0 exactly
+        like ``HiRadixCache``, so decode-side hierarchical cache works without an
+        external store and transparently gains storage-hit prefetch when one is
+        configured.
+
+        ``HiRadixCache`` takes a ``TreeNode`` here, but a ``UnifiedRadixCache``
+        caller holds a ``NodeId`` handle: `_build_decode_prefix_match` resolves
+        one for its own use and then passes the *unresolved* handle to this
+        method. ``NodeId`` is an ``int``, so the node has to be resolved here.
+        """
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        node = self.resolve_node_handle(last_host_node)
+        extra_key = node.key.extra_key if node.key else None
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
+        return storage_hit_count
 
     def prefetch_from_storage(
         self,
