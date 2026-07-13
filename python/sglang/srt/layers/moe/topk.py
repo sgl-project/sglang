@@ -402,12 +402,12 @@ class TopK(MultiPlatformOp):
         self.layer_id = layer_id
         from sglang.srt.runtime_context import get_server_args
 
-        self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0 and get_server_args().enable_deepep_waterfill
+        self.enable_waterfill = (
+            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
 
-        self.deepep_waterfill_balancer = None
-        if self.enable_deepep_waterfill:
+        self.waterfill_balancer = None
+        if self.enable_waterfill:
             # TODO(ch-wan): Refactor shared-expert fusion and routed TopK fusion.
             top_k -= num_fused_shared_experts
             num_fused_shared_experts = 0
@@ -433,17 +433,15 @@ class TopK(MultiPlatformOp):
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
-    def _apply_deepep_waterfill(
-        self, topk_output: TopKOutput, num_tokens: int
-    ) -> TopKOutput:
-        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+    def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
+        if self.enable_waterfill and self.waterfill_balancer is None:
             raise RuntimeError(
-                "DeepEP waterfill TopK must be prepared by ModelRunner before forward."
+                "Waterfill TopK must be prepared by ModelRunner before forward."
             )
-        if self.deepep_waterfill_balancer is None:
+        if self.waterfill_balancer is None:
             return topk_output
         assert TopKOutputChecker.format_is_standard(topk_output)
-        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
+        return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def forward_native(
         self,
@@ -462,7 +460,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_cuda(
         self,
@@ -526,7 +524,7 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_cpu(
         self,
@@ -544,7 +542,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_npu(
         self,
@@ -609,7 +607,7 @@ class TopK(MultiPlatformOp):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_deepep_waterfill(topk_output, 0)
+        return self._apply_waterfill(topk_output, 0)
 
     def forward_xpu(
         self,
