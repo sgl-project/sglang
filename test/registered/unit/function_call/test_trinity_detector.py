@@ -1,7 +1,5 @@
 """Unit tests for TrinityDetector — no server, no model loading."""
 
-import json
-
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.test.ci.ci_register import register_cpu_ci
