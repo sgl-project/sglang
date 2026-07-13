@@ -3302,6 +3302,95 @@ class UnifiedRadixCacheSuite:
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
 
+    def test_load_back_abort_frees_unpublished_mamba_slot(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+        self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
+
+        # A request whose mamba slot was released: load_back's CoW arm allocates one.
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+        req.mamba_pool_idx = None
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        # Impossible quota -> load_back aborts after building the transfers.
+        loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
+
+        self.assertFalse(loaded)
+        # the aborted call must return its slot and not leave req pointing at it
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
+        self._release_ongoing_load_back_locks(cache)
+
+    def test_load_back_load_failure_frees_unpublished_mamba_slot(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+        req.mamba_pool_idx = None
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        # cache_controller.load() failing (device alloc / transfer resolution)
+        # must also return the slot this call allocated.
+        with mock.patch.object(cache.cache_controller, "load", return_value=None):
+            loaded = cache.load_back(leaf, req=req)
+
+        self.assertFalse(loaded)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
+        self._release_ongoing_load_back_locks(cache)
+
+    def test_load_back_abort_keeps_preexisting_mamba_slot(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        # The request already owns its slot: an aborted load-back must not free it.
+        req = self._make_req(req_to_token_pool)
+        preexisting_slot = req.mamba_pool_idx
+        self.assertIsNotNone(preexisting_slot)
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
+
+        self.assertFalse(loaded)
+        self.assertIs(req.mamba_pool_idx, preexisting_slot)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
+        self._release_ongoing_load_back_locks(cache)
+
     def test_scheduler_hicache_aux_only_load_back_appends_full_device_indices(self):
         if self.cfg.page_size != 1:
             self.skipTest("page_size=1 keeps the expected suffix precise")

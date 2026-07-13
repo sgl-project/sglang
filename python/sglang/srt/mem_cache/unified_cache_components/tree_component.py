@@ -75,6 +75,16 @@ class EvictLayer(IntFlag):
     ALL = DEVICE | HOST
 
 
+@dataclasses.dataclass(frozen=True)
+class PrepareTransfersResult:
+    """Outcome of prepare_build_hicache_transfers; default = nothing to prepare."""
+
+    # Host pool exhausted; the caller aborts the transfer flow.
+    alloc_failed: bool = False
+    # LOAD_BACK: freshly allocated device mamba slot, recovered on failure.
+    allocated_mamba_slot: Optional[torch.Tensor] = None
+
+
 class CacheTransferPhase(str, Enum):
 
     BACKUP_HOST = "backup_host"  # D→H
@@ -379,6 +389,23 @@ class TreeComponent(ABC):
         pass
 
     # ---- HiCache Hooks ----
+
+    def prepare_build_hicache_transfers(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareTransfersResult:
+        """Cache-level pre-allocation before build_hicache_transfers."""
+        return PrepareTransfersResult()
+
+    def postprocess_build_hicache_transfers(
+        self, req: Optional[Req], prep: PrepareTransfersResult, success: bool
+    ) -> None:
+        """Release state populated by prepare_build_hicache_transfers when the
+        transfer did not go through."""
+        pass
 
     def build_hicache_transfers(
         self,

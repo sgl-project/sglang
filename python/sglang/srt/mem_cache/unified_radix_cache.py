@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     FullComponent,
     LRURefreshPhase,
     MambaComponent,
+    PrepareTransfersResult,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -1678,8 +1679,45 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Lock path & pre-evict if device pool is insufficient
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
-        kv_tokens = len(kv_xfer.host_indices)
 
+        # Let each component pre-allocate per-request state for the load-back;
+        # the finally below lets components recover it unless the load succeeds.
+        preps: dict[ComponentType, PrepareTransfersResult] = {
+            comp.component_type: comp.prepare_build_hicache_transfers(
+                best_match_node, CacheTransferPhase.LOAD_BACK, req=req
+            )
+            for comp in self._components_tuple
+        }
+        success = False
+        try:
+            success = self._load_back_transfers(
+                best_match_node=best_match_node,
+                mem_quota=mem_quota,
+                req=req,
+                kv_xfer=kv_xfer,
+                result=result,
+                ancestor_lock_params=ancestor_lock_params,
+                host_anchor_params=host_anchor_params,
+            )
+            return success
+        finally:
+            for comp in self._components_tuple:
+                comp.postprocess_build_hicache_transfers(
+                    req, preps[comp.component_type], success
+                )
+
+    def _load_back_transfers(
+        self,
+        *,
+        best_match_node: UnifiedTreeNode,
+        mem_quota: Optional[int],
+        req,
+        kv_xfer: PoolTransfer,
+        result: IncLockRefResult,
+        ancestor_lock_params: Optional[DecLockRefParams],
+        host_anchor_params: Optional[DecLockRefParams],
+    ) -> bool:
+        kv_tokens = len(kv_xfer.host_indices)
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
