@@ -126,6 +126,33 @@ def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
     return torch.cat(tuple(image_features), dim=0)
 
 
+def _num_outputs_per_prompt(batch: Req) -> int:
+    return max(1, int(getattr(batch, "num_outputs_per_prompt", 1) or 1))
+
+
+def _seed_for_output(seed: Optional[Union[int, List[int]]], output_idx: int):
+    if seed is None:
+        return None
+    if isinstance(seed, list):
+        if not seed:
+            return None
+        if output_idx < len(seed):
+            return int(seed[output_idx])
+        return int(seed[0]) + output_idx
+    return int(seed) + output_idx
+
+
+def _repeat_to_batch(tensor: Optional[torch.Tensor], batch_size: int):
+    if tensor is None or tensor.shape[0] == batch_size:
+        return tensor
+    if tensor.shape[0] != 1:
+        raise ValueError(
+            f"Cannot expand tensor with batch size {tensor.shape[0]} to {batch_size}"
+        )
+    repeat_shape = [batch_size] + [1] * (tensor.dim() - 1)
+    return tensor.repeat(*repeat_shape)
+
+
 class GlmImageAR(PipelineStage):
     r"""
     Pipeline for text-to-image generation using GLM-Image.
@@ -180,11 +207,11 @@ class GlmImageAR(PipelineStage):
     def _upsample_token_ids(
         token_ids: torch.Tensor, token_h: int, token_w: int
     ) -> torch.Tensor:
-        token_ids = token_ids.view(1, 1, token_h, token_w)
+        token_ids = token_ids.reshape(1, 1, token_h, token_w)
         token_ids = torch.nn.functional.interpolate(
             token_ids.float(), scale_factor=2, mode="nearest"
         ).to(dtype=torch.long)
-        token_ids = token_ids.view(1, -1)
+        token_ids = token_ids.reshape(1, -1)
         return token_ids
 
     def generate_prior_tokens(
@@ -386,28 +413,43 @@ class GlmImageAR(PipelineStage):
             width = width or ar_condition_images[0].width
 
         time_start = time.time()
+        num_outputs = _num_outputs_per_prompt(batch)
         seed = getattr(batch, "seed", None)
-        if seed is None:
-            prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-                prompt=prompt,
-                image=ar_condition_images,
-                height=height,
-                width=width,
-                server_args=server_args,
-            )
-        else:
-            rng_devices = []
-            if device.type == "cuda":
-                rng_devices.append(torch.cuda.current_device())
-            with torch.random.fork_rng(devices=rng_devices, enabled=True):
-                torch.manual_seed(int(seed))
-                prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-                    prompt=prompt,
-                    image=ar_condition_images,
-                    height=height,
-                    width=width,
-                    server_args=server_args,
+        rng_devices = []
+        if device.type == "cuda":
+            rng_devices.append(torch.cuda.current_device())
+
+        prior_token_ids = []
+        prior_token_image_ids = None
+        for output_idx in range(num_outputs):
+            output_seed = _seed_for_output(seed, output_idx)
+            if output_seed is None:
+                prior_token_id, output_prior_token_image_ids = (
+                    self.generate_prior_tokens(
+                        prompt=prompt,
+                        image=ar_condition_images,
+                        height=height,
+                        width=width,
+                        server_args=server_args,
+                    )
                 )
+            else:
+                with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                    torch.manual_seed(output_seed)
+                    prior_token_id, output_prior_token_image_ids = (
+                        self.generate_prior_tokens(
+                            prompt=prompt,
+                            image=ar_condition_images,
+                            height=height,
+                            width=width,
+                            server_args=server_args,
+                        )
+                    )
+            prior_token_ids.append(prior_token_id)
+            if prior_token_image_ids is None:
+                prior_token_image_ids = output_prior_token_image_ids
+
+        prior_token_id = torch.cat(prior_token_ids, dim=0)
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
         logger.info(f"generate_prior_tokens time: {time_end - time_start}")
@@ -579,7 +621,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         seq_len = prompt_embeds.size(1)
         prompt_embeds = prompt_embeds.repeat(1, 1, 1)
-        prompt_embeds = prompt_embeds.view(1, seq_len, -1)
+        prompt_embeds = prompt_embeds.reshape(1, seq_len, -1)
 
         negative_prompt_embeds = None
         if do_classifier_free_guidance:
@@ -608,7 +650,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
             seq_len = negative_prompt_embeds.size(1)
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, 1, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(1, seq_len, -1)
+            negative_prompt_embeds = negative_prompt_embeds.reshape(1, seq_len, -1)
 
         return prompt_embeds, negative_prompt_embeds
 
@@ -726,8 +768,28 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         width = batch.width
 
         device = get_local_torch_device()
+        batch_size = _num_outputs_per_prompt(batch)
         max_sequence_length = 1024
-        generator = torch.Generator(device=device).manual_seed(batch.seed)
+        seed = getattr(batch, "seed", None)
+        if batch_size == 1:
+            output_seed = _seed_for_output(seed, 0)
+            generator = (
+                None
+                if output_seed is None
+                else torch.Generator(device=device).manual_seed(int(output_seed))
+            )
+        elif seed is None:
+            generator = None
+        else:
+            output_seeds = [_seed_for_output(seed, i) for i in range(batch_size)]
+            generator = (
+                None
+                if any(output_seed is None for output_seed in output_seeds)
+                else [
+                    torch.Generator(device=device).manual_seed(int(output_seed))
+                    for output_seed in output_seeds
+                ]
+            )
         attention_kwargs = {}
         prompt_embeds = None
         do_classifier_free_guidance = True
@@ -744,6 +806,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prior_token_id = batch.prior_token_id
         prior_token_image_ids = batch.prior_token_image_ids
         prior_token_id = prior_token_id.to(device)
+        prior_token_id = _repeat_to_batch(prior_token_id, batch_size)
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
@@ -754,6 +817,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             device=device,
             dtype=dtype,
         )
+        prompt_embeds = _repeat_to_batch(prompt_embeds, batch_size)
+        negative_prompt_embeds = _repeat_to_batch(negative_prompt_embeds, batch_size)
 
         # 4. process images
         if ar_condition_images is not None:
@@ -776,7 +841,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         # 5. Prepare latents and (optional) condition_images kv cache
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
-            batch_size=1,
+            batch_size=batch_size,
             num_channels_latents=latent_channels,
             height=height,
             width=width,
@@ -788,10 +853,10 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
 
         if ar_condition_images is not None:
-            latents_mean = torch.tensor(self.vae.config.latents_mean).view(
+            latents_mean = torch.tensor(self.vae.config.latents_mean).reshape(
                 1, self.vae.config.latent_channels, 1, 1
             )
-            latents_std = torch.tensor(self.vae.config.latents_std).view(
+            latents_std = torch.tensor(self.vae.config.latents_std).reshape(
                 1, self.vae.config.latent_channels, 1, 1
             )
 
@@ -805,6 +870,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 condition_image = align_tensor_to_module_dtype(
                     condition_image, self.vae, device=device
                 )
+                condition_image = _repeat_to_batch(condition_image, batch_size)
 
                 condition_latent = retrieve_latents(
                     self.vae.encode(condition_image),
@@ -812,6 +878,13 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     sample_mode="argmax",
                 )
                 condition_latent = (condition_latent - latents_mean) / latents_std
+                if condition_image_prior_token_id.dim() == 1:
+                    condition_image_prior_token_id = (
+                        condition_image_prior_token_id.unsqueeze(0)
+                    )
+                condition_image_prior_token_id = _repeat_to_batch(
+                    condition_image_prior_token_id.to(device=device), batch_size
+                )
 
                 # Do not remove.
                 # It would be use to run the reference image through a
@@ -827,17 +900,23 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                         _ = transformer(
                             hidden_states=condition_latent,
                             encoder_hidden_states=torch.zeros_like(prompt_embeds)[
-                                :1, :0, ...
+                                :, :0, ...
                             ],
                             prior_token_id=condition_image_prior_token_id,
                             prior_token_drop=torch.full_like(
                                 condition_image_prior_token_id, False, dtype=torch.bool
                             ),
-                            timestep=torch.zeros((1,), device=device),
+                            timestep=torch.zeros((batch_size,), device=device),
                             target_size=torch.tensor(
-                                [condition_image.shape[-2:]], device=device
+                                [condition_image.shape[-2:]],
+                                dtype=prompt_embeds.dtype,
+                                device=device,
+                            ).repeat(batch_size, 1),
+                            crop_coords=torch.zeros(
+                                (batch_size, 2),
+                                dtype=prompt_embeds.dtype,
+                                device=device,
                             ),
-                            crop_coords=torch.zeros((1, 2), device=device),
                             attention_kwargs=attention_kwargs,
                             kv_caches=kv_caches,
                             kv_caches_mode="write",
@@ -847,10 +926,10 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         target_size = (height, width)
         target_size = torch.tensor(
             [target_size], dtype=prompt_embeds.dtype, device=device
-        )
+        ).repeat(batch_size, 1)
         crops_coords_top_left = torch.tensor(
             [(0, 0)], dtype=prompt_embeds.dtype, device=device
-        )
+        ).repeat(batch_size, 1)
 
         # Prepare timesteps
         scheduler = self.scheduler
