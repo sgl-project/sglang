@@ -289,18 +289,29 @@ class ExpertLocationMetadata:
         require_global_experts: bool = False,
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
+        cpu_map = self.logical_to_all_physical_map_cpu
+        # Draft workers can query MoE layers whose layer_id lies beyond the
+        # target-sized expert map; fall back to the identity mapping (no EPLB
+        # rebalancing for those layers) instead of indexing out of range.
+        if layer_id >= cpu_map.shape[0]:
+            if require_global_experts:
+                num_physical_experts = cpu_map.shape[-1]
+                return list(
+                    range(
+                        logical_expert_id,
+                        num_physical_experts,
+                        self.num_logical_experts,
+                    )
+                )
+            return [logical_expert_id]
         if require_global_experts:
-            num_physical_experts = self.logical_to_all_physical_map_cpu[layer_id].shape[
-                -1
-            ]
+            num_physical_experts = cpu_map[layer_id].shape[-1]
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
         return [
             physical_expert_id
-            for physical_expert_id in self.logical_to_all_physical_map_cpu[
-                layer_id, logical_expert_id
-            ].tolist()
+            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
             if physical_expert_id != -1
         ]
 
