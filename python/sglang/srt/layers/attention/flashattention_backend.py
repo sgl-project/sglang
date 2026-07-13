@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -280,10 +281,14 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            self.speculative_num_draft_tokens = SpeculativeAlgorithm.from_string(
-                model_runner.server_args.speculative_algorithm
-            ).get_num_tokens_per_req_for_target_verify(
-                int(self.speculative_num_draft_tokens), is_draft_worker=True
+            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=model_runner.server_args,
+                spec_algorithm=SpeculativeAlgorithm.from_string(
+                    model_runner.server_args.speculative_algorithm
+                ),
+                is_draft_worker=True,
+                num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.speculative_step_id = speculative_step_id
 
@@ -2353,7 +2358,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = num_tokens // bs
+            num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -2738,9 +2743,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=device,
                 )
             else:
-                default_extend = getattr(
-                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
-                )
+                default_extend = spec_info.num_tokens_per_req
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
                 )
@@ -2749,9 +2752,7 @@ class FlashAttentionBackend(AttentionBackend):
             if extend_seq_lens_cpu:
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
-                metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
-                )
+                metadata.max_seq_len_q = spec_info.num_tokens_per_req
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)

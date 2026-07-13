@@ -86,6 +86,35 @@ if _is_cpu:
 logger = logging.getLogger(__name__)
 
 
+def resolve_num_tokens_per_req(
+    *,
+    phase: str,
+    server_args: ServerArgs,
+    spec_algorithm=None,
+    is_draft_worker: bool = False,
+    num_draft_tokens: Optional[int] = None,
+) -> int:
+    """Single static derivation point for the per-request token width of a
+    speculative forward phase ("draft_decode" / "draft_extend" /
+    "target_verify"), used to size capture shapes and buffers.
+
+    Runners and backends call this instead of re-deriving the width from
+    server args; the per-forward dynamic width lives on
+    ``SpecInput.num_tokens_per_req``.
+    """
+    if phase == "draft_decode":
+        return server_args.speculative_eagle_topk
+    if phase == "draft_extend":
+        return server_args.speculative_num_draft_tokens
+    if phase == "target_verify":
+        if num_draft_tokens is None:
+            num_draft_tokens = server_args.speculative_num_draft_tokens
+        return spec_algorithm.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
+    raise ValueError(f"Unknown speculative phase: {phase}")
+
+
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     sample_index = torch.multinomial(probs, num_samples=num_samples)
     sample_p = probs.gather(1, sample_index)

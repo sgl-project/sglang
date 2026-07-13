@@ -38,7 +38,10 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.speculative.spec_utils import (
+    fast_topk,
+    resolve_num_tokens_per_req,
+)
 from sglang.srt.utils import (
     is_hip,
     require_attn_tp_gather,
@@ -133,7 +136,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Size cuda-graph buffers by num_draft_tokens (full tree width), not
         # num_steps + 1, or topk > 1 draft-extend overflows them.
-        self.num_tokens_per_req = model_runner.server_args.speculative_num_draft_tokens
+        self.num_tokens_per_req = resolve_num_tokens_per_req(
+            phase="draft_extend", server_args=model_runner.server_args
+        )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_req
 

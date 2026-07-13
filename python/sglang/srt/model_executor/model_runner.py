@@ -192,6 +192,7 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -847,10 +848,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
-            if num_draft_tokens is None:
-                num_draft_tokens = self.server_args.speculative_num_draft_tokens
-            return self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                num_draft_tokens, self.is_draft_worker
+            return resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=self.server_args,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=self.is_draft_worker,
+                num_draft_tokens=num_draft_tokens,
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
         return dllm_config.block_size if dllm_config is not None else 1
@@ -2640,12 +2643,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         role = "draft" if self.is_draft_worker else "target"
         if self.spec_algorithm.is_speculative():
             capture_name = f"{role} verify"
-            num_tokens_per_req = (
-                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    self.server_args.speculative_num_draft_tokens,
-                    self.is_draft_worker,
-                )
-            )
+            num_tokens_per_req = self.decode_num_tokens_per_req()
         else:
             capture_name = f"{role} decode"
             num_tokens_per_req = 1

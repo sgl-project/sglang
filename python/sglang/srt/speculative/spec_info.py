@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -316,6 +316,16 @@ class SpecInput(ABC):
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
+    # Uniform per-request token width of the forward this spec input
+    # describes, and its logits-row counterpart. Also the multiplier that
+    # scales batch.global_num_tokens into this forward's token unit for DP
+    # attention (get_spec_adjusted_global_num_tokens); ragged forwards (e.g.
+    # prefill draft-extend) carry 1 there because their global_num_tokens is
+    # already in tokens. Class-level defaults for the same dataclass reason
+    # as ragged_verify_layout above; -1 means "not set by this flow".
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -339,9 +349,8 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
-    @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        pass
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     def get_spec_adjusted_global_num_tokens(
         self, batch: ScheduleBatch
