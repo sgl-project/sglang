@@ -16,7 +16,8 @@ if not torch.cuda.is_available():
 from sglang.jit_kernel.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
 
 N_VALUES = [1024, 2624, 6144]
-K_VALUES = [2048, 6144]
+# 6144/12288 route through the split-K tactics (29-34) for small-N shapes.
+K_VALUES = [2048, 6144, 12288]
 NUM_TOKENS = get_ci_test_range(list(range(1, 33)), [1, 15, 16, 32])
 
 

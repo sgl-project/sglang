@@ -34,51 +34,138 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cutlass_dsl import dsl_user_op
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import get_device_sm
 from sglang.srt.utils.common import direct_register_custom_op
 
-# Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
-# 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
-# Tactic 1 (1-CTA 64×8 stages=8) is the default.
+
+@dsl_user_op
+def _st_async_shared_cluster_v4_f32(addr, mbar, v0, v1, v2, v3, *, loc=None, ip=None):
+    """st.async 16B to peer-CTA SMEM with mbarrier tx-completion (SASS STAS).
+
+    The TMA-style completion mechanism: data delivery bumps the destination
+    mbarrier's completed-tx count, so NO producer-side release fence and no
+    consumer-side acquire fence are needed (a plain-PTX release.cluster
+    arrive lowers to MEMBAR.ALL.GPU — catastrophic on the tail; this doesn't).
+    """
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v0).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v1).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v2).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32"
+        " [$0], {$2, $3, $4, $5}, [$1];",
+        "r,r,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _st_async_shared_cluster_f32(addr, mbar, val, *, loc=None, ip=None):
+    """Scalar st.async fallback for fragment sizes not divisible by 4."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.b32"
+        " [$0], $2, [$1];",
+        "r,r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mbarrier_wait_parity_spin(addr, phase, *, loc=None, ip=None):
+    """Hot-spin mbarrier.try_wait.parity on a local barrier.
+
+    Replaces the DSL's mbarrier_wait NANOSLEEP back-off on the once-per-kernel
+    tail wait. Plain parity semantics suffice: st.async tx-completion carries
+    the data-visibility guarantee (same contract as TMA loads), so no acquire
+    fence — an acquire.cluster spin makes ptxas emit CCTL.IVALL.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(phase).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .pred P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1;\n"
+        "@!P1 bra LAB_WAIT;\n"
+        "}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta, split_k); cta_k is
+# fixed at 128. Sorted within each use_2cta block by (cta_m, cta_n,
+# num_ab_stage). Tactic 1 (1-CTA 64×8 stages=8) is the default. Split-K
+# tactics (29+) pair split_k 1-CTA pipelines per output tile with a DSMEM
+# reduction; stage counts are the max that fits SMEM with the red_buf slots.
 _TGV_CUTE_EXT_CTA_K: int = 128
 _TGV_CUTE_EXT_DEFAULT_TACTIC: int = 1
-_TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
+_TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool, int]] = [
     # 1-CTA configs
-    (64, 8, 6, False),  # 0
-    (64, 8, 8, False),  # 1 (default)
-    (64, 8, 10, False),  # 2
-    (64, 8, 12, False),  # 3
-    (64, 16, 6, False),  # 4
-    (64, 16, 8, False),  # 5
-    (64, 16, 11, False),  # 6
-    (64, 32, 6, False),  # 7
-    (64, 32, 9, False),  # 8
-    (64, 64, 7, False),  # 9
-    (64, 128, 4, False),  # 10
-    (128, 8, 6, False),  # 11
-    (128, 16, 6, False),  # 12
-    (128, 32, 5, False),  # 13
-    (128, 64, 4, False),  # 14
-    (128, 128, 3, False),  # 15
+    (64, 8, 6, False, 1),  # 0
+    (64, 8, 8, False, 1),  # 1 (default)
+    (64, 8, 10, False, 1),  # 2
+    (64, 8, 12, False, 1),  # 3
+    (64, 16, 6, False, 1),  # 4
+    (64, 16, 8, False, 1),  # 5
+    (64, 16, 11, False, 1),  # 6
+    (64, 32, 6, False, 1),  # 7
+    (64, 32, 9, False, 1),  # 8
+    (64, 64, 7, False, 1),  # 9
+    (64, 128, 4, False, 1),  # 10
+    (128, 8, 6, False, 1),  # 11
+    (128, 16, 6, False, 1),  # 12
+    (128, 32, 5, False, 1),  # 13
+    (128, 64, 4, False, 1),  # 14
+    (128, 128, 3, False, 1),  # 15
     # 2-CTA configs
-    (64, 16, 6, True),  # 16
-    (64, 16, 8, True),  # 17
-    (64, 16, 12, True),  # 18
-    (64, 32, 6, True),  # 19
-    (64, 32, 8, True),  # 20
-    (64, 32, 11, True),  # 21
-    (64, 64, 6, True),  # 22
-    (64, 64, 9, True),  # 23
-    (64, 128, 7, True),  # 24
-    (128, 16, 6, True),  # 25
-    (128, 32, 6, True),  # 26
-    (128, 64, 5, True),  # 27
-    (128, 128, 4, True),  # 28
+    (64, 16, 6, True, 1),  # 16
+    (64, 16, 8, True, 1),  # 17
+    (64, 16, 12, True, 1),  # 18
+    (64, 32, 6, True, 1),  # 19
+    (64, 32, 8, True, 1),  # 20
+    (64, 32, 11, True, 1),  # 21
+    (64, 64, 6, True, 1),  # 22
+    (64, 64, 9, True, 1),  # 23
+    (64, 128, 7, True, 1),  # 24
+    (128, 16, 6, True, 1),  # 25
+    (128, 32, 6, True, 1),  # 26
+    (128, 64, 5, True, 1),  # 27
+    (128, 128, 4, True, 1),  # 28
+    # split-K configs (1-CTA + cluster DSMEM reduce)
+    (64, 8, 12, False, 2),  # 29
+    (64, 8, 12, False, 3),  # 30
+    (64, 8, 12, False, 4),  # 31
+    (64, 16, 11, False, 2),  # 32
+    (64, 16, 10, False, 3),  # 33
+    (64, 16, 10, False, 4),  # 34
 ]
 
 
@@ -119,6 +206,10 @@ class TgvGemmCuteExtKernel:
         pdl_launch: Optional[bool] = None,
         pdl_count: int = -1,
         has_bias: bool = False,
+        split_k: int = 1,
+        # DEBUG timing knobs: 0 = full reduce; 1 = skip exchange entirely
+        # (WRONG results — timing only).
+        _split_k_debug: int = 0,
     ):
         self.acc_dtype = acc_dtype
         self.cta_m = cta_m
@@ -129,6 +220,13 @@ class TgvGemmCuteExtKernel:
         self.use_pdl = use_pdl
         self.pdl_launch = pdl_launch if pdl_launch is not None else use_pdl
         self.pdl_count = pdl_count
+        # split_k=2: the two CTAs of a (2,1,1) cluster compute the SAME output
+        # tile over disjoint K halves (each runs the full 1-CTA pipeline); the
+        # non-leader pushes its fp32 accumulator into the leader's SMEM over
+        # DSMEM and the leader adds it before the bf16 cast. Requires
+        # ceil(K/cta_k) >= 2 so both ranks get at least one k-tile.
+        self.split_k = split_k
+        self._split_k_debug = _split_k_debug
         # has_bias: when True, kernel reads a (Gemm_M, Gemm_N, Gemm_L):(1,0,0)
         # bias tensor (M-broadcast over N,L), converts it to fp32 in RMEM, and
         # adds it to the accumulator before the bf16 cast. When False, all
@@ -143,6 +241,10 @@ class TgvGemmCuteExtKernel:
                 f"cta_n={cta_n} invalid for use_2cta={use_2cta}: "
                 f"bf16 K-major mma requires N ∈ [{min_n}, 256] step {step_n}"
             )
+        if not 1 <= split_k <= 8:
+            raise ValueError(f"split_k={split_k} unsupported (1..8, portable cluster)")
+        if split_k > 1 and use_2cta:
+            raise ValueError("split_k requires use_2cta=False (cluster is the K group)")
 
         # Fixed configuration matching the C++ / DSL kernels.
         self.threads_per_cta = 256  # 8 warps (warp 3 unused)
@@ -153,8 +255,9 @@ class TgvGemmCuteExtKernel:
             self.cta_group = tcgen05.CtaGroup.TWO
             self.tma_op = cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
         else:
-            # 1 SM mode, 1x1 cluster, no multicast.
-            self.cluster_shape = (1, 1, 1)
+            # 1 SM mode, no multicast; cluster is (1,1,1) unless split_k pairs
+            # two 1-CTA pipelines for the DSMEM K-reduction.
+            self.cluster_shape = (split_k, 1, 1)
             self.mma_tiler_mn = (cta_m, cta_n)
             self.cta_group = tcgen05.CtaGroup.ONE
             self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
@@ -163,7 +266,7 @@ class TgvGemmCuteExtKernel:
         return (
             f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
-            f"_bias{int(self.has_bias)}"
+            f"_bias{int(self.has_bias)}_sk{self.split_k}"
         )
 
     @cute.experimental.jit
@@ -180,9 +283,12 @@ class TgvGemmCuteExtKernel:
         # don't leave an odd M-CTA without its peer (e.g. M=2880, cta_m=64 →
         # 45 M-tiles, invalid for cluster=(2,1,1)). cute_ext OOB-protects the
         # extra CTA's GMEM stores.
+        # split_k>1 launches split_k CTAs per output tile (bidx // split_k is
+        # the M tile, bidx % split_k the K-split rank); the product is already
+        # cluster-aligned so round_up is a no-op there.
         grid = cute.round_up(
             (
-                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(c.layout.shape[0], self.cta_m) * self.split_k,
                 cute.ceil_div(c.layout.shape[1], self.cta_n),
                 c.layout.shape[2],
             ),
@@ -260,9 +366,18 @@ class TgvGemmCuteExtKernel:
                 cute.arch.block_idx_in_cluster()
             )
             is_leader = cta_rank_in_cluster == 0
+        elif cutlass.const_expr(self.split_k > 1):
+            # split_k cluster: rank = K-split index; BOTH CTAs run their own
+            # full MMA pipeline (is_leader stays True), the rank only decides
+            # who owns the epilogue reduction + store.
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
+            is_leader = cutlass.Boolean(True)
         else:
             cta_rank_in_cluster = leader_rank
             is_leader = cutlass.Boolean(True)
+        split_rank = cta_rank_in_cluster
 
         # ---- SMEM A/B (DMA_Stage-staged, swizzled ComposedLayout) ----
         # alignment=1024 covers TMA's natural alignment requirements. 2-CTA
@@ -316,61 +431,73 @@ class TgvGemmCuteExtKernel:
         #      software-programmable. Used here for (a) thread sync within a
         #      CTA, (b) TMA transaction-count tracking (TMA→SM signaling),
         #      and (c) 1-arrival "wake the consumer warp" patterns.
-        # Allocated as 1D tensors; .iterator gives a Pointer[Int64] supporting
-        # `bar + stage` arithmetic. Arrival counts are in the module docstring.
-        bar_full_arr = cute_ext.allocate(
+        # Allocated as one flat 1D tensor so the one-init-per-lane below can
+        # index barrier `tidx` without warp divergence; .iterator gives a
+        # Pointer[Int64] supporting `bar + stage` arithmetic.
+        num_bars = 2 * DMA_Stage + 4
+        bars_arr = cute_ext.allocate(
             cutlass.Int64,
             cute.AddressSpace.smem,
-            cute.make_layout(DMA_Stage),
+            cute.make_layout(num_bars),
             alignment=8,
-        )
-        bar_empty_arr = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(DMA_Stage),
-            alignment=8,
-        )
-        bar_tma_epilog_arr = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
-        )
-        bar_mma_epilog_arr = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
-        )
-        bar_tmem_alloc_arr = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
         tmem_base_arr = cute_ext.allocate(
             cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
         )
+        # split_k partial-accumulator landing zone in the LEADER's SMEM: each
+        # non-leader rank r DSMEM-stores its fp32 (cta_m × cta_n) fragment
+        # into slot r-1. Elided (1 dummy element) when split_k == 1.
+        red_buf_len = (
+            (self.split_k - 1) * self.cta_m * self.cta_n if self.split_k > 1 else 1
+        )
+        red_buf = cute_ext.allocate(
+            self.acc_dtype,
+            cute.AddressSpace.smem,
+            cute.make_layout(red_buf_len),
+            alignment=16,
+        )
 
-        bar_full = bar_full_arr.iterator  # Pointer[Int64], DMA_Stage
-        bar_empty = bar_empty_arr.iterator  # Pointer[Int64], DMA_Stage
-        bar_tma_epilog = bar_tma_epilog_arr.iterator  # Pointer[Int64]
-        bar_mma_epilog = bar_mma_epilog_arr.iterator  # Pointer[Int64]
-        bar_tmem_alloc = bar_tmem_alloc_arr.iterator  # Pointer[Int64]
+        bars = bars_arr.iterator  # Pointer[Int64], num_bars
+        bar_full = bars  # Pointer[Int64], DMA_Stage
+        bar_empty = bars + DMA_Stage  # Pointer[Int64], DMA_Stage
+        bar_tma_epilog = bars + 2 * DMA_Stage  # Pointer[Int64]
+        bar_mma_epilog = bars + 2 * DMA_Stage + 1  # Pointer[Int64]
+        bar_tmem_alloc = bars + 2 * DMA_Stage + 2  # Pointer[Int64]
+        bar_splitk = bars + 2 * DMA_Stage + 3  # Pointer[Int64]
         tmem_base_ptr = tmem_base_arr.iterator  # Pointer[Int32]
 
-        # ---- Barrier init (1 thread, PTX mbarrier.init is single-thread) ----
+        # ---- Barrier init (warp 0, one mbarrier per lane) ----
+        # The 2*DMA_Stage+3 inits sit on the pre-cluster-barrier critical path
+        # of every launch; a single elected thread serializes all of them, so
+        # spread them one-per-lane in ceil(num_bars/32) rounds (1 round up to
+        # 14 stages). warp_idx==0 ⇒ tidx is the lane id. The
+        # arrival count is picked with predicated moves, NOT an if/elif
+        # ladder: divergent arms get a copy of the mbarrier-init fence sunk
+        # into each of them, which costs more than the store fan-out saves.
         # bar_full arrival = 2 * num_mma_ctas:
         #   1-CTA: 2 (own DMA_A + DMA_B)
         #   2-CTA: 4 (own + peer DMA_A/DMA_B, routed via SM100_TMA_LOAD_2SM
         #          onto the leader's bar). In 2-CTA the peer's copy is unused.
         if warp_idx == 0:
-            with cute.arch.elect_one():
-                for i in range(DMA_Stage):
-                    cute.arch.mbarrier_init(bar_full + i, 2 * num_mma_ctas)
-                for i in range(DMA_Stage):
-                    cute.arch.mbarrier_init(bar_empty + i, 1)  # MMA tcgen05.commit
-                cute.arch.mbarrier_init(bar_tma_epilog, 32)  # whole DMA_B warp
-                cute.arch.mbarrier_init(bar_mma_epilog, 1)  # MMA tcgen05.commit
-                cute.arch.mbarrier_init(
-                    bar_tmem_alloc, 32 + 128
-                )  # MMA + 4 EPILOG warps
+            for base in range(0, num_bars, 32):  # constexpr; 1 round for ≤12 stages
+                bar_idx = base + tidx
+                if bar_idx < num_bars:
+                    # bar_empty / bar_mma_epilog: 1 (MMA tcgen05.commit)
+                    count = cutlass.Int32(1)
+                    if bar_idx < DMA_Stage:
+                        count = cutlass.Int32(2 * num_mma_ctas)
+                    if bar_idx == 2 * DMA_Stage:
+                        count = cutlass.Int32(32)  # whole DMA_B warp
+                    if bar_idx == 2 * DMA_Stage + 2:
+                        count = cutlass.Int32(32 + 128)  # MMA + 4 EPILOG warps
+                    # bar_splitk (2*DMA_Stage+3) keeps count 1: single elected
+                    # expect_tx arrive; peers signal via st.async tx-completion.
+                    cute.arch.mbarrier_init(bars + bar_idx, count)
 
         cute.arch.mbarrier_init_fence()
-        if cutlass.const_expr(self.use_2cta):
+        if cutlass.const_expr(self.use_2cta or self.split_k > 1):
             # Cluster-wide sync: ensure peer's barriers are visible before any
             # cross-CTA arrives. Splitting arrive/wait lets the per-CTA tile
             # setup below overlap with the cluster barrier. (Implicit
@@ -379,13 +506,31 @@ class TgvGemmCuteExtKernel:
         else:
             cute.arch.barrier()
 
-        work_tile_info = WorkTileInfo(
-            M_idx=bidx,
-            N_idx=bidy,
-            L_idx=bidz,
-            K_idx_start=cutlass.Int32(0),
-            K_idx_end=cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k),
-        )
+        total_k_tiles = cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k)
+        if cutlass.const_expr(self.split_k > 1):
+            # Interleaved: rank r takes tiles {r, r+split, r+2*split, ...};
+            # K_idx_start doubles as the rank's first tile, the DMA warps
+            # stride by split_k. Non-empty for every rank while T >= split_k
+            # (guarded at dispatch); measured equal to contiguous halves and
+            # generalizes to any split without remainder clamping.
+            tiles_this_rank = (
+                total_k_tiles - split_rank + self.split_k - 1
+            ) // self.split_k
+            work_tile_info = WorkTileInfo(
+                M_idx=bidx // self.split_k,
+                N_idx=bidy,
+                L_idx=bidz,
+                K_idx_start=split_rank,
+                K_idx_end=split_rank + tiles_this_rank,
+            )
+        else:
+            work_tile_info = WorkTileInfo(
+                M_idx=bidx,
+                N_idx=bidy,
+                L_idx=bidz,
+                K_idx_start=cutlass.Int32(0),
+                K_idx_end=total_k_tiles,
+            )
         k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start
 
         # ---- CTA-to-Value maps for TMA (constexpr) ----
@@ -432,7 +577,7 @@ class TgvGemmCuteExtKernel:
             (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
         )
 
-        if cutlass.const_expr(self.use_2cta):
+        if cutlass.const_expr(self.use_2cta or self.split_k > 1):
             # Cluster sync deferred to here — tile-view setup above runs in
             # parallel with the cluster barrier latency.
             cute.arch.cluster_wait()
@@ -447,6 +592,7 @@ class TgvGemmCuteExtKernel:
                 sA,
                 a_cta_v_map,
                 k_tile_count,
+                work_tile_info.K_idx_start,
             )
         elif warp_idx == 1:
             self.dma_b_warp(
@@ -458,6 +604,7 @@ class TgvGemmCuteExtKernel:
                 sB,
                 b_cta_v_map,
                 k_tile_count,
+                work_tile_info.K_idx_start,
             )
         elif warp_idx == 2:
             self.mma_warp(
@@ -481,10 +628,13 @@ class TgvGemmCuteExtKernel:
                 bar_tma_epilog,
                 bar_mma_epilog,
                 bar_tmem_alloc,
+                bar_splitk,
                 tmem_base_ptr,
                 acc_layout,
                 gD_tile,
                 gBias_tile,
+                red_buf,
+                split_rank,
                 epi_tid,
                 c_dtype,
                 d_layout,
@@ -507,6 +657,7 @@ class TgvGemmCuteExtKernel:
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         a_cta_v_map: cute.Layout,
         k_tile_count: cutlass.Int32,
+        k_tile_offset: cutlass.Int32,  # split_k rank's first tile; 0 otherwise
     ):
         DMA_Stage = self.num_ab_stage
 
@@ -545,8 +696,12 @@ class TgvGemmCuteExtKernel:
                     ),
                     peer_cta_rank_in_cluster=leader_rank if self.use_2cta else None,
                 )
+            if cutlass.const_expr(self.split_k > 1):
+                g_k_idx = k_tile_offset + self.split_k * k_tile
+            else:
+                g_k_idx = k_tile_offset + k_tile
             cute_ext.tma_load(
-                gA_tile[None, None, k_tile],  # (CTA_M, CTA_K) GMEM slice
+                gA_tile[None, None, g_k_idx],  # (CTA_M, CTA_K)
                 sA[None, None, None, stage],  # ((Mma_M,Mma_K),NumMma_M,NumMma_K)
                 (bar_full + stage).value,  # Pointer→ir.Value bridge
                 cta_v_map=a_cta_v_map,
@@ -591,6 +746,7 @@ class TgvGemmCuteExtKernel:
         sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
         b_cta_v_map: cute.Layout,
         k_tile_count: cutlass.Int32,
+        k_tile_offset: cutlass.Int32,  # split_k rank's first tile; 0 otherwise
     ):
         DMA_Stage = self.num_ab_stage
 
@@ -616,8 +772,12 @@ class TgvGemmCuteExtKernel:
                     ),
                     peer_cta_rank_in_cluster=leader_rank if self.use_2cta else None,
                 )
+            if cutlass.const_expr(self.split_k > 1):
+                g_k_idx = k_tile_offset + self.split_k * k_tile
+            else:
+                g_k_idx = k_tile_offset + k_tile
             cute_ext.tma_load(
-                gB_tile[None, None, k_tile],  # (CTA_N, CTA_K) GMEM slice
+                gB_tile[None, None, g_k_idx],  # (CTA_N, CTA_K)
                 sB[None, None, None, stage],  # ((Mma_N,Mma_K),NumMma_N,NumMma_K)
                 (bar_full + stage).value,
                 cta_v_map=b_cta_v_map,
@@ -771,10 +931,13 @@ class TgvGemmCuteExtKernel:
         bar_tma_epilog,  # Pointer[Int64], 1 entry (32-arrival)
         bar_mma_epilog,  # Pointer[Int64], 1 entry
         bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
+        bar_splitk,  # Pointer[Int64], 1 entry (128-arrival) — split_k only
         tmem_base_ptr,  # Pointer[Int32] — SMEM slot from MMA
         acc_layout: cutlass.Constexpr,
         gD_tile: cute.Tensor,  # (CTA_M, CTA_N) — this CTA's output tile
         gBias_tile: cute.Tensor,  # (CTA_M, CTA_N) with stride (1,0) — bias broadcast
+        red_buf: cute.Tensor,  # fp32 (cta_m*cta_n) partial landing zone — split_k only
+        split_rank: cutlass.Int32,  # K-split rank; 0 when split_k == 1
         epi_tid: cutlass.Int32,  # 0..127 within the 4 EPILOG warps
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
@@ -915,6 +1078,62 @@ class TgvGemmCuteExtKernel:
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
+        # ---- split_k: merge the K-peer's partial accumulator (fp32) ----
+        # The non-leader DSMEM-stores its rAcc fragment into the LEADER's
+        # red_buf at (epi_tid, i) slots — both CTAs use the identical t2r
+        # partition, so slot (t, i) is the same (m, n) element in both — then
+        # remote-arrives on the leader's bar_splitk (release.cluster orders
+        # the stores). The leader waits and adds before bias/cast/store.
+        do_store = cutlass.Boolean(True)
+        if cutlass.const_expr(self.split_k > 1):
+            do_store = split_rank == 0
+        if cutlass.const_expr(self.split_k > 1 and self._split_k_debug != 1):
+            frag_sz = cute.size(rmem_layout)
+            red_layout = cute.make_layout(
+                (self.split_k - 1, 128, frag_sz),
+                stride=(128 * frag_sz, frag_sz, 1),
+            )
+            if split_rank != 0:
+                # st.async delivers each 16B chunk into the leader's red_buf
+                # AND bumps the leader's bar_splitk completed-tx count —
+                # no arrive, no fences (see helper docstrings).
+                remote_ptr = cute.arch.map_dsmem_ptr(red_buf.iterator, 0)
+                base_addr = remote_ptr.toint() + (
+                    ((split_rank - 1) * (128 * frag_sz) + epi_tid * frag_sz) * 4
+                )
+                remote_bar = cute.arch.map_dsmem_ptr(bar_splitk, 0).toint()
+                if cutlass.const_expr(frag_sz % 4 == 0):
+                    for i in cutlass.range_constexpr(frag_sz // 4):
+                        _st_async_shared_cluster_v4_f32(
+                            base_addr + i * 16,
+                            remote_bar,
+                            rAcc[i * 4],
+                            rAcc[i * 4 + 1],
+                            rAcc[i * 4 + 2],
+                            rAcc[i * 4 + 3],
+                        )
+                else:
+                    for i in cutlass.range_constexpr(frag_sz):
+                        _st_async_shared_cluster_f32(
+                            base_addr + i * 4, remote_bar, rAcc[i]
+                        )
+            else:
+                # Single arrive declares the expected tx bytes (the full
+                # (split_k-1) partial tiles); the phase completes when every
+                # peer's st.async has landed. NOT elect_one — that elects one
+                # lane PER WARP and the epilog spans 4 warps (4 arrives would
+                # corrupt the count-1 barrier).
+                if epi_tid == 0:
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        bar_splitk,
+                        (self.split_k - 1) * self.cta_m * self.cta_n * 4,
+                    )
+                rLocal = cute.make_tensor(red_buf.iterator, red_layout)
+                _mbarrier_wait_parity_spin(bar_splitk.toint(), 0)
+                for s in cutlass.range_constexpr(self.split_k - 1):
+                    for i in cutlass.range_constexpr(frag_sz):
+                        rAcc[i] = rAcc[i] + rLocal[s, epi_tid, i]
+
         # Add bias in fp32 before the dtype cast.
         if cutlass.const_expr(self.has_bias):
             rAcc.store(rAcc.load() + rBiasAcc.load())
@@ -943,7 +1162,9 @@ class TgvGemmCuteExtKernel:
         # stay untouched. So the C++ / vanilla-DSL kernels' explicit predicate
         # dance (make_identity_tensor + elem_less + basic_copy_if) isn't
         # needed; the explicit `predicated_tensor_origin` marker isn't either.
-        cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+        # split_k: only the leader (rank 0) writes the merged tile.
+        if do_store:
+            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
 
 # =====================================================================
@@ -1078,6 +1299,7 @@ def _get_compiled_cute_ext_kernel(
     use_2cta: bool,
     use_pdl: bool,
     has_bias: bool,
+    split_k: int,
     a_leading: int,
     b_leading: int,
     c_leading: int,
@@ -1098,6 +1320,7 @@ def _get_compiled_cute_ext_kernel(
         bool(use_2cta),
         bool(use_pdl),
         bool(has_bias),
+        split_k,
         a_leading,
         b_leading,
         c_leading,
@@ -1120,6 +1343,7 @@ def _get_compiled_cute_ext_kernel(
         use_2cta=use_2cta,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        split_k=split_k,
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
@@ -1210,7 +1434,7 @@ def _to_cute_swap(
 
 
 def _resolve_tactic(tactic: int) -> Tuple[int, int, int, bool]:
-    """Return (cta_m, cta_n, num_ab_stage, use_2cta) for the given tactic id."""
+    """Return (cta_m, cta_n, num_ab_stage, use_2cta, split_k) for the tactic."""
     if tactic < 0:
         tactic = _TGV_CUTE_EXT_DEFAULT_TACTIC
     if tactic >= len(_TGV_CUTE_EXT_TACTIC_CONFIGS):
@@ -1229,7 +1453,7 @@ def _run_tgv(
     tactic: int,
 ) -> torch.Tensor:
     """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
-    cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
+    cta_m, cta_n, num_ab_stage, use_2cta, split_k = _resolve_tactic(tactic)
     has_bias = bias is not None
 
     a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
@@ -1248,6 +1472,7 @@ def _run_tgv(
         use_2cta=use_2cta,
         use_pdl=bool(pdl),
         has_bias=has_bias,
+        split_k=split_k,
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
@@ -1282,8 +1507,48 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
     return num_mma_ctas * -(n // -cluster_m) * -(m // -cta_n)
 
 
+# (cta_n, split_k) -> split tactic id.
+_TGV_SPLIT_TACTICS = {
+    (8, 2): 29,
+    (8, 3): 30,
+    (8, 4): 31,
+    (16, 2): 32,
+    (16, 3): 33,
+    (16, 4): 34,
+}
+
+
+def _pick_split_tactic(m: int, n: int, k: int) -> Optional[int]:
+    """Largest split-K tactic that fills (but doesn't overflow) the machine.
+
+    CUPTI-swept on B300 (sweep_splitk 2026-07: 168 shapes, mean regret vs
+    per-shape best 0.6%). Constraints from the data:
+      - k_tiles >= 10*split — shorter K ranges don't amortize the pipeline
+        fill (k=2048 loses with any split);
+      - grid <= 148 for split 2, <= 128 for split 3/4 — near-full waves of
+        3/4-CTA clusters degrade sharply (m=48, n=1024: sk3's 144-CTA grid
+        loses 34% to sk2's 96).
+    """
+    k_tiles = -(k // -_TGV_CUTE_EXT_CTA_K)
+    cta_n = 8 if m <= 8 else 16
+    token_tiles = -(m // -cta_n)
+    m_tiles = -(n // -64)
+    best = None
+    for split in (2, 3, 4):
+        if k_tiles < 10 * split:
+            continue
+        if m_tiles * token_tiles * split > (_TGV_NUM_SMS if split == 2 else 128):
+            continue
+        best = _TGV_SPLIT_TACTICS[(cta_n, split)]
+    return best
+
+
 def _pick_tactic(m: int, n: int, k: int) -> int:
-    """Pick the first ladder tactic whose grid fits one wave of the SMs."""
+    """Pick a split-K tactic when one fills the machine, else the first
+    ladder tactic whose grid fits one wave of the SMs."""
+    split = _pick_split_tactic(m, n, k)
+    if split is not None:
+        return split
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
@@ -1300,12 +1565,32 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     back to cuBLAS."""
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    if n < 1024 or k < 2048 or k > 6144:
+    if n < 512 or k < 2048 or k > 12288:
         return False
+    if n < 1024:
+        # DEBUG: removed the GLM-5.2 mlp.shared_experts.gate_up split-K case
+        # (N=512, K=6144, TP8) from the heuristic for debug purposes.
+        return False
+    if k > 6144:
+        # Split-K territory (sweep_splitk 2026-07): TGV+split beats cuBLAS by
+        # 5-27% for small-N large-K; unmeasured combinations stay on cuBLAS.
+        if n > 2624:
+            return False
+        if n <= 2112:
+            return m <= 48
+        return m <= (24 if k <= 8192 else 16)
     ragged = m % 16 != 0
     if n <= 1024:
+        # DEBUG: removed the GLM-5.2 mlp.shared_experts.gate_up split-K case
+        # (N=1024, K=6144, TP4) from the heuristic for debug purposes.
         return m <= 512 and (m >= 48 or m % 16 >= 9)
     if n <= 2624:
+        if n <= 2048 and k <= 2048:
+            # GLM-5.2 q_b_proj at TP8 (N=2048, K=2048): TGV (no split-K;
+            # K=2048 doesn't clear the split-K tile threshold) beats or ties
+            # cuBLAS at every M up to 128 (sweep_splitk_bf16 2026-07-11,
+            # M=1..128, min gain 0.0% at m=101, never a loss).
+            return m <= 128
         return m <= 128 and k >= 4096
     if n <= 4096:
         return m <= 64
