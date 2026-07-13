@@ -2116,7 +2116,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_lens=commit_lens,
                 can_run_cuda_graph=can_run_cuda_graph,
                 next_draft_input=next_draft_input,
-                speculative_num_draft_tokens=int(self.block_size),
+                # Result stride: batch_result_processor slices next_token_ids as
+                # [i*stride : i*stride + accept_lens[i]]. out_tokens is
+                # [bs, draft_token_num] (the VERIFY budget), so the stride is the
+                # tree budget, NOT the draft block_size. When tree verify decouples
+                # them (block_size < draft_token_num), passing self.block_size reads
+                # the wrong per-req slice for every req after the first (bs > 1).
+                speculative_num_draft_tokens=block_size,
                 new_seq_lens=new_seq_lens,
             )
 
