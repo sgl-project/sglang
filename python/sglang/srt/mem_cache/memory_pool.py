@@ -3221,10 +3221,50 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if tgt_loc.numel() == 0:
             return
 
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
+        # index_k_with_scale_buffer is page-indexed: each row holds a whole page
+        # of `page_size` tokens laid out as
+        #   [page_size * index_head_dim fp8-K bytes | page_size * 4 fp32-scale bytes].
+        # tgt_loc/src_loc are per-token slot indices, so a token at slot `loc`
+        # lives in row `loc // page_size` at within-page offset `loc % page_size`
+        # (matching index_buf_accessor.SetK/SetS). Indexing the buffer's row axis
+        # with the raw token slot would move the wrong rows and corrupt the
+        # indexer relative to the latent KV, so translate each token to its
+        # (page, offset) byte range and move the per-token K and scale slices.
+        tgt_byte_indices = self._indexer_byte_gather_indices(tgt_loc.view(-1).long())
+        src_byte_indices = self._indexer_byte_gather_indices(src_loc.view(-1).long())
         for index_k in self.index_k_with_scale_buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            flat_buf = index_k.view(-1)
+            flat_buf[tgt_byte_indices] = flat_buf[src_byte_indices]
+
+    def _indexer_byte_gather_indices(self, loc: torch.Tensor) -> torch.Tensor:
+        """Flat byte indices into a single index_k_with_scale_buffer layer for the
+        per-token K and scale slices of the tokens in `loc`.
+
+        Returns a 1-D int64 tensor addressing, for every token, its
+        `index_head_dim` K bytes followed by its `num_s_bytes_per_token` scale
+        bytes within the token's page row.
+        """
+        num_k_bytes_per_token = self.index_head_dim
+        num_s_bytes_per_token = self.index_head_dim // self.quant_block_size * 4
+        buf_numel_per_page = (
+            self.page_size * num_k_bytes_per_token
+            + self.page_size * num_s_bytes_per_token
+        )
+        s_offset_in_page = self.page_size * num_k_bytes_per_token
+
+        page_index = loc // self.page_size
+        offset_in_page = loc % self.page_size
+        page_base = page_index * buf_numel_per_page
+
+        k_start = page_base + offset_in_page * num_k_bytes_per_token
+        k_bytes = k_start[:, None] + torch.arange(
+            num_k_bytes_per_token, device=loc.device
+        )
+        s_start = page_base + s_offset_in_page + offset_in_page * num_s_bytes_per_token
+        s_bytes = s_start[:, None] + torch.arange(
+            num_s_bytes_per_token, device=loc.device
+        )
+        return torch.cat([k_bytes, s_bytes], dim=1).view(-1)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
