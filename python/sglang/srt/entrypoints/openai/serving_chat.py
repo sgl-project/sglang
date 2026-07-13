@@ -1645,7 +1645,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
-        if finish_reason_type is not None:
+        if finish_reason_type is not None and finish_reason_type != "abort":
             end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
             if end_reasoning_text:
                 reasoning_text = (reasoning_text or "") + end_reasoning_text

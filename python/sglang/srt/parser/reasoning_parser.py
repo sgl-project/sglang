@@ -65,7 +65,7 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
-    def _apply_force_nonempty_content(
+    def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
     ) -> StreamingParseResult:
         if self._force_nonempty_content and not ret.normal_text:
@@ -77,7 +77,9 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        return self._apply_force_nonempty_content(self._detect_and_parse_impl(text))
+        return self._maybe_apply_force_nonempty_content(
+            self._detect_and_parse_impl(text)
+        )
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
@@ -213,7 +215,13 @@ class BaseReasoningFormatDetector:
         reasoning (plus any partial token still buffered) as normal text.
         """
         if self._force_nonempty_content and self._in_reasoning:
-            normal_text = self._accumulated_reasoning + self._buffer
+            # stream_reasoning=False never clears _buffer, so the opening think
+            # token (stripped only from the base class's local view) survives here.
+            buffer = self._buffer
+            think_start_text = self.think_start_token + self.think_start_self_label
+            if buffer.startswith(think_start_text):
+                buffer = buffer[len(think_start_text) :]
+            normal_text = self._accumulated_reasoning + buffer
             self._accumulated_reasoning = ""
             self._buffer = ""
             if normal_text:
@@ -463,7 +471,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
         normal_text = "".join(normal_parts)
         # Tool call events preserve raw text with structural markers
 
-        return self._apply_force_nonempty_content(
+        return self._maybe_apply_force_nonempty_content(
             StreamingParseResult(
                 normal_text=normal_text,
                 reasoning_text=reasoning_text,
@@ -712,7 +720,7 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
             normal_text="".join(text_parts),
             reasoning_text="".join(reasoning_parts),
         )
-        return self._apply_force_nonempty_content(ret)
+        return self._maybe_apply_force_nonempty_content(ret)
 
     def detect_and_parse_block_sequence(self, text: str) -> list[tuple[str, str]]:
         """Return an ordered sequence of blocks: [("reasoning"|"text", content), ...]"""
@@ -1013,7 +1021,7 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         if reasoning.startswith(think_start_text):
             reasoning = reasoning[len(think_start_text) :]
 
-        return self._apply_force_nonempty_content(
+        return self._maybe_apply_force_nonempty_content(
             StreamingParseResult(
                 normal_text=self._strip_text_markers(rest),
                 reasoning_text=reasoning,
