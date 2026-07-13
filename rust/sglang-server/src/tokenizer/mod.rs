@@ -45,8 +45,13 @@ pub fn load_tokenizer(
 
     let file = resolve_model_file(path, revision, "tokenizer.json")
         .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
-    let tokenizer = dynamo_tokenizers::Tokenizer::from_file(&file)
-        .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
+    let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
+        &file,
+        dynamo_tokenizers::TokenizerOptions {
+            add_special_tokens: true,
+        },
+    )
+    .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded tokenizer");
     Ok(Some(tokenizer))
 }

@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # tokenizer
-dynamo-tokenizers = "1.3.2"
+dynamo-tokenizers = "1.5.1"
 
 # Offline HF Hub cache lookup only (no `tokio`/`ureq`/TLS features) — resolves a
 # repo id to its already-downloaded local tokenizer.json without network/openssl.
