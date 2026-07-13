@@ -1,13 +1,14 @@
-from types import SimpleNamespace
-
 from collections import namedtuple
 from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_cache_builder import is_supported_dsv4_decode_radix_mtp
@@ -153,24 +154,103 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         allow_radix_cache_insert_once=False,
         extend_range=Range(0, 5),
         full_untruncated_fill_ids=[1, 2, 3, 4, 5],
+        extra_key=None,
+        req_pool_idx=0,
+        cache_protected_len=0,
+        swa_evicted_seqlen=4,
+        rid="test",
     )
     req.get_fill_ids = lambda: [1, 2, 3, 4, 5][: req.extend_range.end]
-    tree_cache = SimpleNamespace(inserted_fill_ids=[])
+
+    tree_cache = SimpleNamespace(
+        inserted_fill_ids=[],
+        inserted_swa_evicted_seqlens=[],
+        inserted_force_leaf_creation=[],
+        page_size=2,
+        sliding_window_size=2,
+        is_eagle=True,
+    )
 
     def cache_unfinished_req(inserted_req, **_kwargs):
         tree_cache.inserted_fill_ids.append(list(inserted_req.get_fill_ids()))
+        tree_cache.inserted_swa_evicted_seqlens.append(
+            inserted_req.swa_evicted_seqlen
+        )
+        tree_cache.inserted_force_leaf_creation.append(
+            inserted_req.force_radix_leaf_creation
+        )
+        inserted_req.cache_protected_len = 2
 
     tree_cache.cache_unfinished_req = cache_unfinished_req
-    processor = SimpleNamespace(tree_cache=tree_cache)
+    token_to_kv_pool_allocator = SimpleNamespace(freed_swa_indices=[])
 
-    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
-        processor, req, is_prebuilt_batch=True
+    def free_swa(indices):
+        token_to_kv_pool_allocator.freed_swa_indices.append(indices.tolist())
+
+    token_to_kv_pool_allocator.free_swa = free_swa
+    req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[11, 12, 13, 14, 15]], dtype=torch.int64)
     )
-    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
-        processor, req, is_prebuilt_batch=True
+    processor = SimpleNamespace(
+        tree_cache=tree_cache,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        req_to_token_pool=req_to_token_pool,
     )
+
+    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
+    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
 
     assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
+    assert tree_cache.inserted_swa_evicted_seqlens == [2]
+    assert tree_cache.inserted_force_leaf_creation == [True]
+    assert token_to_kv_pool_allocator.freed_swa_indices == [[11, 12]]
     assert req.extend_range.end == 5
+    assert req.cache_protected_len == 2
+    assert req.swa_evicted_seqlen == 4
+    assert req.force_radix_leaf_creation is False
     assert req.allow_radix_cache_insert_once is False
     assert req.dsv4_decode_radix_cache_prompt_once is False
+
+
+def test_dsv4_decode_radix_match_uses_full_match_for_full_only_leaf():
+    queue = _make_queue(page_size=2)
+    node = object()
+    tree_cache = SimpleNamespace(captured_params=None)
+
+    def supports_mamba():
+        return False
+
+    def match_prefix(params):
+        tree_cache.captured_params = params
+        return MatchResult(
+            device_indices=torch.tensor([1, 2], dtype=torch.int64),
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+        )
+
+    def inc_lock_ref(_node):
+        return SimpleNamespace(swa_uuid_for_lock=None)
+
+    tree_cache.supports_mamba = supports_mamba
+    tree_cache.match_prefix = match_prefix
+    tree_cache.inc_lock_ref = inc_lock_ref
+    queue.tree_cache = tree_cache
+
+    req = SimpleNamespace(
+        origin_input_ids=[1, 2, 3],
+        extra_key=None,
+        prefix_indices=None,
+        last_node=None,
+        last_host_node=None,
+        best_match_node=None,
+        host_hit_length=0,
+        swa_uuid_for_lock=None,
+    )
+
+    prefix_indices, prefix_len = DecodePreallocQueue._match_prefix_and_lock(queue, req)
+
+    assert prefix_indices.tolist() == [1, 2]
+    assert prefix_len == 2
+    assert tree_cache.captured_params.return_full_match is True
+    assert req.last_node is node
