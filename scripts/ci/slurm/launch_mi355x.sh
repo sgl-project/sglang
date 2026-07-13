@@ -168,15 +168,21 @@ fi
 eval "$RECIPE_VARS"
 # Optional image override from workflow_dispatch input / setup-resolved latest.
 # A recipe with `runtime.pin_image: true` keeps its pinned image (a known-good
-# pin wins over the dynamically resolved latest). An explicit manual
-# workflow_dispatch `image` input still wins over everything, so a human can
-# force any image for a one-off run.
-if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
-    if [[ "${PIN_IMAGE:-0}" == "1" && "${IMAGE_INPUT_EXPLICIT:-0}" != "1" ]]; then
+# pin wins over the dynamically resolved latest) AND runs that image's coherent
+# baked sglang (checkout-runtime forced off): an OLD pinned image's kernels
+# won't match the checked-out (newer) python, so reinstalling the checkout would
+# ABI-crash the server. An explicit manual workflow_dispatch `image` input still
+# wins over everything (and leaves checkout-runtime as-is), so a human can force
+# any image for a one-off run.
+if [[ "${PIN_IMAGE:-0}" == "1" && "${IMAGE_INPUT_EXPLICIT:-0}" != "1" ]]; then
+    [[ -n "${IMAGE_OVERRIDE:-}" ]] && \
         echo "recipe pins image=$IMAGE; ignoring resolved override $IMAGE_OVERRIDE"
-    else
-        IMAGE="$IMAGE_OVERRIDE"
+    if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
+        echo "pin_image: forcing SGLANG_USE_CHECKOUT_RUNTIME=0 to use the pinned image's coherent baked sglang"
+        SGLANG_USE_CHECKOUT_RUNTIME=0
     fi
+elif [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
+    IMAGE="$IMAGE_OVERRIDE"
 fi
 echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
 
