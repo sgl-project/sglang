@@ -25,10 +25,6 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.srt.configs.hybrid_arch import (
-    hybrid_gdn_config,
-    mambaish_config,
-)
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -482,8 +478,6 @@ class ModelRunner:
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             use_mla_backend=self.use_mla_backend,
-            mambaish_config=mambaish_config(self.model_config),
-            hybrid_gdn_config=hybrid_gdn_config(self.model_config),
             layer_info=self.layer_info,
             forward_stream=self.forward_stream,
             req_to_token_pool=self.req_to_token_pool,
