@@ -162,23 +162,23 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
-        if quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
-            # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
-            # swiglu_limit==0) still run on aiter builds where this module
-            # lives elsewhere / is absent.
+        # Pass gate_mode whenever the aiter build exposes GateMode. The a16w4
+        # gate/up-interleaved weight layout (shuffle_weight_a16w4) requires
+        # gate_mode=INTERLEAVE so aiter dispatches the fp4_bf16 FlyDSL kernels.
+        # Pass it unconditionally (not only swiglu_limit>0) so non-clamped models
+        # (e.g. Qwen3.5 MXFP4, swiglu_limit==0) also select the a16w4 path.
+        # Import lazily/guarded: older aiter builds may lack this module.
+        try:
             from aiter.ops.flydsl.moe_common import GateMode
 
-            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
-            # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
-            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
+        except ImportError:
+            pass
+        if quant_info.swiglu_limit > 0:
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True

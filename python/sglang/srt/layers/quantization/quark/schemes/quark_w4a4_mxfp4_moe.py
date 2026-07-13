@@ -44,6 +44,14 @@ if _use_aiter:
     except ImportError:
         shuffle_scale_a16w4_sep_fp4 = shuffle_weight_a16w4_sep_fp4 = None
 
+    try:
+        from aiter.ops.shuffle import (
+            shuffle_scale_a16w4_gui_fp4,
+            shuffle_weight_a16w4_gui_fp4,
+        )
+    except ImportError:
+        shuffle_scale_a16w4_gui_fp4 = shuffle_weight_a16w4_gui_fp4 = None
+
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
@@ -236,15 +244,37 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
 
         if _use_a16w4:
-            # a16w4 (bf16 activations + fp4 weights): the fp4_bf16 SEPARATED FlyDSL
-            # kernels use the klane-inner sep_fp4 preshuffle layout (both stages).
-            # w13 is gate|up-concat (as loaded); the kernel reads gate=first inter_dim
-            # N cols, up=next inter_dim. moe_runner passes gate_mode=INTERLEAVE which
-            # aiter maps to bf16 acts + the fp4_bf16 kernel.
+            # a16w4 (bf16 activations + fp4 weights): the fp4_bf16 FlyDSL kernels use
+            # the klane-inner preshuffle layout. w13 is gate|up-concat (as loaded).
+            #   - SEPARATED (default): both stages use sep_fp4 klane-inner layout.
+            #   - INTERLEAVE (AITER_FP4BF16_USE_ITLV=1): w13 uses the gui_fp4 layout
+            #     (gate/up interleaved at 16-block + klane-inner) for the faster `_gui`
+            #     stage1 kernel; w2 (stage2) always stays sep_fp4 (stage2 is separated).
+            import os
+
+            _use_itlv = (
+                int(os.environ.get("AITER_FP4BF16_USE_ITLV", "0"))
+                and shuffle_weight_a16w4_gui_fp4 is not None
+            )
+            _w13_wshuf = (
+                shuffle_weight_a16w4_gui_fp4
+                if _use_itlv
+                else shuffle_weight_a16w4_sep_fp4
+            )
+            _w13_sshuf = (
+                shuffle_scale_a16w4_gui_fp4
+                if _use_itlv
+                else shuffle_scale_a16w4_sep_fp4
+            )
+            logger.info(
+                "[quark a16w4] w13 shuffle = %s (INTERLEAVE=%s), w2 = sep_fp4",
+                "gui_fp4" if _use_itlv else "sep_fp4",
+                bool(_use_itlv),
+            )
             E = layer.w13_weight.shape[0]
 
             s0, s1, _ = layer.w13_weight_scale.shape
-            layer.w13_weight_scale.data = shuffle_scale_a16w4_sep_fp4(
+            layer.w13_weight_scale.data = _w13_sshuf(
                 layer.w13_weight_scale.view(s0 * s1, -1), E
             ).view(s0, s1, -1)
             s0, s1, _ = layer.w2_weight_scale.shape
@@ -252,9 +282,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 layer.w2_weight_scale.view(s0 * s1, -1), E
             ).view(s0, s1, -1)
 
-            layer.w13_weight.data = shuffle_weight_a16w4_sep_fp4(
-                layer.w13_weight.contiguous()
-            )
+            layer.w13_weight.data = _w13_wshuf(layer.w13_weight.contiguous())
             layer.w2_weight.data = shuffle_weight_a16w4_sep_fp4(
                 layer.w2_weight.contiguous()
             )
