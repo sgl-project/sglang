@@ -733,6 +733,21 @@ class ServerArgs:
         bool,
         "If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
     ] = False
+    qos_lpm_shared_weight: A[
+        float, "Weight of the HBM/DRAM prefix-sharing score for qos-lpm."
+    ] = 1.0
+    qos_lpm_delay_weight: A[
+        float, "Weight of queueing-delay urgency for qos-lpm."
+    ] = 1.0
+    qos_lpm_priority_weight: A[
+        float, "Weight of the request QoS tier for qos-lpm."
+    ] = 1.0
+    qos_lpm_dram_discount: A[
+        float, "Relative value of a DRAM prefix hit compared with an HBM hit for qos-lpm."
+    ] = 0.5
+    qos_lpm_delay_reference: A[
+        float, "Reference wait time in seconds used to normalize qos-lpm delay urgency."
+    ] = 10.0
     priority_scheduling_preemption_threshold: A[
         int,
         "Minimum difference in priorities for an incoming request to have to preempt running request(s).",

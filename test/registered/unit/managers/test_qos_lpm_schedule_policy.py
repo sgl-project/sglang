@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -79,14 +80,96 @@ class TestQoSLPMSchedulePolicy(unittest.TestCase):
         self.assertEqual(node.hit_count, initial_hit_count)
         self.assertEqual(node.last_access_time, initial_access_time)
 
+    def test_hbm_hit_scores_higher_than_same_length_dram_hit(self):
+        hbm = self._req("hbm", [1, 2, 3, 4], 1, 99.0)
+        dram = self._req("dram", [5, 6, 7, 8], 1, 99.0)
+        hbm.prefix_indices = torch.tensor([1, 2, 3, 4])
+        dram.prefix_indices = torch.tensor([], dtype=torch.int64)
+        dram.host_hit_length = 4
+        waiting_queue = [dram, hbm]
+
+        with patch(
+            "sglang.srt.managers.schedule_policy.time.monotonic", return_value=100.0
+        ):
+            SchedulePolicy._sort_by_qos_longest_prefix(
+                waiting_queue,
+                set(),
+                False,
+                shared_weight=1.0,
+                delay_weight=0.0,
+                priority_weight=0.0,
+                dram_discount=0.5,
+                delay_reference=10.0,
+            )
+
+        self.assertEqual([r.rid for r in waiting_queue], ["hbm", "dram"])
+
+    def test_mixed_hit_uses_discounted_dram_length(self):
+        mixed = self._req("mixed", [1, 2, 3, 4], 1, 99.0)
+        device_only = self._req("device-only", [5, 6, 7, 8], 1, 99.0)
+        mixed.prefix_indices = torch.tensor([1, 2])
+        mixed.host_hit_length = 2
+        device_only.prefix_indices = torch.tensor([5, 6])
+        waiting_queue = [device_only, mixed]
+
+        with patch(
+            "sglang.srt.managers.schedule_policy.time.monotonic", return_value=100.0
+        ):
+            SchedulePolicy._sort_by_qos_longest_prefix(
+                waiting_queue,
+                set(),
+                False,
+                shared_weight=1.0,
+                delay_weight=0.0,
+                priority_weight=0.0,
+                dram_discount=0.5,
+                delay_reference=10.0,
+            )
+
+        self.assertEqual([r.rid for r in waiting_queue], ["mixed", "device-only"])
+
+    def test_waiting_delay_can_prevent_low_qos_starvation(self):
+        high_qos = self._req("high-qos", [1], 3, 99.0)
+        old_low_qos = self._req("old-low-qos", [2], 1, 0.0)
+        waiting_queue = [high_qos, old_low_qos]
+
+        with patch(
+            "sglang.srt.managers.schedule_policy.time.monotonic", return_value=100.0
+        ):
+            SchedulePolicy._sort_by_qos_longest_prefix(
+                waiting_queue,
+                set(),
+                False,
+                shared_weight=0.0,
+                delay_weight=1.0,
+                priority_weight=1.0,
+                dram_discount=0.5,
+                delay_reference=10.0,
+            )
+
+        self.assertEqual(
+            [r.rid for r in waiting_queue], ["old-low-qos", "high-qos"]
+        )
+
+    def test_invalid_location_score_config_is_rejected(self):
+        with self.assertRaises(ValueError):
+            SchedulePolicy(
+                policy="qos-lpm",
+                tree_cache=RadixCache.create_simulated(),
+                enable_hierarchical_cache=False,
+                enable_priority_scheduling=False,
+                schedule_low_priority_values_first=False,
+                qos_lpm_dram_discount=1.5,
+            )
+
     def test_same_priority_longer_prefix_scheduled_first(self):
         tree_cache = RadixCache.create_simulated()
         tree_cache.insert(
             InsertParams(key=RadixKey([1, 2, 3]), value=torch.tensor([1, 2, 3]))
         )
         waiting_queue = [
-            self._req("short", [1, 2], 2, 1.0),
-            self._req("long", [1, 2, 3], 2, 2.0),
+            self._req("short", [1, 2, 9], 2, 1.0),
+            self._req("long", [1, 2, 3], 2, 1.0),
         ]
 
         self._policy(tree_cache).calc_priority(waiting_queue)

@@ -1045,6 +1045,11 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            qos_lpm_shared_weight=self.server_args.qos_lpm_shared_weight,
+            qos_lpm_delay_weight=self.server_args.qos_lpm_delay_weight,
+            qos_lpm_priority_weight=self.server_args.qos_lpm_priority_weight,
+            qos_lpm_dram_discount=self.server_args.qos_lpm_dram_discount,
+            qos_lpm_delay_reference=self.server_args.qos_lpm_delay_reference,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0

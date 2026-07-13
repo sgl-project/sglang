@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -165,6 +166,11 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        qos_lpm_shared_weight: float = 1.0,
+        qos_lpm_delay_weight: float = 1.0,
+        qos_lpm_priority_weight: float = 1.0,
+        qos_lpm_dram_discount: float = 0.5,
+        qos_lpm_delay_reference: float = 10.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -172,6 +178,21 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        if min(
+            qos_lpm_shared_weight,
+            qos_lpm_delay_weight,
+            qos_lpm_priority_weight,
+        ) < 0:
+            raise ValueError("qos-lpm score weights must be non-negative")
+        if not 0.0 <= qos_lpm_dram_discount <= 1.0:
+            raise ValueError("qos-lpm DRAM discount must be between 0 and 1")
+        if qos_lpm_delay_reference <= 0:
+            raise ValueError("qos-lpm delay reference must be positive")
+        self.qos_lpm_shared_weight = qos_lpm_shared_weight
+        self.qos_lpm_delay_weight = qos_lpm_delay_weight
+        self.qos_lpm_priority_weight = qos_lpm_priority_weight
+        self.qos_lpm_dram_discount = qos_lpm_dram_discount
+        self.qos_lpm_delay_reference = qos_lpm_delay_reference
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -213,6 +234,11 @@ class SchedulePolicy:
                     waiting_queue,
                     temporary_deprioritized,
                     self.schedule_low_priority_values_first,
+                    shared_weight=self.qos_lpm_shared_weight,
+                    delay_weight=self.qos_lpm_delay_weight,
+                    priority_weight=self.qos_lpm_priority_weight,
+                    dram_discount=self.qos_lpm_dram_discount,
+                    delay_reference=self.qos_lpm_delay_reference,
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
@@ -327,19 +353,39 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         temporary_deprioritized: Set[int],
         schedule_low_priority_values_first: bool,
+        *,
+        shared_weight: float,
+        delay_weight: float,
+        priority_weight: float,
+        dram_discount: float,
+        delay_reference: float,
     ) -> None:
-        """Sorts by higher QoS priority, longer prefix match, then arrival time."""
+        """Sort by cache location, queueing delay, and QoS as one score."""
+        now = time.monotonic()
 
         def sort_key(req: Req):
             is_deprioritized = req.rid in temporary_deprioritized
-            prefix_key = -len(req.prefix_indices)
+            total_prefix_len = max(len(req.origin_input_ids) + len(req.output_ids), 1)
+            device_hit_len = min(len(req.prefix_indices), total_prefix_len)
+            host_hit_len = min(
+                req.host_hit_length, total_prefix_len - device_hit_len
+            )
+            shared_score = (
+                device_hit_len + dram_discount * host_hit_len
+            ) / total_prefix_len
+            wait_time = max(now - req.time_stats.wait_queue_entry_time, 0.0)
+            delay_score = 1.0 + wait_time / delay_reference
             qos_weight = get_qos_weight(
                 req.priority, schedule_low_priority_values_first
             )
+            score = (
+                shared_weight * shared_score
+                + delay_weight * delay_score
+                + priority_weight * qos_weight
+            )
             return (
                 is_deprioritized,
-                -qos_weight,
-                prefix_key,
+                -score,
                 req.time_stats.wait_queue_entry_time,
             )
 
