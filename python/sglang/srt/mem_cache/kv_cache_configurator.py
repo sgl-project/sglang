@@ -375,20 +375,8 @@ class KVCacheConfigurator:
                     is_dsa_model=is_dsa_model,
                 )
             else:
-                PoolCls = current_platform.get_mha_kv_pool_cls()
-                token_to_kv_pool = PoolCls(
-                    max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
+                token_to_kv_pool = self._build_oot_mha_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
                 )
         elif (
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
@@ -1273,6 +1261,22 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
+        return token_to_kv_pool
+
+    def _build_oot_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        PoolCls = current_platform.get_mha_kv_pool_cls()
+        token_to_kv_pool = PoolCls(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
             layer_num=self.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
