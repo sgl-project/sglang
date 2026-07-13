@@ -1898,7 +1898,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         logger.info(
             f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
         )
-        return {"flashinfer_allreduce_fusion_backend": "auto"}
+        return {"flashinfer_allreduce_fusion_backend": "auto", "enable_flashinfer_pure_allreduce": True}
     return {}
 
 
@@ -1911,7 +1911,7 @@ def _enforce_disable_allreduce_fusion(view: Any) -> dict:
             "FlashInfer allreduce fusion is forcibly disabled "
             "via --enforce-disable-flashinfer-allreduce-fusion."
         )
-        return {"flashinfer_allreduce_fusion_backend": None}
+        return {"flashinfer_allreduce_fusion_backend": None, "enable_flashinfer_pure_allreduce": False}
     return {}
 
 
