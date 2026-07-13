@@ -484,6 +484,102 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
     tl.store(qout_head + N + offs_r[None, :], r, mask=m_mask[:, None])
 
 
+@triton.jit
+def absorbed_bmm_concat_cast_q_fp8_grouped_kernel(
+    qout_ptr,  # [num_tokens, pad_heads, N+ROPE] fp8 (dst; only [:, :H, :] written)
+    a_ptr,  # q_nope (pre-absorb) [num_tokens, H, K] bf16
+    b_ptr,  # w_kc [H, K, N] bf16 (any strides; typically N-major)
+    rope_ptr,  # q_rope (post-rope) [num_tokens, H, ROPE] bf16
+    T,  # num_tokens (runtime; masked)
+    qout_s0,
+    qout_s1,
+    a_s0,
+    a_s1,
+    b_s0,
+    b_s1,
+    b_s2,
+    rope_s0,
+    rope_s1,
+    H: tl.constexpr,
+    K0: tl.constexpr,
+    K1: tl.constexpr,
+    N: tl.constexpr,
+    ROPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # "grouped" launch variant of absorbed_bmm_concat_cast_q_fp8_kernel: the
+    # per-tile math and epilogue are those of K_MODE == 2 ("two_dot"), but
+    # instead of one CTA per (m-tile, head) grid cell, a persistent grid of
+    # ~num_SMs CTAs strides over the flattened (m-tile, head) tile space with
+    # the grouped ordering of deep_gemm's source-available Triton kernel
+    # (deep_gemm/legacy/m_grouped_gemm.py::m_grouped_bf16_gemm_contiguous_tl_
+    # impl) — here the per-head w_kc slice plays that kernel's per-group b and
+    # the head axis plays the n-tile axis of its GROUP_SIZE_M swizzle.  GROUP_M
+    # consecutive m-tiles of one head are adjacent in tile order, so a wave of
+    # concurrent CTAs covers few heads x many m-tiles and each w_kc head slice
+    # is re-read from L2 rather than DRAM.  Unlike deep_gemm there is no
+    # K-loop: K is at most 256 here, so the a-tile is preloaded whole-K once
+    # per tile as up to two power-of-2 sub-tiles (192 = 128 + 64) and each
+    # N-block runs chained tl.dot into one fp32 accumulator — the same k order
+    # and the same fp32 -> bf16 -> fp8 epilogue as "two_dot", hence bitwise-
+    # identical output (a k-loop that re-reads a per (N, K)-block is K_MODE
+    # == 1 "loop", already measured slower).
+    #
+    # Loop staging: the N-loop must be a dynamic tl.range (NOT the unrolled
+    # tl.static_range of the one-tile-per-CTA kernel) and the outer tile loop
+    # must be pinned to num_stages=1 — otherwise the pipeliner stages every
+    # N-block's b tiles at once (~340KB more than the 227KB smem).  So only
+    # the inner loop takes the kernel num_stages (measured best: 2).  Probed
+    # and rejected on Triton 3.5.1: flatten=True on the outer loop (the
+    # persistent-matmul recipe) dies in TritonGPUAssignLatencies with the
+    # unrolled body and re-blows smem with the dynamic one; warp_specialize=
+    # True on the N-loop is perf-neutral at num_warps=8 and an
+    # NVGPUWarpSpecialization crash at num_warps=4.
+    start_pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(T, BLOCK_M)
+    num_tiles = num_pid_m * H
+    num_pid_in_group = GROUP_M * H
+    offs_k0 = tl.arange(0, K0)
+    offs_bn = tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, ROPE)
+    for tile_id in tl.range(start_pid, num_tiles, tl.num_programs(0), num_stages=1):
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + (tile_id % group_size_m)
+        h = (tile_id % num_pid_in_group) // group_size_m
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_mask = offs_m < T
+        # token-row offsets in int64: T * row-stride can exceed int32 (e.g.
+        # 128 heads x 576 dims x tens of thousands of tokens).
+        offs_m64 = offs_m.to(tl.int64)
+        qout_head = qout_ptr + offs_m64[:, None] * qout_s0 + h * qout_s1
+        a_row = a_ptr + offs_m64[:, None] * a_s0 + h * a_s1
+        b_head = b_ptr + h * b_s0
+        a0 = tl.load(a_row + offs_k0[None, :], mask=m_mask[:, None], other=0.0)
+        if K1 > 0:
+            offs_k1 = K0 + tl.arange(0, K1)
+            a1 = tl.load(a_row + offs_k1[None, :], mask=m_mask[:, None], other=0.0)
+        for nb in tl.range(0, N // BLOCK_N):
+            offs_n = nb * BLOCK_N + offs_bn
+            b0 = tl.load(b_head + offs_k0[:, None] * b_s1 + offs_n[None, :] * b_s2)
+            acc = tl.dot(a0, b0)  # fp32 accumulator
+            if K1 > 0:
+                b1 = tl.load(b_head + offs_k1[:, None] * b_s1 + offs_n[None, :] * b_s2)
+                acc = tl.dot(a1, b1, acc)  # chained: stays fp32 across both dots
+            val = acc.to(tl.bfloat16)  # cublas-equivalent bf16 output rounding
+            # implicit bf16 -> fp8 conversion on store (same as the concat-cast)
+            tl.store(qout_head + offs_n[None, :], val, mask=m_mask[:, None])
+        r = tl.load(
+            rope_ptr + offs_m64[:, None] * rope_s0 + h * rope_s1 + offs_r[None, :],
+            mask=m_mask[:, None],
+            other=0.0,
+        )
+        tl.store(qout_head + N + offs_r[None, :], r, mask=m_mask[:, None])
+
+
 # Non-power-of-2-K variant used by variant="auto" (power-of-2 K always takes
 # the single-dot fast path).  Set to the winner of the K=192 A/B in
 # scripts/pr3_qprep_microbench.py; "loop" = the pre-A/B split-K behavior.
@@ -502,6 +598,8 @@ def absorbed_bmm_concat_cast_q_fp8(
     block_k: int = 0,
     num_warps: int = 8,
     num_stages: int = 0,
+    group_m: int = 8,
+    num_ctas: int = 0,
 ):
     """Fused absorbed-q bmm + nope/rope concat + bf16->fp8 cast ("born fp8" q).
 
@@ -540,9 +638,17 @@ def absorbed_bmm_concat_cast_q_fp8(
     * ``"single_k"``: single ``tl.dot`` with ``BLOCK_K`` == K.  Only
       compiles if the Triton build supports non-power-of-2 ``tl.arange``
       (Triton <= 3.5.x raises "arange's range must be a power of 2").
+    * ``"grouped"``: the ``"two_dot"`` per-tile math launched as a
+      persistent grid-stride kernel over the flattened (m-tile, head) tile
+      space with deep_gemm-style GROUP_SIZE_M ordering (bitwise identical
+      output to ``"two_dot"``).  Needs K = pow2 or pow2 + pow2; ``group_m``
+      = m-tiles per head kept adjacent in tile order, ``num_ctas`` = grid
+      size (0 = min(tiles, 2 x SM count)).  Unlike the other variants it
+      also accepts power-of-2 K.
 
     ``block_m`` / ``block_n`` / ``num_warps`` / ``num_stages`` are tuning
-    knobs for the microbench sweep (0 = Triton default for ``num_stages``).
+    knobs for the microbench sweep (0 = Triton default for ``num_stages``);
+    ``group_m`` / ``num_ctas`` apply to ``"grouped"`` only.
     """
     num_tokens, _, k_dim = q_nope.shape
     n_dim = w_kc.shape[-1]
@@ -562,6 +668,56 @@ def absorbed_bmm_concat_cast_q_fp8(
     assert n_dim % block_n == 0, "N must be a multiple of block_n"
     assert q_nope.stride(2) == 1 and q_rope.stride(2) == 1
     assert q_fp8_pad.stride(2) == 1
+    # "grouped" takes its own persistent launch (and, unlike the K_MODE
+    # variants, also accepts power-of-2 K when requested explicitly; "auto"
+    # keeps routing power-of-2 K to the single-dot fast path below).
+    if variant == "grouped" or (
+        variant == "auto"
+        and k_dim & (k_dim - 1) != 0
+        and _AUTO_NONPOW2_VARIANT == "grouped"
+    ):
+        # Whole-K preload as one or two power-of-2 sub-tiles (192 = 128 + 64).
+        k0 = 1 << (k_dim.bit_length() - 1)
+        k1 = k_dim - k0
+        assert k1 == 0 or (
+            k1 & (k1 - 1) == 0 and k1 >= 16
+        ), "grouped needs K = pow2 or pow2 + pow2 with both parts >= 16"
+        num_tiles = triton.cdiv(num_tokens, block_m) * num_heads
+        if not num_ctas:
+            # 2 CTAs/SM: enough persistent programs to keep occupancy while
+            # each still sweeps several same-head tiles (L2 w_kc reuse).
+            num_ctas = (
+                2
+                * torch.cuda.get_device_properties(q_nope.device).multi_processor_count
+            )
+        extra = {"num_stages": num_stages} if num_stages else {}
+        absorbed_bmm_concat_cast_q_fp8_grouped_kernel[(min(num_tiles, num_ctas),)](
+            q_fp8_pad,
+            q_nope,
+            w_kc,
+            q_rope,
+            num_tokens,
+            q_fp8_pad.stride(0),
+            q_fp8_pad.stride(1),
+            q_nope.stride(0),
+            q_nope.stride(1),
+            w_kc.stride(0),
+            w_kc.stride(1),
+            w_kc.stride(2),
+            q_rope.stride(0),
+            q_rope.stride(1),
+            H=num_heads,
+            K0=k0,
+            K1=k1,
+            N=n_dim,
+            ROPE=rope_dim,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            GROUP_M=group_m,
+            num_warps=num_warps,
+            **extra,
+        )
+        return
     # Resolve (K_MODE, BLOCK_K) from the variant; see the kernel's K-handling
     # comment for what each mode compiles to.
     if k_dim & (k_dim - 1) == 0:
