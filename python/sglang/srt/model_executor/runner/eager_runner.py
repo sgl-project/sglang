@@ -34,8 +34,16 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
@@ -100,11 +108,7 @@ class EagerRunner(BaseRunner):
 
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
-        prefill_ceiling = (
-            sa.max_prefill_buffer_tokens()
-            if sa.chunked_prefill_size and sa.chunked_prefill_size > 0
-            else mr.max_total_num_tokens
-        )
+        prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
         if require_mlp_sync(sa):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
@@ -125,6 +129,9 @@ class EagerRunner(BaseRunner):
                 getattr(mr.model_config.hf_config, "max_source_positions", 0)
                 if is_encoder_decoder
                 else 0
+            ),
+            encoder_lens_dtype=(
+                torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
             dp_size=sa.dp_size,
         )
@@ -169,7 +176,12 @@ class EagerRunner(BaseRunner):
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
-        raw_num_tokens = forward_batch.input_ids.shape[0]
+        if forward_batch.input_ids is not None:
+            raw_num_tokens = forward_batch.input_ids.shape[0]
+        elif forward_batch.input_embeds is not None:
+            raw_num_tokens = forward_batch.input_embeds.shape[0]
+        else:
+            raw_num_tokens = 0
         registry = self._eager_registry
         registry.fill_from(
             forward_batch,
@@ -204,7 +216,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
         model_runner = self.model_runner
-        if model_runner.server_args.enable_pdmux:
+        if self.enable_pdmux:
             return model_runner.decode_attn_backend, forward_context(
                 ForwardContext(attn_backend=model_runner.decode_attn_backend)
             )
@@ -216,7 +228,7 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = model_runner.server_args.enable_pdmux
+        enable_pdmux = self.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -251,10 +263,27 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not model_runner.server_args.enable_pdmux:
+        if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
+            if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+                # prepare kv cache buffer for dcp to gather kv cache
+                forward_batch.attn_dcp_metadata = (
+                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.req_pool_indices,
+                        get_req_to_token_pool().req_to_token,
+                        forward_batch.seq_lens_sum,
+                        get_token_to_kv_pool().get_kv_buffer_shape()[0],
+                        model_runner.kv_cache_dtype,
+                        model_runner.device,
+                        create_chunked_prefix_cache_kv_indices,
+                    )
+                )
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -276,9 +305,16 @@ class EagerRunner(BaseRunner):
             )
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
+        else:
+            forward_batch.attn_cp_metadata = None
 
+        category = (
+            "target_verify"
+            if forward_batch.forward_mode.is_target_verify()
+            else "extend"
+        )
         ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "extend"})
+            model_runner.device_timer.wrap(metadata={"category": category})
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
@@ -357,7 +393,7 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not model_runner.server_args.enable_pdmux:
+            if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
