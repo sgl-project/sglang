@@ -564,6 +564,36 @@ class KVCacheConfigurator:
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
 
+    def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
+        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
+
+        if self.server_args.disaggregation_mode == "decode":
+            # Extra slots for pre-allocated requests
+            pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
+            if self.mambaish_config:
+                req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
+                    pre_alloc_size=pre_alloc_size,
+                )
+            else:
+                req_to_token_pool = self._build_decode_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
+                    pre_alloc_size=pre_alloc_size,
+                )
+        elif self.mambaish_config:
+            req_to_token_pool = self._build_hybrid_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+            )
+        else:
+            req_to_token_pool = self._build_default_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+            )
+        return req_to_token_pool
+
     def _build_hybrid_mamba_decode_req_pool(
         self,
         *,
@@ -1237,36 +1267,6 @@ class KVCacheConfigurator:
                         mha_pool_class=mha_pool_class,
                     )
         return token_to_kv_pool
-
-    def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
-
-        if self.server_args.disaggregation_mode == "decode":
-            # Extra slots for pre-allocated requests
-            pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
-            if self.mambaish_config:
-                req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                    pre_alloc_size=pre_alloc_size,
-                )
-            else:
-                req_to_token_pool = self._build_decode_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                    pre_alloc_size=pre_alloc_size,
-                )
-        elif self.mambaish_config:
-            req_to_token_pool = self._build_hybrid_req_pool(
-                max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
-            )
-        else:
-            req_to_token_pool = self._build_default_req_pool(
-                max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
-            )
-        return req_to_token_pool
 
     def _build_token_to_kv_pool_allocator(
         self,
