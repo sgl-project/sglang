@@ -6,26 +6,28 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for GLM-5.1 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [GLM-5.1 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65k+1.5k (100% prefix cache hit rate) | 33ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -43,7 +45,7 @@ This page focuses on optimal configuration and benchmark results for GLM-5.1 on 
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -134,7 +136,7 @@ done
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -161,7 +163,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 56.4ms
 
@@ -321,7 +323,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -341,7 +343,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -366,7 +368,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 16K+1K
+**Dataset**: 16k+1k
 
 **TPOT**: 50ms
 
@@ -526,7 +528,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -546,7 +548,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -571,7 +573,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 55.2ms
 
@@ -731,7 +733,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -751,7 +753,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -776,7 +778,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 50ms
 
@@ -934,7 +936,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -954,7 +956,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -979,7 +981,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K (90% prefix cache hit rate)
+**Dataset**: 65k+1.5k (90% prefix cache hit rate)
 
 **TPOT**: 25ms
 
@@ -1139,7 +1141,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -1159,10 +1161,10 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 59904` = `int(66560 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6655` = `int(66560 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 6656` = `int(66560 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1171,7 +1173,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 480 \
     --gsp-system-prompt-len 59904 \
-    --gsp-question-len 6655 \
+    --gsp-question-len 6656 \
     --gsp-output-len 1536 \
     --max-concurrency 100 \
     --num-prompts 480 \
@@ -1190,7 +1192,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K (100% prefix cache hit rate)
+**Dataset**: 65k+1.5k (100% prefix cache hit rate)
 
 **TPOT**: 33ms
 
@@ -1343,7 +1345,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -1363,7 +1365,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1388,7 +1390,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1550,7 +1552,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1574,7 +1576,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1602,7 +1604,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K (90% prefix cache hit rate)
+**Dataset**: 64k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1763,7 +1765,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>, <your prefill ip3>, <your prefill ip4>: prefill node IP addresses
@@ -1789,7 +1791,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \

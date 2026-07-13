@@ -65,12 +65,16 @@ QWEN3_32B_OTHER_ARGS = [
     1,
     "--dtype",
     "bfloat16",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen",
 ]
 
 
 class TestQwen32B(TestNpuPerformanceTestCaseBase):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_32B_MODEL_PATH
     other_args = QWEN3_32B_OTHER_ARGS
     envs = QWEN3_32B_ENVS
@@ -80,6 +84,7 @@ class TestQwen32B(TestNpuPerformanceTestCaseBase):
     input_len = 18000
     output_len = 4000
     random_range_ratio = 1
+    seed = 1
     tpot = 6
     output_token_throughput = 171
 
