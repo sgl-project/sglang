@@ -28,6 +28,8 @@ from typing import Optional
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
@@ -36,8 +38,6 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.layernorm import RMSNorm  # noqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
 
 try:
     from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
