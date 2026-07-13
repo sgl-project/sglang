@@ -11,23 +11,34 @@ Requires flashinfer >= 0.6.7.
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
-from sglang.srt.layers.attention.linear.kernels.gdn_kernel_backend import (
-    GDNKernelBase,
-    unwrap_direct_write_out,
-)
 from sglang.srt.layers.attention.linear.kernels.gdn_prefill import (
     MAX_FUSED_QKV_SPLIT_DIM,
     GDNQKVShape,
     split_gdn_prefill_qkv,
 )
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+def unwrap_direct_write_out(
+    out: Optional[torch.Tensor], *, expected_shape: Tuple[int, ...]
+) -> Optional[torch.Tensor]:
+    """Validate and unwrap a caller-supplied direct-write output buffer."""
+    if out is None:
+        return None
+    assert (
+        out.shape == expected_shape
+    ), f"direct-write out buffer {tuple(out.shape)} != expected {expected_shape}"
+    return out.squeeze(0)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -99,7 +110,7 @@ def is_flashinfer_gdn_prefill_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-class FlashInferGDNKernel(GDNKernelBase):
+class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
