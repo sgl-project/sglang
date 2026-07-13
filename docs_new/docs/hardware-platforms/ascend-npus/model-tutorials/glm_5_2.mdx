@@ -13,6 +13,10 @@ Attention (DSA) and multi-token prediction (MTP), and supports high-throughput i
 This document demonstrates the deployment of GLM-5.2 on Ascend NPUs using SGLang, including single-node deployment,
 multi-node deployment, prefill-decode disaggregation, feature configuration, and performance optimization.
 
+> GLM-5.2 currently uses a daily build image because 0Day support was released before the related code was merged into
+> the SGLang main branch. The deployment commands and image tags in this document will be updated to a stable release
+> once the support lands in a stable SGLang release.
+
 ## Supported features
 
 | Feature                       | Example usage                                                                     |
@@ -39,6 +43,18 @@ For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
 
 ## Prerequisites
+
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
+  It covers the component version mapping (CANN, PyTorch adapter, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
 
 ### Model weights
 
@@ -101,7 +117,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
 ```
 
   </Tab>
@@ -136,7 +152,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-910b-glm5.2-20260615
 ```
 
   </Tab>
@@ -146,7 +162,6 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
 - Replace `${NAME}` with your own container name or remove `--name` to use default name.
-- Replace `${TAG}` with the image tag for the corresponding hardware platform.
 </Tip>
 
 ## Online service deployment
@@ -486,8 +501,6 @@ do
         break
     fi
 done
-
-exit 1
 ```
 
 Launch the router after the prefill and decode services are ready.
@@ -549,6 +562,18 @@ For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend
 
 For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
 
+## Best practices
+
+### Best practice configuration reference
+
+GLM-5.2 has no standalone best practice page yet, as 0Day support is still on daily build images and tuning parameters
+are not finalized. Instead, the [Online service deployment](#online-service-deployment) section above provides
+ready-to-use scripts for single-node, multi-node, and PD disaggregation, each embedding the recommended feature
+combinations and tuning parameters (e.g., DeepEP mode, speculative decoding, overlap schedule).
+
+For the full catalog of optimization features and their parameter and compatibility details,
+see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
 ## Performance tuning
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
@@ -557,4 +582,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 ## FAQ
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
-This section only covers model-specific issues.
