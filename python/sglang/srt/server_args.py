@@ -749,7 +749,6 @@ class ServerArgs:
     nsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
-    enable_longcat_double_stream: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
 
     # Context parallelism
@@ -929,7 +928,6 @@ class ServerArgs:
         self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
-        self._handle_longcat_double_stream()
         self._handle_elastic_ep()
 
         # Handle pipeline parallelism.
@@ -3237,13 +3235,6 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
-
-    def _handle_longcat_double_stream(self):
-        if self.enable_longcat_double_stream:
-            if self.disaggregation_mode == "prefill":
-                raise RuntimeError(
-                    "--enable-longcat-double-stream is not supported in prefill disaggregation mode, only available in decode and hybrid modes."
-                )
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
@@ -6521,11 +6512,6 @@ class ServerArgs:
             "--enable-precise-embedding-interpolation",
             action="store_true",
             help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
-        )
-        parser.add_argument(
-            "--enable-longcat-double-stream",
-            action="store_true",
-            help="Enable double stream mode for longcat.",
         )
         parser.add_argument(
             "--enable-fused-moe-sum-all-reduce",

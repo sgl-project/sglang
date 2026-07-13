@@ -1501,7 +1501,6 @@ def get_attn_cp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
-_DOUBLE_STREAM_EP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1517,10 +1516,6 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
-
-def get_double_stream_ep_group() -> GroupCoordinator:
-    assert _DOUBLE_STREAM_EP is not None, "double stream parallel group is not initialized"
-    return _DOUBLE_STREAM_EP
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
@@ -1845,28 +1840,6 @@ def initialize_model_parallel(
         group_name="tp",
         recovered_rank=recovered_rank,
     )
-
-    from sglang.srt.server_args import get_global_server_args
-
-    try:
-        enable_longcat_double_stream = (
-            get_global_server_args().enable_longcat_double_stream
-        )
-    except ValueError:
-        enable_longcat_double_stream = False
-
-    if enable_longcat_double_stream:
-        global _DOUBLE_STREAM_EP
-        assert (
-            _DOUBLE_STREAM_EP is None
-        ), "double stream expert parallel group is already initialized"
-        _DOUBLE_STREAM_EP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            group_name="double_stream_ep",
-            recovered_rank=recovered_rank,
-        )
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
@@ -2280,11 +2253,6 @@ def destroy_model_parallel():
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
-
-    global _DOUBLE_STREAM_EP
-    if _DOUBLE_STREAM_EP:
-        _DOUBLE_STREAM_EP.destroy()
-    _DOUBLE_STREAM_EP = None
 
     global _MOE_TP
     if _MOE_TP:

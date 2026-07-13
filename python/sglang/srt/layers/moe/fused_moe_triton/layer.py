@@ -15,7 +15,6 @@ from sglang.srt.compilation.piecewise_context_manager import (
     is_in_piecewise_cuda_graph,
 )
 from sglang.srt.distributed import (
-    get_double_stream_ep_group,
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
@@ -39,7 +38,6 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
@@ -93,11 +91,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     ):
         if a2a_backend.is_mori():
             group = get_tp_group()
-        elif (
-            a2a_backend.is_deepep()
-            and get_global_server_args().enable_longcat_double_stream
-        ):
-            group = get_double_stream_ep_group().device_group
         else:
             group = get_tp_group().device_group
 

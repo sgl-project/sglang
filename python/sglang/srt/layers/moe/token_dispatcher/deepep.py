@@ -5,10 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
-from sglang.srt.distributed.parallel_state import (
-    get_double_stream_ep_group,
-    get_tp_group,
-)
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -29,7 +26,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     is_blackwell,
@@ -73,10 +69,7 @@ def _deepep_precompile_tp_barrier() -> None:
     if not envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         return
 
-    if get_global_server_args().enable_longcat_double_stream:
-        get_double_stream_ep_group().barrier()
-    else:
-        get_tp_group().barrier()
+    get_tp_group().barrier()
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
