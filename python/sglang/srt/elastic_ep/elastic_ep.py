@@ -143,7 +143,10 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return False
-        if inst.pending_ep_size is not None:
+        if (
+            inst.pending_ep_size is not None
+            or inst.scale_phase == "recovery_unsupported"
+        ):
             return False
         inst.pending_ep_size = n
         inst.scale_phase = "pending"
@@ -192,6 +195,14 @@ class ElasticEPStateManager:
         inst.last_error = error
         inst.pending_since = None
         inst.reset()
+
+    @classmethod
+    def fail_recovery(cls, error: str) -> None:
+        inst = cls._instance
+        if inst is None:
+            return
+        inst.scale_phase = "recovery_unsupported"
+        inst.last_error = error
 
     @classmethod
     def get_effective_ep_size(cls) -> int:
@@ -247,6 +258,8 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None or inst.active_ranks_cpu is None:
             return False
+        if inst.scale_phase == "recovery_unsupported":
+            return False
         if inst.pending_ep_size is not None:
             return True
         active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
@@ -264,7 +277,7 @@ def elastic_expanded_world_enabled() -> bool:
     if inst is None:
         return False
     sa = get_server_args()
-    if getattr(sa, "max_ep_size", None) is None:
+    if sa.max_ep_size is None:
         return False
     active_target_size = inst.effective_ep_size
     if inst.pending_ep_size is not None and inst.scale_phase in (

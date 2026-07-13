@@ -2008,6 +2008,10 @@ class ServerArgs:
         Optional[int],
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
+    elastic_ep_scale_timeout: A[
+        float,
+        "Timeout in seconds for a pending elastic EP scale operation.",
+    ] = 600
     elastic_ep_rejoin: A[
         bool,
         "[Deprecated] Alias for --elastic-ep-join-mode recover.",
@@ -5692,6 +5696,9 @@ class ServerArgs:
             )
         if scaling_active:
             resolved = self._resolved()
+            assert (
+                self.elastic_ep_scale_timeout > 0
+            ), "--elastic-ep-scale-timeout must be greater than zero."
             assert self.tokenizer_worker_num == 1, (
                 "Elastic EP runtime scale-up currently requires "
                 "--tokenizer-worker-num 1."

@@ -152,6 +152,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     cp_align_size = get_cp_padding_align_size()
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+    # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(

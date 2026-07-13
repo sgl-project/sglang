@@ -35,10 +35,7 @@ logger = logging.getLogger(__name__)
 def _prefer_same_node_experts(server_args: ServerArgs) -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
 
-    return (
-        getattr(server_args, "ep_join_mode", None) != "scale"
-        and not elastic_expanded_world_enabled()
-    )
+    return server_args.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
 
 
 def _compute_elastic_expert_layout(
@@ -509,12 +506,14 @@ def append_trivial_expert_slots(
 
 
 def broadcast_global_expert_location_metadata(
-    server_args: ServerArgs,
     model_config: ModelConfig,
     moe_ep_rank: int,
     src_rank: int = 0,
     group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ExpertLocationMetadata:
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 

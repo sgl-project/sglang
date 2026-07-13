@@ -3475,7 +3475,7 @@ class Scheduler(
             return
 
         model_runner = self.tp_worker.model_runner
-        pending = getattr(model_runner, "_pending_elastic_scale_update", None)
+        pending = model_runner._pending_elastic_scale_update
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
             model_runner._pending_elastic_scale_update = None

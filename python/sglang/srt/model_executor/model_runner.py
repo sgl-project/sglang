@@ -411,6 +411,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
@@ -605,79 +606,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.initialize()
         self.check_quantized_moe_compatibility()
 
-        if (
-            self.server_args.elastic_ep_backend is not None
-            and self.server_args.is_ep_joiner
-        ):
-            is_scale_join = self.server_args.ep_join_mode == "scale"
-            if is_scale_join:
-                join_scale_process_group()
-            else:
-                join_process_groups()
-
-            if is_scale_join:
-                join_effective_ep_size = (
-                    self.server_args.ep_join_rank_offset + self.server_args.tp_size
-                )
-                self.server_args.override(
-                    "elastic_ep.scale_join", ep_size=join_effective_ep_size
-                )
-
-            broadcast_global_expert_location_metadata(
-                server_args=self.server_args,
-                model_config=self.model_config,
-                moe_ep_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
-                src_rank=(
-                    0
-                    if is_scale_join
-                    else self._get_healthy_expert_location_src_rank(
-                        is_rejoining_rank=True
-                    )
-                ),
-            )
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    self.server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank + self.server_args.ep_join_rank_offset,
-                )
-            )
-
-            if is_scale_join:
-                from sglang.srt.layers.dp_attention import (
-                    enable_joiner_all_gather,
-                    update_dp_attention_post_scale,
-                )
-
-                enable_joiner_all_gather()
-                update_dp_attention_post_scale(
-                    new_dp_size=join_effective_ep_size,
-                    new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
-                )
-                self.server_args.override(
-                    "elastic_ep.scale_join", dp_size=join_effective_ep_size
-                )
-                self.dp_size = join_effective_ep_size
-                if self.eplb_manager is not None:
-                    self.eplb_manager.disable_rebalance(
-                        "EPLB rebalance is disabled after elastic EP scale-up"
-                    )
-
-                inst = ElasticEPStateManager.instance()
-                if inst is not None:
-                    inst.active_ranks.zero_()
-                    inst.active_ranks[:join_effective_ep_size] = 1
-                    inst.snapshot_active_to_last()
-                    inst.sync_active_to_cpu()
-                    inst.scale_phase = "syncing_new_world"
-                self._elastic_scale_ready_barrier(
-                    target_size=join_effective_ep_size,
-                    log_tag="JOINER",
-                )
-                if inst is not None:
-                    inst.scale_phase = "serving_expanded"
-            else:
-                ElasticEPStateManager.instance().reset()
+        self._initialize_elastic_ep_joiner()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -695,6 +624,80 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+    def _initialize_elastic_ep_joiner(self) -> None:
+        if not (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.is_ep_joiner
+        ):
+            return
+
+        is_scale_join = self.server_args.ep_join_mode == "scale"
+        if is_scale_join:
+            join_scale_process_group()
+        else:
+            join_process_groups()
+
+        if is_scale_join:
+            join_effective_ep_size = (
+                self.server_args.ep_join_rank_offset + self.server_args.tp_size
+            )
+            self.server_args.override(
+                "elastic_ep.scale_join", ep_size=join_effective_ep_size
+            )
+
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
+            src_rank=(
+                0
+                if is_scale_join
+                else self._get_healthy_expert_location_src_rank(is_rejoining_rank=True)
+            ),
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=self.tp_rank + self.server_args.ep_join_rank_offset,
+            )
+        )
+
+        if is_scale_join:
+            from sglang.srt.layers.dp_attention import (
+                enable_joiner_all_gather,
+                update_dp_attention_post_scale,
+            )
+
+            enable_joiner_all_gather()
+            update_dp_attention_post_scale(
+                new_dp_size=join_effective_ep_size,
+                new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
+            )
+            self.server_args.override(
+                "elastic_ep.scale_join", dp_size=join_effective_ep_size
+            )
+            self.dp_size = join_effective_ep_size
+            if self.eplb_manager is not None:
+                self.eplb_manager.disable_rebalance(
+                    "EPLB rebalance is disabled after elastic EP scale-up"
+                )
+
+            inst = ElasticEPStateManager.instance()
+            if inst is not None:
+                inst.active_ranks.zero_()
+                inst.active_ranks[:join_effective_ep_size] = 1
+                inst.snapshot_active_to_last()
+                inst.sync_active_to_cpu()
+                inst.scale_phase = "syncing_new_world"
+            self._elastic_scale_ready_barrier(
+                target_size=join_effective_ep_size,
+                log_tag="JOINER",
+            )
+            if inst is not None:
+                inst.scale_phase = "serving_expanded"
+        else:
+            ElasticEPStateManager.instance().reset()
 
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
@@ -1929,7 +1932,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             effective_size=target_size,
         )
         broadcast_global_expert_location_metadata(
-            server_args=self.server_args,
             model_config=self.model_config,
             moe_ep_rank=self._elastic_global_rank(),
             src_rank=0,
@@ -1991,7 +1993,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.eplb_manager.reset_generator()
 
         broadcast_global_expert_location_metadata(
-            server_args=self.server_args,
             model_config=self.model_config,
             moe_ep_rank=self._elastic_global_rank(),
             src_rank=self._get_healthy_expert_location_src_rank(
@@ -2030,17 +2031,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pending_size = ElasticEPStateManager.get_pending_ep_size()
         target_size = pending_size or effective_size
         if pending_size is None and inst is not None and inst.has_scaled:
-            raise RuntimeError(
+            error = (
                 "Elastic EP rank recovery is unsupported after runtime scale-up. "
                 "Restart the expanded deployment."
             )
+            ElasticEPStateManager.fail_recovery(error)
+            self._report_elastic_scale_failure(error, effective_size)
+            if self.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                logger.error("[Elastic EP] %s", error)
+            return
         if pending_size is not None:
             pending_since = inst.pending_since if inst is not None else None
-            timeout_s = getattr(self.server_args, "elastic_ep_scale_timeout", 600)
-            if (
+            local_timeout = (
                 pending_since is not None
-                and time.monotonic() - pending_since > timeout_s
-            ):
+                and time.monotonic() - pending_since
+                > self.server_args.elastic_ep_scale_timeout
+            )
+            timeout = inst.active_ranks.new_tensor(int(local_timeout))
+            dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+            if timeout.item():
                 error = (
                     f"Timed out waiting for ranks to join target EP size {pending_size}"
                 )
