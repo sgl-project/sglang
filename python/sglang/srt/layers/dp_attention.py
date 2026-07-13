@@ -236,9 +236,14 @@ def set_dp_buffer_len(
     local_dp_buffer_len: int,
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
+    global_num_tokens_gpu: Optional[torch.Tensor] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
+        global_dp_buffer_len,
+        local_dp_buffer_len,
+        dp_max_padding,
+        global_num_tokens,
+        global_num_tokens_gpu,
     )
 
 
