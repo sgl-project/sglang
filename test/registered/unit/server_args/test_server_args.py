@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.entrypoints.sidecar import _run_sidecar, build_sidecar_args
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -1535,6 +1536,53 @@ class TestGrpcServerArgs(CustomTestCase):
         with envs.SGLANG_GRPC_PORT.override(45000):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 45000)
+
+    def test_sidecar_uses_native_grpc_endpoint(self):
+        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
+        sa._handle_deprecated_args()
+        self.assertEqual(
+            build_sidecar_args(sa),
+            ["--sglang-endpoint", "http://127.0.0.1:50051"],
+        )
+
+    def test_sidecar_requires_native_grpc(self):
+        sa = self._args(sidecar="example.sidecar")
+        with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_rejects_legacy_grpc(self):
+        sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)
+        with self.assertRaisesRegex(ValueError, "native gRPC server"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_rejects_empty_value(self):
+        sa = self._args(sidecar="", grpc_port=50051)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_calls_main_in_child(self):
+        main = MagicMock()
+        with (
+            patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
+            patch(
+                "sglang.srt.entrypoints.sidecar.importlib.import_module",
+                return_value=SimpleNamespace(main=main),
+            ),
+        ):
+            _run_sidecar("example.sidecar", ["--sglang-endpoint", "endpoint"])
+
+        main.assert_called_once_with(["--sglang-endpoint", "endpoint"])
+
+    def test_sidecar_requires_main(self):
+        with (
+            patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
+            patch(
+                "sglang.srt.entrypoints.sidecar.importlib.import_module",
+                return_value=SimpleNamespace(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "main\\(argv\\)"),
+        ):
+            _run_sidecar("example.sidecar", [])
 
     def test_legacy_smg_derives_grpc_port_from_http_port(self):
         sa = self._args(port=30000, smg_grpc_mode=True)
