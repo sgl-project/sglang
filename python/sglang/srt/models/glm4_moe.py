@@ -15,7 +15,6 @@
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
 import logging
-import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1188,8 +1187,36 @@ class Glm4MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """GLM4-MoE: shared expert fusion."""
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            return name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+        return name
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def determine_num_fused_shared_experts(self):
         if get_flags().disable_shared_experts_fusion:
@@ -1283,43 +1310,8 @@ class Glm4MoeForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-
-            def iter_weights_with_fused_shared_experts(
-                weights: Iterable[Tuple[str, torch.Tensor]],
-            ) -> Iterable[Tuple[str, torch.Tensor]]:
-
-                pattern = re.compile(
-                    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
-                )
-                for name, weight in weights:
-                    match = pattern.match(name)
-                    if match:
-                        layer_id = int(match.group(1))
-                        suffix = match.group(2)
-                        name = f"model.layers.{layer_id}.mlp.experts.{self.config.n_routed_experts}.{suffix}"
-                    yield name, weight
-
-            weights = iter_weights_with_fused_shared_experts(weights)
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
+        stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.expert_params_mapping
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -1339,6 +1331,8 @@ class Glm4MoeForCausalLM(nn.Module):
         weight_names = []
         for name, loaded_weight in weights:
             weight_names.append(name)
+
+            name = self.mutate_weight_preload(name)
 
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
