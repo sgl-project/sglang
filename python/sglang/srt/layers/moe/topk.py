@@ -1402,7 +1402,7 @@ def _zero_topk_weights_padded_region(
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def _biased_grouped_topk_postprocess(
+def _postprocess_topk_ids_cuda(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
@@ -1855,7 +1855,7 @@ def _post_process_topk_ids(
             # so split, dispatch the routed cols, recombine.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
-            routed_cols = _biased_grouped_topk_postprocess(
+            routed_cols = _postprocess_topk_ids_cuda(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
@@ -1864,7 +1864,7 @@ def _post_process_topk_ids(
             # space, so keep the routed physical ids separately for statistics.
             recorder_topk_ids = routed_cols
         else:
-            topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids = _postprocess_topk_ids_cuda(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:

@@ -80,7 +80,7 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
             get_parallel().override(moe_ep_size=8, moe_ep_rank=7),
             patch.object(
                 topk_module,
-                "_biased_grouped_topk_postprocess",
+                "_postprocess_topk_ids_cuda",
                 side_effect=fake_eplb_postprocess,
             ),
         ):
@@ -119,7 +119,7 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
             ),
             patch.object(
                 topk_module,
-                "_biased_grouped_topk_postprocess",
+                "_postprocess_topk_ids_cuda",
                 side_effect=fake_eplb_postprocess,
             ),
         ):
