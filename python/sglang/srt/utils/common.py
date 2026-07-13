@@ -185,6 +185,24 @@ def is_npu() -> bool:
     return True
 
 
+# torch_npu.npu.get_soc_version() code for the Ascend A5 (Ascend950) series.
+_ASCEND_A5_SOC_VERSION = 260
+
+
+@lru_cache(maxsize=1)
+def is_npu_a5() -> bool:
+    """Whether the current NPU is an Ascend A5 (Ascend950) device.
+
+    Some fused ops (e.g. npu_gemma_rms_norm) have no kernel registered for the
+    A5 soc and must fall back to an equivalent path, while A2/A3 keep the op.
+    """
+    if not is_npu():
+        return False
+    import torch_npu  # noqa: F401
+
+    return torch.npu.get_soc_version() == _ASCEND_A5_SOC_VERSION
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
