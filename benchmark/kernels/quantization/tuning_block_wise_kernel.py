@@ -521,7 +521,9 @@ if __name__ == "__main__":
     parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument("--batch-sizes", nargs="+", type=int, required=False)
     parser.add_argument(
-        "--save-path", type=str, default="python/sglang/srt/layers/quantization/configs"
+        "--save-path",
+        type=str,
+        default="python/sglang/kernels/ops/quantization/configs",
     )
     args = parser.parse_args()
 
