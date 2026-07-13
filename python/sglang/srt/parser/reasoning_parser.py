@@ -18,6 +18,25 @@ class StreamingParseResult:
         self.reasoning_text = reasoning_text or ""
 
 
+def _trailing_partial_token_len(text: str, tokens: List[str]) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of any
+    token in ``tokens`` (0 if none).
+
+    Used to hold back a structural token (``<think>`` / ``</think>`` / a tool
+    marker) that split across a streaming chunk boundary, so the partial isn't
+    emitted as content and can be completed on the next increment. This is the
+    end-of-buffer counterpart to the whole-buffer prefix guard.
+    """
+    best = 0
+    for token in tokens:
+        limit = min(len(text), len(token) - 1)
+        for k in range(limit, best, -1):
+            if token.startswith(text[-k:]):
+                best = k
+                break
+    return best
+
+
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
@@ -170,16 +189,32 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
-                # Stream the content immediately
-                self._buffer = ""
-                return StreamingParseResult(reasoning_text=current_text)
+                # Stream the content immediately, but hold back a trailing
+                # partial end/tool token that split across this chunk boundary
+                # so it isn't emitted as reasoning content (it would otherwise
+                # leak the tag and mis-classify the following normal text).
+                hold = _trailing_partial_token_len(current_text, tokens_to_check)
+                emit = (
+                    current_text[: len(current_text) - hold] if hold else current_text
+                )
+                self._buffer = current_text[len(current_text) - hold :] if hold else ""
+                if not emit:
+                    return StreamingParseResult()
+                return StreamingParseResult(reasoning_text=emit)
             else:
                 return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
-            self._buffer = ""
-            return StreamingParseResult(normal_text=current_text)
+            # Hold back a trailing partial start/tool token so a reasoning block
+            # opening that split across this chunk boundary is still detected on
+            # the next increment instead of leaking into normal text.
+            hold = _trailing_partial_token_len(current_text, tokens_to_check)
+            emit = current_text[: len(current_text) - hold] if hold else current_text
+            self._buffer = current_text[len(current_text) - hold :] if hold else ""
+            if not emit:
+                return StreamingParseResult()
+            return StreamingParseResult(normal_text=emit)
 
         return StreamingParseResult()
 

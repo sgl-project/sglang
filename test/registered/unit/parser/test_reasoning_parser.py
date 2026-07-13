@@ -110,6 +110,29 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "normal text")
         self.assertFalse(self.detector._in_reasoning)
 
+    def test_parse_streaming_increment_end_token_split(self):
+        """End token split across chunk boundaries must still be detected.
+
+        Regression: a partial `</think>` at the end of buffered reasoning
+        content (e.g. `"reasoning<"` + `"/think>..."`) was emitted as content,
+        so the tag leaked and the following normal text was mis-classified as
+        reasoning.
+        """
+        self.detector.parse_streaming_increment("<think>")
+        r1 = self.detector.parse_streaming_increment("reasoning<")
+        r2 = self.detector.parse_streaming_increment("/think>normal text")
+        self.assertEqual(r1.reasoning_text + r2.reasoning_text, "reasoning")
+        self.assertEqual(r1.normal_text + r2.normal_text, "normal text")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_parse_streaming_increment_lt_in_reasoning_content(self):
+        """A bare `<` in reasoning content is not mistaken for a split tag."""
+        self.detector.parse_streaming_increment("<think>")
+        r1 = self.detector.parse_streaming_increment("a<b ")
+        r2 = self.detector.parse_streaming_increment("more</think>x")
+        self.assertEqual(r1.reasoning_text + r2.reasoning_text, "a<b more")
+        self.assertEqual(r1.normal_text + r2.normal_text, "x")
+
     def test_parse_streaming_increment_no_stream_reasoning(self):
         """Test streaming parse without streaming reasoning."""
         detector = BaseReasoningFormatDetector(
