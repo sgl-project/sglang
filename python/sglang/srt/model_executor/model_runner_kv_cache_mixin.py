@@ -20,7 +20,6 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import (
+    _should_enable_lazy_compaction,
     calculate_mla_kv_cache_dim,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -67,14 +67,6 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-
-
-def _should_enable_lazy_compaction() -> bool:
-    """Lazy compaction default — ON unless
-    `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
-    Centralized here so both unified-memory-pool factory call sites stay in sync.
-    """
-    return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
 # the ratio of mamba cache pool size to max_running_requests
