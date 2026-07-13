@@ -1,4 +1,4 @@
-"""Unit tests for DeepEP Waterfill and EPLB updater compatibility."""
+"""Unit tests for Waterfill and EPLB updater compatibility."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -30,7 +30,7 @@ class _FakeExpertParam(nn.Module):
         self.global_scale._sglang_require_global_experts = True
 
 
-class TestDeepEPWaterfillEPLB(CustomTestCase):
+class TestWaterfillEPLB(CustomTestCase):
     def test_deepseek_moe_get_moe_weights_excludes_fused_shared_slot(self):
         experts = _FakeExpertParam()
         moe = SimpleNamespace(num_fused_shared_experts=1, experts=experts)
