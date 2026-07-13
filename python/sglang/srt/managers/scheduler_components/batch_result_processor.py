@@ -180,7 +180,6 @@ class SchedulerBatchResultProcessor:
             req.allow_radix_cache_insert_once = False
             return
 
-        old_end = req.extend_range.end
         old_cache_protected_len = getattr(req, "cache_protected_len", 0)
         old_swa_evicted_seqlen = getattr(req, "swa_evicted_seqlen", 0)
         old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
@@ -207,14 +206,12 @@ class SchedulerBatchResultProcessor:
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "
-                    "prompt_len=%d radix_key_len=%d fill_len=%d",
+                    "prompt_len=%d radix_key_len=%d",
                     req.rid,
                     prompt_len,
                     radix_key_len,
-                    old_end,
                 )
         finally:
-            req.extend_range.end = old_end
             req.swa_evicted_seqlen = old_swa_evicted_seqlen
             req.force_radix_leaf_creation = old_force_leaf_creation
             if req.cache_protected_len < old_cache_protected_len:
