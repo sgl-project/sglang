@@ -316,14 +316,9 @@ class KVCacheConfigurator:
                         pre_alloc_size=pre_alloc_size,
                     )
                 else:
-                    from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
-
-                    req_to_token_pool = DecodeReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
+                    req_to_token_pool = self._build_decode_req_pool(
+                        max_num_reqs=max_num_reqs,
+                        extra_max_context_len=extra_max_context_len,
                         pre_alloc_size=pre_alloc_size,
                     )
             elif self.mambaish_config:
@@ -1204,6 +1199,24 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             mamba_size=self.server_args.max_mamba_cache_size,
             start_layer=self.start_layer,
+        )
+        return req_to_token_pool
+
+    def _build_decode_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+        pre_alloc_size: int,
+    ) -> ReqToTokenPool:
+        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+        req_to_token_pool = DecodeReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            pre_alloc_size=pre_alloc_size,
         )
         return req_to_token_pool
 
