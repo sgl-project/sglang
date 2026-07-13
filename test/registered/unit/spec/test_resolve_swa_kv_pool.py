@@ -1,10 +1,17 @@
 """Unit tests for attention-backend SWA KV pool resolution."""
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferAttnBackend,
+    FlashInferMultiStepDraftBackend,
+)
+from sglang.srt.layers.attention.trtllm_mha_backend import (
+    TRTLLMHAAttnBackend,
+    TRTLLMHAAttnMultiStepDraftBackend,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -36,6 +43,46 @@ def _mock_runner(
 
 
 class TestResolveSwaKvPool(CustomTestCase):
+    def test_trtllm_mha_backends_are_decoupled_from_flashinfer(self):
+        self.assertTrue(issubclass(TRTLLMHAAttnBackend, AttentionBackend))
+        self.assertFalse(issubclass(TRTLLMHAAttnBackend, FlashInferAttnBackend))
+        self.assertFalse(
+            issubclass(
+                TRTLLMHAAttnMultiStepDraftBackend, FlashInferMultiStepDraftBackend
+            )
+        )
+
+    @patch("sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend")
+    def test_multistep_backend_initializes_only_trtllm_steps(self, backend_cls):
+        runner = MagicMock()
+        runner.model_config.context_len = 4096
+
+        backend = TRTLLMHAAttnMultiStepDraftBackend(
+            runner, topk=1, speculative_num_steps=3
+        )
+
+        self.assertEqual(len(backend.attn_backends), 2)
+        self.assertEqual(backend.max_context_len, 4096)
+        self.assertFalse(hasattr(backend, "kv_indptr"))
+        self.assertFalse(hasattr(backend, "kv_last_page_len"))
+        self.assertEqual(
+            [call.kwargs["speculative_step_id"] for call in backend_cls.call_args_list],
+            [0, 1],
+        )
+
+    @patch("sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend")
+    def test_multistep_backend_handles_no_draft_steps(self, backend_cls):
+        runner = MagicMock()
+        runner.model_config.context_len = 4096
+
+        backend = TRTLLMHAAttnMultiStepDraftBackend(
+            runner, topk=1, speculative_num_steps=1
+        )
+
+        self.assertEqual(backend.attn_backends, [])
+        self.assertEqual(backend.max_context_len, 4096)
+        backend_cls.assert_not_called()
+
     def test_active_pool_is_swa_returns_it(self):
         for name, resolve, pool_type in _RESOLVERS:
             with self.subTest(backend=name):
