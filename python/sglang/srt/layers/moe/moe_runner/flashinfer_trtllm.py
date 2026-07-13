@@ -9,6 +9,12 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
+
 # Import to register custom ops for torch.compile compatibility
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -28,11 +34,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
-)
-from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
@@ -963,6 +964,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
+            backend="cute-dsl",
         )
 
         seq_len, hidden_size = hidden_states.shape
