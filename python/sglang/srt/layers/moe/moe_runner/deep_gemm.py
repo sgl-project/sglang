@@ -180,9 +180,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
         from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
         )
+        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -257,7 +258,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             # Hacky byte-equal fallback that reproduces the optimize-branch
             # code path exactly: bf16 silu_and_mul then a separate per-token
             # group fp8 quant. Kept behind the mega-moe-memory flag.
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
 
@@ -909,9 +910,10 @@ def _varlen_deep_gemm_silu_mul_quant(
     num_real_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_8bit,
     )
+    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
     if _MASKED_GEMM_FAST_ACT:
         assert (

@@ -144,3 +144,13 @@ for _mod, _fn in _PHASE25_TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+# Packed (topk_id << 16 | bf16-weight) kernel migrated from
+# srt/layers/quantization/mxfp4_flashinfer_trtllm_moe (RFC #29630, Phase 2.5).
+register_kernel(
+    KernelSpec(
+        op="moe.pack_topk_ids",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.pack_topk_ids:PackTopkIds.triton",
+    )
+)

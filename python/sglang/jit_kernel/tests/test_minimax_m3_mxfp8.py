@@ -27,7 +27,7 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_dot_scaled_linear,
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
@@ -90,7 +90,7 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )
-    from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
 
     torch.manual_seed(0)
     alpha, beta, limit = 1.702, 1.0, 7.0
