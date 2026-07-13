@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -152,3 +153,7 @@ class TestKimiVLEncoderParallelism(CustomTestCase):
             output = multihead_attention(q, q, q, cu_seqlens, cu_seqlens, max_seqlen=4)
         self.assertTrue(torch.equal(output, fake_output.flatten(start_dim=-2)))
         self.assertEqual(flash_attn.call_args.args[5:7], (4, 4))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

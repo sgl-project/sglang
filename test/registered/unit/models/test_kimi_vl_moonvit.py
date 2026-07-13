@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -57,3 +58,7 @@ def test_learnable_2d_pos_emb_evicts_oldest_inference_cache_entry(monkeypatch):
     assert ((3, 2), module.weight.dtype, module.weight.device) in (
         module._interpolated_pos_emb_cache
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
