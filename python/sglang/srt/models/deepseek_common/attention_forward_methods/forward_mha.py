@@ -61,6 +61,35 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     return backend
 
 
+def _forward_dsa_indexer_for_mha(
+    indexer,
+    *,
+    hidden_states: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+) -> None:
+    """Fill the indexer K cache and publish an MTP seed when requested."""
+    seed_buf = getattr(forward_batch.spec_info, "dsa_seed_topk_capture", None)
+    topk_indices = indexer(
+        x=hidden_states,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        return_indices=seed_buf is not None,
+    )
+    if seed_buf is None:
+        return
+    if topk_indices is None:
+        raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
+
+    select = forward_batch.spec_info.dsa_seed_topk_select
+    src = topk_indices if select is None else topk_indices[select]
+    seed_buf[: src.shape[0]].copy_(src)
+
+
 # Configs for DeepSeek-V3:
 # num_local_heads = 128
 # qk_nope_head_dim = 128
@@ -174,13 +203,13 @@ class DeepseekMHAForwardMixin:
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if self.should_run_indexer():
-                    _ = self.indexer(
-                        x=hidden_states,
+                    _forward_dsa_indexer_for_mha(
+                        self.indexer,
+                        hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
-                        return_indices=False,
                     )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
