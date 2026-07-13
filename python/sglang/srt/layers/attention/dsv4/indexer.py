@@ -18,7 +18,6 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
-    _CHUNKED_INDEXER,
     _SM120_INDEXER_M_CHUNK,
     PagedIndexerMetadata,
 )
@@ -618,17 +617,11 @@ class C4IndexerBackendMixin:
                 )
 
         _meta = indexer_metadata.deep_gemm_metadata
-        if _meta is _CHUNKED_INDEXER:
-            import deep_gemm as _dg
-            from deep_gemm import get_paged_mqa_logits_metadata as _get_meta
-
+        if isinstance(_meta, list):
             m_total = _c4sl.shape[0]
-            for _s in range(0, m_total, _SM120_INDEXER_M_CHUNK):
+            for _i, _s in enumerate(range(0, m_total, _SM120_INDEXER_M_CHUNK)):
                 _e = min(_s + _SM120_INDEXER_M_CHUNK, m_total)
-                _meta_c = _get_meta(
-                    _c4sl[_s:_e], indexer_metadata.c4_page_size, _dg.get_num_sms()
-                )
-                _run_indexer_and_topk(slice(_s, _e), _meta_c)
+                _run_indexer_and_topk(slice(_s, _e), _meta[_i])
         else:
             _run_indexer_and_topk(slice(0, _c4sl.shape[0]), _meta)
         if hisparse_coordinator is not None:

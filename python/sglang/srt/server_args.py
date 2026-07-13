@@ -3996,7 +3996,11 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(True)
+                from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                    HAS_TF32_HC_PRENORM,
+                )
+
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(HAS_TF32_HC_PRENORM)
                 # SM120: use the CUDA paged-MQA-logits path (DeepGEMM metadata
                 # kernel) instead of the torch fallback. The torch fallback
                 # computes the indexer logits in eager torch ops and dominates

@@ -53,7 +53,6 @@ Some other notes:
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 _SM120_INDEXER_M_CHUNK = 16384
-_CHUNKED_INDEXER = object()
 
 
 def copy_metadata(
@@ -133,7 +132,17 @@ class PagedIndexerMetadata:
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
             if _IS_SM120 and _c4.shape[0] > _SM120_INDEXER_M_CHUNK:
-                self.deep_gemm_metadata = _CHUNKED_INDEXER
+                # Chunk metadata is identical for every layer in the forward
+                # pass; compute the per-chunk list once here instead of per
+                # layer in the indexer.
+                self.deep_gemm_metadata = [
+                    get_paged_mqa_logits_metadata(
+                        _c4[_s : _s + _SM120_INDEXER_M_CHUNK],
+                        self.c4_page_size,
+                        deep_gemm.get_num_sms(),
+                    )
+                    for _s in range(0, _c4.shape[0], _SM120_INDEXER_M_CHUNK)
+                ]
             else:
                 self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
                     _c4,

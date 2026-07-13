@@ -1178,7 +1178,6 @@ def _per_token_group_quant_fp8_pow2_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
-    M,
     K,
     group_size: tl.constexpr,
     fp8_max: tl.constexpr,
@@ -1187,9 +1186,6 @@ def _per_token_group_quant_fp8_pow2_kernel(
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
     num_groups = K // group_size
-
-    if pid_m >= M or pid_g >= num_groups:
-        return
 
     offs = tl.arange(0, BLOCK_GROUP)
     x_base = pid_m * K + pid_g * group_size
@@ -1217,7 +1213,6 @@ def _per_token_group_quant_fp8_pow2(x, group_size):
         x,
         x_q,
         x_s,
-        M,
         K,
         group_size,
         fp8_max,
