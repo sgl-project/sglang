@@ -7,7 +7,7 @@ import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
-from sglang.kernels.ops.quantization import per_token_group_quant_v3
+from sglang.kernels.ops.quantization import per_token_group_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -933,8 +933,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     del D_2
     G = D // group_size
 
-    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until v3 grows an
-    # activation-kind axis. The output_scale dtype picks the schedule: packed
+    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
+    # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
     # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
     # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
     if gemm1_alpha is not None:
@@ -1011,12 +1011,12 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path: the unified v3 masked fused quant. v3 allocates
+    # Default plain-silu path: the unified JIT masked fused quant. It allocates
     # the outputs itself, with scales directly in the layout deep_gemm consumes
     # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
     # so the caller's get_mn_major transform short-circuits.
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
-    return per_token_group_quant_v3(
+    return per_token_group_quant(
         gateup_output,
         group_size=group_size,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,

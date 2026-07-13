@@ -1,4 +1,4 @@
-"""Correctness tests for the trait-driven per_token_group_quant_v3 JIT kernel.
+"""Correctness tests for the trait-driven per_token_group_quant JIT kernel.
 
 The reference is computed in pure PyTorch (the quantization math itself), NOT by
 calling the v2 / minimax kernels -- those are being deprecated, so the tests
@@ -21,9 +21,9 @@ import itertools
 import pytest
 import torch
 
-from sglang.jit_kernel.per_token_group_quant_v3 import per_token_group_quant_v3
+from sglang.jit_kernel.per_token_group_quant import per_token_group_quant
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
@@ -139,7 +139,7 @@ UE8M0_CASES = get_ci_test_range(
 
 
 @pytest.mark.parametrize("dtype,num_tokens,hidden", UE8M0_CASES)
-def test_v3_ue8m0_bitexact(dtype, num_tokens, hidden):
+def test_ue8m0_bitexact(dtype, num_tokens, hidden):
     """Col-major packed UE8M0: fp8 codes and decoded exponent bytes are
     bit-exact with the torch reference (exact pow-2 multiplier). Covers the
     aligned and non-4-aligned (hidden=768) pack-tail layouts."""
@@ -149,7 +149,7 @@ def test_v3_ue8m0_bitexact(dtype, num_tokens, hidden):
 
     x_q = torch.zeros_like(x, dtype=fp8_dtype)
     x_s = _alloc_scale((num_tokens, hidden), column_major=True, scale_ue8m0=True)
-    per_token_group_quant_v3(x, x_q, x_s, G, scale_ue8m0=True)
+    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
     torch.cuda.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
@@ -158,7 +158,7 @@ def test_v3_ue8m0_bitexact(dtype, num_tokens, hidden):
 
 
 @pytest.mark.parametrize("group_size", get_ci_test_range([16, 32, 64, 128], [16, 64]))
-def test_v3_ue8m0_group_sizes(group_size):
+def test_ue8m0_group_sizes(group_size):
     """Group size is a template axis (v2 dispatched a runtime switch). Each size
     maps a group onto a different subwarp lane count; codes/exponents must stay
     bit-exact -- a wrong lane span would fold the wrong elements into absmax."""
@@ -177,7 +177,7 @@ def test_v3_ue8m0_group_sizes(group_size):
         scale_ue8m0=True,
     )
     x_s.zero_()
-    per_token_group_quant_v3(x, x_q, x_s, group_size, scale_ue8m0=True)
+    per_token_group_quant(x, x_q, x_s, group_size, scale_ue8m0=True)
     torch.cuda.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
@@ -188,7 +188,7 @@ def test_v3_ue8m0_group_sizes(group_size):
 # hidden 4096 -> 32 groups (aligned); 768 -> 6 groups (6 % 4 = 2, unaligned:
 # the last int32 holds 2 real exponent bytes + 2 zero-padded tail bytes).
 @pytest.mark.parametrize("hidden", [4096, 768])
-def test_v3_ue8m0_row_packed_bitexact(hidden):
+def test_ue8m0_row_packed_bitexact(hidden):
     """Row-major packed UE8M0 (int32 [T, ceil(G/4)] contiguous, the minimax
     layout): bit-exact vs the torch reference. The unaligned hidden exercises
     the row-major pack-tail zeroing (fill_unaligned)."""
@@ -201,7 +201,7 @@ def test_v3_ue8m0_row_packed_bitexact(hidden):
     x_s = torch.zeros(
         num_tokens, (hidden // G + 3) // 4, device="cuda", dtype=torch.int32
     )
-    per_token_group_quant_v3(x, x_q, x_s, G, scale_ue8m0=True)
+    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
     torch.cuda.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
@@ -221,7 +221,7 @@ def test_v3_ue8m0_row_packed_bitexact(hidden):
 @pytest.mark.parametrize("hidden", [4096, 768])
 @pytest.mark.parametrize("column_major", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_v3_fp32_scale(dtype, column_major, hidden):
+def test_fp32_scale(dtype, column_major, hidden):
     """fp32 scale (row-major contiguous / col-major TMA view): the stored scale
     is amax/FMAX (a single multiply, bit-exact) and dequant round-trips within
     fp8 error.
@@ -238,7 +238,7 @@ def test_v3_fp32_scale(dtype, column_major, hidden):
     x_s = _alloc_scale(
         (num_tokens, hidden), column_major=column_major, scale_ue8m0=False
     )
-    per_token_group_quant_v3(x, x_q, x_s, G)
+    per_token_group_quant(x, x_q, x_s, G)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
@@ -246,7 +246,7 @@ def test_v3_fp32_scale(dtype, column_major, hidden):
 
 
 @pytest.mark.parametrize("column_major", [False, True])
-def test_v3_int8_scale(column_major):
+def test_int8_scale(column_major):
     """int8 output (row-major / col-major fp32 scale): exact stored scale
     (amax/127) + dequant round-trip. Pins the multiply-by-inverse family (v1
     divided by the scale and differed by a ULP) without depending on v2."""
@@ -259,7 +259,7 @@ def test_v3_int8_scale(column_major):
     x_s = _alloc_scale(
         (num_tokens, hidden), column_major=column_major, scale_ue8m0=False
     )
-    per_token_group_quant_v3(x, x_q, x_s, G)
+    per_token_group_quant(x, x_q, x_s, G)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
@@ -268,7 +268,7 @@ def test_v3_int8_scale(column_major):
     assert _dequant_rel_err(x_q, x_s, x, G) < 0.08
 
 
-def test_v3_group_size_256_roundtrip():
+def test_group_size_256_roundtrip():
     """Group 256 (32 lanes on H100, 16 on Blackwell) is above v2's old cap of
     128. Pin the derived property: the fp32 scale equals absmax/FMAX and dequant
     round-trips. A mis-mapped wide subwarp would fold the wrong elements into
@@ -280,7 +280,7 @@ def test_v3_group_size_256_roundtrip():
 
     x_q = torch.zeros_like(x, dtype=fp8_dtype)
     x_s = torch.zeros(num_tokens, hidden // gs, device="cuda", dtype=torch.float32)
-    per_token_group_quant_v3(x, x_q, x_s, gs)
+    per_token_group_quant(x, x_q, x_s, gs)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
@@ -299,7 +299,7 @@ def _ref_silu_mul(x, hidden):
 
 @pytest.mark.parametrize("column_major", [True, False])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
-def test_v3_fused_silu(scale_ue8m0, column_major):
+def test_fused_silu(scale_ue8m0, column_major):
     """fuse_silu_and_mul quantizes ``silu(x[..., :h]) * x[..., h:]`` (SGLang's
     SiluAndMul: first half is the gated half). Covered across all four scale
     layouts so the fused [gate | up] input layout is pinned everywhere.
@@ -324,7 +324,7 @@ def test_v3_fused_silu(scale_ue8m0, column_major):
         x_s = _alloc_scale(
             (num_tokens, hidden), column_major=column_major, scale_ue8m0=scale_ue8m0
         )
-    per_token_group_quant_v3(
+    per_token_group_quant(
         x, x_q, x_s, G, scale_ue8m0=scale_ue8m0, fuse_silu_and_mul=True
     )
     torch.cuda.synchronize()
@@ -345,11 +345,11 @@ MASKED_CASES = get_ci_test_range(
 @pytest.mark.parametrize("masked_m_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("expected_m", [None, 4])
 @pytest.mark.parametrize("num_experts,hidden,tokens_pad", MASKED_CASES)
-def test_v3_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
+def test_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
     """Masked EP-MoE schedule (col-packed ue8m0, plain quant -- no silu, so the
     quant is bit-reproducible): rows < masked_m[e] are bit-exact vs the torch
     reference; rows >= masked_m[e] stay zero (untouched). Fusion numerics are
-    covered by test_v3_fused_silu; here the schedule is what's under test.
+    covered by test_fused_silu; here the schedule is what's under test.
 
     masked_m is accepted as int32 or int64 (the latter read as its low word),
     so both dtypes are exercised.
@@ -368,7 +368,7 @@ def test_v3_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
 
     x_q = torch.zeros(out_shape, device="cuda", dtype=fp8_dtype)
     x_s = _alloc_scale(out_shape, column_major=True, scale_ue8m0=True)
-    per_token_group_quant_v3(
+    per_token_group_quant(
         x, x_q, x_s, G, scale_ue8m0=True, masked_m=masked_m, expected_m=expected_m
     )
     torch.cuda.synchronize()
@@ -399,7 +399,7 @@ AUTO_ALLOC_CASES = [
 ]
 
 
-def test_v3_masked_fused():
+def test_masked_fused():
     """The production EP-MoE path: masked schedule + fuse_silu_and_mul +
     col-packed ue8m0. silu is not bit-reproducible, so check the written rows
     round-trip to the torch activation and padding rows stay zero."""
@@ -415,7 +415,7 @@ def test_v3_masked_fused():
 
     x_q = torch.zeros(out_shape, device="cuda", dtype=fp8_dtype)
     x_s = _alloc_scale(out_shape, column_major=True, scale_ue8m0=True)
-    per_token_group_quant_v3(
+    per_token_group_quant(
         x, x_q, x_s, G, scale_ue8m0=True, fuse_silu_and_mul=True, masked_m=masked_m
     )
     torch.cuda.synchronize()
@@ -430,7 +430,7 @@ def test_v3_masked_fused():
 
 
 @pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)
-def test_v3_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
+def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     """Omitting output_q/output_s allocates them per out_dtype / major mode /
     scale format and returns (q, s). The auto-allocated run must be bit-
     identical to quantizing into caller-supplied buffers of the same layout --
@@ -450,9 +450,9 @@ def test_v3_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
             column_major=column_major_scales,
             scale_ue8m0=scale_ue8m0,
         )
-    per_token_group_quant_v3(x, q_buf, s_buf, G, scale_ue8m0=scale_ue8m0)
+    per_token_group_quant(x, q_buf, s_buf, G, scale_ue8m0=scale_ue8m0)
 
-    q_auto, s_auto = per_token_group_quant_v3(
+    q_auto, s_auto = per_token_group_quant(
         x,
         group_size=G,
         scale_ue8m0=scale_ue8m0,

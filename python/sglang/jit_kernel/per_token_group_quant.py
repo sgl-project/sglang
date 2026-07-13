@@ -52,11 +52,11 @@ def _jit_module(
         else "PerTokenGroupQuantFlatKernel"
     )
     return load_jit(
-        "per_token_group_quant_v3",
+        "per_token_group_quant",
         *trait_args,
         "masked" if masked_layout else "flat",
-        cuda_files=["gemm/per_token_group_quant_v3.cuh"],
-        cuda_wrappers=[("per_token_group_quant_v3", f"{launcher}<{trait_args}>::run")],
+        cuda_files=["gemm/per_token_group_quant.cuh"],
+        cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
         extra_cuda_cflags=["--use_fast_math"],
     )
 
@@ -83,10 +83,10 @@ def _infer_scale_layout(
 
 
 @register_custom_op(
-    op_name="per_token_group_quant_v3",
+    op_name="per_token_group_quant",
     mutates_args=["output_q", "output_s"],
 )
-def _per_token_group_quant_v3_custom_op(
+def _per_token_group_quant_custom_op(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
@@ -110,11 +110,11 @@ def _per_token_group_quant_v3_custom_op(
         is_arch_support_pdl(),
     )
     if masked_m is not None:
-        module.per_token_group_quant_v3(
+        module.per_token_group_quant(
             input, output_q, output_s, masked_m, int(expected_m or -1)
         )
     else:
-        module.per_token_group_quant_v3(input, output_q, output_s)
+        module.per_token_group_quant(input, output_q, output_s)
 
 
 def _allocate_outputs(
@@ -143,7 +143,7 @@ def _allocate_outputs(
             dtype=torch.int32,
         )
     else:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
         )
 
@@ -159,7 +159,7 @@ def _allocate_outputs(
 
 
 @debug_kernel_api
-def per_token_group_quant_v3(
+def per_token_group_quant(
     input: torch.Tensor,
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
@@ -210,7 +210,7 @@ def per_token_group_quant_v3(
     else:
         assert output_s is not None
         assert out_dtype is None or out_dtype == output_q.dtype
-    _per_token_group_quant_v3_custom_op(
+    _per_token_group_quant_custom_op(
         input=input,
         output_q=output_q,
         output_s=output_s,

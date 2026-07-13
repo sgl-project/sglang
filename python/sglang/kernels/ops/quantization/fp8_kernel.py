@@ -59,12 +59,12 @@ if _is_cuda or _is_musa:
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
     from sglang.kernels.ops.quantization import (
-        per_token_group_quant_v3,
+        per_token_group_quant,
         sgl_per_token_quant_fp8,
     )
 
 if _is_musa:
-    # v3 is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 if _is_hip:
@@ -511,8 +511,8 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
-# AOT v2 (the MUSA path) runtime-switches on these; the JIT v3 kernel also
-# templates on 256.
+# AOT v2 (the MUSA path) runtime-switches on these; the JIT
+# per_token_group_quant kernel also templates on 256.
 _MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
 _V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 
@@ -532,10 +532,11 @@ def _run_per_token_group_quant_8bit_kernel(
 ) -> None:
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
-    CUDA routes to the JIT v3 kernel unconditionally; MUSA stays on the AOT v2
-    op (v3 is CUDA-only). v3 bakes the quant constants in at compile time, so
+    CUDA routes to the JIT per_token_group_quant kernel unconditionally; MUSA
+    stays on the AOT v2 op (the JIT kernel is CUDA-only). The kernel bakes the
+    quant constants in at compile time, so
     drifted constants are rejected loudly here instead of silently quantizing
-    with different ones; unsupported shapes/layouts error inside v3's host
+    with different ones; unsupported shapes/layouts error inside its host
     checks. Whole-row (per-token) quantization is a different op:
     ``sglang_per_token_quant_fp8``.
     """
@@ -555,13 +556,15 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert eps == 1e-10, f"v3 bakes the absmax floor in at 1e-10, got {eps}"
+    assert (
+        eps == 1e-10
+    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
     expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
     assert (fp8_min, fp8_max) == expected_range, (
-        f"v3 bakes the {x_q.dtype} quant range in at {expected_range}, "
+        f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
         f"got ({fp8_min}, {fp8_max})"
     )
-    per_token_group_quant_v3(
+    per_token_group_quant(
         x,
         x_q,
         x_s,

@@ -54,9 +54,9 @@ del _name
 
 register_kernel(
     KernelSpec(
-        op="quantization.per_token_group_quant_v3",
+        op="quantization.per_token_group_quant",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.per_token_group_quant_v3:per_token_group_quant_v3",
+        target="sglang.jit_kernel.per_token_group_quant:per_token_group_quant",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn", "int8"),
@@ -67,7 +67,7 @@ register_kernel(
                 "layouts, optional fused silu_and_mul and masked EP-MoE schedule"
             ),
         ),
-        description="Unified per-token-group quantization (sglang.jit_kernel v3).",
+        description="Unified per-token-group quantization (sglang.jit_kernel).",
     )
 )
 
@@ -117,7 +117,7 @@ sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
 sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
-def per_token_group_quant_v3(
+def per_token_group_quant(
     input: torch.Tensor,
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
@@ -130,7 +130,7 @@ def per_token_group_quant_v3(
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
 ):
-    """Unified per-token-group quantization (JIT v3). Returns ``(x_q, x_s)``.
+    """Unified per-token-group quantization (JIT). Returns ``(x_q, x_s)``.
 
     bf16/fp16 input, fp8_e4m3/int8 output, group size 16..256, fp32 or
     packed-UE8M0 scales in row-/col-major layouts, optional fused
@@ -139,7 +139,7 @@ def per_token_group_quant_v3(
     caller-owned buffers (layout inferred from their dtype/strides), or omit
     both to have them allocated.
     """
-    return get_kernel("quantization.per_token_group_quant_v3", KernelBackend.CUDA_JIT)(
+    return get_kernel("quantization.per_token_group_quant", KernelBackend.JIT)(
         input,
         output_q,
         output_s,
@@ -158,7 +158,7 @@ __all__ = [
     "sgl_per_token_group_quant_8bit",
     "sgl_per_token_group_quant_fp8",
     "sgl_per_token_group_quant_int8",
-    "per_token_group_quant_v3",
+    "per_token_group_quant",
 ]
 
 

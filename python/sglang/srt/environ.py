@@ -1190,7 +1190,7 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
-    # Superseded by the JIT v3 per-token-group quant, which is the default CUDA path.
+    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
     _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")

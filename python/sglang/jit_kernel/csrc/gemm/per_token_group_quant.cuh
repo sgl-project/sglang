@@ -223,8 +223,8 @@ struct QuantTrait {
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / sizeof(InputType);
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
-  static_assert(sizeof(InputType) == 2, "v3 only supports 16-bit inputs (bf16/fp16)");
-  static_assert(16 <= kGroupSize && kGroupSize <= 256, "v3 supports group sizes 16..256");
+  static_assert(sizeof(InputType) == 2, "only 16-bit inputs (bf16/fp16) are supported");
+  static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
 

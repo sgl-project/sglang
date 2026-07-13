@@ -4,11 +4,14 @@ import torch
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_empty, create_random
+
+# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
+# kernel is kept only as the perf baseline for this benchmark.
+from sglang.jit_kernel.per_token_group_quant import per_token_group_quant
 from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
-from sglang.jit_kernel.per_token_group_quant_v3 import per_token_group_quant_v3
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
@@ -43,8 +46,8 @@ def _jit_v2(G, x, x_q, x_s, masked_m, expected_m, fuse):
     )
 
 
-def _jit_v3(G, x, x_q, x_s, masked_m, expected_m, fuse):
-    per_token_group_quant_v3(
+def _current(G, x, x_q, x_s, masked_m, expected_m, fuse):
+    per_token_group_quant(
         x,
         x_q,
         x_s,
@@ -56,7 +59,7 @@ def _jit_v3(G, x, x_q, x_s, masked_m, expected_m, fuse):
     )
 
 
-FN = {"jit_v2": _jit_v2, "jit_v3": _jit_v3}
+FN = {"jit_v2": _jit_v2, "current": _current}
 
 
 @marker.parametrize("model", list(MODELS), ci_vals=["deepseek_v3"])
@@ -64,7 +67,7 @@ FN = {"jit_v2": _jit_v2, "jit_v3": _jit_v3}
 @marker.parametrize("fuse_silu", [True, False], ci_vals=[False])
 @marker.parametrize("balanced", [True, False], ci_vals=[True])
 @marker.parametrize("num_tokens", [2**n for n in range(8)], ci_vals=[1, 128])
-@marker.benchmark("impl", ["jit_v2", "jit_v3"], unit="us")
+@marker.benchmark("impl", ["jit_v2", "current"], unit="us")
 def benchmark(
     model: str,
     fuse_silu: bool,
