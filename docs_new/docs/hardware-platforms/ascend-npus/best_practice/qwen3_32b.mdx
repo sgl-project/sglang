@@ -4,20 +4,24 @@ metatags:
   description: "Best Practice for Qwen3-32B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3-32B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-32B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-32B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_32b).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
+</Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-32B | Atlas 800I A3 | 8 | PD Mixed | 18K+4K | 6ms | BF16 | [Optimal Configuration](#qwen3-32b-bf16-8p-in18k-out4k-6ms) |
+| Qwen3-32B | Atlas 800I A3 | 8 | PD Mixed | 18k+4k | 6ms | BF16 | [Optimal Configuration](#qwen3-32b-bf16-8p-in18k-out4k-6ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-32B | Atlas 800I A2 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms-a2) |
-| Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) |
+| Qwen3-32B | Atlas 800I A2 | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms-a2) |
+| Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -35,7 +39,7 @@ This guide describes the best practice data for Qwen3-32B on the Ascend NPU.
 
 **Quantization**: BF16
 
-**Dataset**: 18K+4K
+**Dataset**: 18k+4k
 
 **TPOT**: 6ms
 
@@ -98,14 +102,16 @@ python3 -m sglang.launch_server \
     --tp-size 16 \
     --mem-fraction-static 0.72 \
     --cuda-graph-bs 1 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -130,7 +136,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -195,14 +201,16 @@ python3 -m sglang.launch_server \
     --tp-size 4 \
     --mem-fraction-static 0.845 \
     --cuda-graph-bs 16 32 64 72 88 90 92 94 96 97 98 99 100 101 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -227,7 +235,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -292,14 +300,16 @@ python3 -m sglang.launch_server \
     --tp-size 4 \
     --mem-fraction-static 0.845 \
     --cuda-graph-bs 16 32 64 72 88 90 92 94 96 97 98 99 100 101 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

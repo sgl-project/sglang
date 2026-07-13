@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
@@ -23,7 +24,6 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -99,7 +99,7 @@ class DeepEPMoE(FusedMoE):
         elif (
             get_moe_runner_backend().is_flashinfer_cutedsl()
             and quant_config is not None
-            and quant_config.get_name() == "modelopt_fp4"
+            and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.deprecate_flag = True
         elif (

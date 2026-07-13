@@ -157,6 +157,12 @@ This minimal hybrid layout was selected by a hardware-in-the-loop architecture s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compact instruct, structured output</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-230M">LFM2.5-230M</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>230M (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Most compact; data extraction, structured output</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606">LFM2.5-1.2B-JP-202606</a></strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.17B (dense)</td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
@@ -189,7 +195,7 @@ This minimal hybrid layout was selected by a hardware-in-the-loop architecture s
   </tbody>
 </table>
 
-The Deploy panel above covers the seven serving variants; **LFM2.5-1.2B-JP** (original — launch without `--tool-call-parser`) and the **Base** repos (pre-trained only, no post-training — see [§3.5](#3-5-base-checkpoints)) launch the same way with the model path swapped.
+The Deploy panel above covers the eight serving variants; **LFM2.5-1.2B-JP** (original — launch without `--tool-call-parser`) and the **Base** repos (pre-trained only, no post-training — see [§3.5](#3-5-base-checkpoints)) launch the same way with the model path swapped.
 
 **Choosing a variant:**
 
@@ -197,6 +203,7 @@ The Deploy panel above covers the seven serving variants; **LFM2.5-1.2B-JP** (or
 - **1.2B-Thinking** — reasoning-heavy tasks: math, tool use, programming.
 - **1.2B-Instruct** — the recommended pick for chat and creative writing.
 - **350M** — tool use, data extraction, and structured output; not recommended for math, code, or creative writing.
+- **230M** — the most compact checkpoint; same use as the 350M, not for math, code, or creative writing.
 
 **License:** [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B/blob/main/LICENSE).
 
@@ -228,6 +235,7 @@ The Deploy panel above covers the seven serving variants; **LFM2.5-1.2B-JP** (or
     <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-Instruct</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
     <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-Thinking</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.05</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
     <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-350M</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-230M</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
     <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-JP-202606</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
     <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-JP</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.3</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"min_p": 0.15, "repetition_penalty": 1.05}`}</code></td></tr>
     <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-VL-1.6B (text)</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"min_p": 0.15, "repetition_penalty": 1.05}`}</code></td></tr>
@@ -253,6 +261,7 @@ SAMPLING = {
     "LiquidAI/LFM2.5-1.2B-Instruct":  dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
     "LiquidAI/LFM2.5-1.2B-Thinking":  dict(temperature=0.05, extra_body={"top_k": 50, "repetition_penalty": 1.05}),
     "LiquidAI/LFM2.5-350M":           dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-230M":           dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
     "LiquidAI/LFM2.5-1.2B-JP-202606": dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
     "LiquidAI/LFM2.5-VL-1.6B":        dict(temperature=0.1,  extra_body={"min_p": 0.15, "repetition_penalty": 1.05}),
     "LiquidAI/LFM2.5-VL-450M":        dict(temperature=0.1,  extra_body={"min_p": 0.15, "repetition_penalty": 1.05}),
@@ -312,7 +321,7 @@ for call in resp.choices[0].message.tool_calls or []:
     print(call.function.name, call.function.arguments)
 ```
 
-Tool calling is supported on 8B-A1B, 1.2B-Thinking, 1.2B-Instruct, 350M, 1.2B-JP-202606, VL-1.6B, and VL-450M. For the **VL** models it is text-turn-only — do not combine an image and tools in the same turn.
+Tool calling is supported on 8B-A1B, 1.2B-Thinking, 1.2B-Instruct, 350M, 230M, 1.2B-JP-202606, VL-1.6B, and VL-450M. For the **VL** models it is text-turn-only — do not combine an image and tools in the same turn.
 
 ### 3.4 Vision Input
 
@@ -335,7 +344,7 @@ print(resp.choices[0].message.content)
 
 ### 3.5 Base Checkpoints
 
-Each size ships a pre-trained Base repo — [LFM2.5-1.2B-Base](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Base), [LFM2.5-350M-Base](https://huggingface.co/LiquidAI/LFM2.5-350M-Base), and [LFM2.5-8B-A1B-Base](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-Base) — intended for fine-tuning and continued pre-training.
+Each size ships a pre-trained Base repo — [LFM2.5-230M-Base](https://huggingface.co/LiquidAI/LFM2.5-230M-Base), [LFM2.5-1.2B-Base](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Base), [LFM2.5-350M-Base](https://huggingface.co/LiquidAI/LFM2.5-350M-Base), and [LFM2.5-8B-A1B-Base](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-Base) — intended for fine-tuning and continued pre-training.
 
 The repos ship a ChatML-style chat template, so `chat.completions` requests format normally. The checkpoints have no post-training, though — don't expect instruction following. For raw text continuation:
 
