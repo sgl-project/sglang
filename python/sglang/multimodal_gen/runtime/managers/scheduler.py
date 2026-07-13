@@ -72,6 +72,7 @@ _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 _BATCH_INTERARRIVAL_EWMA_ALPHA = 0.25
 _BATCH_INTERARRIVAL_HEADROOM = 1.25
+_BATCH_ADAPTIVE_BOOTSTRAP_MULTIPLIER = 4.0
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
@@ -162,6 +163,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batching_interarrival_ewma_s: float | None = None
         self._batching_last_arrival_s: float | None = None
         self._next_batch_wait_s = self._batching_delay_s
+        self._last_batch_wait_s = self._batching_delay_s
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
@@ -199,11 +201,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return
 
         if self._batching_last_arrival_s is not None:
-            interval_s = min(
-                now - self._batching_last_arrival_s,
-                self._batching_adaptive_delay_max_s,
-            )
-            if self._batching_interarrival_ewma_s is None:
+            interval_s = now - self._batching_last_arrival_s
+            if interval_s > self._batching_adaptive_delay_max_s:
+                self._batching_interarrival_ewma_s = None
+            elif self._batching_interarrival_ewma_s is None:
                 self._batching_interarrival_ewma_s = interval_s
             else:
                 alpha = _BATCH_INTERARRIVAL_EWMA_ALPHA
@@ -221,7 +222,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return self._batching_delay_s
 
         if self._batching_interarrival_ewma_s is None:
-            return max_delay_s
+            return min(
+                self._batching_delay_s * _BATCH_ADAPTIVE_BOOTSTRAP_MULTIPLIER,
+                max_delay_s,
+            )
 
         missing_slots = max(0, max_batch_size - batch_size)
         predicted_additional_wait_s = (
@@ -373,10 +377,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     )
 
                 logger.info(
-                    "Processed dynamic batch of %d/%d request(s) with max_delay=%.2fms",
+                    "Processed dynamic batch of %d/%d request(s) with wait_limit=%.2fms",
                     batch_size,
                     self._batching_max_size,
-                    self._batching_delay_s * 1000.0,
+                    self._last_batch_wait_s * 1000.0,
                 )
                 return split_outputs
             except Exception as e:
@@ -415,10 +419,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
 
             logger.info(
-                "Processed native grouped batch of %d/%d request(s) with max_delay=%.2fms",
+                "Processed native grouped batch of %d/%d request(s) with wait_limit=%.2fms",
                 batch_size,
                 self._batching_max_size,
-                self._batching_delay_s * 1000.0,
+                self._last_batch_wait_s * 1000.0,
             )
             return split_outputs
         except Exception as e:
@@ -980,6 +984,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if should_wait_for_more:
             self._next_batch_wait_s = batch_wait_s
             return None
+
+        self._last_batch_wait_s = batch_wait_s
 
         batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
         for pos, idx in enumerate(reversed(compatible_indices)):
