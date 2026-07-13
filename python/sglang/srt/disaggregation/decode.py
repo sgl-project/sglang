@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
+import math
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -412,6 +413,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
+
+    def _uses_dsv4_decode_radix_cache(self) -> bool:
+        return (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        )
+
+    def _dsv4_safe_prefix_len(self, prefix_len: int) -> int:
+        """Avoid splitting reused prefixes through compressed DSV4 blocks."""
+        if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
+            return prefix_len
+
+        compression_ratios = getattr(self.token_to_kv_pool, "compression_ratios", [])
+        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        alignment = math.lcm(page_size, max_compression_ratio)
+        return (prefix_len // alignment) * alignment
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
@@ -999,6 +1017,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
+                locked_prefix_len = prefix_len
+                # Align prefix_len down to page boundary so both prefill and
+                # decode agree on the page-aligned split point for KV transfer.
+                page_size = self.token_to_kv_pool_allocator.page_size
+                if page_size > 1 and prefix_len % page_size != 0:
+                    prefix_len = page_align_floor(prefix_len, page_size)
+                    prefix_indices = prefix_indices[:prefix_len]
+                    total_prefix_len = min(total_prefix_len, prefix_len)
 
                 fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
 
@@ -1014,7 +1040,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         # Cap the prefill-committed prefix too: tokens past the
                         # cap are not device-resident, so prefill must transfer
                         # them.
-                        total_prefix_len = prefix_len
+                        total_prefix_len = min(total_prefix_len, prefix_len)
+
+                dsv4_safe_prefix_len = self._dsv4_safe_prefix_len(prefix_len)
+                if dsv4_safe_prefix_len < prefix_len:
+                    prefix_len = dsv4_safe_prefix_len
+                    prefix_indices = prefix_indices[:prefix_len]
+                    total_prefix_len = min(total_prefix_len, prefix_len)
+
+                if locked_prefix_len > 0 and prefix_len == 0:
+                    self.tree_cache.dec_lock_ref(
+                        decode_req.req.last_node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                        ),
+                    )
+                    decode_req.req.last_node = self.tree_cache.root_node
+                    decode_req.req.swa_uuid_for_lock = None
 
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
