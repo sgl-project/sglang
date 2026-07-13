@@ -840,7 +840,11 @@ class GemmaRMSNorm(MultiPlatformOp):
             )
             return norm_out, residual
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        # npu_gemma_rms_norm has no kernel registered for Ascend A5 (socVersion
+        # ascend950). Gemma RMSNorm == normalize(x) * (1 + weight), which is
+        # equivalent to a plain rms_norm with gamma = 1 + weight; npu_rms_norm is
+        # implemented on A2/A3/A5, so this is a safe cross-SOC replacement.
+        x, _ = torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)
         return x
 
     def forward_xpu(
