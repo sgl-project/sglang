@@ -5,7 +5,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Run every 6 hours (UTC)
+    - cron: '0 */12 * * *' # Run every 12 hours (UTC)
   pull_request:
     paths:
       - "python/**"
@@ -27,6 +27,7 @@ on:
           - sgl-kernel-unit-test-2-gpu-amd
           - stage-a-test-1-gpu-small-amd
           - jit-kernel-unit-test-amd
+          - jit-kernel-benchmark-test-amd
           - stage-b-test-1-gpu-small-amd
           - stage-b-test-1-gpu-small-amd-nondeterministic
           - stage-b-test-1-gpu-small-amd-mi35x
@@ -390,6 +391,43 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+  jit-kernel-benchmark-test-amd:
+    name: ${{ format('jit-kernel-benchmark-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
+    needs: [check-changes, call-gate]
+    if: |
+      always() && !cancelled() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
+          needs.check-changes.outputs.jit_kernel == 'true'
+        )
+      )
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run JIT kernel benchmarks
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-benchmark-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
   # These jobs poll GitHub API to wait for previous stages to complete.
@@ -972,6 +1010,7 @@ jobs:
           jobs: |
             [
               {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 14},
+              {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 3},
               {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 2}
             ]
           max-wait-minutes: '480'
@@ -1269,6 +1308,7 @@ jobs:
         wait-for-stage-a-amd,
         stage-a-test-1-gpu-small-amd,
         jit-kernel-unit-test-amd,
+        jit-kernel-benchmark-test-amd,
         wait-for-stage-b-amd,
         stage-b-test-1-gpu-small-amd,
         stage-b-test-1-gpu-small-amd-nondeterministic,
