@@ -115,6 +115,35 @@ class KVCacheConfigurator:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def _apply_token_constraints(self, token_capacity: int) -> int:
+        """Apply external constraints to token capacity: user cap, PP sync.
+
+        Page alignment is handled by the configurator, not here.
+        If constraints change the value, the configurator re-runs and re-aligns.
+        """
+        user_limit = self.server_args.max_total_tokens
+
+        # Apply user-specified upper bound
+        if user_limit is not None:
+            if user_limit > token_capacity:
+                logging.warning(
+                    f"max_total_tokens={user_limit} is larger than the profiled value "
+                    f"{token_capacity}. Use the profiled value instead."
+                )
+            token_capacity = min(token_capacity, user_limit)
+
+        # Sync across PP ranks (each may have different layer counts)
+        if self.server_args.pp_size > 1:
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        return token_capacity
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
