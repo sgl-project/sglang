@@ -215,6 +215,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.scheduler_gc_manager import SchedulerGCManager
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -248,6 +249,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
+    configure_gc_warning,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -1105,6 +1107,12 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+
+        # Keep stop-the-world GC pauses away from the batch critical path
+        # (a gen-2 pause in one TP rank stalls every rank).
+        self.gc_manager = SchedulerGCManager()
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -3602,6 +3610,9 @@ class Scheduler(
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
 
+        # reclaim cyclic garbage while a pause cannot stall in-flight batches
+        self.gc_manager.on_idle()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
@@ -4397,6 +4408,11 @@ def run_scheduler_process(
         dp_rank,
     )
     parent_process = psutil.Process().parent()
+
+    if server_args.gc_threshold:
+        import gc
+
+        gc.set_threshold(*server_args.gc_threshold)
 
     # Set up tracing
     if server_args.enable_trace:

@@ -1030,6 +1030,10 @@ class ServerArgs:
         Optional[List[int]],
         "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
     ] = None
+    gc_freeze_on_idle: A[
+        bool,
+        "Broadcast gc.freeze() to the tokenizer manager, scheduler, and detokenizer after sustained idle periods. Serving accumulates millions of live long-lived objects in GC generation 2 in each process; full collections over them cost hundreds of milliseconds each and can fire during serving. Freezing at idle moments moves that population out of GC scan scope.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # HTTP server

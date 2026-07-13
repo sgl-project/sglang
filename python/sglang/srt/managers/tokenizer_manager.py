@@ -53,6 +53,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.idle_gc import IdleGCFreezeGate
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -115,6 +116,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    configure_gc_logger,
     configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
@@ -311,6 +313,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+        self.maybe_init_idle_gc()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -543,6 +546,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 encode_urls=self.encoder_urls,
             )
 
+    def maybe_init_idle_gc(self) -> None:
+        if self.server_args.gc_freeze_on_idle:
+            self.idle_gc_gate = IdleGCFreezeGate()
+        else:
+            self.idle_gc_gate = None
+
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
@@ -578,6 +587,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+        if envs.SGLANG_LOG_GC.get():
+            configure_gc_logger()
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=self.server_args.soft_watchdog_timeout,
@@ -1823,6 +1834,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         freeze_gc("Tokenizer Manager")
         return None
 
+    async def idle_gc_freeze_watcher(self):
+        """Broadcast gc.freeze() after sustained idle (see IdleGCFreezeGate)."""
+        while True:
+            await asyncio.sleep(2.0)
+            now = time.monotonic()
+            if self.idle_gc_gate.note(busy=bool(self.rid_to_state), now=now):
+                await self.freeze_gc()
+                self.idle_gc_gate.mark_frozen(now)
+
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
@@ -1861,6 +1881,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        if envs.SGLANG_LOG_TOKENIZER_LOOP_LAG_SECS.get() > 0:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.watch_loop_lag))
+            )
+
+        if self.idle_gc_gate is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.idle_gc_freeze_watcher))
+            )
+
+    async def watch_loop_lag(self):
+        """Log when this process's event loop is starved.
+
+        A wakeup later than SGLANG_LOG_TOKENIZER_LOOP_LAG_SECS means the loop
+        was blocked that long by synchronous work (e.g. tokenization,
+        chat-template rendering) or a stop-the-world GC pause; while blocked,
+        finished responses from the detokenizer cannot be dispatched.
+        """
+        threshold = envs.SGLANG_LOG_TOKENIZER_LOOP_LAG_SECS.get()
+        interval = 1.0
+        while True:
+            start = time.monotonic()
+            await asyncio.sleep(interval)
+            lag = time.monotonic() - start - interval
+            if lag > threshold:
+                logger.warning(
+                    f"TokenizerManager event loop wakeup was {lag:.2f}s late "
+                    f"(threshold {threshold:.2f}s). The loop was blocked by "
+                    f"synchronous work or a GC pause; output dispatch was "
+                    f"stalled for at least this long."
+                )
 
     async def handle_loop(self):
         """The event loop that handles requests"""

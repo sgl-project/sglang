@@ -40,7 +40,13 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils import (
+    configure_gc_logger,
+    configure_gc_warning,
+    configure_logger,
+    freeze_gc,
+    kill_itself_when_parent_died,
+)
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -144,6 +150,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
+
+        if envs.SGLANG_LOG_GC.get():
+            configure_gc_logger()
+        if server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(server_args.gc_warning_threshold_secs)
 
         if server_args.enable_metrics:
             start_cpu_monitor_thread("detokenizer")
@@ -492,6 +503,11 @@ def run_detokenizer_process(
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+
+    if server_args.gc_threshold:
+        import gc
+
+        gc.set_threshold(*server_args.gc_threshold)
 
     manager = None
     try:

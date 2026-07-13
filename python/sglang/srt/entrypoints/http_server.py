@@ -2174,6 +2174,32 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _freeze_gc_after_warmup(server_args: ServerArgs):
+    """Broadcast gc.freeze() to all server processes via /freeze_gc.
+
+    Called once right after warmup, so the long-lived startup heap (imports,
+    weights metadata, CUDA graph bookkeeping) is moved out of gen2 GC scan
+    scope before real traffic arrives. Requests in flight at freeze time would
+    be frozen too and never reclaimed, hence warmup time only.
+    """
+    headers = {}
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            timeout=120,
+            headers=headers,
+            verify=server_args.ssl_verify(),
+        )
+        assert res.status_code == 200, f"{res=}, {res.text=}"
+        logger.info("Froze GC in all server processes after warmup.")
+    except Exception:
+        logger.error(
+            f"freeze_gc after warmup failed (non-fatal): {get_exception_traceback()}"
+        )
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2188,6 +2214,9 @@ def _wait_and_warmup(
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+    if envs.SGLANG_GC_FREEZE_AFTER_WARMUP.get():
+        _freeze_gc_after_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
