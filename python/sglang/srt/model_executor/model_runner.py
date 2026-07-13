@@ -1119,7 +1119,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_cuda_arch()
 
-        self.load_config = self.build_load_config()
+        self.load_config = ModelRunner.build_load_config(
+            server_args=self.server_args,
+            tp_rank=self.tp_rank,
+            remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
+            remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
+            draft_model_idx=self.draft_model_idx,
+        )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
@@ -1129,7 +1135,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args, tp_rank=self.tp_rank
         )
 
-        self.load_model_with_memory_saver()
+        loaded = ModelRunner.load_model_with_memory_saver(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            load_config=self.load_config,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            memory_saver_adapter=self.memory_saver_adapter,
+            is_draft_worker=self.is_draft_worker,
+        )
+        self.loader = loaded.loader
+        self.model = loaded.model
+        if loaded.remote_instance_weight_info is not None:
+            self.remote_instance_weight_transporter.weight_info = (
+                loaded.remote_instance_weight_info
+            )
 
         if not self.is_draft_worker:
             get_offloader().post_init()
@@ -1191,7 +1211,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        self.dist_barrier_after_load()
+        ModelRunner.dist_barrier_after_load(
+            elastic_ep_backend=self.server_args.elastic_ep_backend,
+            tp_rank=self.tp_rank,
+        )
 
     def _prepare_moe_topk(self):
         balancer_cls = None
@@ -1268,68 +1291,94 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_global_lplb_solver(lid, solver)
         logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
-    def build_load_config(self) -> LoadConfig:
-        # Prepare the model config
+    @staticmethod
+    def build_load_config(
+        *,
+        server_args: ServerArgs,
+        tp_rank: int,
+        remote_instance_weight_transporter_engine: Any,
+        remote_instance_weight_transporter_session_id: str,
+        draft_model_idx: Optional[int],
+    ) -> LoadConfig:
         from sglang.srt.configs.modelopt_config import ModelOptConfig
 
         modelopt_config = ModelOptConfig(
-            quant=self.server_args.modelopt_quant,
-            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
-            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
-            export_path=self.server_args.modelopt_export_path,
-            quantize_and_serve=self.server_args.quantize_and_serve,
+            quant=server_args.modelopt_quant,
+            checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
+            checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
+            export_path=server_args.modelopt_export_path,
+            quantize_and_serve=server_args.quantize_and_serve,
         )
 
         return LoadConfig(
-            load_format=self.server_args.load_format,
-            download_dir=self.server_args.download_dir,
-            model_loader_extra_config=self.server_args.model_loader_extra_config,
-            tp_rank=self.tp_rank,
-            remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
-            remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
-            remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
-            remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
-            remote_instance_weight_loader_transfer_engine=self.remote_instance_weight_transporter.engine,
-            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_weight_transporter.session_id,
-            modelexpress_url=self.server_args.modelexpress_url,
-            modelexpress_transport=self.server_args.modelexpress_transport,
+            load_format=server_args.load_format,
+            download_dir=server_args.download_dir,
+            model_loader_extra_config=server_args.model_loader_extra_config,
+            tp_rank=tp_rank,
+            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+            remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
+            remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
+            remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
+            modelexpress_url=server_args.modelexpress_url,
+            modelexpress_transport=server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
-            rl_quant_profile=self.server_args.rl_quant_profile,
-            draft_model_idx=self.draft_model_idx,
+            rl_quant_profile=server_args.rl_quant_profile,
+            draft_model_idx=draft_model_idx,
         )
 
-    def load_model_with_memory_saver(self) -> None:
-        # Load the model
+    @staticmethod
+    def load_model_with_memory_saver(
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        load_config: LoadConfig,
+        device: str,
+        gpu_id: int,
+        memory_saver_adapter: Any,
+        is_draft_worker: bool,
+    ) -> LoadedModel:
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
-        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
-            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
+        enable_cpu_backup = server_args.enable_weights_cpu_backup or (
+            is_draft_worker and server_args.enable_draft_weights_cpu_backup
         )
-        with self.memory_saver_adapter.region(
+        remote_instance_weight_info = None
+        with memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
+            loader = get_model_loader(
+                load_config=load_config,
+                model_config=model_config,
             )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
+            model = loader.load_model(
+                model_config=model_config,
+                device_config=DeviceConfig(device, gpu_id),
             )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_weight_transporter.weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
+            if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
+                remote_instance_weight_info = (
+                    loader.remote_instance_transfer_engine_weight_info
                 )
-        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # Cache needs to be cleared after loading model weights (in the loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-    def dist_barrier_after_load(self) -> None:
-        if self.server_args.elastic_ep_backend == "mooncake":
+        return LoadedModel(
+            loader=loader,
+            model=model,
+            remote_instance_weight_info=remote_instance_weight_info,
+        )
+
+    @staticmethod
+    def dist_barrier_after_load(
+        *, elastic_ep_backend: Optional[str], tp_rank: int
+    ) -> None:
+        if elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
         else:
@@ -1344,7 +1393,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             except RuntimeError:
                 raise ValueError(
-                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                    f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
 
     def maybe_recover_ep_ranks(self):
