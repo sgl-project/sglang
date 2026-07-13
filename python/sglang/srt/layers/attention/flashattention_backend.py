@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.utils import get_compiler_backend
 
@@ -216,6 +217,8 @@ class FlashAttentionBackend(AttentionBackend):
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 
+    supports_ragged_verify_graph: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -253,11 +256,12 @@ class FlashAttentionBackend(AttentionBackend):
         self.max_num_pages = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
-        # Opt out of the seq_lens_cpu D2H only for dflash (the worker adapted to
-        # the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the CPU mirror.
+        # Opt out of the seq_lens_cpu D2H only for dflash/dspark (their workers
+        # adapted to the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the
+        # CPU mirror.
         self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
-        ).is_dflash()
+        ).is_dflash_family()
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
@@ -272,6 +276,15 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and model_runner.is_draft_worker
+        ):
+            self.speculative_num_draft_tokens = SpeculativeAlgorithm.from_string(
+                model_runner.server_args.speculative_algorithm
+            ).get_num_tokens_per_req_for_target_verify(
+                int(self.speculative_num_draft_tokens), is_draft_worker=True
+            )
         self.speculative_step_id = speculative_step_id
 
         # Local attention settings
@@ -500,7 +513,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it to
                 # max(num_accept_tokens_cpu) which is None/empty at capture time,
                 # falling back to 1. Restore the correct upper bound so the kernel
-                # sees num_tokens_per_bs (not 1) for all replays of this graph.
+                # sees num_tokens_per_req (not 1) for all replays of this graph.
                 self.forward_metadata.max_seq_len_q = num_tokens // bs
         else:
             self._apply_cuda_graph_metadata(
@@ -714,26 +727,47 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
-                ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                ragged_layout = getattr(
+                    forward_batch.spec_info, "ragged_verify_layout", None
                 )
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
+                if ragged_layout is not None:
+                    geometry = build_ragged_target_verify_geometry(
+                        seq_lens=forward_batch.seq_lens, layout=ragged_layout
+                    )
+                    metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
+                    # Device-only layouts carry no host lens; the verify
+                    # window is a valid varlen upper bound.
+                    metadata.max_seq_len_q = (
+                        geometry.max_seq_len_q
+                        if geometry.max_seq_len_q is not None
+                        else self.speculative_num_draft_tokens
+                    )
+                    metadata.max_seq_len_k = int(
+                        metadata.cache_seqlens_int32.max().item()
+                    )
+                    metadata.cu_seqlens_q = geometry.cu_seqlens_q
+                    metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                else:
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    ).to(torch.int32)
+                    metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                    metadata.max_seq_len_k = (
+                        seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * self.speculative_num_draft_tokens + 1,
+                        self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
@@ -2319,11 +2353,11 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = num_tokens // bs
+            num_tokens_per_req = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.max_seq_len_q = num_tokens_per_req
             metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][: bs + 1]
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
@@ -2563,9 +2597,18 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
-                )
+                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                if ragged_layout is not None:
+                    padded = ragged_layout.padded_to_bucket(padded_bs=bs)
+                    geometry = build_ragged_target_verify_geometry(
+                        seq_lens=seq_lens, layout=padded
+                    )
+                    metadata.cache_seqlens_int32.copy_(geometry.cache_seqlens_int32)
+                    metadata.cu_seqlens_q.copy_(geometry.cu_seqlens_q)
+                else:
+                    metadata.cache_seqlens_int32.copy_(
+                        (seq_lens + self.speculative_num_draft_tokens)
+                    )
 
                 # Page table built on-device (self-guards on cache_seqlens);
                 # max_seq_len_k left unset -- unread here (scheduler_metadata is

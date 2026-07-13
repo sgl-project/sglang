@@ -45,6 +45,7 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
+            default_chat_template_kwargs=None,
         )
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -282,6 +283,54 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, _ = self.chat._convert_to_internal_request(req)
 
         self.assertFalse(adapted.require_reasoning)
+
+    def test_default_chat_template_kwargs_applied_when_request_unset(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], False)
+
+    def test_default_chat_template_kwargs_overridden_per_request(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], True)
+
+    def test_default_chat_template_kwargs_mirrors_reasoning_effort(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "high"}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "high")
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None

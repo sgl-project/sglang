@@ -539,11 +539,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and str(device) == "cpu":
-        return False
-    return True
+    return current_platform.is_pin_memory_available(device)
 
 
 def get_dispatch_device_backend():
@@ -4010,6 +4006,21 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+@lru_cache(maxsize=1)
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    gfx942 (CDNA3) has no hardware MX-scaled matmul: ``tl.dot_scaled`` fails to
+    lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+    checkpoints there are converted to block-fp8 [128,128] at load and run
+    through the native block-fp8 kernels. gfx95 keeps its native MX path (this
+    returns False there).
+    """
+    if not torch.version.hip:
+        return False
+    return is_gfx942_supported() and not is_gfx95_supported()
 
 
 # LoRA-related constants and utilities

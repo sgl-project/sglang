@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
+"""Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
 from typing import NamedTuple, Optional, Tuple
 
@@ -29,7 +29,7 @@ _LOCAL_PREF_DENOM = 10
 
 
 class WaterfillDispatchPlan(NamedTuple):
-    """Inputs needed by the fused DeepEP Waterfill expansion path."""
+    """Inputs needed by the fused Waterfill expansion path."""
 
     # Effective rank load consumed by the fused kernel.
     rank_load: Tensor
@@ -275,10 +275,10 @@ def materialize_waterfill_dispatch_fused(
     allow_all_ranks: bool = False,
     target_total: int = 0,
 ) -> Tuple[Tensor, Tensor]:
-    """Run fused Waterfill rank selection and DeepEP TopK expansion.
+    """Run fused Waterfill rank selection and TopK expansion.
 
     The Triton kernel intentionally selects each token's shared-expert rank and
-    writes the expanded DeepEP TopK layout in one pass.
+    writes the expanded TopK layout in one pass.
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -358,7 +358,7 @@ def expand_topk_with_shared_expert(
     return expanded_topk_ids, expanded_topk_weights
 
 
-class DeepEPWaterfillBalancer:
+class WaterfillBalancer:
     """Waterfill load balancer: shared expert fused as real routed expert (topk 8→9)."""
 
     MIN_BATCH_FOR_BALANCE = 64
@@ -484,7 +484,7 @@ class DeepEPWaterfillBalancer:
             return self._build_static_dispatch_plan(local_routed_counts)
 
         global_routed_counts, local_tokens_per_rank = (
-            DeepEPWaterfillBalancer._all_reduce_dynamic_rank_load(
+            WaterfillBalancer._all_reduce_dynamic_rank_load(
                 local_routed_counts, num_tokens
             )
         )
