@@ -700,6 +700,17 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            if batch.forward_mode.is_prebuilt() and getattr(
+                req, "dsv4_decode_radix_cache_prompt_once", False
+            ):
+                # process_prebuilt() runs before the prebuilt forward and the
+                # batch still references the request-owned prompt pages via
+                # out_cache_loc. Insert only after forward completes so overlap
+                # insertion can safely free duplicate prompt KV.
+                req.dsv4_decode_radix_cache_prompt_once = False
+                req.allow_radix_cache_insert_once = True
+                maybe_cache_unfinished_req(req, self.tree_cache)
+
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
