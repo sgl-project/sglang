@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
     gather_dequant_requant_fp8_paged,
 )
@@ -501,6 +502,11 @@ class DeepseekSparseAttnBackend(
         )
         # Persistent (grow-only) kernel-output buffers (out/max_logits/lse).
         self._q8kv8_out_bufs: Optional[tuple] = None
+        # Fused non-prefix KV prep (cast-concat k/k_rope directly into the
+        # fp8 buffer; SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION).
+        self._q8kv8_kv_cat_fusion: bool = (
+            envs.SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION.get()
+        )
 
         # Born-fp8 q handshake (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): when the
         # model's q-prep decides (via q8kv8_born_fp8_q_eligible) that this
@@ -2077,6 +2083,23 @@ class DeepseekSparseAttnBackend(
                             v_head_dim=layer.v_head_dim,
                             layer_id=layer.layer_id,
                         )
+                    if self._q8kv8_kv_cat_fusion:
+                        # Fused path: no bf16 concat materialization — k and
+                        # k_rope are cast-concatenated straight into the fp8
+                        # buffer inside the helper.
+                        return self._forward_flashmla_sparse_q8kv8(
+                            q_nope=q_nope,
+                            q_rope=q_rope,
+                            kv_bf16=None,
+                            kv_k=k,
+                            kv_k_rope=k_rope,
+                            paged_kv_cache=None,
+                            page_table_1_flattened=None,
+                            page_table_1=page_table_1,
+                            sm_scale=layer.scaling,
+                            v_head_dim=layer.v_head_dim,
+                            layer_id=layer.layer_id,
+                        )
                     kv_cache = _cat([k, k_rope], dim=-1)
                     return self._forward_flashmla_sparse_q8kv8(
                         q_nope=q_nope,
@@ -2500,6 +2523,8 @@ class DeepseekSparseAttnBackend(
         paged_kv_cache: Optional[torch.Tensor] = None,
         page_table_1_flattened: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
+        kv_k: Optional[torch.Tensor] = None,
+        kv_k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Native FP8 (q8 x kv8) sparse-prefill attention (SM90 JIT kernel).
 
@@ -2618,11 +2643,12 @@ class DeepseekSparseAttnBackend(
         # left real KV data there.  The gather kernel fuses the pad-row
         # zeroing; the bf16 path zeroes the tail explicitly.
         topk = page_table_1.shape[-1]
-        num_kv_tokens = (
-            page_table_1_flattened.shape[0]
-            if paged_kv_cache is not None
-            else kv_bf16.shape[0]
-        )
+        if paged_kv_cache is not None:
+            num_kv_tokens = page_table_1_flattened.shape[0]
+        elif kv_k is not None:
+            num_kv_tokens = kv_k.shape[0]
+        else:
+            num_kv_tokens = kv_bf16.shape[0]
         total_kv_rows = num_kv_tokens + topk
         kv_buf = self._q8kv8_kv_buf
         if kv_buf is None or kv_buf.shape[0] < total_kv_rows:
@@ -2638,6 +2664,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1_flattened,
                 extra_rows=topk,
                 out=kv_buf[:total_kv_rows],
+            ).view(-1, 1, head_dim)
+        elif kv_k is not None:
+            # Fused non-prefix KV prep (SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION):
+            # cast-concat k/k_rope straight into the fp8 buffer + zero the pad
+            # band in ONE kernel — the bf16 _cat materialization, the copy_
+            # cast and the zero_ tail all disappear.  Same store-cast as the
+            # gather kernel (bit-identical bytes).
+            kv_padded = concat_cast_kv_fp8_pad(
+                kv_buf[:total_kv_rows], kv_k, kv_k_rope, num_kv_tokens
             ).view(-1, 1, head_dim)
         else:
             kv_padded = kv_buf[:total_kv_rows]
