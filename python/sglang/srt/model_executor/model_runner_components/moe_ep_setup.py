@@ -35,9 +35,7 @@ def prepare_moe_topk(
                 model_config.hf_config, "n_routed_experts", None
             )
             if num_routed_experts is None:
-                raise ValueError(
-                    "Waterfill requires model config n_routed_experts."
-                )
+                raise ValueError("Waterfill requires model config n_routed_experts.")
         if balancer_cls is None:
             from sglang.srt.layers.moe.waterfill import WaterfillBalancer
 
@@ -63,6 +61,4 @@ def prepare_moe_topk(
         )
         num_prepared += 1
     if num_prepared:
-        log_info_on_rank0(
-            logger, f"Prepared {num_prepared} Waterfill TopK modules."
-        )
+        log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
