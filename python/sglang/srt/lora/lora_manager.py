@@ -398,8 +398,8 @@ class LoRAManager:
         # Extend batches eligible for the prefill CUDA graph update the static
         # prefill batch info in place instead of allocating fresh metadata, so
         # kernels captured in the prefill graph read current values at replay.
-        use_prefill_cuda_graph = (
-            not use_cuda_graph and self.can_use_prefill_cuda_graph(forward_batch)
+        use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
+            forward_batch
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)

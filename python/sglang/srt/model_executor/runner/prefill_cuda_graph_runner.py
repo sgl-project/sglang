@@ -647,9 +647,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # init_new sets lora_ids to a list of Nones even without LoRA.
         if self.model_runner.server_args.enable_lora and not (
             self._capture_lora
-            and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
-                forward_batch
-            )
+            and self.model_runner.lora_manager.can_use_prefill_cuda_graph(forward_batch)
         ):
             return False
         if forward_batch.input_embeds is not None:

@@ -296,9 +296,7 @@ class TritonLoRABackend(BaseLoRABackend):
                 forward_batch.extend_seq_lens, non_blocking=True
             )
             batch_info.seg_lens[bs:].zero_()
-            torch.cumsum(
-                batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:]
-            )
+            torch.cumsum(batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:])
         else:
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.
