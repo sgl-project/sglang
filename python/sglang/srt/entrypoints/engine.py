@@ -166,7 +166,7 @@ def init_tokenizer_manager(
         if getattr(server_args, attr) != "auto":
             continue
         if suggested is not None:
-            setattr(server_args, attr, suggested)
+            server_args.override(source="template-detection", **{attr: suggested})
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
@@ -175,7 +175,7 @@ def init_tokenizer_manager(
                 f"--{attr.replace('_', '-')}=auto specified but could not detect "
                 f"{label} from chat template. Disabling {label}."
             )
-            setattr(server_args, attr, None)
+            server_args.override(source="template-detection", **{attr: None})
 
     return tokenizer_manager, template_manager
 
@@ -1303,7 +1303,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.12",
+                "0.6.14",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

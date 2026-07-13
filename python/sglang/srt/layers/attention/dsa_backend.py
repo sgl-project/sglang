@@ -136,9 +136,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
-# Reuse this workspace buffer across all DSA backend instances
-
-
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -1375,7 +1372,7 @@ class DeepseekSparseAttnBackend(
             max_len = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
 
@@ -1417,7 +1414,7 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
 
@@ -1515,7 +1512,7 @@ class DeepseekSparseAttnBackend(
             )
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
 

@@ -62,8 +62,9 @@ def query_granularity(device_id: int) -> int:
 # committed watermark) so upper-bound tensors can be allocated before physical
 # commit. Allocations are granularity-aligned so each pointer can be committed at
 # its own VA range (cuMemMap requires it; GB300 rejects partial-handle maps).
-# Symbols are SUFFIXED per arena instance and each instance loads its own .so, so
-# multiple arenas per process (hybrid-SWA: full + swa) don't clobber each other.
+# Symbols are SUFFIXED per (process, arena instance) and each instance loads its
+# own .so, so neither multiple arenas per process (hybrid-SWA: full + swa) nor
+# co-located engine processes sharing the tempdir clobber each other.
 def _stub_source(sfx: str) -> str:
     return f"""
 #include <cstddef>
@@ -104,7 +105,10 @@ class KvVmmArena:
 
     def __init__(self, device_id: int, reserve_bytes: int = _DEFAULT_RESERVE_BYTES):
         self.device_id = int(device_id)
-        self._sfx = str(KvVmmArena._instance_count)
+        # Unique per (process, arena instance): the stub .so lives in a host-shared
+        # tempdir, so co-located engine processes must not build the same-named .so
+        # (they race and one loads a half-relinked copy -> undefined symbol crash).
+        self._sfx = f"{os.getpid()}_{KvVmmArena._instance_count}"
         KvVmmArena._instance_count += 1
         drv = _driver()
         with torch.cuda.device(self.device_id):
@@ -159,7 +163,12 @@ class KvVmmArena:
         return align_up(v, self.granularity)
 
     def _build_stub(self) -> ctypes.CDLL:
-        out_dir = os.path.join(tempfile.gettempdir(), "sgl_kv_vmm_arena")
+        # Per-arena build dir: load_inline writes every caller's source to the same
+        # main.cpp inside build_directory, so any sharing (across co-located engine
+        # processes under the host tempdir, or across arenas within one process)
+        # can compile another arena's source and link a .so missing this arena's
+        # symbols. One dir per stub means no shared ninja scratch or .so, ever.
+        out_dir = os.path.join(tempfile.gettempdir(), "sgl_kv_vmm_arena", self._sfx)
         os.makedirs(out_dir, exist_ok=True)
         libname = f"sgl_kv_vmm_arena_stub_{self._sfx}"
         torch.utils.cpp_extension.load_inline(
