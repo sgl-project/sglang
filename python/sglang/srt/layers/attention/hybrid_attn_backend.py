@@ -63,6 +63,20 @@ class HybridAttnBackend(AttentionBackend):
         else:
             return self.prefill_backend
 
+    @property
+    def supports_full_cuda_graph_chunked_prefix(self) -> bool:
+        return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        self.prefill_backend.prepare_full_cuda_graph_chunked_prefix(
+            forward_batch, in_capture=in_capture
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
