@@ -131,18 +131,18 @@ class DecodeReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        pre_alloc_size: int,
+        pre_alloc_size: Optional[int],
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self.size = size
+        self.pre_alloc_size = pre_alloc_size if pre_alloc_size is not None else 0
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
-        self._alloc_size = size + pre_alloc_size + 1
+        self._alloc_size = size + self.pre_alloc_size + 1
         self.max_context_len = max_context_len
         self.device = device
-        self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len),
@@ -208,7 +208,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_layer_ids: List[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
-        pre_alloc_size: int,
+        pre_alloc_size: Optional[int],
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
@@ -226,12 +226,13 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        _pre_alloc = pre_alloc_size if pre_alloc_size is not None else 0
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
         slots_per_req = 1 + (
             self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
         )
-        max_slots_needed = (size + pre_alloc_size) * slots_per_req
+        max_slots_needed = (size + _pre_alloc) * slots_per_req
         if mamba_size is not None:
             effective_mamba_size = max(mamba_size, max_slots_needed)
             if mamba_size < max_slots_needed:
@@ -240,7 +241,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
                     "raising effective_mamba_size to %d",
                     mamba_size,
                     max_slots_needed,
-                    size + pre_alloc_size,
+                    size + _pre_alloc,
                     slots_per_req,
                     effective_mamba_size,
                 )
@@ -250,7 +251,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.layer_transfer_counter = None
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=size + _pre_alloc,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
