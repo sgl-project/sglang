@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -972,12 +973,12 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 4)
 
 
-class TestDeepEPWaterfillArgs(CustomTestCase):
+class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -994,7 +995,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="none",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
@@ -1005,11 +1006,27 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
+    def test_waterfill_keeps_megamoe_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="megamoe",
+            enable_waterfill=True,
+            disable_shared_experts_fusion=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
             deepep_mode="low_latency",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -1294,6 +1311,48 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestHandleCrashDumpEnv(CustomTestCase):
+    _COREDUMP_ENV_KEYS = (
+        "CUDA_ENABLE_COREDUMP_ON_EXCEPTION",
+        "CUDA_ENABLE_USER_TRIGGERED_COREDUMP",
+        "CUDA_COREDUMP_SHOW_PROGRESS",
+        "CUDA_COREDUMP_GENERATION_FLAGS",
+        "CUDA_COREDUMP_FILE",
+        "CUDA_COREDUMP_PIPE",
+    )
+
+    def _run_handler(self, crash_dump_folder, preset_env=None):
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.crash_dump_folder = crash_dump_folder
+        with patch.dict(os.environ, preset_env or {}):
+            for key in self._COREDUMP_ENV_KEYS:
+                if key not in (preset_env or {}):
+                    os.environ.pop(key, None)
+            ServerArgs._handle_crash_dump_env(server_args)
+
+    def test_creates_coredump_dir_when_auto_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_handler(tmp)
+            self.assertTrue(
+                os.path.isdir(os.path.join(tmp, socket.gethostname())),
+                "coredump dir not created for auto-set CUDA_COREDUMP_FILE",
+            )
+
+    def test_creates_coredump_dir_when_env_preset(self):
+        # Regression test: when CUDA_COREDUMP_FILE is preset, the coredump
+        # directory must still be created up front.
+        with tempfile.TemporaryDirectory() as tmp:
+            preset_dir = os.path.join(tmp, "preset-location")
+            self._run_handler(
+                tmp,
+                preset_env={"CUDA_COREDUMP_FILE": f"{preset_dir}/%h/core.cuda.%t.%p"},
+            )
+            self.assertTrue(
+                os.path.isdir(os.path.join(preset_dir, socket.gethostname())),
+                "coredump dir not created for preset CUDA_COREDUMP_FILE",
+            )
+
+
 class TestGrpcServerArgs(CustomTestCase):
     """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
     alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
@@ -1409,7 +1468,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestDeepEPWaterfillArgs)."""
+    directly (same pattern as TestWaterfillArgs)."""
 
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")

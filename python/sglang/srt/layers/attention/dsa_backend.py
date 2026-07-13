@@ -102,8 +102,8 @@ def _all_gather_dsa_trtllm_fp8_kv(
 _is_hip = is_hip()
 
 if _is_hip:
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
     try:
         from aiter import (  # noqa: F401
@@ -134,9 +134,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
-
-
-# Reuse this workspace buffer across all DSA backend instances
 
 
 @dataclass(frozen=True)
@@ -1375,7 +1372,7 @@ class DeepseekSparseAttnBackend(
             max_len = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
 
@@ -1417,7 +1414,7 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
 
@@ -1515,7 +1512,7 @@ class DeepseekSparseAttnBackend(
             )
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
 
