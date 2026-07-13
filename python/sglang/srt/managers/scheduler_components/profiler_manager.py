@@ -188,7 +188,6 @@ class SchedulerProfilerManager:
 
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
 
         if current_platform.is_out_of_tree():
@@ -200,7 +199,12 @@ class SchedulerProfilerManager:
                     current_platform.get_torch_profiler_activity()
                 )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
+            # Intel XPU build: "GPU" and "XPU" both map to the XPU activity.
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
+            activity_map["GPU"] = torch.profiler.ProfilerActivity.XPU
+        elif hasattr(torch.profiler.ProfilerActivity, "CUDA"):
+            # CUDA activity covers both NVIDIA and AMD (ROCm) builds.
+            activity_map["GPU"] = torch.profiler.ProfilerActivity.CUDA
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
@@ -495,7 +499,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_prefix,
                     recv_req.detailed_annotations,
                     recv_req.profile_stages,
-                    recv_req.record_execution_trace,
+                    record_execution_trace=recv_req.record_execution_trace,
                 )
             else:
                 self._init_profile(
