@@ -43,6 +43,29 @@ class TestDsparkSpeculatorsConventionDetection(CustomTestCase):
         )
         self.assertTrue(config.speculators_convention)
 
+    def test_speculators_dspark_checkpoint_flagged_case_insensitive(self):
+        # Checkpoint config values are author-controlled strings, not a
+        # validated enum -- a future speculators release or a different
+        # checkpoint author could write "DSpark"/"Dspark" instead of the
+        # lowercase "dspark" seen in every checkpoint verified so far.
+        for variant in ("DSpark", "DSPARK", "Dspark"):
+            with self.subTest(variant=variant):
+                config = parse_dspark_draft_config(
+                    draft_hf_config=_base_dspark_hf_config(
+                        speculators_model_type=variant
+                    )
+                )
+                self.assertTrue(config.speculators_convention)
+
+    def test_non_string_speculators_model_type_not_flagged(self):
+        # Malformed config where the field is present but not a string (e.g.
+        # accidentally set to a number or a dict) -- must not crash on
+        # .lower() and must not be treated as a match.
+        config = parse_dspark_draft_config(
+            draft_hf_config=_base_dspark_hf_config(speculators_model_type=123)
+        )
+        self.assertFalse(config.speculators_convention)
+
 
 if __name__ == "__main__":
     unittest.main()
