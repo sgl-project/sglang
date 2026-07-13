@@ -435,30 +435,9 @@ class KVCacheConfigurator:
                         max_total_num_tokens=max_total_num_tokens,
                     )
                 else:
-                    pool_cls = (
-                        NoOpMHATokenToKVPool
-                        if self.server_args.prefill_only_disable_kv_cache
-                        else mha_pool_class
-                    )
-                    token_to_kv_pool = pool_cls(
-                        max_total_num_tokens,
-                        page_size=self.server_args.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_parallel().attn_tp_size
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
-                        post_capture_active=self.post_capture_kv_active,
+                    token_to_kv_pool = self._build_mha_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
+                        mha_pool_class=mha_pool_class,
                     )
 
         # Initialize token_to_kv_pool_allocator
@@ -1345,6 +1324,32 @@ class KVCacheConfigurator:
             end_layer=self.end_layer,
             enable_alt_stream=not self.server_args.enable_pdmux,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+        )
+        return token_to_kv_pool
+
+    def _build_mha_kv_pool(
+        self, *, max_total_num_tokens: int, mha_pool_class: type
+    ) -> KVCache:
+        pool_cls = (
+            NoOpMHATokenToKVPool
+            if self.server_args.prefill_only_disable_kv_cache
+            else mha_pool_class
+        )
+        token_to_kv_pool = pool_cls(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            post_capture_active=self.post_capture_kv_active,
         )
         return token_to_kv_pool
 
