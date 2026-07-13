@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -414,29 +415,13 @@ class GlmImageAttention(torch.nn.Module):
         self.num_local_heads = self.heads // tp_size
         self.num_local_kv_heads = self.num_local_heads
 
-        self.to_q = ColumnParallelLinear(
+        self.to_qkv = MergedColumnParallelLinear(
             query_dim,
-            self.inner_dim,
+            [self.inner_dim, self.inner_kv_dim, self.inner_kv_dim],
             bias=bias,
             gather_output=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.to_q" if prefix else "to_q",
-        )
-        self.to_k = ColumnParallelLinear(
-            query_dim,
-            self.inner_kv_dim,
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.to_k" if prefix else "to_k",
-        )
-        self.to_v = ColumnParallelLinear(
-            query_dim,
-            self.inner_kv_dim,
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.to_v" if prefix else "to_v",
+            prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
         )
 
         # (dropout omitted)
@@ -493,9 +478,8 @@ class GlmImageAttention(torch.nn.Module):
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         # 1. QKV projections
-        query, _ = self.to_q(hidden_states)
-        key, _ = self.to_k(hidden_states)
-        value, _ = self.to_v(hidden_states)
+        qkv, _ = self.to_qkv(hidden_states)
+        query, key, value = [tensor.contiguous() for tensor in qkv.chunk(3, dim=-1)]
 
         query = query.unflatten(2, (self.num_local_heads, -1))
         key = key.unflatten(2, (self.num_local_kv_heads, -1))
@@ -823,6 +807,8 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             The base resolution of input latents. If height/width is not provided during generation, this value is used
             to determine the resolution as `sample_size * vae_scale_factor => 128 * 8 => 1024`
     """
+
+    param_names_mapping = GlmImageDitConfig().arch_config.param_names_mapping
 
     def __init__(
         self,
