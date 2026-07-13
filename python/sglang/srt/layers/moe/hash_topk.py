@@ -96,7 +96,8 @@ class HashTopK(nn.Module):
     def empty_topk_output(
         self, device: torch.device, *, layer_id: Optional[int] = None
     ):
-        topk = self.topk - self.num_fused_shared_experts
+        # self.topk includes any fused shared-expert columns.
+        topk = self.topk
         if layer_id is not None:
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 
@@ -107,18 +108,10 @@ class HashTopK(nn.Module):
                 )
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
-        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        router_logits = torch.empty(
+            (0, self.num_experts), dtype=torch.float32, device=device
+        )
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if has_per_rank_fused_shared_slots(self.num_fused_shared_experts):
-            n = self.num_fused_shared_experts
-            topk_output = topk_output._replace(
-                topk_ids=topk_output.topk_ids.new_empty(
-                    (0, topk_output.topk_ids.shape[-1] + n)
-                ),
-                topk_weights=topk_output.topk_weights.new_empty(
-                    (0, topk_output.topk_weights.shape[-1] + n)
-                ),
-            )
         return self._apply_deepep_waterfill(topk_output, num_tokens=0)
 
     def _apply_deepep_waterfill(
