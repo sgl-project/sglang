@@ -134,7 +134,8 @@ def _topk_ids_logical_to_physical_probability(
     Uses the JIT-compiled CUDA dispatch kernel when the fused cuBLASDx backend
     is available (Hopper+ NVIDIA), otherwise the pure-torch reference — which is
     the production path on ROCm/HIP (e.g. MI355X) where the fused kernel cannot
-    build.
+    build. The ROCm path is fully CUDA-graph-capturable (see the deterministic
+    sampling below).
     """
     if not topk_ids.is_cuda:
         raise RuntimeError(
@@ -148,11 +149,19 @@ def _topk_ids_logical_to_physical_probability(
             topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
         )
 
+    # Deterministic low-discrepancy inverse-CDF instead of torch.rand: RNG is
+    # not capturable inside a CUDA graph, and the physical-replica choice never
+    # affects numerical correctness (all replicas of a logical expert share the
+    # same weights) — it only affects load balance. The golden-ratio sequence
+    # frac(i * phi) is uniform on [0, 1) and lower-discrepancy than uniform
+    # noise, so it spreads tokens across replicas per the LP probabilities at
+    # least as evenly, while staying free of host<->device sync.
     n = topk_ids.numel()
-    random_vals = torch.rand(n, dtype=torch.float32, device=topk_ids.device)
+    idx = torch.arange(n, device=topk_ids.device, dtype=torch.float32)
+    sample_vals = (idx * 0.6180339887498949) % 1.0
     return cuda_solver.dispatch_probability_torch_reference(
         topk_ids,
         log2phy_prob,
         info.partial_logical_to_all_physical_map,
-        random_vals,
+        sample_vals,
     )
