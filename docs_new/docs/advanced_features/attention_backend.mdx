@@ -620,7 +620,7 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
-- HPC-Ops (MHA kernels from [HPC-Ops](https://github.com/Tencent/hpc-ops) by the Tencent Hunyuan AI Infra team; Hopper+, requires `pip` install of the `hpc` package, page size 64, bf16 KV cache, head_dim 128, q/kv head group 4 or 8)
+- HPC-Ops (MHA kernels from [HPC-Ops](https://github.com/Tencent/hpc-ops) by the Tencent Hunyuan AI Infra team; Hopper+, requires installing the `hpc` package from source, page size 64, bf16 KV cache, head_dim 128, q/kv head group 4 or 8)
 ```bash Command
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
