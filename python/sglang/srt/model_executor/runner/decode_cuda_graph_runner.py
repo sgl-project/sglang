@@ -913,6 +913,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                # PP + spec verify: the pre-planned load ran without the proxy
+                # (eagle_prepare_for_verify has no access to it), so the
+                # graph's proxy input buffers must be refreshed here -- the
+                # captured graph reads these rows (mirrors fill_from's
+                # side-slot copy).
+                for k, v in pp_proxy_tensors.tensors.items():
+                    buf = self.buffers.pp_proxy_tensors.get(k)
+                    if buf is not None:  # skip markers like __msg_type__
+                        buf[: v.shape[0]].copy_(v)
+            if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
@@ -1056,7 +1069,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # Slice in token rows, not request rows: under speculative verify
+            # each request carries num_tokens_per_bs tokens (identical for
+            # plain decode, where num_tokens_per_bs == 1).
+            return PPProxyTensors(
+                {
+                    k: v[: self.bs * self.num_tokens_per_bs]
+                    for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

@@ -742,7 +742,10 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # .get(): a proxy entry can be absent (e.g. topk_indices
+                    # when a DSA model runs a dense attention backend);
+                    # returning None skips the copy for that slot.
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 
