@@ -1,25 +1,13 @@
-"""Fused axis-stacked GDN prefill prologue: split + gating + q/k L2 norm in ONE launch.
+"""Axis-stacked GDN prefill prologue over packed QKV and gating inputs.
 
-Fuses the GDN extend prologue chain ``fused_qkv_split_gdn_prefill`` ->
-``fused_gdn_gating`` -> ``l2norm_fwd_qk`` into a single kernel whose 1D grid is
-range-partitioned by program id into four roles (q-norm rows, k-norm rows,
-v-copy, gating). The norm and gating roles share value-only numerical helpers
-with their standalone kernels while retaining layout-specific loads/stores.
-The q/k loads address the packed ``mixed_qkv`` directly, so the raw
-(un-normalized) q/k intermediates never reach global memory.
-
-Numerical discipline (do NOT "clean up" without re-proving the 0-ULP matrix in
-test_gdn_prefill_flashinfer_opts.py):
+Bit-parity invariants, enforced by ``test_gdn_prefill_flashinfer_opts.py``:
 
 1. L2 normalization and GDN gating formulas live in ``fla_math``. The role
    bodies here own only their layout-specific loads, masks, and stores.
-2. The norm role's 0-ULP equality under manual-pointer loads (vs the original
-   block-ptr loads) is a Triton lowering property pinned by CI, not a language
-   contract; a Triton upgrade that breaks it must fail the 0-ULP matrix test.
-3. If the causal conv1d is ever fused in, q/k MUST be rounded to
-   bf16 in-register before the L2 reduction: today the norm reads the conv's
-   already-rounded bf16 output, and norming pre-round fp32 values diverges on
-   ~26% of elements.
+2. Manual-pointer norm loads must remain 0-ULP equal to the standalone
+   block-pointer loads. This is a Triton lowering property, not an API promise.
+3. A future causal-conv fusion must round q/k to bf16 before L2 normalization,
+   matching the current kernel boundary.
 """
 
 from typing import Tuple
