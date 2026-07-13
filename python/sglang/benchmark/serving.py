@@ -109,6 +109,9 @@ class RequestFuncOutput:
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
+    spec_cap_lens_histogram: List[int] = field(default_factory=list)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -136,7 +139,12 @@ def get_request_headers() -> Dict[str, str]:
 
 
 def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
-    return (message.get("reasoning_content") or "") + (message.get("content") or "")
+    # Most OpenAI-compatible servers use ``reasoning_content``. vLLM's Kimi
+    # parser instead streams its reasoning in ``reasoning``. Prefer the
+    # standard field when both are present to avoid counting the same tokens
+    # twice on servers that expose aliases.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    return reasoning + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -477,6 +485,15 @@ async def async_request_openai_chat_completions(
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
+                        )
+                        output.spec_cap_length = (
+                            _meta_info.get("spec_cap_length", 0.0) or 0.0
+                        )
+                        output.spec_block_accept_length = (
+                            _meta_info.get("spec_block_accept_length", 0.0) or 0.0
+                        )
+                        output.spec_cap_lens_histogram = (
+                            _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
@@ -2281,7 +2298,9 @@ def cli_main():
         default="1080p",
         help=(
             "Resolution of images for image dataset. "
-            "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+            "Supports presets 4k/1080p/720p/360p, custom 'heightxwidth' "
+            "(e.g., 1080x1920), or random 'random:<min_h>x<min_w>-<max_h>x<max_w>' "
+            "bounds (e.g., random:256x256-1024x1024)."
         ),
     )
     parser.add_argument(

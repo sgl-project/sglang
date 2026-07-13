@@ -171,6 +171,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.default_chat_template_kwargs = (
+            self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
+        )
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -633,6 +636,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
@@ -1790,6 +1802,13 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.reasoning_parser == "minimax-m3":
+            # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
+            # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
+            return (request.chat_template_kwargs or {}).get(
+                "thinking_mode"
+            ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
