@@ -27,6 +27,7 @@ def run_profile(
     merge_profiles: bool = False,
     profile_prefix: Optional[str] = None,
     start_step: Optional[int] = None,
+    record_execution_trace: bool = False,
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
@@ -57,6 +58,7 @@ def run_profile(
         "profile_by_stage": profile_by_stage,
         "merge_profiles": merge_profiles,
         "profile_prefix": profile_prefix,
+        "record_execution_trace": record_execution_trace,
     }
     if start_step is not None:
         json_data["start_step"] = str(start_step)
@@ -135,6 +137,13 @@ if __name__ == "__main__":
         default=False,
         help="Whether to merge profiles from all ranks into a single trace file",
     )
+    parser.add_argument(
+        "--export-et-trace",
+        action="store_true",
+        default=False,
+        help="Whether to also capture a PyTorch Execution Trace (ET) alongside "
+        "the chrome trace, saved as *.et.json (CUDA/CPU only, not NPU).",
+    )
 
     args = parser.parse_args()
     activities = []
@@ -155,4 +164,5 @@ if __name__ == "__main__":
         profile_by_stage=args.profile_by_stage,
         profile_prefix=args.profile_prefix,
         merge_profiles=args.merge_profiles,
+        record_execution_trace=args.export_et_trace,
     )

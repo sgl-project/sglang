@@ -77,6 +77,9 @@ class SchedulerProfilerManager:
         self.profile_in_progress: bool = False
         self.merge_profiles = False
 
+        self.record_execution_trace: bool = False
+        self._et_observer = None
+
         # For ROCM
         self.rpd_profiler = None
 
@@ -93,6 +96,7 @@ class SchedulerProfilerManager:
         merge_profiles: bool = False,
         profile_prefix: str = "",
         profile_stages: Optional[List[str]] = None,
+        record_execution_trace: bool = False,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.configure(
@@ -129,6 +133,7 @@ class SchedulerProfilerManager:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
+        self.record_execution_trace = record_execution_trace
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
@@ -206,6 +211,31 @@ class SchedulerProfilerManager:
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
         elif torchprof_activities:
+            self._et_observer = None
+            if (
+                self.record_execution_trace
+                and not _is_npu
+                and not _is_mps
+                and hasattr(torch.profiler, "ExecutionTraceObserver")
+            ):
+                self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+                stage_suffix = f"-{stage.name}" if stage else ""
+                et_filename = (
+                    (self.profile_prefix + "-" if self.profile_prefix else "")
+                    + self.profile_id
+                    + f"-TP-{self.ps.tp_rank}"
+                    + stage_suffix
+                    + ".et.json"
+                )
+                et_file = os.path.join(self.torch_profiler_output_dir, et_filename)
+                self._et_observer = torch.profiler.ExecutionTraceObserver()
+                self._et_observer.register_callback(et_file)
+                logger.info(f"Profiler will save execution trace to {et_file}")
+            et_kwargs = (
+                {"execution_trace_observer": self._et_observer}
+                if self._et_observer is not None
+                else {}
+            )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
@@ -232,6 +262,7 @@ class SchedulerProfilerManager:
                         gc_detect_threshold=None,
                     )
                 ),
+                **et_kwargs,
             )
             try:
                 self.torch_profiler.start()
@@ -306,6 +337,9 @@ class SchedulerProfilerManager:
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
+            if self._et_observer is not None:
+                self._et_observer.unregister_callback()
+                self._et_observer = None
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
                 filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
@@ -426,6 +460,7 @@ class SchedulerProfilerManager:
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
                     recv_req.profile_stages,
+                    recv_req.record_execution_trace,
                 )
             else:
                 self._init_profile(
@@ -439,6 +474,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    record_execution_trace=recv_req.record_execution_trace,
                 )
                 return self._start_profile()
         else:
