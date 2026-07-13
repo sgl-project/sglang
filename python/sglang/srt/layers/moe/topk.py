@@ -685,10 +685,12 @@ def fused_topk_torch_native(
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
-        # fp32 like the reference gate; the epsilon is not representable in fp16
-        topk_weights = topk_weights.float()
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights = topk_weights / (
-            topk_weights.sum(dim=-1, keepdim=True) + _RENORMALIZE_SUM_EPSILON
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+            + _RENORMALIZE_SUM_EPSILON
         )
     return topk_weights, topk_ids
 
@@ -958,12 +960,13 @@ def grouped_topk_gpu(
             )
 
     if renormalize:
-        # fp32 like the reference gate; the epsilon is not representable in fp16
-        topk_weights = topk_weights.float()
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
@@ -1029,9 +1032,10 @@ def kimi_k2_biased_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if renormalize:
-        # fp32 like the reference gate; the epsilon is not representable in fp16
-        topk_weights = topk_weights.float()
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
@@ -1087,12 +1091,13 @@ def biased_topk_impl(
             )
 
     if renormalize:
-        # fp32 like the reference gate; the epsilon is not representable in fp16
-        topk_weights = topk_weights.float()
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
@@ -1218,12 +1223,13 @@ def biased_grouped_topk_impl(
             )
 
     if renormalize:
-        # fp32 like the reference gate; the epsilon is not representable in fp16
-        topk_weights = topk_weights.float()
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
