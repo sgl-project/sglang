@@ -50,6 +50,7 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
         raise ValueError(f"Unsupported test layout: {layout}")
 
     host.kv_buffer = (torch.empty(k_dims), torch.empty(v_dims))
+    host.can_use_write_back_jit = False
     return host
 
 
@@ -79,16 +80,37 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             get_mha_host_pool_cls(asymmetric_pool), AsymmetricMHATokenToKVPoolHost
         )
 
-    def test_staged_write_back_jit_is_disabled(self):
+    def test_staged_write_back_jit_uses_separate_kv_buffers(self):
         host = _make_host("page_first")
+        host.page_num = 4
+        host.v_head_dim = 8
+        host.device_pool = SimpleNamespace(device="cuda")
+        cpu_empty = torch.empty
 
-        host._init_write_back_staging_buffers()
+        def _cpu_empty(shape, *, dtype, device):
+            return cpu_empty(shape, dtype=dtype)
 
-        self.assertFalse(host.can_use_write_back_jit)
-        self.assertEqual(host.staging_page_capacity, 0)
-        self.assertEqual(host.staging_token_capacity, 0)
-        self.assertIsNone(host.staging_k_buffer)
-        self.assertIsNone(host.staging_v_buffer)
+        with (
+            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_cuda", True),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.can_use_write_back_jit_kernel",
+                return_value=True,
+            ) as can_use,
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.torch.empty",
+                side_effect=_cpu_empty,
+            ),
+        ):
+            host._init_write_back_staging_buffers()
+
+        self.assertTrue(host.can_use_write_back_jit)
+        self.assertEqual(host.staging_page_capacity, 4)
+        self.assertEqual(host.staging_token_capacity, 8)
+        self.assertEqual(host.staging_k_buffer.shape, (8, 3, 2, 4))
+        self.assertEqual(host.staging_v_buffer.shape, (8, 3, 2, 8))
+        self.assertEqual(
+            [call.kwargs["element_size"] for call in can_use.call_args_list], [16, 32]
+        )
 
     def test_kernel_load_splits_k_and_v_with_separate_strides(self):
         # Dispatch-only test: the CUDA kernel is mocked; this verifies that K and
@@ -147,6 +169,38 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertIs(v_call.kwargs["dst"], host.v_buffer)
         self.assertEqual(v_call.kwargs["item_size"], 24)
         self.assertEqual(v_call.kwargs["dst_layout_dim"], 72)
+
+    def test_kernel_backup_uses_staged_kernel_for_each_kv_buffer(self):
+        host = _make_host("page_first")
+        host.can_use_write_back_jit = True
+        host.staging_k_buffer = torch.empty(4, 3, 2, 4)
+        host.staging_v_buffer = torch.empty(4, 3, 2, 6)
+        device_pool = _make_device_pool(host)
+        host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.jit_transfer_hicache_all_layer_mla_staged_lf_pf"
+            ) as staged,
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_mla_lf_pf",
+                create=True,
+            ) as fallback,
+        ):
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend="kernel"
+            )
+
+        self.assertEqual(staged.call_count, 2)
+        self.assertEqual(fallback.call_count, 0)
+        k_call, v_call = staged.call_args_list
+        self.assertIs(k_call.kwargs["ptr_src"], device_pool.k_data_ptrs)
+        self.assertIs(k_call.kwargs["staging"], host.staging_k_buffer)
+        self.assertIs(k_call.kwargs["dst"], host.k_buffer)
+        self.assertIs(v_call.kwargs["ptr_src"], device_pool.v_data_ptrs)
+        self.assertIs(v_call.kwargs["staging"], host.staging_v_buffer)
+        self.assertIs(v_call.kwargs["dst"], host.v_buffer)
 
     def test_direct_load_splits_k_and_v_for_page_first_direct(self):
         # Direct kernels derive copy size from each call's first tensor, so K/V
