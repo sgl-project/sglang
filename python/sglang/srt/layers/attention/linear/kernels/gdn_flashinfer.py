@@ -21,8 +21,6 @@ from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
-_MAX_FUSED_PREFILL_DIM = 8192
-
 
 # ---------------------------------------------------------------------------
 # Lazy import for FlashInfer GDN kernels
@@ -327,7 +325,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
         return (
             mixed_qkv.shape[1] == total_dim
-            and total_dim <= _MAX_FUSED_PREFILL_DIM
             and mixed_qkv.stride(1) == 1
             and num_q_heads == num_k_heads
             and head_q_dim == head_k_dim == 128
