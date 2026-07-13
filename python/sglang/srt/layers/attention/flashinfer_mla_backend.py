@@ -523,6 +523,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        # DSA-family models pass the indexer's top-k selection; dense MLA
+        # attends the full KV (a lossless superset of the sparse selection),
+        # so the hint is safely ignored.
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if forward_batch.attn_attend_prefix_cache is not None and any(
             forward_batch.extend_prefix_lens_cpu
@@ -602,6 +606,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        # DSA-family models pass the indexer's top-k selection; dense MLA
+        # attends the full KV (a lossless superset), safely ignored.
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
