@@ -178,6 +178,100 @@ class KVCacheConfigurator:
         )
         return bundle
 
+    def _init_unified_swa_pools(
+        self: ModelRunner,
+        *,
+        max_num_reqs: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> UnifiedPoolBundle:
+        """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
+        buffer split between the full-attention and SWA KV pools."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedPoolBundle,
+            init_unified_swa_pools,
+        )
+
+        assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
+        # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
+        # once in virtual space and binds the new pages on both sub-allocators.
+        assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        # Mirror the non-shared path's extra_max_context_len computation.
+        extra_max_context_len = 4
+        if self.server_args.speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        req_to_token_pool = ReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+        )
+
+        head_num = self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        head_dim = self.model_config.head_dim
+        if self.is_hybrid_swa_compress:
+            # Asymmetric head dims between full and SWA (NPU compress path):
+            # pull SWA-specific dims from the hf text config.
+            v_head_dim = self.model_config.hf_text_config.v_head_dim
+            swa_head_num = max(
+                1,
+                self.model_config.hf_text_config.swa_num_key_value_heads
+                // get_parallel().attn_tp_size,
+            )
+            swa_head_dim = self.model_config.hf_text_config.swa_head_dim
+            swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
+        else:
+            v_head_dim = head_dim
+            swa_head_num = head_num
+            swa_head_dim = head_dim
+            swa_v_head_dim = head_dim
+
+        # Filter layer ids to this worker's [start_layer, end_layer) range.
+        swa_attention_layer_ids = [
+            i
+            for i in self.model_config.swa_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        full_attention_layer_ids = [
+            i
+            for i in self.model_config.full_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+
+        bundle = init_unified_swa_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
+            page_size=self.page_size,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
+            # Overlap mode: same wait_stream(forward_stream) rationale as
+            # `_init_unified_mamba_pools`.
+            forward_stream=self.forward_stream,
+            # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
+            lazy_compaction=_should_enable_lazy_compaction(),
+        )
+        return UnifiedPoolBundle(
+            unified_memory_pool=bundle.unified_memory_pool,
+            token_to_kv_pool=bundle.token_to_kv_pool,
+            token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+            req_to_token_pool=req_to_token_pool,
+        )
+
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
         is_dsa_model: bool,
