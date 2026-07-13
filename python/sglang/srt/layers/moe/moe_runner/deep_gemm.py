@@ -1132,6 +1132,16 @@ def _varlen_deep_gemm_silu_mul_quant(
     if gemm1_alpha is not None:
         use_jit_ep_activation = False
 
+    if not use_jit_ep_activation and swiglu_limit is not None:
+        # The JIT EP-activation kernel is the only fused consumer of
+        # swiglu_limit; when it cannot run for this shape (e.g. SM120 TP>=2:
+        # D//8 < num_experts), clamp before the unfused kernel.
+        _apply_swiglu_limit(
+            gateup_output.view(-1, gateup_output.shape[-1]),
+            swiglu_limit=swiglu_limit,
+        )
+        swiglu_limit = None
+
     if use_jit_ep_activation:
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
