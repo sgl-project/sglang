@@ -2896,6 +2896,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
+        """Customize a runner-created dummy batch before attention metadata initialization."""
+        return forward_batch
+
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.
 
