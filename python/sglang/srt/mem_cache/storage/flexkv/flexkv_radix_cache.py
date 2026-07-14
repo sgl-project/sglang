@@ -42,7 +42,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+    FlexKVConnector,
+    _FlexKVRetrieveResult,
+    is_flexkv_layerwise_transfer_enabled,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -67,6 +71,15 @@ class _LoadBackMarker:
 
     key: RadixKey
     value_numel: int  # device tokens already present at lookup time
+    lookup_task_id: int
+
+
+@dataclass
+class _PendingFlexKVMPLease:
+    lease_id: int
+    rid: str
+    lookup_task_id: int
+    slots: torch.Tensor
 
 
 class FlexKVRadixCache(RadixCache):
@@ -87,7 +100,15 @@ class FlexKVRadixCache(RadixCache):
         attn_tp_group=None,
         attn_cp_group=None,
     ) -> None:
+        allocator_page_size = int(params.token_to_kv_pool_allocator.page_size)
+        if allocator_page_size > 1 and is_flexkv_layerwise_transfer_enabled():
+            raise ValueError(
+                "FlexKV layerwise transfer currently requires allocator page "
+                "size 1; disable layerwise transfer or use MP"
+            )
+
         super().__init__(params)
+        self._allocator_page_size = allocator_page_size
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         # ``tp_group`` and ``attn_tp_group`` are sometimes passed
@@ -99,6 +120,7 @@ class FlexKVRadixCache(RadixCache):
             sgl_model_config=model_config,
             server_args=server_args,
             page_size=params.page_size,
+            allocator_page_size=self._allocator_page_size,
             kvcache=kvcache,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -124,6 +146,8 @@ class FlexKVRadixCache(RadixCache):
         # Two-phase MP load: stash marker between ``match_prefix`` and
         # ``init_load_back``.
         self._load_markers: dict[str, _LoadBackMarker] = {}
+        self._pending_mp_leases: dict[int, _PendingFlexKVMPLease] = {}
+        self._next_mp_lease_id = 0
         # ``store_kv`` is async — we keep a lock on the source node
         # until FlexKV signals completion, draining in ``evict`` /
         # ``check_hicache_events``.
@@ -135,16 +159,24 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def reset(self) -> None:  # type: ignore[override]
+        if hasattr(self, "_pending_mp_leases") and self._pending_mp_leases:
+            raise RuntimeError(
+                "Cannot reset FlexKV while MP slot leases lack terminal proof"
+            )
+        if hasattr(self, "flexkv_connector"):
+            self.flexkv_connector.reset()
         super().reset()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
         if hasattr(self, "_inflight_store_nodes"):
             with self._node_lock:
                 self._inflight_store_nodes.clear()
-        if hasattr(self, "flexkv_connector"):
-            self.flexkv_connector.reset()
 
     def shutdown(self) -> None:
+        if hasattr(self, "_pending_mp_leases") and self._pending_mp_leases:
+            raise RuntimeError(
+                "Cannot shut down FlexKV while MP slot leases lack terminal proof"
+            )
         if hasattr(self, "flexkv_connector"):
             self.flexkv_connector.shutdown()
 
@@ -165,8 +197,10 @@ class FlexKVRadixCache(RadixCache):
         # FlexKV operates at page granularity — round the lookup query
         # down to a multiple of ``page_size`` so the hit count we report
         # back to sglang matches what FlexKV can actually serve.
-        if self.page_size != 1:
-            aligned_len = (len(key) // self.page_size) * self.page_size
+        if self._allocator_page_size != 1:
+            aligned_len = (
+                len(key) // self._allocator_page_size * self._allocator_page_size
+            )
             key = key[:aligned_len]
 
         base_res = super().match_prefix(params)
@@ -204,11 +238,17 @@ class FlexKVRadixCache(RadixCache):
         token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
         token_mask[device_len:] = True
 
-        fkv_task_id, hit = self.flexkv_connector.lookup_kv(
+        lookup_task_id, hit = self.flexkv_connector.lookup_kv(
             token_ids=token_ids, token_mask=token_mask, rid=req.rid
         )
         if hit <= 0:
             return base_res
+        if device_len % self._allocator_page_size != 0:
+            self.flexkv_connector.release_pending(req.rid)
+            raise RuntimeError(
+                "FlexKV MP load-back requires an allocator-page-aligned "
+                "device prefix"
+            )
 
         # Snapshot the matched key (the live key aliases ``req.fill_ids``).
         if token_ids is key.token_ids:
@@ -218,6 +258,7 @@ class FlexKVRadixCache(RadixCache):
         self._load_markers[req.rid] = _LoadBackMarker(
             key=RadixKey(token_ids_snap, key.extra_key, key.is_bigram),
             value_numel=device_len,
+            lookup_task_id=lookup_task_id,
         )
         return MatchResult(
             device_indices=device_value,
@@ -252,7 +293,7 @@ class FlexKVRadixCache(RadixCache):
         if hit <= 0:
             return base_res
 
-        result = self._allocate_and_load(
+        result = self._allocate_and_load_layerwise(
             key=key,
             value_numel=device_len,
             uncached_len=hit,
@@ -294,14 +335,13 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
 
-        result = self._allocate_and_load(
+        result = self._allocate_and_load_mp(
+            rid=req.rid,
+            lookup_task_id=marker.lookup_task_id,
             key=marker.key,
             value_numel=marker.value_numel,
             uncached_len=params.host_hit_length,
             last_node=last_node,
-            load_fn=lambda slot_mapping: self.flexkv_connector.retrieve_kv(
-                req.rid, slot_mapping
-            ),
         )
         if result is None:
             # Allocation failed or load returned zero. ``retrieve_kv``
@@ -315,7 +355,152 @@ class FlexKVRadixCache(RadixCache):
             )
         return result
 
-    def _allocate_and_load(
+    def _allocate_and_load_mp(
+        self,
+        *,
+        rid: str,
+        lookup_task_id: int,
+        key: RadixKey,
+        value_numel: int,
+        uncached_len: int,
+        last_node: TreeNode,
+    ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
+        local_manifest_error: Optional[str] = None
+        published_length = (
+            uncached_len // self._allocator_page_size * self._allocator_page_size
+        )
+        if uncached_len <= 0:
+            local_manifest_error = "FlexKV MP load-back requires a positive hit length"
+        elif value_numel % self._allocator_page_size != 0:
+            local_manifest_error = (
+                "FlexKV MP load-back requires an allocator-page-aligned radix prefix"
+            )
+        elif value_numel + published_length > len(key):
+            local_manifest_error = (
+                "FlexKV MP retrieve exceeds the matched radix key length"
+            )
+
+        allocation_size = (
+            (
+                (uncached_len + self._allocator_page_size - 1)
+                // self._allocator_page_size
+                * self._allocator_page_size
+            )
+            if uncached_len > 0
+            else 0
+        )
+        local_prelaunch_error: Optional[str] = None
+        local_has_capacity = local_manifest_error is not None
+        if local_manifest_error is None:
+            try:
+                local_has_capacity = (
+                    self.token_to_kv_pool_allocator.available_size() >= allocation_size
+                )
+            except Exception as exc:  # noqa: BLE001
+                local_prelaunch_error = f"allocator capacity query failed: {exc}"
+
+        requires_eviction = self.flexkv_connector.requires_mp_eviction(
+            local_has_capacity=local_has_capacity
+        )
+        if requires_eviction:
+            try:
+                self.evict(EvictParams(num_tokens=allocation_size))
+            except Exception as exc:  # noqa: BLE001
+                if local_prelaunch_error is None:
+                    local_prelaunch_error = f"allocator eviction failed: {exc}"
+
+        token_slots: Optional[torch.Tensor] = None
+        if local_manifest_error is None and local_prelaunch_error is None:
+            try:
+                token_slots = self.token_to_kv_pool_allocator.alloc(allocation_size)
+            except Exception as exc:  # noqa: BLE001
+                local_prelaunch_error = f"allocator allocation failed: {exc}"
+        lease: Optional[_PendingFlexKVMPLease] = None
+        if token_slots is not None:
+            lease_id = self._next_mp_lease_id
+            self._next_mp_lease_id += 1
+            lease = _PendingFlexKVMPLease(
+                lease_id=lease_id,
+                rid=rid,
+                lookup_task_id=lookup_task_id,
+                slots=token_slots,
+            )
+            self._pending_mp_leases[lease_id] = lease
+
+        retrieve_result: _FlexKVRetrieveResult = self.flexkv_connector.retrieve_kv(
+            rid=rid,
+            slot_mapping=(
+                token_slots[:uncached_len].to(torch.int64)
+                if token_slots is not None
+                else None
+            ),
+            expected_lookup_task_id=lookup_task_id,
+            local_manifest_error=local_manifest_error,
+            local_prelaunch_error=local_prelaunch_error,
+        )
+        if retrieve_result.prelaunch_miss:
+            if lease is not None:
+                self._release_mp_lease(lease.lease_id)
+            if retrieve_result.prelaunch_contract_error:
+                raise RuntimeError("FlexKV MP prelaunch manifest validation failed")
+            return None
+        if token_slots is None or lease is None:
+            raise RuntimeError("FlexKV launched without a local allocator slot lease")
+        if retrieve_result.terminal_proof and not retrieve_result.terminal_success:
+            self._release_mp_lease(lease.lease_id)
+            return None
+
+        valid_result = (
+            retrieve_result.lookup_task_id == lookup_task_id
+            and retrieve_result.requested_slots == uncached_len
+            and retrieve_result.terminal_proof
+            and retrieve_result.terminal_success
+            and len(retrieve_result.terminal_task_ids) > 0
+        )
+        if not valid_result:
+            if retrieve_result.terminal_proof:
+                self._release_mp_lease(lease.lease_id)
+            raise RuntimeError(
+                "FlexKV MP retrieve returned an inconsistent terminal manifest"
+            )
+
+        if published_length == 0:
+            self._release_mp_lease(lease.lease_id)
+            return None
+        if value_numel + published_length > len(key):
+            self._release_mp_lease(lease.lease_id)
+            raise RuntimeError(
+                "FlexKV MP retrieve exceeds the matched radix key length"
+            )
+
+        fetched_slots = token_slots[:published_length]
+        new_node = TreeNode(priority=last_node.priority)
+        new_node.key = key[value_numel : value_numel + published_length]
+        new_node.value = fetched_slots
+        new_node.parent = last_node
+
+        lease.slots = fetched_slots
+        if published_length < allocation_size:
+            self.token_to_kv_pool_allocator.free(token_slots[published_length:])
+
+        last_node.children[new_node.key.child_key(self.page_size)] = new_node
+        self.evictable_size_ += published_length
+        self._update_leaf_status(last_node)
+        self._update_leaf_status(new_node)
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
+        self._pending_mp_leases.pop(lease.lease_id)
+
+        return fetched_slots, new_node
+
+    def _release_mp_lease(self, lease_id: int) -> None:
+        lease = self._pending_mp_leases.get(lease_id)
+        if lease is None:
+            raise RuntimeError(f"Unknown FlexKV MP lease {lease_id}")
+        self.token_to_kv_pool_allocator.free(lease.slots)
+        self._pending_mp_leases.pop(lease_id)
+
+    def _allocate_and_load_layerwise(
         self,
         *,
         key: RadixKey,
@@ -324,7 +509,7 @@ class FlexKVRadixCache(RadixCache):
         last_node: TreeNode,
         load_fn,
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
-        """Shared allocator + post-load bookkeeping for MP/IP.
+        """Legacy allocator + post-load bookkeeping for layerwise transfer.
 
         Returns ``(token_slots[:fetched], new_node)`` on success.
         ``None`` on either allocation failure or zero retrieved (in
@@ -482,6 +667,11 @@ class FlexKVRadixCache(RadixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         """Clean up tracking for an aborted request without invoking FlexKV."""
+        if any(lease.rid == rid for lease in self._pending_mp_leases.values()):
+            raise RuntimeError(
+                "Cannot abort a FlexKV request while its MP slot lease lacks "
+                "terminal proof"
+            )
         self._load_markers.pop(rid, None)
         with self._node_lock:
             node = self._inflight_store_nodes.pop(rid, None)

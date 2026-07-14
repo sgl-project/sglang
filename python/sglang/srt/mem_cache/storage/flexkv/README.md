@@ -237,6 +237,23 @@ Either flag also sets `FLEXKV_CONFIG_PATH` so you can omit
 * When `host_hit_length > 0`, the scheduler later calls
   `init_load_back`, which allocates the uncached slots and fires
   `retrieve_kv` (FlexKV `launch` + `wait`).
+* Load-back allocates complete pages using the token allocator's actual page
+  size. The connector only receives logical hit destinations, while temporary
+  padding remains owned by the local load lease and is never exposed to the
+  transfer worker.
+* A lookup task id identifies an unlaunched held lookup and is only valid for
+  prelaunch cancellation. `launch` returns the terminal task ids used by
+  `wait`; publication requires a successful `wait(..., completely=True)` for
+  every terminal id. A mapping send that returns `None` only proves that the
+  local sender did not raise, not that a remote receiver consumed it.
+* Every rank follows the same capacity, eviction, allocation, and launch
+  consensus sequence. Slot mappings must match the leader's complete manifest
+  exactly; equal lengths with different fragmented slot ids are rejected before
+  launch.
+* Radix nodes publish only complete actual allocator pages. A partial trailing
+  hit is discarded, and the node key, value, returned slots, and evictable
+  accounting are truncated to the same length before the remaining lease is
+  returned to the allocator.
 * `cache_finished_req` runs `put_match` + `launch` and stashes the
   in-flight FlexKV task id. Source-node lock is held until
   `check_completed_stores` (called from `check_hicache_events` /
@@ -247,8 +264,17 @@ This is the path you'll use under any non-trivial deployment topology
 
 ### IP / layerwise (`FLEXKV_ENABLE_LAYERWISE_TRANSFER=1`)
 
+Layerwise transfer currently requires an actual allocator page size of 1.
+Deployments with larger allocator pages must use MP mode. The page-size check
+runs before FlexKV configuration, collectives, remote processes, GPU buffer
+registration, or eventfd setup. The existing page-size-1 layerwise lifecycle is
+unchanged.
+
 * `match_prefix` allocates the uncached slots and fires
   `start_load_kv_layerwise` immediately.
+* Lookup remains a single legacy `get_match` call: its hit length is the sum of
+  the returned mask, including a mask with holes, and the original held task id
+  is passed unchanged to the layerwise launch.
 * A `FlexKVLayerDoneCounter` is registered onto sglang's KV pool via
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker
