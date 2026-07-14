@@ -360,9 +360,6 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
         )
-        from sglang.srt.distributed.device_communicators.pyxccl import (
-            PyXcclCommunicator,
-        )
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
@@ -370,6 +367,9 @@ class GroupCoordinator:
             debug_check_symmetric_mempool,
             is_symmetric_memory_enabled,
             use_symmetric_memory,
+        )
+        from sglang.srt.distributed.device_communicators.pyxccl import (
+            PyXcclCommunicator,
         )
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,

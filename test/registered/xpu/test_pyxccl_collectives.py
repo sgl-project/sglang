@@ -95,8 +95,10 @@ def all_gather_fn(rank: int, world_size: int):
         comm.all_gather(out, inp)
         torch.xpu.synchronize()
         expected = torch.cat(
-            [torch.full((chunk,), float(r + 1), dtype=dtype, device=dev)
-             for r in range(world_size)]
+            [
+                torch.full((chunk,), float(r + 1), dtype=dtype, device=dev)
+                for r in range(world_size)
+            ]
         )
         torch.testing.assert_close(out, expected)
     comm.destroy()
@@ -109,14 +111,19 @@ def reduce_scatter_fn(rank: int, world_size: int):
     for dtype in DTYPES:
         per_rank = 4
         # Full input on every rank: value (r+1) contributed by rank r.
-        full = torch.full((per_rank * world_size,), float(rank + 1),
-                          dtype=dtype, device=dev)
+        full = torch.full(
+            (per_rank * world_size,), float(rank + 1), dtype=dtype, device=dev
+        )
         out = torch.empty((per_rank,), dtype=dtype, device=dev)
         comm.reduce_scatter(out, full)
         torch.xpu.synchronize()
         # Each output element is the sum over ranks of (r+1).
-        expected = torch.full((per_rank,), float(sum(r + 1 for r in range(world_size))),
-                              dtype=dtype, device=dev)
+        expected = torch.full(
+            (per_rank,),
+            float(sum(r + 1 for r in range(world_size))),
+            dtype=dtype,
+            device=dev,
+        )
         torch.testing.assert_close(out, expected)
     comm.destroy()
     dist.destroy_process_group()
@@ -154,9 +161,9 @@ def sglang_tp_collectives_fn(rank: int, world_size: int):
 
     tp = get_tp_group()
     # The whole point of this port: on XPU tp>1 the TP group drives pyxccl.
-    assert tp.pyxccl_comm is not None and not tp.pyxccl_comm.disabled, (
-        "TP group is not using the pyxccl (direct oneCCL) path"
-    )
+    assert (
+        tp.pyxccl_comm is not None and not tp.pyxccl_comm.disabled
+    ), "TP group is not using the pyxccl (direct oneCCL) path"
 
     dev = f"xpu:{rank}"
 
@@ -174,8 +181,10 @@ def sglang_tp_collectives_fn(rank: int, world_size: int):
     gathered = tensor_model_parallel_all_gather(g, dim=0)
     torch.xpu.synchronize()
     expected_gather = torch.cat(
-        [torch.full((3, 4), float(r + 1), device=dev, dtype=torch.float32)
-         for r in range(world_size)],
+        [
+            torch.full((3, 4), float(r + 1), device=dev, dtype=torch.float32)
+            for r in range(world_size)
+        ],
         dim=0,
     )
     torch.testing.assert_close(gathered, expected_gather)
