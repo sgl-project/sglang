@@ -43,6 +43,10 @@ class MoeRunner:
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_humming():
+            from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
+
+            self.runner_core = HummingRunnerCore(config)
         elif runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 
@@ -65,6 +69,13 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer CUTLASS only supports fused path
         elif runner_backend.is_flashinfer_mxfp4():
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
+            # Import flashinfer_cutlass here (not at module top, to avoid a circular
+            # import) to register the flashinfer_mxfp4 fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                flashinfer_cutlass,
+            )
+        elif runner_backend.is_cutlass():
+            self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
