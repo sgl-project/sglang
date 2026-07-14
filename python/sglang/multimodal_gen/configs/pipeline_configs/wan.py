@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
+    PromptBatchExpander,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
@@ -96,6 +97,19 @@ class WanT2V480PConfig(PipelineConfig):
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
         )
+
+    def prepare_denoising_conditioning(self, batch) -> None:
+        expander = PromptBatchExpander.from_batch(batch)
+        if expander is None:
+            return
+
+        batch.prompt_embeds = expander.tensors(batch.prompt_embeds, "prompt_embeds")
+        batch.negative_prompt_embeds = expander.tensors(
+            batch.negative_prompt_embeds, "negative_prompt_embeds"
+        )
+        batch.image_embeds = expander.tensors(batch.image_embeds, "image_embeds")
+        if batch.image_latent is not None:
+            batch.image_latent = expander.tensor(batch.image_latent, "image_latent")
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

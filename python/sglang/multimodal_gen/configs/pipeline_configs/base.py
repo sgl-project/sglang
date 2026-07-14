@@ -138,6 +138,83 @@ class TextConditioningOutput:
     prompt_seq_lens: list[int] | None = None
 
 
+@dataclass(frozen=True)
+class PromptBatchExpander:
+    """Expand explicitly selected conditioning from prompt to sample order."""
+
+    prompt_batch_size: int
+    sample_batch_size: int
+
+    @classmethod
+    def from_batch(cls, batch):
+        num_outputs = int(batch.num_outputs_per_prompt or 1)
+        if num_outputs <= 1:
+            return None
+        if isinstance(batch.prompt, list):
+            prompt_batch_size = len(batch.prompt)
+        elif batch.prompt is not None:
+            prompt_batch_size = 1
+        else:
+            raise ValueError(
+                "Multi-output conditioning requires prompt text so the prompt "
+                "batch size is unambiguous."
+            )
+        if prompt_batch_size <= 0:
+            raise ValueError("Multi-output conditioning requires at least one prompt.")
+        return cls(prompt_batch_size, prompt_batch_size * num_outputs)
+
+    def tensor(self, value: torch.Tensor, name: str) -> torch.Tensor:
+        current_batch_size = value.shape[0]
+        if current_batch_size == self.sample_batch_size:
+            return value
+        if current_batch_size != self.prompt_batch_size:
+            raise ValueError(
+                f"{name} has batch dim {current_batch_size} (shape "
+                f"{tuple(value.shape)}); expected {self.prompt_batch_size} "
+                f"(per-prompt) or {self.sample_batch_size} (per-sample)."
+            )
+        repeats = self.sample_batch_size // self.prompt_batch_size
+        return value.repeat_interleave(repeats, dim=0)
+
+    def tensors(self, value, name: str):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return self.tensor(value, name)
+        if not isinstance(value, list):
+            raise TypeError(f"{name} must be a tensor, list of tensors, or None.")
+        if any(
+            item is not None and not isinstance(item, torch.Tensor) for item in value
+        ):
+            raise TypeError(f"{name} entries must be tensors or None.")
+        return [
+            self.tensor(item, f"{name}[{index}]") if item is not None else None
+            for index, item in enumerate(value)
+        ]
+
+    def seq_lens(
+        self, value: list[list[int] | None] | None, name: str
+    ) -> list[list[int] | None] | None:
+        if value is None:
+            return None
+        repeats = self.sample_batch_size // self.prompt_batch_size
+        expanded = []
+        for index, seq_lens in enumerate(value):
+            if seq_lens is None or len(seq_lens) == self.sample_batch_size:
+                expanded.append(seq_lens)
+            elif len(seq_lens) == self.prompt_batch_size:
+                expanded.append(
+                    [seq_len for seq_len in seq_lens for _ in range(repeats)]
+                )
+            else:
+                raise ValueError(
+                    f"{name}[{index}] has {len(seq_lens)} entries; expected "
+                    f"{self.prompt_batch_size} (per-prompt) or "
+                    f"{self.sample_batch_size} (per-sample)."
+                )
+        return expanded
+
+
 def pad_text_embeddings_with_mask(
     text_embeds: list[torch.Tensor],
 ) -> TextConditioningOutput:
@@ -674,6 +751,16 @@ class PipelineConfig:
 
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds
+
+    def prepare_denoising_conditioning(self, batch) -> None:
+        """Normalize model-owned conditioning before denoising.
+
+        The default is deliberately a no-op. A model family may override this
+        hook when it has audited which of its conditioning values are batched
+        per prompt and must be expanded for single-request multi-output
+        generation.
+        """
+        return None
 
     def post_denoising_loop(self, latents, batch):
         latents = maybe_unpad_latents(latents, batch)

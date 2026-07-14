@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConf
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    PromptBatchExpander,
     maybe_unpad_latents,
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
@@ -180,6 +181,34 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             None,
         ]
     )
+
+    def prepare_denoising_conditioning(self, batch) -> None:
+        expander = PromptBatchExpander.from_batch(batch)
+        if expander is None:
+            return
+
+        batch.prompt_embeds = expander.tensors(batch.prompt_embeds, "prompt_embeds")
+        batch.negative_prompt_embeds = expander.tensors(
+            batch.negative_prompt_embeds, "negative_prompt_embeds"
+        )
+        batch.prompt_attention_mask = expander.tensors(
+            batch.prompt_attention_mask, "prompt_attention_mask"
+        )
+        batch.negative_attention_mask = expander.tensors(
+            batch.negative_attention_mask, "negative_attention_mask"
+        )
+        batch.prompt_embeds_mask = expander.tensors(
+            batch.prompt_embeds_mask, "prompt_embeds_mask"
+        )
+        batch.negative_prompt_embeds_mask = expander.tensors(
+            batch.negative_prompt_embeds_mask, "negative_prompt_embeds_mask"
+        )
+        batch.prompt_seq_lens = expander.seq_lens(
+            batch.prompt_seq_lens, "prompt_seq_lens"
+        )
+        batch.negative_prompt_seq_lens = expander.seq_lens(
+            batch.negative_prompt_seq_lens, "negative_prompt_seq_lens"
+        )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         tok_kwargs.setdefault("truncation", True)

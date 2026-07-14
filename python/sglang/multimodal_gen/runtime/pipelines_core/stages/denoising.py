@@ -754,6 +754,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Returns:
             A context object containing the invariant state for the denoising loop.
         """
+        # This is the last shared boundary before model-specific conditioning
+        # kwargs are derived. The base config is a no-op; audited model families
+        # explicitly opt in to any prompt-to-sample batch normalization.
+        server_args.pipeline_config.prepare_denoising_conditioning(batch)
+
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         scheduler = batch.scheduler
