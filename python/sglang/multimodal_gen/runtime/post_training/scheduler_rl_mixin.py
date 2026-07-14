@@ -16,11 +16,54 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import (
     SchedulerRLDebugMixin,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
+
+    # Class-level so the rollout scheduler info log prints once per process.
+    _logged_rollout_scheduler_check = False
+
+    def check_rollout_timestep_convention(self) -> None:
+        """Verify ``timesteps == sigmas[:-1] * num_train_timesteps``.
+
+        The rollout SDE/log-prob math assumes this flow-match Euler
+        convention, and it can break silently: ``set_timesteps`` applies
+        shift to sigmas but keeps request-provided custom timesteps as-is.
+        Called once per rollout request, after timesteps are prepared.
+        """
+        sigmas = self.sigmas
+        timesteps = self.timesteps
+        if sigmas is None or timesteps is None or sigmas.numel() < 2:
+            return
+        if timesteps.numel() != sigmas.numel() - 1:
+            raise ValueError(
+                "rollout timestep/sigma length mismatch: "
+                f"{timesteps.numel()} timesteps vs {sigmas.numel()} sigmas"
+            )
+        reconstructed = sigmas[:-1].to(device=timesteps.device) * float(
+            self.config.num_train_timesteps
+        )
+        max_abs_diff = (timesteps.float() - reconstructed.float()).abs().max().item()
+        if max_abs_diff > 1e-3:
+            raise ValueError(
+                f"rollout timestep/sigma mismatch: max_abs_diff={max_abs_diff:.6g}"
+            )
+        if not SchedulerRLMixin._logged_rollout_scheduler_check:
+            logger.info(
+                "RL rollout using %s (timesteps dtype=%s, sigmas dtype=%s, "
+                "max_abs_diff=%.6g)",
+                type(self).__name__,
+                timesteps.dtype,
+                sigmas.dtype,
+                max_abs_diff,
+            )
+            SchedulerRLMixin._logged_rollout_scheduler_check = True
+
     @staticmethod
     def _get_rollout_session_data(batch) -> RolloutSessionData:
         """Return the RolloutSessionData attached to *batch*, or raise if not prepared."""

@@ -59,6 +59,7 @@ class RolloutDenoisingMixin:
 
         scheduler.release_rollout_resources(batch)
         if batch.rollout:
+            scheduler.check_rollout_timestep_convention()
             scheduler.prepare_rollout(
                 batch=batch,
                 pipeline_config=self.server_args.pipeline_config,

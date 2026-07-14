@@ -8,9 +8,6 @@ This module contains an implementation of the Wan video diffusion pipeline
 using the modular pipeline architecture.
 """
 
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
-    FlowMatchEulerDiscreteScheduler,
-)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -20,7 +17,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
-    TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
     WanProgressiveDenoisingStage,
@@ -53,19 +49,10 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        shift = server_args.pipeline_config.flow_shift
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
         self.add_standard_latent_preparation_stage()
-        # rollout=True requests lazily bind a flow-match Euler scheduler (RL SDE path).
-        self.add_stage(
-            TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                rollout_scheduler_factory=lambda: FlowMatchEulerDiscreteScheduler(
-                    shift=1.0 if shift is None else shift
-                ),
-            )
-        )
+        self.add_standard_timestep_preparation_stage()
         self.add_progressive_denoising_stage(WanProgressiveDenoisingStage)
         self.add_standard_decoding_stage()
 

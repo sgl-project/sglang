@@ -28,9 +28,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.post_training.rollout_timestep_mixin import (
-    RolloutTimestepPreparationMixin,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -48,7 +45,7 @@ class TimestepPreparationFingerprint:
     num_frames: int | None
 
 
-class TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
+class TimestepPreparationStage(PipelineStage):
     """
     Stage for preparing timesteps for the diffusion process.
 
@@ -66,13 +63,9 @@ class TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
         prepare_extra_set_timesteps_kwargs: (
             list[Callable[[Req, ServerArgs], Tuple[str, Any]]] | None
         ) = None,
-        rollout_scheduler_factory: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        # See RolloutTimestepPreparationMixin.
-        self.rollout_scheduler_factory = rollout_scheduler_factory
-        self._rollout_scheduler = None
         self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )
@@ -97,11 +90,18 @@ class TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
         if batch.scheduler is not None and batch.timesteps is not None:
             return batch
 
-        rollout_template = self._resolve_rollout_scheduler(batch)
-        scheduler = get_or_create_request_scheduler(
-            batch,
-            rollout_template if rollout_template is not None else self.scheduler,
-        )
+        scheduler_template = self.scheduler
+        if batch.rollout:
+            # The rollout SDE/log-prob path may need an RL-capable scheduler
+            # the pipeline does not serve with; the serving->rollout mapping
+            # is owned by post_training and the resolved scheduler by this
+            # request, so a serving-only engine never initializes one.
+            from sglang.multimodal_gen.runtime.post_training.rollout_scheduler_registry import (
+                resolve_rollout_scheduler,
+            )
+
+            scheduler_template = resolve_rollout_scheduler(self.scheduler)
+        scheduler = get_or_create_request_scheduler(batch, scheduler_template)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
@@ -163,9 +163,6 @@ class TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
                 num_inference_steps, device=device, **extra_set_timesteps_kwargs
             )
             timesteps = scheduler.timesteps
-
-        if rollout_template is not None:
-            self._check_rollout_timesteps(scheduler)
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
