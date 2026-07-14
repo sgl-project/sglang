@@ -2183,16 +2183,33 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
-        weight = getattr(
-            getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
-        )
+        proj = getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+        weight = getattr(proj, "weight", None)
         if weight is None:
             return ""
         if weight.dtype == torch.uint8:
             return "mxfp4"
         if weight.dtype == getattr(torch, "float8_e4m3fn", None):
-            return "fp8"
+            # Only use the fused fp8 block-scale path when weight_scale is a
+            # block scale (2D, K/128 cols). Per-channel scale [N, 1] is
+            # incompatible with the 1x128 group-scale activation tuple.
+            weight_scale = getattr(proj, "weight_scale", None)
+            if weight_scale is not None and weight_scale.dim() == 2:
+                return "fp8" if weight_scale.shape[-1] > 1 else ""
+            # weight_scale not yet reshaped (called before process_weights_after_loading)
+            # — will be resolved on first forward call via _resolve_gfx95_quant_format.
+            return "fp8_pending"
         return ""
+
+    def _resolve_gfx95_quant_format(self) -> str:
+        """Re-evaluate after weights are loaded if still pending."""
+        fmt = getattr(self, "_gfx95_quant_format", "")
+        if fmt == "fp8_pending":
+            fmt = self._detect_gfx95_quant_format()
+            if fmt == "fp8_pending":
+                fmt = "fp8"  # fallback if weight_scale still unavailable
+            self._gfx95_quant_format = fmt
+        return fmt
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -2221,7 +2238,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
-                quant_format=getattr(self, "_gfx95_quant_format", ""),
+                quant_format=self._resolve_gfx95_quant_format(),
             )
         )
 
