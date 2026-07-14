@@ -1206,9 +1206,7 @@ def alloc_for_spec_decode(
     allocator = tree_cache.token_to_kv_pool_allocator
     allocator_page: int = allocator.page_size
     uses_page_aligned_alloc: bool = (
-        not _is_npu
-        and allocator_page > 1
-        and allocator.supports_page_aligned_alloc
+        not _is_npu and allocator_page > 1 and allocator.supports_page_aligned_alloc
     )
     allocation_nxt_kv_lens_cpu: torch.Tensor
     allocation_nxt_kv_lens: torch.Tensor
@@ -1240,27 +1238,27 @@ def alloc_for_spec_decode(
     assert req_to_token.ndim == 2, f"{req_to_token.shape=}"
     assert req_to_token.dtype == torch.int32, f"{req_to_token.dtype=}"
     assert req_to_token.is_contiguous(), f"{req_to_token.stride()=}"
-    assert all(tensor.ndim == 1 for tensor in all_inputs), (
-        f"shapes={[tensor.shape for tensor in all_inputs]}"
-    )
-    assert all(tensor.numel() == batch_size for tensor in all_inputs), (
-        f"{batch_size=}, numels={[tensor.numel() for tensor in all_inputs]}"
-    )
-    assert all(tensor.is_contiguous() for tensor in all_inputs), (
-        f"strides={[tensor.stride() for tensor in all_inputs]}"
-    )
-    assert all(tensor.device == req_to_token.device for tensor in device_inputs), (
-        f"{req_to_token.device=}, devices={[tensor.device for tensor in device_inputs]}"
-    )
+    assert all(
+        tensor.ndim == 1 for tensor in all_inputs
+    ), f"shapes={[tensor.shape for tensor in all_inputs]}"
+    assert all(
+        tensor.numel() == batch_size for tensor in all_inputs
+    ), f"{batch_size=}, numels={[tensor.numel() for tensor in all_inputs]}"
+    assert all(
+        tensor.is_contiguous() for tensor in all_inputs
+    ), f"strides={[tensor.stride() for tensor in all_inputs]}"
+    assert all(
+        tensor.device == req_to_token.device for tensor in device_inputs
+    ), f"{req_to_token.device=}, devices={[tensor.device for tensor in device_inputs]}"
     assert all(
         tensor.dtype in supported_integer_dtypes for tensor in device_inputs
     ), f"dtypes={[tensor.dtype for tensor in device_inputs]}"
-    assert all(tensor.device.type == "cpu" for tensor in cpu_inputs), (
-        f"devices={[tensor.device for tensor in cpu_inputs]}"
-    )
-    assert all(tensor.dtype == torch.int32 for tensor in cpu_inputs), (
-        f"dtypes={[tensor.dtype for tensor in cpu_inputs]}"
-    )
+    assert all(
+        tensor.device.type == "cpu" for tensor in cpu_inputs
+    ), f"devices={[tensor.device for tensor in cpu_inputs]}"
+    assert all(
+        tensor.dtype == torch.int32 for tensor in cpu_inputs
+    ), f"dtypes={[tensor.dtype for tensor in cpu_inputs]}"
 
     row_count: int = req_to_token.shape[0]
     row_width: int = req_to_token.shape[1]
@@ -1269,9 +1267,7 @@ def alloc_for_spec_decode(
     for index, req in enumerate(reqs):
         req_pool_idx: Optional[int] = req.req_pool_idx
         assert req_pool_idx is not None
-        assert 1 <= req_pool_idx < row_count, (
-            f"{req_pool_idx=}, {row_count=}, {index=}"
-        )
+        assert 1 <= req_pool_idx < row_count, f"{req_pool_idx=}, {row_count=}, {index=}"
         assert req.kv is not None, f"missing kv allocation state for request {index}"
         cur_kv_len: int = int(cur_kv_lens_cpu[index])
         allocation_nxt_kv_len: int = int(allocation_nxt_kv_lens_cpu[index])
@@ -1309,9 +1305,9 @@ def alloc_for_spec_decode(
     if batch_size == 0:
         assert allocation_num_needed_tokens == 0
     if uses_page_aligned_alloc:
-        assert allocation_num_needed_tokens % allocator_page == 0, (
-            f"{allocation_num_needed_tokens=}, {allocator_page=}"
-        )
+        assert (
+            allocation_num_needed_tokens % allocator_page == 0
+        ), f"{allocation_num_needed_tokens=}, {allocator_page=}"
 
     if allocation_num_needed_tokens > 0:
         out_cache_loc: torch.Tensor
@@ -1326,18 +1322,16 @@ def alloc_for_spec_decode(
                 num_tokens=allocation_num_needed_tokens,
                 phase="Spec decode",
             )
-            assert allocated_page_blocks.ndim == 1, (
-                f"{allocated_page_blocks.shape=}"
-            )
-            assert allocated_page_blocks.is_contiguous(), (
-                f"{allocated_page_blocks.stride()=}"
-            )
-            assert allocated_page_blocks.dtype == torch.int64, (
-                f"{allocated_page_blocks.dtype=}"
-            )
-            assert allocated_page_blocks.device == req_to_token.device, (
-                f"{allocated_page_blocks.device=}, {req_to_token.device=}"
-            )
+            assert allocated_page_blocks.ndim == 1, f"{allocated_page_blocks.shape=}"
+            assert (
+                allocated_page_blocks.is_contiguous()
+            ), f"{allocated_page_blocks.stride()=}"
+            assert (
+                allocated_page_blocks.dtype == torch.int64
+            ), f"{allocated_page_blocks.dtype=}"
+            assert (
+                allocated_page_blocks.device == req_to_token.device
+            ), f"{allocated_page_blocks.device=}, {req_to_token.device=}"
             assert allocated_page_blocks.numel() == allocation_num_needed_tokens, (
                 f"allocated={allocated_page_blocks.numel()}, "
                 f"expected={allocation_num_needed_tokens}"
@@ -1345,9 +1339,7 @@ def alloc_for_spec_decode(
             out_cache_loc = allocated_page_blocks
         else:
             assert batch is not None
-            last_loc = get_last_loc(
-                req_to_token, req_pool_indices, cur_kv_lens
-            )
+            last_loc = get_last_loc(req_to_token, req_pool_indices, cur_kv_lens)
             device_type = getattr(
                 batch.device, "type", str(batch.device).split(":", 1)[0]
             )
