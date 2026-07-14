@@ -968,6 +968,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                         "modality": modality.name,
                         "prefill_host": self.host_name,
                         "embedding_port": self.embedding_port,
+                        # Echoed back through the /encode response into each
+                        # rank's /send so the encoder can release the held GPU
+                        # embedding as soon as all ranks have received it.
+                        "receive_count": self.receive_count,
                     }
                 )
                 cum_idx += 1
