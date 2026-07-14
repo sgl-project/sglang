@@ -337,6 +337,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         pending_fp8_lock = threading.Lock()
         quantization_log_lock = threading.Lock()
         did_log_quantization = False
+
         def log_quantization_start() -> None:
             nonlocal did_log_quantization
             if did_log_quantization:
