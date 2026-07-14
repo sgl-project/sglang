@@ -2,7 +2,26 @@ from typing import List, Optional, Tuple
 
 import torch
 
-if torch.version.hip is not None:
+
+def _is_rdna() -> bool:
+    """True if the current AMD GPU is RDNA (gfx11xx/gfx12xx).
+
+    The custom/deterministic/quick all-reduce ops are CDNA-only and are omitted
+    from the RDNA build (see sgl-kernel/setup_rocm.py), so their Python wrappers
+    are skipped here too. Multi-GPU all-reduce on RDNA falls back to RCCL.
+    """
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        return arch.startswith("gfx11") or arch.startswith("gfx12")
+    except Exception:
+        return False
+
+
+_HIP_IS_RDNA = _is_rdna()
+
+if torch.version.hip is not None and not _HIP_IS_RDNA:
     # ROCM custom allreduce
     def init_custom_ar(
         meta: torch.Tensor,
@@ -91,6 +110,12 @@ if torch.version.hip is not None:
 
     def qr_max_size() -> int:
         return torch.ops.sgl_kernel.qr_max_size.default()
+
+elif torch.version.hip is not None:
+    # RDNA (e.g. gfx1151 / Strix Halo): the CDNA-only custom/deterministic/quick
+    # all-reduce ops are not built, so no wrappers are exposed here. Multi-GPU
+    # all-reduce falls back to RCCL; single-GPU never calls all-reduce.
+    pass
 
 else:
 
