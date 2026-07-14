@@ -9,7 +9,11 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.entrypoints.sidecar import _run_sidecar, build_sidecar_args
+from sglang.srt.entrypoints.sidecar import (
+    _run_sidecar,
+    build_sidecar_args,
+    start_sidecar,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -1541,6 +1545,21 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(
             build_sidecar_args(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
             ["--sglang-endpoint", "http://127.0.0.1:50051"],
+        )
+
+    def test_sidecar_process_name_includes_module(self):
+        server_args = SimpleNamespace(
+            sidecar="example.sidecar", host="127.0.0.1", grpc_port=50051
+        )
+        with (
+            patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
+            patch("sglang.srt.entrypoints.sidecar.Sidecar"),
+        ):
+            start_sidecar(server_args)
+
+        self.assertEqual(
+            get_context.return_value.Process.call_args.kwargs["name"],
+            "sglang_sidecar_example.sidecar",
         )
 
     def test_sidecar_requires_native_grpc(self):
