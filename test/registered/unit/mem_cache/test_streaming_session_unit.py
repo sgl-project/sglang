@@ -1,3 +1,4 @@
+import unittest
 from types import SimpleNamespace
 
 import torch
@@ -21,6 +22,7 @@ class _FakeAllocator:
 class _FakeInnerCache:
     def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
+        allocator.page_size = page_size
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
         self.match_results = list(match_results or [])
@@ -224,6 +226,49 @@ def test_trim_overshoot_postcondition():
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(38, 44))
+
+
+class TestStreamingPageAlignedBookkeeping(unittest.TestCase):
+    def test_trim_overshoot_preserves_page_aligned_watermark(self) -> None:
+        """Streaming trim frees pages and retains the partial committed page."""
+        page_size = 4
+        req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+        allocator = _FakeAllocator()
+        tree_cache = StreamingSession(
+            _FakeInnerCache(req_to_token_pool, allocator, page_size)
+        )
+        req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
+        req.origin_input_ids = list(range(26))
+        req.output_ids = list(range(14))
+
+        tree_cache._trim_overshoot(req, finished_len=12)
+
+        self.assertEqual(req.kv_committed_len, 38)
+        self.assertEqual(req.kv.kv_allocated_len, 40)
+        self.assertEqual(allocator.freed[0].tolist(), list(range(40, 44)))
+
+    def test_resume_free_tail_preserves_page_aligned_watermark(self) -> None:
+        """Streaming resume retains the page containing the restored prefix."""
+        page_size = 4
+        req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+        allocator = _FakeAllocator()
+        tree_cache = StreamingSession(
+            _FakeInnerCache(req_to_token_pool, allocator, page_size)
+        )
+        req = _FakeReq("session-a", req_pool_idx=0, committed=38, allocated=44)
+        slot = SessionSlot(
+            req_pool_idx=0,
+            kv_committed_len=38,
+            kv=SimpleNamespace(kv_allocated_len=44, swa_evicted_seqlen=0),
+        )
+
+        tree_cache._free_tail(slot, req, prefix_len=38)
+
+        self.assertEqual(slot.kv.kv_allocated_len, 40)
+        self.assertEqual(req.kv.kv_allocated_len, 40)
+        self.assertEqual(allocator.freed[0].tolist(), list(range(40, 44)))
 
 
 if __name__ == "__main__":
