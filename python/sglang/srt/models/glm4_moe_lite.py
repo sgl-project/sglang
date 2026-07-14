@@ -81,15 +81,12 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
-    is_npu,
     log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
-_is_npu = is_npu()
-
 
 class Glm4MoeLiteMLP(nn.Module):
     def __init__(
