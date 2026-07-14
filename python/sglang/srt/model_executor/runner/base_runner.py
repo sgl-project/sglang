@@ -229,7 +229,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.pp_size > 1
+            and mr.ps.pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -458,10 +458,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.pp_rank != 0
-                and mr.attn_cp_size > 1
+                and mr.ps.pp_rank != 0
+                and mr.ps.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
