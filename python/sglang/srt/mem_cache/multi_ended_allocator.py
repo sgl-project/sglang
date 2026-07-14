@@ -2287,20 +2287,85 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         assert mapped_end <= extend_num_tokens
 
-        if extend_num_tokens > self.available_size():
-            if not self._flush_both_for_alloc(extend_num_tokens):
-                return None
-
         full_allocator = self.full_attn_allocator
+        swa_allocator = self.swa_attn_allocator
         full_page_count = extend_num_tokens // self.page_size
+        swa_page_count = (mapped_end - win_start) // self.page_size
+        if self.lazy_compaction:
+            full_allocator._flush(urgent=True)
+            swa_allocator._flush(urgent=True)
+        if full_page_count > len(full_allocator.free_virtual_ids):
+            return None
+        if not self._has_asymmetric_swa_tail_capacity(
+            full_page_count=full_page_count,
+            swa_page_count=swa_page_count,
+        ):
+            return None
+
         virtual_pages = full_allocator.free_virtual_ids[:full_page_count].clone()
         tail_virtual_pages = virtual_pages[
             win_start // self.page_size : mapped_end // self.page_size
         ]
+        torch._assert_async(
+            torch.all(swa_allocator.virtual_to_physical[virtual_pages] == -1),
+            "Fresh full virtual pages must be unbound in the SWA allocator",
+        )
         virtual_tokens = full_allocator.alloc(extend_num_tokens)
         assert virtual_tokens is not None
-        self.swa_attn_allocator.alloc_with_virtual(tail_virtual_pages)
+        swa_allocated = False
+        try:
+            swa_allocator.alloc_with_virtual(tail_virtual_pages)
+            swa_allocated = True
+        finally:
+            if not swa_allocated:
+                full_allocator.free(virtual_tokens)
+                full_allocator.clear_inverse_history()
         return virtual_tokens
+
+    def _has_asymmetric_swa_tail_capacity(
+        self,
+        *,
+        full_page_count: int,
+        swa_page_count: int,
+    ) -> bool:
+        full_allocator = self.full_attn_allocator
+        swa_allocator = self.swa_attn_allocator
+        full_holes = len(full_allocator._free_phys_pages)
+        swa_holes = len(swa_allocator._free_phys_pages)
+        full_room = (
+            full_allocator.num_pages
+            - full_allocator.min_page_index
+            - full_allocator._allocated_pages()
+        )
+        swa_room = (
+            swa_allocator.num_pages
+            - swa_allocator.min_page_index
+            - swa_allocator._allocated_pages()
+        )
+        if full_page_count > full_holes + full_room:
+            return False
+        if swa_page_count > swa_holes + swa_room:
+            return False
+
+        if full_allocator.grow_direction == "up":
+            gap_bytes = max(
+                0,
+                swa_allocator._byte_low_frontier()
+                - full_allocator._byte_high_frontier(),
+            )
+        else:
+            gap_bytes = max(
+                0,
+                full_allocator._byte_low_frontier()
+                - swa_allocator._byte_high_frontier(),
+            )
+        required_bytes = (
+            max(0, full_page_count - full_holes)
+            * full_allocator.entry_bytes_per_page
+            + max(0, swa_page_count - swa_holes)
+            * swa_allocator.entry_bytes_per_page
+        )
+        return required_bytes <= gap_bytes
 
     def alloc_extend(
         self,

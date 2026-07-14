@@ -259,9 +259,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if swa_need_size == 0:
             return alloc_full_indices
 
-        alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+        alloc_swa_indices = None
+        try:
+            alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+        finally:
+            if alloc_swa_indices is None:
+                self.full_attn_allocator.free(alloc_full_indices)
         if alloc_swa_indices is None:
-            self.full_attn_allocator.free(alloc_full_indices)
             return None
 
         self.set_full_to_swa_mapping(

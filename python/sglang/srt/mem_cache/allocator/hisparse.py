@@ -342,9 +342,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert logical_indices.ndim == 1
         assert logical_indices.numel() == need_size
 
-        hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
+        hisparse_indices = None
+        try:
+            hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
+        finally:
+            if hisparse_indices is None:
+                self.logical_attn_allocator.free(logical_indices)
         if hisparse_indices is None:
-            self.logical_attn_allocator.free(logical_indices)
             return None
         assert hisparse_indices.ndim == 1
         assert hisparse_indices.numel() == need_size
@@ -642,9 +646,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert compressed_indices.ndim == 1
         assert compressed_indices.numel() == hisparse_need_size
-        hisparse_indices = self.hisparse_attn_allocator.alloc(hisparse_need_size)
+        hisparse_indices = None
+        try:
+            hisparse_indices = self.hisparse_attn_allocator.alloc(hisparse_need_size)
+        finally:
+            if hisparse_indices is None:
+                self.logical_attn_allocator.free(logical_indices)
         if hisparse_indices is None:
-            self.logical_attn_allocator.free(logical_indices)
             return None
 
         assert hisparse_indices.ndim == 1
