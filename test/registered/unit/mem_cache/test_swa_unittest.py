@@ -1,9 +1,11 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+import sglang.srt.mem_cache.allocator.swa as swa_allocator_module
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import (
@@ -266,6 +268,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
+        """SWA rejects partial free and clears mapping for a complete page."""
         page_size = 4
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
@@ -279,7 +282,17 @@ class TestSWA(unittest.TestCase):
         self.assertIsNotNone(full_indices)
         self.assertEqual(allocator.swa_available_size(), 16 - page_size)
 
-        allocator.free_swa(full_indices[:1])
+        with self.assertRaisesRegex(AssertionError, "complete page blocks"):
+            allocator.free_swa(full_indices[:1])
+
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] > 0
+            )
+        )
+
+        allocator.free_swa(full_indices)
         self.assertEqual(allocator.swa_available_size(), 16)
         self.assertTrue(
             torch.all(
@@ -287,8 +300,27 @@ class TestSWA(unittest.TestCase):
             )
         )
 
-        allocator.free_swa(full_indices[1:2])
-        self.assertEqual(allocator.swa_available_size(), 16)
+    def test_swa_page_expansion_preserves_npu_partial_carve_out(self) -> None:
+        """Non-NPU expansion uses stride while NPU keeps unordered partial unique."""
+        page_size = 4
+        allocator = object.__new__(SWATokenToKVPoolAllocator)
+        allocator.page_size = page_size
+        full_pages = torch.arange(8, 16, dtype=torch.int64, device=get_device())
+
+        with mock.patch.object(swa_allocator_module, "_is_npu", False):
+            strided = allocator._expand_to_full_pages(full_pages)
+
+        self.assertTrue(torch.equal(strided, full_pages))
+
+        unordered_partial = torch.tensor(
+            [13, 9],
+            dtype=torch.int64,
+            device=get_device(),
+        )
+        with mock.patch.object(swa_allocator_module, "_is_npu", True):
+            npu_expanded = allocator._expand_to_full_pages(unordered_partial)
+
+        self.assertTrue(torch.equal(npu_expanded, full_pages))
 
     def test_swa_tail_mapping_owns_the_padded_tail_page(self):
         """SWA-tail mapping excludes the prefix and owns its padded tail page."""
