@@ -817,13 +817,9 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Repoint by full-attention residency, not the SWA-window-safe match.
-        # A reused prefix can remain full-resident after its SWA window is
-        # tombstoned, so the window-safe match may be shorter than the KV
-        # indices that must be preserved.
-        match_result = self.match_prefix(
-            MatchPrefixParams(key=radix_key, req=req, return_full_match=True)
-        )
+        # Match prefix. SWA insertion retains one extra window before the
+        # page-aligned boundary, so the normal match remains safe to repoint.
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len

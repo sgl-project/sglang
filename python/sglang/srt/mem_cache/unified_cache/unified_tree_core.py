@@ -630,7 +630,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_last_device_node,
             full_kv_hit_length,
             action,
         ) = self._match_prefix_helper(key)
@@ -640,7 +639,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_last_device_node,
             full_kv_hit_length,
             action,
         )
@@ -650,7 +648,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         UnifiedTreeNode,
         UnifiedTreeNode,
         int,
-        UnifiedTreeNode,
         int,
         Optional[CacheAction | ComponentAction],
     ]:
@@ -664,9 +661,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
-        # Deepest device-resident full-attention node. Component validators can
-        # cap the normal match earlier when SWA is tombstoned.
-        full_last_device_node = node
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
@@ -716,13 +710,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node, action = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
-                    full_last_device_node = node
                 _update_best_if_valid(node)
                 break
 
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
-                full_last_device_node = child
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -734,7 +726,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_last_device_node,
             full_kv_hit_length,
             action,
         )
@@ -746,7 +737,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
-        full_last_device_node: UnifiedTreeNode,
         full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
     ) -> MatchResult:
@@ -770,20 +760,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node if self.enable_hicache else best_match_device_node
         )
 
-        if params.return_full_match:
-            device_indices = (
-                torch.cat(value) if value else self._empty_match_result.device_indices
-            )
-            last_device_node = full_last_device_node
-        elif best_match_device_value_len > 0:
+        if best_match_device_value_len > 0:
             device_indices = torch.cat(value[:best_match_device_value_len])
-            last_device_node = best_match_device_node
         else:
             device_indices = self._empty_match_result.device_indices
-            last_device_node = best_match_device_node
         result = MatchResult(
             device_indices=device_indices,
-            last_device_node=last_device_node,
+            last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
