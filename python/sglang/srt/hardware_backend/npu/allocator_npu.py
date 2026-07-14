@@ -69,6 +69,30 @@ def alloc_extend_naive(
             ).view(-1)
 
 
+def get_last_loc(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Slot id of each req's last already-allocated token, or -1 when
+    ``prefix_lens[i] == 0`` (fresh req).
+
+    Looks up ``req_to_token[req, prefix_lens - 1]`` to anchor the paged
+    allocator's ``alloc_extend`` on the real previous tail slot, preserving the
+    intra-page slot continuity the kernel's ``cmp_block_table`` relies on (the
+    allocator debug-asserts ``(last_loc + 1) % page_size == prefix_lens %
+    page_size``). Result dtype matches ``prefix_lens``.
+    """
+    req_pool_indices = req_pool_indices.to(torch.int64)
+    safe_idx = (prefix_lens.to(torch.int64) - 1).clamp(min=0)
+    looked_up = req_to_token[req_pool_indices, safe_idx].to(prefix_lens.dtype)
+    return torch.where(
+        prefix_lens > 0,
+        looked_up,
+        torch.full_like(prefix_lens, -1),
+    )
+
+
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def __init__(
         self,

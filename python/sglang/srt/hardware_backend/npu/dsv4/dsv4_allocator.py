@@ -29,7 +29,10 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_v4
-from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
+from sglang.srt.hardware_backend.npu.allocator_npu import (
+    NPUPagedTokenToKVPoolAllocator,
+    get_last_loc,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
@@ -39,30 +42,6 @@ from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4St
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
-
-def get_last_loc(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
-) -> torch.Tensor:
-    """Slot id of each req's last already-allocated token, or -1 when
-    ``prefix_lens[i] == 0`` (fresh req).
-
-    Looks up ``req_to_token[req, prefix_lens - 1]`` to anchor the paged
-    allocator's ``alloc_extend`` on the real previous tail slot, preserving the
-    intra-page slot continuity the kernel's ``cmp_block_table`` relies on (the
-    allocator debug-asserts ``(last_loc + 1) % page_size == prefix_lens %
-    page_size``). Result dtype matches ``prefix_lens``.
-    """
-    req_pool_indices = req_pool_indices.to(torch.int64)
-    safe_idx = (prefix_lens.to(torch.int64) - 1).clamp(min=0)
-    looked_up = req_to_token[req_pool_indices, safe_idx].to(prefix_lens.dtype)
-    return torch.where(
-        prefix_lens > 0,
-        looked_up,
-        torch.full_like(prefix_lens, -1),
-    )
 
 
 def alloc_paged_token_slots_extend_npu(*args, batch=None, **kwargs):
