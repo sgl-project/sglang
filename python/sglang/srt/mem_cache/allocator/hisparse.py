@@ -105,9 +105,7 @@ class _HiSparsePageOwnership:
         padding_page_ids = allocated_page_ids[
             ~torch.isin(allocated_page_ids, semantic_page_ids)
         ]
-        retained_padding_page_ids = padding_page_ids[
-            : remaining_size // self.page_size
-        ]
+        retained_padding_page_ids = padding_page_ids[: remaining_size // self.page_size]
         retained_padding_blocks = self._full_page_blocks(retained_padding_page_ids)
 
         new_size = remaining_size - retained_padding_blocks.numel()
@@ -120,9 +118,7 @@ class _HiSparsePageOwnership:
         else:
             new_blocks = allocated_page_ids[:0]
 
-        retained_page_ids = torch.cat(
-            [semantic_page_ids, retained_padding_page_ids]
-        )
+        retained_page_ids = torch.cat([semantic_page_ids, retained_padding_page_ids])
         surplus_page_ids = allocated_page_ids[
             ~torch.isin(allocated_page_ids, retained_page_ids)
         ]
