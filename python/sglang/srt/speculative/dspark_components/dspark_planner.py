@@ -371,12 +371,33 @@ class DSparkVerifyPlanner:
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not self.server_args.disable_overlap_schedule:
-            return draft_input.verify_token_budget
-        return self.compute_budget_sync(
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=req_pool_indices,
+            budget = draft_input.verify_token_budget
+        else:
+            budget = self.compute_budget_sync(
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_pool_indices,
+            )
+        return self._broadcast_verify_token_budget(budget)
+
+    def _broadcast_verify_token_budget(self, budget: Optional[int]) -> Optional[int]:
+        """Use TP0's budget to keep compact verify graph tiers identical."""
+        broadcast_group, group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
         )
+        if group_size <= 1:
+            return budget
+
+        budget_tensor = torch.tensor(
+            [-1 if budget is None else budget], dtype=torch.int64
+        )
+        torch.distributed.broadcast(
+            budget_tensor,
+            src=broadcast_group.ranks[0],
+            group=broadcast_group.cpu_group,
+        )
+        synced_budget = int(budget_tensor.item())
+        return None if synced_budget < 0 else synced_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
@@ -572,6 +593,12 @@ class DSparkVerifyPlanner:
                 f"DSpark verify-len budget violated (budget={budget})",
             )
 
+        broadcast_group, group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
+        )
+        if group_size > 1:
+            broadcast_group.broadcast(verify_lens, src=0)
+
         if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
             self._log_verify_lens_decision(
                 req_pool_indices=req_pool_indices,
@@ -580,12 +607,6 @@ class DSparkVerifyPlanner:
                 sort_survival=compute_sort_survival(confidence),
                 verify_lens=verify_lens,
             )
-
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
-        )
-        if group_size > 1:
-            broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
 
