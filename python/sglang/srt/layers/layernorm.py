@@ -85,11 +85,28 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
 
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
+    from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
+    from sgl_kernel import gemma_fused_add_rmsnorm as _sgl_gemma_fused_add_rmsnorm
+    from sgl_kernel import gemma_rmsnorm as _sgl_gemma_rmsnorm
+    from sgl_kernel import rmsnorm as _sgl_rmsnorm
+
+    from sglang.srt.utils.custom_op import register_custom_op_from_extern
+
+    rmsnorm = register_custom_op_from_extern(
+        _sgl_rmsnorm, op_name="sgl_rmsnorm", out_shape="input"
+    )
+    fused_add_rmsnorm = register_custom_op_from_extern(
+        _sgl_fused_add_rmsnorm,
+        op_name="sgl_fused_add_rmsnorm",
+        mutates_args=["input", "residual"],
+    )
+    gemma_rmsnorm = register_custom_op_from_extern(
+        _sgl_gemma_rmsnorm, op_name="sgl_gemma_rmsnorm", out_shape="input"
+    )
+    gemma_fused_add_rmsnorm = register_custom_op_from_extern(
+        _sgl_gemma_fused_add_rmsnorm,
+        op_name="sgl_gemma_fused_add_rmsnorm",
+        mutates_args=["input", "residual"],
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
