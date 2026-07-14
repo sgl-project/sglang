@@ -84,7 +84,7 @@ class TritonRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
-            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+            from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
                 fused_experts_mxfp8,
             )
 
@@ -181,7 +181,7 @@ def fused_experts_none_to_triton(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
-        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
+        from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
             fused_experts_mxfp8,
         )
 

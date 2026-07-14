@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
+    should_use_dsa_fused_topk,
 )
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
@@ -63,6 +64,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
+    print_warning_once,
 )
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
@@ -340,6 +342,7 @@ class DeepseekSparseAttnBackend(
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
         self.forward_metadata: DSAMetadata
@@ -433,6 +436,13 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self.use_fused_topk = should_use_dsa_fused_topk(
+            model_runner.server_args, seed_dsa_topk_from_draft_extend
+        )
+        if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
+            print_warning_once(
+                "Disabling fused DSA top-k for IndexShare under PD disaggregation."
+            )
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -1107,7 +1117,7 @@ class DeepseekSparseAttnBackend(
             and self.real_page_size > 1
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
-            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and self.use_fused_topk
             and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and self.dsa_index_topk is not None
             and self.dsa_index_topk <= 2048
@@ -1888,19 +1898,20 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
-        # Align topk_indices with q dimensions
-        # This handles cases where q is padded (TP + partial DP attention)
-        if topk_indices is not None:
-            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+
+        if self.use_fused_topk:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
+                if topk_indices is not None:
+                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
                 mask = topk_indices != -1
@@ -1919,6 +1930,12 @@ class DeepseekSparseAttnBackend(
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
+                    output_num_tokens=q_nope.shape[0],
+                    page_table_is_expanded=(
+                        forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_draft_extend_v2()
+                    ),
+                    cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
         # todo hisparse: to cover more backends
@@ -2112,7 +2129,7 @@ class DeepseekSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif envs.SGLANG_DSA_FUSE_TOPK.get():
+        elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -2665,11 +2682,9 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # Align topk_indices with q dimensions
-        if topk_indices is not None:
-            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
-
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        if self.use_fused_topk:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2677,8 +2692,16 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
+                output_num_tokens=q.shape[0],
+                page_table_is_expanded=(
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ),
+                cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
@@ -2835,7 +2858,7 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = (
+        force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
@@ -2879,7 +2902,11 @@ class DeepseekSparseAttnMultiStepBackend:
     needs_cpu_seq_lens: bool = False
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -2891,6 +2918,7 @@ class DeepseekSparseAttnMultiStepBackend:
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    seed_dsa_topk_from_draft_extend=seed_dsa_topk_from_draft_extend,
                 )
             )
 
