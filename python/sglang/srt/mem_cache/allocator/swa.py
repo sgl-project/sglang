@@ -15,10 +15,6 @@ _is_npu = is_npu()
 if _is_npu:
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.allocator_npu import (
-        NPUPagedTokenToKVPoolAllocator,
-    )
-
 
 # TODO(temporary-inside-chain): Move this legacy NPU helper to the NPU backend in op30.
 def alloc_extend_swa_tail_legacy_npu(
@@ -133,10 +129,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            if _is_npu:
-                PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
-            else:
-                PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
+            PagedTokenToKVPoolAllocatorClass = self._get_paged_allocator_class()
             self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size,
                 page_size,
@@ -176,6 +169,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+    def _get_paged_allocator_class(
+        self,
+    ) -> type[PagedTokenToKVPoolAllocator]:
+        return PagedTokenToKVPoolAllocator
 
     def available_size(self):
         return min(

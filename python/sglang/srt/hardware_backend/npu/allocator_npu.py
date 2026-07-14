@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
@@ -234,3 +235,10 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+
+class NPUSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    def _get_paged_allocator_class(
+        self,
+    ) -> type[PagedTokenToKVPoolAllocator]:
+        return NPUPagedTokenToKVPoolAllocator
