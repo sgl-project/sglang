@@ -673,7 +673,8 @@ class FlexKVRadixCache(RadixCache):
         quickly) and the launched-load tail (so the FlexKV pipe
         doesn't accumulate)."""
         self._drain_completed_stores()
-        self.flexkv_connector.drain_launched_loads()
+        if self._mode is FlexKVMode.IP:
+            self.flexkv_connector.drain_launched_loads()
 
     def _drain_completed_stores(self) -> None:
         completed_rids = self.flexkv_connector.check_completed_stores()
