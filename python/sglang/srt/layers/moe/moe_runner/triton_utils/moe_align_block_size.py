@@ -16,7 +16,7 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
 
 
 def moe_align_block_size(

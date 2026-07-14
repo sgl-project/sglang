@@ -110,6 +110,9 @@ def is_deepseek_dsa(config) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "GlmMoeDsaForCausalLMNextN",
+            "LongcatFlashForCausalLM",
+            "LongcatFlashForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -325,7 +328,10 @@ class ModelConfig:
         self.is_fp4_experts: bool = False
         if is_deepseek_v4(self.hf_config):
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
-            if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
+            if (
+                not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
+                or envs.SGLANG_DSV4_FP4_DEQUANT.is_set()
+            ):
                 from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
 
                 detected = try_detect_fp4_experts(self.model_path)
@@ -335,6 +341,8 @@ class ModelConfig:
                         "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
                         self.is_fp4_experts,
                     )
+            if envs.SGLANG_DSV4_FP4_DEQUANT.get():
+                envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
 
             # HF config.json inherits topk_group=4 from the V3 template, but
             # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
@@ -453,8 +461,6 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
-        self._verify_transformers_version()
-
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
@@ -485,6 +491,7 @@ class ModelConfig:
         model_path: str = None,
         model_revision: str = None,
         is_draft_model: bool = False,
+        context_length: Optional[int] = None,
         **kwargs,
     ):
         quantization = (
@@ -501,7 +508,11 @@ class ModelConfig:
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
-            context_length=server_args.context_length,
+            context_length=(
+                context_length
+                if context_length is not None
+                else server_args.context_length
+            ),
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
@@ -526,9 +537,11 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
-            "GlmMoeDsaForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
+            self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
 
         if (
             is_draft_model
@@ -731,6 +744,7 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
+            or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -915,19 +929,6 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
-        if "HrmTextForCausalLM" in self.hf_config.architectures:
-            # Compute KV slot count explicitly: native 5.9.0 configs inflate
-            # num_hidden_layers to this in __post_init__, but non-native ones
-            # may carry the raw per-stack count.
-            H_cycles = self.hf_text_config.H_cycles
-            L_cycles = self.hf_text_config.L_cycles
-            num_layers_per_stack = (
-                getattr(self.hf_text_config, "num_layers_per_stack", None)
-                or self.num_hidden_layers
-            )
-            self.num_attention_layers = (
-                int(num_layers_per_stack) * H_cycles * (L_cycles + 1)
-            )
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
@@ -943,6 +944,10 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
+        # GLM-Image is the only model here whose output head predicts vision tokens.
+        # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
+        if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
+            self.vocab_size = self.hf_text_config.vision_vocab_size
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -1156,10 +1161,14 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
-            architectures = getattr(self.hf_config, "architectures", []) or []
-            if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
-                arch.startswith("NemotronH") for arch in architectures
-            ):
+            quantized_layers = json_quant_configs.get("quantized_layers") or {}
+            has_modelopt_nvfp4_layers = any(
+                str(layer_info.get("quant_algo", "")).upper()
+                in ("NVFP4", "W4A16_NVFP4")
+                for layer_info in quantized_layers.values()
+                if isinstance(layer_info, dict)
+            )
+            if has_modelopt_nvfp4_layers:
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
@@ -1446,46 +1455,6 @@ class ModelConfig:
                     "sparse_attention_enabled"
                 ] = True
 
-    def _verify_transformers_version(self):
-        import transformers
-        from packaging import version
-
-        tf_version_str = getattr(transformers, "__version__", None)
-        if tf_version_str is None:
-            return
-
-        vision_config = getattr(self.hf_config, "vision_config", None)
-        is_glm_46vmoe = "glm-4.6v" in self.model_path.lower() or (
-            vision_config is not None
-            and getattr(vision_config, "model_type", None) == "glm4v_moe_vision"
-            # The vision config model type for GLM-4.5v is 'glm4v_moe',
-            # while for GLM-4.6v, it is 'glm4v_moe_vision'.
-        )
-        needs_tf_v5 = is_glm_46vmoe
-        # Older transformers lacks the native hrm_text config, so it silently
-        # falls back to TransformersForCausalLM and loads fused weights as junk.
-        architectures = getattr(self.hf_config, "architectures", []) or []
-        is_hrm_text = getattr(self.hf_config, "model_type", None) == "hrm_text" or (
-            "HrmTextForCausalLM" in architectures
-        )
-        if is_hrm_text and version.parse(tf_version_str) < version.parse("5.9.0"):
-            raise ValueError(
-                f"HRM-Text (model type {self.hf_config.model_type!r}) requires "
-                f"transformers >= 5.9.0, but {tf_version_str} is installed. "
-                "Please upgrade transformers."
-            )
-
-        tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0dev0")
-
-        if tf_version < required_version:
-            if needs_tf_v5:
-                raise ValueError(
-                    f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
-                    f"or model type {self.hf_config.model_type}. "
-                    "Please upgrade transformers to >= 5.0.0."
-                )
-
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
@@ -1686,6 +1655,7 @@ multimodal_model_archs = [
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
+    "GlmImageForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -1756,6 +1726,8 @@ piecewise_cuda_graph_disabled_model_archs = [
 # cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
 multimodal_piecewise_cuda_graph_supported_model_archs = [
     "Cohere2VisionForConditionalGeneration",
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1814,14 +1786,6 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
         arch in piecewise_cuda_graph_disabled_model_archs
         for arch in model_architectures
     )
-
-
-# Multimodal archs whose LM-decoder prefill is validated under piecewise CUDA
-# graph (capture wraps only the decoder; the image encoder runs eager).
-multimodal_piecewise_cuda_graph_supported_archs = [
-    "MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration",
-]
 
 
 def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):

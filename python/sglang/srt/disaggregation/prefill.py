@@ -39,8 +39,10 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
@@ -50,6 +52,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
+    NextBatchPlan,
     Req,
     ScheduleBatch,
 )
@@ -152,14 +155,34 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        layer_shard_enabled = getattr(
+            self.token_to_kv_pool, "layer_shard_enabled", False
+        )
+        layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
+        layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
+        transfer_draft_cache = (
+            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+        )
+        kv_args.prefill_start_layer = (
+            getattr(
+                self.token_to_kv_pool,
+                "layer_shard_start",
+                self.token_to_kv_pool.start_layer,
+            )
+            if layer_shard_enabled
+            else self.token_to_kv_pool.start_layer
+        )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.prefill_end_layer = (
+            kv_args.prefill_start_layer + len(kv_data_ptrs)
+            if layer_shard_enabled
+            else getattr(self.token_to_kv_pool, "end_layer", None)
+        )
 
-        if self.draft_token_to_kv_pool is not None:
+        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -189,7 +212,7 @@ class PrefillBootstrapQueue:
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
+            self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
@@ -246,6 +269,7 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
+            req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
         self._process_req(req)
         req.pending_bootstrap = True
@@ -269,9 +293,8 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        num_kv_indices = len(req.origin_input_ids)
-
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+        num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
@@ -447,24 +470,28 @@ class SchedulerDisaggregationPrefillMixin:
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
-    ) -> Optional[ScheduleBatch]:
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+    ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
-        self.running_batch.batch_is_full = False
+        running_batch.batch_is_full = False
 
-        self.process_prefill_chunk()
+        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 
         self.resolve_waiting_queue_bootstrap()
 
-        batch = self.get_new_batch_prefill()
+        prefill_plan = self.get_new_batch_prefill(running_batch)
+        batch = prefill_plan.batch_to_run
+        running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
 
-        return batch
+        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -473,15 +500,19 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -505,17 +536,21 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -538,7 +573,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -919,7 +954,11 @@ class SchedulerDisaggregationPrefillMixin:
             req, polls[0], defer_release=self.enable_overlap
         )
 
-    def process_prefill_chunk(self: Scheduler) -> None:
+    def process_prefill_chunk(
+        self: Scheduler,
+        last_batch: Optional[ScheduleBatch],
+        running_batch: ScheduleBatch,
+    ) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
@@ -937,20 +976,18 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk(self.chunked_req)
 
             if self.chunked_req is not None:
-                self.running_batch.batch_is_full = False
+                running_batch.batch_is_full = False
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req:
+        if last_batch and last_batch.forward_mode.is_extend():
+            if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+                chunked_req_to_exclude.add(last_batch.chunked_req)
 
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
+            last_bs = last_batch.batch_size()
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            if last_batch.batch_size() < last_bs:
+                running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         # Only bootstrap-finalized requests; staging excluded.
@@ -979,10 +1016,11 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
+        transfer_input_len = len(req.origin_input_ids)
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(req.extend_range.end, len(req.origin_input_ids))
+            else min(req.extend_range.end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1007,13 +1045,12 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            # fill_ids includes the token sampled during prefill, but decode
-            # registers state pages over origin_input_ids (DecodePreallocQueue)
-            # and the main pool send is clamped to end_idx above. Matching that
-            # length here avoids emitting an extra state page when the sampled
-            # token crosses a page boundary, which mismatched src/dst lengths in
-            # group_concurrent_contiguous.
-            seq_len = min(req.extend_range.end, len(req.origin_input_ids))
+            # Most state payloads read token-pool rows and should match the KV
+            # range actually materialized on prefill. C128 state is request
+            # scoped, so its transfer index must use the logical input length
+            # that decode used to register the destination row.
+            seq_len = min(req.extend_range.end, transfer_input_len)
+            c128_seq_len = transfer_input_len
 
             def _mamba_payload():
                 return [
@@ -1059,6 +1096,22 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _c128_state_payload():
+                online = is_dsv4_c128_online_enabled()
+                ring_size = (
+                    1
+                    if online
+                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
+                        128
+                    )
+                )
+                return get_dsv4_c128_state_indices(
+                    int(req.req_pool_idx),
+                    c128_seq_len,
+                    online=online,
+                    ring_size=ring_size,
+                )
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1076,6 +1129,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_dsa_payload())
                 elif st == StateType.SWA_RING:
                     state_indices.append(_swa_ring_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 

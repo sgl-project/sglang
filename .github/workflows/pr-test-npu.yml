@@ -410,8 +410,8 @@ jobs:
 
   pr-single-node-tests:
     name: single-node-poc
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -428,8 +428,10 @@ jobs:
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
-      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3'
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_from_source: false
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
       transformers_version: ''
 
   pr-test-npu-finish:
