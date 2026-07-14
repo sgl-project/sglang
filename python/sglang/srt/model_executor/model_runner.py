@@ -25,10 +25,6 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.srt.configs.hybrid_arch import (
-    hybrid_gdn_config,
-    mambaish_config,
-)
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -161,9 +157,6 @@ from sglang.srt.model_executor.model_runner_components.weight_exporter import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    ModelRunnerKVCacheMixin,
-)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
@@ -246,7 +239,7 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
-class ModelRunner(ModelRunnerKVCacheMixin):
+class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -469,24 +462,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
             gpu_id=self.gpu_id,
             ps=self.ps,
+            pp_group=self.pp_group,
             model_config=self.model_config,
             server_args=self.server_args,
             kv_cache_dtype=self.kv_cache_dtype,
+            model_dtype=self.dtype,
             page_size=self.page_size,
+            sliding_window_size=self.sliding_window_size,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
             post_capture_kv_active=is_post_capture_kv_active(
                 server_args=self.server_args, is_draft_worker=self.is_draft_worker
             ),
-            dflash_draft_num_layers=self.spec_aux_config.dflash_draft_num_layers,
+            spec_aux_config=self.spec_aux_config,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             use_mla_backend=self.use_mla_backend,
-            mambaish_config=mambaish_config(self.model_config),
-            hybrid_gdn_config=hybrid_gdn_config(self.model_config),
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            num_effective_layers=self.layer_info.num_effective_layers,
+            layer_info=self.layer_info,
             forward_stream=self.forward_stream,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -656,7 +648,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator()
-        self.init_memory_pool(self.pre_model_load_memory)
+        result = self.kv_cache_configurator.configure(
+            pre_model_load_memory=self.pre_model_load_memory
+        )
+        self.max_total_num_tokens = result.max_total_num_tokens
+        self.max_running_requests = result.max_running_requests
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool = result.token_to_kv_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.memory_pool_config = result.memory_pool_config
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = result.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
+        # Keep a reference so the shared byte buffer is not GC'd.
+        self._unified_memory_pool = result.unified_memory_pool
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
