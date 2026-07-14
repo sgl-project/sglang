@@ -1523,6 +1523,11 @@ class MMEncoder:
 
         return normalized
 
+    def _kimi_preprocess_images_gpu(self, images):
+        from sglang.srt.multimodal.processors.kimi_k25 import kimi_gpu_preprocess
+
+        return kimi_gpu_preprocess(images, self.image_processor.media_proc_cfg)
+
     async def _process_mm_items(self, mm_items, modality, log_metrics: bool = True):
         model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
 
@@ -1559,6 +1564,9 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         if self.model_type in ["kimi_k25", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
+            # kimi_vl's processor has no media_proc_cfg; GPU path is k2.5-only.
+            if self.model_type == "kimi_k25" and self.use_image_processor_gpu:
+                return self._kimi_preprocess_images_gpu(images)
         return await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
