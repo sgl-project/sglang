@@ -194,9 +194,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         self.assertEqual(mapping[3].item(), 0)
         self.assertTrue(torch.equal(mapping[4:6], rows[1, 2:4]))
         self.assertEqual(child_allocator.alloc_sizes, [])
-        self.assertTrue(
-            torch.equal(child_allocator.freed[0], torch.arange(20, 22))
-        )
+        self.assertTrue(torch.equal(child_allocator.freed[0], torch.arange(20, 22)))
 
     def test_generic_boundary_rejects_a_missing_temporary_owner(self) -> None:
         """Generic HiSparse still fails when a direct page has no temporary owner."""
