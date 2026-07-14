@@ -30,13 +30,15 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
-    get_num_indexer_layers,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     bootstrap,
     get_world_group,
+)
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    maybe_init_shared_mooncake_transfer_engine,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
@@ -195,7 +197,6 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -751,18 +752,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # would overwrite the target's process-global one.
             return
 
-        if not self.server_args.disable_shared_experts_fusion and hasattr(
-            self.model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = self.model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
-
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_server_args().enable_return_routed_experts,
+                model=self.model,
                 model_config=self.model_config,
-                num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
@@ -770,26 +763,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        enable = get_server_args().enable_return_indexer_topk
-        # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
-        # path); other backends would create a capturer but never feed it.
-        if enable and self.device != "cuda":
-            logger.warning(
-                "indexer-topk capture is CUDA-only; %s backend not yet wired. "
-                "Disabling capturer.",
-                self.device,
-            )
-            set_global_indexer_capturer(None)
-            return
-
-        hf_text_config = self.model_config.hf_text_config
-        num_indexer_layers = get_num_indexer_layers(hf_text_config)
-        index_topk = getattr(hf_text_config, "index_topk", 0)
         set_global_indexer_capturer(
             create_indexer_capturer(
-                enable=enable,
-                num_indexer_layers=num_indexer_layers,
-                index_topk=index_topk,
+                model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
@@ -857,49 +833,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
-        """
-        Need MooncakeTransferEngine when:
-        1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
-        2) HiCache uses mooncake storage backend
-        3) Encoder disaggregation uses mooncake
-        """
-        use_mooncake_te = (
-            (
-                self.server_args.disaggregation_mode != "null"
-                and self.server_args.disaggregation_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.enable_hierarchical_cache
-                and self.server_args.hicache_storage_backend == "mooncake"
-                and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-            )
-            or (
-                self.server_args.encoder_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.enable_elastic_expert_backup
-                and self.server_args.elastic_ep_backend is not None
-            )
+        maybe_init_shared_mooncake_transfer_engine(
+            server_args=self.server_args, gpu_id=self.gpu_id
         )
-
-        if use_mooncake_te:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                init_mooncake_transfer_engine,
-            )
-
-            init_mooncake_transfer_engine(
-                hostname=get_local_ip_auto(),
-                gpu_id=self.gpu_id,
-                ib_device=(
-                    self.server_args.disaggregation_ib_device
-                    or self.server_args.mooncake_ib_device
-                ),
-            )
 
     def load_model(self):
         tic_total = time.perf_counter()
