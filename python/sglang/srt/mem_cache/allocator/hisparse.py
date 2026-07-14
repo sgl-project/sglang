@@ -100,6 +100,38 @@ def _release_owned_page_ids(
     child_allocator.free(full_page_blocks)
 
 
+def _validate_page_block_indices(
+    indices: torch.Tensor,
+    *,
+    expected_size: int,
+    page_size: int,
+    device: torch.device,
+) -> None:
+    assert indices.ndim == 1, f"{indices.shape=}"
+    assert indices.is_contiguous(), f"{indices.stride()=}"
+    assert indices.dtype == torch.int64, f"{indices.dtype=}"
+    assert indices.device == device, f"{indices.device=}, {device=}"
+    assert indices.numel() == expected_size, f"{indices.numel()=}, {expected_size=}"
+    assert indices.numel() % page_size == 0, f"{indices.numel()=}, {page_size=}"
+    if indices.numel() == 0:
+        return
+
+    page_rows = indices.view(-1, page_size)
+    expected_rows = page_rows[:, :1] + torch.arange(
+        page_size,
+        dtype=torch.int64,
+        device=device,
+    )
+    torch._assert_async(
+        torch.all(page_rows[:, 0] % page_size == 0),
+        "HiSparse allocation blocks must be page aligned",
+    )
+    torch._assert_async(
+        torch.all(page_rows == expected_rows),
+        "HiSparse allocation blocks must contain complete consecutive pages",
+    )
+
+
 def _build_device_buffer_candidate(
     *,
     mapping: torch.Tensor,
@@ -268,20 +300,43 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def alloc(self, need_size: int):
-        if self.page_size != 1:
-            raise NotImplementedError(
-                "HiSparse generic allocation is only supported for page_size=1. "
-                "Use alloc_extend for paged allocation."
-            )
+        assert self.is_not_in_free_group
+        assert need_size >= 0, f"{need_size=}"
+        assert need_size % self.page_size == 0, f"{need_size=}, {self.page_size=}"
+        if need_size == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        if need_size > self.logical_attn_allocator.available_size():
+            return None
+        if need_size > self.hisparse_attn_allocator.available_size():
+            return None
 
         logical_indices = self.logical_attn_allocator.alloc(need_size)
         if logical_indices is None:
             return None
+        _validate_page_block_indices(
+            logical_indices,
+            expected_size=need_size,
+            page_size=self.page_size,
+            device=self.full_to_hisparse_device_index_mapping.device,
+        )
 
         hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
         if hisparse_indices is None:
             self.logical_attn_allocator.free(logical_indices)
+            torch._assert_async(
+                torch.all(
+                    self.full_to_hisparse_device_index_mapping[logical_indices] == 0
+                ),
+                "HiSparse mapping must remain unpublished after allocation rollback",
+            )
             return None
+        _validate_page_block_indices(
+            hisparse_indices,
+            expected_size=need_size,
+            page_size=self.hisparse_device_page_size,
+            device=self.full_to_hisparse_device_index_mapping.device,
+        )
 
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
@@ -579,10 +634,72 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "DeepSeek V4 HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
+        assert self.is_not_in_free_group
+        assert self.compress_ratio == 4
+        assert self.page_size % self.compress_ratio == 0
+        assert self.hisparse_page_size == self.page_size // self.compress_ratio
+        assert need_size >= 0, f"{need_size=}"
+        assert need_size % self.page_size == 0, f"{need_size=}, {self.page_size=}"
+        if need_size == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        hisparse_need_size = need_size // self.compress_ratio
+        if need_size > self.logical_attn_allocator.available_size():
+            return None
+        if hisparse_need_size > self.hisparse_attn_allocator.available_size():
+            return None
+
+        logical_indices = self.logical_attn_allocator.alloc(need_size)
+        if logical_indices is None:
+            return None
+        _validate_page_block_indices(
+            logical_indices,
+            expected_size=need_size,
+            page_size=self.page_size,
+            device=self.full_to_hisparse_device_index_mapping.device,
         )
+
+        compressed_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+                logical_indices
+            )
+        )
+        _validate_page_block_indices(
+            compressed_indices,
+            expected_size=hisparse_need_size,
+            page_size=self.hisparse_page_size,
+            device=self.full_to_hisparse_device_index_mapping.device,
+        )
+        expected_compressed_indices = logical_indices[
+            (logical_indices + 1) % self.compress_ratio == 0
+        ] // self.compress_ratio
+        torch._assert_async(
+            torch.all(compressed_indices == expected_compressed_indices),
+            "DeepSeek V4 compressed mapping keys must match the C4 translation",
+        )
+
+        hisparse_indices = self.hisparse_attn_allocator.alloc(hisparse_need_size)
+        if hisparse_indices is None:
+            self.logical_attn_allocator.free(logical_indices)
+            torch._assert_async(
+                torch.all(
+                    self.full_to_hisparse_device_index_mapping[compressed_indices]
+                    == 0
+                ),
+                "HiSparse mapping must remain unpublished after allocation rollback",
+            )
+            return None
+        _validate_page_block_indices(
+            hisparse_indices,
+            expected_size=hisparse_need_size,
+            page_size=self.hisparse_page_size,
+            device=self.full_to_hisparse_device_index_mapping.device,
+        )
+
+        self.full_to_hisparse_device_index_mapping[compressed_indices] = (
+            hisparse_indices
+        )
+        return logical_indices
 
     def alloc_logical_only(
         self,
@@ -602,6 +719,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+
 
     def collect_owned_hisparse_page_ids(
         self,
