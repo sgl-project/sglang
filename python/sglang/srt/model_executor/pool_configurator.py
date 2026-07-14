@@ -144,7 +144,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
-            eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
+            eagle_draft_num_layers = mr.spec_aux_config.eagle_draft_num_layers
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -161,7 +161,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = mr.dflash_family_draft_num_layers
+            draft_num_layers = mr.spec_aux_config.dflash_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
@@ -332,7 +332,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
-            draft_layers = getattr(mr, "eagle_draft_num_layers", None)
+            draft_layers = mr.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 self._draft_full_layers_num = int(draft_layers)
 
