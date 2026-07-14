@@ -19,8 +19,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -474,6 +476,43 @@ def _flash_mla_flashinfer(
     )
 
     return (output.unsqueeze(1), None)
+
+
+def _validate_flashinfer_sparse_mla_backend(
+    *,
+    model_arch: str,
+    device_sm_major: int,
+    kv_cache_dtype: torch.dtype,
+    prefill_impl: str,
+    decode_impl: str,
+    enable_hisparse: bool,
+) -> bool:
+    selected = {prefill_impl, decode_impl}
+    uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
+    is_glm_sm12_fp8 = (
+        model_arch == "GlmMoeDsaForCausalLM"
+        and device_sm_major == 12
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and not _is_hip
+    )
+    if uses_flashinfer_sparse_mla and not is_glm_sm12_fp8:
+        raise ValueError(
+            "flashinfer_sparse_mla supports only GLM DSA with FP8 KV cache "
+            "on NVIDIA SM120/SM121."
+        )
+    if is_glm_sm12_fp8:
+        unsupported = selected - {"flashinfer_sparse_mla"}
+        if unsupported:
+            raise ValueError(
+                "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
+                "only flashinfer_sparse_mla, "
+                f"but got {sorted(unsupported)}."
+            )
+        if enable_hisparse:
+            raise ValueError(
+                "flashinfer_sparse_mla does not support --enable-hisparse."
+            )
+    return uses_flashinfer_sparse_mla
 
 
 def flashinfer_sparse_mla_forward(

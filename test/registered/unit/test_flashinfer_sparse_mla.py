@@ -5,10 +5,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.dsa_backend import (
+from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _validate_flashinfer_sparse_mla_backend,
-)
-from sglang.srt.layers.attention.flash_mla_sm120 import (
     flashinfer_sparse_mla_forward,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
