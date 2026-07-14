@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.triton_ops.common import (
+    gather_req_to_token_pool_triton,
     get_last_loc_triton,
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
@@ -88,6 +90,50 @@ def write_cache_indices(
                 out_cache_loc[pt : pt + extend_len],
             )
             pt += extend_len
+
+
+def gather_out_cache_loc_extend(
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    req_pool_indices_tensor: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_tensor: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_lens_tensor: torch.Tensor,
+    extend_num_tokens: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    num_reqs: int = req_pool_indices_tensor.shape[0]
+    if num_reqs == 0 or extend_num_tokens == 0:
+        return torch.empty(
+            (0,), dtype=out_dtype, device=req_to_token_pool.device
+        )
+
+    req_to_token: torch.Tensor = req_to_token_pool.req_to_token
+    if support_triton(get_server_args().attention_backend):
+        out_gather: torch.Tensor = torch.empty(
+            (extend_num_tokens,), dtype=torch.int32, device=req_to_token_pool.device
+        )
+        gather_req_to_token_pool_triton[(num_reqs,)](
+            req_to_token,
+            req_pool_indices_tensor,
+            prefix_lens_tensor,
+            seq_lens_tensor,
+            extend_lens_tensor,
+            out_gather,
+            req_to_token.shape[1],
+        )
+        return out_gather.to(out_dtype)
+
+    chunks: list[torch.Tensor] = []
+    for index in range(num_reqs):
+        req_pool_index: int = req_pool_indices_cpu[index].item()
+        prefix_len: int = prefix_lens_cpu[index].item()
+        seq_len: int = seq_lens_cpu[index].item()
+        chunks.append(req_to_token[req_pool_index, prefix_len:seq_len])
+    return torch.cat(chunks).to(out_dtype)
 
 
 def get_last_loc(
@@ -354,6 +400,22 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    gathered: torch.Tensor = gather_out_cache_loc_extend(
+        batch.req_to_token_pool,
+        req_pool_indices_tensor=req_pool_indices_device,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        prefix_lens_tensor=prefix_lens_device,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_tensor=batch.seq_lens,
+        seq_lens_cpu=batch.seq_lens_cpu,
+        extend_lens_tensor=extend_lens_device,
+        extend_num_tokens=batch.extend_num_tokens,
+        out_dtype=out_cache_loc.dtype,
+    )
+    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+    out_cache_loc = gathered
+
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
         maybe_write_dsv4_extend(
@@ -468,6 +530,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
+
+    gathered: torch.Tensor = batch.req_to_token_pool.req_to_token[
+        batch.req_pool_indices, locs
+    ].to(out_cache_loc.dtype)
+    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+    out_cache_loc = gathered
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
