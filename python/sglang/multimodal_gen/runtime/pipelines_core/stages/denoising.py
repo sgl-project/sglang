@@ -757,7 +757,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # This is the last shared boundary before model-specific conditioning
         # kwargs are derived. The base config is a no-op; audited model families
         # explicitly opt in to any prompt-to-sample batch normalization.
-        server_args.pipeline_config.prepare_denoising_conditioning(batch)
+        server_args.pipeline_config.expand_conditioning_to_sample_batch(batch)
 
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
