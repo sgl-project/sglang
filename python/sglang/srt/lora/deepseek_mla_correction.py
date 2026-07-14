@@ -83,7 +83,9 @@ def apply_q_correction(
     A_buf, B_buf, batch_info = state
 
     full_K_per_head = attn_module.qk_nope_head_dim + attn_module.v_head_dim
-    return q_side_fused_fwd(q_nope, B_buf, A_buf, batch_info, q_nope_out, full_K_per_head)
+    return q_side_fused_fwd(
+        q_nope, B_buf, A_buf, batch_info, q_nope_out, full_K_per_head
+    )
 
 
 def apply_v_correction(
