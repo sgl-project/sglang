@@ -1857,7 +1857,7 @@ class MHATokenToKVPool(KVCache):
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
-            from sglang.srt.layers.attention.utils import (
+            from sglang.kernels.ops.attention.utils import (
                 launch_reshape_and_cache_shuffle_5d,
             )
 
