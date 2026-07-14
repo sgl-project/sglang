@@ -41,8 +41,19 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 
+MEM_BACKEND_UNKNOWN = 0
+MEM_BACKEND_MMAP = 1
+MEM_BACKEND_HUGEPAGE = 2
+
 HUGEPAGE_BYTES_2MB = 2 * 1024 * 1024
 HUGEPAGE_BYTES_1GB = 1024 * 1024 * 1024
+
+_HUGEPAGE_SYSFS_PATH = (
+    "/sys/kernel/mm/hugepages/hugepages-2048kB",
+    "/sys/kernel/mm/hugepages/hugepages-1048576kB",
+)
+
+_tensor_mem_backend: dict[int, int] = {}
 
 
 def hugepage_size_requested() -> int:
@@ -57,9 +68,9 @@ def hugepage_size_requested() -> int:
 
 def hugepage_available_bytes(hugepage_size: int) -> int:
     if hugepage_size == HUGEPAGE_BYTES_2MB:
-        sysfs_path = "/sys/kernel/mm/hugepages/hugepages-2048kB"
+        sysfs_path = _HUGEPAGE_SYSFS_PATH[0]
     elif hugepage_size == HUGEPAGE_BYTES_1GB:
-        sysfs_path = "/sys/kernel/mm/hugepages/hugepages-1048576kB"
+        sysfs_path = _HUGEPAGE_SYSFS_PATH[1]
     else:
         return 0
     try:
@@ -73,14 +84,31 @@ def hugepage_available_bytes(hugepage_size: int) -> int:
 def memory_available_bytes() -> int:
     """Bytes available for HiCache host pool preflight.
 
-    Without ``SGLANG_HUGEPAGE_SIZE``, uses free host RAM.
-    With hugepages requested, uses ``max(RAM, free hugetlb)``.
+    Without ``SGLANG_HUGEPAGE_SIZE``, uses free host RAM. With hugepages requested,
+    uses ``max(RAM, free hugetlb)`` so preflight can succeed when normal RAM is
+    low but the reserved hugetlb pool is large (``alloc_mmap`` still may fall
+    back to normal pages if the pool is exhausted at allocation time).
     """
     available_bytes = psutil.virtual_memory().available
     hugepage_size = hugepage_size_requested()
     if hugepage_size > 0:
         available_bytes = max(available_bytes, hugepage_available_bytes(hugepage_size))
     return available_bytes
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> int:
+    return tensor.untyped_storage().data_ptr()
+
+
+def _track_tensor_backend(tensor: torch.Tensor, backend: int) -> torch.Tensor:
+    key = _tensor_storage_key(tensor)
+    _tensor_mem_backend[key] = backend
+    weakref.finalize(tensor, _tensor_mem_backend.pop, key, None)
+    return tensor
+
+
+def tensor_mem_backend(tensor: torch.Tensor) -> int:
+    return _tensor_mem_backend.get(_tensor_storage_key(tensor), MEM_BACKEND_UNKNOWN)
 
 
 def _mmap_page_size_and_flags() -> tuple[int, int]:
@@ -146,9 +174,12 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         else:
             try:
                 array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
-                return torch.frombuffer(
-                    array, dtype=dtype, count=math.prod(dims)
-                ).reshape(dims)
+                return _track_tensor_backend(
+                    torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(
+                        dims
+                    ),
+                    MEM_BACKEND_HUGEPAGE,
+                )
             except OSError as e:
                 logger.error(
                     "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
@@ -167,4 +198,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
         prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
-    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    return _track_tensor_backend(
+        torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims),
+        MEM_BACKEND_MMAP,
+    )
