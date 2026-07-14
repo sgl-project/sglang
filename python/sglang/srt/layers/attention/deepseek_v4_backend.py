@@ -1656,13 +1656,9 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and (not _is_sm120)
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                )
+            if forward_batch.forward_mode.is_extend_without_speculative() and (
+                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             ):
                 return self._forward_prefill_sparse(
                     q=q,
