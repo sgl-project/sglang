@@ -134,12 +134,12 @@ transferred.
 sglang serve --model-path /models/GLM-Image --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19001 \
   --num-gpus 2 --base-gpu-id 0 --denoiser-sp 2 \
-  --batching-max-size 2 --attention-backend fa
+  --cfg-parallel-size 1 --batching-max-size 2 --attention-backend fa
 
 sglang serve --model-path /models/GLM-Image --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19002 \
   --num-gpus 2 --base-gpu-id 2 --denoiser-sp 2 \
-  --batching-max-size 2 --attention-backend fa
+  --cfg-parallel-size 1 --batching-max-size 2 --attention-backend fa
 
 # Public head; --encoder-urls and --decoder-urls are intentionally omitted
 sglang serve --model-path /models/GLM-Image --disagg-role server \

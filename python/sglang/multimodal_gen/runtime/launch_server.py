@@ -714,6 +714,24 @@ def launch_disagg_role(server_args: ServerArgs):
         "ulysses_degree": role_par["ulysses_degree"],
         "ring_degree": role_par["ring_degree"],
     }
+    role_tp = role_par["tp_size"] or 1
+    role_sp = role_par["sp_degree"] or 1
+    cfg_degree = (
+        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
+    )
+    if role_tp * role_sp * cfg_degree * server_args.dp_size > server_args.num_gpus:
+        logger.warning(
+            "Disabling CFG parallel for %s role because tp=%d, sp=%d, cfg=%d, "
+            "dp=%d requires more than %d devices",
+            role_type.value,
+            role_tp,
+            role_sp,
+            cfg_degree,
+            server_args.dp_size,
+            server_args.num_gpus,
+        )
+        role_overrides["enable_cfg_parallel"] = False
+        role_overrides["cfg_parallel_degree"] = 1
 
     base_dict = {
         f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)
