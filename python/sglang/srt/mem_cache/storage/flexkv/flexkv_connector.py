@@ -87,7 +87,14 @@ class FlexKVRetrieveResult:
 class _PreparedFlexKVLoad:
     pending: Optional[_PendingFlexKVLookup]
     slot_mapping: Optional[torch.Tensor]
+    producer_id: Optional[int]
     failure: Optional[FlexKVRetrieveResult]
+
+
+@dataclass(frozen=True)
+class _LayerwiseProducerSelection:
+    producer_id: int
+    reason: Optional[str]
 
 
 class FlexKVAmbiguousLoadError(RuntimeError):
@@ -390,7 +397,11 @@ class FlexKVConnector:
         All ranks make one combined pre-launch decision. Once launch has
         been attempted, every non-success outcome is ambiguous.
         """
-        prepared = self._prepare_load(rid=rid, slot_mapping=slot_mapping)
+        prepared = self._prepare_load(
+            rid=rid,
+            slot_mapping=slot_mapping,
+            layerwise=False,
+        )
         if prepared.failure is not None:
             return prepared.failure
         assert prepared.pending is not None and prepared.slot_mapping is not None
@@ -463,40 +474,23 @@ class FlexKVConnector:
             "start_load_kv_layerwise called but layerwise transfer is "
             "disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
         )
-        prepared = self._prepare_load(rid=rid, slot_mapping=slot_mapping)
+        prepared = self._prepare_load(
+            rid=rid,
+            slot_mapping=slot_mapping,
+            layerwise=True,
+        )
         if prepared.failure is not None:
             return 0, -1
-        assert prepared.pending is not None and prepared.slot_mapping is not None
+        assert (
+            prepared.pending is not None
+            and prepared.slot_mapping is not None
+            and prepared.producer_id is not None
+        )
         pending = prepared.pending
         fkv_task_id = pending.task_id
         slot_mapping_cpu = prepared.slot_mapping
+        producer_id = prepared.producer_id
         n = slot_mapping_cpu.numel()
-
-        # Allocate / receive producer slot.
-        if self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_LAYERWISE:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_LAYERWISE, got "
-                    f"{payload.get('cmd')}"
-                )
-            producer_id = int(payload["counter_id"])
-            self.layer_done_counter.register_task_with_explicit_counter_id(
-                fkv_task_id, producer_id
-            )
-        else:
-            producer_id = self.layer_done_counter.update_producer()
-            self.layer_done_counter.events[producer_id].reset_for_new_transfer()
-            self.layer_done_counter.register_task(fkv_task_id, producer_id)
-
-        if self._sync_ctx.is_pp_sender:
-            self._sync_ctx.scatter_pp(
-                {
-                    "cmd": CMD_LAYERWISE,
-                    "fkv_task_id": fkv_task_id,
-                    "counter_id": producer_id,
-                }
-            )
 
         outcome = {"observation_task_ids": [], "reason": None}
         if self._sync_ctx.is_sync_leader:
@@ -526,43 +520,70 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader:
             self._launched_load_tids.extend(observation_task_ids)
 
-        # Tell the layer hook which counter slot to wait on.
-        self.layer_done_counter.set_consumer(fkv_task_id)
         return n, producer_id
 
     def drain_launched_loads(self, threshold: int = 100) -> None:
-        """Inspect long-lived layerwise tasks without releasing their leases."""
+        """Release only layerwise tasks proven fully terminal and successful."""
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
             return
         if len(self._launched_load_tids) < threshold:
             return
-        try:
-            completed = self.kv_manager.try_wait(
-                task_ids=list(self._launched_load_tids)
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[FlexKV] drain_launched_loads try_wait: %s", exc)
-            return
         tracked_ids = set(self._launched_load_tids)
-        for task_id, response in (completed or {}).items():
-            try:
+        try:
+            responses = self.kv_manager.wait(
+                task_ids=list(self._launched_load_tids),
+                timeout=0,
+                completely=True,
+            )
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV layerwise terminal wait failed: {exc}"
+            self._poison_reason = reason
+            for task_id in tracked_ids:
+                self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
+            return
+
+        normalized_responses: Dict[int, Any] = {}
+        try:
+            if responses is None:
+                raise ValueError("FlexKV layerwise terminal wait returned no result")
+            for task_id, response in responses.items():
                 normalized_task_id = self._normalize_task_id(task_id)
-            except ValueError as exc:
-                self._poison_reason = str(exc)
-                continue
-            if normalized_task_id not in tracked_ids:
+                response_task_id = self._normalize_task_id(response.task_id)
+                if response_task_id != normalized_task_id:
+                    raise ValueError(
+                        "FlexKV layerwise terminal response changed task identity"
+                    )
+                normalized_responses[normalized_task_id] = response
+            if set(normalized_responses) != tracked_ids:
+                raise ValueError(
+                    "FlexKV layerwise terminal wait returned unexpected task ids"
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._poison_reason = str(exc)
+            for task_id in tracked_ids:
+                self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
+            return
+
+        completed_ids: set[int] = set()
+        for task_id, response in normalized_responses.items():
+            try:
+                status = response.status
+            except AttributeError:
+                status = None
+            if status is KVResponseStatus.SUCCESS:
+                completed_ids.add(task_id)
+            elif status is not KVResponseStatus.TIMEOUT:
                 self._poison_reason = (
-                    "FlexKV layerwise drain returned an unexpected task id"
+                    f"FlexKV layerwise task {task_id} completed with status {status}"
                 )
-                continue
-            if response.status != KVResponseStatus.SUCCESS:
-                self._poison_reason = (
-                    f"FlexKV layerwise task {normalized_task_id} completed with "
-                    f"status {response.status}"
-                )
-                self._ambiguous_loads[f"layerwise:{normalized_task_id}"] = (
-                    normalized_task_id,
-                )
+                self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
+        self._launched_load_tids = [
+            task_id
+            for task_id in self._launched_load_tids
+            if task_id not in completed_ids
+        ]
 
     # ------------------------------------------------------------------
     # Public API — store
@@ -839,13 +860,18 @@ class FlexKVConnector:
     # ------------------------------------------------------------------
 
     def _prepare_load(
-        self, *, rid: str, slot_mapping: Optional[torch.Tensor]
+        self,
+        *,
+        rid: str,
+        slot_mapping: Optional[torch.Tensor],
+        layerwise: bool,
     ) -> _PreparedFlexKVLoad:
         pending = self._pending_lookups.get(rid)
         local_status = 1
         local_reason: Optional[str] = None
         slot_mapping_cpu: Optional[torch.Tensor] = None
         page_starts: List[int] = []
+        producer_id = -1
 
         if self._poison_reason is not None:
             local_status = 0
@@ -871,18 +897,6 @@ class FlexKVConnector:
                 local_status = 0
                 local_reason = str(exc)
 
-        local_manifest = {
-            "task_id": pending.task_id if pending is not None else -1,
-            "expected_slots": pending.expected_slots if pending is not None else -1,
-            "page_starts": page_starts,
-        }
-        leader_manifest = local_manifest
-        if self._sync_ctx.needs_sync:
-            leader_manifest = self._sync_ctx.scatter(local_manifest)
-        if local_status == 1 and local_manifest != leader_manifest:
-            local_status = 0
-            local_reason = "lookup or slot manifest differs across ranks"
-
         if (
             local_status == 1
             and self._sync_ctx.should_send_slot_mapping_to_remote
@@ -891,6 +905,36 @@ class FlexKVConnector:
         ):
             try:
                 self._send_slot_mapping_to_remote(pending.task_id, slot_mapping_cpu)
+            except Exception as exc:  # noqa: BLE001
+                local_status = 0
+                local_reason = str(exc)
+
+        if layerwise:
+            producer_selection = self._select_layerwise_producer(pending=pending)
+            producer_id = producer_selection.producer_id
+            if producer_selection.reason is not None:
+                local_status = 0
+                local_reason = producer_selection.reason
+
+        local_manifest = {
+            "task_id": pending.task_id if pending is not None else -1,
+            "expected_slots": pending.expected_slots if pending is not None else -1,
+            "page_starts": page_starts,
+            "producer_id": producer_id,
+        }
+        leader_manifest = local_manifest
+        if self._sync_ctx.needs_sync:
+            leader_manifest = self._sync_ctx.scatter(local_manifest)
+        if local_status == 1 and local_manifest != leader_manifest:
+            local_status = 0
+            local_reason = "lookup or slot manifest differs across ranks"
+
+        if local_status == 1 and layerwise and pending is not None:
+            try:
+                self._register_layerwise_counter(
+                    pending=pending,
+                    producer_id=producer_id,
+                )
             except Exception as exc:  # noqa: BLE001
                 local_status = 0
                 local_reason = str(exc)
@@ -907,6 +951,7 @@ class FlexKVConnector:
             return _PreparedFlexKVLoad(
                 pending=pending,
                 slot_mapping=slot_mapping_cpu,
+                producer_id=producer_id if layerwise else None,
                 failure=FlexKVRetrieveResult(
                     status=FlexKVRetrieveStatus.DEFINITE_TERMINAL_FAILURE,
                     num_slots=0,
@@ -919,8 +964,98 @@ class FlexKVConnector:
         return _PreparedFlexKVLoad(
             pending=pending,
             slot_mapping=slot_mapping_cpu,
+            producer_id=producer_id if layerwise else None,
             failure=None,
         )
+
+    def _select_layerwise_producer(
+        self, *, pending: Optional[_PendingFlexKVLookup]
+    ) -> _LayerwiseProducerSelection:
+        counter = self.layer_done_counter
+        task_id = pending.task_id if pending is not None else -1
+        producer_id = -1
+        reason: Optional[str] = None
+
+        if self._sync_ctx.is_pp_receiver:
+            try:
+                payload = self._sync_ctx.scatter_pp(None)
+                if not isinstance(payload, dict):
+                    raise ValueError("FlexKV layerwise counter payload is invalid")
+                if payload.get("error") is not None:
+                    raise RuntimeError(str(payload["error"]))
+                if payload.get("cmd") != CMD_LAYERWISE:
+                    raise ValueError("FlexKV layerwise counter payload has the wrong tag")
+                received_task_id = self._normalize_task_id(
+                    payload.get("fkv_task_id")
+                )
+                if received_task_id != task_id:
+                    raise ValueError(
+                        "FlexKV layerwise counter payload changed task identity"
+                    )
+                if counter is None:
+                    raise RuntimeError("FlexKV layerwise counter is not initialized")
+                producer_id = self._normalize_counter_id(
+                    payload.get("counter_id"),
+                    num_counters=counter.num_counters,
+                )
+            except Exception as exc:  # noqa: BLE001
+                reason = str(exc)
+            return _LayerwiseProducerSelection(
+                producer_id=producer_id,
+                reason=reason,
+            )
+
+        try:
+            if pending is None:
+                raise RuntimeError("missing held lookup")
+            if counter is None:
+                raise RuntimeError("FlexKV layerwise counter is not initialized")
+            producer_id = self._normalize_counter_id(
+                counter.update_producer(),
+                num_counters=counter.num_counters,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc)
+
+        if self._sync_ctx.is_pp_sender:
+            payload = {
+                "cmd": CMD_LAYERWISE,
+                "fkv_task_id": task_id,
+                "counter_id": producer_id,
+                "error": reason,
+            }
+            try:
+                self._sync_ctx.scatter_pp(payload)
+            except Exception as exc:  # noqa: BLE001
+                reason = str(exc)
+
+        return _LayerwiseProducerSelection(
+            producer_id=producer_id,
+            reason=reason,
+        )
+
+    def _register_layerwise_counter(
+        self, *, pending: _PendingFlexKVLookup, producer_id: int
+    ) -> None:
+        counter = self.layer_done_counter
+        if counter is None:
+            raise RuntimeError("FlexKV layerwise counter is not initialized")
+        normalized_producer_id = self._normalize_counter_id(
+            producer_id,
+            num_counters=counter.num_counters,
+        )
+        if self._sync_ctx.is_pp_receiver:
+            counter.register_task_with_explicit_counter_id(
+                task_id=pending.task_id,
+                counter_id=normalized_producer_id,
+            )
+        else:
+            counter.events[normalized_producer_id].reset_for_new_transfer()
+            counter.register_task(
+                task_id=pending.task_id,
+                producer_id=normalized_producer_id,
+            )
+        counter.set_consumer(pending.task_id)
 
     def _validate_lookup_match(
         self,
@@ -972,6 +1107,17 @@ class FlexKVConnector:
         if not isinstance(task_ids, list) or not task_ids:
             raise ValueError("KVManager.launch returned invalid task ids")
         return [cls._normalize_task_id(task_id) for task_id in task_ids]
+
+    @staticmethod
+    def _normalize_counter_id(counter_id: Any, *, num_counters: int) -> int:
+        if isinstance(counter_id, bool) or not isinstance(
+            counter_id, (int, np.integer)
+        ):
+            raise ValueError("FlexKV returned an invalid layerwise counter id")
+        normalized_counter_id = int(counter_id)
+        if not 0 <= normalized_counter_id < num_counters:
+            raise ValueError("FlexKV returned an invalid layerwise counter id")
+        return normalized_counter_id
 
     def _validate_slot_mapping(
         self, *, slot_mapping: torch.Tensor, expected_slots: int
