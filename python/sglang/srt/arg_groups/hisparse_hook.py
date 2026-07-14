@@ -83,6 +83,15 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     if not server_args.enable_hisparse:
         return
 
+    if server_args.disaggregation_decode_enable_offload_kvcache:
+        raise ValueError(
+            "--enable-hisparse is incompatible with "
+            "--disaggregation-decode-enable-offload-kvcache. Generic DSA "
+            "would copy indirect KV slots and bypass HiSparse coordinator "
+            "cleanup, causing incorrect data and leaks; DeepSeek V4 "
+            "configurations generally fail during offload-manager construction."
+        )
+
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
         is_deepseek_v4,
