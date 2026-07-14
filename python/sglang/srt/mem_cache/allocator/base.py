@@ -20,8 +20,44 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+_DEBUG_MEMORY_POOL = envs.SGLANG_DEBUG_MEMORY_POOL.get()
+
+
+def _validate_page_aligned_free(
+    free_index: torch.Tensor,
+    *,
+    page_size: int,
+) -> None:
+    assert free_index.numel() % page_size == 0, (
+        f"free requires complete page blocks: "
+        f"numel={free_index.numel()}, page_size={page_size}"
+    )
+    if free_index.numel() == 0 or not _DEBUG_MEMORY_POOL:
+        return
+
+    page_blocks = free_index.reshape(-1, page_size).to(dtype=torch.int64)
+    page_starts = page_blocks[:, 0]
+    expected_blocks = page_starts[:, None] + torch.arange(
+        page_size,
+        dtype=torch.int64,
+        device=free_index.device,
+    )
+    sorted_page_starts = torch.sort(page_starts).values
+    valid_blocks = (
+        torch.all(page_starts % page_size == 0)
+        & torch.all(page_blocks == expected_blocks)
+        & torch.all(sorted_page_starts[1:] != sorted_page_starts[:-1])
+    )
+    torch._assert_async(
+        valid_blocks,
+        "free requires unique, aligned, complete page blocks",
+    )
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):

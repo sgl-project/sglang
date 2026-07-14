@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    _validate_page_aligned_free,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -67,6 +70,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
+        _validate_page_aligned_free(free_index, page_size=self.page_size)
         if free_index.numel() == 0:
             return
 
