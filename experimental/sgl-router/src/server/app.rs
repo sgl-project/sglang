@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::server::app_context::AppContext;
+use crate::server::header_utils::SERVER_TIMING;
 use crate::server::metrics::{
     outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome, WorkerModeLabel,
 };
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -81,6 +82,25 @@ fn pod_id() -> &'static str {
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "unknown".to_string())
     })
+}
+
+/// Pre-composed `Server-Timing` entry announcing this router pod's identity,
+/// `router.pod;desc=<pod_id>`, appended to every response at the single edge
+/// site so a gateway (or a direct caller) can attribute a response to a
+/// specific router replica — the same information stamped on the access log,
+/// now on the wire. Emitted as its own repeated `Server-Timing` line, exactly
+/// as the error path appends `router.stage`, so a consumer that joins the
+/// `Server-Timing` values and matches segment names can read `router.pod`
+/// without it colliding with a co-present `router.stage`. Built once from
+/// [`pod_id`]; falls back to a static `unknown` entry if the resolved id
+/// somehow isn't a valid header value (it always is for a real pod name).
+fn pod_server_timing() -> HeaderValue {
+    static V: OnceLock<HeaderValue> = OnceLock::new();
+    V.get_or_init(|| {
+        HeaderValue::from_str(&format!("router.pod;desc={}", pod_id()))
+            .unwrap_or_else(|_| HeaderValue::from_static("router.pod;desc=unknown"))
+    })
+    .clone()
 }
 
 /// Coarse point in the request lifecycle a handler has reached, as observed
@@ -278,10 +298,17 @@ async fn access_log_and_record(
         phase,
     };
 
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
     // Past this point the function is fully synchronous (no more `.await`),
     // so it will run to completion — safe to disarm the fallback now.
     log_guard.disarm();
+
+    // Stamp this router pod's identity on every response (2xx streams, router
+    // errors, admission sheds, infra probes alike) as its own `Server-Timing`
+    // line — appended, never overwriting, so an error path's `router.stage`
+    // entry and any upstream `Server-Timing` survive. See `pod_server_timing`.
+    resp.headers_mut()
+        .append(SERVER_TIMING, pod_server_timing());
 
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -806,6 +833,60 @@ mod tests {
             !logs.contains("test-infra-cancelled-rid"),
             "a cancelled infra-path request must not produce a WARN fallback \
              line; captured:\n{logs}"
+        );
+    }
+
+    /// The edge middleware stamps this router pod's identity as a `router.pod`
+    /// `Server-Timing` entry on a normal response, and does so by APPEND so a
+    /// handler's own `Server-Timing` line (the error path's `router.stage`, an
+    /// upstream's TTFB) survives alongside it rather than being overwritten —
+    /// see `pod_server_timing` for why a separate repeated line.
+    #[tokio::test]
+    async fn response_carries_router_pod_server_timing_without_clobbering() {
+        use axum::response::IntoResponse;
+
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    // Mimic the error path, which appends its own Server-Timing
+                    // entry (router.stage) before this middleware runs.
+                    let mut resp = StatusCode::OK.into_response();
+                    resp.headers_mut().append(
+                        SERVER_TIMING,
+                        HeaderValue::from_static("router.stage;desc=queue"),
+                    );
+                    resp
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let timings: Vec<String> = res
+            .headers()
+            .get_all(SERVER_TIMING)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            timings.iter().any(|t| t.starts_with("router.pod;desc=")),
+            "the edge middleware must stamp a router.pod Server-Timing entry; got {timings:?}",
+        );
+        assert!(
+            timings.iter().any(|t| t == "router.stage;desc=queue"),
+            "the handler's own Server-Timing entry must survive alongside \
+             router.pod (append, not overwrite); got {timings:?}",
         );
     }
 
