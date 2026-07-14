@@ -41,6 +41,10 @@ import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.js
 
 <GLM5Deployment />
 
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel` — that is the configuration our GLM-5 accuracy and benchmark runs cover, so we recommend keeping the default.
+</Warning>
+
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.

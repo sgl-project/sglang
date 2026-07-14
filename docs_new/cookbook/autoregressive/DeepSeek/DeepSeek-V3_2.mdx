@@ -57,6 +57,10 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
 
 <DeepSeekV32Deployment />
 
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel` — that is the configuration our DeepSeek-V3.2 accuracy and benchmark runs cover, so we recommend keeping the default.
+</Warning>
+
 ### 3.2 Configuration Tips
 
 - **Short-sequence MHA prefill (adaptive):** For prefill sequences shorter than 2048 tokens (default threshold), the DSA backend automatically switches to standard MHA (using FlashAttention variable-length on SM90, TRT-LLM ragged MHA on SM100). To extend this to longer sequences set env var `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a larger value (potential minor accuracy trade-off).

@@ -59,6 +59,10 @@ import { benchmarks } from "/src/snippets/configs/meituan-longcat/longcat-2.0-be
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Warning>
+  All recipes here run the LongCat sparse-attention indexer top-k on the default `--dsa-topk-backend sgl-kernel` — that is the configuration our LongCat-2.0 accuracy and benchmark runs cover, so we recommend keeping the default.
+</Warning>
+
 <Note>
   The B300 single-node recipe was validated end-to-end with CUDA graph capture enabled. H200, B200, and H20 are shown as 2-node recipes because LongCat-2.0-FP8 needs 16 ranks for those GPU memory profiles.
 </Note>
