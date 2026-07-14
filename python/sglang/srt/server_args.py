@@ -2723,6 +2723,7 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+        self._validate_hisparse_early_compatibility()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -2880,6 +2881,35 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _validate_hisparse_early_compatibility(self) -> None:
+        if not self.enable_hisparse:
+            return
+
+        if is_npu():
+            raise ValueError("HiSparse does not support NPU.")
+
+        raw_algorithm = self.speculative_algorithm
+        if raw_algorithm is None:
+            return
+        if isinstance(raw_algorithm, str):
+            if raw_algorithm.upper() == "NONE":
+                self.speculative_algorithm = None
+                return
+            raise ValueError(
+                "HiSparse does not support speculative decoding, "
+                f"but got {raw_algorithm!r}."
+            )
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if raw_algorithm is SpeculativeAlgorithm.NONE:
+            self.speculative_algorithm = None
+            return
+        raise ValueError(
+            "HiSparse does not support speculative decoding, "
+            f"but got {raw_algorithm!r}."
+        )
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:

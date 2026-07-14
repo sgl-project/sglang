@@ -6,6 +6,16 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    MultiEndedAllocator,
+    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -94,6 +104,26 @@ def _make_dsv4_allocator(
 
 
 class TestHiSparseDirectAllocator(unittest.TestCase):
+    def test_page_aligned_spec_capability_matrix_is_explicit(self) -> None:
+        """Spec direct capability remains disabled only for unsupported allocators."""
+        supported_classes = (
+            PagedTokenToKVPoolAllocator,
+            MultiEndedAllocator,
+            UnifiedMambaTokenToKVPoolAllocator,
+            SWATokenToKVPoolAllocator,
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+        for allocator_class in supported_classes:
+            self.assertTrue(allocator_class.supports_spec_page_aligned_alloc)
+
+        unsupported_classes = (
+            PureSWATokenToKVPoolAllocator,
+            HiSparseTokenToKVPoolAllocator,
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+        for allocator_class in unsupported_classes:
+            self.assertFalse(allocator_class.supports_spec_page_aligned_alloc)
+
     def test_generic_direct_alloc_publishes_complete_page_mapping(self) -> None:
         """Generic direct allocation publishes matching logical and device pages."""
         logical_indices = torch.arange(4, 8, dtype=torch.int64)
@@ -131,9 +161,7 @@ class TestHiSparseDirectAllocator(unittest.TestCase):
                 logical_indices,
             )
         )
-        self.assertTrue(
-            torch.all(allocator.full_to_hisparse_device_index_mapping == 0)
-        )
+        self.assertTrue(torch.all(allocator.full_to_hisparse_device_index_mapping == 0))
 
     def test_dsv4_direct_alloc_uses_c4_count_and_translated_keys(self) -> None:
         """DSV4 direct allocation maps translated C4 keys to C4 device slots."""
@@ -151,9 +179,7 @@ class TestHiSparseDirectAllocator(unittest.TestCase):
         self.assertEqual(allocator.hisparse_attn_allocator.alloc_sizes, [2])
         self.assertTrue(
             torch.equal(
-                allocator.full_to_hisparse_device_index_mapping[
-                    compressed_indices
-                ],
+                allocator.full_to_hisparse_device_index_mapping[compressed_indices],
                 device_indices,
             )
         )

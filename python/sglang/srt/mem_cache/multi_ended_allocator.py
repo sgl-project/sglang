@@ -100,6 +100,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
     supports_page_aligned_alloc: bool = True
+    supports_spec_page_aligned_alloc: bool = True
 
     def __init__(
         self,
@@ -1674,6 +1675,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
 
     supports_page_aligned_alloc: bool = True
+    supports_spec_page_aligned_alloc: bool = True
 
     def __init__(
         self,
@@ -1970,6 +1972,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """
 
     supports_page_aligned_alloc: bool = True
+    supports_spec_page_aligned_alloc: bool = True
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
     # override with a no-op setter. Reading returns `min(_size_full, _size_swa)`.

@@ -223,6 +223,8 @@ def _build_device_buffer_candidate(
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    supports_spec_page_aligned_alloc: bool = False
+
     def __init__(
         self,
         size: int,
@@ -534,6 +536,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    supports_spec_page_aligned_alloc: bool = False
 
     def __init__(
         self,

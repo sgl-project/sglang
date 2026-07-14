@@ -1206,7 +1206,10 @@ def alloc_for_spec_decode(
     allocator = tree_cache.token_to_kv_pool_allocator
     allocator_page: int = allocator.page_size
     uses_page_aligned_alloc: bool = (
-        not _is_npu and allocator_page > 1 and allocator.supports_page_aligned_alloc
+        not _is_npu
+        and allocator_page > 1
+        and allocator.supports_page_aligned_alloc
+        and allocator.supports_spec_page_aligned_alloc
     )
     allocation_nxt_kv_lens_cpu: torch.Tensor
     allocation_nxt_kv_lens: torch.Tensor

@@ -21,6 +21,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
     supports_page_aligned_alloc: bool = True
+    supports_spec_page_aligned_alloc: bool = True
 
     def __init__(
         self,
@@ -456,6 +457,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Single-pool allocator for models whose every layer is sliding-window attention."""
 
     supports_page_aligned_alloc: bool = False
+    supports_spec_page_aligned_alloc: bool = False
 
     def __init__(
         self,

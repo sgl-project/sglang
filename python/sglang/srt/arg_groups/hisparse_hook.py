@@ -83,6 +83,29 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     if not server_args.enable_hisparse:
         return
 
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        raise ValueError("HiSparse does not support NPU.")
+
+    raw_algorithm = server_args.speculative_algorithm
+    if isinstance(raw_algorithm, (SpeculativeAlgorithm, CustomSpecAlgo)):
+        resolved_algorithm = raw_algorithm
+    elif raw_algorithm is None or isinstance(raw_algorithm, str):
+        resolved_algorithm = SpeculativeAlgorithm.from_string(raw_algorithm)
+    else:
+        raise ValueError(
+            "HiSparse received an unsupported speculative algorithm value: "
+            f"type={type(raw_algorithm).__name__}, value={raw_algorithm!r}."
+        )
+    if resolved_algorithm is not SpeculativeAlgorithm.NONE:
+        raise ValueError(
+            "HiSparse does not support speculative decoding, "
+            f"but got {resolved_algorithm!r}."
+        )
+
     if server_args.disaggregation_decode_enable_offload_kvcache:
         raise ValueError(
             "--enable-hisparse is incompatible with "

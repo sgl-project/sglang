@@ -113,6 +113,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
 
     supports_page_aligned_alloc: bool = True
+    supports_spec_page_aligned_alloc: bool = True
 
     def __init__(
         self,
