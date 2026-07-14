@@ -145,7 +145,7 @@ class RelayPayload:
             topk_p=draft_input.topk_p,
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
-            draft_probs=getattr(draft_input, "draft_probs", None),
+            draft_probs=draft_input.draft_probs,
             dsa_topk_indices=draft_input.dsa_topk_indices,
         )
 

@@ -396,11 +396,11 @@ class HiCacheController:
             except Exception:
                 pass
 
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        alive = [t for t in threads if t.is_alive()]
         if alive:
             logger.error(
                 "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                [t.name for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 

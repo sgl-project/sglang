@@ -130,7 +130,7 @@ class SchedulerMetricsReporter:
             "cpu": "cpu graph",
             "npu": "npu graph",
             "musa": "musa graph",
-        }.get(getattr(self.scheduler, "device", ""), "cuda graph")
+        }.get(self.scheduler.device, "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
         # Each update adds (num_correct_drafts + bs, bs).
@@ -370,8 +370,8 @@ class SchedulerMetricsReporter:
         hf_text_config = model_config.hf_text_config
 
         hidden_size = float(model_config.hidden_size)
-        num_layers = float(getattr(model_config, "num_attention_layers", 0))
-        head_dim = float(getattr(model_config, "head_dim", 0))
+        num_layers = float(model_config.num_attention_layers)
+        head_dim = float(model_config.head_dim)
         num_attn_heads = float(
             model_config.get_num_attention_heads(self.scheduler.ps.tp_size)
         )
@@ -1023,16 +1023,15 @@ class SchedulerMetricsReporter:
             # For PP mode, check all running micro batches
             if self.scheduler.server_args.pp_size > 1:
                 for batch in self.scheduler.running_mbs:
-                    if batch and hasattr(batch, "reqs"):
+                    if batch:
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
             # For normal mode, check running_batch
             elif self.scheduler.running_batch:
-                if hasattr(self.scheduler.running_batch, "reqs"):
-                    for req in self.scheduler.running_batch.reqs:
-                        if hasattr(req, "lora_id") and req.lora_id is not None:
-                            active_lora_ids.add(req.lora_id)
+                for req in self.scheduler.running_batch.reqs:
+                    if req.lora_id is not None:
+                        active_lora_ids.add(req.lora_id)
 
             # Count active adapters (excluding None for base model)
             slots_used = len(active_lora_ids)
