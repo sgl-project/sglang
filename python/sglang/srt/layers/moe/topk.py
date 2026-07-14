@@ -31,8 +31,6 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 from sglang.srt.runtime_context import get_parallel
 
@@ -397,12 +395,12 @@ class TopK(MultiPlatformOp):
         self.layer_id = layer_id
         from sglang.srt.runtime_context import get_server_args
 
-        self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0 and get_server_args().enable_deepep_waterfill
+        self.enable_waterfill = (
+            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
 
-        self.deepep_waterfill_balancer = None
-        if self.enable_deepep_waterfill:
+        self.waterfill_balancer = None
+        if self.enable_waterfill:
             # TODO(ch-wan): Refactor shared-expert fusion and routed TopK fusion.
             top_k -= num_fused_shared_experts
             num_fused_shared_experts = 0
@@ -428,17 +426,15 @@ class TopK(MultiPlatformOp):
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
-    def _apply_deepep_waterfill(
-        self, topk_output: TopKOutput, num_tokens: int
-    ) -> TopKOutput:
-        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+    def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
+        if self.enable_waterfill and self.waterfill_balancer is None:
             raise RuntimeError(
-                "DeepEP waterfill TopK must be prepared by ModelRunner before forward."
+                "Waterfill TopK must be prepared by ModelRunner before forward."
             )
-        if self.deepep_waterfill_balancer is None:
+        if self.waterfill_balancer is None:
             return topk_output
         assert TopKOutputChecker.format_is_standard(topk_output)
-        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
+        return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def forward_native(
         self,
@@ -457,7 +453,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_cuda(
         self,
@@ -521,7 +517,7 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_cpu(
         self,
@@ -539,7 +535,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_npu(
         self,
@@ -604,7 +600,7 @@ class TopK(MultiPlatformOp):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_deepep_waterfill(topk_output, 0)
+        return self._apply_waterfill(topk_output, 0)
 
     def forward_xpu(
         self,
@@ -1211,73 +1207,14 @@ def biased_grouped_topk_impl(
     return topk_weights, topk_ids
 
 
+from sglang.kernels.ops.moe.fill_padded_rows import (
+    _can_fuse_padded_region,
+    _fill_padded_rows,
+)
+
+
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
-
-
-@triton.jit
-def _fill_padded_rows_kernel(
-    out_ptr,
-    num_token_non_padded_ptr,
-    n_cols,
-    fill_value,
-    stride_row,
-    BLOCK_COLS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    n_valid = tl.load(num_token_non_padded_ptr)
-    if row >= n_valid:
-        cols = tl.arange(0, BLOCK_COLS)
-        mask = cols < n_cols
-        ptrs = out_ptr + row * stride_row + cols
-        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
-        tl.store(ptrs, fill, mask=mask)
-
-
-def _can_fuse_padded_region(x: torch.Tensor) -> bool:
-    # The fused kernel uses one program per row and assumes a row-major 2D
-    # tensor (columns contiguous); fall back to eager for anything else.
-    return x.dim() == 2 and x.stride(1) == 1
-
-
-def _fill_padded_rows(
-    x: torch.Tensor,
-    num_token_non_padded: torch.Tensor,
-    fill_value,
-) -> None:
-    """Set ``x[row, :] = fill_value`` for every padded row (row index
-    ``>= num_token_non_padded``) using a single Triton launch.
-
-    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
-    issues several launch-latency-bound kernels per call. The grid is static
-    (one program per row) and the pad count is read from device memory inside
-    the kernel, so this is safe to capture inside a CUDA/HIP graph.
-    """
-    # Metadata-only checks (no device sync): the kernel reads a single scalar
-    # routing count from device memory, so it must be a 1-element integer tensor
-    # on the same device as ``x``.
-    assert isinstance(
-        num_token_non_padded, torch.Tensor
-    ), "num_token_non_padded must be a torch.Tensor"
-    assert num_token_non_padded.numel() == 1, (
-        "num_token_non_padded must be a single-element tensor, got shape "
-        f"{tuple(num_token_non_padded.shape)}"
-    )
-    assert (
-        not num_token_non_padded.dtype.is_floating_point
-    ), f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
-    assert (
-        num_token_non_padded.device == x.device
-    ), "num_token_non_padded and x must be on the same device"
-    n_rows, n_cols = x.shape
-    _fill_padded_rows_kernel[(n_rows,)](
-        x,
-        num_token_non_padded,
-        n_cols,
-        fill_value,
-        x.stride(0),
-        BLOCK_COLS=triton.next_power_of_2(n_cols),
-    )
 
 
 def _eplb_remap_enabled() -> bool:
@@ -1298,74 +1235,6 @@ def _eplb_remap_enabled() -> bool:
         server_args.enable_eplb
         or server_args.init_expert_location != "trivial"
         or server_args.ep_num_redundant_experts > 0
-    )
-
-
-@triton.jit
-def _fill_padded_rows_kernel(
-    out_ptr,
-    num_token_non_padded_ptr,
-    n_cols,
-    fill_value,
-    stride_row,
-    BLOCK_COLS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    n_valid = tl.load(num_token_non_padded_ptr)
-    if row >= n_valid:
-        cols = tl.arange(0, BLOCK_COLS)
-        mask = cols < n_cols
-        ptrs = out_ptr + row * stride_row + cols
-        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
-        tl.store(ptrs, fill, mask=mask)
-
-
-def _can_fuse_padded_region(x: torch.Tensor) -> bool:
-    # The fused kernel uses one program per row and assumes a row-major 2D
-    # tensor (columns contiguous); fall back to eager for anything else.
-    return x.dim() == 2 and x.stride(1) == 1
-
-
-def _fill_padded_rows(
-    x: torch.Tensor,
-    num_token_non_padded: torch.Tensor,
-    fill_value,
-) -> None:
-    """Set ``x[row, :] = fill_value`` for every padded row (row index
-    ``>= num_token_non_padded``) using a single Triton launch.
-
-    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
-    issues several launch-latency-bound kernels per call. The grid is static
-    (one program per row) and the pad count is read from device memory inside
-    the kernel, so this is safe to capture inside a CUDA/HIP graph.
-    """
-    # Metadata-only checks (no device sync): the kernel reads a single scalar
-    # routing count from device memory, so it must be a 1-element integer tensor
-    # on the same device as ``x``. Use explicit raises (not asserts) so the
-    # checks survive ``python -O`` and invalid inputs fail loudly instead of
-    # turning into opaque Triton/memory errors.
-    if not isinstance(num_token_non_padded, torch.Tensor):
-        raise TypeError("num_token_non_padded must be a torch.Tensor")
-    if num_token_non_padded.numel() != 1:
-        raise ValueError(
-            "num_token_non_padded must be a single-element tensor, got shape "
-            f"{tuple(num_token_non_padded.shape)}"
-        )
-    if num_token_non_padded.dtype.is_floating_point:
-        raise TypeError(
-            "num_token_non_padded must be an integer tensor, got "
-            f"{num_token_non_padded.dtype}"
-        )
-    if num_token_non_padded.device != x.device:
-        raise ValueError("num_token_non_padded and x must be on the same device")
-    n_rows, n_cols = x.shape
-    _fill_padded_rows_kernel[(n_rows,)](
-        x,
-        num_token_non_padded,
-        n_cols,
-        fill_value,
-        x.stride(0),
-        BLOCK_COLS=triton.next_power_of_2(n_cols),
     )
 
 
@@ -1919,7 +1788,7 @@ def _post_process_topk_ids(
         shared_id_base = ep_rank * num_local_experts + num_local_routed
 
         # Lazy import to avoid circular-import issues
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_remap_shared_experts_deepep,
         )
 
@@ -1940,7 +1809,7 @@ def _post_process_topk_ids(
         )
 
         # Lazy import to avoid circular-import issues
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_shared_experts,
         )
 

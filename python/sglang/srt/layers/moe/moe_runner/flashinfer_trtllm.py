@@ -36,7 +36,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
-    is_cuda_alike,
     is_flashinfer_available,
     next_power_of_2,
 )
@@ -103,8 +102,6 @@ if TYPE_CHECKING:
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-elif is_cuda_alike():
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 
@@ -964,6 +961,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
+            backend="cute-dsl",
         )
 
         seq_len, hidden_size = hidden_states.shape
