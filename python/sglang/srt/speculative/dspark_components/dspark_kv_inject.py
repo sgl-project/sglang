@@ -3,6 +3,9 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+    hip_unified_kv_triton_enabled,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -102,7 +105,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
     ) -> None:
-        if getattr(pool, "_unified_kv", False):
+        if hip_unified_kv_triton_enabled():
             swa_loc = self._unified_inject_loc(
                 pool=pool,
                 positions=positions,
@@ -185,7 +188,7 @@ class TargetHiddenKvInjector:
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
                 return
-            if getattr(pool, "_unified_kv", False):
+            if hip_unified_kv_triton_enabled():
                 inject_layout = build_unified_commit_inject_layout(
                     req_pool_indices=batch.req_pool_indices,
                     prefix_lens=prefix_lens,

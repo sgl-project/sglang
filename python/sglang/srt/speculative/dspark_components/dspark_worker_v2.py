@@ -5,6 +5,9 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+    hip_unified_kv_triton_enabled,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -426,11 +429,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # injector keeps only the last SWA window (older prefill tokens share a
         # ring slot and would race). Cheap; only consumed under unified_kv.
         state_slot = final_pos = None
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        if is_unified_kv_triton():
+        if hip_unified_kv_triton_enabled():
             repeats = ctx_lens.to(torch.int64)
             state_slot = torch.repeat_interleave(
                 batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
