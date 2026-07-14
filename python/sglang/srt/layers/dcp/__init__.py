@@ -31,7 +31,6 @@ out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
-    dcp_lse_combine_triton,
 )
 from sglang.srt.layers.dcp.comm import (
     dcp_a2a_lse_reduce,
@@ -65,7 +64,6 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 __all__ = [
     "DecodeContextParallelMetadata",
     "dcp_a2a_lse_reduce",
-    "dcp_lse_combine_triton",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
