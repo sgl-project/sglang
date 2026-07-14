@@ -424,9 +424,9 @@ class WriteReqToTokenPool:
             torch.int64,
         ), f"{out_cache_loc.dtype=}"
         assert out_cache_loc.is_contiguous(), f"{out_cache_loc.stride()=}"
-        assert out_cache_loc.device == req_to_token.device, (
-            f"{out_cache_loc.device=}, {req_to_token.device=}"
-        )
+        assert (
+            out_cache_loc.device == req_to_token.device
+        ), f"{out_cache_loc.device=}, {req_to_token.device=}"
 
         assert bool(torch.all(req_pool_indices_cpu >= 0)), f"{req_pool_indices_cpu=}"
         assert bool(
