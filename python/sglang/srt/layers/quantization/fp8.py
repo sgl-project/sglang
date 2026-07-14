@@ -1902,25 +1902,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
-            # Re-initialize w13_scale because we directly quantize
-            # merged w13 weights and generate a single scaling factor.
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_local_experts,
-                    dtype=torch.float32,
-                    device=w13_weight.device,
-                ),
-                requires_grad=False,
-            )
+            # Quantize merged w13 weights and generate a single scaling factor
+            # per expert.  We fill both columns of the original [E, 2] scale
+            # Parameter in-place (same value) to preserve its object identity
+            # and custom attributes (weight_loader, quant_method) for EPLB
+            # hot-reload, following the same principle as _copy_or_rebind in
+            # process_weights_after_loading_block_quant.
             for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                w13_weight[expert, :, :], scale = scaled_fp8_quant(
+                    layer.w13_weight.data[expert, :, :]
                 )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                layer.w13_weight_scale.data[expert].fill_(scale)
+                w2_weight[expert, :, :], layer.w2_weight_scale.data[expert] = (
                     scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
                 )
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+            # Rebind underlying tensor data while preserving Parameter objects.
+            layer.w13_weight.data = w13_weight
+            layer.w2_weight.data = w2_weight
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
@@ -1945,12 +1943,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         "fp8 MoE layer. Using the maximum across experts "
                         "for each layer. "
                     )
-                layer.w13_input_scale = torch.nn.Parameter(
-                    layer.w13_input_scale.max(), requires_grad=False
-                )
-                layer.w2_input_scale = torch.nn.Parameter(
-                    layer.w2_input_scale.max(), requires_grad=False
-                )
+                # Fill in-place to preserve the Parameter object and its
+                # custom attributes (weight_loader, quant_method, etc.)
+                # needed for EPLB hot-reload, following the same principle
+                # as _copy_or_rebind in process_weights_after_loading_block_quant.
+                layer.w13_input_scale.data.fill_(layer.w13_input_scale.data.max())
+                layer.w2_input_scale.data.fill_(layer.w2_input_scale.data.max())
 
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
@@ -2000,9 +1998,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
                     start += shard_size
 
-            layer.w13_weight_scale = torch.nn.Parameter(
-                max_w13_scales, requires_grad=False
-            )
+            # Fill in-place to preserve the Parameter object and its
+            # custom attributes (weight_loader, quant_method, etc.)
+            # needed for EPLB hot-reload.  Both columns of the [E, 2]
+            # tensor are set to the same per-expert max so that the
+            # weight_loader can reuse the original shape on reload.
+            # The runtime extracts a 1-D [E] view via [:, 0] in apply().
+            for expert_id in range(layer.num_local_experts):
+                layer.w13_weight_scale.data[expert_id].fill_(max_w13_scales[expert_id])
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
@@ -2288,8 +2291,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape = [scale_block_size, scale_block_size]
                 w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
                 w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                # w13_weight_scale is kept as [E, 2] for EPLB hot-reload
+                # compatibility; both columns hold the same per-expert max.
+                # Collapse to [E] before expanding to block shape.
+                _w13_ws = layer.w13_weight_scale
+                if _w13_ws.ndim == 2:
+                    _w13_ws = _w13_ws[:, 0]
                 w13_scale = (
-                    layer.w13_weight_scale.unsqueeze(1)
+                    _w13_ws.unsqueeze(1)
                     .repeat_interleave(w13_scale_n, dim=1)
                     .unsqueeze(2)
                     .repeat_interleave(w13_scale_k, dim=2)
