@@ -24,7 +24,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
-from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
+from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_WATERMARK_WAIT_S,
+    StagingRegisterInfo,
+)
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -1102,10 +1105,6 @@ class NixlKVManager(CommonKVManager):
                                 # pick it up again on the next pop.
                                 staging_deferred = True
                                 break
-                            # kv_xfer_handle is None here means staging
-                            # send_kvcache_staged() returned None (e.g.
-                            # decode buffer too small) -- fall through to
-                            # the slice path below.
 
                         if kv_xfer_handle is None:
                             if self.is_mla_backend or (
@@ -1212,11 +1211,10 @@ class NixlKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
+                        # Snapshot first: the scheduler thread adds concurrently.
+                        for k in list(self._staging_ctx.prefetch_requested):
+                            if k[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(k)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
@@ -1728,9 +1726,9 @@ class NixlKVManager(CommonKVManager):
           - staging successfully posted -> return ``(handle, False)``. The
             caller appends the handle to the per-chunk handle list and
             busy-polls it to DONE alongside other handles.
-          - send_kvcache_staged returned None (decode buffer too small,
-            kv_buffer_tensors missing, etc.) -> return ``(None, False)``,
-            signalling the caller to fall back to send_kvcache_slice.
+          - send_kvcache_staged returned None (chunk cannot fit; decode buffer
+            too small, kv_buffer_tensors missing, etc.) -> raise RuntimeError
+            instead of falling back to the slice path.
         """
         page_start = kv_chunk.index_slice.start
         num_pages = len(kv_chunk.prefill_kv_indices)
@@ -1750,6 +1748,11 @@ class NixlKVManager(CommonKVManager):
                     f"(room={kv_chunk.room}). Increase "
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            # Not ready yet: wait (bounded) for a watermark advance, then
+            # re-enqueue to retry. A plain block-until-ready would head-of-line
+            # block other rooms on this single worker thread.
+            with self._staging_ctx.watermark_cv:
+                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
             queue.put(kv_chunk)
             return (None, True)
 
@@ -1770,6 +1773,18 @@ class NixlKVManager(CommonKVManager):
             notif_tag,
             staging_buffer=staging_strategy.staging_buffer,
         )
+        if handle is None:
+            # A silent slice fallback would leak this chunk's decode-side
+            # allocation and pin the ring watermark; with grid-aligned sends
+            # not fitting can only mean misconfiguration.
+            raise RuntimeError(
+                f"[Staging] Staged transfer cannot fit chunk "
+                f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
+                f"pages={num_pages}). Increase "
+                f"SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB / "
+                f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
+                f"chunked_prefill_size."
+            )
         return (handle, False)
 
     def send_aux(
