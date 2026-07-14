@@ -245,11 +245,11 @@ allocator-page boundary. Consequently, FlexKV never publishes or releases a
 partial allocator page through this integration.
 
 Before a load launches, all participating ranks agree on the held lookup, the
-exact slot count, and the allocator-page starts. A PP stage uses its own exact
-slot mapping: followers compare against that stage's mapping, and a stage that
-owns a remote transfer sends that mapping to FlexKV. Slot numbers are not
-assumed to be identical across PP stages. A pre-launch mismatch requests
-cancellation of the held task and does not publish the allocated slots.
+exact slot count, and the allocator-page starts. A pre-launch mismatch requests
+cancellation of the held task and does not publish the allocated slots. STORE
+uses a stage-local exact slot mapping: followers compare against their PP
+stage's mapping, and a stage that owns a remote transfer sends that mapping to
+FlexKV. Store slot numbers are not assumed to be identical across PP stages.
 
 The task IDs returned by `KVManager.launch` are the observation IDs for both
 loads and stores; the pre-launch ID from `get_match` or `put_match` is not used
