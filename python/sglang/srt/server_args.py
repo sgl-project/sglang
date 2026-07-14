@@ -185,6 +185,7 @@ QUANTIZATION_CHOICES = [
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
+    "humming",
 ]
 
 
@@ -261,6 +262,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "humming",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -294,7 +296,6 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "cutlass",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -1434,7 +1435,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
         ),
@@ -2926,7 +2927,7 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
@@ -3644,8 +3645,12 @@ class ServerArgs:
             ),
             # DP-attn × BCG capture/replay not yet validated.
             ("DP attention", lambda: self._resolved().enable_dp_attention),
-            # Multimodal prefill replay faults under BCG.
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
+            (
+                "multimodal model",
+                lambda: self.get_model_config().is_multimodal
+                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            ),
         ]
         for name, predicate in rules:
             if predicate():
@@ -5199,7 +5204,7 @@ class ServerArgs:
 
         mode = strategy_to_legacy_mode[self.cp_strategy]
         use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
+            self._resolved(), "attention_backend", None
         ) in ("dsa", "dsv4")
         if use_dsa_legacy_aliases:
             self.enable_dsa_prefill_context_parallel = True
@@ -5419,19 +5424,19 @@ class ServerArgs:
         MoE layer on one (DP) rank. Single source of truth for both the
         standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
         budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_bs is
+        capture, and decode/verify bounds; num_tokens_per_req is
         speculative_num_draft_tokens under speculative decoding, else 1.
         """
         if self.speculative_algorithm:
-            num_tokens_per_bs = self.speculative_num_draft_tokens or 1
+            num_tokens_per_req = self.speculative_num_draft_tokens or 1
         else:
-            num_tokens_per_bs = 1
+            num_tokens_per_req = 1
         prefill_tokens = self.max_prefill_tokens
         cg_config = self.cuda_graph_config
         if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
             prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_bs
+        decode_tokens = decode_max_bs * num_tokens_per_req
         return max(prefill_tokens, decode_tokens)
 
     def max_prefill_buffer_tokens(self) -> int:
@@ -5452,7 +5457,7 @@ class ServerArgs:
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
-        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
         from sglang.srt.arg_groups.overrides import resolved_view
 
         view = resolved_view(self)
