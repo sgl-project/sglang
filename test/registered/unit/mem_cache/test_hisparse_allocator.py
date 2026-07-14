@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -154,6 +155,120 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.mem_pool_host.alloc_paged_token_slots.assert_called_once()
+
+
+class _FakeChildAllocator:
+    def __init__(
+        self,
+        *,
+        allocation: torch.Tensor | None,
+    ) -> None:
+        self.allocation = allocation
+        self.alloc_sizes: list[int] = []
+        self.freed: list[torch.Tensor] = []
+
+    def available_size(self) -> int:
+        return 64
+
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        self.alloc_sizes.append(need_size)
+        return self.allocation
+
+    def free(self, indices: torch.Tensor) -> None:
+        self.freed.append(indices.clone())
+
+
+class _FakeC4Pool:
+    @staticmethod
+    def translate_loc_from_full_to_compressed(
+        full_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        return full_indices[(full_indices + 1) % 4 == 0] // 4
+
+
+def _make_direct_allocator(
+    *,
+    dsv4: bool,
+    device_allocation: torch.Tensor | None,
+) -> HiSparseTokenToKVPoolAllocator | DeepSeekV4HiSparseTokenToKVPoolAllocator:
+    allocator_class = (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator
+        if dsv4
+        else HiSparseTokenToKVPoolAllocator
+    )
+    allocator = object.__new__(allocator_class)
+    allocator.page_size = 8
+    allocator.compress_ratio = 4 if dsv4 else 1
+    allocator.hisparse_page_size = 2 if dsv4 else 8
+    allocator.device = "cpu"
+    allocator.is_not_in_free_group = True
+    allocator.logical_attn_allocator = _FakeChildAllocator(
+        allocation=torch.arange(8, 16, dtype=torch.int64)
+    )
+    allocator.hisparse_attn_allocator = _FakeChildAllocator(
+        allocation=device_allocation
+    )
+    allocator.full_to_hisparse_device_index_mapping = torch.zeros(
+        64,
+        dtype=torch.int64,
+    )
+    if dsv4:
+        allocator.hisparse_kvcache = _FakeC4Pool()
+    return allocator
+
+
+class TestHiSparseDirectAllocator(unittest.TestCase):
+    def test_direct_alloc_publishes_generic_and_dsv4_mappings(self) -> None:
+        """Direct allocation publishes both generic and compressed mappings."""
+        cases = (
+            (False, torch.arange(24, 32, dtype=torch.int64)),
+            (True, torch.arange(6, 8, dtype=torch.int64)),
+        )
+
+        for dsv4, device_indices in cases:
+            with self.subTest(dsv4=dsv4):
+                allocator = _make_direct_allocator(
+                    dsv4=dsv4,
+                    device_allocation=device_indices,
+                )
+
+                result = allocator.alloc(8)
+                mapping_indices = (
+                    torch.tensor([2, 3], dtype=torch.int64)
+                    if dsv4
+                    else torch.arange(8, 16, dtype=torch.int64)
+                )
+
+                self.assertTrue(
+                    torch.equal(result, torch.arange(8, 16, dtype=torch.int64))
+                )
+                self.assertTrue(
+                    torch.equal(
+                        allocator.full_to_hisparse_device_index_mapping[
+                            mapping_indices
+                        ],
+                        device_indices,
+                    )
+                )
+
+    def test_direct_alloc_rolls_back_on_second_child_failure(self) -> None:
+        """A failed device-child allocation leaves no logical or mapping owner."""
+        for dsv4 in (False, True):
+            with self.subTest(dsv4=dsv4):
+                allocator = _make_direct_allocator(
+                    dsv4=dsv4,
+                    device_allocation=None,
+                )
+
+                result = allocator.alloc(8)
+
+                self.assertIsNone(result)
+                self.assertEqual(len(allocator.logical_attn_allocator.freed), 1)
+                self.assertTrue(
+                    torch.all(
+                        allocator.full_to_hisparse_device_index_mapping == 0
+                    )
+                )
 
 
 if __name__ == "__main__":
