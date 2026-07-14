@@ -962,6 +962,7 @@ class Req(ReqDllmMixin):
 
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
+        self.spec_num_proposed_drafts = 0
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.

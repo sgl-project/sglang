@@ -41,6 +41,7 @@ class GenerationBatchResult:
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
+    num_proposed_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 

@@ -278,6 +278,7 @@ class _GenerationStreamAccumulator:
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_proposed_drafts: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
@@ -406,6 +407,7 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_num_proposed_drafts.append(req.spec_num_proposed_drafts)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
 
         if self.return_logprob:
@@ -528,6 +530,7 @@ class _GenerationStreamAccumulator:
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_proposed_drafts=self.spec_num_proposed_drafts,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,

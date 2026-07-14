@@ -2349,9 +2349,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
             # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                self.server_args.max_speculative_num_draft_tokens - 1
-            )
+            if (
+                hasattr(recv_obj, "spec_num_proposed_drafts")
+                and recv_obj.spec_num_proposed_drafts
+                and len(recv_obj.spec_num_proposed_drafts) > i
+            ):
+                num_proposed_drafts = recv_obj.spec_num_proposed_drafts[i]
+            else:
+                max_draft_tokens = (
+                    self.server_args.max_speculative_num_draft_tokens
+                    or self.server_args.speculative_num_draft_tokens
+                    or 1
+                )
+                num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
+                    max_draft_tokens - 1
+                )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
