@@ -51,7 +51,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         device = torch.device("xpu")
 
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
-        hidden_states = torch.randn(M, 100, dtype=torch.float32, device=device)
+        hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
         gating_output = torch.randn(M, E, dtype=gating_dtype, device=device)
         correction_bias = torch.randn(E, dtype=bias_dtype, device=device)
 
@@ -86,7 +86,6 @@ class TestBiasedGroupedTopK(CustomTestCase):
         ref.scatter_(1, ref_topk_ids.long(), ref_topk_weights)
         torch.testing.assert_close(res, ref)
 
-    """
     # Nemotron-3-Nano-30B-A3B uses fast biased_grouped_topk with num_expert_group = 1 and topk_group = 1
     def test_fast_biased_grouped_topk(self):
         # The test config is also from this nemotron model.
@@ -115,7 +114,6 @@ class TestBiasedGroupedTopK(CustomTestCase):
                 bias_dtype,
                 routed_scaling_factor,
             )
-    """
 
     def test_biased_grouped_topk(self):
         # DeepSeek-V3 style grouped routing shape
