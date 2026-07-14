@@ -429,10 +429,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
+        # thread the per-token state_slot + the req's final position so the
+        # injector keeps only the last SWA window (older prefill tokens share a
+        # ring slot and would race). Cheap; only consumed under unified_kv.
+        state_slot = final_pos = None
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            repeats = ctx_lens.to(torch.int64)
+            state_slot = torch.repeat_interleave(
+                batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
+            )
+            final_pos = torch.repeat_interleave(
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
+            )
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
             positions=positions,
+            state_slot=state_slot,
+            final_pos=final_pos,
         )
         logits_output.hidden_states = None
 

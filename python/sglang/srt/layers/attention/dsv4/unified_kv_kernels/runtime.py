@@ -110,6 +110,56 @@ def store_swa_into_unified(
     )
 
 
+@triton.jit
+def _scatter_loc_kernel(
+    kv_ptr,  # [T, D] bf16
+    loc_ptr,  # [T] int (unified row index; <0 => skip)
+    unified_ptr,  # [pages, D] bf16
+    n_rows,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    loc = tl.load(loc_ptr + row).to(tl.int64)
+    if loc < 0:
+        return
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < D
+    vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
+    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
+
+
+def scatter_bf16_into_unified(
+    *,
+    kv: torch.Tensor,  # [T, head_dim] bf16 (already norm+rope'd)
+    loc: torch.Tensor,  # [T] int32/int64 unified ring row; <0 => skip
+    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
+) -> None:
+    """Scatter already-norm+rope'd bf16 K into ``unified_kv[loc]`` (skip loc < 0).
+
+    Companion to ``store_swa_into_unified`` for callers that already hold the
+    precomputed ring row index (the DSpark draft: ``get_unified_swa_loc`` for the
+    draft forward, or the commit-inject layout for target-hidden injection) and
+    need per-row commit masking expressed as ``loc == -1``.
+    """
+    n_rows, D = kv.shape
+    if n_rows == 0:
+        return
+    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert loc.is_contiguous()
+    _scatter_loc_kernel[(n_rows,)](
+        kv,
+        loc,
+        unified_kv,
+        n_rows,
+        D=D,
+        BLOCK_D=triton.next_power_of_2(D),
+        num_warps=8,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ragged indptr helper (shared by the decode streams + prefill builders)
 # ---------------------------------------------------------------------------

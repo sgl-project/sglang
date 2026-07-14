@@ -141,6 +141,20 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        if pool._unified_kv:
+            # unified_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
+            # None). Use the unified ring write target -- get_unified_swa_loc
+            # recomputes it from live positions for multi-step draft decode.
+            pool.set_unified_key_buffer_radix_fused_norm_rope(
+                layer_id=self.layer_id,
+                swa_loc=attn_backend.get_unified_swa_loc(forward_batch),
+                kv=kv,
+                kv_weight=self.kv_norm.weight.data,
+                eps=self.eps,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
+            )
+            return
         pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -665,9 +679,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
         )
+        # Under unified_kv the swa_kv_pool is None; the caller passes a unified
+        # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
+        # store just needs to target the bf16 ring instead of the fp8 flashmla
+        # buffer. Same swa_loc/positions contract either way.
+        store_kv = (
+            pool.set_unified_key_buffer_radix_fused_norm_rope
+            if pool._unified_kv
+            else pool.set_swa_key_buffer_radix_fused_norm_rope
+        )
         for stage, kv in zip(self.stages, kvs):
             attn = stage.self_attn
-            pool.set_swa_key_buffer_radix_fused_norm_rope(
+            store_kv(
                 layer_id=attn.layer_id,
                 swa_loc=swa_loc,
                 kv=kv,

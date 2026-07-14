@@ -1195,6 +1195,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_kv_pool.page_size,
         )
 
+    def set_unified_key_buffer_radix_fused_norm_rope(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """unified_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope.
+
+        Under unified_kv the (fp8, paged) swa_kv_pool is None -- SWA K lives in
+        the shared bf16 unified_kv ring instead. Norm+RoPE the draft KV in place
+        (the same freqs_cis path the main model uses via _compute_kv_bf16) and
+        scatter it into ``unified_kv[swa_loc]``. Rows with swa_loc < 0
+        (uncommitted verify tokens) are skipped by the scatter.
+        """
+        from sglang.jit_kernel.dsv4 import fused_norm_rope_inplace
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+        fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+        runtime.scatter_bf16_into_unified(
+            kv=kv,
+            loc=swa_loc,
+            unified_kv=self.get_unified_kv(layer_id),
+        )
+
     def set_extra_key_buffer_fused(
         self,
         layer_id: int,
