@@ -112,12 +112,10 @@ def gather_out_cache_loc_extend(
     assert req_to_token.dtype == torch.int32, f"{req_to_token.dtype=}"
     assert req_to_token.is_contiguous(), f"{req_to_token.stride()=}"
     assert req_to_token.stride(1) == 1, f"{req_to_token.stride()=}"
-    assert req_to_token.shape[0] > 0 and req_to_token.shape[1] > 0, (
-        f"{req_to_token.shape=}"
-    )
-    assert req_pool_indices_tensor.ndim == 1, (
-        f"{req_pool_indices_tensor.shape=}"
-    )
+    assert (
+        req_to_token.shape[0] > 0 and req_to_token.shape[1] > 0
+    ), f"{req_to_token.shape=}"
+    assert req_pool_indices_tensor.ndim == 1, f"{req_pool_indices_tensor.shape=}"
     num_reqs: int = req_pool_indices_tensor.shape[0]
 
     input_tensors: tuple[torch.Tensor, ...] = (
@@ -130,21 +128,21 @@ def gather_out_cache_loc_extend(
         extend_lens_tensor,
         extend_lens_cpu,
     )
-    assert all(tensor.ndim == 1 for tensor in input_tensors), (
-        f"shapes={[tensor.shape for tensor in input_tensors]}"
-    )
-    assert all(tensor.shape == (num_reqs,) for tensor in input_tensors), (
-        f"{num_reqs=}, shapes={[tensor.shape for tensor in input_tensors]}"
-    )
-    assert all(tensor.dtype == torch.int64 for tensor in input_tensors), (
-        f"dtypes={[tensor.dtype for tensor in input_tensors]}"
-    )
-    assert all(tensor.is_contiguous() for tensor in input_tensors), (
-        f"strides={[tensor.stride() for tensor in input_tensors]}"
-    )
-    assert all(tensor.stride(0) == 1 for tensor in input_tensors), (
-        f"strides={[tensor.stride() for tensor in input_tensors]}"
-    )
+    assert all(
+        tensor.ndim == 1 for tensor in input_tensors
+    ), f"shapes={[tensor.shape for tensor in input_tensors]}"
+    assert all(
+        tensor.shape == (num_reqs,) for tensor in input_tensors
+    ), f"{num_reqs=}, shapes={[tensor.shape for tensor in input_tensors]}"
+    assert all(
+        tensor.dtype == torch.int64 for tensor in input_tensors
+    ), f"dtypes={[tensor.dtype for tensor in input_tensors]}"
+    assert all(
+        tensor.is_contiguous() for tensor in input_tensors
+    ), f"strides={[tensor.stride() for tensor in input_tensors]}"
+    assert all(
+        tensor.stride(0) == 1 for tensor in input_tensors
+    ), f"strides={[tensor.stride() for tensor in input_tensors]}"
 
     device_tensors: tuple[torch.Tensor, ...] = (
         req_pool_indices_tensor,
@@ -158,40 +156,36 @@ def gather_out_cache_loc_extend(
         seq_lens_cpu,
         extend_lens_cpu,
     )
-    assert all(tensor.device == req_to_token.device for tensor in device_tensors), (
-        f"{req_to_token.device=}, devices={[tensor.device for tensor in device_tensors]}"
-    )
-    assert all(tensor.device.type == "cpu" for tensor in cpu_tensors), (
-        f"devices={[tensor.device for tensor in cpu_tensors]}"
-    )
+    assert all(
+        tensor.device == req_to_token.device for tensor in device_tensors
+    ), f"{req_to_token.device=}, devices={[tensor.device for tensor in device_tensors]}"
+    assert all(
+        tensor.device.type == "cpu" for tensor in cpu_tensors
+    ), f"devices={[tensor.device for tensor in cpu_tensors]}"
 
     assert type(extend_num_tokens) is int, f"{type(extend_num_tokens)=}"
     assert extend_num_tokens >= 0, f"{extend_num_tokens=}"
     assert out_dtype in (torch.int32, torch.int64), f"{out_dtype=}"
-    assert bool(torch.all(req_pool_indices_cpu >= 0)), (
-        f"{req_pool_indices_cpu=}"
-    )
-    assert bool(torch.all(req_pool_indices_cpu < req_to_token.shape[0])), (
-        f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
-    )
+    assert bool(torch.all(req_pool_indices_cpu >= 0)), f"{req_pool_indices_cpu=}"
+    assert bool(
+        torch.all(req_pool_indices_cpu < req_to_token.shape[0])
+    ), f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
     assert bool(torch.all(prefix_lens_cpu >= 0)), f"{prefix_lens_cpu=}"
-    assert bool(torch.all(seq_lens_cpu >= prefix_lens_cpu)), (
-        f"{prefix_lens_cpu=}, {seq_lens_cpu=}"
-    )
-    assert bool(torch.all(seq_lens_cpu <= req_to_token.shape[1])), (
-        f"{seq_lens_cpu=}, row_width={req_to_token.shape[1]}"
-    )
+    assert bool(
+        torch.all(seq_lens_cpu >= prefix_lens_cpu)
+    ), f"{prefix_lens_cpu=}, {seq_lens_cpu=}"
+    assert bool(
+        torch.all(seq_lens_cpu <= req_to_token.shape[1])
+    ), f"{seq_lens_cpu=}, row_width={req_to_token.shape[1]}"
     assert bool(torch.all(extend_lens_cpu >= 0)), f"{extend_lens_cpu=}"
-    assert torch.equal(seq_lens_cpu - prefix_lens_cpu, extend_lens_cpu), (
-        f"{prefix_lens_cpu=}, {seq_lens_cpu=}, {extend_lens_cpu=}"
-    )
+    assert torch.equal(
+        seq_lens_cpu - prefix_lens_cpu, extend_lens_cpu
+    ), f"{prefix_lens_cpu=}, {seq_lens_cpu=}, {extend_lens_cpu=}"
     extend_num_tokens_cpu: int = int(extend_lens_cpu.sum().item())
-    assert extend_num_tokens_cpu == extend_num_tokens, (
-        f"extend_sum={extend_num_tokens_cpu}, {extend_num_tokens=}"
-    )
-    assert num_reqs > 0 or extend_num_tokens == 0, (
-        f"{num_reqs=}, {extend_num_tokens=}"
-    )
+    assert (
+        extend_num_tokens_cpu == extend_num_tokens
+    ), f"extend_sum={extend_num_tokens_cpu}, {extend_num_tokens=}"
+    assert num_reqs > 0 or extend_num_tokens == 0, f"{num_reqs=}, {extend_num_tokens=}"
 
     if num_reqs == 0 or extend_num_tokens == 0:
         return torch.empty((0,), dtype=out_dtype, device=req_to_token.device)
@@ -203,18 +197,16 @@ def gather_out_cache_loc_extend(
             "xpu",
             "musa",
         )
-        assert req_to_token.device.type in supported_accelerator_types, (
-            f"{req_to_token.device=}"
-        )
+        assert (
+            req_to_token.device.type in supported_accelerator_types
+        ), f"{req_to_token.device=}"
         assert all(
             tensor.device.type in supported_accelerator_types
             for tensor in device_tensors
-        ), (
-            f"devices={[tensor.device for tensor in device_tensors]}"
-        )
-        assert all(tensor.device == req_to_token.device for tensor in device_tensors), (
-            f"{req_to_token.device=}, devices={[tensor.device for tensor in device_tensors]}"
-        )
+        ), f"devices={[tensor.device for tensor in device_tensors]}"
+        assert all(
+            tensor.device == req_to_token.device for tensor in device_tensors
+        ), f"{req_to_token.device=}, devices={[tensor.device for tensor in device_tensors]}"
         out_gather: torch.Tensor = torch.empty(
             (extend_num_tokens,), dtype=torch.int32, device=req_to_token.device
         )
