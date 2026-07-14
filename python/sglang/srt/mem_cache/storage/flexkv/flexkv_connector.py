@@ -122,9 +122,7 @@ class FlexKVConnector:
             int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
         )
         if self.enable_layerwise and self.allocator_page_size > 1:
-            raise ValueError(
-                "FlexKV layerwise transfer requires allocator page size 1"
-            )
+            raise ValueError("FlexKV layerwise transfer requires allocator page size 1")
         if self.allocator_page_size % self.storage_page_size != 0:
             raise ValueError(
                 "FlexKV requires the storage page size to divide the allocator "
@@ -404,9 +402,7 @@ class FlexKVConnector:
                     expected_slots=pending.expected_slots,
                 )
                 if local_reason is None:
-                    page_starts = slot_mapping_cpu[
-                        :: self.allocator_page_size
-                    ].tolist()
+                    page_starts = slot_mapping_cpu[:: self.allocator_page_size].tolist()
                 else:
                     local_status = 0
             except Exception as exc:  # noqa: BLE001
@@ -643,9 +639,7 @@ class FlexKVConnector:
         # Page-align inputs *before* put_match so the FlexKV allocator
         # only reserves slots that line up with the slot_mapping we send.
         if self.storage_page_size > 1:
-            aligned_len = (
-                n // self.storage_page_size * self.storage_page_size
-            )
+            aligned_len = n // self.storage_page_size * self.storage_page_size
             if aligned_len == 0:
                 self._send_pp_put_meta(-1, [])
                 return -1
@@ -837,8 +831,7 @@ class FlexKVConnector:
     def ensure_reset_safe(self) -> None:
         if self._poison_reason is not None or self._ambiguous_loads:
             raise RuntimeError(
-                "Cannot reset FlexKV after an ambiguous load: "
-                f"{self._poison_reason}"
+                "Cannot reset FlexKV after an ambiguous load: " f"{self._poison_reason}"
             )
 
     def reset(self) -> None:
