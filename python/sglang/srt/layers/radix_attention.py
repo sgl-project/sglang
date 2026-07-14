@@ -129,8 +129,15 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
+        # The attention output dtype normally matches q, but backends taking a
+        # quantized query (e.g. hpc_ops FP8) produce a higher-precision output;
+        # such callers pass output_dtype explicitly.
+        if output_dtype is None:
+            output_dtype = q.dtype
+
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
@@ -170,9 +177,12 @@ class RadixAttention(nn.Module):
                 )
                 return idx_out, attn_out
             if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+                output = q.new_empty(
+                    (q.shape[0], self.tp_q_head_num * self.v_head_dim),
+                    dtype=output_dtype,
+                )
             else:
-                output = torch.empty_like(q)
+                output = torch.empty_like(q, dtype=output_dtype)
             if is_in_breakable_cuda_graph():
                 breakable_unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs

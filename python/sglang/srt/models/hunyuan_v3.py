@@ -370,6 +370,8 @@ class HYV3Attention(nn.Module):
                 None,
                 forward_batch,
                 save_kv_cache=False,
+                # q is FP8 but the attention kernels emit bf16.
+                output_dtype=qkv.dtype,
             )
             output, _ = self.o_proj(attn_output)
             return output
