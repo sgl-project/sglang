@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
     _HiSparsePageOwnership,
 )
@@ -34,17 +35,24 @@ def _make_coordinator(
     capacities: torch.Tensor,
     mapping: torch.Tensor,
     extra_allocation: torch.Tensor | None,
+    dsv4: bool = False,
 ) -> tuple[HiSparseCoordinator, _ChildAllocator]:
     child_allocator = _ChildAllocator(extra_allocation)
-    allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
-    allocator.page_size = 4
-    allocator.compress_ratio = 1
+    allocator_class = (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator
+        if dsv4
+        else HiSparseTokenToKVPoolAllocator
+    )
+    allocator = object.__new__(allocator_class)
+    allocator.page_size = 8 if dsv4 else 4
+    allocator.compress_ratio = 4 if dsv4 else 1
+    allocator.hisparse_page_size = 2 if dsv4 else 4
     allocator.hisparse_attn_allocator = child_allocator
     allocator.full_to_hisparse_device_index_mapping = mapping
     allocator._page_ownership = _HiSparsePageOwnership(
         mapping=mapping,
         child_allocator=child_allocator,
-        page_size=4,
+        page_size=allocator.hisparse_page_size,
     )
 
     coordinator = object.__new__(HiSparseCoordinator)
@@ -52,8 +60,8 @@ def _make_coordinator(
     coordinator.mem_pool_device = SimpleNamespace(
         full_to_hisparse_device_index_mapping=mapping
     )
-    coordinator.is_dsv4_hisparse = False
-    coordinator.compress_ratio = 1
+    coordinator.is_dsv4_hisparse = dsv4
+    coordinator.compress_ratio = allocator.compress_ratio
     coordinator.device_buffer_size = 8
     coordinator.padded_buffer_size = 12
     coordinator.req_to_device_buffer = rows
@@ -127,6 +135,35 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 child_allocator.freed[0], torch.arange(32, 36, dtype=torch.int64)
+            )
+        )
+
+        dsv4_mapping = torch.zeros(64, dtype=torch.int64)
+        dsv4_mapping[2:4] = torch.arange(20, 22, dtype=torch.int64)
+        dsv4_rows = torch.arange(40, 52, dtype=torch.int64).reshape(1, 12)
+        dsv4_coordinator, dsv4_child = _make_coordinator(
+            rows=dsv4_rows,
+            capacities=torch.tensor([12], dtype=torch.int64),
+            mapping=dsv4_mapping,
+            extra_allocation=torch.arange(24, 26, dtype=torch.int64),
+            dsv4=True,
+        )
+
+        dsv4_coordinator._rehome_page_boundary_owners(
+            seq_lens=torch.tensor([4], dtype=torch.int64),
+            out_cache_loc=torch.tensor([11], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+        )
+
+        self.assertTrue(
+            torch.equal(dsv4_mapping[2:4], torch.arange(40, 42, dtype=torch.int64))
+        )
+        self.assertEqual(dsv4_child.alloc_sizes, [])
+        self.assertTrue(
+            torch.equal(
+                dsv4_child.freed[0], torch.arange(20, 22, dtype=torch.int64)
             )
         )
 
