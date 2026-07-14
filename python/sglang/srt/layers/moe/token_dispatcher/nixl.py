@@ -415,9 +415,6 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
 
             n = ElasticEPStateManager.get_effective_ep_size()
             self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
-            elastic_state = ElasticEPStateManager.instance()
-            if elastic_state is not None:
-                elastic_state.sync_active_to_cpu()
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

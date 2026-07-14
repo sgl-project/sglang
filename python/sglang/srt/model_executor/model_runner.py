@@ -42,10 +42,12 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     get_healthy_expert_location_src_rank,
+    get_scale_cohort_target,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
+    register_scale_cohort,
     try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
@@ -382,10 +384,16 @@ class ModelRunner:
 
         is_scale_join = self.server_args.ep_join_mode == "scale"
         if is_scale_join:
-            join_scale_process_group()
             join_effective_ep_size = (
                 self.server_args.ep_join_rank_offset + self.ps.tp_size
             )
+            dist.barrier(group=self.tp_group.cpu_group)
+            if self.ps.tp_rank == 0:
+                register_scale_cohort(
+                    self.server_args.ep_join_rank_offset,
+                    join_effective_ep_size,
+                )
+            join_scale_process_group()
             self.server_args.override(
                 "elastic_ep.scale_join", ep_size=join_effective_ep_size
             )
@@ -1714,6 +1722,23 @@ class ModelRunner:
             if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
                 logger.error("[Elastic EP] %s", error)
             return
+
+        if state.scale_phase == "waiting_for_cohort":
+            cohort_target = get_scale_cohort_target(effective_size)
+            if cohort_target is None:
+                return
+            if cohort_target != pending_size:
+                error = (
+                    f"Requested target EP size {pending_size} does not match "
+                    f"joining cohort target {cohort_target}"
+                )
+                ElasticEPStateManager.fail_scale(error)
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            if not ElasticEPStateManager.begin_scale():
+                return
 
         ranks_to_join = list(range(effective_size, pending_size))
         if not ranks_to_join:

@@ -4264,18 +4264,21 @@ class Scheduler(
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
 
-        if not ElasticEPStateManager.begin_scale(new_ep_size):
+        if not ElasticEPStateManager.request_scale(new_ep_size):
             return ScaleElasticEPReqOutput(
                 success=False,
-                message="Failed to start elastic EP scale: no elastic state or scale already pending.",
+                message=(
+                    "Failed to queue elastic EP scale: no elastic state or "
+                    "scale already pending."
+                ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
         logger.debug(
-            "[Elastic EP][scale] scale pending: target_ep_size=%d; "
-            "waiting for ranks to join",
+            "[Elastic EP][scale] scale requested: target_ep_size=%d; "
+            "waiting for a joining cohort",
             new_ep_size,
         )
 

@@ -229,9 +229,7 @@ def _init_parallel_groups(
     is_scale_joiner = server_args.is_ep_scale_joiner
     rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
-        rank_offset + tp_size * pp_size
-        if is_scale_joiner
-        else tp_size * pp_size
+        rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
 

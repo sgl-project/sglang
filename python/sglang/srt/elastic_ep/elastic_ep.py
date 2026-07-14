@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 import torch
 
 from sglang.srt.distributed import get_world_group, parallel_state
+from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import broadcast_pyobj, is_cpu, is_cuda
@@ -16,6 +17,25 @@ if TYPE_CHECKING:
     from sglang.srt.eplb.eplb_manager import EPLBManager
 
 logger = logging.getLogger(__name__)
+
+_SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
+
+
+def register_scale_cohort(rank_offset: int, target_ep_size: int) -> None:
+    store = get_global_tcp_store()
+    if store is None:
+        raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
+    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(target_ep_size).encode())
+
+
+def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
+    store = get_global_tcp_store()
+    if store is None:
+        return None
+    key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
+    if not store.check([key]):
+        return None
+    return int(store.get(key).decode())
 
 
 @dataclass
@@ -143,7 +163,7 @@ class ElasticEPStateManager:
         return torch.ones(size, dtype=torch.int32, device=dev)
 
     @classmethod
-    def begin_scale(cls, n: int) -> bool:
+    def request_scale(cls, n: int) -> bool:
         inst = cls._instance
         if inst is None:
             return False
@@ -153,9 +173,21 @@ class ElasticEPStateManager:
         ):
             return False
         inst.pending_ep_size = n
-        inst.scale_phase = "pending"
+        inst.scale_phase = "waiting_for_cohort"
         inst.last_error = None
         inst.pending_since = time.monotonic()
+        return True
+
+    @classmethod
+    def begin_scale(cls) -> bool:
+        inst = cls._instance
+        if (
+            inst is None
+            or inst.pending_ep_size is None
+            or inst.scale_phase != "waiting_for_cohort"
+        ):
+            return False
+        inst.scale_phase = "pending"
         return True
 
     @classmethod
