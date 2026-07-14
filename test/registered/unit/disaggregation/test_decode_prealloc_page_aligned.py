@@ -99,6 +99,59 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
         self.assertEqual(locations.numel(), 8)
         self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
 
+    def test_hisparse_host_allocation_uses_real_fill_length(self) -> None:
+        """HiSparse host allocation excludes page-alignment padding."""
+        allocator = _Allocator()
+        allocator.available_size = mock.Mock(return_value=8)
+        req = SimpleNamespace(
+            rid="req-0",
+            origin_input_ids=list(range(5)),
+            output_ids=[],
+            kv=None,
+            set_extend_range=mock.Mock(),
+        )
+
+        def alloc_reqs(reqs: list[SimpleNamespace]) -> torch.Tensor:
+            reqs[0].req_pool_idx = 0
+            return torch.tensor([0], dtype=torch.int64)
+
+        host_pool = SimpleNamespace(
+            alloc_paged_token_slots=mock.Mock(
+                return_value=torch.arange(5, dtype=torch.int64)
+            )
+        )
+        coordinator = SimpleNamespace(
+            mem_pool_host=host_pool,
+            req_to_host_pool=mock.Mock(),
+            req_to_host_pool_allocated_len=mock.Mock(),
+            host_token_len=mock.Mock(side_effect=lambda length: length),
+        )
+        queue = decode.DecodePreallocQueue.__new__(decode.DecodePreallocQueue)
+        queue.req_to_token_pool = SimpleNamespace(
+            alloc=mock.Mock(side_effect=alloc_reqs),
+            write=mock.Mock(),
+        )
+        queue.token_to_kv_pool_allocator = allocator
+        queue.tree_cache = SimpleNamespace()
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_coordinator=coordinator,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+        )
+        queue._pre_alloc_fill_len = mock.Mock(return_value=5)
+        queue._uses_swa_tail_prealloc = mock.Mock(return_value=False)
+        queue._swa_tail_len = mock.Mock(return_value=0)
+
+        host_indices = queue._pre_alloc(req)
+
+        self.assertEqual(req.kv.kv_allocated_len, 8)
+        coordinator.host_token_len.assert_called_once_with(5)
+        self.assertEqual(
+            host_pool.alloc_paged_token_slots.call_args.args[-1],
+            5,
+        )
+        self.assertEqual(host_indices.tolist(), [0, 1, 2, 3, 4])
+
     def test_decode_prealloc_aligns_swa_tail_around_real_endpoint(self) -> None:
         """SWA-tail preallocation separates padded capacity from the real endpoint."""
         allocator = _Allocator()

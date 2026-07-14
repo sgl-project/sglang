@@ -1497,7 +1497,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                coordinator.host_token_len(req.kv.kv_allocated_len),
+                coordinator.host_token_len(fill_len),
             )
         else:
             uses_swa_tail = (
