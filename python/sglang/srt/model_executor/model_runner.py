@@ -2768,7 +2768,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_layers = []
         self.moe_fusions = []
         self.dsa_indexers = []
-        for layer in layer_model.layers:
+        decoder_layers = (
+            layer_model.layers.values()
+            if isinstance(layer_model.layers, nn.ModuleDict)
+            else layer_model.layers
+        )
+        for layer in decoder_layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
