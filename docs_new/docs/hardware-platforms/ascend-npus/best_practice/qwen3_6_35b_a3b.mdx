@@ -393,7 +393,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
     --enable-prefill-delayer \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --max-running-requests 103 \
     --max-mamba-cache-size 85 \
     --mem-fraction-static 0.85 \
@@ -788,7 +788,7 @@ python3 -m sglang.launch_server \
     --max-total-tokens 470784 \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --max-running-requests 40 \
     --max-mamba-cache-size 200 \
     --mem-fraction-static 0.9 \

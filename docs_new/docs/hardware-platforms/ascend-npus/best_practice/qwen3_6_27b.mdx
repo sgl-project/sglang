@@ -287,7 +287,7 @@ python3 -m sglang.launch_server \
     --device npu \
     --chunked-prefill-size 32768 \
     --max-prefill-tokens 32768 \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 20 \
     --max-mamba-cache-size 160 \
