@@ -2291,15 +2291,24 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         swa_allocator = self.swa_attn_allocator
         full_page_count = extend_num_tokens // self.page_size
         swa_page_count = (mapped_end - win_start) // self.page_size
-        if self.lazy_compaction:
+        has_capacity = (
+            full_page_count <= len(full_allocator.free_virtual_ids)
+            and self._has_asymmetric_swa_tail_capacity(
+                full_page_count=full_page_count,
+                swa_page_count=swa_page_count,
+            )
+        )
+        if not has_capacity and self.lazy_compaction:
             full_allocator._flush(urgent=True)
             swa_allocator._flush(urgent=True)
-        if full_page_count > len(full_allocator.free_virtual_ids):
-            return None
-        if not self._has_asymmetric_swa_tail_capacity(
-            full_page_count=full_page_count,
-            swa_page_count=swa_page_count,
-        ):
+            has_capacity = (
+                full_page_count <= len(full_allocator.free_virtual_ids)
+                and self._has_asymmetric_swa_tail_capacity(
+                    full_page_count=full_page_count,
+                    swa_page_count=swa_page_count,
+                )
+            )
+        if not has_capacity:
             return None
 
         virtual_pages = full_allocator.free_virtual_ids[:full_page_count].clone()
