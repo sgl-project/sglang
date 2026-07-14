@@ -52,8 +52,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
-from sglang.srt.managers.template_detection import detect_inline_system_support
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.parser.template_detection import detect_inline_system_support
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
