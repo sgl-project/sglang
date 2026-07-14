@@ -685,7 +685,7 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
+        # Reserve one page per request for page-alignment rounding headroom.
         page_overhead = self.page_size
         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
@@ -800,8 +800,7 @@ class PrefillAdder:
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
-                # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM
+                # Page-aligned SWA allocation can round up by one page per request.
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
@@ -990,9 +989,8 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve page_size for page-alignment overhead: the paged allocator may
-        # consume one extra page per request (see alloc_extend), which
-        # _update_prefill_budget also deducts.
+        # Reserve one page per request for the same page-alignment rounding
+        # overhead deducted by _update_prefill_budget.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,

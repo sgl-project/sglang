@@ -28,26 +28,19 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.hardware_backend.npu.allocator_npu import (
     NPUPagedTokenToKVPoolAllocator,
     NPUSWATokenToKVPoolAllocator,
+    _alloc_paged_token_slots_extend_npu,
     get_last_loc,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4StateLens
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
-
-def alloc_paged_token_slots_extend_npu(*args, batch=None, **kwargs):
-    if batch is not None and is_deepseek_v4(batch.model_config.hf_config):
-        return alloc_paged_token_slots_reserve_extend(*args, batch=batch, **kwargs)
-    return alloc_paged_token_slots_extend(*args, batch=batch, **kwargs)
 
 
 def alloc_paged_token_slots_reserve_extend(
@@ -74,7 +67,7 @@ def alloc_paged_token_slots_reserve_extend(
             else None
         )
 
-    out_cache_loc = alloc_paged_token_slots_extend(
+    out_cache_loc = _alloc_paged_token_slots_extend_npu(
         tree_cache,
         prefix_lens,
         prefix_lens_cpu,

@@ -69,9 +69,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-        # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
+        # Append one more item so the -1 padding sentinel maps to itself.
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -524,16 +522,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         assert self.page_size == 1
         return self.swa_attn_allocator.alloc(need_size)
-
-    def alloc_extend(self, *args, **kwargs):
-        raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
-        )
-
-    def alloc_decode(self, *args, **kwargs):
-        raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
-        )
 
     def alloc_extend_swa_tail(self, *args, **kwargs):
         raise NotImplementedError(

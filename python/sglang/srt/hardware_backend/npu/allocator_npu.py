@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -7,13 +8,304 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
     _is_npu,
 )
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    evict_from_tree_cache,
+)
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if _is_npu:
     import torch_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
+
+
+logger = logging.getLogger(__name__)
+
+
+def alloc_for_extend_npu(
+    tree_cache: "BasePrefixCache",
+    *,
+    prefix_tensors: list[torch.Tensor],
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_num_tokens: int,
+    req_pool_indices: torch.Tensor,
+    dsv4_state_lens: Optional["DSV4StateLens"],
+    batch: "ScheduleBatch",
+) -> torch.Tensor:
+    last_locations = [
+        prefix_tensor[-1:]
+        if prefix_tensor.numel() > 0
+        else torch.tensor([-1], dtype=torch.int64, device=batch.device)
+        for prefix_tensor in prefix_tensors
+    ]
+    last_loc = (
+        torch.cat(last_locations)
+        if last_locations
+        else torch.empty((0,), dtype=torch.int64, device=batch.device)
+    )
+    return _alloc_paged_token_slots_extend_npu(
+        tree_cache=tree_cache,
+        prefix_lens=prefix_lens,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        last_loc=last_loc,
+        extend_num_tokens=extend_num_tokens,
+        req_pool_indices=req_pool_indices,
+        dsv4_state_lens=dsv4_state_lens,
+        batch=batch,
+    )
+
+
+def alloc_for_decode_npu(
+    batch: "ScheduleBatch",
+    *,
+    next_seq_lens: torch.Tensor,
+    next_seq_lens_cpu: torch.Tensor,
+    token_per_req: int,
+) -> torch.Tensor:
+    current_seq_lens = next_seq_lens - token_per_req
+    last_loc = batch.req_to_token_pool.req_to_token[
+        batch.req_pool_indices, current_seq_lens - 1
+    ]
+    return _alloc_paged_token_slots_decode_npu(
+        tree_cache=batch.tree_cache,
+        seq_lens=next_seq_lens,
+        seq_lens_cpu=next_seq_lens_cpu,
+        last_loc=last_loc,
+        token_per_req=token_per_req,
+        req_pool_indices=batch.req_pool_indices,
+        dsv4_state_lens=_compute_dsv4_state_lens_npu(batch, is_decode=True),
+        batch=batch,
+    )
+
+
+def alloc_for_spec_decode_npu(
+    tree_cache: "BasePrefixCache",
+    req_to_token_pool,
+    *,
+    req_pool_indices: torch.Tensor,
+    cur_kv_lens: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+    num_needed_tokens: int,
+    batch: "ScheduleBatch",
+) -> torch.Tensor:
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    last_loc = get_last_loc(
+        req_to_token_pool.req_to_token,
+        req_pool_indices,
+        cur_kv_lens,
+    )
+    if is_deepseek_v4(batch.model_config.hf_config):
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+            alloc_paged_token_slots_reserve_extend,
+        )
+
+        return alloc_paged_token_slots_reserve_extend(
+            tree_cache=tree_cache,
+            prefix_lens=cur_kv_lens,
+            prefix_lens_cpu=cur_kv_lens_cpu,
+            seq_lens=nxt_kv_lens,
+            seq_lens_cpu=nxt_kv_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=num_needed_tokens,
+            req_pool_indices=req_pool_indices,
+            batch=batch,
+        )
+    return _alloc_paged_token_slots_extend_npu(
+        tree_cache=tree_cache,
+        prefix_lens=cur_kv_lens,
+        prefix_lens_cpu=cur_kv_lens_cpu,
+        seq_lens=nxt_kv_lens,
+        seq_lens_cpu=nxt_kv_lens_cpu,
+        last_loc=last_loc,
+        extend_num_tokens=num_needed_tokens,
+        req_pool_indices=req_pool_indices,
+        batch=batch,
+    )
+
+
+def alloc_for_decode_prealloc_npu(
+    allocator: "BaseTokenToKVPoolAllocator",
+    *,
+    prefix_indices: Optional[torch.Tensor],
+    fill_len: int,
+    prefix_len: int,
+    total_prefix_len: int,
+    delta_len: int,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+    swa_tail_end: int,
+    req: "Req",
+) -> torch.Tensor:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    assert delta_len == fill_len - total_prefix_len
+    if uses_swa_tail:
+        assert prefix_len == 0 and total_prefix_len == 0
+        assert prefix_indices is None or prefix_indices.numel() == 0
+        assert delta_len == fill_len
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+
+    if uses_swa_tail:
+        result = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=fill_len,
+            swa_tail_len=swa_tail_len,
+            swa_tail_end=swa_tail_end,
+        )
+        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        return result
+
+    device = allocator.device
+    prefix_lens_cpu = torch.tensor([total_prefix_len], dtype=torch.int64)
+    seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+    prefix_lens = prefix_lens_cpu.to(device=device, non_blocking=True)
+    seq_lens = seq_lens_cpu.to(device=device, non_blocking=True)
+    last_loc = (
+        prefix_indices[-1:].to(dtype=torch.int64, device=device)
+        if prefix_len > 0
+        else torch.tensor([-1], dtype=torch.int64, device=device)
+    )
+    return allocator.alloc_extend(
+        prefix_lens=prefix_lens,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        last_loc=last_loc,
+        extend_num_tokens=delta_len,
+    )
+
+
+def _compute_dsv4_state_lens_npu(batch: "ScheduleBatch", *, is_decode: bool):
+    allocator = batch.token_to_kv_pool_allocator
+    if not hasattr(allocator, "compute_dsv4_state_lens_extend"):
+        return None
+    if is_decode:
+        return allocator.compute_dsv4_state_lens_decode(batch.reqs)
+    return allocator.compute_dsv4_state_lens_extend(
+        batch.reqs, batch.seq_lens_cpu.tolist()
+    )
+
+
+def _alloc_paged_token_slots_extend_npu(
+    tree_cache: "BasePrefixCache",
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    extend_num_tokens: int,
+    backup_state: bool = False,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    batch: Optional["ScheduleBatch"] = None,
+):
+    allocator = tree_cache.token_to_kv_pool_allocator
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    state = allocator.backup_state() if backup_state else None
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
+    extra_alloc_kwargs = {}
+    if is_dsv4:
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        if batch is not None:
+            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if dsv4_state_lens is not None:
+            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+
+    output = allocator.alloc_extend(
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        extend_num_tokens,
+        **extra_alloc_kwargs,
+    )
+    if is_dsv4:
+        bundle = output
+        output_locations = None if bundle is None else bundle.out_full_loc
+        if batch is not None:
+            batch.out_cache_loc_dsv4 = bundle
+    else:
+        output_locations = output
+
+    if output_locations is None:
+        error_message = (
+            "Prefill out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {extend_num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_message)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_message)
+    return (output_locations, state) if backup_state else output_locations
+
+
+def _alloc_paged_token_slots_decode_npu(
+    tree_cache: "BasePrefixCache",
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    token_per_req: int = 1,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    batch: Optional["ScheduleBatch"] = None,
+) -> torch.Tensor:
+    allocator = tree_cache.token_to_kv_pool_allocator
+    evict_from_tree_cache(tree_cache, len(seq_lens) * allocator.page_size)
+
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
+    extra_alloc_kwargs = {}
+    if is_dsv4:
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        if batch is not None:
+            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if dsv4_state_lens is not None:
+            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+
+    output = allocator.alloc_decode(
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        **extra_alloc_kwargs,
+    )
+    if is_dsv4:
+        bundle = output
+        output_locations = None if bundle is None else bundle.out_full_loc
+        if batch is not None:
+            batch.out_cache_loc_dsv4 = bundle
+    else:
+        output_locations = output
+
+    if output_locations is None:
+        error_message = (
+            "Decode out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_message)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_message)
+    return output_locations
 
 
 def alloc_extend_naive(

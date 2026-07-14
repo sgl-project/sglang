@@ -221,12 +221,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
-    def alloc_extend(self, *args, **kwargs):
-        raise NotImplementedError("alloc_extend is only for paged allocator")
-
-    def alloc_decode(self, *args, **kwargs):
-        raise NotImplementedError("alloc_decode is only for paged allocator")
-
     def resize(self, config) -> None:
         self.size = config.max_total_num_tokens
         if self.page_size > 1:

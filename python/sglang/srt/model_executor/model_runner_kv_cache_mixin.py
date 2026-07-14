@@ -523,8 +523,7 @@ class ModelRunnerKVCacheMixin:
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
-        # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
-        # once in virtual space and binds the new pages on both sub-allocators.
+        # Both sub-pools use page-aligned direct allocation over shared virtual ids.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         assert (
             not self.use_mla_backend

@@ -9,7 +9,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.utils.common import get_num_new_pages
 
 
 def _stable_unique_page_ids(page_ids: torch.Tensor) -> torch.Tensor:
@@ -433,68 +432,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
 
-    def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self._kvcache._translate_loc_to_hisparse_device(last_locs)
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-        extend_num_tokens: int,
-    ):
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        if (
-            num_new_pages
-            > self.logical_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-        if (
-            num_new_pages
-            > self.hisparse_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-
-        logical_indices = self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
-
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            hisparse_last_loc,
-            len(logical_indices),
-            num_new_pages=num_new_pages,
-        )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
-        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
-        return logical_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-    ):
-        return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-
     def free_hisparse(self, free_indices: torch.Tensor):
         owned_page_ids = self.collect_owned_hisparse_page_ids(
             mapping_indices=free_indices
@@ -796,82 +733,6 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
-
-    def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self.hisparse_kvcache._translate_loc_to_hisparse_device(
-            self.get_last_loc_compressed(last_locs)
-        )
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
-        assert self.page_size > 1
-
-        num_new_pages_logical = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        num_new_pages_hisparse = get_num_new_pages(
-            seq_lens=seq_lens_cpu // self.compress_ratio,
-            page_size=self.hisparse_page_size,
-            prefix_lens=prefix_lens_cpu // self.compress_ratio,
-        )
-        if (
-            num_new_pages_logical
-            > self.logical_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-        if (
-            num_new_pages_hisparse
-            > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
-        ):
-            return None
-
-        logical_indices = self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
-
-        compressed_logical_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
-        )
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens // self.compress_ratio,
-            prefix_lens_cpu // self.compress_ratio,
-            seq_lens // self.compress_ratio,
-            seq_lens_cpu // self.compress_ratio,
-            hisparse_last_loc,
-            len(compressed_logical_indices),
-        )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
-
-        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
-            hisparse_indices.to(torch.int64)
-        )
-        return logical_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ):
-        return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
 
     def free_compressed(self, compressed_indices: torch.Tensor):
         owned_page_ids = self.collect_owned_hisparse_page_ids(
