@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -39,6 +40,9 @@ class DecodeKVCacheOffloadManager:
         tree_cache: BasePrefixCache,
         server_args: ServerArgs,
     ) -> None:
+        if is_npu():
+            raise ValueError("Decode KV cache offload is not supported on NPU.")
+
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.storage_page_size = server_args.page_size

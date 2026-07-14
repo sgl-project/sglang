@@ -2444,7 +2444,7 @@ class ServerArgs:
     ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool,
-        "Enable async KV cache offloading on decode server (PD mode). Incompatible with --enable-hisparse.",
+        "Enable async KV cache offloading on decode server (PD mode). Incompatible with --enable-hisparse and unsupported on NPU.",
     ] = False
     num_reserved_decode_tokens: A[
         int,
@@ -6180,6 +6180,8 @@ class ServerArgs:
             )
 
         if self.disaggregation_decode_enable_offload_kvcache:
+            if is_npu():
+                raise ValueError("Decode KV cache offload is not supported on NPU.")
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
