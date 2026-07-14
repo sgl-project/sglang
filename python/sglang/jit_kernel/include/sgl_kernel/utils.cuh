@@ -239,20 +239,6 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
 }
 
-#ifndef USE_ROCM
-// SM (compute-capability) version is a CUDA-only concept; the
-// cudaDevAttrComputeCapability* enums do not exist under HIP, so guard this
-// out on ROCm (it has no ROCm-JIT caller). Without the guard this inline --
-// included transitively by nearly every JIT TU -- fails to compile on gfx950.
-inline int getSMVersion(int device_id) {
-  int sm_major = 0;
-  int sm_minor = 0;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-  return sm_major * 10 + sm_minor;
-}
-#endif  // USE_ROCM
-
 inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
   if (required_bytes == 0) return {};
   DLDataType u8 = {kDLUInt, 8, 1};
