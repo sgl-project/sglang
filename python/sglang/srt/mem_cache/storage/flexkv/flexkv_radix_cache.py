@@ -43,7 +43,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+    FlexKVAmbiguousLoadError,
+    FlexKVConnector,
+    FlexKVRetrieveStatus,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -68,6 +72,7 @@ class _LoadBackMarker:
 
     key: RadixKey
     value_numel: int  # device tokens already present at lookup time
+    expected_slots: int
 
 
 class FlexKVRadixCache(RadixCache):
@@ -143,6 +148,7 @@ class FlexKVRadixCache(RadixCache):
         # Two-phase MP load: stash marker between ``match_prefix`` and
         # ``init_load_back``.
         self._load_markers: dict[str, _LoadBackMarker] = {}
+        self._quarantined_load_slots: list[torch.Tensor] = []
         # ``store_kv`` is async — we keep a lock on the source node
         # until FlexKV signals completion, draining in ``evict`` /
         # ``check_hicache_events``.
@@ -154,14 +160,18 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def reset(self) -> None:  # type: ignore[override]
+        if hasattr(self, "flexkv_connector"):
+            self.flexkv_connector.ensure_reset_safe()
+        if hasattr(self, "_quarantined_load_slots") and self._quarantined_load_slots:
+            raise RuntimeError("Cannot reset FlexKV while load slots are quarantined")
+        if hasattr(self, "flexkv_connector"):
+            self.flexkv_connector.reset()
         super().reset()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
         if hasattr(self, "_inflight_store_nodes"):
             with self._node_lock:
                 self._inflight_store_nodes.clear()
-        if hasattr(self, "flexkv_connector"):
-            self.flexkv_connector.reset()
 
     def shutdown(self) -> None:
         if hasattr(self, "flexkv_connector"):
@@ -218,13 +228,18 @@ class FlexKVRadixCache(RadixCache):
         device_len = int(device_value.numel())
         if device_len >= len(token_ids):
             return base_res
+        if device_len % self._allocator_page_size != 0:
+            raise RuntimeError(
+                "FlexKV MP load-back requires an allocator-page-aligned device "
+                "prefix"
+            )
 
         # token_mask=True for tokens NOT on device — FlexKV decides
         # which of those it can serve.
         token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
         token_mask[device_len:] = True
 
-        fkv_task_id, hit = self.flexkv_connector.lookup_kv(
+        _, hit = self.flexkv_connector.lookup_kv(
             token_ids=token_ids, token_mask=token_mask, rid=req.rid
         )
         if hit <= 0:
@@ -238,6 +253,7 @@ class FlexKVRadixCache(RadixCache):
         self._load_markers[req.rid] = _LoadBackMarker(
             key=RadixKey(token_ids_snap, key.extra_key, key.is_bigram),
             value_numel=device_len,
+            expected_slots=hit,
         )
         return MatchResult(
             device_indices=device_value,
@@ -272,14 +288,12 @@ class FlexKVRadixCache(RadixCache):
         if hit <= 0:
             return base_res
 
-        result = self._allocate_and_load(
+        result = self._allocate_and_load_layerwise(
+            rid=synthetic_rid,
             key=key,
             value_numel=device_len,
             uncached_len=hit,
             last_node=last_node,
-            load_fn=lambda slot_mapping: self.flexkv_connector.start_load_kv_layerwise(
-                synthetic_rid, slot_mapping
-            )[0],
         )
         if result is None:
             return base_res
@@ -314,86 +328,188 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
 
-        result = self._allocate_and_load(
+        result = self._allocate_and_load_mp(
+            rid=req.rid,
             key=marker.key,
             value_numel=marker.value_numel,
             uncached_len=params.host_hit_length,
+            expected_slots=marker.expected_slots,
             last_node=last_node,
-            load_fn=lambda slot_mapping: self.flexkv_connector.retrieve_kv(
-                req.rid, slot_mapping
-            ),
         )
         if result is None:
-            # Allocation failed or load returned zero. ``retrieve_kv``
-            # already cancels/cleans up on failure paths; release_pending
-            # is idempotent for the case where allocation failed before
-            # we even popped the held task.
-            self.flexkv_connector.release_pending(req.rid)
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
             )
         return result
 
-    def _allocate_and_load(
+    def _allocate_and_load_mp(
         self,
         *,
+        rid: str,
+        key: RadixKey,
+        value_numel: int,
+        uncached_len: int,
+        expected_slots: int,
+        last_node: TreeNode,
+    ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
+        valid_manifest = (
+            uncached_len > 0
+            and uncached_len == expected_slots
+            and uncached_len % self._allocator_page_size == 0
+            and value_numel % self._allocator_page_size == 0
+            and value_numel + uncached_len <= len(key)
+        )
+        token_slots = (
+            self._allocate_load_slots(num_slots=uncached_len)
+            if valid_manifest
+            else None
+        )
+        try:
+            retrieve_result = self.flexkv_connector.retrieve_kv(
+                rid=rid,
+                slot_mapping=(
+                    token_slots.to(torch.int64) if token_slots is not None else None
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            self._quarantine_load_slots(token_slots)
+            raise
+
+        if retrieve_result.status is FlexKVRetrieveStatus.DEFINITE_TERMINAL_FAILURE:
+            if token_slots is not None:
+                self._release_load_slots(token_slots)
+            return None
+        if retrieve_result.status is FlexKVRetrieveStatus.AMBIGUOUS:
+            self._quarantine_load_slots(token_slots)
+            raise RuntimeError(
+                f"FlexKV MP load outcome is ambiguous: {retrieve_result.reason}"
+            )
+        if (
+            retrieve_result.status is not FlexKVRetrieveStatus.SUCCESS
+            or token_slots is None
+            or retrieve_result.num_slots != uncached_len
+        ):
+            self._quarantine_load_slots(token_slots)
+            raise RuntimeError("FlexKV MP load returned an inconsistent success result")
+
+        return self._publish_loaded_slots(
+            key=key,
+            value_numel=value_numel,
+            loaded_slots=token_slots,
+            last_node=last_node,
+        )
+
+    def _allocate_and_load_layerwise(
+        self,
+        *,
+        rid: str,
         key: RadixKey,
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
-        load_fn,
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
-        """Shared allocator + post-load bookkeeping for MP/IP.
-
-        Returns ``(token_slots[:fetched], new_node)`` on success.
-        ``None`` on either allocation failure or zero retrieved (in
-        which case all slots are freed).
-        """
-        if uncached_len <= 0:
-            return None
-
-        # Evict to make room when needed.
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(EvictParams(num_tokens=uncached_len))
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
-        if token_slots is None:
-            return None
-
-        # The FlexKV ``launch`` interface takes the slot indices for the
-        # tokens it will write — no leading ``-1`` padding (FlexKV has
-        # no concept of "skip these device slots, they're already
-        # cached"; we pass it exactly the destinations for the
-        # uncached tail).
-        num_retrieved = load_fn(token_slots.to(torch.int64))
+        valid_manifest = (
+            uncached_len > 0
+            and uncached_len % self._allocator_page_size == 0
+            and value_numel % self._allocator_page_size == 0
+            and value_numel + uncached_len <= len(key)
+        )
+        token_slots = (
+            self._allocate_load_slots(num_slots=uncached_len)
+            if valid_manifest
+            else None
+        )
+        try:
+            num_retrieved, _ = self.flexkv_connector.start_load_kv_layerwise(
+                rid=rid,
+                slot_mapping=(
+                    token_slots.to(torch.int64) if token_slots is not None else None
+                ),
+            )
+        except FlexKVAmbiguousLoadError:
+            self._quarantine_load_slots(token_slots)
+            raise
+        except Exception:  # noqa: BLE001
+            self._quarantine_load_slots(token_slots)
+            raise
 
         if num_retrieved <= 0:
-            self.token_to_kv_pool_allocator.free(token_slots)
+            if token_slots is not None:
+                self._release_load_slots(token_slots)
+            return None
+        if token_slots is None or num_retrieved != uncached_len:
+            self._quarantine_load_slots(token_slots)
+            raise RuntimeError(
+                "FlexKV layerwise load returned an inconsistent success result"
+            )
+
+        return self._publish_loaded_slots(
+            key=key,
+            value_numel=value_numel,
+            loaded_slots=token_slots,
+            last_node=last_node,
+        )
+
+    def _allocate_load_slots(self, *, num_slots: int) -> Optional[torch.Tensor]:
+        token_slots: Optional[torch.Tensor] = None
+        try:
+            if self.token_to_kv_pool_allocator.available_size() < num_slots:
+                self.evict(EvictParams(num_tokens=num_slots))
+            token_slots = self.token_to_kv_pool_allocator.alloc(num_slots)
+            if token_slots is None:
+                return None
+            if token_slots.numel() != num_slots:
+                self.token_to_kv_pool_allocator.free(token_slots)
+                logger.warning(
+                    "[FlexKV] allocator returned %d slots for a %d-slot request",
+                    token_slots.numel(),
+                    num_slots,
+                )
+                return None
+            return token_slots
+        except Exception as exc:  # noqa: BLE001
+            self._quarantine_load_slots(token_slots)
+            logger.warning(
+                "[FlexKV] load slot allocation failed: %s",
+                exc,
+                exc_info=True,
+            )
             return None
 
-        # Free the tail of the over-allocation when FlexKV returned
-        # fewer than expected.
-        if num_retrieved < uncached_len:
-            self.token_to_kv_pool_allocator.free(token_slots[num_retrieved:])
-            fetched_slots = token_slots[:num_retrieved]
-        else:
-            fetched_slots = token_slots
+    def _release_load_slots(self, token_slots: torch.Tensor) -> None:
+        try:
+            self.token_to_kv_pool_allocator.free(token_slots)
+        except Exception:  # noqa: BLE001
+            self._quarantine_load_slots(token_slots)
+            raise
 
+    def _quarantine_load_slots(self, token_slots: Optional[torch.Tensor]) -> None:
+        if token_slots is not None:
+            self._quarantined_load_slots.append(token_slots)
+
+    def _publish_loaded_slots(
+        self,
+        *,
+        key: RadixKey,
+        value_numel: int,
+        loaded_slots: torch.Tensor,
+        last_node: TreeNode,
+    ) -> Tuple[torch.Tensor, TreeNode]:
+        loaded_length = int(loaded_slots.numel())
         new_node = TreeNode(priority=last_node.priority)
-        start = value_numel
-        end = start + num_retrieved
-        new_node.key = key[start:end]
-        new_node.value = fetched_slots
+        new_node.key = key[value_numel : value_numel + loaded_length]
+        new_node.value = loaded_slots
         new_node.parent = last_node
         last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        self.evictable_size_ += num_retrieved
+        self.evictable_size_ += loaded_length
         self._update_leaf_status(last_node)
         self._update_leaf_status(new_node)
 
         self._record_store_event(new_node.parent)
         self._record_store_event(new_node)
 
-        return fetched_slots, new_node
+        return loaded_slots, new_node
 
     # ------------------------------------------------------------------
     # cache_finished_req (STORE)
