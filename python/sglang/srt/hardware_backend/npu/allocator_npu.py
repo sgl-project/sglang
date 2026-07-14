@@ -42,9 +42,11 @@ def alloc_for_extend_npu(
     batch: "ScheduleBatch",
 ) -> torch.Tensor:
     last_locations = [
-        prefix_tensor[-1:]
-        if prefix_tensor.numel() > 0
-        else torch.tensor([-1], dtype=torch.int64, device=batch.device)
+        (
+            prefix_tensor[-1:]
+            if prefix_tensor.numel() > 0
+            else torch.tensor([-1], dtype=torch.int64, device=batch.device)
+        )
         for prefix_tensor in prefix_tensors
     ]
     last_loc = (

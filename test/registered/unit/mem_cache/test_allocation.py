@@ -92,8 +92,7 @@ def _call_spec(inputs) -> None:
         cur_kv_lens_cpu=inputs.cur_kv_lens_cpu,
         nxt_kv_lens=inputs.nxt_kv_lens,
         nxt_kv_lens_cpu=inputs.nxt_kv_lens_cpu,
-        num_needed_tokens=inputs.nxt_kv_lens_cpu.item()
-        - inputs.cur_kv_lens_cpu.item(),
+        num_needed_tokens=inputs.nxt_kv_lens_cpu.item() - inputs.cur_kv_lens_cpu.item(),
         batch=inputs.batch,
     )
 
@@ -146,12 +145,8 @@ class TestSpecPageAlignedAllocation(unittest.TestCase):
         inputs.allocator.alloc.assert_not_called()
         inputs.allocator.alloc_extend.assert_not_called()
         self.assertEqual(inputs.reqs[0].kv.kv_allocated_len, before_watermark)
-        self.assertTrue(
-            torch.equal(inputs.req_to_token_pool.req_to_token, before_row)
-        )
-        self.assertTrue(
-            torch.equal(inputs.allocator.free_pages, before_free_pages)
-        )
+        self.assertTrue(torch.equal(inputs.req_to_token_pool.req_to_token, before_row))
+        self.assertTrue(torch.equal(inputs.allocator.free_pages, before_free_pages))
         self.assertTrue(
             torch.equal(inputs.allocator.release_pages, before_release_pages)
         )
@@ -178,9 +173,7 @@ class TestSpecPageAlignedAllocation(unittest.TestCase):
                 )
                 self.assertIn("phase=spec decode", message)
                 self.assertIn("page_size=4", message)
-                self.assertIn(
-                    f"supports_page_aligned_alloc={supports_main}", message
-                )
+                self.assertIn(f"supports_page_aligned_alloc={supports_main}", message)
                 self.assertIn(
                     f"supports_spec_page_aligned_alloc={supports_spec}", message
                 )
@@ -202,12 +195,8 @@ class TestSpecPageAlignedAllocation(unittest.TestCase):
                         "HiSparse legacy allocator must not mutate"
                     )
                 )
-                hisparse_allocator.free_pages = torch.tensor(
-                    [3, 5], dtype=torch.int64
-                )
-                hisparse_allocator.release_pages = torch.tensor(
-                    [7], dtype=torch.int64
-                )
+                hisparse_allocator.free_pages = torch.tensor([3, 5], dtype=torch.int64)
+                hisparse_allocator.release_pages = torch.tensor([7], dtype=torch.int64)
                 inputs = _make_inputs(allocator=hisparse_allocator)
                 message = self._assert_failure_without_mutation(
                     inputs,

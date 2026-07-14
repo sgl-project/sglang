@@ -180,16 +180,10 @@ class TestDecodePreallocAllocation(unittest.TestCase):
 
         allocator.alloc_extend.assert_called_once()
         call_kwargs = allocator.alloc_extend.call_args.kwargs
-        self.assertTrue(
-            torch.equal(call_kwargs["prefix_lens"], torch.tensor([4]))
-        )
-        self.assertTrue(
-            torch.equal(call_kwargs["prefix_lens_cpu"], torch.tensor([4]))
-        )
+        self.assertTrue(torch.equal(call_kwargs["prefix_lens"], torch.tensor([4])))
+        self.assertTrue(torch.equal(call_kwargs["prefix_lens_cpu"], torch.tensor([4])))
         self.assertTrue(torch.equal(call_kwargs["seq_lens"], torch.tensor([8])))
-        self.assertTrue(
-            torch.equal(call_kwargs["seq_lens_cpu"], torch.tensor([8]))
-        )
+        self.assertTrue(torch.equal(call_kwargs["seq_lens_cpu"], torch.tensor([8])))
         self.assertTrue(torch.equal(call_kwargs["last_loc"], prefix_indices[-1:]))
         self.assertEqual(call_kwargs["extend_num_tokens"], 4)
         self.assertIs(result, allocated_locations)
@@ -217,9 +211,7 @@ class TestDecodePreallocAllocation(unittest.TestCase):
         )
 
         call_kwargs = allocator.alloc_extend.call_args.kwargs
-        self.assertTrue(
-            torch.equal(call_kwargs["last_loc"], torch.tensor([-1]))
-        )
+        self.assertTrue(torch.equal(call_kwargs["last_loc"], torch.tensor([-1])))
         self.assertEqual(call_kwargs["extend_num_tokens"], 8)
         self.assertEqual(req.kv.kv_allocated_len, 8)
 
