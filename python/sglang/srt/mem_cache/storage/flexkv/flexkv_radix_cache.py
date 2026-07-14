@@ -534,9 +534,7 @@ class FlexKVRadixCache(RadixCache):
                 len(req.output_ids) - 1, 0
             )
         kv_committed_len = (
-            kv_committed_len
-            // self._allocator_page_size
-            * self._allocator_page_size
+            kv_committed_len // self._allocator_page_size * self._allocator_page_size
         )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
