@@ -202,6 +202,22 @@ def _make_direct_allocator(
 
 
 class TestHiSparseDirectAllocator(unittest.TestCase):
+    def test_top_level_free_rejects_partial_before_group_append(self) -> None:
+        """Generic and DSV4 HiSparse reject partial logical page fragments."""
+        for dsv4 in (False, True):
+            with self.subTest(dsv4=dsv4):
+                allocator = _make_direct_allocator(
+                    dsv4=dsv4,
+                    device_allocation=torch.arange(24, 32, dtype=torch.int64),
+                )
+                allocator.is_not_in_free_group = False
+                allocator.free_group = []
+
+                with self.assertRaisesRegex(AssertionError, "complete page blocks"):
+                    allocator.free(torch.arange(8, 15, dtype=torch.int64))
+
+                self.assertEqual(allocator.free_group, [])
+
     def test_direct_alloc_publishes_generic_and_dsv4_mappings(self) -> None:
         """Direct allocation publishes both generic and compressed mappings."""
         cases = (
