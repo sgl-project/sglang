@@ -307,7 +307,6 @@ def flash_decode_with_gqa_share_sparse(
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")

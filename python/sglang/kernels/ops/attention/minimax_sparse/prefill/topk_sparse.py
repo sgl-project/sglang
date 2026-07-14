@@ -57,7 +57,6 @@ def _gqa_share_sparse_fwd_kernel(
     slot_ids,
     # shape
     max_slots,
-    num_kv_heads,
     gqa_group_size,
     qk_head_dim,
     v_head_dim,
@@ -95,7 +94,6 @@ def _gqa_share_sparse_fwd_kernel(
     BLOCK_SIZE_QH: tl.constexpr,
     # has sink
     HAS_SINK: tl.constexpr,
-    USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -270,7 +268,6 @@ def flash_prefill_with_gqa_share_sparse(
     prefix_lens: torch.Tensor,
     max_seqlen_q: int,
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
 ) -> torch.Tensor:
@@ -323,7 +320,6 @@ def flash_prefill_with_gqa_share_sparse(
         prefix_lens,
         slot_ids,
         max_slots,
-        num_k_heads,
         gqa_group_size,
         qk_head_dim,
         v_head_dim,
@@ -350,7 +346,6 @@ def flash_prefill_with_gqa_share_sparse(
         req_to_token.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
-        USE_TMA=use_tma,
         IS_FP8=is_fp8,
     )
     return o

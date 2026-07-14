@@ -763,7 +763,6 @@ def flash_decode_with_topk_idx(
     init_blocks: int,
     local_blocks: int,
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
     score_type: str = "max",
     disable_index_value: bool = False,
     use_dense_main_attn: bool = False,  # NOTE: need transform idx in this case

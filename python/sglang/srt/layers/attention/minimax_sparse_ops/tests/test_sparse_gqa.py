@@ -120,7 +120,6 @@ def build_inputs(
             ).to(torch.int32)
 
     num_blocks_list = [(sl + block_size - 1) // block_size for sl in seq_lens_list]
-    actual_topk = min(topk, min(num_blocks_list))
     topk_idx = torch.zeros(
         num_kv_heads, batch_size, topk, dtype=torch.int32, device=DEVICE
     )

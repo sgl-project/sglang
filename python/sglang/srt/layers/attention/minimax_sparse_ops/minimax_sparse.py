@@ -192,7 +192,6 @@ def minimax_sparse_decode(
     slot_ids: torch.Tensor,  # [batch_size, ]
     seq_lens: torch.Tensor,  # [batch_size, ]
     max_seqlen: int,  # max of seq_lens, passed from caller to avoid sync during CUDA graph capture
-    block_size_q: int,  # useless for now, will always be 1
     block_size_k: int,
     topk: int,
     init_blocks: int,
