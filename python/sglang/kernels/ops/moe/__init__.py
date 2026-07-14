@@ -66,9 +66,23 @@ def moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     cumsum_buffer: torch.Tensor,
     pad_sorted_token_ids: bool = False,
+    ignore_invalid_expert: bool = False,
 ) -> None:
     """Align and sort expert token ids into block-padded output buffers."""
-    return get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)(
+    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)
+    if ignore_invalid_expert:
+        return kernel(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_token_ids,
+            experts_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            pad_sorted_token_ids,
+            ignore_invalid_expert,
+        )
+    return kernel(
         topk_ids,
         num_experts,
         block_size,
