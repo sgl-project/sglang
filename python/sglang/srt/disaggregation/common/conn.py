@@ -291,6 +291,7 @@ class CommonKVManager(BaseKVManager):
             )
             return
         self._kv_replica_factor = info.required_dst_info_num
+
     def _ensure_prefill_recompute_executor(
         self,
     ) -> concurrent.futures.ThreadPoolExecutor:
