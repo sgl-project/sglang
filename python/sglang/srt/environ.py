@@ -1021,17 +1021,21 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
-    # Keep received embeddings on GPU end-to-end for the ZMQ (non-pool) receive
-    # path: move each part to the local CUDA device on receipt so the concat and
-    # the downstream precomputed-embedding merge happen on GPU, avoiding H2D/D2H
-    # round-trips. Opt-in; default off keeps the CPU behavior.
+    # Keep received embeddings on GPU end-to-end for the ZMQ unpooled receive
+    # path (SGLANG_EMBEDDING_POOL_SIZE_MB=0): move each part to the local CUDA
+    # device on receipt so the concat and the downstream precomputed-embedding
+    # merge happen on GPU, avoiding H2D/D2H round-trips. Opt-in; default off
+    # keeps the CPU behavior. Pooled receive is always on-GPU.
     SGLANG_ENCODER_RECV_EMBEDDING_ON_GPU = EnvBool(False)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
-    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
-    # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
+    # Persistent receiver-side GPU embedding pool size. mooncake EPD transport:
+    # 0 disables (per-request register/deregister). zmq_to_scheduler: received
+    # embeddings are staged into the pool on GPU and requests stay pending
+    # while the pool is full; 0 disables (unbounded CPU receive).
+    # 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
