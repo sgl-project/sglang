@@ -12,6 +12,11 @@ Verifies, against the double-quant baseline:
   (2) shared consumer: cutlass_w8a8_block_fp8_linear_with_fallback with a
       pre-quantized (q, s) tuple vs its own internal quant -- expected BITWISE
       (baseline uses the identical row-padded quant + identical GEMM);
+  (2b) shared consumer under SGLANG_ENABLE_JIT_DEEPGEMM=1 (the SOTA config):
+      deepgemm_w8a8_block_fp8_linear_with_fallback with the same (q, s) tuple
+      -- expected BITWISE (DG's own quant layout, column-major TMA-aligned
+      fp32 scales, is byte-identical to the row-padded quantize-once layout);
+      skipped cleanly when deep_gemm is unavailable or UE8M0 (Blackwell);
   (3) routed consumer: fused_experts(a1_q=..., a1_scale=...) vs the in-kernel
       quant baseline -- expected BITWISE if (1) is bitwise (the fused kernel
       reads A_scale through explicit strides, so the column-major scale view
@@ -100,6 +105,61 @@ def test_shared_consumer(T, K, N, device):
     return bitwise
 
 
+def test_shared_consumer_deepgemm(T, K, N, device):
+    """DG branch (SGLANG_ENABLE_JIT_DEEPGEMM=1 SOTA config): the shared-expert
+    linear resolves to deepgemm_w8a8_block_fp8_linear_with_fallback. Its own
+    quant (column-major + TMA-aligned fp32 scales) has the same buffer layout
+    as the row-padded quantize-once kernel, so this is expected BITWISE."""
+    from sglang.srt.layers.quantization.fp8_utils import (
+        deepgemm_w8a8_block_fp8_linear_with_fallback,
+    )
+
+    torch.manual_seed(T + K + 1)
+    x = torch.randn(T, K, device=device, dtype=torch.bfloat16)
+    w_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16) / K**0.5
+    w, ws = _quant_weight_blockwise_n64(w_bf16)
+
+    ref = deepgemm_w8a8_block_fp8_linear_with_fallback(x, w, [128, 128], ws)
+
+    q_pad, s_pad = sglang_per_token_group_quant_fp8_row_padded(x, GROUP)
+    out = deepgemm_w8a8_block_fp8_linear_with_fallback(
+        q_pad, w, [128, 128], ws, input_scale=s_pad
+    )[:T]
+
+    bitwise = torch.equal(out, ref)
+    close = torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+    _report(
+        f"shared-consumer-deepgemm T={T} K={K} N={N}",
+        close,
+        f"(bitwise={bitwise}, max|d|={(out.float() - ref.float()).abs().max().item():.3e})",
+    )
+    return bitwise
+
+
+def _quant_weight_blockwise_n64(w_bf16, block=128):
+    """Like _quant_weight_blockwise but supports N % 64 == 0 (DeepGEMM's
+    minimum): the last (partial) N-block reuses ceil-division block indexing."""
+    n, k = w_bf16.shape
+    if n % block == 0:
+        return _quant_weight_blockwise(w_bf16, block)
+    import math
+
+    n_blocks = math.ceil(n / block)
+    w = w_bf16.float()
+    q = torch.empty(n, k, device=w.device, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(n_blocks, k // block, device=w.device, dtype=torch.float32)
+    for bn in range(n_blocks):
+        rows = slice(bn * block, min((bn + 1) * block, n))
+        wb = w[rows].view(rows.stop - rows.start, k // block, block)
+        amax = wb.abs().amax(dim=(0, 2)).clamp(min=1e-4)
+        s = amax / torch.finfo(torch.float8_e4m3fn).max
+        q[rows] = (
+            (wb / s[None, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn).view(-1, k)
+        )
+        scale[bn] = s
+    return q, scale
+
+
 def test_routed_consumer(T, K, E, I, topk, device):
     torch.manual_seed(T * 7 + K)
     x = torch.randn(T, K, device=device, dtype=torch.bfloat16)
@@ -176,7 +236,24 @@ def main():
         for K in (6144, 7168):
             test_shared_consumer(T, K, 512, device)
 
+    print("== (2b) shared consumer (deepgemm w8a8 linear, JIT DG SOTA config) ==")
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        print("SKIP: deep_gemm unavailable or SGLANG_ENABLE_JIT_DEEPGEMM=0")
+    elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        print("SKIP: Blackwell UE8M0 scale layout (gated ineligible by design)")
+    else:
+        for T in (4093, 4096):
+            for K in (6144, 7168):
+                test_shared_consumer_deepgemm(T, K, 512, device)
+        # DG accepts N % 64 (cutlass needs % 128) -- exercise the DG-only shape.
+        test_shared_consumer_deepgemm(4096, 7168, 320, device)
+
     print("== (3) routed consumer (triton fused_experts) ==")
+    # Identical in both cutlass and JIT-DG configs: the MoE runner stays
+    # triton with a2a=none (is_deepgemm_moe_runner_backend_enabled() is False
+    # for auto + a2a=none even when SGLANG_ENABLE_JIT_DEEPGEMM=1).
     for T in (61, 4093, 4096):
         test_routed_consumer(T, 7168, E=32, I=256, topk=8, device=device)
 
