@@ -289,7 +289,6 @@ class MambaPoolHost(HostKVCache):
         self.release_slots = []
         self.num_release_slots = 0
 
-    @synchronized
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
 
@@ -907,13 +906,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def get_hybrid_pool_buffer(self):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
-    @synchronized
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
 
-    @synchronized
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
 

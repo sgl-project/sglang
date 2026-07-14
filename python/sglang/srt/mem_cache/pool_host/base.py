@@ -275,7 +275,6 @@ class HostKVCache(abc.ABC):
         # slot_used[k] is true if slot k is allocated.
         self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
-    @synchronized
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
 
