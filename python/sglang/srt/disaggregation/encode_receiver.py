@@ -49,6 +49,23 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+def _recv_embedding_on_gpu() -> bool:
+    """Whether the ZMQ receive path should keep embeddings on the CUDA device."""
+    return envs.SGLANG_ENCODER_RECV_EMBEDDING_ON_GPU.get() and torch.cuda.is_available()
+
+
+def _mark_keep_device_embedding(mm_inputs) -> None:
+    """Flag mm items so ``general_mm_embed_routine`` keeps their precomputed
+    embeddings on the GPU instead of copying them back to CPU after use."""
+    if mm_inputs is None:
+        return
+    for item in getattr(mm_inputs, "mm_items", []) or []:
+        try:
+            item._keep_device_embedding = True
+        except Exception:
+            pass
+
+
 class EncoderBootstrapServer:
     """Lightweight bootstrap server for dynamic encoder discovery.
 
@@ -562,10 +579,16 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     def get_embedding(self, is_concat=False):
         if is_concat:
+            # Move parts to GPU before torch.cat: the concat itself is faster on
+            # GPU and the result stays on-device for the downstream merge,
+            # avoiding H2D/D2H round-trips. Opt-in via the env switch.
+            on_gpu = _recv_embedding_on_gpu()
             groups = defaultdict(list)
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
-                    groups[self.modality_list[i]].append(e)
+                    groups[self.modality_list[i]].append(
+                        e.cuda(non_blocking=True) if on_gpu else e
+                    )
             return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
 
@@ -825,6 +848,8 @@ class WaitingImageRequest:
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        if _recv_embedding_on_gpu():
+            _mark_keep_device_embedding(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
@@ -1172,11 +1197,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         # Bind slot release to mm_inputs GC
         if self._buffer_from_pool and mm_inputs is not None:
             weakref.finalize(mm_inputs, self.embedding_pool.release, self._pool_slot_id)
-            for item in getattr(mm_inputs, "mm_items", []) or []:
-                try:
-                    setattr(item, "_keep_device_embedding", True)
-                except Exception:
-                    pass
+            _mark_keep_device_embedding(mm_inputs)
             # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
             self._pool_slot_id = None
             self.embeddings_buffer = None
