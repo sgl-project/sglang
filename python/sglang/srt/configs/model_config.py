@@ -452,6 +452,9 @@ class ModelConfig:
         self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
             is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
+        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -1345,6 +1348,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "humming",
             "quark_mxfp4",
             "auto-round",
         ]
@@ -1758,6 +1762,13 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
     "MiniMaxM3SparseForConditionalGeneration",
 ]
 
+# Multimodal archs whose LM prefill is validated under breakable CUDA graph;
+# embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+multimodal_breakable_cuda_graph_supported_model_archs = [
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1820,6 +1831,14 @@ def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str])
     """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
     return any(
         arch in multimodal_piecewise_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
+def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill breakable CUDA graph enabled."""
+    return any(
+        arch in multimodal_breakable_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 

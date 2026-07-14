@@ -864,7 +864,7 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         return result
 
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         invoke_fused_moe_kernel,
     )
 
