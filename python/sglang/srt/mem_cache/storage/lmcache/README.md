@@ -29,7 +29,7 @@ pip install -e . --no-build-isolation
 
 ## Use LMCache
 
-LMCache supports two transport modes. **MP (multi-process, default)** issues a single blocking retrieve over ZMQ to a standalone daemon that owns the KV store and survives SGLang restarts. **IP (in-process)** uses an embedded layerwise connector — the cache lives and dies with the SGLang process. Mode selection is currently a code-level setting in `LMCRadixCache.__init__` (`self._mode`); only MP is reachable by default.
+LMCache supports two transport modes. **MP (multi-process, default)** issues a single blocking retrieve over ZMQ to a standalone daemon that owns the KV store and survives SGLang restarts. **IP (in-process)** uses an embedded layerwise connector — the cache lives and dies with the SGLang process. Mode selection is currently a code-level setting on `LMCRadixCache._mode`; only MP is reachable by default.
 
 ### MP mode (default): multi-process daemon
 
@@ -59,7 +59,9 @@ For full LMCache config options see https://docs.lmcache.ai/api_reference/config
 
 ### IP mode: in-process
 
-Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, edit `LMCRadixCache.__init__` and set `self._mode = LMCacheMode.IP`.
+Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, set `LMCRadixCache._mode = LMCacheMode.IP` in the source.
+
+IP load-back requires allocator page size 1. MP load-back supports larger allocator pages: it allocates complete pages, publishes only the complete-page prefix returned by LMCache, and releases the aligned tail exactly once. The configured storage page size must divide the actual allocator page size.
 
 The LMCache config still controls chunk_size and storage; `mp_host` / `mp_port` are ignored on this path. Use the bundled `example_config_ip.yaml`:
 
