@@ -1824,9 +1824,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "deepep"},
@@ -1836,9 +1834,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "megamoe"},
