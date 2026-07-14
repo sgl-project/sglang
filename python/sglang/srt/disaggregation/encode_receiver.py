@@ -375,7 +375,9 @@ class EmbeddingData:
             self.shape = list(embedding.shape) if embedding is not None else None
         self.cached_embedding = None
         self.error_msg = error_msg
-        self.error_code = error_code
+        # Coerce to plain int: this object crosses process boundaries via
+        # safe_pickle_loads, whose allowlist blocks http.HTTPStatus.
+        self.error_code = int(error_code) if error_code is not None else None
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -783,51 +785,78 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
-            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
-                logger.warning(
-                    f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
+            try:
+                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+                if getattr(recv_obj, "error_msg", None) is not None:
+                    logger.warning(
+                        f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
+                    )
+                    self.error_msg = recv_obj.error_msg
+                    self.error_code = recv_obj.error_code
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.recv_socket.close()
+                    return
+
+                # Extract original req_id from part_req_id and drop stale payloads
+                # that may arrive on a reused ZMQ port after a prior request aborted.
+                original_req_id = extract_original_req_id(recv_obj.req_id)
+                if original_req_id != self.recv_req.rid:
+                    logger.warning(
+                        f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                        f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+                    )
+                    continue
+                recv_obj.req_id = original_req_id
+
+                buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+                recv_obj.embedding = (
+                    torch.frombuffer(buffer, dtype=recv_obj.dtype)
+                    .reshape(recv_obj.shape)
+                    .clone()
                 )
-                self.error_msg = recv_obj.error_msg
-                self.error_code = recv_obj.error_code
+
+                if self.recv_embedding_data is None:
+                    self.recv_embedding_data = (
+                        MultiModalEmbeddingData.from_embedding_data(
+                            recv_obj, model_type=self.model_type
+                        )
+                    )
+                else:
+                    self.recv_embedding_data.add(recv_obj)
+            except Exception as e:
+                # A message the scheduler cannot decode (blocked unpickle,
+                # bad shape/dtype, ...) must fail this request, not crash the
+                # scheduler event loop; FAIL still reaches the TP-wide status
+                # all-reduce in _process_waiting_requests.
+                logger.exception(
+                    "Failed to decode embedding message for rid=%s", self.rid
+                )
+                self.error_msg = f"Failed to decode embedding message: {e}"
                 self.status = WaitingImageRequestStatus.FAIL
+                self._cleanup_gpu_buffer()
                 self.recv_socket.close()
                 return
 
-            # Extract original req_id from part_req_id and drop stale payloads
-            # that may arrive on a reused ZMQ port after a prior request aborted.
-            original_req_id = extract_original_req_id(recv_obj.req_id)
-            if original_req_id != self.recv_req.rid:
-                logger.warning(
-                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
-                )
-                continue
-            recv_obj.req_id = original_req_id
-
-            buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-            recv_obj.embedding = (
-                torch.frombuffer(buffer, dtype=recv_obj.dtype)
-                .reshape(recv_obj.shape)
-                .clone()
+        # Assemble mm_inputs. Wrapped so an assembly failure still reaches the
+        # TP-wide status all-reduce in _process_waiting_requests instead of
+        # raising past it.
+        try:
+            recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+            mm_inputs = self.mm_processor.get_mm_data(
+                self.recv_req.input_text,
+                recv_embedding,
+                **self.recv_embedding_data.get_mm_extra_meta(),
             )
-
-            if self.recv_embedding_data is None:
-                self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj, model_type=self.model_type
-                )
-            else:
-                self.recv_embedding_data.add(recv_obj)
-
-        recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
-            recv_embedding,
-            **self.recv_embedding_data.get_mm_extra_meta(),
-        )
-        self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
-        self.status = WaitingImageRequestStatus.SUCCESS
+            self.recv_req.mm_inputs = mm_inputs
+            self.recv_req.input_ids = array("q", mm_inputs.input_ids)
+            self.status = WaitingImageRequestStatus.SUCCESS
+        except Exception as e:
+            logger.exception(
+                "Failed to assemble multimodal inputs for rid=%s", self.rid
+            )
+            self.status = WaitingImageRequestStatus.FAIL
+            self.error_msg = f"Failed to assemble multimodal inputs: {e}"
+            self._cleanup_gpu_buffer()
         self.recv_socket.close()
 
     def _cleanup_gpu_buffer(self):
@@ -1120,6 +1149,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             try:
                 parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
+                return
+            except zmq.ZMQError:
+                # The RDMA pipeline thread closed the socket after an encoder
+                # error (e.g. OOM).  It already set status=FAIL; just bail.
                 return
 
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
