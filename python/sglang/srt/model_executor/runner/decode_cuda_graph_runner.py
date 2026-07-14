@@ -84,6 +84,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (
+    _set_capture_dsa_variant,
     _set_capture_lora_variant,
     model_capture_mode,
 )
@@ -222,6 +223,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+
+        # --- DSA dense-decode dual-graph (Design A) --------------------
+        # When enabled, capture a "dense" (k-only, skip-indexer) and a "sparse"
+        # (full indexer) decode graph per bs bucket, and dispatch on max_kv_len
+        # vs index_topk at replay. Opt-in (extra ~52 graphs + ~2x capture time)
+        # and only meaningful for DSA models where the decode indexer can be
+        # skipped when kv_len <= index_topk.
+        self.dsa_dual_graph = False
+        self.dsa_index_topk: Optional[int] = None
+        self._dsa_dispatch_counts = {"dense": 0, "sparse": 0}
+        self._dsa_dispatch_last: Optional[str] = None
+        if envs.SGLANG_DSA_DECODE_DUAL_GRAPH.get():
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_topk,
+                is_deepseek_dsa,
+            )
+
+            hf_config = model_runner.model_config.hf_config
+            if is_deepseek_dsa(hf_config):
+                self.dsa_dual_graph = True
+                self.dsa_index_topk = get_dsa_index_topk(hf_config)
+                logger.info(
+                    "[dense-decode] Design A dual-graph enabled: capturing "
+                    "dense (k-only) + sparse (full indexer) decode graphs; "
+                    "dispatch on max_kv_len vs index_topk=%d.",
+                    self.dsa_index_topk,
+                )
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -434,15 +462,53 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, size, stream_idx=None, variant_label=None):
+    def _make_graph_key(
+        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+    ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            dsa_variant=dsa_variant,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
+
+    def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        """Design A host dispatch: pick which pre-captured DSA decode graph to
+        replay from the batch-max kv_len. If any request has kv_len > index_topk
+        the dense (k-only) graph would be wrong for it, so the whole batch uses
+        the sparse (full indexer) graph. Returns None when dual-graph is off."""
+        if not self.dsa_dual_graph:
+            return None
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            # Host-side mirror (maintained incrementally for plain decode) — no
+            # d2h sync needed.
+            max_kv_len = int(seq_lens_cpu.max().item())
+        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
+            # Fallback: a single scalar reduction d2h (cheap, per-step).
+            max_kv_len = int(forward_batch.seq_lens.max().item())
+        else:
+            # No length info: be safe and use the correct-for-all sparse graph.
+            return "sparse"
+        variant = "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
+        if envs.SGLANG_KONLY_DEBUG.get():
+            self._dsa_dispatch_counts[variant] += 1
+            total = sum(self._dsa_dispatch_counts.values())
+            if total % 100 == 0 or self._dsa_dispatch_last != variant:
+                logger.info(
+                    "[dense-decode] dispatch variant=%s max_kv_len=%d "
+                    "index_topk=%d (counts dense=%d sparse=%d)",
+                    variant,
+                    max_kv_len,
+                    self.dsa_index_topk,
+                    self._dsa_dispatch_counts["dense"],
+                    self._dsa_dispatch_counts["sparse"],
+                )
+            self._dsa_dispatch_last = variant
+        return variant
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
@@ -872,6 +938,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
+        # Design A: capture a dense (k-only) and a sparse (full indexer) graph
+        # per bs bucket. Order: dense first so its (smaller) capture-time peak
+        # runs while the shared pool is fresh; sparse's peak subsumes it.
+        dsa_variants = ["dense", "sparse"] if self.dsa_dual_graph else [None]
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -885,13 +955,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_req,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                for dsa_variant in dsa_variants:
+                    _set_capture_dsa_variant(dsa_variant)
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_req,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs, forward, stream_idx, variant_label, dsa_variant
+                        )
+        _set_capture_dsa_variant(None)
 
     def capture_one_shape(
         self,
@@ -899,6 +974,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        dsa_variant: Optional[str] = None,
     ):
         num_tokens = size * self.num_tokens_per_req
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -986,6 +1062,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_graph_size(bs=bs, num_tokens=num_tokens),
                     stream_idx,
                     variant_label,
+                    dsa_variant,
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1079,9 +1156,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.input_embeds
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
+            dsa_variant = self._resolve_dsa_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label
+                graph_size_key, stream_idx, variant_label, dsa_variant
             )
             return
 
@@ -1180,9 +1258,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
+        dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
+            graph_size_key, stream_idx, variant_label, dsa_variant
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

@@ -569,10 +569,26 @@ class Indexer(MultiPlatformOp):
             if get_is_capture_mode():
                 # Under a captured decode cuda graph the taken branch is frozen at
                 # capture time, so we must NOT branch on a runtime seq_len (also a
-                # host sync would break capture). M2a "static" path: enable only
-                # when the deployment guarantees every request's kv_len<=index_topk
-                # (e.g. i1k/o1k). General/mixed traffic needs the M2b graph-variant
-                # + can_run_graph gating instead.
+                # host sync would break capture). The chosen branch is instead
+                # driven by which graph variant is being captured.
+                #
+                # Design A (dual graph): the decode runner captures a "dense"
+                # (k-only) and a "sparse" (full indexer) graph per bs bucket and
+                # dispatches on max_kv_len at replay. The capture-variant signal
+                # tells us which one to bake in.
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_dsa_variant,
+                )
+
+                variant = get_capture_dsa_variant()
+                if variant == "dense":
+                    return True
+                if variant == "sparse":
+                    return False
+
+                # M2a "static" fallback (no dual-variant capture active): enable
+                # k-only only when the deployment guarantees every request's
+                # kv_len<=index_topk (e.g. i1k/o1k). WRONG for mixed >2K traffic.
                 import os
 
                 return os.environ.get("SGLANG_DSA_DECODE_DENSE_GRAPH", "0") == "1"
