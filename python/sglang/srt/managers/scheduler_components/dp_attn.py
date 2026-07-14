@@ -49,7 +49,6 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
-    recv_skipper_forward_mode: Optional[ForwardMode] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -107,18 +106,14 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info.cpu()
+        cpu_data = tp0_info[:, :2].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_cuda_graph = bool(cpu_data[:, 2].min().item())
-        self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
-        self.can_run_breakable_cuda_graph = bool(cpu_data[:, 6].min().item())
-        forward_modes = cpu_data[:, 5].tolist()
-        self.recv_skipper_forward_mode = SchedulerRecvSkipper.derive_forward_mode(
-            forward_modes
-        )
+        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
+        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(forward_modes)
+            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
 
 def _update_gather_batch(
@@ -258,7 +253,11 @@ def prepare_mlp_sync_batch_raw(
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and not skip_all_gather:
-        local_batch.recv_skipper_forward_mode = mlp_sync_info.recv_skipper_forward_mode
+        local_batch.recv_skipper_forward_mode = (
+            SchedulerRecvSkipper.derive_forward_mode(
+                mlp_sync_info.tp0_info[:, 5].tolist()
+            )
+        )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info

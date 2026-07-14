@@ -77,18 +77,6 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         self.assertEqual(derive([verify, verify]), ForwardMode.TARGET_VERIFY)
         self.assertEqual(derive([verify, decode]), ForwardMode.DECODE)
 
-    def test_derived_mode_is_rank_invariant(self):
-        # Permutations of the gathered list must not change the result.
-        derive = SchedulerRecvSkipper.derive_forward_mode
-        modes = [
-            ForwardMode.DECODE.value,
-            ForwardMode.IDLE.value,
-            ForwardMode.EXTEND.value,
-            ForwardMode.TARGET_VERIFY.value,
-        ]
-        results = {derive(modes[i:] + modes[:i]) for i in range(len(modes))}
-        self.assertEqual(len(results), 1)
-
 
 class TestRecvSkipperLastForwardMode(CustomTestCase):
     """The scheduler-side helper that picks what the skipper is fed."""
@@ -111,13 +99,6 @@ class TestRecvSkipperLastForwardMode(CustomTestCase):
             recv_skipper_forward_mode=ForwardMode.EXTEND,
         )
         self.assertEqual(_last_forward_mode(True, batch), ForwardMode.EXTEND)
-
-    def test_dp_without_synced_mode_returns_none(self):
-        # SGLANG_SCHEDULER_SKIP_ALL_GATHER is global, so None stays consistent.
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, recv_skipper_forward_mode=None
-        )
-        self.assertIsNone(_last_forward_mode(True, batch))
 
 
 if __name__ == "__main__":

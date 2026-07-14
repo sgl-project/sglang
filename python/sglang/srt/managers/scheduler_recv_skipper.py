@@ -4,10 +4,6 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 
-# Modes that accumulate slowly in the weight table below; anything else gets
-# the large default weight and forces a recv on the next iteration.
-_SLOW_RECV_MODE_VALUES = (ForwardMode.DECODE.value, ForwardMode.TARGET_VERIFY.value)
-
 
 class SchedulerRecvSkipper:
     @staticmethod
@@ -17,24 +13,18 @@ class SchedulerRecvSkipper:
         return SchedulerRecvSkipper(server_args)
 
     @staticmethod
-    def derive_forward_mode(
-        global_forward_modes: List[int],
-    ) -> Optional[ForwardMode]:
-        """Collapse the gathered per-DP-rank forward modes into one
-        weight-table bucket; the input is rank-identical, so the result is too."""
-        active = [
-            m
-            for m in global_forward_modes
-            if m != ForwardMode.IDLE.value and m != ForwardMode.PREBUILT.value
-        ]
+    def derive_forward_mode(gathered_modes: List[int]) -> Optional[ForwardMode]:
+        """Collapse the gathered per-DP-rank forward modes into one weight-table
+        bucket; the input is rank-identical, so the recv decision is too."""
+        active = set(gathered_modes) - {
+            ForwardMode.IDLE.value,
+            ForwardMode.PREBUILT.value,
+        }
         if not active:
-            # Same bucket as "no last batch": ranks holding only an
-            # IDLE/PREBUILT batch must agree with ranks whose last_batch is None.
-            return None
-        if any(m not in _SLOW_RECV_MODE_VALUES for m in active):
-            # Any extend-like rank forces a prompt recv.
-            return ForwardMode.EXTEND
-        if all(m == ForwardMode.TARGET_VERIFY.value for m in active):
+            return None  # globally idle: same bucket as "no last batch"
+        if active - {ForwardMode.DECODE.value, ForwardMode.TARGET_VERIFY.value}:
+            return ForwardMode.EXTEND  # any extend-like rank: prompt recv
+        if active == {ForwardMode.TARGET_VERIFY.value}:
             return ForwardMode.TARGET_VERIFY
         return ForwardMode.DECODE
 
