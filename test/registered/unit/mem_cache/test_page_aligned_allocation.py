@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import dflash_info_v2 as dflash_info_v2_module
 from sglang.srt.speculative import eagle_utils as eagle_utils_module
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -849,6 +850,17 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         self.assertEqual(events, ["validate", "evict"])
         alloc.assert_called_once()
+
+    def test_eagle_and_dflash_share_spec_allocation_entry(self) -> None:
+        """EAGLE and DFLASH route through the same owned allocation entry."""
+        self.assertIs(
+            eagle_utils_module.alloc_for_spec_decode,
+            allocation_module.alloc_for_spec_decode,
+        )
+        self.assertIs(
+            dflash_info_v2_module.alloc_for_spec_decode,
+            allocation_module.alloc_for_spec_decode,
+        )
 
     def test_release_accepts_only_the_committed_partial_page(self) -> None:
         """Release permits over-allocation only through the committed page."""
