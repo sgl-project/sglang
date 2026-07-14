@@ -2725,8 +2725,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
-        # Disable prefill CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
+        # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
+        # expose it as ``language_model`` rather than ``model``.
+        try:
+            language_model = resolve_language_model(self.model)
+        except AttributeError:
             logger.warning(
                 "Disable prefill CUDA graph because the model is not a language model"
             )
@@ -2739,9 +2742,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+        # Collect attention layers and moe layers from the model. Keep a VLM
+        # wrapper that exposes ``language_model`` unchanged: assigning it to
+        # ``model`` would register a duplicate module alias and duplicate the
+        # model's state-dict namespace.
+        if hasattr(self.model, "model"):
+            self.model.model = language_model
 
         # Find the module that owns the decoder `layers`. Models wrap it at
         # varying depths: a direct text model exposes `.layers`, a CausalLM
