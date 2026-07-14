@@ -61,6 +61,13 @@ export const Llama31Deployment = () => {
   const getDisplayOptions = (values) => {
     const displayOptions = {
       ...options,
+      modelsize: {
+        ...options.modelsize,
+        items: options.modelsize.items.map(item => ({
+          ...item,
+          disabled: values.hardware === 'xeon' && item.id !== '8b'
+        }))
+      },
       quantization: {
         ...options.quantization,
         items: options.quantization.items.map(item => ({
@@ -111,6 +118,7 @@ export const Llama31Deployment = () => {
     setValues(prev => {
       const next = { ...prev, [optionName]: value };
       if (optionName === 'hardware' && value === 'xeon') {
+        next.modelsize = '8b';
         next.quantization = 'bf16';
         next.optimization = 'basic';
       }
@@ -124,6 +132,7 @@ export const Llama31Deployment = () => {
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
     const isXeon = hardware === 'xeon';
+    const effectiveModelSize = isXeon ? '8b' : modelsize;
 
     // Model size mapping
     const sizeMap = {
@@ -131,13 +140,13 @@ export const Llama31Deployment = () => {
       '70b': '70B',
       '405b': '405B'
     };
-    const sizeToken = sizeMap[modelsize] || '70B';
+    const sizeToken = sizeMap[effectiveModelSize] || '70B';
     const categorySuffix = category === 'instruct' ? '-Instruct' : '';
 
     // Determine model path
     let modelPath;
     if (quantization === 'fp8' && category === 'instruct' && !isXeon) {
-      if (modelsize === '405b') {
+      if (effectiveModelSize === '405b') {
         // Meta official FP8 for 405B
         modelPath = `meta-llama/Llama-3.1-${sizeToken}${categorySuffix}-FP8`;
       } else if (isAMD) {
@@ -172,16 +181,16 @@ export const Llama31Deployment = () => {
         }
       };
       tpSize = quantization === 'fp8'
-        ? amdTpConfig[hardware][modelsize].fp8
-        : amdTpConfig[hardware][modelsize].bf16;
+        ? amdTpConfig[hardware][effectiveModelSize].fp8
+        : amdTpConfig[hardware][effectiveModelSize].bf16;
     } else if (isXeon) {
       // Intel Xeon CPU TP configuration
-      tpSize = modelsize === '8b' ? 3 : 6;
+      tpSize = 3;
     } else {
       // NVIDIA GPU TP configuration
-      if (modelsize === '405b') {
+      if (effectiveModelSize === '405b') {
         tpSize = 8;
-      } else if (modelsize === '70b' && (hardware === 'h100' || hardware === 'h200')) {
+      } else if (effectiveModelSize === '70b' && (hardware === 'h100' || hardware === 'h200')) {
         tpSize = 2;
       }
     }
@@ -214,7 +223,7 @@ export const Llama31Deployment = () => {
         args.push(`--speculative-num-steps 3`);
         args.push(`--speculative-eagle-topk 1`);
         args.push(`--speculative-num-draft-tokens 4`);
-        if (modelsize === '8b' && category === 'instruct') {
+        if (effectiveModelSize === '8b' && category === 'instruct') {
           args.push(`--speculative-draft-model-path yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`);
         } else {
           args.push(`--speculative-draft-model-path \${EAGLE3_MODEL_PATH}`);
