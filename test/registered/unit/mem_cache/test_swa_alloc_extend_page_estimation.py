@@ -1,16 +1,12 @@
-"""Regression for SWA alloc_extend page estimation.
-
-Old gate in SWATokenToKVPoolAllocator.alloc_extend added one full page_size
-per request unconditionally, refusing extends that fit inside the request's
-last partial page. Fix replaces with get_num_new_pages-based gating.
-"""
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.hardware_backend.npu.allocator_npu import (
+    NPUSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -38,10 +34,12 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
         page_size=page_size,
         full_attn_allocator=SimpleNamespace(
             available_size=lambda: full_available,
+            alloc=MagicMock(return_value=full_indices),
             alloc_extend=MagicMock(return_value=full_indices),
         ),
         swa_attn_allocator=SimpleNamespace(
             available_size=lambda: swa_available,
+            alloc=MagicMock(return_value=swa_indices),
             alloc_extend=MagicMock(return_value=swa_indices),
         ),
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
@@ -52,7 +50,7 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
 
 
 def _call(stub, *, prefix_lens_cpu, seq_lens_cpu, extend_num_tokens):
-    return SWATokenToKVPoolAllocator.alloc_extend(
+    return NPUSWATokenToKVPoolAllocator.alloc_extend(
         stub,
         prefix_lens=prefix_lens_cpu,
         prefix_lens_cpu=prefix_lens_cpu,
@@ -66,6 +64,43 @@ def _call(stub, *, prefix_lens_cpu, seq_lens_cpu, extend_num_tokens):
 
 
 class TestSWAAllocExtendPageEstimation(CustomTestCase):
+    def test_non_npu_direct_alloc_uses_aligned_child_allocators(self):
+        """Non-NPU direct allocation publishes the paired child mapping."""
+        stub = _make_self(page_size=2, full_available=2, swa_available=2)
+
+        result = SWATokenToKVPoolAllocator.alloc(stub, 2)
+
+        self.assertTrue(torch.equal(result, torch.tensor([10, 11])))
+        stub.full_attn_allocator.alloc.assert_called_once_with(2)
+        stub.swa_attn_allocator.alloc.assert_called_once_with(2)
+        self.assertTrue(
+            torch.equal(
+                stub.full_to_swa_index_mapping[result],
+                torch.tensor([20, 21]),
+            )
+        )
+
+    def test_non_npu_tail_allocates_only_the_live_window(self):
+        """Non-NPU tail allocation maps the live aligned SWA window."""
+        stub = _make_self(page_size=2, full_available=2, swa_available=2)
+
+        result = SWATokenToKVPoolAllocator.alloc_extend_swa_tail(
+            stub,
+            extend_num_tokens=2,
+            swa_tail_len=2,
+            swa_tail_end=2,
+        )
+
+        self.assertTrue(torch.equal(result, torch.tensor([10, 11])))
+        stub.full_attn_allocator.alloc.assert_called_once_with(2)
+        stub.swa_attn_allocator.alloc.assert_called_once_with(2)
+        self.assertTrue(
+            torch.equal(
+                stub.full_to_swa_index_mapping[result],
+                torch.tensor([20, 21]),
+            )
+        )
+
     def test_zero_new_pages_must_succeed(self):
         # Old: 2 + 2*8 = 18 > 16 -> would refuse.
         # New: prefix 5 -> 6 stays in page 0, 0 new pages.

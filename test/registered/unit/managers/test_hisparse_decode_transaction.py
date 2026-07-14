@@ -72,7 +72,7 @@ class _FakeHiSparseAllocator:
         self.collect_calls: list[torch.Tensor] = []
         self.release_calls: list[torch.Tensor] = []
         self.materialize_calls: list[torch.Tensor] = []
-        self.get_last_calls = 0
+        self.translate_latest_calls = 0
 
     def available_size(self) -> int:
         return min(
@@ -80,11 +80,15 @@ class _FakeHiSparseAllocator:
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
 
-    def get_last_loc_compressed(self, last_locs: torch.Tensor) -> torch.Tensor:
-        self.get_last_calls += 1
+    def translate_latest_cache_locs_to_compressed(
+        self, latest_cache_locs: torch.Tensor
+    ) -> torch.Tensor:
+        self.translate_latest_calls += 1
         if self.compress_ratio == 1:
-            return last_locs
-        return (last_locs - (self.compress_ratio - 1)) // self.compress_ratio
+            return latest_cache_locs
+        return (
+            latest_cache_locs - (self.compress_ratio - 1)
+        ) // self.compress_ratio
 
     def collect_owned_hisparse_page_ids(
         self,
@@ -212,7 +216,7 @@ def _run_page_aligned_map(
     out_cache_locs: list[int],
     req_pool_indices: list[int],
 ) -> None:
-    coordinator._map_page_aligned_last_loc_to_buffer(
+    coordinator._map_page_aligned_latest_cache_loc_to_buffer(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
         out_cache_loc=torch.tensor(out_cache_locs, dtype=torch.int64),
         req_pool_indices=torch.tensor(req_pool_indices, dtype=torch.int64),
@@ -573,7 +577,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
             out_cache_locs=[32],
             req_pool_indices=[0],
         )
-        self.assertEqual(empty.token_to_kv_pool_allocator.get_last_calls, 0)
+        self.assertEqual(empty.token_to_kv_pool_allocator.translate_latest_calls, 0)
         self.assertEqual(empty.token_to_kv_pool_allocator.collect_calls, [])
         self.assertEqual(empty.token_to_kv_pool_allocator.materialize_calls, [])
 
@@ -768,12 +772,12 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
                 coordinator._grow_device_buffers = Mock(
                     return_value=torch.tensor([100], dtype=torch.int64)
                 )
-                coordinator._map_page_aligned_last_loc_to_buffer = Mock(
+                coordinator._map_page_aligned_latest_cache_loc_to_buffer = Mock(
                     side_effect=AssertionError("direct path must remain disabled")
                 )
 
                 with patch("sglang.srt.managers.hisparse_coordinator._is_hip", False):
-                    coordinator.map_last_loc_to_buffer(
+                    coordinator.map_latest_cache_loc_to_buffer(
                         seq_lens=torch.tensor([1], dtype=torch.int64),
                         out_cache_loc=torch.tensor([16], dtype=torch.int64),
                         req_pool_indices=torch.tensor([0], dtype=torch.int64),
@@ -782,7 +786,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
                     )
 
                 coordinator._grow_device_buffers.assert_called_once()
-                coordinator._map_page_aligned_last_loc_to_buffer.assert_not_called()
+                coordinator._map_page_aligned_latest_cache_loc_to_buffer.assert_not_called()
                 self.assertEqual(
                     int(allocator.full_to_hisparse_device_index_mapping[16]), 100
                 )

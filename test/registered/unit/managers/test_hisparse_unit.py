@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import Range
+from sglang.srt.utils.common import Range, ceil_align
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -202,21 +202,14 @@ class TestHiSparseUnit(unittest.TestCase):
         """Allocate KV indices, write req_to_token_pool, update req fields.
         If logical_only=True, uses alloc_logical_only (PD-separated path).
         Returns kv_loc tensor."""
-        device = self.allocator.device
+        allocation_len = ceil_align(fill_len, self.page_size)
         if logical_only:
-            kv_loc = self.allocator.alloc_logical_only(need_size=fill_len)
+            kv_loc = self.allocator.alloc_logical_only(need_size=allocation_len)
         else:
-            kv_loc = self.allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            kv_loc = self.allocator.alloc(allocation_len)
         self.assertIsNotNone(kv_loc, "KV alloc failed")
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
-        req.kv.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = allocation_len
         req.kv_committed_len = fill_len
         req.full_untruncated_fill_ids = array("q", range(fill_len))
         req.extend_range = Range(0, fill_len)
@@ -268,7 +261,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         For long-sequence tests (fill_len > DEVICE_BUFFER_SIZE) where the
         "newest token" reserved slot is not populated (it requires an actual
-        decode step + map_last_loc_to_buffer), callers should pass
+        decode step + map_latest_cache_loc_to_buffer), callers should pass
         ``fill_len - 1`` as the effective pool size so position fill_len-1 is
         never randomly selected.
         """
@@ -418,7 +411,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         # Pass fill_len-1 so position fill_len-1 ("newest token") is never
         # randomly selected — its reserved device-buffer slot is only valid
-        # after map_last_loc_to_buffer in a real decode step.
+        # after map_latest_cache_loc_to_buffer in a real decode step.
         tokens = self._build_topk_tokens(fill_len - 1)
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
@@ -453,8 +446,9 @@ class TestHiSparseUnit(unittest.TestCase):
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
         # Step 1: load the first TOP_K positions from host (no newest token —
-        # the reserved slot is only valid after map_last_loc_to_buffer which is
-        # called during an actual decode step, not modelled here).
+        # the reserved slot is only valid after
+        # map_latest_cache_loc_to_buffer, which is called during an actual
+        # decode step, not modelled here).
         tokens_s1 = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
         locs1 = self._swap_in_selected_pages(
             rpi, sls, tokens_s1.unsqueeze(0), layer_id=0
@@ -498,19 +492,11 @@ class TestHiSparseUnit(unittest.TestCase):
     # Test: Allocator alloc/free lifecycle
     # ==================================================================
     def test_allocator_alloc_free_cycle(self):
-        """alloc_extend / alloc_device_buffer / free restores available_size."""
+        """Composite alloc, buffer transfer, and free restore available size."""
         initial = self._get_initial_sizes()
-        device = self.allocator.device
         fill_len = self.page_size * 2
 
-        kv_loc = self.allocator.alloc_extend(
-            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-            extend_num_tokens=fill_len,
-        )
+        kv_loc = self.allocator.alloc(fill_len)
         self.assertIsNotNone(kv_loc)
         self.assertEqual(len(kv_loc), fill_len)
 
@@ -562,7 +548,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_sizes_restored(initial, "page_size_one_alloc_free_cycle")
 
     def test_decode_remap_frees_stale_page_size_one_mapping(self):
-        """map_last_loc_to_buffer frees the temporary alloc() hisparse slot."""
+        """The latest-cache remap frees the temporary alloc() HiSparse slot."""
         if self.page_size != 1:
             self.skipTest("page_size=1 decode remap path is ROCm-specific")
 
@@ -588,7 +574,7 @@ class TestHiSparseUnit(unittest.TestCase):
         req.kv.kv_allocated_len = seq_len
         req.kv_committed_len = seq_len
 
-        self.coordinator.map_last_loc_to_buffer(
+        self.coordinator.map_latest_cache_loc_to_buffer(
             seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
             out_cache_loc=out_loc,
             req_pool_indices=torch.tensor(
@@ -645,7 +631,7 @@ class TestHiSparseUnit(unittest.TestCase):
         req.kv.kv_allocated_len = fill_len + self.page_size
         req.kv_committed_len = fill_len + 1
 
-        self.coordinator.map_last_loc_to_buffer(
+        self.coordinator.map_latest_cache_loc_to_buffer(
             seq_lens=torch.tensor([fill_len + 1], dtype=torch.int64, device=device),
             out_cache_loc=logical_page[:1],
             req_pool_indices=torch.tensor(

@@ -429,8 +429,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_owned_hisparse_pages(owned_page_ids=pure_surplus_page_ids)
         return buffer_indices
 
-    def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return last_locs
+    def translate_latest_cache_locs_to_compressed(
+        self, latest_cache_locs: torch.Tensor
+    ):
+        return latest_cache_locs
 
     def free_hisparse(self, free_indices: torch.Tensor):
         owned_page_ids = self.collect_owned_hisparse_page_ids(
@@ -731,8 +733,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_owned_hisparse_pages(owned_page_ids=pure_surplus_page_ids)
         return buffer_indices
 
-    def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return (last_locs - 3) // self.compress_ratio
+    def translate_latest_cache_locs_to_compressed(
+        self, latest_cache_locs: torch.Tensor
+    ):
+        return (latest_cache_locs - 3) // self.compress_ratio
 
     def free_compressed(self, compressed_indices: torch.Tensor):
         owned_page_ids = self.collect_owned_hisparse_page_ids(

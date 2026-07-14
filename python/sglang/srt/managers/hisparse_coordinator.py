@@ -561,7 +561,7 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
-    def map_last_loc_to_buffer(
+    def map_latest_cache_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
@@ -575,7 +575,7 @@ class HiSparseCoordinator:
 
         allocator = self.token_to_kv_pool_allocator
         if allocator.page_size > 1 and allocator.supports_page_aligned_alloc:
-            self._map_page_aligned_last_loc_to_buffer(
+            self._map_page_aligned_latest_cache_loc_to_buffer(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
                 req_pool_indices=req_pool_indices,
@@ -585,7 +585,7 @@ class HiSparseCoordinator:
             return
 
         if not self.is_dsv4_hisparse:
-            # Grow device buffers if needed and resolve the latest-token slot.
+            # Grow device buffers if needed and resolve the latest cache slot.
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
@@ -593,8 +593,10 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
-            compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-                out_cache_loc
+            compressed_cache_locs = (
+                self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
+                    out_cache_loc
+                )
             )
             # ROCm: the decode remap creates a temporary hisparse device slot per
             # new token (via the page_size==1 allocator path). Free the stale
@@ -604,7 +606,7 @@ class HiSparseCoordinator:
             # top_k_device_locs, so stale mapping entries are harmless there.
             if _is_hip:
                 previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
-                    compressed_locs
+                    compressed_cache_locs
                 )
                 torch._assert_async(
                     torch.all(previous_locs >= 0),
@@ -614,7 +616,7 @@ class HiSparseCoordinator:
                     previous_locs != reserved_buffer_loc
                 )
                 if self.token_to_kv_pool_allocator.hisparse_device_page_size == 1:
-                    stale_mapping_indices = compressed_locs[stale_mask]
+                    stale_mapping_indices = compressed_cache_locs[stale_mask]
                     stale_page_ids = (
                         self.token_to_kv_pool_allocator.collect_owned_hisparse_page_ids(
                             mapping_indices=stale_mapping_indices
@@ -634,7 +636,7 @@ class HiSparseCoordinator:
                     )
 
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                compressed_locs
+                compressed_cache_locs
             ] = reserved_buffer_loc
             return
 
@@ -655,14 +657,16 @@ class HiSparseCoordinator:
             :, active_req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
 
-        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-            active_out_cache_loc
+        compressed_cache_locs = (
+            self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
+                active_out_cache_loc
+            )
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
-            reserved_buffer_loc
-        )
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            compressed_cache_locs
+        ] = reserved_buffer_loc
 
-    def _map_page_aligned_last_loc_to_buffer(
+    def _map_page_aligned_latest_cache_loc_to_buffer(
         self,
         *,
         seq_lens: torch.Tensor,
@@ -738,7 +742,7 @@ class HiSparseCoordinator:
             device=seq_lens.device,
         )
         first_semantic_positions = semantic_positions[first_indices]
-        first_mapping_indices = allocator.get_last_loc_compressed(
+        first_mapping_indices = allocator.translate_latest_cache_locs_to_compressed(
             mapped_out_cache_loc[first_indices]
         ).to(dtype=torch.int64)
         first_req_pool_indices = mapped_req_pool_indices[first_indices]
@@ -783,7 +787,7 @@ class HiSparseCoordinator:
         full_logical_blocks = self.req_to_token_pool.req_to_token[
             first_req_pool_indices[:, None], full_semantic_position_blocks
         ]
-        expected_mapping_index_blocks = allocator.get_last_loc_compressed(
+        expected_mapping_index_blocks = allocator.translate_latest_cache_locs_to_compressed(
             full_logical_blocks
         ).to(dtype=torch.int64)
         torch._assert_async(
@@ -1046,7 +1050,7 @@ class HiSparseCoordinator:
             mapped_req_pool_indices, current_buffer_positions
         ]
         current_mapping_indices = (
-            self.token_to_kv_pool_allocator.get_last_loc_compressed(
+            self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
                 mapped_out_cache_loc
             ).to(dtype=torch.int64)
         )

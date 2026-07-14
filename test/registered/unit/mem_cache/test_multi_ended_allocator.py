@@ -1466,71 +1466,32 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             int(tail_virtual_page.item()),
         )
 
-    # 9. REGRESSION: alloc_extend must bind v2p / p2v on
-    # this allocator. Without binding, `virtual_to_physical[virt_page]`
-    # stays -1 and `translate_kv_loc(virt_token)` returns negative token
-    # ids → CUDA OOB in the Triton attention kernel.
-    def test_paged_alloc_extend_binds_v2p_p2v(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
-
+    # 9. REGRESSION: direct allocation must bind v2p / p2v on this allocator.
+    def test_paged_alloc_binds_v2p_p2v(self):
+        """Direct page allocation publishes bidirectional virtual ownership."""
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
         free_before = full_alloc.free_virtual_ids.clone()
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
 
-        # Stub the kernel — we only need to verify the BINDING contract.
-        # (Driving the real Triton kernel needs a GPU; the contract we're
-        # checking is that the v2p/p2v tables get updated regardless of
-        # what the kernel writes into out_indices.)
-        original_kernel = mea_mod.alloc_extend_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_extend_kernel = _NoOpKernelGrid()
-        try:
-            # bs=1, prefix=0, seq=2 pages worth, so num_new_pages=2.
-            prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEV)
-            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-            seq_lens = torch.tensor([2 * PS], dtype=torch.int64, device=_DEV)
-            seq_lens_cpu = torch.tensor([2 * PS], dtype=torch.int64)
-            last_loc = torch.tensor([-1], dtype=torch.int64, device=_DEV)
-
-            out = full_alloc.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                2 * PS,
-                num_new_pages=2,
-            )
-        finally:
-            mea_mod.alloc_extend_kernel = original_kernel
+        out = full_alloc.alloc(2 * PS)
 
         self.assertIsNotNone(out)
-        # The two virtual pages consumed from the front of free_virtual_ids
-        # must now be BOUND in v2p_page (not -1).
+        assert out is not None
         consumed_pages = free_before[:2]
+        self.assertTrue(
+            torch.equal(out.view(2, PS)[:, 0] // PS, consumed_pages)
+        )
         v2p_values = full_alloc.virtual_to_physical[consumed_pages]
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
             self.assertNotEqual(
                 p_page,
                 -1,
-                f"REGRESSION: virtual page {v_page} not bound after "
-                f"alloc_extend (translate_kv_loc would return negative)",
+                f"virtual page {v_page} was not bound after direct allocation",
             )
-        # And p2v_page must round-trip.
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
             self.assertEqual(int(full_alloc.physical_to_virtual[p_page].item()), v_page)
-        # Watermark must have advanced by 2 pages.
-        # `allocated_count()` returns TOKENS, so it
-        # advances by 2 * PAGE_SIZE; `_allocated_pages()` is the page count.
         self.assertEqual(
             full_alloc.allocated_count(),
             allocated_count_before + 2 * PS,
@@ -1543,139 +1504,64 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             self.assertEqual(full_alloc.watermark_physical, watermark_before + 2)
         else:
             self.assertEqual(full_alloc.watermark_physical, watermark_before - 2)
-        # Free-list must have shrunk by 2.
         self.assertEqual(
             int(full_alloc.free_virtual_ids.numel()),
             int(free_before.numel()) - 2,
         )
 
-    # 10. REGRESSION: alloc_decode must bind v2p / p2v on
-    # this allocator when num_new_pages > 0. Most decode steps reuse the
-    # prefix's tail page (num_new_pages == 0), but the page-wrapping case
-    # must update tables.
-    def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
-
+    # 10. REGRESSION: an impossible direct allocation leaves ownership unchanged.
+    def test_paged_alloc_failure_preserves_ownership(self):
+        """Failed direct allocation preserves all ownership state."""
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
-        # Pre-allocate ~1 page so an arbitrary `seq_len % page_size == 1`
-        # decode step triggers a new-page consumption.
-        v = full_alloc.alloc(PS)
-        self.assertIsNotNone(v)
+        free_before = full_alloc.free_virtual_ids.clone()
+        watermark_before = full_alloc.watermark_physical
+        allocated_count_before = full_alloc.allocated_count()
+        virtual_to_physical_before = full_alloc.virtual_to_physical.clone()
+        physical_to_virtual_before = full_alloc.physical_to_virtual.clone()
+
+        out = full_alloc.alloc(full_alloc.available_size() + PS)
+
+        self.assertIsNone(out)
+        self.assertEqual(full_alloc.watermark_physical, watermark_before)
+        self.assertEqual(full_alloc.allocated_count(), allocated_count_before)
+        self.assertTrue(torch.equal(full_alloc.free_virtual_ids, free_before))
+        self.assertTrue(
+            torch.equal(full_alloc.virtual_to_physical, virtual_to_physical_before)
+        )
+        self.assertTrue(
+            torch.equal(full_alloc.physical_to_virtual, physical_to_virtual_before)
+        )
+
+    # 11. REGRESSION: releasing a direct allocation retires both bindings.
+    def test_paged_free_releases_direct_allocation_bindings(self):
+        """Freeing direct pages retires both virtual ownership bindings."""
+        _, full_alloc, _, _, _ = self._build()
+        PS = self.PAGE_SIZE
         free_before = full_alloc.free_virtual_ids.clone()
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
 
-        # Build a decode that wraps to a new page: seq_len % page_size == 1
-        # (one req that just stepped past a page boundary). The kernel will
-        # consume 1 new page from `free_virtual_ids[0]`.
-        seq_lens = torch.tensor([PS + 1], dtype=torch.int64, device=_DEV)
-        seq_lens_cpu = torch.tensor([PS + 1], dtype=torch.int64)
-        last_loc = torch.tensor(
-            # last token of page-N at offset page_size-1.
-            [int(v[-1].item())],
-            dtype=torch.int64,
-            device=_DEV,
-        )
-
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        out = full_alloc.alloc(PS)
 
         self.assertIsNotNone(out)
-        # 1 virtual page consumed from the head of free_virtual_ids.
-        consumed_page = int(free_before[0].item())
-        # v2p_page must now map to a valid physical page (not -1).
-        p_page = int(full_alloc.virtual_to_physical[consumed_page].item())
-        self.assertNotEqual(
-            p_page,
-            -1,
-            f"REGRESSION: virtual page {consumed_page} not bound after "
-            f"alloc_decode (translate_kv_loc would return negative)",
-        )
-        # p2v round-trip.
-        self.assertEqual(
-            int(full_alloc.physical_to_virtual[p_page].item()), consumed_page
-        )
-        # Watermark must have advanced by 1 page.
-        # `allocated_count()` returns TOKENS (advance by PAGE_SIZE);
-        # `_allocated_pages()` is the page count.
-        self.assertEqual(
-            full_alloc.allocated_count(),
-            allocated_count_before + PS,
-        )
-        self.assertEqual(
-            full_alloc._allocated_pages(),
-            (allocated_count_before // PS) + 1,
-        )
-        if full_alloc.grow_direction == "up":
-            self.assertEqual(full_alloc.watermark_physical, watermark_before + 1)
-        else:
-            self.assertEqual(full_alloc.watermark_physical, watermark_before - 1)
-        # Free-list must have shrunk by 1.
-        self.assertEqual(
-            int(full_alloc.free_virtual_ids.numel()),
-            int(free_before.numel()) - 1,
-        )
+        assert out is not None
+        allocated_page = int(out[0].item()) // PS
+        physical_page = int(full_alloc.virtual_to_physical[allocated_page].item())
 
-    # 11. REGRESSION: alloc_decode with num_new_pages == 0
-    # (the common case — the decode token reuses the prefix's tail page)
-    # must NOT advance the watermark and NOT touch v2p / p2v.
-    def test_paged_alloc_decode_no_op_when_no_new_page(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        full_alloc.free(out)
 
-        _, full_alloc, _, _, _ = self._build()
-        PS = self.PAGE_SIZE
-        # Pre-allocate 2 pages worth. We'll simulate a decode where seq_len
-        # advances WITHIN the existing tail page (no new page consumed).
-        v = full_alloc.alloc(PS)
-        free_before = full_alloc.free_virtual_ids.clone()
-        watermark_before = full_alloc.watermark_physical
-        allocated_count_before = full_alloc.allocated_count()
-
-        # seq_len = PS - 1 (just inside the prefix page), pre-prefix-len = PS - 2.
-        # `(seq_lens % page_size == 1)` is FALSE here, so num_new_pages == 0.
-        seq_lens = torch.tensor([PS - 1], dtype=torch.int64, device=_DEV)
-        seq_lens_cpu = torch.tensor([PS - 1], dtype=torch.int64)
-        last_loc = torch.tensor(
-            [int(v[PS - 2].item())],
-            dtype=torch.int64,
-            device=_DEV,
-        )
-
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
-
-        self.assertIsNotNone(out)
-        # Nothing should have moved — no new page consumed.
         self.assertEqual(full_alloc.watermark_physical, watermark_before)
         self.assertEqual(full_alloc.allocated_count(), allocated_count_before)
         self.assertEqual(
             int(full_alloc.free_virtual_ids.numel()),
             int(free_before.numel()),
+        )
+        self.assertEqual(
+            int(full_alloc.virtual_to_physical[allocated_page].item()), -1
+        )
+        self.assertEqual(
+            int(full_alloc.physical_to_virtual[physical_page].item()), -1
         )
 
     # 12. translate_kv_loc preserves token-level identity end-to-end.
