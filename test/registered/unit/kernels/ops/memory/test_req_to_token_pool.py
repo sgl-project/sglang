@@ -226,15 +226,15 @@ class TestWriteReqToTokenPool(unittest.TestCase):
                     self.assertTrue(torch.equal(triton_pool, vanilla_pool))
                     self.assertTrue(torch.equal(triton_pool, oracle))
                     untouched_rows = sorted(set(range(7)) - set(req_pool_indices))
-                    self.assertTrue(
-                        torch.all(triton_pool[untouched_rows] == -7).item()
-                    )
+                    self.assertTrue(torch.all(triton_pool[untouched_rows] == -7).item())
                     for req_pool_index, prefix, extension in zip(
                         req_pool_indices, prefixes, extensions
                     ):
                         seq_len = len(prefix) + len(extension)
                         self.assertTrue(
-                            torch.all(triton_pool[req_pool_index, seq_len:] == -7).item()
+                            torch.all(
+                                triton_pool[req_pool_index, seq_len:] == -7
+                            ).item()
                         )
 
     @staticmethod
