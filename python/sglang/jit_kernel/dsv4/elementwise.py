@@ -171,6 +171,18 @@ def fused_q_indexer_rope_hadamard_quant(
             freqs_real,
             positions,
         )
+    elif _is_xpu:
+        from sgl_kernel import fused_q_indexer_rope_hadamard_quant
+
+        fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
     else:
         module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
         module.forward(
