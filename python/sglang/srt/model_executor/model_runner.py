@@ -25,31 +25,12 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import (
-    BailingHybridConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    Lfm2Config,
-    Lfm2MoeConfig,
-    Lfm2VlConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    ZayaConfig,
-)
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -255,8 +236,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 logger = logging.getLogger(__name__)
 
-_UNSET: Any = object()
-
 
 @dataclass
 class ModelRunnerOutput:
@@ -334,17 +313,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
-        self.is_hybrid_swa_compress = getattr(
-            model_config, "is_hybrid_swa_compress", False
-        )
+        self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-        rope_scaling = getattr(
-            model_config.hf_text_config, "rope_parameters", None
-        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
-        self.model_is_mrope = (
-            rope_scaling is not None and "mrope_section" in rope_scaling
-        )
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self.init_new_workspace = False
@@ -534,8 +505,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
-
-        self._linear_attn_registry_cache: Any = _UNSET
 
         # Load model weights and configure
         self.initialize()
@@ -1797,107 +1766,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result
 
     @property
-    def qwen3_next_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
-            return config
-        return None
-
-    @property
-    def hybrid_lightning_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, BailingHybridConfig):
-            return config
-        return None
-
-    @property
-    def hybrid_gdn_config(self):
-        config = self.model_config.hf_config.get_text_config()
-        if isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | InternS2PreviewConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        ):
-            return config
-        return None
-
-    @property
-    def mamba2_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
-            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
-            # so they shouldn't use HybridLinearAttnBackend
-            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
-            if pattern is not None and "M" not in pattern:
-                return None
-        if isinstance(
-            config,
-            FalconH1Config
-            | NemotronHConfig
-            | Lfm2Config
-            | Lfm2MoeConfig
-            | Lfm2VlConfig
-            | ZayaConfig,
-        ):
-            return config
-        if isinstance(config, NemotronH_Nano_VL_V2_Config):
-            return config.llm_config
-
-        if isinstance(config, GraniteMoeHybridConfig):
-            has_mamba = any(
-                layer_type == "mamba"
-                for layer_type in getattr(config, "layer_types", [])
-            )
-            if not has_mamba:
-                return None
-            else:
-                return config
-
-        return None
-
-    @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
-
-    @property
-    def kimi_linear_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, KimiLinearConfig):
-            return config
-        return None
-
-    def _get_linear_attn_registry_result(self):
-        if self._linear_attn_registry_cache is _UNSET:
-            self._linear_attn_registry_cache = get_linear_attn_config(
-                self.model_config.hf_config
-            )
-        return self._linear_attn_registry_cache
-
-    @property
-    def linear_attn_model_spec(self):
-        result = self._get_linear_attn_registry_result()
-        return result[0] if result else None
-
-    @property
-    def mambaish_config(self):
-        existing = (
-            self.mamba2_config
-            or self.hybrid_gdn_config
-            or self.kimi_linear_config
-            or self.hybrid_lightning_config
-        )
-        if existing:
-            return existing
-        result = self._get_linear_attn_registry_result()
-        return result[1] if result else None
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
         # Load-time resolution transition: the weight-resolved kv-cache dtype

@@ -9,6 +9,7 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
@@ -160,7 +161,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.is_hybrid_swa = False
 
         # Create minimal pools
-        if self.mambaish_config is not None:
+        if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self.server_args.max_mamba_cache_size
             if auxiliary_state_size is None:
                 auxiliary_state_size = self.max_running_requests * 4

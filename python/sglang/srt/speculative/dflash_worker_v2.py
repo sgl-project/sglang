@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -277,12 +278,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
-        self._need_mamba_verify_commit = (
-            self.model_runner.mambaish_config is not None
-            and hasattr(
-                self.model_runner.attn_backend,
-                "update_mamba_state_after_mtp_verify",
-            )
+        self._need_mamba_verify_commit = mambaish_config(
+            self.model_runner.model_config
+        ) is not None and hasattr(
+            self.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
         )
 
     def init_cuda_graphs(self):
