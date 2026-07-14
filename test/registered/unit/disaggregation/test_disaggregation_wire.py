@@ -110,6 +110,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             cached_tokens_storage=0,
             multimodal_inputs=None,
             return_logprob=False,
+            return_sampling_mask=False,
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
