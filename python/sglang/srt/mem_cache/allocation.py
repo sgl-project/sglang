@@ -709,8 +709,7 @@ def _plan_page_aligned_decode(
     in_page_mask_cpu = ~crossing_mask_cpu
     assert bool(
         torch.all(
-            write_locs.cpu[in_page_mask_cpu] + 1
-            <= allocated_old_cpu[in_page_mask_cpu]
+            write_locs.cpu[in_page_mask_cpu] + 1 <= allocated_old_cpu[in_page_mask_cpu]
         )
     ), (
         f"decode in-page writes exceed allocation watermarks: "

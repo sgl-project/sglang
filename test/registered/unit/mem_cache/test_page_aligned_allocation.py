@@ -7,12 +7,12 @@ import torch
 from sglang.srt.mem_cache import allocation as allocation_module
 from sglang.srt.mem_cache import common as mem_cache_common
 from sglang.srt.mem_cache.allocation import (
-    _DecodeWriteLocs,
-    alloc_for_extend,
-    alloc_for_decode,
-    alloc_for_spec_decode,
     _compute_decode_write_locs,
+    _DecodeWriteLocs,
     _plan_page_aligned_decode,
+    alloc_for_decode,
+    alloc_for_extend,
+    alloc_for_spec_decode,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
@@ -209,7 +209,9 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         with (
             mock.patch.object(allocation_module, "_is_npu", False),
-            mock.patch.object(allocation_module, "get_last_loc", return_value=torch.tensor([3])),
+            mock.patch.object(
+                allocation_module, "get_last_loc", return_value=torch.tensor([3])
+            ),
             mock.patch.dict(allocation_module.ALLOC_EXTEND_FUNCS, {"cpu": producer}),
             mock.patch.object(allocation_module, "assign_req_to_token_pool_func"),
         ):

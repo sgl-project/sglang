@@ -450,9 +450,7 @@ class WriteReqToTokenPool:
         assert bool(
             torch.all(req_pool_indices_cpu < req_to_token.shape[0])
         ), f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
-        assert bool(torch.all(prefix_write_lens_cpu >= 0)), (
-            f"{prefix_write_lens_cpu=}"
-        )
+        assert bool(torch.all(prefix_write_lens_cpu >= 0)), f"{prefix_write_lens_cpu=}"
         assert bool(
             torch.all(alloc_start_lens_cpu >= prefix_write_lens_cpu)
         ), f"{prefix_write_lens_cpu=}, {alloc_start_lens_cpu=}"
