@@ -12,7 +12,7 @@ from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-    hip_unified_kv_triton_enabled,
+    is_unified_kv_triton,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -144,7 +144,7 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
-        if hip_unified_kv_triton_enabled():
+        if is_unified_kv_triton():
             # unified_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
             # None). Use the unified ring write target -- get_unified_swa_loc
             # recomputes it from live positions for multi-step draft decode.
@@ -688,7 +688,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         # buffer. Same swa_loc/positions contract either way.
         store_kv = (
             pool.set_unified_key_buffer_radix_fused_norm_rope
-            if hip_unified_kv_triton_enabled()
+            if is_unified_kv_triton()
             else pool.set_swa_key_buffer_radix_fused_norm_rope
         )
         for stage, kv in zip(self.stages, kvs):

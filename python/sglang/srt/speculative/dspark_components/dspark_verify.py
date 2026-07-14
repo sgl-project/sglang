@@ -6,7 +6,7 @@ import msgspec
 import torch
 
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-    hip_unified_kv_triton_enabled,
+    is_unified_kv_triton,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -310,7 +310,7 @@ class TargetVerifyExecutor:
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
         state_slot = None
         pool = self.kv_injector.draft_model_runner.token_to_kv_pool
-        if hip_unified_kv_triton_enabled():
+        if is_unified_kv_triton():
             # unified_kv needs the per-token draft req slot to address the SWA ring
             # (state_slot * ring + pos % ring). Verify tokens are the latest in each
             # req so they always fall in the window; the commit gate (via commit_lens
@@ -648,7 +648,7 @@ class DsparkVerifyEpilogue:
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
-        if hip_unified_kv_triton_enabled():
+        if is_unified_kv_triton():
             inject_layout = build_unified_commit_inject_layout(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=seq_lens[:bs],
