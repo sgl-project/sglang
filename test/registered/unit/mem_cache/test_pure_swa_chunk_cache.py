@@ -63,7 +63,7 @@ class TestPureSWAChunkCache(CustomTestCase):
         cache.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(10, dtype=torch.int64).unsqueeze(0)
         )
-        cache.token_to_kv_pool_allocator = _FakeAllocator()
+        cache.token_to_kv_pool_allocator = _FakeAllocator(page_size=4)
         cache.page_size = 4
         req = _FakeReq()
         req.swa_evict_floor = 3
