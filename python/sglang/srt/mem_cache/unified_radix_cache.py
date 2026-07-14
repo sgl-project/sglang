@@ -49,7 +49,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     FullComponent,
     LRURefreshPhase,
     MambaComponent,
-    PrepareTransfersResult,
+    PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -1682,10 +1682,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Let each component pre-allocate per-request state for the load-back;
         # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareTransfersResult] = {
-            comp.component_type: comp.prepare_build_hicache_transfers(
-                best_match_node, CacheTransferPhase.LOAD_BACK, req=req
-            )
+        preps: dict[ComponentType, PrepareLoadBackResult] = {
+            comp.component_type: comp.prepare_load_back(best_match_node, req=req)
             for comp in self._components_tuple
         }
         success = False
@@ -1702,9 +1700,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return success
         finally:
             for comp in self._components_tuple:
-                comp.postprocess_build_hicache_transfers(
-                    req, preps[comp.component_type], success
-                )
+                comp.finalize_load_back(req, preps[comp.component_type], success)
 
     def _load_back_transfers(
         self,
