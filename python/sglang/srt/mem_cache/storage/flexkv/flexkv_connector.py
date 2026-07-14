@@ -841,9 +841,7 @@ class FlexKVConnector:
         )
         if not remote_mapping_valid:
             if not self._cancel_prelaunch_store(task_id=task_id):
-                self.poison_load_back(
-                    "FlexKV store remote mapping cancellation failed"
-                )
+                self.poison_load_back("FlexKV store remote mapping cancellation failed")
             return -1
 
         local_owner_install_valid = True
@@ -874,13 +872,9 @@ class FlexKVConnector:
                     exc,
                     exc_info=True,
                 )
-            cleanup_valid = (
-                self._sync_ctx.all_reduce_min(int(local_cleanup_valid)) == 1
-            )
+            cleanup_valid = self._sync_ctx.all_reduce_min(int(local_cleanup_valid)) == 1
             if not cancel_valid or not cleanup_valid:
-                self.poison_load_back(
-                    "FlexKV provisional store owner cleanup failed"
-                )
+                self.poison_load_back("FlexKV provisional store owner cleanup failed")
             return -1
 
         try:
