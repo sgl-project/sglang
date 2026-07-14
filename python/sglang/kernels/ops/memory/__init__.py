@@ -12,7 +12,6 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 _TRITON_KERNELS = [
     ("allocator", "alloc_extend_kernel"),
     ("allocator", "alloc_decode_kernel"),
-    ("common", "write_req_to_token_pool_triton"),
     ("common", "get_last_loc_triton"),
     ("common", "get_last_loc_triton_safe"),
     ("virtual_slot", "alloc_bind_inplace"),
@@ -32,6 +31,13 @@ register_kernel(
         op="memory.gather_req_to_token_pool",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.req_to_token_pool:GatherReqToTokenPool.triton",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.write_req_to_token_pool",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:WriteReqToTokenPool.triton",
     )
 )
 
