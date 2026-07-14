@@ -164,12 +164,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         alloc_swa_indices: torch.Tensor | None = self.swa_attn_allocator.alloc(
             need_size
         )
-        assert alloc_full_indices is not None, (
-            "full allocator returned None after the joint capacity pre-check passed"
-        )
-        assert alloc_swa_indices is not None, (
-            "SWA allocator returned None after the joint capacity pre-check passed"
-        )
+        assert (
+            alloc_full_indices is not None
+        ), "full allocator returned None after the joint capacity pre-check passed"
+        assert (
+            alloc_swa_indices is not None
+        ), "SWA allocator returned None after the joint capacity pre-check passed"
 
         expected_device: torch.device = self.full_to_swa_index_mapping.device
         allocator_outputs: tuple[tuple[str, torch.Tensor], ...] = (
