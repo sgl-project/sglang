@@ -95,14 +95,10 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     if f"c{ratio}_loc" not in result:
                         setattr(fm, f"c{ratio}_loc", None)
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
-            # seqused only for decode. A chunked prefill batch routed to the fused
-            # op (Option B) needs them too, plus c*_loc from the bundle and the
-            # page-table zeroing. Build them here for real (eager) extend; gated to
-            # is_extend() so the host sync (cu.cpu) never runs for target_verify /
-            # draft_extend (potentially graph-captured). Runs after
-            # _compute_compress_locs set c*_state_page_table (read for zeroing) and
-            # overwrites the None c*_loc set just above. start_pos collapses to 0 for
-            # non-chunked prefill (which goes native and ignores all this).
+            # seqused only for decode. Every eager prefill uses the fused compressor,
+            # so build its global block positions, state metadata, and output locs
+            # here. Keep this gated to is_extend() so the cu.cpu() host read never
+            # runs for target_verify / draft_extend (potentially graph-captured).
             if forward_batch.forward_mode.is_extend():
                 self._build_npu_compress_metadata_prefill(forward_batch)
 
@@ -128,7 +124,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             end = int(cu_cpu[idx + 1])
             if end == start:
                 continue
-            prefix = int(prefix_cpu[idx]) if prefix_cpu is not None else 0
+            prefix = int(prefix_cpu[idx])
             total = prefix + (end - start)
             for ratio in ratio_lists:
                 first_k = prefix // ratio
@@ -172,14 +168,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         for ratio in (4, 128):
             if ratio not in ratio_lists:
                 continue
-            bundle_loc = None
-            if bundle is not None:
-                bundle_loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
-            setattr(
-                fm,
-                f"c{ratio}_loc",
-                bundle_loc.to(torch.int32) if bundle_loc is not None else None,
-            )
+            bundle_loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
+            expected_count = sum(x.numel() for x in ratio_lists[ratio])
+            setattr(fm, f"c{ratio}_loc", bundle_loc.to(torch.int32))
 
         # req_to_token_c*_state is not re-zeroed on slot reuse; zero pre-tail page cols so the kernel block-0 skip masks stale entries
         page_size = self.page_size
@@ -191,9 +182,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 chunk_len = int(cu_cpu[idx + 1] - cu_cpu[idx])
                 if chunk_len == 0:
                     continue
-                seqlen = (
-                    int(prefix_cpu[idx]) if prefix_cpu is not None else 0
-                ) + chunk_len
+                seqlen = int(prefix_cpu[idx]) + chunk_len
                 tail = seqlen % 128
                 if ratio == 4:
                     c_alloc_len = tail + 128 if (tail <= 3 and seqlen >= 128) else tail
@@ -335,22 +324,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        if (
-            forward_batch.forward_mode.is_prefill()
-            and not forward_batch.forward_mode.is_target_verify()
-        ):
-            # Non-chunked / first-chunk prefill (every req prefix_len==0) -> native.
-            # A chunked batch (some req is a follow-up chunk, prefix_len>0) -> the
-            # fused op below, for BOTH the main compressor and the c4 indexer: the
-            # fused op + _compressor_epilog_npu are is_in_indexer-aware (state buffer
-            # via get_state_cache, output via set_compress_buffer), and decode already
-            # runs the indexer through them. So prefix_len>0 never reaches native ->
-            # _forward_compress_native is non-chunked-only.
-            epl = forward_batch.extend_prefix_lens_cpu
-            is_chunked = epl is not None and any(p > 0 for p in epl)
-            if not is_chunked:
-                return self._forward_compress_native(compressor, x, forward_batch)
-
         from sglang.kernels.ops.attention.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
@@ -432,7 +405,10 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        """Per-request unfused compress path.
+        """Reference per-request unfused compress path for precision ablations.
+
+        Production dispatch no longer calls this path: ordinary prefill, every
+        chunked-prefill chunk, verify, and decode all use the fused compressor.
 
         * Prefill: split seq into ``cutoff = seqlen - seqlen % ratio`` to compress
           + ``remainder`` stashed as state (overlap/ratio=4 also stashes the last
