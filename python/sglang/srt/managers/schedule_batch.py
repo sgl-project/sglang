@@ -1786,6 +1786,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
+    # Per-DP-rank local forward modes (ForwardMode values) from the MLP sync
+    # all-gather; identical on every rank. Unlike `global_forward_mode`
+    # (TBO-only, None unless TBO runs), this is populated on every synced
+    # step. Consumed by the scheduler recv skipper.
+    global_forward_modes: Optional[List[int]] = None
 
     # For processing logprobs
     return_logprob: bool = False

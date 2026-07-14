@@ -48,6 +48,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    global_forward_modes: list[int] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -105,14 +106,17 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        cpu_data = tp0_info.cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.can_cuda_graph = bool(cpu_data[:, 2].min().item())
+        self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
+        self.can_run_breakable_cuda_graph = bool(cpu_data[:, 6].min().item())
+        self.global_forward_modes = cpu_data[:, 5].tolist()
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                self.global_forward_modes
+            )
 
 
 def _update_gather_batch(
@@ -248,6 +252,12 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+
+    # The recv skipper reads this off `last_batch`, which for PREBUILT batches
+    # is the prebuilt batch itself (not its inner idle batch), so set it on
+    # `local_batch` rather than `batch_to_gather`.
+    if local_batch is not None and not skip_all_gather:
+        local_batch.global_forward_modes = mlp_sync_info.global_forward_modes
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
