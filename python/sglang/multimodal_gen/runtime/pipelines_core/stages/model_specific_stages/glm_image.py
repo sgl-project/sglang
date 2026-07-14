@@ -416,8 +416,12 @@ class GlmImageAR(PipelineStage):
         num_outputs = _num_outputs_per_prompt(batch)
         seed = getattr(batch, "seed", None)
         rng_devices = []
+        rng_device_type = "cuda"
         if device.type == "cuda":
             rng_devices.append(torch.cuda.current_device())
+        elif device.type == "npu":
+            rng_devices.append(torch.npu.current_device())
+            rng_device_type = "npu"
 
         prior_token_ids = []
         prior_token_image_ids = None
@@ -434,7 +438,11 @@ class GlmImageAR(PipelineStage):
                     )
                 )
             else:
-                with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                with torch.random.fork_rng(
+                    devices=rng_devices,
+                    enabled=True,
+                    device_type=rng_device_type,
+                ):
                     torch.manual_seed(output_seed)
                     prior_token_id, output_prior_token_image_ids = (
                         self.generate_prior_tokens(

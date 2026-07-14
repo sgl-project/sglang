@@ -453,7 +453,7 @@ def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]
 
 
 def _is_scalar_or_hidden_modulation(tensor: torch.Tensor, hidden_size: int) -> bool:
-    return tensor.dim() == 0 or tuple(tensor.shape) in {(), (1,), (hidden_size,)}
+    return tensor.numel() in (1, hidden_size)
 
 
 def _can_use_npu_fused_scale_shift(
@@ -473,6 +473,10 @@ def _try_npu_fused_scale_shift(
         return None
 
     from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+    scale = scale.reshape(-1)
+    if tuple(shift.shape) != tuple(x.shape):
+        shift = shift.reshape(-1)
 
     return fused_scale_shift(x, scale.contiguous(), shift.contiguous())
 

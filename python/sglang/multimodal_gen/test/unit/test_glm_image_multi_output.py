@@ -3,6 +3,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    _can_use_npu_fused_scale_shift,
+)
 from sglang.multimodal_gen.runtime.models.dits import glm_image as glm_model
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     glm_image as glm_stage,
@@ -19,7 +22,9 @@ class _DummyVisionLanguageEncoder:
 
 class _RecordingGlmImageAR(GlmImageAR):
     def __init__(self):
-        super().__init__(processor=None, vision_language_encoder=_DummyVisionLanguageEncoder())
+        super().__init__(
+            processor=None, vision_language_encoder=_DummyVisionLanguageEncoder()
+        )
         self.initial_seeds = []
 
     def generate_prior_tokens(self, **kwargs):
@@ -58,7 +63,9 @@ class _RecordingBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
     def encode_prompt(self, *args, **kwargs):
         return torch.ones(1, 3, 5), torch.zeros(1, 3, 5)
 
-    def prepare_latents(self, batch_size, num_channels_latents, height, width, **kwargs):
+    def prepare_latents(
+        self, batch_size, num_channels_latents, height, width, **kwargs
+    ):
         return torch.zeros(batch_size, num_channels_latents, height // 2, width // 2)
 
 
@@ -74,6 +81,20 @@ class _NpuForwardProbe(glm_model.GlmImageTransformer2DModel):
         return marker.expand(1, 1, 2, 2)
 
 
+def test_npu_fused_scale_shift_accepts_broadcast_modulation_shapes():
+    hidden_size = 8
+    x = torch.zeros(1, 4, hidden_size)
+
+    for shape in ((), (1,), (hidden_size,), (1, hidden_size), (1, 1, hidden_size)):
+        scale = torch.zeros(shape)
+        shift = torch.zeros(shape)
+        assert _can_use_npu_fused_scale_shift(x, shift, scale)
+
+    assert not _can_use_npu_fused_scale_shift(
+        x, torch.zeros(1, 2, hidden_size), torch.zeros(1, 2, hidden_size)
+    )
+
+
 def test_ar_stage_generates_one_prior_per_requested_output():
     stage = _RecordingGlmImageAR()
     batch = SimpleNamespace(
@@ -85,7 +106,9 @@ def test_ar_stage_generates_one_prior_per_requested_output():
         seed=11,
     )
 
-    with patch.object(glm_stage, "get_local_torch_device", return_value=torch.device("cpu")):
+    with patch.object(
+        glm_stage, "get_local_torch_device", return_value=torch.device("cpu")
+    ):
         result = stage.forward(batch, SimpleNamespace())
 
     assert result.prior_token_id.shape == (2, 4)
@@ -108,7 +131,9 @@ def test_before_denoising_expands_latents_and_conditions_for_requested_outputs()
         prior_token_image_ids=None,
     )
 
-    with patch.object(glm_stage, "get_local_torch_device", return_value=torch.device("cpu")):
+    with patch.object(
+        glm_stage, "get_local_torch_device", return_value=torch.device("cpu")
+    ):
         result = stage.forward(batch, SimpleNamespace())
 
     assert result.latents.shape[0] == 2
