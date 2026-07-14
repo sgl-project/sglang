@@ -183,7 +183,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
         )
-        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -913,7 +912,6 @@ def _varlen_deep_gemm_silu_mul_quant(
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_8bit,
     )
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
     if _MASKED_GEMM_FAST_ACT:
         assert (
