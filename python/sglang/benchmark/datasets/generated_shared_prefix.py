@@ -292,6 +292,7 @@ def sample_generated_shared_prefix_requests(
                 prompt_len=prompt_len,
                 output_len=output_len_val,
                 routing_key=routing_key,
+                system_prompt=system_prompt,
             )
         )
         total_input_tokens += prompt_len
