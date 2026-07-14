@@ -4,20 +4,35 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers import hisparse_coordinator as hisparse_coordinator_module
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache import allocation as allocation_module
 from sglang.srt.mem_cache import common as mem_cache_common
 from sglang.srt.mem_cache.allocation import (
     _compute_decode_write_locs,
     _DecodeWriteLocs,
     _plan_page_aligned_decode,
+    _validate_main_page_aligned_alloc,
     alloc_for_decode,
     alloc_for_extend,
     alloc_for_spec_decode,
     alloc_paged_token_slots_extend,
 )
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
     get_req_to_token_extra_context_len,
+)
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    MultiEndedAllocator,
+    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -26,6 +41,122 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPageAlignedAllocation(unittest.TestCase):
+    def test_unknown_allocator_rejects_extend_before_mutation(self) -> None:
+        """Unknown paged allocators reject extend before any shared state mutation."""
+        allocator = _UnsupportedMainAllocator(page_size=4)
+        req_to_token_pool = SimpleNamespace(
+            alloc=mock.Mock(),
+            write=mock.Mock(),
+        )
+        batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            req_to_token_pool=req_to_token_pool,
+            maybe_evict_swa=mock.Mock(),
+        )
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(allocation_module, "alloc_token_slots") as alloc,
+            self.assertRaisesRegex(NotImplementedError, "UnsupportedMainAllocator"),
+        ):
+            alloc_for_extend(batch)
+
+        batch.maybe_evict_swa.assert_not_called()
+        req_to_token_pool.alloc.assert_not_called()
+        req_to_token_pool.write.assert_not_called()
+        alloc.assert_not_called()
+
+    def test_unknown_allocator_rejects_decode_before_mutation(self) -> None:
+        """Unknown paged allocators reject decode before eviction or publication."""
+        allocator = _UnsupportedMainAllocator(page_size=4)
+        req_to_token_pool = SimpleNamespace(write=mock.Mock())
+        batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            req_to_token_pool=req_to_token_pool,
+            maybe_evict_swa=mock.Mock(),
+        )
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(allocation_module, "alloc_token_slots") as alloc,
+            self.assertRaisesRegex(NotImplementedError, "UnsupportedMainAllocator"),
+        ):
+            alloc_for_decode(batch, token_per_req=1)
+
+        batch.maybe_evict_swa.assert_not_called()
+        req_to_token_pool.write.assert_not_called()
+        alloc.assert_not_called()
+
+    def test_all_builtin_paged_allocators_support_main_allocation(self) -> None:
+        """Every built-in paged allocator explicitly accepts main direct allocation."""
+        allocator_types = (
+            PagedTokenToKVPoolAllocator,
+            MultiEndedAllocator,
+            UnifiedMambaTokenToKVPoolAllocator,
+            SWATokenToKVPoolAllocator,
+            UnifiedSWATokenToKVPoolAllocator,
+            HiSparseTokenToKVPoolAllocator,
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+
+        for allocator_type in allocator_types:
+            with self.subTest(allocator_type=allocator_type.__name__):
+                self.assertIn(
+                    "validate_main_page_aligned_alloc",
+                    allocator_type.__dict__,
+                )
+                allocator_type.validate_main_page_aligned_alloc(
+                    object.__new__(allocator_type)
+                )
+
+    def test_main_capability_bypasses_page_one_and_npu(self) -> None:
+        """Page-one and NPU legacy paths do not require the main paged hook."""
+        page_one_batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                token_to_kv_pool_allocator=_UnsupportedMainAllocator(page_size=1)
+            )
+        )
+        npu_batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                token_to_kv_pool_allocator=_UnsupportedMainAllocator(page_size=4)
+            )
+        )
+
+        with mock.patch.object(allocation_module, "_is_npu", False):
+            _validate_main_page_aligned_alloc(page_one_batch)
+        with mock.patch.object(allocation_module, "_is_npu", True):
+            _validate_main_page_aligned_alloc(npu_batch)
+
+    def test_hisparse_rehome_bypasses_page_one_and_npu(self) -> None:
+        """HiSparse re-home routing stays exclusive to non-NPU paged allocation."""
+        cases = ((1, False), (4, True))
+
+        for page_size, is_npu in cases:
+            with self.subTest(page_size=page_size, is_npu=is_npu):
+                coordinator = object.__new__(HiSparseCoordinator)
+                coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+                    page_size=page_size
+                )
+                coordinator._rehome_page_boundary_owners = mock.Mock()
+                coordinator._eager_backup_previous_token = mock.Mock()
+                coordinator.is_dsv4_hisparse = True
+                coordinator.compress_ratio = 4
+
+                with mock.patch.object(
+                    hisparse_coordinator_module,
+                    "_is_npu",
+                    is_npu,
+                ):
+                    coordinator.map_last_loc_to_buffer(
+                        seq_lens=torch.tensor([1], dtype=torch.int64),
+                        out_cache_loc=torch.tensor([1], dtype=torch.int64),
+                        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                        seq_lens_cpu=torch.tensor([1], dtype=torch.int64),
+                        req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+                    )
+
+                coordinator._rehome_page_boundary_owners.assert_not_called()
+
     def test_extend_entry_rejects_misalignment_before_eviction(self) -> None:
         """Extend rejects a malformed page request before eviction or allocation."""
         allocator = SimpleNamespace(
@@ -65,7 +196,10 @@ class TestPageAlignedAllocation(unittest.TestCase):
             req_to_token=req_to_token,
             alloc=lambda _: [0],
         )
-        allocator = SimpleNamespace(page_size=4)
+        allocator = SimpleNamespace(
+            page_size=4,
+            validate_main_page_aligned_alloc=mock.Mock(),
+        )
         batch = SimpleNamespace(
             reqs=[req],
             prefix_lens=[2],
@@ -86,7 +220,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
             mock.patch.object(allocation_module, "_is_npu", False),
             mock.patch.object(
                 allocation_module,
-                "alloc_paged_token_slots_extend",
+                "alloc_token_slots",
                 return_value=physical_slots,
             ) as producer,
             mock.patch.object(allocation_module, "write_cache_indices") as writer,
@@ -99,15 +233,53 @@ class TestPageAlignedAllocation(unittest.TestCase):
             out_cache_loc, _, _ = alloc_for_extend(batch)
 
         self.assertEqual(out_cache_loc.numel(), 3)
-        self.assertEqual(producer.call_args.kwargs["prefix_lens_cpu"].tolist(), [4])
-        self.assertEqual(producer.call_args.kwargs["seq_lens_cpu"].tolist(), [8])
-        self.assertEqual(producer.call_args.kwargs["extend_num_tokens"], 4)
+        self.assertEqual(producer.call_args.kwargs["num_tokens"], 4)
         self.assertEqual(writer.call_args.kwargs["alloc_start_lens_cpu"].tolist(), [4])
         self.assertEqual(writer.call_args.kwargs["alloc_end_lens_cpu"].tolist(), [8])
         self.assertEqual(gather.call_args.kwargs["prefix_lens_cpu"].tolist(), [2])
         self.assertEqual(gather.call_args.kwargs["seq_lens_cpu"].tolist(), [5])
         self.assertEqual(gather.call_args.kwargs["extend_num_tokens"], 3)
         self.assertEqual(req.kv.kv_allocated_len, 8)
+
+    def test_decode_direct_allocation_mixes_crossing_and_in_page(self) -> None:
+        """Decode allocates one whole page only for the crossing request."""
+        batch = _make_decode_batch(
+            write_locs=[8, 6],
+            allocated_lens=[8, 8],
+        )
+        allocated_page = torch.tensor([101, 102, 103, 104], dtype=torch.int64)
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(
+                allocation_module,
+                "alloc_token_slots",
+                return_value=allocated_page,
+            ) as alloc,
+        ):
+            out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+
+        self.assertEqual(alloc.call_args.kwargs["num_tokens"], 4)
+        self.assertEqual(out_cache_loc.tolist(), [101, 207])
+        self.assertEqual([req.kv.kv_allocated_len for req in batch.reqs], [12, 8])
+
+    def test_decode_direct_allocation_skips_zero_crossings(self) -> None:
+        """Decode validates capability but allocates nothing for in-page writes."""
+        batch = _make_decode_batch(
+            write_locs=[5, 7],
+            allocated_lens=[8, 8],
+        )
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(allocation_module, "alloc_token_slots") as alloc,
+        ):
+            out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+
+        batch.tree_cache.token_to_kv_pool_allocator.validate_main_page_aligned_alloc.assert_called_once_with()
+        alloc.assert_not_called()
+        self.assertEqual(out_cache_loc.tolist(), [106, 208])
+        self.assertEqual([req.kv.kv_allocated_len for req in batch.reqs], [8, 8])
 
     def test_decode_plan_mixes_crossing_and_in_page_requests(self) -> None:
         """Crossing requests grow while in-page requests retain capacity."""
@@ -167,7 +339,10 @@ class TestPageAlignedAllocation(unittest.TestCase):
         batch.model_config = SimpleNamespace(is_encoder_decoder=False)
         batch.maybe_evict_swa = mock.Mock()
         batch.tree_cache = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(page_size=4)
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=4,
+                validate_main_page_aligned_alloc=mock.Mock(),
+            )
         )
 
         with (
@@ -450,6 +625,62 @@ def _make_batch(allocated_lens: list[int]) -> SimpleNamespace:
 def _make_write_locs(values: list[int]) -> _DecodeWriteLocs:
     tensor = torch.tensor(values, dtype=torch.int64)
     return _DecodeWriteLocs(device=tensor.clone(), cpu=tensor)
+
+
+def _make_decode_batch(
+    *,
+    write_locs: list[int],
+    allocated_lens: list[int],
+) -> SimpleNamespace:
+    req_to_token = torch.zeros((len(write_locs), 16), dtype=torch.int32)
+    for index, allocated_len in enumerate(allocated_lens):
+        req_to_token[index, :allocated_len] = torch.arange(
+            (index + 1) * 100 + 1,
+            (index + 1) * 100 + allocated_len + 1,
+            dtype=torch.int32,
+        )
+
+    def write(indices, values) -> None:
+        req_to_token[indices] = values
+
+    allocator = SimpleNamespace(
+        page_size=4,
+        validate_main_page_aligned_alloc=mock.Mock(),
+    )
+    return SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_allocated_len=allocated_len),
+                kv_committed_len=write_loc,
+            )
+            for write_loc, allocated_len in zip(write_locs, allocated_lens)
+        ],
+        seq_lens=torch.tensor(write_locs, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(write_locs, dtype=torch.int64),
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=req_to_token,
+            write=mock.Mock(side_effect=write),
+        ),
+        req_pool_indices=torch.arange(len(write_locs), dtype=torch.int64),
+        device=torch.device("cpu"),
+        maybe_evict_swa=mock.Mock(),
+    )
+
+
+class _UnsupportedMainAllocator(BaseTokenToKVPoolAllocator):
+    def __init__(self, *, page_size: int) -> None:
+        self.page_size = page_size
+
+    def clear(self) -> None:
+        return None
+
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        raise AssertionError("unsupported allocator must not allocate")
+
+    def free(self, free_index: torch.Tensor) -> None:
+        raise AssertionError("unsupported allocator must not free")
 
 
 if __name__ == "__main__":
