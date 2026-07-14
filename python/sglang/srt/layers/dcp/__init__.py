@@ -29,6 +29,10 @@ Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
 out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
 ``get_parallel().attn_dcp_*``."""
 
+from sglang.kernels.ops.attention.dcp_kernels import (
+    create_triton_kv_indices_for_dcp_triton,
+    dcp_lse_combine_triton,
+)
 from sglang.srt.layers.dcp.comm import (
     dcp_a2a_lse_reduce,
     init_fi_a2a_workspace,
@@ -42,10 +46,6 @@ from sglang.srt.layers.dcp.comm import (
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
-)
-from sglang.srt.layers.dcp.kernels import (
-    create_triton_kv_indices_for_dcp_triton,
-    dcp_lse_combine_triton,
 )
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,

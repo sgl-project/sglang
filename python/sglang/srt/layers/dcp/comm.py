@@ -25,19 +25,16 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    get_dcp_group,
-)
-from sglang.srt.layers.dcp.kernels import (
+from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
     _lse_pack_dim,
     correct_attn_out,
     dcp_lse_combine_triton,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -153,11 +150,11 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     # copy — transport an fp8 KV cache (fp8_e4m3 / fp8_e5m2) as raw bytes via a
     # uint8 view (shared storage) so DCP works with --kv-cache-dtype fp8_*.
     if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        get_dcp_group().all_gather_into_tensor(
+        parallel.dcp_group.all_gather_into_tensor(
             gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
         )
     else:
-        get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
+        parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
     gathered_kv_a = (
         gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
         .transpose(0, 1)
