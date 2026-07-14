@@ -25,6 +25,9 @@ from sglang.jit_kernel.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
@@ -46,9 +49,6 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
-)
-from sglang.srt.layers.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -132,7 +132,11 @@ if not _is_hip:
 if _is_xpu:
     from sgl_kernel import hc_split_sinkhorn
 else:
-    from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
+    from sglang.kernels.ops.layernorm.mhc import (
+        hc_split_sinkhorn,
+        mhc_fused_post_pre,
+        npu_hc_pre,
+    )
 
 from sglang.srt.utils import (
     LazyValue,
@@ -476,7 +480,7 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-        from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
+        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
         self.rope_scaling = rope_scaling
@@ -801,7 +805,7 @@ class MQALayer(MqaAttentionBase):
                 else self.wkv(x_linear)[0]
             )
 
-            from sglang.srt.layers.fused_qk_norm_rope_store import (
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
@@ -915,7 +919,7 @@ class MQALayer(MqaAttentionBase):
                     False,
                 )
 
-            from sglang.srt.layers.fused_qk_norm_rope_store import (
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
@@ -1366,7 +1370,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre
+            from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
             norm_kwargs = {}
             if norm is not None:
@@ -1450,7 +1454,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
+            from sglang.kernels.ops.layernorm.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
 
@@ -2035,6 +2039,8 @@ class DeepseekV4Model(nn.Module):
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
+        self.dspark_layers_to_capture: Optional[List[int]] = None
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -2046,7 +2052,7 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
-            from sglang.srt.layers.mhc_head import fused_hc_head
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
                 x.contiguous(),
@@ -2220,7 +2226,18 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        if self._can_run_tbo(forward_batch):
+        capture_dspark = self.dspark_layers_to_capture is not None
+        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture is not supported together with "
+                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
+                "of them: DSpark static-verify is CP-off for v1."
+            )
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        # execution cannot expose per-layer completed hidden states), so skip
+        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        if self._can_run_tbo(forward_batch) and not capture_dspark:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2251,6 +2268,14 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
+                if capture_dspark and i in self.dspark_layers_to_capture:
+                    if use_fused:
+                        completed = layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                    else:
+                        completed = hidden_states
+                    dspark_aux_hidden_states.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -2276,6 +2301,9 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+
         return hidden_states, pre_hc_head
 
 
@@ -2291,7 +2319,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
-            from sglang.srt.layers.deepseek_v4_rope import set_batched_rope
+            from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
             from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
 
             set_force_ck_w8a8(True)
@@ -2351,6 +2379,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
@@ -2429,7 +2467,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
@@ -2564,7 +2604,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.srt.layers.mhc import prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
 
         tic = time.perf_counter()
         prewarm_mhc_pre(
