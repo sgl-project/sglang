@@ -82,7 +82,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_extend,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,

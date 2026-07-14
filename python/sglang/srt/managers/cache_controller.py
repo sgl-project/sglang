@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (

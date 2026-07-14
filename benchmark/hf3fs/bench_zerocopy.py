@@ -14,7 +14,7 @@ from sglang.srt.managers.cache_controller import (
     PrefetchOperation,
     StorageOperation,
 )
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 

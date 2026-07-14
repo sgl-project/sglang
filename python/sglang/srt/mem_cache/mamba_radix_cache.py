@@ -27,10 +27,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.mem_cache.allocator import (
-    PagedTokenToKVPoolAllocator,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishedReqResult,

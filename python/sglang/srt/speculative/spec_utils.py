@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

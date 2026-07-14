@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
