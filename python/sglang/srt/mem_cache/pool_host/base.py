@@ -6,10 +6,10 @@ import threading
 from functools import wraps
 from typing import Optional
 
-import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.mmap_allocator import memory_available_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -123,9 +123,8 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
