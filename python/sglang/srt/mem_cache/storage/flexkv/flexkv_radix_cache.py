@@ -164,10 +164,9 @@ class FlexKVRadixCache(RadixCache):
             with self._node_lock:
                 has_active_store_nodes = bool(self._inflight_store_nodes)
             self.flexkv_connector.ensure_reset_safe(
-                has_active_store_nodes=has_active_store_nodes
+                has_active_store_nodes=has_active_store_nodes,
+                has_quarantined_load_slots=bool(self._quarantined_load_slots),
             )
-        if hasattr(self, "_quarantined_load_slots") and self._quarantined_load_slots:
-            raise RuntimeError("Cannot reset FlexKV while load slots are quarantined")
         if hasattr(self, "flexkv_connector"):
             self.flexkv_connector.reset()
         super().reset()
@@ -217,7 +216,7 @@ class FlexKVRadixCache(RadixCache):
             return self._mp_match_prefix(
                 key, base_res, device_value, last_node, params.req
             )
-        return self._ip_match_prefix(key, base_res, device_value, last_node)
+        return self._ip_match_prefix(key, base_res, device_value)
 
     def _mp_match_prefix(
         self,
@@ -268,7 +267,6 @@ class FlexKVRadixCache(RadixCache):
         key: RadixKey,
         base_res: MatchResult,
         device_value: torch.Tensor,
-        last_node: TreeNode,
     ) -> MatchResult:
         """Layerwise path: allocate slots and fire ``start_load_kv_layerwise``
         immediately. Per-layer hook waits during forward."""
@@ -293,7 +291,6 @@ class FlexKVRadixCache(RadixCache):
             key=key,
             value_numel=device_len,
             uncached_len=hit,
-            last_node=last_node,
         )
         if result is None:
             return base_res
@@ -334,7 +331,6 @@ class FlexKVRadixCache(RadixCache):
             value_numel=marker.value_numel,
             uncached_len=params.host_hit_length,
             expected_slots=marker.expected_slots,
-            last_node=last_node,
         )
         if result is None:
             return (
@@ -351,7 +347,6 @@ class FlexKVRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         expected_slots: int,
-        last_node: TreeNode,
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         valid_manifest = (
             uncached_len > 0
@@ -397,7 +392,6 @@ class FlexKVRadixCache(RadixCache):
             key=key,
             value_numel=value_numel,
             loaded_slots=token_slots,
-            last_node=last_node,
         )
 
     def _allocate_and_load_layerwise(
@@ -407,7 +401,6 @@ class FlexKVRadixCache(RadixCache):
         key: RadixKey,
         value_numel: int,
         uncached_len: int,
-        last_node: TreeNode,
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         valid_manifest = (
             uncached_len > 0
@@ -448,7 +441,6 @@ class FlexKVRadixCache(RadixCache):
             key=key,
             value_numel=value_numel,
             loaded_slots=token_slots,
-            last_node=last_node,
         )
 
     def _allocate_load_slots(self, *, num_slots: int) -> Optional[torch.Tensor]:
@@ -458,6 +450,15 @@ class FlexKVRadixCache(RadixCache):
                 0,
                 num_slots - self.token_to_kv_pool_allocator.available_size(),
             )
+        except Exception as exc:  # noqa: BLE001
+            local_shortage = num_slots
+            logger.warning(
+                "[FlexKV] load slot capacity query failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        try:
             self.evict(EvictParams(num_tokens=local_shortage))
             token_slots = self.token_to_kv_pool_allocator.alloc(num_slots)
             if token_slots is None:
@@ -497,20 +498,84 @@ class FlexKVRadixCache(RadixCache):
         key: RadixKey,
         value_numel: int,
         loaded_slots: torch.Tensor,
-        last_node: TreeNode,
     ) -> Tuple[torch.Tensor, TreeNode]:
         loaded_length = int(loaded_slots.numel())
-        new_node = TreeNode(priority=last_node.priority)
-        new_node.key = key[value_numel : value_numel + loaded_length]
-        new_node.value = loaded_slots
-        new_node.parent = last_node
-        last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        self.evictable_size_ += loaded_length
-        self._update_leaf_status(last_node)
-        self._update_leaf_status(new_node)
+        target_key = key[: value_numel + loaded_length]
+        current_match = super().match_prefix(MatchPrefixParams(key=target_key))
+        current_length = int(current_match.device_indices.numel())
+        current_parent = current_match.last_device_node
 
-        self._record_store_event(new_node.parent)
-        self._record_store_event(new_node)
+        if current_length == len(target_key):
+            if self._mode is FlexKVMode.IP:
+                self._quarantine_load_slots(loaded_slots)
+                raise RuntimeError(
+                    "FlexKV layerwise load collided with an existing Radix entry"
+                )
+            current_loaded_slots = current_match.device_indices[value_numel:]
+            if int(current_loaded_slots.numel()) != loaded_length:
+                self._release_load_slots(loaded_slots)
+                raise RuntimeError(
+                    "FlexKV MP load collided with a non-exact Radix suffix"
+                )
+            self._release_load_slots(loaded_slots)
+            return current_loaded_slots, current_parent
+
+        if current_length != value_numel:
+            if self._mode is FlexKVMode.IP:
+                self._quarantine_load_slots(loaded_slots)
+            else:
+                self._release_load_slots(loaded_slots)
+            raise RuntimeError(
+                "FlexKV load publication found a stale or partial Radix prefix"
+            )
+
+        new_node = TreeNode(priority=current_parent.priority)
+        new_node.key = target_key[value_numel:]
+        new_node.value = loaded_slots
+        new_node.parent = current_parent
+        child_key = new_node.key.child_key(self.page_size)
+        if current_parent.children.get(child_key) is not None:
+            if self._mode is FlexKVMode.IP:
+                self._quarantine_load_slots(loaded_slots)
+            else:
+                self._release_load_slots(loaded_slots)
+            raise RuntimeError("FlexKV load publication collided with a Radix child")
+
+        parent_was_evictable_leaf = current_parent in self.evictable_leaves
+        child_attached = False
+        size_added = False
+        try:
+            current_parent.children[child_key] = new_node
+            child_attached = True
+            self.evictable_size_ += loaded_length
+            size_added = True
+            self._update_leaf_status(current_parent)
+            self._update_leaf_status(new_node)
+        except Exception:  # noqa: BLE001
+            if child_attached and current_parent.children.get(child_key) is new_node:
+                current_parent.children.pop(child_key)
+            if size_added:
+                self.evictable_size_ -= loaded_length
+            self.evictable_leaves.discard(new_node)
+            if parent_was_evictable_leaf:
+                self.evictable_leaves.add(current_parent)
+            else:
+                self.evictable_leaves.discard(current_parent)
+            if self._mode is FlexKVMode.IP:
+                self._quarantine_load_slots(loaded_slots)
+            else:
+                self._release_load_slots(loaded_slots)
+            raise
+
+        for event_node in (current_parent, new_node):
+            try:
+                self._record_store_event(event_node)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[FlexKV] failed to record loaded Radix node: %s",
+                    exc,
+                    exc_info=True,
+                )
 
         return loaded_slots, new_node
 

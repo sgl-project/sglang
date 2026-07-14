@@ -821,19 +821,25 @@ class FlexKVConnector:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def ensure_reset_safe(self, *, has_active_store_nodes: bool = False) -> None:
+    def ensure_reset_safe(
+        self,
+        *,
+        has_active_store_nodes: bool = False,
+        has_quarantined_load_slots: bool = False,
+    ) -> None:
         local_safe = int(
             self._poison_reason is None
             and not self._ambiguous_loads
             and not self._launched_load_tids
             and not self._inflight_stores
             and not has_active_store_nodes
+            and not has_quarantined_load_slots
         )
         combined_safe = self._sync_ctx.all_reduce_min(local_safe)
         if combined_safe == 0:
             raise RuntimeError(
                 "Cannot reset FlexKV with ambiguous loads, active layerwise loads, "
-                "or active stores"
+                "active stores, or quarantined load slots"
             )
 
     def reset(self) -> None:
