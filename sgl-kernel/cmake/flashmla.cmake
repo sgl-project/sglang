@@ -98,6 +98,8 @@ endif()
 
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"
+    "csrc/flashmla_nvfp4_api.cpp"
+    "csrc/flashmla/sm90/sparse_nvfp4/splitkv_mla.cu"
 
     # Compatibility shim for sgl-kernel torch.ops API.
     ${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp
@@ -158,6 +160,16 @@ if(FLASHMLA_ENABLE_SM100)
     target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM100)
 endif()
 
+option(
+    SGLANG_FLASHMLA_NVFP4_STAGE_TIMING
+    "Build the benchmark-only SM90 NVFP4 FlashMLA stage-timing operator"
+    OFF
+)
+if(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
+    target_compile_definitions(flashmla_ops PRIVATE SGLANG_FLASHMLA_NVFP4_STAGE_TIMING=1)
+    target_compile_options(flashmla_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+endif()
+
 # CUDA 13 moved cuda/std/* under cccl/cuda/std/*. The vendored cutlass routes
 # <cuda/std/...> to <cccl/cuda/std/...> when __CUDACC_VER_MAJOR__ >= 13, so the
 # host C++ TU (compiled by g++, where that macro is unset for the legacy path)
@@ -168,6 +180,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
               ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/cccl)
 endif()
 target_include_directories(flashmla_ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc/kerutils/include
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90

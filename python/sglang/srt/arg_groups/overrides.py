@@ -1187,10 +1187,16 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "fp4_e2m1" and view.fp4_kv_cache_recipe != "nvfp4":
+        raise ValueError(
+            "DeepSeek DSA with fp4_e2m1 KV cache requires "
+            "--fp4-kv-cache-recipe=nvfp4."
+        )
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "fp4_e2m1",
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or fp4_e2m1 kv_cache_dtype"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -1238,6 +1244,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     if not user_set_prefill and not user_set_decode and is_hip():
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
+    elif kv_cache_dtype == "fp4_e2m1":
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "fa3"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"

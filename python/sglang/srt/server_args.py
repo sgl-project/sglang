@@ -611,6 +611,16 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = "auto"
+    fp4_kv_cache_recipe: A[
+        str,
+        Arg(
+            help=(
+                "FP4 KV-cache scaling recipe. 'nvfp4' uses an FP32 tensor scale "
+                "plus E4M3 block-16 scales; 'mxfp4' uses MX block scaling."
+            ),
+            choices=["nvfp4", "mxfp4"],
+        ),
+    ] = "mxfp4"
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32."
     ] = False
@@ -4895,6 +4905,41 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import resolved_view
 
         if self.kv_cache_dtype != "fp4_e2m1":
+            return
+
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if is_deepseek_dsa(self.get_model_config().hf_config):
+            if not is_cuda():
+                raise RuntimeError("DSA NVFP4 KV cache is only supported on CUDA.")
+            import torch
+
+            capability = torch.cuda.get_device_capability()
+            if capability != (9, 0):
+                raise ValueError(
+                    "DSA NVFP4 KV cache currently requires SM90/Hopper, "
+                    f"got compute capability {capability}."
+                )
+            if self.fp4_kv_cache_recipe != "nvfp4":
+                raise ValueError(
+                    "DSA with fp4_e2m1 KV cache requires "
+                    "--fp4-kv-cache-recipe=nvfp4."
+                )
+            if self.enable_hisparse:
+                raise ValueError("DSA NVFP4 does not yet support --enable-hisparse.")
+            if self.enable_dsa_cache_layer_split:
+                raise ValueError(
+                    "DSA NVFP4 does not yet support --enable-dsa-cache-layer-split."
+                )
+            if self.dsa_prefill_backend != "flashmla_sparse" or (
+                self.dsa_decode_backend not in {"fa3", "flashmla_kv"}
+            ):
+                raise ValueError(
+                    "DSA NVFP4 requires --dsa-prefill-backend=flashmla_sparse "
+                    "and --dsa-decode-backend in {fa3,flashmla_kv}."
+                )
+            if self.page_size != 64:
+                raise ValueError("DSA NVFP4 requires --page-size=64.")
             return
 
         use_mla_backend = self.use_mla_backend()

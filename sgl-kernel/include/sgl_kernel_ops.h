@@ -866,6 +866,31 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     const std::optional<at::Tensor>& topk_length,
     const std::optional<at::Tensor>& extra_topk_length);
 
+std::vector<at::Tensor> fwd_kvcache_mla_nvfp4(
+    at::Tensor& q,                      // batch_size x seqlen_q x num_heads x 576, BF16
+    const at::Tensor& kcache,           // num_pages x 64 x 1 x 416, uint8
+    const at::Tensor& kv_global_scale,  // device FP32 scalar
+    const int64_t head_size_v,          // must be 512
+    const at::Tensor& seqlens_k,        // batch_size, int32
+    const double softmax_scale,
+    const at::Tensor& tile_scheduler_metadata,
+    const at::Tensor& num_splits,
+    const at::Tensor& indices  // batch_size x seqlen_q x topk physical token indices
+);
+
+#if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
+std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_stage_timing(
+    at::Tensor& q,
+    const at::Tensor& kcache,
+    const at::Tensor& kv_global_scale,
+    const int64_t head_size_v,
+    const at::Tensor& seqlens_k,
+    const double softmax_scale,
+    const at::Tensor& tile_scheduler_metadata,
+    const at::Tensor& num_splits,
+    const at::Tensor& indices);
+#endif
+
 void FMHACutlassSM100FwdRun(
     at::Tensor workspace_buffer,
     at::Tensor q,

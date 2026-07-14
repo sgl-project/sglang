@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+    dequantize_nvfp4_k_cache_paged,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -125,6 +128,22 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+def _require_native_nvfp4_flashmla() -> None:
+    """Fail during backend construction if the source-built SM90 op is absent."""
+    try:
+        import sgl_kernel.flash_mla  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "Native DSA NVFP4 decode requires a source-built sglang-kernel "
+            "with FlashMLA support."
+        ) from exc
+    if not hasattr(torch.ops.sgl_kernel, "fwd_kvcache_mla_nvfp4"):
+        raise RuntimeError(
+            "sglang-kernel was built without fwd_kvcache_mla_nvfp4; rebuild "
+            "sgl-kernel from the same commit as the SGLang Python package."
+        )
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -357,6 +376,9 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_nvfp4 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_nvfp4", False
+        )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -389,6 +411,8 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+        if self.dsa_kv_cache_store_nvfp4 and self.dsa_decode_impl == "flashmla_kv":
+            _require_native_nvfp4_flashmla()
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -1985,15 +2009,33 @@ class DeepseekSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            if (
+                self.dsa_kv_cache_store_nvfp4
+                and topk_transform_method == TopkTransformMethod.PAGED
+            ):
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                )
+            elif topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self.dsa_kv_cache_store_nvfp4:
+                        kv_cache = dequantize_nvfp4_k_cache_paged(
+                            kv_cache,
+                            page_table_1_flattened,
+                            self.token_to_kv_pool.get_mla_kv_global_scale(
+                                layer.layer_id
+                            ),
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
@@ -2019,6 +2061,12 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "fa3":
+            if self.dsa_kv_cache_store_nvfp4:
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -2176,6 +2224,12 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.dsa_decode_impl == "fa3":
+            if self.dsa_kv_cache_store_nvfp4:
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -2243,6 +2297,32 @@ class DeepseekSparseAttnBackend(
         )
         return o  # type: ignore
 
+    def _prepare_nvfp4_paged_fallback(
+        self,
+        kv_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        layer_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Materialize selected NVFP4 rows for BF16 correctness paths."""
+        physical_indices = page_table.contiguous().view(-1)
+        dequantized_kv = dequantize_nvfp4_k_cache_paged(
+            kv_cache,
+            physical_indices,
+            self.token_to_kv_pool.get_mla_kv_global_scale(layer_id),
+        )
+        local_indices = torch.arange(
+            physical_indices.numel(),
+            dtype=torch.int32,
+            device=physical_indices.device,
+        ).view(page_table.shape)
+        valid_indices = (page_table >= 0) & (page_table < kv_cache.shape[0])
+        local_page_table = torch.where(
+            valid_indices,
+            local_indices,
+            torch.full_like(local_indices, -1),
+        )
+        return dequantized_kv, local_page_table
+
     def _forward_flashmla_sparse(
         self,
         q_all: torch.Tensor,
@@ -2302,15 +2382,17 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
-        target_q_heads = self.flashmla_kv_num_q_heads
+        target_q_heads = (
+            num_q_heads
+            if self.dsa_kv_cache_store_nvfp4
+            else self.flashmla_kv_num_q_heads
+        )
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
@@ -2323,7 +2405,11 @@ class DeepseekSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_nvfp4:
+            kv_global_scale = self.token_to_kv_pool.get_mla_kv_global_scale(
+                layer.layer_id
+            )
+        elif not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -2332,21 +2418,38 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
-            q=q_input,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=True,
-        )
+        if self.dsa_kv_cache_store_nvfp4:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache_nvfp4
+
+            o, _ = flash_mla_with_kvcache_nvfp4(
+                q=q_input,
+                k_cache=kv_cache,
+                kv_global_scale=kv_global_scale,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+            )
+        else:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+            o, _ = flash_mla_with_kvcache(
+                q=q_input,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                ),
+                is_fp8_kvcache=True,
+            )
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
@@ -2845,6 +2948,13 @@ class DeepseekSparseAttnBackend(
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
+            self.dsa_kv_cache_store_nvfp4
+            and self.dsa_prefill_impl == "flashmla_sparse"
+            and forward_mode is not None
+            and forward_mode.is_extend_without_speculative()
+        ):
+            topk_transform_method = TopkTransformMethod.RAGGED
+        elif (
             # disable for MTP
             self.dsa_kv_cache_store_fp8
             and self.dsa_prefill_impl == "flashmla_sparse"

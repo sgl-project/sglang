@@ -199,6 +199,42 @@ def flash_mla_with_kvcache(
     return out, softmax_lse
 
 
+def flash_mla_with_kvcache_nvfp4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the SM90 sparse MLA kernel on the NVFP4 latent-cache ABI.
+
+    Each cache row is 416 bytes: 512 packed E2M1 latent values, 32 E4M3
+    block-16 scales, and 64 unscaled BF16 RoPE values. ``indices`` contains
+    flattened physical token indices.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_nvfp4.default(
+        q,
+        k_cache,
+        kv_global_scale,
+        head_dim_v,
+        cache_seqlens,
+        softmax_scale,
+        tile_scheduler_metadata,
+        num_splits,
+        indices,
+    )
+    return out, softmax_lse
+
+
 def _flash_mla_with_kvcache_sched_meta(
     q: torch.Tensor,
     k_cache: torch.Tensor,

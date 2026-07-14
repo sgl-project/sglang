@@ -93,6 +93,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
 #ifdef FLASHMLA_ENABLE_SM100
   m.def(
+      "fwd_kvcache_mla_nvfp4(Tensor q, Tensor kcache, Tensor kv_global_scale, int head_size_v, Tensor seqlens_k, "
+      "float softmax_scale, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor indices) -> Tensor[]");
+  m.impl("fwd_kvcache_mla_nvfp4", torch::kCUDA, &fwd_kvcache_mla_nvfp4);
+
+#if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
+  m.def(
+      "_fwd_kvcache_mla_nvfp4_stage_timing(Tensor q, Tensor kcache, Tensor kv_global_scale, int head_size_v, Tensor "
+      "seqlens_k, float softmax_scale, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor indices) -> Tensor[]");
+  m.impl(
+      "_fwd_kvcache_mla_nvfp4_stage_timing", torch::kCUDA, &fwd_kvcache_mla_nvfp4_stage_timing);
+#endif
+
+  m.def(
       "dense_prefill_fwd(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v, Tensor cumulative_seqlen_q, Tensor "
       "cumulative_seqlen_kv, Tensor o, Tensor lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int "
       "max_seqlen_kv, bool is_varlen) -> ()");

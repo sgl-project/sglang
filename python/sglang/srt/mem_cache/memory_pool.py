@@ -46,6 +46,11 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+    NVFP4_BYTES_PER_TOKEN,
+    dequantize_nvfp4_k_cache_paged,
+    quantize_nvfp4_k_cache_into,
+)
 from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -78,6 +83,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import is_float4_e2m1fn_x2
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -2744,12 +2750,27 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_nvfp4 = (
+            use_dsa and is_float4_e2m1fn_x2(dtype) and override_kv_cache_dim is not None
+        )
+        if self.dsa_kv_cache_store_nvfp4:
+            if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+                raise ValueError(
+                    "DSA NVFP4 currently requires kv_lora_rank=512 and "
+                    f"qk_rope_head_dim=64, got {kv_lora_rank=} and "
+                    f"{qk_rope_head_dim=}."
+                )
+            self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
-            override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
-            else (kv_lora_rank + qk_rope_head_dim)
+            NVFP4_BYTES_PER_TOKEN
+            if self.dsa_kv_cache_store_nvfp4
+            else (
+                override_kv_cache_dim
+                if self.dsa_kv_cache_store_fp8
+                else (kv_lora_rank + qk_rope_head_dim)
+            )
         )
 
         self._create_buffers()
@@ -2779,15 +2800,27 @@ class MLATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+        if self.dsa_kv_cache_store_nvfp4:
+            # Keep the scale outside the discardable KV-cache region. CUDA graphs
+            # capture its address and every encoded row depends on its value.
+            self.mla_kv_global_scale = torch.ones(
+                self.layer_num,
+                dtype=torch.float32,
+                device=self.device,
+            )
 
     def _clear_buffers(self):
         del self.kv_buffer
+        if hasattr(self, "mla_kv_global_scale"):
+            del self.mla_kv_global_scale
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        if hasattr(self, "mla_kv_global_scale"):
+            kv_size_bytes += get_tensor_size_bytes(self.mla_kv_global_scale)
         return kv_size_bytes
 
     # for disagg
@@ -2804,6 +2837,8 @@ class MLATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        if self.dsa_kv_cache_store_nvfp4:
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -2813,6 +2848,8 @@ class MLATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        if self.dsa_kv_cache_store_nvfp4:
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
                 ..., : self.kv_lora_rank
@@ -2821,6 +2858,45 @@ class MLATokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_mla_kv_global_scale(self, layer_id: int) -> torch.Tensor:
+        if not self.dsa_kv_cache_store_nvfp4:
+            raise RuntimeError("MLA NVFP4 global scale requested for a non-NVFP4 pool")
+        idx = layer_id - self.start_layer
+        if idx < 0 or idx >= self.layer_num:
+            raise IndexError(
+                f"MLA NVFP4 layer_id {layer_id} is outside the local range "
+                f"[{self.start_layer}, {self.start_layer + self.layer_num})."
+            )
+        return self.mla_kv_global_scale[idx : idx + 1]
+
+    def set_mla_kv_global_scale(
+        self, layer_id: int, scale: Union[float, torch.Tensor]
+    ) -> None:
+        dst = self.get_mla_kv_global_scale(layer_id)
+        if isinstance(scale, torch.Tensor):
+            if scale.numel() != 1:
+                raise ValueError(
+                    "MLA NVFP4 global scale must contain exactly one value, "
+                    f"got {scale.numel()}."
+                )
+            scale_value = float(scale.detach().to(torch.float32).item())
+        else:
+            scale_value = float(scale)
+        if not np.isfinite(scale_value) or scale_value <= 0.0:
+            raise ValueError(
+                "MLA NVFP4 global scale must be finite and positive, "
+                f"got {scale_value}."
+            )
+        dst.fill_(scale_value)
+
+    def get_raw_mla_kv_buffer(self, layer_id: int) -> dict:
+        if not self.dsa_kv_cache_store_nvfp4:
+            raise RuntimeError("Raw MLA NVFP4 buffer requested for a non-NVFP4 pool")
+        return {
+            "kv": self.get_key_buffer(layer_id),
+            "global_scale": self.get_mla_kv_global_scale(layer_id),
+        }
 
     def set_kv_buffer(
         self,
@@ -2833,6 +2909,7 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_nvfp4
         parallel = get_parallel()
         if parallel.dcp_enabled:
             valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
@@ -2851,12 +2928,21 @@ class MLATokenToKVPool(KVCache):
 
     def _write_mla_kv_buffer(
         self,
+        layer_id: int,
         dst_buffer: torch.Tensor,
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+        if self.dsa_kv_cache_store_nvfp4:
+            quantize_nvfp4_k_cache_into(
+                cache_k_nope,
+                cache_k_rope,
+                dst_buffer,
+                loc,
+                self.get_mla_kv_global_scale(layer_id),
+            )
+        elif _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -2908,6 +2994,7 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
+            layer_id,
             self.kv_buffer[layer_id - self.start_layer],
             loc,
             cache_k_nope,
@@ -2922,6 +3009,19 @@ class MLATokenToKVPool(KVCache):
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
+        if self.dsa_kv_cache_store_nvfp4:
+            dst_dtype = dst_dtype or torch.bfloat16
+            cache_k = dequantize_nvfp4_k_cache_paged(
+                self.get_key_buffer(layer_id),
+                loc,
+                self.get_mla_kv_global_scale(layer_id),
+                dtype=dst_dtype,
+            )
+            return (
+                cache_k[..., : self.kv_lora_rank],
+                cache_k[..., self.kv_lora_rank :],
+            )
+
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(

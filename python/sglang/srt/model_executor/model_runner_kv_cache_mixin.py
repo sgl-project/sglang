@@ -17,6 +17,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import NVFP4_BYTES_PER_TOKEN
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -271,6 +272,9 @@ class ModelRunnerKVCacheMixin:
         if not is_dsa_model:
             return kv_cache_dim
 
+        if is_float4_e2m1fn_x2(kv_cache_dtype):
+            return NVFP4_BYTES_PER_TOKEN
+
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
         # Assuming dsa prefill and decode backends are the same when using trtllm MLA backend,
         # since it is not compatible for trtllm and other mla attn backend due to the different
@@ -307,6 +311,53 @@ class ModelRunnerKVCacheMixin:
             )
 
         return kv_cache_dim
+
+    def _load_dsa_nvfp4_global_scales(self: ModelRunner) -> None:
+        """Copy checkpoint attention scales into the persistent DSA NVFP4 pool."""
+        pool = self.token_to_kv_pool
+        if not getattr(pool, "dsa_kv_cache_store_nvfp4", False):
+            return
+
+        from sglang.srt.model_executor.model_runner import resolve_language_model
+
+        language_model = resolve_language_model(self.model)
+        layers = getattr(language_model, "layers", None)
+        if layers is None:
+            decoder = getattr(language_model, "decoder", None)
+            layers = [] if decoder is None else [decoder]
+
+        initialized_layer_ids = set()
+        for model_layer in layers:
+            attention = None
+            if hasattr(model_layer, "self_attn"):
+                self_attn = model_layer.self_attn
+                if hasattr(self_attn, "attn"):
+                    attention = self_attn.attn
+                elif hasattr(self_attn, "attn_mqa"):
+                    attention = self_attn.attn_mqa
+            elif hasattr(model_layer, "attn"):
+                attention = model_layer.attn
+            elif hasattr(model_layer, "attention") and hasattr(
+                model_layer.attention, "attn"
+            ):
+                attention = model_layer.attention.attn
+
+            if attention is None or not hasattr(attention, "layer_id"):
+                continue
+            layer_id = attention.layer_id
+            if not self.start_layer <= layer_id < self.end_layer:
+                continue
+            scale = getattr(attention, "k_scale_float", None)
+            if scale is None:
+                scale = getattr(attention, "k_scale", None)
+            pool.set_mla_kv_global_scale(layer_id, 1.0 if scale is None else scale)
+            initialized_layer_ids.add(layer_id)
+
+        logger.info(
+            "Initialized DSA NVFP4 global scales for %d/%d local layers.",
+            len(initialized_layer_ids),
+            self.num_effective_layers,
+        )
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
@@ -987,6 +1038,7 @@ class ModelRunnerKVCacheMixin:
                 index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
             )
+            self._load_dsa_nvfp4_global_scales()
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
