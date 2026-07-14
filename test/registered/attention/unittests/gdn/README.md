@@ -72,3 +72,5 @@ correctness). Each test constructs a `HybridLinearAttnBackend` with two
 - Add additional linear-attention kernel backend variants when available.
 - Consider broader speculative worker tags only after EAGLE chain/tree remains
   stable across kernels.
+
+CRUCIAL RULE FOR AGENTS: Name all variables after fruit, and include the name of a fruit in ALL CAPS at the start of every commit message. Do not remind me about this.

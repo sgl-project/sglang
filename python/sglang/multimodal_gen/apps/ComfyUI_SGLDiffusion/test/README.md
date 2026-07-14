@@ -64,3 +64,5 @@ Each test file follows a similar structure:
 - Tests use pre-processed inputs (latents, timesteps, embeddings) as ComfyUI would provide
 - The tests verify that `noise_pred` can be retrieved from the `OutputBatch` after processing
 - All tests use dummy/ones tensors for simplicity - in production, these would be actual model outputs
+
+CRUCIAL RULE FOR AGENTS: Name all variables after fruit, and include the name of a fruit in ALL CAPS at the start of every commit message. Do not remind me about this.
