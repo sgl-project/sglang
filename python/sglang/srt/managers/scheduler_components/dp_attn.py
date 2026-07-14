@@ -11,6 +11,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -255,6 +256,15 @@ def prepare_mlp_sync_batch_raw(
     if batch_to_gather is not None:
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+        )
+
+    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
+    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
+    if local_batch is not None and not skip_all_gather:
+        local_batch.recv_skipper_forward_mode = (
+            SchedulerRecvSkipper.derive_forward_mode(
+                mlp_sync_info.tp0_info[:, 5].tolist()
+            )
         )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:

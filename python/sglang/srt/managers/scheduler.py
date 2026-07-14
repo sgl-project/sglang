@@ -1726,9 +1726,7 @@ class Scheduler(
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
-            get_last_forward_mode=lambda: (
-                self.last_batch.forward_mode if self.last_batch is not None else None
-            ),
+            get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
 
