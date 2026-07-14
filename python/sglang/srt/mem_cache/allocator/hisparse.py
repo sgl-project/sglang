@@ -145,6 +145,25 @@ class _HiSparsePageOwnership:
         )
         return buffer_indices
 
+    def rehome_pages(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        retained_page_ids: torch.Tensor,
+        install_retained_owner: Callable[[], None],
+    ) -> None:
+        owned_page_ids = self._owned_page_ids(self.mapping[mapping_indices])
+        torch._assert_async(
+            torch.all(torch.isin(retained_page_ids, owned_page_ids)),
+            "Retained HiSparse pages must belong to the temporary mapping owner",
+        )
+        self.mapping[mapping_indices] = 0
+        install_retained_owner()
+        released_page_ids = owned_page_ids[
+            ~torch.isin(owned_page_ids, retained_page_ids)
+        ]
+        self._release_owned_page_ids(released_page_ids)
+
     def _take_device_buffer_with_reserved_newest_page(
         self,
         *,
@@ -374,6 +393,19 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_owned_coordinates=extra_owned_coordinates,
             clear_extra_owner=clear_extra_owner,
             unique_page_owners=unique_page_owners,
+        )
+
+    def rehome_temporary_hisparse_pages(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        retained_page_ids: torch.Tensor,
+        install_retained_owner: Callable[[], None],
+    ) -> None:
+        self._page_ownership.rehome_pages(
+            mapping_indices=mapping_indices,
+            retained_page_ids=retained_page_ids,
+            install_retained_owner=install_retained_owner,
         )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
@@ -668,6 +700,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_owned_coordinates=extra_owned_coordinates,
             clear_extra_owner=clear_extra_owner,
             unique_page_owners=unique_page_owners,
+        )
+
+    def rehome_temporary_hisparse_pages(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        retained_page_ids: torch.Tensor,
+        install_retained_owner: Callable[[], None],
+    ) -> None:
+        self._page_ownership.rehome_pages(
+            mapping_indices=mapping_indices,
+            retained_page_ids=retained_page_ids,
+            install_retained_owner=install_retained_owner,
         )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):

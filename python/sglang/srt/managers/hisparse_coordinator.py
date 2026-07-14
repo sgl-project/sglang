@@ -42,6 +42,14 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
+class _DeviceBufferGrowth(NamedTuple):
+    boundary_index: int
+    req_index: int
+    old_cap: int
+    new_cap: int
+    net_extra: int
+
+
 class HiSparseCoordinator:
     def __init__(
         self,
@@ -477,6 +485,15 @@ class HiSparseCoordinator:
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
 
+        if self.token_to_kv_pool_allocator.page_size > 1:
+            self._rehome_page_boundary_owners(
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                req_pool_indices=req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+            )
+
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
@@ -542,6 +559,174 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
+
+    def _rehome_page_boundary_owners(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        allocator = self.token_to_kv_pool_allocator
+        page_size = allocator.hisparse_device_page_size
+        boundary_batch_indices_cpu = []
+        for batch_index in range(seq_lens_cpu.numel()):
+            seq_len = int(seq_lens_cpu[batch_index])
+            if self.is_dsv4_hisparse and seq_len % self.compress_ratio != 0:
+                continue
+            semantic_position = seq_len - 1
+            if self.is_dsv4_hisparse:
+                semantic_position = seq_len // self.compress_ratio - 1
+            if semantic_position % page_size == 0:
+                boundary_batch_indices_cpu.append(batch_index)
+        if not boundary_batch_indices_cpu:
+            return
+
+        boundary_batch_indices = torch.tensor(
+            boundary_batch_indices_cpu, dtype=torch.int64, device=seq_lens.device
+        )
+        boundary_seq_lens = seq_lens[boundary_batch_indices]
+        boundary_req_indices = req_pool_indices[boundary_batch_indices]
+        semantic_positions = boundary_seq_lens - 1
+        if self.is_dsv4_hisparse:
+            semantic_positions = boundary_seq_lens // self.compress_ratio - 1
+        first_mapping_indices = allocator.get_last_loc_compressed(
+            out_cache_loc[boundary_batch_indices]
+        ).to(torch.int64)
+        offsets = torch.arange(page_size, dtype=torch.int64, device=seq_lens.device)
+        mapping_index_blocks = first_mapping_indices[:, None] + offsets
+        buffer_positions = (semantic_positions[:, None] + offsets).clamp(
+            max=self.device_buffer_size
+        )
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        mapped_coordinates = mapping[mapping_index_blocks]
+        temporary_page_ids = mapped_coordinates[:, 0] // page_size
+        temporary_blocks = temporary_page_ids[:, None] * page_size + offsets
+        torch._assert_async(
+            torch.all(first_mapping_indices % page_size == 0),
+            "HiSparse temporary mapping keys must be page aligned",
+        )
+        torch._assert_async(
+            torch.all(mapped_coordinates == temporary_blocks),
+            "HiSparse temporary owners must cover complete pages",
+        )
+        sorted_page_ids = torch.sort(temporary_page_ids).values
+        torch._assert_async(
+            torch.all(sorted_page_ids[1:] != sorted_page_ids[:-1]),
+            "HiSparse temporary pages must have unique request owners",
+        )
+
+        owner_rows = self.req_to_device_buffer[boundary_req_indices]
+        growths = []
+        for boundary_index, batch_index in enumerate(boundary_batch_indices_cpu):
+            req_index = int(req_pool_indices_cpu[batch_index])
+            seq_len = int(seq_lens_cpu[batch_index])
+            old_cap = int(self.req_device_buffer_size[req_index])
+            if self.is_dsv4_hisparse or seq_len > self.device_buffer_size:
+                continue
+            if seq_len <= old_cap:
+                continue
+            assert seq_len - 1 == old_cap
+            new_cap = min(
+                (seq_len + page_size - 1) // page_size * page_size,
+                self.device_buffer_size,
+            )
+            if new_cap == self.device_buffer_size:
+                new_cap = self.padded_buffer_size
+            net_extra = new_cap - old_cap - page_size
+            assert net_extra >= 0
+            growths.append(
+                _DeviceBufferGrowth(boundary_index, req_index, old_cap, new_cap, net_extra)
+            )
+            torch._assert_async(
+                torch.all(owner_rows[boundary_index, :old_cap] > 0),
+                "HiSparse existing buffer prefix must remain owned",
+            )
+            torch._assert_async(
+                torch.all(owner_rows[boundary_index, old_cap:new_cap] == 0),
+                "HiSparse growth must target an unowned buffer range",
+            )
+
+        growth_mask_values = [False] * len(boundary_batch_indices_cpu)
+        for growth in growths:
+            growth_mask_values[growth.boundary_index] = True
+        growth_mask = torch.tensor(growth_mask_values, device=seq_lens.device)
+        torch._assert_async(
+            torch.all(~torch.isin(owner_rows // page_size, temporary_page_ids)),
+            "HiSparse temporary pages must not already belong to a device buffer",
+        )
+        existing_destinations = torch.gather(owner_rows, 1, buffer_positions)
+        torch._assert_async(
+            torch.all(existing_destinations[~growth_mask] > 0),
+            "HiSparse release destinations must remain owned",
+        )
+        torch._assert_async(
+            torch.all(
+                ~torch.isin(
+                    existing_destinations[~growth_mask] // page_size,
+                    temporary_page_ids,
+                )
+            ),
+            "HiSparse release destinations must not alias temporary pages",
+        )
+
+        total_net_extra = sum(growth.net_extra for growth in growths)
+        if total_net_extra > 0:
+            extra_indices = allocator.hisparse_attn_allocator.alloc(total_net_extra)
+            if extra_indices is None:
+                raise RuntimeError(
+                    "HiSparse device buffer net allocation failed "
+                    f"(total_net_extra={total_net_extra})"
+                )
+            assert extra_indices.numel() == total_net_extra
+            extra_blocks = extra_indices.reshape(-1, page_size)
+            torch._assert_async(
+                torch.all(
+                    (extra_blocks[:, :1] % page_size == 0)
+                    & (extra_blocks == extra_blocks[:, :1] + offsets)
+                ),
+                "HiSparse net-extra allocation must contain complete pages",
+            )
+        else:
+            extra_indices = temporary_page_ids[:0]
+
+        destinations = torch.where(
+            growth_mask[:, None], temporary_blocks, existing_destinations
+        )
+        torch._assert_async(
+            torch.all(destinations > 0),
+            "HiSparse mapping destinations must be owned before publication",
+        )
+
+        def install_growth_rows() -> None:
+            extra_offset = 0
+            for growth in growths:
+                self.req_to_device_buffer[
+                    growth.req_index,
+                    growth.old_cap : growth.old_cap + page_size,
+                ] = temporary_blocks[growth.boundary_index]
+                self.req_to_device_buffer[
+                    growth.req_index,
+                    growth.old_cap + page_size : growth.new_cap,
+                ] = extra_indices[extra_offset : extra_offset + growth.net_extra]
+                extra_offset += growth.net_extra
+                self.req_device_buffer_size[growth.req_index] = growth.new_cap
+            assert extra_offset == total_net_extra
+
+        allocator.rehome_temporary_hisparse_pages(
+            mapping_indices=mapping_index_blocks.reshape(-1),
+            retained_page_ids=temporary_page_ids[growth_mask],
+            install_retained_owner=install_growth_rows,
+        )
+        for growth in growths:
+            self.req_device_buffer_token_locs[
+                :, growth.req_index, growth.old_cap : growth.new_cap
+            ] = self.req_to_device_buffer[
+                growth.req_index, growth.old_cap : growth.new_cap
+            ].to(torch.int32)
+        mapping[mapping_index_blocks] = destinations
 
     def _eager_backup_previous_token(
         self,
