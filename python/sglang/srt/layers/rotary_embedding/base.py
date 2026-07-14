@@ -68,7 +68,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.srt.layers.attention.utils import (
+    from sglang.kernels.ops.attention.utils import (
         fused_qk_rope_reshape_and_cache,
     )
 
