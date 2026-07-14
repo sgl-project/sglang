@@ -736,6 +736,9 @@ class SelfBenchmark:
             metrics_collector=None,
             extra_key=extra_key or rid,
         )
+        # Synthetic requests bypass Scheduler.handle_generate_request, which
+        # disables input logprob computation when return_logprob is false.
+        req.logprob_start_len = -1
         req.tokenizer = self.scheduler.tokenizer
         req.suppress_output = True
         return req
