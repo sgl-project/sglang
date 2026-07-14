@@ -768,3 +768,29 @@ def resolve_total_kv_heads(
         "nor kv_head_num. "
         "Ensure DecodePreallocQueue._init_kv_manager sets kv_args.kv_head_num."
     )
+
+
+def staging_grid_tokens(chunked_prefill_size: Optional[int], page_size: int) -> int:
+    """Token width of one staging grid slot; shared by prefetch and the
+    sender's grid alignment."""
+    cps = chunked_prefill_size or 8192
+    return max(1, cps // page_size) * page_size
+
+
+def compute_grid_segments(
+    start_idx: int, end_idx: int, base: int, grid_tokens: int
+) -> List[Tuple[int, int]]:
+    """Split [start_idx, end_idx) at grid boundaries base + k * grid_tokens
+    so each segment maps to exactly one staging slot. An empty range yields
+    one empty segment (a metadata-only last chunk still needs a send).
+    """
+    segments: List[Tuple[int, int]] = []
+    seg_start = start_idx
+    while seg_start < end_idx:
+        next_boundary = base + ((seg_start - base) // grid_tokens + 1) * grid_tokens
+        seg_end = min(next_boundary, end_idx)
+        segments.append((seg_start, seg_end))
+        seg_start = seg_end
+    if not segments:
+        segments = [(start_idx, end_idx)]
+    return segments

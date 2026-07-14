@@ -239,7 +239,6 @@ class MooncakeKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
-                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
 
     def init_engine(self):
@@ -370,7 +369,8 @@ class MooncakeKVManager(CommonKVManager):
         return PrefillStagingStrategy(self, staging_buffer)
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
-        """Notify decode that a non-last staging chunk RDMA is complete."""
+        """Notify decode that a staging chunk RDMA is complete (every chunk;
+        scatter is arrival-driven)."""
         na = NetworkAddress(req.endpoint, req.dst_port)
         self._connect(
             na.to_tcp(),
@@ -446,7 +446,7 @@ class MooncakeKVManager(CommonKVManager):
                 "reduce chunked_prefill_size."
             )
             return (-1, False)
-        if ret == 0 and not kv_chunk.is_last_chunk:
+        if ret == 0:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 
@@ -1645,7 +1645,6 @@ class MooncakeKVManager(CommonKVManager):
                         page_start,
                         num_pages,
                         session_id,
-                        self._chunk_writer_counts,
                     )
                     continue
 
@@ -1680,7 +1679,6 @@ class MooncakeKVManager(CommonKVManager):
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(
