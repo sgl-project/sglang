@@ -19,7 +19,9 @@ def _stable_unique_page_ids(page_ids: torch.Tensor) -> torch.Tensor:
     unique_page_ids, inverse = torch.unique(
         page_ids.to(dtype=torch.int64), sorted=False, return_inverse=True
     )
-    positions = torch.arange(page_ids.numel(), dtype=torch.int64, device=page_ids.device)
+    positions = torch.arange(
+        page_ids.numel(), dtype=torch.int64, device=page_ids.device
+    )
     first_positions = torch.full_like(unique_page_ids, page_ids.numel())
     first_positions.scatter_reduce_(
         0, inverse, positions, reduce="amin", include_self=True
@@ -144,9 +146,7 @@ def _build_device_buffer_candidate(
     semantic_completion_tail = semantic_unseen_coordinates[:tail_capacity]
 
     remaining_size = (
-        need_size
-        - ordered_real_prefix.numel()
-        - semantic_completion_tail.numel()
+        need_size - ordered_real_prefix.numel() - semantic_completion_tail.numel()
     )
     assert remaining_size % device_page_size == 0
 
@@ -170,9 +170,7 @@ def _build_device_buffer_candidate(
     else:
         new_page_tail = all_owned_page_ids[:0]
 
-    retained_page_ids = torch.cat(
-        [semantic_retained_page_ids, tail_retained_page_ids]
-    )
+    retained_page_ids = torch.cat([semantic_retained_page_ids, tail_retained_page_ids])
     pure_surplus_page_ids = all_owned_page_ids[
         ~torch.isin(all_owned_page_ids, retained_page_ids)
     ]
@@ -328,15 +326,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear_hisparse_mapping(self, *, mapping_indices: torch.Tensor) -> None:
         self.full_to_hisparse_device_index_mapping[mapping_indices] = 0
         torch._assert_async(
-            torch.all(
-                self.full_to_hisparse_device_index_mapping[mapping_indices] == 0
-            ),
+            torch.all(self.full_to_hisparse_device_index_mapping[mapping_indices] == 0),
             "HiSparse mapping owners must be cleared before release",
         )
 
-    def release_owned_hisparse_pages(
-        self, *, owned_page_ids: torch.Tensor
-    ) -> None:
+    def release_owned_hisparse_pages(self, *, owned_page_ids: torch.Tensor) -> None:
         _release_owned_page_ids(
             self.hisparse_attn_allocator,
             owned_page_ids=owned_page_ids,
@@ -626,15 +620,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear_hisparse_mapping(self, *, mapping_indices: torch.Tensor) -> None:
         self.full_to_hisparse_device_index_mapping[mapping_indices] = 0
         torch._assert_async(
-            torch.all(
-                self.full_to_hisparse_device_index_mapping[mapping_indices] == 0
-            ),
+            torch.all(self.full_to_hisparse_device_index_mapping[mapping_indices] == 0),
             "HiSparse mapping owners must be cleared before release",
         )
 
-    def release_owned_hisparse_pages(
-        self, *, owned_page_ids: torch.Tensor
-    ) -> None:
+    def release_owned_hisparse_pages(self, *, owned_page_ids: torch.Tensor) -> None:
         _release_owned_page_ids(
             self.hisparse_attn_allocator,
             owned_page_ids=owned_page_ids,

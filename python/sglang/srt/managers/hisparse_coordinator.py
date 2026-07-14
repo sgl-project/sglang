@@ -309,9 +309,7 @@ class HiSparseCoordinator:
         assert real_host_token_count <= self.req_to_host_pool.shape[1]
         assert real_host_token_count <= self.req_to_device_buffer.shape[1]
 
-        host_indices = self.req_to_host_pool[
-            req.req_pool_idx, :real_host_token_count
-        ]
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :real_host_token_count]
         device_locs = self.req_to_device_buffer[
             req.req_pool_idx, :real_host_token_count
         ]
@@ -397,15 +395,11 @@ class HiSparseCoordinator:
         )
         assert int(self.req_device_buffer_size[req.req_pool_idx]) == alloc_size
         torch._assert_async(
-            torch.all(
-                self.req_to_device_buffer[req.req_pool_idx, :alloc_size] > 0
-            ),
+            torch.all(self.req_to_device_buffer[req.req_pool_idx, :alloc_size] > 0),
             "HiSparse admission must publish positive device coordinates",
         )
         torch._assert_async(
-            torch.all(
-                self.req_to_device_buffer[req.req_pool_idx, alloc_size:] == 0
-            ),
+            torch.all(self.req_to_device_buffer[req.req_pool_idx, alloc_size:] == 0),
             "HiSparse admission must not publish owners beyond its capacity",
         )
 
@@ -555,10 +549,7 @@ class HiSparseCoordinator:
                 stale_mask = (previous_locs > 0) & (
                     previous_locs != reserved_buffer_loc
                 )
-                if (
-                    self.token_to_kv_pool_allocator.hisparse_device_page_size
-                    == 1
-                ):
+                if self.token_to_kv_pool_allocator.hisparse_device_page_size == 1:
                     stale_mapping_indices = compressed_locs[stale_mask]
                     stale_page_ids = (
                         self.token_to_kv_pool_allocator.collect_owned_hisparse_page_ids(
@@ -899,9 +890,7 @@ class HiSparseCoordinator:
             "HiSparse terminal cleanup must clear device buffer tokens",
         )
         torch._assert_async(
-            torch.all(
-                self.req_device_buffer_token_locs[:, req.req_pool_idx, :] == -1
-            ),
+            torch.all(self.req_device_buffer_token_locs[:, req.req_pool_idx, :] == -1),
             "HiSparse terminal cleanup must clear device buffer locations",
         )
 
