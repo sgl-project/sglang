@@ -176,9 +176,7 @@ class TestLMCachePageAlignedLoadBack(unittest.TestCase):
             self.assertIsNotNone(run.result)
             published_slots, new_node = run.result
             self.assertEqual(run.allocator.alloc_requests, [8])
-            self.assertEqual(
-                run.mappings[0].tolist(), [-1] * 4 + list(range(100, 107))
-            )
+            self.assertEqual(run.mappings[0].tolist(), [-1] * 4 + list(range(100, 107)))
             self.assertEqual(published_slots.tolist(), list(range(100, 104)))
             self.assertEqual(new_node.value.tolist(), list(range(100, 104)))
             self.assertEqual(list(new_node.key), list(range(4, 8)))
