@@ -1704,6 +1704,11 @@ class ServerArgs:
         Optional[int],
         "The number of tokens sampled from the draft model in Speculative Decoding.",
     ] = None
+    speculative_fanout: A[
+        Optional[int],
+        "Bonus-token fan-out F for decoupled enumeration speculative decoding; "
+        "number of bonus-token guesses the drafter enumerates per accept case.",
+    ] = None
     speculative_dflash_block_size: A[
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",

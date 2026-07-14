@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 class DraftMeshMessageType(str, Enum):
     CONTROL_BATCH = "control_batch"
-    TAIL_STREAM_OUTPUT_BATCH = "tail_stream_output_batch"
+    ENUMERATION_BUFFER_BATCH = "enumeration_buffer_batch"
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,21 @@ class VerifyCommit:
     ].
     Drafter must align its reqs to these committed tokens,
     and sometimes needs to truncate tokens / reprefill.
+
+    Enumeration-side interpretation
+    -------------------------------
+    Under the enumeration data plane (DraftEnumerationBuffer) the verifier
+    GPU-selects one enumerated chain per verify round, so the newly committed
+    tokens are the accepted draft tokens followed by the bonus token:
+
+        accept_len = len(committed_tokens) - 1
+        bonus      = committed_tokens[-1]
+
+    A fallback round (no enumerated chain was usable) commits exactly the bonus
+    token, i.e. committed_tokens == [bonus] and accept_len == 0. Coalescing
+    contiguous commits into a VerifierCommitSegment still works because the
+    drafter only needs the latest committed prefix to base the next enumeration
+    round on; it never reconstructs per-round accept/bonus boundaries.
     """
 
     request_id: str
@@ -121,30 +136,90 @@ class DraftClose:
 
 
 @dataclass
-class DraftTailStreamOutput:
-    """
-    Drafter sends one output token to the verifier-side DraftTailBuffer.
+class DraftEnumerationBuffer:
+    """Drafter pushes a full enumeration block for one request, one round ahead.
 
-    base_committed_len records the verifier prefix length that the drafter used
-    as the base when this token was emitted. The verifier compares it with its
-    stale-base boundary before accepting the token as tail data or as
-    pending-prefix confirmation.
+    Instead of streaming draft tail tokens one at a time, the drafter
+    pre-enumerates, from a single committed base, every chain the verifier could
+    possibly select in the next verify round and pushes the whole block at once.
+    The verifier then GPU-selects the matching chain; a branch that does not
+    match is simply never selected, so a wrong guess is never committed.
 
-    new_token_pos is the 0-based output token position for new_token. Normal
-    decode streams send the latest generated token.
+    Enumeration dimensions
+    ----------------------
+    - num_steps (K): speculative_num_steps, the draft chain length per case.
+    - fanout (F): speculative_fanout, the number of bonus-token guesses the
+      drafter enumerates per accept case.
+    - accept cases (K + 1): the possible accept lengths of the *previous* round
+      that this block is drafted against, 0 .. K inclusive.
+
+    tokens layout
+    -------------
+    tokens is a flat tuple of (K + 1) * F * K vocab ids laid out as
+    [accept_case][guess][step]:
+
+        flat_index = (accept_case * F + guess) * K + step
+
+    with accept_case in [0, K], guess in [0, F), step in [0, K). The value at
+    that index is the draft token the drafter proposes for chain
+    (accept_case, guess) at position step.
+
+    base_committed_len is the verifier committed length this block was drafted
+    from; it is the staleness version. The verifier judges usability entirely on
+    GPU by comparing base_committed_len against its current committed length
+    together with the bonus-token match, so no host round-trip is needed to
+    decide whether the block is fresh.
     """
 
     src_drafter_rank: int
     dst_verifier_rank: int
     request_id: str
     base_committed_len: int
-    new_token_pos: int
-    new_token: int
+    num_steps: int
+    fanout: int
+    tokens: tuple[int, ...] = ()
+
+    @property
+    def draft_key(self) -> DraftReqKey:
+        return DraftReqKey(
+            src_verifier_rank=int(self.dst_verifier_rank),
+            request_id=self.request_id,
+        )
+
+    @property
+    def num_tokens(self) -> int:
+        return (int(self.num_steps) + 1) * int(self.fanout) * int(self.num_steps)
+
+    def validate(self) -> None:
+        if int(self.num_steps) < 1:
+            raise ValueError(
+                "DraftEnumerationBuffer num_steps must be >= 1: "
+                f"request_id={self.request_id} num_steps={self.num_steps}"
+            )
+        if int(self.fanout) < 1:
+            raise ValueError(
+                "DraftEnumerationBuffer fanout must be >= 1: "
+                f"request_id={self.request_id} fanout={self.fanout}"
+            )
+        if int(self.base_committed_len) < 0:
+            raise ValueError(
+                "DraftEnumerationBuffer base_committed_len must be non-negative: "
+                f"request_id={self.request_id} "
+                f"base_committed_len={self.base_committed_len}"
+            )
+        if len(self.tokens) != self.num_tokens:
+            raise ValueError(
+                "DraftEnumerationBuffer tokens length must equal "
+                "(num_steps + 1) * fanout * num_steps: "
+                f"request_id={self.request_id} "
+                f"num_steps={self.num_steps} fanout={self.fanout} "
+                f"expected={self.num_tokens} actual={len(self.tokens)}"
+            )
 
 
 @dataclass
-class DraftTailStreamOutputBatch:
-    outputs: list[DraftTailStreamOutput] = field(default_factory=list)
+class DraftEnumerationBufferBatch:
+    buffers: list[DraftEnumerationBuffer] = field(default_factory=list)
 
 
 @dataclass
@@ -358,7 +433,7 @@ class ReadyDraftControls:
 class DraftMeshMessage:
     message_type: DraftMeshMessageType
     control_batch: Optional[DraftControlBatch] = None
-    tail_stream_output_batch: Optional[DraftTailStreamOutputBatch] = None
+    enumeration_buffer_batch: Optional[DraftEnumerationBufferBatch] = None
 
     @staticmethod
     def from_control_batch(message: DraftControlBatch) -> DraftMeshMessage:
@@ -368,12 +443,12 @@ class DraftMeshMessage:
         )
 
     @staticmethod
-    def from_tail_stream_output_batch(
-        message: DraftTailStreamOutputBatch,
+    def from_enumeration_buffer_batch(
+        message: DraftEnumerationBufferBatch,
     ) -> DraftMeshMessage:
         return DraftMeshMessage(
-            message_type=DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH,
-            tail_stream_output_batch=message,
+            message_type=DraftMeshMessageType.ENUMERATION_BUFFER_BATCH,
+            enumeration_buffer_batch=message,
         )
 
 

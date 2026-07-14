@@ -12,6 +12,8 @@ import unittest
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
+    DraftEnumerationBuffer,
+    DraftEnumerationBufferBatch,
     DraftMeshMessage,
     DraftMeshMessageType,
     DraftReqKey,
@@ -248,23 +250,90 @@ class TestDraftControlInbox(CustomTestCase):
         self.assertEqual(seg.end_committed_len, 3)
 
 
+def _enum_buffer(
+    rid="r",
+    *,
+    num_steps=2,
+    fanout=3,
+    base_committed_len=0,
+    src_drafter_rank=0,
+    dst_verifier_rank=0,
+    tokens=None,
+) -> DraftEnumerationBuffer:
+    if tokens is None:
+        # A well-formed (K + 1) * F * K flat block.
+        tokens = tuple(range((num_steps + 1) * fanout * num_steps))
+    return DraftEnumerationBuffer(
+        src_drafter_rank=src_drafter_rank,
+        dst_verifier_rank=dst_verifier_rank,
+        request_id=rid,
+        base_committed_len=base_committed_len,
+        num_steps=num_steps,
+        fanout=fanout,
+        tokens=tokens,
+    )
+
+
+class TestDraftEnumerationBuffer(CustomTestCase):
+    def test_num_tokens_and_valid_block_passes(self):
+        # num_tokens is the (K + 1) * F * K layout size; a matching block
+        # validates without raising.
+        buf = _enum_buffer(num_steps=2, fanout=3)
+        self.assertEqual(buf.num_tokens, (2 + 1) * 3 * 2)
+        self.assertEqual(len(buf.tokens), buf.num_tokens)
+        buf.validate()  # should not raise
+
+    def test_num_steps_below_one_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_buffer(num_steps=0, fanout=3, tokens=()).validate()
+
+    def test_fanout_below_one_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_buffer(num_steps=2, fanout=0, tokens=()).validate()
+
+    def test_negative_base_committed_len_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_buffer(base_committed_len=-1).validate()
+
+    def test_wrong_tokens_length_raises(self):
+        # One token short of the (K + 1) * F * K block.
+        buf = _enum_buffer(num_steps=2, fanout=3)
+        short = DraftEnumerationBuffer(
+            src_drafter_rank=buf.src_drafter_rank,
+            dst_verifier_rank=buf.dst_verifier_rank,
+            request_id=buf.request_id,
+            base_committed_len=buf.base_committed_len,
+            num_steps=buf.num_steps,
+            fanout=buf.fanout,
+            tokens=buf.tokens[:-1],
+        )
+        with self.assertRaises(ValueError):
+            short.validate()
+
+    def test_draft_key_uses_dst_verifier_rank(self):
+        # The owning verifier is the destination rank; draft_key must key on it
+        # so the drafter-side table is unambiguous across verifier ranks.
+        buf = _enum_buffer("req-9", dst_verifier_rank=4)
+        self.assertEqual(
+            buf.draft_key, DraftReqKey(src_verifier_rank=4, request_id="req-9")
+        )
+
+
 class TestDraftMeshMessageEnvelope(CustomTestCase):
     def test_from_control_batch_sets_discriminant_and_slot(self):
         batch = DraftControlBatch(dst_drafter_rank=0)
         msg = DraftMeshMessage.from_control_batch(batch)
         self.assertEqual(msg.message_type, DraftMeshMessageType.CONTROL_BATCH)
         self.assertIs(msg.control_batch, batch)
-        self.assertIsNone(msg.tail_stream_output_batch)
+        self.assertIsNone(msg.enumeration_buffer_batch)
 
-    def test_from_tail_stream_output_batch_sets_discriminant_and_slot(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftTailStreamOutputBatch
-
-        batch = DraftTailStreamOutputBatch()
-        msg = DraftMeshMessage.from_tail_stream_output_batch(batch)
+    def test_from_enumeration_buffer_batch_sets_discriminant_and_slot(self):
+        batch = DraftEnumerationBufferBatch(buffers=[_enum_buffer()])
+        msg = DraftMeshMessage.from_enumeration_buffer_batch(batch)
         self.assertEqual(
-            msg.message_type, DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
+            msg.message_type, DraftMeshMessageType.ENUMERATION_BUFFER_BATCH
         )
-        self.assertIs(msg.tail_stream_output_batch, batch)
+        self.assertIs(msg.enumeration_buffer_batch, batch)
         self.assertIsNone(msg.control_batch)
 
 
