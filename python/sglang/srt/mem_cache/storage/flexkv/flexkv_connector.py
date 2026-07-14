@@ -554,9 +554,7 @@ class FlexKVConnector:
                             )
                     outcome["completed_task_ids"] = completed_task_ids
             except Exception as exc:  # noqa: BLE001
-                outcome["reason"] = (
-                    f"FlexKV layerwise terminal wait failed: {exc}"
-                )
+                outcome["reason"] = f"FlexKV layerwise terminal wait failed: {exc}"
         if self._sync_ctx.needs_sync:
             outcome = self._sync_ctx.scatter(outcome)
 
@@ -592,9 +590,7 @@ class FlexKVConnector:
 
     def ensure_load_back_safe(self) -> None:
         if self._poison_reason is not None or self._ambiguous_loads:
-            raise RuntimeError(
-                f"FlexKV load-back is poisoned: {self._poison_reason}"
-            )
+            raise RuntimeError(f"FlexKV load-back is poisoned: {self._poison_reason}")
 
     def ensure_layerwise_evict_safe(self) -> None:
         self.drain_launched_loads()
