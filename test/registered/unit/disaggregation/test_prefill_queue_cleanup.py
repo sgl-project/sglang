@@ -144,6 +144,7 @@ class TestPrefillQueueCleanup(CustomTestCase):
             finished_reason=None,
             to_finish=FINISH_ABORT("externally aborted"),
             metadata_buffer_index=-1,
+            pending_bootstrap=False,
             return_logprob=False,
             time_stats=MagicMock(),
         )
