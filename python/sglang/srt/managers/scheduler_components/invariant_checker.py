@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
+    is_npu,
     raise_error_or_warn,
 )
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
@@ -250,9 +252,22 @@ class SchedulerInvariantChecker:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+                allocator_page: int = self.token_to_kv_pool_allocator.page_size
+                if not _is_npu:
+                    assert allocated_len % allocator_page == 0, (
+                        f"kv_allocated_len must be page-aligned: "
+                        f"{allocated_len=}, {allocator_page=}, req={req.rid}"
+                    )
+                    assert allocated_len >= ceil_align(
+                        req.kv_committed_len, allocator_page
+                    ), (
+                        f"kv_allocated_len must cover committed KV: "
+                        f"{allocated_len=}, {req.kv_committed_len=}, "
+                        f"{allocator_page=}, req={req.rid}"
+                    )
+                if allocator_page > 1:
+                    allocated_len = ceil_align(allocated_len, allocator_page)
+                    assert req.cache_protected_len % allocator_page == 0
 
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
@@ -309,6 +324,16 @@ class SchedulerInvariantChecker:
 
         def _add_owner(req_or_slot, label, rpi, committed, allocated):
             assert 0 <= committed <= allocated <= row_width
+            allocator_page: int = self.token_to_kv_pool_allocator.page_size
+            if not _is_npu:
+                assert allocated % allocator_page == 0, (
+                    f"kv_allocated_len must be page-aligned: {label}, "
+                    f"{allocated=}, {allocator_page=}"
+                )
+                assert allocated >= ceil_align(committed, allocator_page), (
+                    f"kv_allocated_len must cover committed KV: {label}, "
+                    f"{allocated=}, {committed=}, {allocator_page=}"
+                )
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []

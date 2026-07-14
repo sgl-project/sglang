@@ -18,13 +18,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 class _VirtualNode:
@@ -527,11 +528,16 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
+        allocator_page: int = self.token_to_kv_pool_allocator.page_size
+        bookkeeping_page_size: int = 1 if _is_npu else allocator_page
+        allocated_after_free: int = min(
+            slot.kv.kv_allocated_len, ceil_align(prefix_len, bookkeeping_page_size)
+        )
         self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
-        slot.kv.kv_allocated_len = prefix_len
+        slot.kv.kv_allocated_len = allocated_after_free
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
-        req.kv.kv_allocated_len = prefix_len
+        req.kv.kv_allocated_len = allocated_after_free
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
 
@@ -542,8 +548,12 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
+        allocator_page: int = self.token_to_kv_pool_allocator.page_size
+        bookkeeping_page_size: int = 1 if _is_npu else allocator_page
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
-        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
+        req.kv.kv_allocated_len = min(
+            req.kv.kv_allocated_len, ceil_align(target, bookkeeping_page_size)
+        )
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
@@ -558,8 +568,9 @@ class StreamingSession(BasePrefixCache):
         if end <= target:
             return
         start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
+        allocator_page: int = self.token_to_kv_pool_allocator.page_size
+        if allocator_page > 1:
+            start = ceil_align(start, allocator_page)
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
             self.token_to_kv_pool_allocator.free(tail)
