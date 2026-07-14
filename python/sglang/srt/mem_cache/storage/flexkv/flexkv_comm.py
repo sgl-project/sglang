@@ -256,6 +256,25 @@ class FlexKVComm:
             blocking=False,
         )
 
+    def scatter_stage(self, data: Any) -> Any:
+        if self._cp_leader_ranks:
+            data = self._scatter_group(
+                data,
+                self._cp_leader_ranks,
+                self.is_cp_leader,
+                self._TAG_CP,
+                blocking=False,
+            )
+        if self._tp_group_ranks:
+            data = self._scatter_group(
+                data,
+                self._tp_group_ranks,
+                self.is_tp_leader,
+                self._TAG_TP,
+                blocking=False,
+            )
+        return data
+
     def all_reduce_min(self, value: int) -> int:
         """Hierarchical all_reduce(MIN) across TP, CP, PP.
 

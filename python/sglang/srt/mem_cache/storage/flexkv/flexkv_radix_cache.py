@@ -821,7 +821,18 @@ class FlexKVRadixCache(RadixCache):
                     kv_indices=kv_indices,
                 )
         except Exception:  # noqa: BLE001
-            self.dec_lock_ref(new_last_node)
+            if self.flexkv_connector.store_requires_owner_lock(req.rid):
+                with self._node_lock:
+                    existing_node = self._inflight_store_nodes.setdefault(
+                        req.rid,
+                        new_last_node,
+                    )
+                if existing_node is not new_last_node:
+                    self.flexkv_connector.poison_load_back(
+                        "FlexKV store source ownership changed after launch"
+                    )
+            else:
+                self.dec_lock_ref(new_last_node)
             raise
 
         if fkv_task_id < 0:
@@ -830,8 +841,21 @@ class FlexKVRadixCache(RadixCache):
             self.dec_lock_ref(new_last_node)
             return result
 
+        if not self.flexkv_connector.store_requires_owner_lock(req.rid):
+            self.dec_lock_ref(new_last_node)
+            reason = "FlexKV active store is missing source ownership"
+            self.flexkv_connector.poison_load_back(reason)
+            raise RuntimeError(reason)
+
         with self._node_lock:
-            self._inflight_store_nodes[req.rid] = new_last_node
+            existing_node = self._inflight_store_nodes.setdefault(
+                req.rid,
+                new_last_node,
+            )
+        if existing_node is not new_last_node:
+            reason = "FlexKV store source ownership changed for an active request"
+            self.flexkv_connector.poison_load_back(reason)
+            raise RuntimeError(reason)
 
         return result
 

@@ -275,6 +275,7 @@ class FlexKVConnector:
         # Stores
         self._inflight_stores: Dict[str, Tuple[int, ...]] = {}
         self._ambiguous_stores: Dict[str, str] = {}
+        self._store_owner_required: set[str] = set()
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_enabled = bool(
@@ -652,6 +653,9 @@ class FlexKVConnector:
     def coordinate_store_owner_release(self, *, local_success: bool) -> bool:
         return self._sync_ctx.all_reduce_min(int(local_success)) == 1
 
+    def store_requires_owner_lock(self, rid: str) -> bool:
+        return rid in self._store_owner_required
+
     def poison_load_back(self, reason: str) -> None:
         self._poison_reason = reason
 
@@ -787,6 +791,7 @@ class FlexKVConnector:
 
         slot_mapping_cpu: Optional[torch.Tensor] = None
         local_mapping_valid = True
+        local_mapping_manifest: Optional[List[int]] = None
         try:
             if aligned_kv_indices is None:
                 raise RuntimeError("FlexKV store indices are unavailable")
@@ -798,8 +803,7 @@ class FlexKVConnector:
             slot_mapping_cpu = self._to_cpu_int64(aligned_kv_indices[mask_tensor])
             if slot_mapping_cpu.numel() != int(unmatched_mask.sum()):
                 raise RuntimeError("FlexKV store slot mapping has an invalid length")
-            if self._sync_ctx.should_send_slot_mapping_to_remote:
-                self._send_slot_mapping_to_remote(task_id, slot_mapping_cpu)
+            local_mapping_manifest = slot_mapping_cpu.tolist()
         except Exception as exc:  # noqa: BLE001
             local_mapping_valid = False
             logger.warning(
@@ -808,76 +812,88 @@ class FlexKVConnector:
                 exc_info=True,
             )
 
+        stage_mapping_manifest = self._sync_ctx.scatter_stage(local_mapping_manifest)
+        if local_mapping_manifest != stage_mapping_manifest:
+            local_mapping_valid = False
+
         mapping_valid = self._sync_ctx.all_reduce_min(int(local_mapping_valid)) == 1
         if not mapping_valid:
             if not self._cancel_prelaunch_store(task_id=task_id):
                 self.poison_load_back("FlexKV store pre-launch cancellation failed")
             return -1
 
-        launch_outcome = {
-            "observation_task_ids": [],
-            "reason": None,
-        }
-        if self._sync_ctx.is_sync_leader:
-            try:
-                if self.kv_manager is None or slot_mapping_cpu is None:
-                    raise RuntimeError("FlexKV store launch is not prepared")
-                launch_outcome["observation_task_ids"] = self._normalize_task_ids(
-                    self.kv_manager.launch(
-                        task_ids=[task_id],
-                        slot_mappings=[slot_mapping_cpu],
-                        as_batch=False,
-                        layerwise_transfer=False,
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                launch_outcome["reason"] = str(exc)
-        if self._sync_ctx.needs_sync:
-            launch_outcome = self._sync_ctx.scatter(launch_outcome)
-
-        observation_task_ids: Tuple[int, ...] = ()
-        local_launch_valid = True
+        local_remote_mapping_valid = True
         try:
-            if not isinstance(launch_outcome, dict):
-                raise ValueError("FlexKV store launch outcome is invalid")
-            reason = launch_outcome.get("reason")
-            if reason is not None and not isinstance(reason, str):
-                raise ValueError("FlexKV store launch reason is invalid")
-            raw_observation_task_ids = launch_outcome.get("observation_task_ids")
-            if reason is None:
-                observation_task_ids = tuple(
-                    self._normalize_task_ids(raw_observation_task_ids)
-                )
-                active_task_ids = {
-                    task_id
-                    for task_ids in self._inflight_stores.values()
-                    for task_id in task_ids
-                }
-                if active_task_ids.intersection(observation_task_ids):
-                    raise ValueError("FlexKV reused an active store observation id")
-            else:
-                observation_task_ids = tuple(
-                    self._normalize_task_ids_allow_empty(raw_observation_task_ids)
-                )
-        except Exception:  # noqa: BLE001
-            local_launch_valid = False
+            if self._sync_ctx.should_send_slot_mapping_to_remote:
+                if slot_mapping_cpu is None:
+                    raise RuntimeError("FlexKV store slot mapping is unavailable")
+                self._send_slot_mapping_to_remote(task_id, slot_mapping_cpu)
+        except Exception as exc:  # noqa: BLE001
+            local_remote_mapping_valid = False
+            logger.warning(
+                "[FlexKV] store remote mapping failed: %s",
+                exc,
+                exc_info=True,
+            )
 
-        launch_valid = self._sync_ctx.all_reduce_min(int(local_launch_valid)) == 1
-        if launch_valid and launch_outcome.get("reason") is None:
-            self._inflight_stores[rid] = observation_task_ids
-            return observation_task_ids[0]
-
-        if not launch_valid:
-            observation_task_ids = ()
-        ambiguous_reason = (
-            str(launch_outcome.get("reason"))
-            if launch_valid
-            else "FlexKV store launch validation differs across ranks"
+        remote_mapping_valid = (
+            self._sync_ctx.all_reduce_min(int(local_remote_mapping_valid)) == 1
         )
-        self._inflight_stores[rid] = observation_task_ids
-        self._ambiguous_stores[rid] = ambiguous_reason
-        self.poison_load_back(ambiguous_reason)
-        return task_id
+        if not remote_mapping_valid:
+            if not self._cancel_prelaunch_store(task_id=task_id):
+                self.poison_load_back(
+                    "FlexKV store remote mapping cancellation failed"
+                )
+            return -1
+
+        local_owner_install_valid = True
+        try:
+            self._inflight_stores[rid] = ()
+            self._store_owner_required.add(rid)
+        except Exception as exc:  # noqa: BLE001
+            local_owner_install_valid = False
+            logger.warning(
+                "[FlexKV] store owner installation failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        owner_install_valid = (
+            self._sync_ctx.all_reduce_min(int(local_owner_install_valid)) == 1
+        )
+        if not owner_install_valid:
+            cancel_valid = self._cancel_prelaunch_store(task_id=task_id)
+            local_cleanup_valid = True
+            try:
+                self._inflight_stores.pop(rid, None)
+                self._store_owner_required.discard(rid)
+            except Exception as exc:  # noqa: BLE001
+                local_cleanup_valid = False
+                logger.warning(
+                    "[FlexKV] provisional store owner cleanup failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+            cleanup_valid = (
+                self._sync_ctx.all_reduce_min(int(local_cleanup_valid)) == 1
+            )
+            if not cancel_valid or not cleanup_valid:
+                self.poison_load_back(
+                    "FlexKV provisional store owner cleanup failed"
+                )
+            return -1
+
+        try:
+            return self._launch_store_after_owner_install(
+                rid=rid,
+                task_id=task_id,
+                slot_mapping_cpu=slot_mapping_cpu,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV post-attempt store launch failed: {exc}"
+            self._ambiguous_stores[rid] = reason
+            self.poison_load_back(reason)
+            raise
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
@@ -965,6 +981,7 @@ class FlexKVConnector:
 
         for rid in completed_rids:
             self._inflight_stores.pop(rid, None)
+            self._store_owner_required.discard(rid)
         return completed_rids
 
     # ------------------------------------------------------------------
@@ -1048,6 +1065,7 @@ class FlexKVConnector:
             and not self._ambiguous_stores
             and not self._launched_load_tids
             and not self._inflight_stores
+            and not self._store_owner_required
             and not has_active_store_nodes
             and not has_quarantined_load_slots
         )
@@ -1075,6 +1093,7 @@ class FlexKVConnector:
         self._launched_load_tids.clear()
         self._inflight_stores.clear()
         self._ambiguous_stores.clear()
+        self._store_owner_required.clear()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
 
@@ -1098,6 +1117,79 @@ class FlexKVConnector:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _launch_store_after_owner_install(
+        self,
+        *,
+        rid: str,
+        task_id: int,
+        slot_mapping_cpu: Optional[torch.Tensor],
+    ) -> int:
+        launch_outcome = {
+            "observation_task_ids": [],
+            "reason": None,
+        }
+        if self._sync_ctx.is_sync_leader:
+            try:
+                if self.kv_manager is None or slot_mapping_cpu is None:
+                    raise RuntimeError("FlexKV store launch is not prepared")
+                launch_outcome["observation_task_ids"] = self._normalize_task_ids(
+                    self.kv_manager.launch(
+                        task_ids=[task_id],
+                        slot_mappings=[slot_mapping_cpu],
+                        as_batch=False,
+                        layerwise_transfer=False,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                launch_outcome["reason"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            launch_outcome = self._sync_ctx.scatter(launch_outcome)
+
+        observation_task_ids: Tuple[int, ...] = ()
+        local_launch_valid = True
+        try:
+            if not isinstance(launch_outcome, dict):
+                raise ValueError("FlexKV store launch outcome is invalid")
+            reason = launch_outcome.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ValueError("FlexKV store launch reason is invalid")
+            raw_observation_task_ids = launch_outcome.get("observation_task_ids")
+            if reason is None:
+                observation_task_ids = tuple(
+                    self._normalize_task_ids(raw_observation_task_ids)
+                )
+                active_task_ids = {
+                    observation_task_id
+                    for active_rid, task_ids in self._inflight_stores.items()
+                    if active_rid != rid
+                    for observation_task_id in task_ids
+                }
+                if active_task_ids.intersection(observation_task_ids):
+                    raise ValueError("FlexKV reused an active store observation id")
+            else:
+                observation_task_ids = tuple(
+                    self._normalize_task_ids_allow_empty(raw_observation_task_ids)
+                )
+        except Exception:  # noqa: BLE001
+            local_launch_valid = False
+
+        launch_valid = self._sync_ctx.all_reduce_min(int(local_launch_valid)) == 1
+        if launch_valid and launch_outcome.get("reason") is None:
+            self._inflight_stores[rid] = observation_task_ids
+            return observation_task_ids[0]
+
+        if not launch_valid:
+            observation_task_ids = ()
+        ambiguous_reason = (
+            str(launch_outcome.get("reason"))
+            if launch_valid
+            else "FlexKV store launch validation differs across ranks"
+        )
+        self._inflight_stores[rid] = observation_task_ids
+        self._ambiguous_stores[rid] = ambiguous_reason
+        self.poison_load_back(ambiguous_reason)
+        return task_id
 
     def _cancel_prelaunch_store(self, *, task_id: int) -> bool:
         outcome = {"success": False, "reason": None}
