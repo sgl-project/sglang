@@ -169,7 +169,6 @@ QUANTIZATION_CHOICES = [
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
-    "qoq",
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
