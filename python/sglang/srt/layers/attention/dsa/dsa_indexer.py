@@ -546,13 +546,30 @@ class Indexer(MultiPlatformOp):
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
-        if (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            and forward_batch.seq_lens_cpu is not None
-        ):
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
-            return max_kv_len <= self.index_topk
-        return False
+        # When kv_len <= index_topk the top-k selects ALL valid positions, so the
+        # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
+        # topk_transform(dummy_logits) already yields the correct "select-all"
+        # (physical page-slot) indices. Skipping the logits path is safe here.
+        #
+        # Prefill/extend: original fast path.
+        # Decode: NEW. Only enabled in eager (Milestone 1). Under a captured decode
+        # cuda graph the chosen branch is frozen at capture time and would replay
+        # incorrectly for kv_len > index_topk, so decode skip is gated off during
+        # capture and handled separately by graph-variant / eager-fallback (M2).
+        fb = forward_batch
+        is_prefill = fb.forward_mode.is_extend_without_speculative()
+        is_decode = fb.forward_mode.is_decode_or_idle() and not get_is_capture_mode()
+        if not (is_prefill or is_decode):
+            return False
+        # seq_lens_cpu can be None on the DSA decode path (needs_cpu_seq_lens=False);
+        # fall back to a GPU reduction (host sync, acceptable in eager).
+        if fb.seq_lens_cpu is not None:
+            max_kv_len = int(fb.seq_lens_cpu.max().item())
+        elif fb.seq_lens is not None:
+            max_kv_len = int(fb.seq_lens.max().item())
+        else:
+            return False
+        return max_kv_len <= self.index_topk
 
     def _get_q_k_bf16(
         self,
@@ -1325,7 +1342,10 @@ class Indexer(MultiPlatformOp):
         #   - topk_result: pre-allocated padded buffer to fill in place (a downstream
         #     captured graph reads it at a fixed address). None => return a fresh,
         #     naturally-sized tensor.
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_decode_or_idle()
+        )
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops.
