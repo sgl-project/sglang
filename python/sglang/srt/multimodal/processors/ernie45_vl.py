@@ -303,7 +303,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
-            and not self.server_args.disable_fast_image_processor
+            and not self.disable_fast_image_processor
         ):
             if not _is_npu:
                 kwargs["device"] = "cuda"
@@ -349,7 +349,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                     if result["pixel_values_videos"].numel() == 0:
                         del result["pixel_values_videos"]
 
-        if not self.server_args.keep_mm_feature_on_device:
+        if not self.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if SGL_USE_CUDA_IPC:

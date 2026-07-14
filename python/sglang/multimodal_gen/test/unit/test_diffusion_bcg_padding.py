@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    _attn_mask_meta_local_pad,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -108,6 +111,11 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             )
         )
         self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
+    def test_qwen_dynamic_varlen_meta_is_not_tail_pad_meta(self):
+        self.assertEqual(_attn_mask_meta_local_pad(None), 0)
+        self.assertEqual(_attn_mask_meta_local_pad({"local_pad": 7}), 7)
+        self.assertEqual(_attn_mask_meta_local_pad(DynamicVarlenMaskMeta()), 0)
 
     def test_qwen_default_bucket_preserves_mask(self):
         def kwargs(valid_len: int):
@@ -244,9 +252,34 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
         )
         self.assertIn(
+            "fal/ideogram-v4-fast",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "fal/ideogram-v4-instant",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
             "Ideogram4PipelineConfig",
             BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
+
+    def test_image_generation_models_are_registered_as_bcg_supported(self):
+        for model_id in (
+            "qwen/qwen-image",
+            "qwen/qwen-image-2512",
+            "tongyi-mai/z-image",
+            "tongyi-mai/z-image-turbo",
+            "zai-org/glm-image",
+        ):
+            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+        for config_name in (
+            "GlmImagePipelineConfig",
+            "QwenImagePipelineConfig",
+            "ZImagePipelineConfig",
+        ):
+            self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()

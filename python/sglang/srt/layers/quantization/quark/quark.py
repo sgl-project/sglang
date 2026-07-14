@@ -445,10 +445,12 @@ class QuarkConfig(QuantizationConfig):
 
             supported = capability >= min_capability
             if error and not supported:
+                # Pass a single joined message; RuntimeError stringifies
+                # multiple positional args as a tuple repr.
                 raise RuntimeError(
-                    "Quantization scheme is not supported for ",
-                    f"the current GPU. Min capability: {min_capability}. ",
-                    f"Current capability: {capability}.",
+                    "Quantization scheme is not supported for "
+                    f"the current GPU. Min capability: {min_capability}. "
+                    f"Current capability: {capability}."
                 )
             return supported
         else:
@@ -580,7 +582,7 @@ class QuarkConfig(QuantizationConfig):
             ):
                 raise ValueError(
                     f"Found a different quantization configuration for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
             return shard_configs[0]

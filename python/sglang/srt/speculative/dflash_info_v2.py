@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils.common import is_pin_memory_available
@@ -58,6 +58,8 @@ class DFlashDraftInputV2(SpecInput):
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
+
+    verify_token_budget: Optional[int] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -138,7 +140,7 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_global_server_args().speculative_num_draft_tokens)
+        block_size = int(get_server_args().speculative_num_draft_tokens)
         if block_size <= 0:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."

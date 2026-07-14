@@ -29,7 +29,6 @@ from sglang.srt.lora.mem_pool import (
     LoRAMemoryPool,
     _get_moe_ep_context,
     _get_moe_tp_context,
-    _moe_runner_keeps_global_expert_ids,
 )
 
 
@@ -133,16 +132,6 @@ class TestNumExpertHelpers(unittest.TestCase):
 
 class TestGlobalToLocalExpertId(unittest.TestCase):
     """`_global_to_local_expert_id` — the per-rank filter + remap."""
-
-    def test_passthrough_without_ep(self):
-        pool = _make_pool(
-            num_experts_global=8,
-            moe_ep_size=1,
-            moe_ep_rank=0,
-            moe_use_local_expert_ids=False,
-        )
-        for gid in range(8):
-            self.assertEqual(pool._global_to_local_expert_id(gid), gid)
 
     def test_rank0_of_ep4_owns_first_quarter(self):
         pool = _make_pool(
@@ -367,10 +356,6 @@ class TestModuleLevelHelpers(unittest.TestCase):
         tp_size, tp_rank = _get_moe_tp_context()
         self.assertEqual(tp_size, 1)
         self.assertEqual(tp_rank, 0)
-
-    def test_keeps_global_expert_ids_defaults_to_false(self):
-        # Without a specific flashinfer backend selected, default is False.
-        self.assertFalse(_moe_runner_keeps_global_expert_ids())
 
 
 class TestPoolInitPicksUpEpContext(unittest.TestCase):
