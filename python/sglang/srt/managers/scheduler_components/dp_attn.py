@@ -15,7 +15,12 @@ from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
@@ -185,11 +190,14 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
+    # min()-reduces this across DP ranks, so a prefill batch with idle ranks
+    # still resolves to True (idle ranks become a padded dummy extend).
     can_run_breakable_cuda_graph = (
-        local_batch is not None
-        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-        and not disable_cuda_graph
-    )
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+    ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:

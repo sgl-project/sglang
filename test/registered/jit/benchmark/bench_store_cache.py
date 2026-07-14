@@ -7,11 +7,12 @@ from sglang.jit_kernel.benchmark.utils import (
     create_random,
 )
 from sglang.jit_kernel.kvcache import store_cache
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=9, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=9, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 @torch.compile()

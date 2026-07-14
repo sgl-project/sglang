@@ -69,8 +69,9 @@ from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -80,6 +81,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -300,16 +302,40 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+        compute_dp_attention_world_info(
+            server_args.enable_dp_attention,
+            tp_rank,
+            server_args.tp_size,
+            server_args.dp_size,
+            server_args.attn_cp_size,
+        )
+    )
+    ps = ParallelState(
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        pp_rank=0,
+        pp_size=1,
+        dp_rank=None,
+        dp_size=server_args.dp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=0,
+        attn_cp_size=server_args.attn_cp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_dp_size=attn_dp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+        moe_dp_rank=None,
+        moe_dp_size=server_args.moe_dp_size,
+        dcp_size=server_args.dcp_size,
+        gpu_id=gpu_id,
+    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=server_args.ep_size,
-        pp_rank=0,
-        pp_size=1,
+        ps=ps,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
@@ -503,8 +529,8 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=get_attention_tp_size(),
-            attn_cp_size=model_runner.attn_cp_size,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
