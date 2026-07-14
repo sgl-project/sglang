@@ -240,8 +240,10 @@ The sglang Radix tree and GPU slot allocator use the allocator page size as
 their ownership unit. FlexKV may use a smaller storage page, but the storage
 page must divide the allocator page. Prefix lookup truncates the candidate key
 to a whole allocator page and accepts only an exact, contiguous prefix of full
-allocator pages. Store publication similarly stops at the last committed
-allocator-page boundary. Consequently, FlexKV never publishes or releases a
+allocator pages. STORE uses the base cache's completed ownership handoff as its
+only length, then rematches that prefix and reads the canonical Radix slot
+mapping while holding the same source node. It never reads duplicate slots from
+the completed request row. Consequently, FlexKV never publishes or releases a
 partial allocator page through this integration.
 
 Before a load launches, all participating ranks agree on the held lookup, the

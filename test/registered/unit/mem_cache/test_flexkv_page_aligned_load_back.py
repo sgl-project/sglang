@@ -107,6 +107,7 @@ class _FakeSyncContext:
         self.should_send_slot_mapping_to_remote = False
         self.is_pp_receiver = False
         self.minimum_inputs: list[int] = []
+        self.scatter_manifest: Any = None
         self.stage_manifest: Any = None
 
     def all_reduce_min(self, value: int) -> int:
@@ -114,7 +115,7 @@ class _FakeSyncContext:
         return value
 
     def scatter(self, value: Any) -> Any:
-        return value
+        return value if self.scatter_manifest is None else self.scatter_manifest
 
     def scatter_stage(self, value: Any) -> Any:
         return value if self.stage_manifest is None else self.stage_manifest
@@ -147,6 +148,22 @@ def _make_connector(
 
 def _response(task_id: int, status: _ResponseStatus) -> SimpleNamespace:
     return SimpleNamespace(task_id=task_id, status=status)
+
+
+def _make_store_cache(radix_module: types.ModuleType) -> tuple[Any, MagicMock]:
+    cache = radix_module.FlexKVRadixCache.__new__(radix_module.FlexKVRadixCache)
+    cache.device = torch.device("cpu")
+    cache._allocator_page_size = 2
+    cache._load_markers = {}
+    cache._node_lock = threading.Lock()
+    cache._inflight_store_nodes = {}
+    cache.store_stream = object()
+    cache.inc_lock_ref = MagicMock()
+    cache.dec_lock_ref = MagicMock()
+    cache.flexkv_connector = MagicMock()
+    cache.flexkv_connector.store_kv.return_value = -1
+    cache.flexkv_connector.store_requires_owner_lock.return_value = False
+    return cache, cache.flexkv_connector
 
 
 class TestFlexKVPageAlignedLoadBack(unittest.TestCase):
@@ -252,6 +269,163 @@ class TestFlexKVPageAlignedLoadBack(unittest.TestCase):
             self.assertEqual(result, -1)
             manager.cancel.assert_called_once_with([33])
             manager.launch.assert_not_called()
+
+    def test_asymmetric_store_preparation_failure_reaches_fixed_consensus(
+        self,
+    ) -> None:
+        """A rank-local source failure joins the shared preflight rejection."""
+        with _import_flexkv_modules() as (module, _):
+            connector, sync_context, manager = _make_connector(module)
+            sync_context.needs_sync = True
+            sync_context.scatter_manifest = {
+                "rid": "request",
+                "token_ids": [0, 1],
+                "reason": None,
+            }
+
+            result = connector.store_kv(
+                rid="request",
+                token_ids=[],
+                kv_indices=torch.empty((0,), dtype=torch.int64),
+                local_preparation_error="canonical rematch failed",
+            )
+
+            self.assertEqual(result, -1)
+            self.assertEqual(sync_context.minimum_inputs, [0])
+            manager.put_match.assert_not_called()
+            manager.launch.assert_not_called()
+
+    def test_cache_finished_store_uses_canonical_mapping_after_duplicate_handoff(
+        self,
+    ) -> None:
+        """STORE reads the canonical node after base releases duplicate slots."""
+        with _import_flexkv_modules() as (_, radix_module):
+            cache, connector = _make_store_cache(radix_module)
+            cache.req_to_token_pool = SimpleNamespace()
+            node = object()
+            canonical_indices = torch.tensor([200, 201, 202, 203])
+            req = SimpleNamespace(
+                rid="request",
+                origin_input_ids=[0, 1, 2],
+                output_ids=[3, 4, 5],
+                extra_key=None,
+                kv_committed_len=6,
+            )
+
+            with (
+                patch.object(
+                    radix_module.RadixCache,
+                    "cache_finished_req",
+                    return_value=radix_module.CacheFinishedReqResult(
+                        unhandled_kv_start=4
+                    ),
+                ),
+                patch.object(
+                    radix_module.RadixCache,
+                    "match_prefix",
+                    return_value=SimpleNamespace(
+                        device_indices=canonical_indices,
+                        last_device_node=node,
+                    ),
+                ),
+                patch.object(torch.cuda, "stream", return_value=MagicMock()),
+            ):
+                result = cache.cache_finished_req(
+                    req,
+                    is_insert=True,
+                    kv_len_to_handle=6,
+                )
+
+            self.assertEqual(result.unhandled_kv_start, 4)
+            connector.store_kv.assert_called_once()
+            store_kwargs = connector.store_kv.call_args.kwargs
+            self.assertEqual(store_kwargs["token_ids"], [0, 1, 2, 3])
+            self.assertTrue(torch.equal(store_kwargs["kv_indices"], canonical_indices))
+            self.assertIsNone(store_kwargs["local_preparation_error"])
+            cache.inc_lock_ref.assert_called_once_with(node)
+            cache.dec_lock_ref.assert_called_once_with(node)
+
+    def test_cache_finished_store_length_comes_only_from_base_handoff(self) -> None:
+        """A shorter base handoff overrides the request committed-length field."""
+        with _import_flexkv_modules() as (_, radix_module):
+            cache, connector = _make_store_cache(radix_module)
+            node = object()
+            canonical_indices = torch.tensor([300, 301])
+            req = SimpleNamespace(
+                rid="request",
+                origin_input_ids=[0, 1, 2],
+                output_ids=[3, 4, 5],
+                extra_key=None,
+                kv_committed_len=6,
+            )
+
+            with (
+                patch.object(
+                    radix_module.RadixCache,
+                    "cache_finished_req",
+                    return_value=radix_module.CacheFinishedReqResult(
+                        unhandled_kv_start=2
+                    ),
+                ),
+                patch.object(
+                    radix_module.RadixCache,
+                    "match_prefix",
+                    return_value=SimpleNamespace(
+                        device_indices=canonical_indices,
+                        last_device_node=node,
+                    ),
+                ),
+                patch.object(torch.cuda, "stream", return_value=MagicMock()),
+            ):
+                cache.cache_finished_req(
+                    req,
+                    is_insert=True,
+                    kv_len_to_handle=6,
+                )
+
+            store_kwargs = connector.store_kv.call_args.kwargs
+            self.assertEqual(store_kwargs["token_ids"], [0, 1])
+            self.assertTrue(torch.equal(store_kwargs["kv_indices"], canonical_indices))
+
+    def test_cache_finished_rematch_failure_enters_connector_preflight(self) -> None:
+        """A local canonical rematch error is passed to connector consensus."""
+        with _import_flexkv_modules() as (_, radix_module):
+            cache, connector = _make_store_cache(radix_module)
+            req = SimpleNamespace(
+                rid="request",
+                origin_input_ids=[0, 1],
+                output_ids=[],
+                extra_key=None,
+            )
+
+            with (
+                patch.object(
+                    radix_module.RadixCache,
+                    "cache_finished_req",
+                    return_value=radix_module.CacheFinishedReqResult(
+                        unhandled_kv_start=2
+                    ),
+                ),
+                patch.object(
+                    radix_module.RadixCache,
+                    "match_prefix",
+                    side_effect=RuntimeError("rematch failed"),
+                ),
+                patch.object(torch.cuda, "stream", return_value=MagicMock()),
+            ):
+                result = cache.cache_finished_req(
+                    req,
+                    is_insert=True,
+                    kv_len_to_handle=2,
+                )
+
+            self.assertEqual(result.unhandled_kv_start, 2)
+            store_kwargs = connector.store_kv.call_args.kwargs
+            self.assertEqual(store_kwargs["token_ids"], [0, 1])
+            self.assertEqual(store_kwargs["kv_indices"].numel(), 0)
+            self.assertIn("rematch failed", store_kwargs["local_preparation_error"])
+            cache.inc_lock_ref.assert_not_called()
+            cache.dec_lock_ref.assert_not_called()
 
     def test_postattempt_store_failure_retains_owner_and_blocks_reset(self) -> None:
         """An attempted store launch poisons ownership instead of clearing it."""

@@ -683,6 +683,8 @@ class FlexKVConnector:
         rid: str,
         token_ids: List[int],
         kv_indices: torch.Tensor,
+        *,
+        local_preparation_error: Optional[str] = None,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -696,7 +698,7 @@ class FlexKVConnector:
         nothing needed to be written.
         """
         self.ensure_load_back_safe()
-        local_reason: Optional[str] = None
+        local_reason = local_preparation_error
         token_ids_np = np.empty((0,), dtype=np.int64)
         aligned_kv_indices: Optional[torch.Tensor] = None
         try:
@@ -717,7 +719,8 @@ class FlexKVConnector:
             token_ids_np = token_ids_np[:aligned_len]
             aligned_kv_indices = kv_indices[:aligned_len]
         except Exception as exc:  # noqa: BLE001
-            local_reason = str(exc)
+            if local_reason is None:
+                local_reason = str(exc)
 
         local_manifest = {
             "rid": rid,

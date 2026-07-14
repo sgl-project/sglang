@@ -780,48 +780,57 @@ class FlexKVRadixCache(RadixCache):
             self._load_markers.pop(req.rid, None)
             return result
 
-        # Compute the committed prefix mirroring LMCRadixCache's logic.
-        from sglang.srt.runtime_context import get_server_args
-
-        global_server_args = get_server_args()
-        topk = global_server_args.speculative_eagle_topk
-        enable_kv_committed_len = topk is None or topk == 1
-        if enable_kv_committed_len:
-            kv_committed_len = req.kv_committed_len
-        else:
-            kv_committed_len = len(req.origin_input_ids) + max(
-                len(req.output_ids) - 1, 0
+        store_len = -1
+        token_ids: list[int] = []
+        kv_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        new_last_node: Optional[TreeNode] = None
+        local_preparation_error: Optional[str] = None
+        try:
+            store_len = result.unhandled_kv_start
+            all_token_ids = req.origin_input_ids + req.output_ids
+            if (
+                isinstance(store_len, bool)
+                or not isinstance(store_len, int)
+                or store_len < 0
+                or store_len > kv_len_to_handle
+                or store_len > len(all_token_ids)
+                or store_len % self._allocator_page_size != 0
+            ):
+                raise ValueError("FlexKV store ownership boundary is invalid")
+            token_ids = all_token_ids[:store_len]
+            if store_len > 0:
+                match_result = super().match_prefix(
+                    MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+                )
+                kv_indices = match_result.device_indices
+                new_last_node = match_result.last_device_node
+                if (
+                    kv_indices.ndim != 1
+                    or kv_indices.numel() != store_len
+                    or new_last_node is None
+                ):
+                    raise ValueError("FlexKV canonical store mapping is invalid")
+                self.inc_lock_ref(new_last_node)
+        except Exception as exc:  # noqa: BLE001
+            new_last_node = None
+            local_preparation_error = str(exc)
+            logger.warning(
+                "FlexKV store preparation failed: %s",
+                exc,
+                exc_info=True,
             )
-        kv_committed_len = (
-            kv_committed_len // self._allocator_page_size * self._allocator_page_size
-        )
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        if not token_ids:
-            return result
-        self.flexkv_connector.ensure_load_back_safe()
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-
-        # Anchor on the new last_device_node so FlexKV's lock matches
-        # the node we'll later unlock when the store completes.
-        match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
-        )
-        new_last_node = match_result.last_device_node
-        if new_last_node is None:
-            return result
-
-        self.inc_lock_ref(new_last_node)
         try:
             with torch.cuda.stream(self.store_stream):
                 fkv_task_id = self.flexkv_connector.store_kv(
                     rid=req.rid,
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
+                    local_preparation_error=local_preparation_error,
                 )
         except Exception:  # noqa: BLE001
+            if new_last_node is None:
+                raise
             if self.flexkv_connector.store_requires_owner_lock(req.rid):
                 with self._node_lock:
                     existing_node = self._inflight_store_nodes.setdefault(
@@ -837,10 +846,14 @@ class FlexKVRadixCache(RadixCache):
             raise
 
         if fkv_task_id < 0:
-            # Nothing to write back (either everything already in
-            # FlexKV, or put_match failed / returned None).
-            self.dec_lock_ref(new_last_node)
+            if new_last_node is not None:
+                self.dec_lock_ref(new_last_node)
             return result
+
+        if new_last_node is None:
+            reason = "FlexKV active store has no canonical source owner"
+            self.flexkv_connector.poison_load_back(reason)
+            raise RuntimeError(reason)
 
         if not self.flexkv_connector.store_requires_owner_lock(req.rid):
             self.dec_lock_ref(new_last_node)
