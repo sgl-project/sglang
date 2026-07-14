@@ -87,6 +87,7 @@ class _DummyPublisherThread:
 
 def _fake_server_args(**fields):
     """server_args stand-in: carries fields and the override() entry point."""
+    fields.setdefault("decode_log_interval", 40)
     ns = types.SimpleNamespace(**fields)
 
     def _override(source, **updates):

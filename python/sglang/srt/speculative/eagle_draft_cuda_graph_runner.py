@@ -145,9 +145,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        self.num_tokens_per_bs = self.topk
+        self.num_tokens_per_req = self.topk
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.num_tokens_per_req
 
         # Attention backend init
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
@@ -290,7 +290,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
@@ -321,7 +321,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
-        num_tokens = num_seqs * self.num_tokens_per_bs
+        num_tokens = num_seqs * self.num_tokens_per_req
 
         # Graph inputs
         req_pool_indices = buffers.req_pool_indices[:num_seqs]
@@ -393,6 +393,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
+            is_any_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
             need_min_p_sampling=False,
@@ -441,11 +442,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
@@ -489,13 +492,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         buffers = self.buffers
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        raw_num_token = raw_bs * self.num_tokens_per_req
 
         # Pad to nearest captured shape
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens // self.num_tokens_per_bs
+                max_num_tokens // self.num_tokens_per_req
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
@@ -522,7 +525,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
 
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = bs * self.num_tokens_per_req
 
         maybe_detect_nan(
             forward_batch.spec_info.topk_p,
@@ -597,8 +600,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_req)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(
+                bs * self.num_tokens_per_req
+            )
 
         # Save the raw seq_lens_sum; it is restored after replay. While the graph
         # runs it must reflect the padded fake rows (set below), since draft decode
@@ -644,6 +649,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+        if self.buffers.dsa_seed_topk is not None:
+            forward_batch.spec_info.dsa_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

@@ -1,10 +1,11 @@
 import contextlib
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -22,7 +23,6 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -81,6 +82,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_sample,
     generate_token_bitmask,
+    get_plan_stream,
     load_token_map,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
@@ -90,7 +92,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens_func
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -120,17 +121,6 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
-
-
-def _get_plan_stream(
-    device: str,
-) -> Tuple[any, contextlib.AbstractContextManager]:
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
-        return plan_stream, plan_stream_ctx
-    else:
-        return None, contextlib.nullcontext()
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -175,7 +165,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
+            ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             ctx = empty_context()
         with (
@@ -204,7 +194,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     def alloc_memory_pool(
         self,
@@ -383,6 +373,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
         # Initialize decode attention backend
@@ -424,7 +415,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             log_info_on_rank0(
                 logger,
                 f"Capture draft decode CUDA graph begin. backend={decode_backend}, "
-                f"num_tokens_per_bs={self.topk}, bs={capture_bs}, "
+                f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
@@ -471,6 +462,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(DeepseekSparseAttnBackend)
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4AttnBackend,
+            )
+
+            graph_supported_backend_types.append(DeepseekV4AttnBackend)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
@@ -481,18 +477,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ) and graph_supported_backend
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or _is_xpu
-            or supports_cuda_draft_extend_graph
-            or supports_hip_aiter_draft_extend_graph
+        if (
+            self.draft_extend_attn_backend
+            and not envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+            and (
+                _is_npu
+                or _is_xpu
+                or supports_cuda_draft_extend_graph
+                or supports_hip_aiter_draft_extend_graph
+            )
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
                 f"Capture draft extend CUDA graph begin. backend={decode_backend}, "
-                f"num_tokens_per_bs={self.speculative_num_draft_tokens}, "
+                f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
@@ -520,6 +520,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            can_cuda_graph
+            and not forward_batch.forward_mode.is_idle()
+            and self.seed_dsa_topk_from_draft_extend
+            and draft_input.dsa_topk_indices is None
+        ):
+            can_cuda_graph = False
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -1098,7 +1105,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
     def war_fastpath_runner(self):
@@ -1117,23 +1124,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self._draft_worker.draft_runner.attn_backend,
         )
 
-    def alloc_memory_pool(
-        self,
-        memory_pool_config=None,
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
-    ):
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
-        )
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-
-    def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
-
     def init_cuda_graphs(self):
-        self._draft_worker.init_cuda_graphs()
+        super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1162,18 +1154,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else self.server_args.cuda_graph_bs_decode
                     ),
                 )
-
-    @property
-    def target_worker(self):
-        return self._target_worker
-
-    @property
-    def draft_worker(self):
-        return self._draft_worker
-
-    def clear_cache_pool(self):
-        # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
-        pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
