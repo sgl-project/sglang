@@ -4,6 +4,7 @@ import pytest
 import torch
 from utils import precision
 
+from sglang.srt.utils import is_host_cpu_arm64
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
@@ -85,6 +86,9 @@ def fix_query_key_value_ordering_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
+@pytest.mark.skipif(
+    is_host_cpu_arm64(), reason="fused_input_proj_cpu is an x86 AMX kernel"
+)
 def test_fused_input_proj():
     batch = 7
     hidden_size = 256
