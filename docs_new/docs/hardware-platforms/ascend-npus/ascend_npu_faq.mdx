@@ -201,7 +201,7 @@ First, use the `npu-smi info` command to check the NPU memory usage.
 
 If the NPUs are occupied by other processes, use `--base-gpu-id` to specify the starting device index.
 
-If the NPUs are not occupied, you can use `--tp` to deploy across multiple devices, or reduce the KV cache memory usage by decreasing the `--mem-fraction-static` value. For detailed tuning guidance, see [Hyperparameter Tuning](/docs/advanced_features/hyperparameter_tuning).
+If the NPUs are not occupied, you can use `--tp` to deploy across multiple devices, or reduce the KV cache memory usage by increasing the `--mem-fraction-static` value. For detailed tuning guidance, see [Hyperparameter Tuning](/docs/advanced_features/hyperparameter_tuning).
 
 ## 5. How to update sgl-kernel-npu
 

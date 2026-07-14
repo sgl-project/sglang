@@ -30,8 +30,8 @@ class MooncakeEmbeddingStore(MooncakeBaseStore):
 
         logger.info("Mooncake Embedding Store initialized successfully.")
 
-    def get_key(self, image_hash: str) -> str:
-        return f"emb_{image_hash}"
+    def get_key(self, mm_hash: str) -> str:
+        return f"emb_{mm_hash}"
 
     def batch_get(
         self, hashes: List[str], ptrs: List[int], sizes: List[int]
@@ -66,3 +66,45 @@ class MooncakeEmbeddingStore(MooncakeBaseStore):
         keys = [self.get_key(h) for h in hashes]
         results = self.store.batch_is_exist(keys)
         return [res == 1 for res in results]
+
+    def batch_get_into_multi_buffers(
+        self,
+        hashes: List[str],
+        ptrs: List[List[int]],
+        sizes: List[List[int]],
+    ) -> List[bool]:
+        keys = [self.get_key(h) for h in hashes]
+        results = self.store.batch_get_into_multi_buffers(keys, ptrs, sizes)
+        return [res > 0 for res in results]
+
+    def batch_put_from_multi_buffers(
+        self,
+        hashes: List[str],
+        ptrs: List[List[int]],
+        sizes: List[List[int]],
+    ) -> List[bool]:
+        keys = [self.get_key(h) for h in hashes]
+
+        # Skip keys that already exist in Mooncake
+        exists = self.store.batch_is_exist(keys)
+        put_keys = []
+        put_ptrs = []
+        put_sizes = []
+        put_indices = []
+        success_map = [True] * len(hashes)
+
+        for i, status in enumerate(exists):
+            if status != 1:
+                put_keys.append(keys[i])
+                put_ptrs.append(ptrs[i])
+                put_sizes.append(sizes[i])
+                put_indices.append(i)
+
+        if not put_keys:
+            return success_map
+
+        results = self.store.batch_put_from_multi_buffers(put_keys, put_ptrs, put_sizes)
+        for i, res in enumerate(results):
+            success_map[put_indices[i]] = res == 0
+
+        return success_map

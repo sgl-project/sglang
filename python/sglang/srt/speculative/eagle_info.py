@@ -4,11 +4,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -59,19 +59,21 @@ class EagleVerifyInput(SpecInput):
         return self.draft_token_num, self.draft_token_num
 
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(
+        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
+    ):
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -150,8 +152,8 @@ class EagleDraftInput(SpecInput):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, vocab) - single-step draft proposal q from draft-extend;
-    # only set under rejection sampling.
+    # Draft proposal q from draft-extend, only set under rejection sampling:
+    # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
     draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
@@ -161,7 +163,7 @@ class EagleDraftInput(SpecInput):
 
     # Survives across draft steps: spec_info is shared by reference across the
     # per-step forwards (each runs on a copied ForwardBatch, dropping writebacks).
-    mtp_topk_indices: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
     # chain); the worker copies it here post-extend for next iter's draft.
@@ -176,6 +178,7 @@ class EagleDraftInput(SpecInput):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -204,7 +207,7 @@ class EagleDraftInput(SpecInput):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
-                if get_global_server_args().speculative_use_rejection_sampling
+                if get_server_args().speculative_use_rejection_sampling
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,
@@ -233,6 +236,8 @@ class EagleDraftInput(SpecInput):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
+            if self.dsa_topk_indices is not None:
+                self.dsa_topk_indices = self.dsa_topk_indices[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -242,12 +247,18 @@ class EagleDraftInput(SpecInput):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.dsa_topk_indices is not None:
+                self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
+            )
+            self.future_dsa_topk_indices_available = (
+                self.future_dsa_topk_indices_available
+                and spec_info.future_dsa_topk_indices_available
             )
             return
 
@@ -260,6 +271,7 @@ class EagleDraftInput(SpecInput):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
+            self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -272,6 +284,12 @@ class EagleDraftInput(SpecInput):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
+            self.dsa_topk_indices = torch.cat(
+                [self.dsa_topk_indices, spec_info.dsa_topk_indices]
+            )
+        else:
+            self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:
             self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
@@ -316,6 +334,9 @@ class EagleDraftExtendInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
+
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_select: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
