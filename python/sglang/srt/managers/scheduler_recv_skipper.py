@@ -1,8 +1,13 @@
-from typing import List, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class SchedulerRecvSkipper:
@@ -29,8 +34,7 @@ class SchedulerRecvSkipper:
         return ForwardMode.DECODE
 
     def __init__(self, server_args: ServerArgs):
-        # Safe under DP-attention: ``handle`` is fed a mode derived from the
-        # gathered per-rank modes, so every rank makes the same recv decision.
+        self._use_synced_mode = server_args.enable_dp_attention
         self._counter = 0
         self._threshold = server_args.scheduler_recv_interval
         # All can be tuned if needed
@@ -41,11 +45,21 @@ class SchedulerRecvSkipper:
             None: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE.get(),
         }
 
-    def handle(self, last_forward_mode: ForwardMode):
+    def _pick_mode(self, last_batch: Optional[ScheduleBatch]) -> Optional[ForwardMode]:
+        # The recv decision must be identical on every rank in the request
+        # broadcast. Local modes differ across DP ranks (IDLE vs DECODE), so
+        # use the rank-consistent mode derived from the MLP sync all-gather.
+        if last_batch is None:
+            return None
+        if self._use_synced_mode:
+            return last_batch.recv_skipper_forward_mode
+        return last_batch.forward_mode
+
+    def handle(self, last_batch: Optional[ScheduleBatch]) -> bool:
         should_recv = False
 
         last_weight = self._weight_of_forward_mode.get(
-            last_forward_mode, self._default_weight
+            self._pick_mode(last_batch), self._default_weight
         )
         self._counter += last_weight
 
