@@ -604,9 +604,7 @@ class FlexKVConnector:
         self, local_classification: int
     ) -> Optional[int]:
         minimum_classification = self._sync_ctx.all_reduce_min(local_classification)
-        maximum_classification = -self._sync_ctx.all_reduce_min(
-            -local_classification
-        )
+        maximum_classification = -self._sync_ctx.all_reduce_min(-local_classification)
         if minimum_classification != maximum_classification:
             return None
         return minimum_classification

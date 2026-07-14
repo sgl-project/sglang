@@ -527,9 +527,7 @@ class FlexKVRadixCache(RadixCache):
             if current_length == len(target_key):
                 current_loaded_slots = current_match.device_indices[value_numel:]
                 if int(current_loaded_slots.numel()) == loaded_length:
-                    local_classification = (
-                        _LoadPublicationClassification.EXACT_FULL
-                    )
+                    local_classification = _LoadPublicationClassification.EXACT_FULL
             elif current_length == value_numel:
                 child_key = target_key[value_numel:].child_key(self.page_size)
                 if current_parent.children.get(child_key) is None:
@@ -573,10 +571,8 @@ class FlexKVRadixCache(RadixCache):
                 loaded_slots,
                 can_release=True,
             )
-            cleanup_consistent = (
-                self.flexkv_connector.coordinate_load_publication_step(
-                    local_success=cleanup_success
-                )
+            cleanup_consistent = self.flexkv_connector.coordinate_load_publication_step(
+                local_success=cleanup_success
             )
             if not cleanup_consistent:
                 self.flexkv_connector.poison_load_back(
@@ -625,10 +621,8 @@ class FlexKVRadixCache(RadixCache):
                 loaded_slots,
                 can_release=rollback_success,
             )
-            cleanup_consistent = (
-                self.flexkv_connector.coordinate_load_publication_step(
-                    local_success=cleanup_success
-                )
+            cleanup_consistent = self.flexkv_connector.coordinate_load_publication_step(
+                local_success=cleanup_success
             )
             if not rollback_consistent or not cleanup_consistent:
                 self.flexkv_connector.poison_load_back(
@@ -676,7 +670,9 @@ class FlexKVRadixCache(RadixCache):
     ) -> bool:
         try:
             if publication.parent.children.get(publication.child_key) is not None:
-                raise RuntimeError("FlexKV load publication collided with a Radix child")
+                raise RuntimeError(
+                    "FlexKV load publication collided with a Radix child"
+                )
             publication.parent.children[publication.child_key] = publication.new_node
             publication.child_attached = True
             self.evictable_size_ += len(publication.new_node.key)
