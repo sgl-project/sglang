@@ -707,6 +707,7 @@ python3 -m sglang.test.run_eval \\
     },
     {
       match: { hw: "mi300x", variant: "31b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
