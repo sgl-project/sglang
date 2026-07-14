@@ -502,9 +502,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
 
-    # For padding
-    padded_static_len: int = -1  # -1 if not padded
-
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
