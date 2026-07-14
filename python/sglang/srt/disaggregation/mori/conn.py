@@ -1669,24 +1669,39 @@ class MoriKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
-                sock.send_multipart(
-                    [
-                        MORI_GUARD,
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        engine_desc_blob,
-                        packed_kv_descs,
-                        packed_aux_descs,
-                        packed_state_descs,
-                        gpu_id,
-                        decode_tp_size,
-                        decode_tp_rank,
-                        kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                    ]
-                )
+                try:
+                    sock.send_multipart(
+                        [
+                            MORI_GUARD,
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            engine_desc_blob,
+                            packed_kv_descs,
+                            packed_aux_descs,
+                            packed_state_descs,
+                            gpu_id,
+                            decode_tp_size,
+                            decode_tp_rank,
+                            kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                        ]
+                    )
+                except zmq.error.Again:
+                    peer = f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+                    timeout_s = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                    logger.warning_once(
+                        f"_register_kv_args to prefill {peer} timed out after {timeout_s}s "
+                        "(peer likely dead). Failing affected requests. "
+                        "Tune SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to change this bound."
+                    )
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"_register_kv_args to prefill {peer} timed out after {timeout_s}s",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
     def send_metadata(
         self,
@@ -1718,20 +1733,35 @@ class MoriKVReceiver(CommonKVReceiver):
             else:
                 state_bytes = b""
             with lock:
-                sock.send_multipart(
-                    [
-                        MORI_GUARD,
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.engine_desc.key.encode("ascii"),
-                        kv_indices_bytes if not is_dummy else b"",
-                        aux_bytes if not is_dummy else b"",
-                        state_bytes,
-                        str(self.required_dst_info_num).encode("ascii"),
-                        decode_prefix_bytes,
-                    ]
-                )
+                try:
+                    sock.send_multipart(
+                        [
+                            MORI_GUARD,
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.engine_desc.key.encode("ascii"),
+                            kv_indices_bytes if not is_dummy else b"",
+                            aux_bytes if not is_dummy else b"",
+                            state_bytes,
+                            str(self.required_dst_info_num).encode("ascii"),
+                            decode_prefix_bytes,
+                        ]
+                    )
+                except zmq.error.Again:
+                    peer = f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+                    timeout_s = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                    logger.warning_once(
+                        f"send_metadata to prefill {peer} timed out after {timeout_s}s "
+                        "(peer likely dead). Failing affected requests. "
+                        "Tune SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to change this bound."
+                    )
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"send_metadata to prefill {peer} timed out after {timeout_s}s",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

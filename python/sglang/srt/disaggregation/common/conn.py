@@ -1295,6 +1295,11 @@ class CommonKVReceiver(BaseKVReceiver):
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
+                # Bound send so a dead peer cannot block the scheduler forever.
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() * 1000,
+                )
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -1383,7 +1388,9 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
-            # Best-effort notification to prefill side that this request was aborted.
+            # Best-effort abort notify. Use DONTWAIT so a dead peer cannot hold
+            # the scheduler main loop (and the endpoint lock heartbeat needs).
+            peer = f"{bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -1393,15 +1400,20 @@ class CommonKVReceiver(BaseKVReceiver):
                             str(self.bootstrap_room).encode("ascii"),
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
+                        ],
+                        flags=zmq.DONTWAIT,
                     )
                 logger.debug(
-                    f"Sent abort notification for room {self.bootstrap_room} "
-                    f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
+                    f"Sent abort notification for room {self.bootstrap_room} to {peer}"
+                )
+            except zmq.error.Again:
+                logger.warning_once(
+                    f"Dropping abort notification to {peer}: send buffer full "
+                    "(peer likely dead)."
                 )
             except Exception as e:
                 logger.debug(
-                    f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
+                    f"Failed to send abort notification for room {self.bootstrap_room} to {peer}: {e}"
                 )
 
 

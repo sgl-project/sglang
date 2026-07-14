@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
@@ -2584,20 +2585,35 @@ class NixlKVReceiver(CommonKVReceiver):
                 else b""
             )
             with lock:
-                sock.send_multipart(
-                    [
-                        GUARD,
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.name.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii"),
-                        str(self.required_dst_info_num).encode("ascii"),
-                        packed_state_indices,
-                        str(decode_prefix_len or 0).encode("ascii"),
-                    ]
-                )
+                try:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii"),
+                            str(self.required_dst_info_num).encode("ascii"),
+                            packed_state_indices,
+                            str(decode_prefix_len or 0).encode("ascii"),
+                        ]
+                    )
+                except zmq.error.Again:
+                    peer = f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+                    timeout_s = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                    logger.warning_once(
+                        f"send_metadata to prefill {peer} timed out after {timeout_s}s "
+                        "(peer likely dead). Failing affected requests. "
+                        "Tune SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to change this bound."
+                    )
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"send_metadata to prefill {peer} timed out after {timeout_s}s",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
         # Mark that we expect state data if state_indices was provided.
         # Match the prefill-side truthy check: an empty list means the
@@ -2676,30 +2692,45 @@ class NixlKVReceiver(CommonKVReceiver):
             )
 
             with lock:
-                sock.send_multipart(
-                    [
-                        GUARD,
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.name.encode("ascii"),
-                        self.kv_mgr.agent.get_agent_metadata(),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                        str(self.kv_mgr.attn_tp_size).encode("ascii"),
-                        str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
-                        str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        packed_staging_base_ptr,
-                        staging_total_size_str,
-                        str(dst_num_slots).encode("ascii"),
-                        packed_kv_data_mem_kinds,
-                        packed_kv_item_lens,
-                    ]
-                )
+                try:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            self.kv_mgr.agent.get_agent_metadata(),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                            str(self.kv_mgr.attn_tp_size).encode("ascii"),
+                            str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
+                            str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
+                            str(dst_num_slots).encode("ascii"),
+                            packed_kv_data_mem_kinds,
+                            packed_kv_item_lens,
+                        ]
+                    )
+                except zmq.error.Again:
+                    peer = f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+                    timeout_s = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                    logger.warning_once(
+                        f"_register_kv_args to prefill {peer} timed out after {timeout_s}s "
+                        "(peer likely dead). Failing affected requests. "
+                        "Tune SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to change this bound."
+                    )
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"_register_kv_args to prefill {peer} timed out after {timeout_s}s",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
     def failure_exception(self):
         with self.kv_mgr.failure_lock:
