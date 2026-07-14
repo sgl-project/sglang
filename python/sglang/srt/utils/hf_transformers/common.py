@@ -142,6 +142,16 @@ try:
 except ImportError:
     pass
 
+try:
+    from transformers import Gemma4Config as _HFGemma4Config
+
+    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
+        model_type = "gemma4_unified"
+
+    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
+except ImportError:
+    pass
+
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
