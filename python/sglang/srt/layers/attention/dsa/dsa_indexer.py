@@ -8,16 +8,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
-from sglang.jit_kernel.dsa import (
-    aiter_paged_mqa_logits,
-    cutedsl_paged_mqa_logits,
-    deepgemm_paged_mqa_logits_native,
-    deepgemm_paged_mqa_logits_split,
-)
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -31,7 +26,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -66,11 +60,25 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-if not _is_hip and not _is_xpu:
-    # Preserve the original eager import behavior on non-ROCm/non-XPU platforms.
+
+if not _is_npu:
+    from sglang.jit_kernel.dsa import (
+        aiter_paged_mqa_logits,
+        cutedsl_paged_mqa_logits,
+        deepgemm_paged_mqa_logits_native,
+        deepgemm_paged_mqa_logits_split,
+    )
+else:
+    aiter_paged_mqa_logits = None
+    cutedsl_paged_mqa_logits = None
+    deepgemm_paged_mqa_logits_native = None
+    deepgemm_paged_mqa_logits_split = None
+
+if _is_cuda:
     from sglang.jit_kernel.dsa import pick_dsl_expand
 else:
     pick_dsl_expand = None
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -118,7 +126,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
@@ -140,7 +148,7 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     prefill_backend, decode_backend = server_args.get_attention_backends()
     prefill_backend = (
         getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
@@ -337,9 +345,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
-        from sglang.srt.hardware_backend.xpu.kernels.dsa.hadamard_transform import (
-            hadamard_transform,
-        )
+        from sgl_kernel import hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -404,7 +410,7 @@ class Indexer(MultiPlatformOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = get_global_server_args().pp_size
+            pp_size = get_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -456,7 +462,7 @@ class Indexer(MultiPlatformOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
@@ -683,6 +689,10 @@ class Indexer(MultiPlatformOp):
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
@@ -812,6 +822,15 @@ class Indexer(MultiPlatformOp):
         dst.copy_(src)
 
     @staticmethod
+    def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
+        # Read path: prefer the owner-broadcast scratch buffer under DSA cache
+        # layer split; fall back to the owned buffer for plain pools. Stores go
+        # through get_index_k_with_scale_buffer() (owned buffer) instead.
+        if hasattr(pool, "get_broadcastable_index_k_with_scale_buffer"):
+            return pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
+        return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+
+    @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
         """Pad q and weights to 32 heads when num_heads < 32,
         so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
@@ -893,9 +912,7 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
+        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
         if (
@@ -925,7 +942,7 @@ class Indexer(MultiPlatformOp):
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
         ):
-            assert pick_dsl_expand is not None, "Not supported on AMD/ROCm. "
+            assert pick_dsl_expand is not None, "CuTe DSL paged MQA is CUDA-only."
             dsl_expand_factor, dsl_atom = pick_dsl_expand(
                 next_n,
                 batch_size=B,
@@ -1063,7 +1080,7 @@ class Indexer(MultiPlatformOp):
             total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
-        mem_fraction_static = get_global_server_args().mem_fraction_static
+        mem_fraction_static = get_server_args().mem_fraction_static
         if mem_fraction_static is None:
             static_budget = total_mem_budget
         else:
@@ -1698,24 +1715,28 @@ class Indexer(MultiPlatformOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
+        pool = get_token_to_kv_pool()
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                get_token_to_kv_pool().page_size,
+                pool.page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,
                 out_cache_loc,
-                get_token_to_kv_pool().page_size,
+                pool.page_size,
             )
             return
 
@@ -1725,10 +1746,8 @@ class Indexer(MultiPlatformOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = get_token_to_kv_pool().page_size
-            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            page_size = pool.page_size
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
@@ -1750,7 +1769,7 @@ class Indexer(MultiPlatformOp):
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()
 
-        get_token_to_kv_pool().set_index_k_scale_buffer(
+        pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=out_cache_loc,
             index_k=k_fp8,

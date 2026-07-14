@@ -4,8 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
 
 _is_hip = is_hip()
@@ -191,7 +191,7 @@ class GetKAndS:
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
         page_size = pool.page_size
         index_head_dim = pool.index_head_dim

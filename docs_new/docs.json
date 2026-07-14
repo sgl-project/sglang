@@ -938,7 +938,8 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_reference"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1204,6 +1205,13 @@
                     ]
                   },
                   {
+                    "group": "LongLive",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
@@ -1252,7 +1260,8 @@
                     "group": "LingBot World",
                     "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LingBot-World/LingBot-World"
+                      "cookbook/diffusion/LingBot-World/LingBot-World",
+                      "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
                     ]
                   },
                   {
@@ -1260,6 +1269,19 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "VLA (Vision-Language-Action) Models",
+                "pages": [
+                  "cookbook/vla/intro",
+                  {
+                    "group": "OpenPI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/OpenPI/Pi0.5"
                     ]
                   }
                 ]
