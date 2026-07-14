@@ -583,7 +583,7 @@ def _dispatch_auto_backend() -> Callable:
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
 
-    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not _is_sm120_supported:
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
@@ -601,8 +601,8 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
-        # The Triton block-FP8 kernel has no SM120 tuning.
-        backend = "cutlass"
+        # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
+        backend = "triton"
 
     backend = Fp8GemmRunnerBackend(backend)
 
