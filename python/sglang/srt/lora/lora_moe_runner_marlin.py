@@ -23,17 +23,16 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
-
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation import silu_and_mul
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+        moe_sum_reduce_triton,
+    )
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
-    )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        moe_sum_reduce_triton,
     )
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 

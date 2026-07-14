@@ -1,11 +1,11 @@
 import inspect
 import re
 import time
-from math import sqrt
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
+import requests
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -28,6 +27,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     get_module_dtype,
 )
+from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 logger = init_logger(__name__)
 
@@ -192,6 +192,7 @@ class GlmImageAR(PipelineStage):
         prompt: str,
         height: int,
         width: int,
+        server_args: ServerArgs,
         image: Optional[List[PIL.Image.Image]] = None,
         factor: int = 32,
     ) -> Tuple[torch.Tensor, int, int]:
@@ -208,7 +209,7 @@ class GlmImageAR(PipelineStage):
             - pixel_height: Image height in pixels
             - pixel_width: Image width in pixels
         """
-        device = self.vision_language_encoder.device
+        device = get_local_torch_device()
         height = (height // factor) * factor
         width = (width // factor) * factor
 
@@ -238,44 +239,121 @@ class GlmImageAR(PipelineStage):
         )
 
         prior_token_image_ids = None
-        if image is not None:
-            source_grids = image_grid_thw[:-1]
-            prior_token_image_embed = pooled_image_features_to_tensor(
-                self.vision_language_encoder.get_image_features(
-                    inputs["pixel_values"], source_grids
-                )
-            )
-            prior_token_image_ids_d32 = self.vision_language_encoder.get_image_tokens(
-                prior_token_image_embed, source_grids
-            )
-            prior_token_image_ids = []
-            prior_ids_per_source = torch.split(
-                prior_token_image_ids_d32,
-                source_grids.prod(dim=-1).tolist(),
-            )
-            for prior_ids, source_grid in zip(prior_ids_per_source, source_grids):
-                _, source_h, source_w = source_grid.tolist()
-                prior_token_image_ids.append(
-                    self._upsample_token_ids(
-                        prior_ids,
-                        int(source_h),
-                        int(source_w),
-                    ).squeeze(0)
-                )
 
         # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
         # max_new_tokens must be exactly grid_h * grid_w + 1 (the +1 is for EOS).
-        outputs = self.vision_language_encoder.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-        )
+        if server_args.srt_encoder_url is not None:
+            if image is not None:
+                logger.error(
+                    "Image-to-Image tasks is not supported yet when using an external SGLang encoder server."
+                )
+                raise NotImplementedError(
+                    "I2I mode is not supported yet via external SGLang encoder URL."
+                )
 
-        prior_token_ids_d32 = self._extract_large_image_tokens(
-            outputs,
-            inputs["input_ids"].shape[-1],
-            large_image_offset,
-            token_h * token_w,
+            payload = {
+                "input_ids": inputs["input_ids"][0].tolist(),
+                "image_data": [{"image_grid_thw": image_grid_thw.tolist()}],
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            }
+            try:
+                response = requests.post(
+                    server_args.srt_encoder_url + "/generate",
+                    json=payload,
+                    timeout=(
+                        server_args.srt_encoder_connect_timeout,
+                        server_args.srt_encoder_timeout,
+                    ),
+                )
+            except requests.ConnectionError as e:
+                logger.error(
+                    "Failed to establish a connection to SGLang encoder server at %s. "
+                    "Verify that the AR model server is running and accessible. Error details: %s",
+                    server_args.srt_encoder_url,
+                    e,
+                )
+                raise
+            except requests.ConnectTimeout as e:
+                logger.error(
+                    "Connection timeout to SGLang encoder (%s). Try to increase --srt-encoder-connection-timeout (current: %s sec). Details: %s",
+                    server_args.srt_encoder_url,
+                    server_args.srt_encoder_connect_timeout,
+                    e,
+                )
+                raise
+            except requests.ReadTimeout as e:
+                logger.error(
+                    "Read timeout from SGLang encoder (%s). Try to increase --srt-encoder-timeout (current: %s sec). Details: %s",
+                    server_args.srt_encoder_url,
+                    server_args.srt_encoder_timeout,
+                    e,
+                )
+                raise
+            except requests.RequestException as e:
+                logger.error(
+                    "An error occurred during communication with SGLang encoder server at %s. "
+                    "The server is reachable, but the request failed. Error type: %s, Details: %s",
+                    server_args.srt_encoder_url,
+                    type(e).__name__,
+                    e,
+                )
+                raise
+
+            data = response.json()
+            generated_ids = data.get("output_ids")
+        else:
+            if image is not None:
+                source_grids = image_grid_thw[:-1]
+                prior_token_image_embed = pooled_image_features_to_tensor(
+                    self.vision_language_encoder.get_image_features(
+                        inputs["pixel_values"], source_grids
+                    )
+                )
+                prior_token_image_ids_d32 = (
+                    self.vision_language_encoder.get_image_tokens(
+                        prior_token_image_embed, source_grids
+                    )
+                )
+                prior_token_image_ids = []
+                prior_ids_per_source = torch.split(
+                    prior_token_image_ids_d32,
+                    source_grids.prod(dim=-1).tolist(),
+                )
+                for prior_ids, source_grid in zip(prior_ids_per_source, source_grids):
+                    _, source_h, source_w = source_grid.tolist()
+                    prior_token_image_ids.append(
+                        self._upsample_token_ids(
+                            prior_ids,
+                            int(source_h),
+                            int(source_w),
+                        ).squeeze(0)
+                    )
+            outputs = self.vision_language_encoder.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+            )
+            input_len = inputs["input_ids"].shape[-1]
+            generated_ids = outputs[0][input_len:]
+
+        expected_output_len = large_image_offset + token_h * token_w
+        actual_output_len = 0 if generated_ids is None else len(generated_ids)
+        if actual_output_len < expected_output_len:
+            raise RuntimeError(
+                "GLM-Image AR returned too few output_ids: "
+                f"got {actual_output_len}, need at least {expected_output_len} "
+                f"(large_image_offset={large_image_offset}, "
+                f"token_h={token_h}, token_w={token_w})."
+            )
+
+        # Extract large image tokens + upsample D32→D16
+        prior_token_ids_d32 = torch.tensor(
+            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
+            device=device,
         )
         prior_token_ids = self._upsample_token_ids(
             prior_token_ids_d32, token_h, token_w
@@ -315,6 +393,7 @@ class GlmImageAR(PipelineStage):
                 image=ar_condition_images,
                 height=height,
                 width=width,
+                server_args=server_args,
             )
         else:
             rng_devices = []
@@ -327,6 +406,7 @@ class GlmImageAR(PipelineStage):
                     image=ar_condition_images,
                     height=height,
                     width=width,
+                    server_args=server_args,
                 )
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
@@ -338,21 +418,6 @@ class GlmImageAR(PipelineStage):
         batch.width = width
 
         return batch
-
-    def _extract_large_image_tokens(
-        self,
-        outputs: torch.Tensor,
-        input_length: int,
-        large_image_start_offset: int,
-        large_image_tokens: int,
-    ) -> torch.Tensor:
-        """
-        Extract the large image tokens from AR model output.
-        """
-        generated_tokens = outputs[0][input_length:]
-        large_image_start = large_image_start_offset
-        large_image_end = large_image_start + large_image_tokens
-        return generated_tokens[large_image_start:large_image_end]
 
 
 class GlmImageBeforeDenoisingStage(PipelineStage):
@@ -420,91 +485,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 )
             )
         return uses
-
-    def _parse_and_expand_shape_info(
-        self, prompt: str
-    ) -> Tuple[str, int, int, int, int]:
-        """
-        Parse the shape info from prompt and expand it for AR model.
-
-        Args:
-            prompt: The prompt containing <sop>H W<eop> shape specification
-
-        Returns:
-            Tuple of (expanded_prompt, token_h, token_w, prev_token_h, prev_token_w)
-        """
-        match = re.search(r"<sop>(\d+)\s+(\d+)<eop>", prompt)
-        if match is None:
-            raise ValueError(
-                f"Prompt must contain shape info in format '<sop>H W<eop>', got: {prompt}"
-            )
-
-        token_h, token_w = int(match.group(1)), int(match.group(2))
-        ratio = token_h / token_w
-        prev_token_h = int(sqrt(ratio) * 16)
-        prev_token_w = int(sqrt(1 / ratio) * 16)
-
-        old_shape = f"<sop>{token_h} {token_w}<eop>"
-        new_shape = (
-            f"<sop>{token_h} {token_w}<eop><sop>{prev_token_h} {prev_token_w}<eop>"
-        )
-        expanded_prompt = prompt.replace(old_shape, new_shape)
-
-        return expanded_prompt, token_h, token_w, prev_token_h, prev_token_w
-
-    def _build_image_grid_thw(
-        self,
-        token_h: int,
-        token_w: int,
-        prev_token_h: int,
-        prev_token_w: int,
-        existing_grid: Optional[torch.Tensor] = None,
-        device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        """
-        Build image grid tensor for AR model.
-
-        For text-to-image: creates grid for large image + small image For image-to-image: appends new image to existing
-        grid
-        """
-        if existing_grid is None or existing_grid.numel() == 0:
-            # Text-to-image: large image + small image
-            return torch.tensor(
-                [
-                    [1, token_h, token_w],
-                    [1, prev_token_h, prev_token_w],
-                ],
-                device=device,
-            )
-        else:
-            # Image-to-image: append to existing
-            return torch.cat(
-                [existing_grid, torch.tensor([[1, token_h, token_w]], device=device)],
-                dim=0,
-            )
-
-    def _calculate_ar_generation_params(
-        self,
-        token_h: int,
-        token_w: int,
-        prev_token_h: int,
-        prev_token_w: int,
-        is_text_to_image: bool,
-    ) -> Tuple[int, int]:
-        """
-        Calculate max_new_tokens and large_image_start_offset for AR generation.
-        """
-        large_image_tokens = token_h * token_w
-        small_image_tokens = prev_token_h * prev_token_w
-
-        if is_text_to_image:
-            max_new_tokens = small_image_tokens + large_image_tokens + 1
-            large_image_start_offset = small_image_tokens
-        else:
-            max_new_tokens = large_image_tokens + 1
-            large_image_start_offset = 0
-
-        return max_new_tokens, large_image_start_offset
 
     def get_glyph_texts(self, prompt):
         prompt = prompt[0] if isinstance(prompt, list) else prompt
@@ -756,8 +736,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self._guidance_scale = guidance_scale
         self._current_timestep = None
         self._interrupt = False
-
-        device = get_local_torch_device()
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
