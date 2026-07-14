@@ -381,7 +381,7 @@ def get_dp_local_slice_cpu(
     return local_start_pos, local_num_tokens
 
 
-from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton_with_zero_fill
 
 
 def _dp_gather_via_all_reduce(
@@ -392,7 +392,6 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -403,9 +402,16 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+        memcpy_triton_with_zero_fill(
+            dst=global_tokens,
+            src=local_tokens,
+            dim=0,
+            offset=local_start_pos,
+            sz=local_num_tokens,
+            offset_src=False,
         )
+    else:
+        global_tokens.fill_(0)
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -576,7 +582,6 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
@@ -584,9 +589,16 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+        memcpy_triton_with_zero_fill(
+            dst=local_tokens,
+            src=global_tokens,
+            dim=0,
+            offset=local_start_pos,
+            sz=local_num_tokens,
+            offset_src=True,
         )
+    else:
+        local_tokens.fill_(0)
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
