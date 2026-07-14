@@ -271,14 +271,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         return self._verify_planner.carries_confidence
 
     @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
-
-    @property
-    def draft_worker(self):
-        return self._draft_worker
-
-    @property
     def spec_v2_attn_backends(self) -> tuple:
         return (
             self._target_worker.model_runner.attn_backend,
