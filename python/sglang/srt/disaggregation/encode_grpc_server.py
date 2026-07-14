@@ -87,6 +87,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),
+                "modality": Modality.IMAGE.name,
                 "req_id": request.req_id,
                 "num_parts": request.num_parts,
                 "part_idx": request.part_idx,
@@ -94,20 +95,15 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             for socket in self.send_sockets:
                 await async_sock_send(socket, wrap_as_pickle(request_dict))
 
-            # gRPC encode is image-only; encoder.encode() requires modality
+            # gRPC encode is image-only; the request follows the configured
+            # cache and transfer backend.
             (
                 nbytes,
                 embedding_len,
                 embedding_dim,
                 error_msg,
                 error_code,
-            ) = await self.encoder.encode(
-                mm_items=list(request.mm_items),
-                modality=Modality.IMAGE,
-                req_id=request.req_id,
-                num_parts=request.num_parts,
-                part_idx=request.part_idx,
-            )
+            ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
             if error_msg is not None:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(error_msg)
