@@ -62,6 +62,7 @@ class LightningAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    linear_backend: str = "seg_la"
 
     @property
     def batch_size(self) -> int:
@@ -198,6 +199,8 @@ class TinyLightningModelConfig:
             num_attention_heads=num_heads,
             num_hidden_layers=num_hidden_layers,
             linear_backend=linear_backend,
+            head_dim=head_dim,
+            hidden_size=num_heads * head_dim,
         )
         self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
@@ -302,6 +305,7 @@ class MockLightningModelRunner(ModelRunner):
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=speculative_num_draft_tokens or None,
             enable_overlap_schedule=False,
+            linear_backend=model_config.hf_config.linear_backend,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
         self.token_to_kv_pool = MHATokenToKVPool(
@@ -552,6 +556,7 @@ def build_lightning_attention_fixture(
         head_dim=head_dim,
         context_len=max_context_len,
         num_hidden_layers=num_hidden_layers,
+        linear_backend=case.linear_backend,
     )
     runner = MockLightningModelRunner(
         case=case,
@@ -765,6 +770,8 @@ def run_lightning_attention_case(
         loc_layout=loc_layout,
     )
     initial_ssm_states = _ssm_states(fixture).clone()
+    if case.linear_backend == "cula":
+        initial_ssm_states = initial_ssm_states.transpose(-1, -2).contiguous()
     actual = run_lightning_fixture_eager(fixture)
     expected = _pure_torch_lightning_reference(fixture, initial_ssm_states)
 
@@ -784,8 +791,13 @@ def run_lightning_attention_case(
 
 
 def _clone_lightning_cache(fixture: LightningAttentionFixture):
-    """Snapshot the SSM state for CG capture/replay isolation."""
-    return _ssm_states(fixture).clone()
+    """Snapshot the SSM state for CG capture/replay isolation.
+    For cula (V-major layout), transpose to K-major so the pure-Python
+    reference (which uses torch.outer → [K,V]) computes correctly."""
+    state = _ssm_states(fixture).clone()
+    if fixture.case.linear_backend == "cula":
+        state = state.transpose(-1, -2).contiguous()
+    return state
 
 
 def _restore_lightning_cache(

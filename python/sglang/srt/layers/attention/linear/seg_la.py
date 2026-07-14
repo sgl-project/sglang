@@ -226,6 +226,7 @@ def seg_la_p_kernel(
     V_SPLIT_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
     EVEN: tl.constexpr,
+    VK: tl.constexpr,
 ):
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -279,15 +280,26 @@ def seg_la_p_kernel(
         + vid * V_SPLIT_DIM
         + (offs_b[:, None] * H * HEAD_DIM + offs_v[None, :])
     )
-    s_ptrs = (
-        S
-        + s_offset * stride_s
-        + hid * HEAD_DIM * HEAD_DIM
-        + kid * HEAD_DIM * K_SPLIT_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
-    )
-    state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
+    if VK:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + vid * HEAD_DIM * V_SPLIT_DIM
+            + kid * K_SPLIT_DIM
+            + (offs_v[:, None] * HEAD_DIM + offs_k[None, :])
+        )
+        state = tl.trans(tl.load(s_ptrs, mask=s_scale > 0)).to(tl.float32)
+    else:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + kid * HEAD_DIM * K_SPLIT_DIM
+            + vid * V_SPLIT_DIM
+            + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+        )
+        state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
 
     for n in range(0, q_length, BLOCK):
         n = tl.multiple_of(n, BLOCK)
@@ -340,7 +352,10 @@ def seg_la_p_kernel(
                 mask=(n + offs_b)[:, None] < q_length,
             )
 
-    tl.store(s_ptrs, state.to(S.dtype.element_ty))
+    if VK:
+        tl.store(s_ptrs, tl.trans(state).to(S.dtype.element_ty))
+    else:
+        tl.store(s_ptrs, state.to(S.dtype.element_ty))
 
 
 # used for speculative
@@ -368,6 +383,7 @@ def seg_la_s_kernel(
     V_SPLIT_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
     EVEN: tl.constexpr,
+    VK: tl.constexpr,
 ):
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -421,15 +437,26 @@ def seg_la_s_kernel(
         + vid * V_SPLIT_DIM
         + (offs_b[:, None] * H * HEAD_DIM + offs_v[None, :])
     )
-    s_ptrs = (
-        S
-        + s_offset * stride_s
-        + hid * HEAD_DIM * HEAD_DIM
-        + kid * HEAD_DIM * K_SPLIT_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
-    )
-    state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
+    if VK:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + vid * HEAD_DIM * V_SPLIT_DIM
+            + kid * K_SPLIT_DIM
+            + (offs_v[:, None] * HEAD_DIM + offs_k[None, :])
+        )
+        state = tl.trans(tl.load(s_ptrs, mask=s_scale > 0)).to(tl.float32)
+    else:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + kid * HEAD_DIM * K_SPLIT_DIM
+            + vid * V_SPLIT_DIM
+            + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+        )
+        state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
 
     if EVEN:
         q = tl.load(q_ptrs).to(tl.float32)
@@ -497,6 +524,7 @@ def seg_la_d_kernel(
     HEAD_DIM: tl.constexpr,
     K_SPLIT_DIM: tl.constexpr,
     V_SPLIT_DIM: tl.constexpr,
+    VK: tl.constexpr,
 ):
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -528,22 +556,36 @@ def seg_la_d_kernel(
         + vid * V_SPLIT_DIM
         + (offs_v)
     )
-    s_ptrs = (
-        S
-        + s_offset * stride_s
-        + hid * HEAD_DIM * HEAD_DIM
-        + kid * HEAD_DIM * K_SPLIT_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
-    )
+    if VK:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + vid * HEAD_DIM * V_SPLIT_DIM
+            + kid * K_SPLIT_DIM
+            + (offs_v[:, None] * HEAD_DIM + offs_k[None, :])
+        )
+    else:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + kid * HEAD_DIM * K_SPLIT_DIM
+            + vid * V_SPLIT_DIM
+            + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+        )
     state = tl.load(s_ptrs).to(tl.float32)
 
     k = tl.load(k_ptrs).to(tl.float32)
     v = tl.load(v_ptrs).to(tl.float32)
     q = tl.load(q_ptrs).to(tl.float32) * softmax_scale
 
-    state = state * tl.exp(decay_scale) + k[:, None] * v
-    o = tl.sum(q[:, None] * state, axis=0)
+    if VK:
+        state = state * tl.exp(decay_scale) + v[:, None] * k[None, :]
+        o = tl.sum(q[None, :] * state, axis=1)
+    else:
+        state = state * tl.exp(decay_scale) + k[:, None] * v
+        o = tl.sum(q[:, None] * state, axis=0)
 
     tl.store(out_ptrs, o.to(Out.dtype.element_ty))
     tl.store(s_ptrs, state.to(S.dtype.element_ty))
@@ -572,6 +614,7 @@ def seg_la_mtp_kernel(
     HEAD_DIM: tl.constexpr,
     K_SPLIT_DIM: tl.constexpr,
     V_SPLIT_DIM: tl.constexpr,
+    VK: tl.constexpr,
 ):
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -604,33 +647,61 @@ def seg_la_mtp_kernel(
         + (offs_v)
     )
     # (bs, qo_heads, d, d)
-    s_ptrs = (
-        S
-        + s_offset * stride_s
-        + hid * HEAD_DIM * HEAD_DIM
-        + kid * HEAD_DIM * K_SPLIT_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
-    )
+    if VK:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + vid * HEAD_DIM * V_SPLIT_DIM
+            + kid * K_SPLIT_DIM
+            + (offs_v[:, None] * HEAD_DIM + offs_k[None, :])
+        )
+    else:
+        s_ptrs = (
+            S
+            + s_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + kid * HEAD_DIM * K_SPLIT_DIM
+            + vid * V_SPLIT_DIM
+            + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+        )
     state = tl.load(s_ptrs).to(tl.float32)
     # (bs, step, kv_heads, d, d)
     cache_indices = tl.load(cache_indices + bid)
-    c_ptrs = (
-        CACHES
-        + cache_indices * stride_c
-        + hid * HEAD_DIM * HEAD_DIM
-        + kid * HEAD_DIM * K_SPLIT_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
-    )
+    # Under VK, intermediate_ssm is written in [v,k] — the same layout as temporal —
+    # so fused_mamba_state_scatter_with_mask (a layout-agnostic whole-slot copy)
+    # commits [v,k] → [v,k] and stays consistent. The c_ptrs swap is mandatory:
+    # forgetting it would silently corrupt state on MTP commit.
+    if VK:
+        c_ptrs = (
+            CACHES
+            + cache_indices * stride_c
+            + hid * HEAD_DIM * HEAD_DIM
+            + vid * HEAD_DIM * V_SPLIT_DIM
+            + kid * K_SPLIT_DIM
+            + (offs_v[:, None] * HEAD_DIM + offs_k[None, :])
+        )
+    else:
+        c_ptrs = (
+            CACHES
+            + cache_indices * stride_c
+            + hid * HEAD_DIM * HEAD_DIM
+            + kid * HEAD_DIM * K_SPLIT_DIM
+            + vid * V_SPLIT_DIM
+            + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+        )
 
     for i in range(step):
         q = tl.load(q_ptrs).to(tl.float32) * softmax_scale
         k = tl.load(k_ptrs).to(tl.float32)
         v = tl.load(v_ptrs).to(tl.float32)
 
-        state = state * decay_scale + k[:, None] * v
-        o = tl.sum(q[:, None] * state, axis=0)
+        if VK:
+            state = state * decay_scale + v[:, None] * k[None, :]
+            o = tl.sum(q[None, :] * state, axis=1)
+        else:
+            state = state * decay_scale + k[:, None] * v
+            o = tl.sum(q[:, None] * state, axis=0)
 
         tl.store(out_ptrs, o.to(Out.dtype.element_ty))
         tl.store(c_ptrs, state.to(CACHES.dtype.element_ty))
@@ -665,7 +736,14 @@ def seg_la_fwd(
     cache_indices=None,
     softmax_scale=None,
     decouple=False,
+    state_layout: str = "kv",
 ):
+    assert state_layout in (
+        "kv",
+        "vk",
+    ), f"Unsupported seg_la state_layout: {state_layout}"
+    VK = state_layout == "vk"
+
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
     bs = meta.batch_size
@@ -720,6 +798,7 @@ def seg_la_fwd(
                 HEAD_DIM=HEAD_DIM,
                 K_SPLIT_DIM=K_SPLIT_DIM,
                 V_SPLIT_DIM=V_SPLIT_DIM,
+                VK=VK,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
@@ -753,6 +832,7 @@ def seg_la_fwd(
                 V_SPLIT_DIM=V_SPLIT_DIM,
                 BLOCK=BLOCK,
                 EVEN=EVEN,
+                VK=VK,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
@@ -784,6 +864,7 @@ def seg_la_fwd(
                 V_SPLIT_DIM=V_SPLIT_DIM,
                 BLOCK=BLOCK,
                 EVEN=EVEN,
+                VK=VK,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
@@ -842,6 +923,7 @@ def seg_la_fwd(
             HEAD_DIM=HEAD_DIM,
             K_SPLIT_DIM=K_SPLIT_DIM,
             V_SPLIT_DIM=V_SPLIT_DIM,
+            VK=VK,
             num_warps=num_warps,
             num_stages=num_stages,
         )
