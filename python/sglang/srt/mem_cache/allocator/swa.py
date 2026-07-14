@@ -224,6 +224,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
         swa_tail_len: int,
+        swa_tail_end: int,
     ):
         """Allocate full KV for the whole extend and SWA KV only for the tail.
 
@@ -234,7 +235,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
         assert len(prefix_lens_cpu) == 1
-        assert 0 <= swa_tail_len <= extend_num_tokens
+        assert 0 <= swa_tail_len <= swa_tail_end <= extend_num_tokens
+        win_start: int = swa_tail_end - swa_tail_len
+        assert win_start % self.page_size == 0
 
         num_full_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
@@ -276,11 +279,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_swa_indices is not None
 
         self.set_full_to_swa_mapping(
-            alloc_full_indices[-swa_tail_len:], alloc_swa_indices
+            alloc_full_indices[win_start:swa_tail_end], alloc_swa_indices
         )
-        if swa_tail_len < extend_num_tokens:
+        if win_start > 0:
             self.full_to_swa_index_mapping[
-                alloc_full_indices[:-swa_tail_len].to(torch.int64)
+                alloc_full_indices[:win_start].to(torch.int64)
+            ] = 0
+        if swa_tail_end < extend_num_tokens:
+            self.full_to_swa_index_mapping[
+                alloc_full_indices[swa_tail_end:].to(torch.int64)
             ] = 0
         return alloc_full_indices
 
