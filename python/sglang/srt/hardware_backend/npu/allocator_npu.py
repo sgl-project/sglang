@@ -4,15 +4,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import (
-    SWATokenToKVPoolAllocator,
-    _is_npu,
-)
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.utils import get_num_new_pages, is_npu, next_power_of_2
+
+_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
@@ -687,6 +686,44 @@ class NPUSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+            self.free_swa(free_index)
+        else:
+            self.free_group.append(free_index)
+        assert (
+            self.full_attn_allocator.available_size()
+            <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def free_swa(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        if self.page_size == 1:
+            mapping_indices = free_index
+        else:
+            mapping_indices = self._expand_to_full_pages(free_index)
+
+        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+        swa_indices = swa_indices[swa_indices > 0]
+        self.swa_attn_allocator.free(swa_indices)
+        self.full_to_swa_index_mapping[mapping_indices] = 0
+
+    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
+        pages = torch.unique(indices // self.page_size)
+        page_offsets = torch.arange(
+            self.page_size,
+            dtype=indices.dtype,
+            device=indices.device,
+        )
+        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
     def _get_paged_allocator_class(
         self,

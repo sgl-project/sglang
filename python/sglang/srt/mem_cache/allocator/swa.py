@@ -5,9 +5,6 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -160,7 +157,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         free_index: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert not _is_npu
         self._validate_full_domain_free(free_index)
         if free_index.numel() == 0:
             return free_index, free_index
@@ -334,24 +330,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
-        if _is_npu:
-            if free_index.numel() == 0:
-                return
-
-            if self.is_not_in_free_group:
-                self.full_attn_allocator.free(free_index)
-                self.free_swa(free_index)
-            else:
-                self.free_group.append(free_index)
-            assert (
-                self.full_attn_allocator.available_size()
-                <= self.full_attn_allocator.size
-            )
-            assert (
-                self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
-            )
-            return
-
         mapping_indices, swa_indices = self._preflight_swa_free(free_index)
         if free_index.numel() == 0:
             return
@@ -382,31 +360,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        if _is_npu:
-            if free_index.numel() == 0:
-                return
-
-            if self.page_size == 1:
-                mapping_indices = free_index
-            else:
-                mapping_indices = self._expand_to_full_pages(free_index)
-
-            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-            swa_indices = swa_indices[swa_indices > 0]
-            self.swa_attn_allocator.free(swa_indices)
-            self.full_to_swa_index_mapping[mapping_indices] = 0
-            return
-
         mapping_indices, swa_indices = self._preflight_swa_free(free_index)
         if free_index.numel() == 0:
             return
         self._release_preflighted_swa_free(mapping_indices, swa_indices)
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
-        if _is_npu:
-            pages = torch.unique(indices // self.page_size)
-        else:
-            pages = indices[:: self.page_size].to(dtype=torch.int64) // self.page_size
+        pages = indices[:: self.page_size].to(dtype=torch.int64) // self.page_size
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )

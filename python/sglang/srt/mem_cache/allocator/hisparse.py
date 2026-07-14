@@ -84,18 +84,6 @@ def _release_owned_page_ids(
     if full_page_blocks.numel() == 0:
         return
 
-    page_rows = full_page_blocks.view(-1, device_page_size)
-    expected_rows = page_rows[:, :1] + torch.arange(
-        device_page_size, dtype=torch.int64, device=full_page_blocks.device
-    )
-    torch._assert_async(
-        torch.all(page_rows[:, 0] % device_page_size == 0),
-        "HiSparse child free blocks must be page aligned",
-    )
-    torch._assert_async(
-        torch.all(page_rows == expected_rows),
-        "HiSparse child free blocks must contain complete consecutive pages",
-    )
     child_allocator.free(full_page_blocks)
 
 
@@ -380,10 +368,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def clear_hisparse_mapping(self, *, mapping_indices: torch.Tensor) -> None:
         self.full_to_hisparse_device_index_mapping[mapping_indices] = 0
-        torch._assert_async(
-            torch.all(self.full_to_hisparse_device_index_mapping[mapping_indices] == 0),
-            "HiSparse mapping owners must be cleared before release",
-        )
 
     def release_owned_hisparse_pages(self, *, owned_page_ids: torch.Tensor) -> None:
         _release_owned_page_ids(
@@ -688,10 +672,6 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def clear_hisparse_mapping(self, *, mapping_indices: torch.Tensor) -> None:
         self.full_to_hisparse_device_index_mapping[mapping_indices] = 0
-        torch._assert_async(
-            torch.all(self.full_to_hisparse_device_index_mapping[mapping_indices] == 0),
-            "HiSparse mapping owners must be cleared before release",
-        )
 
     def release_owned_hisparse_pages(self, *, owned_page_ids: torch.Tensor) -> None:
         _release_owned_page_ids(

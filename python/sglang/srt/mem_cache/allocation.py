@@ -26,7 +26,6 @@ from sglang.srt.mem_cache.triton_ops.common import (
     gather_req_to_token_pool_triton,
     write_req_to_token_pool_triton,
 )
-from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -490,7 +489,7 @@ def _ensure_page_aligned_allocation_supported(
             f"phase={phase}, supports_page_aligned_alloc={supports_main}, "
             f"supports_spec_page_aligned_alloc={supports_spec}"
         )
-    if platforms.current_platform._enum == PlatformEnum.UNSPECIFIED:
+    if platforms.current_platform.is_unspecified():
         raise NotImplementedError(
             f"allocator={type(allocator).__name__}, page_size={page_size}, "
             f"phase={phase}, unsupported_backend, "
@@ -522,20 +521,20 @@ def alloc_for_extend(
     )
     allocator_page: int = _alloc_page_size(batch)
     allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if not _is_npu and allocator_page > 1:
+    uses_page_aligned_alloc: bool = not _is_npu and allocator_page > 1
+    if uses_page_aligned_alloc:
         _ensure_page_aligned_allocation_supported(
             allocator,
             page_size=allocator_page,
             phase="prefill",
         )
-    uses_aligned_lens: bool = not _is_npu and allocator_page > 1
     alloc_start_lens_cpu: torch.Tensor
     alloc_end_lens_cpu: torch.Tensor
     alloc_extend_lens_cpu: torch.Tensor
     alloc_start_lens_device: torch.Tensor
     alloc_end_lens_device: torch.Tensor
     alloc_extend_lens_device: torch.Tensor
-    if uses_aligned_lens:
+    if uses_page_aligned_alloc:
         alloc_start_lens: list[int] = [
             max(
                 prefix_len,
@@ -570,7 +569,6 @@ def alloc_for_extend(
         alloc_end_lens_device = batch.seq_lens
         alloc_extend_lens_device = extend_lens_device
     alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
-    uses_page_aligned_alloc: bool = not _is_npu and allocator_page > 1
     assert_alloc_extend_lens_page_aligned(
         prefix_lens_cpu=alloc_start_lens_cpu,
         seq_lens_cpu=alloc_end_lens_cpu,
@@ -630,23 +628,25 @@ def alloc_for_extend(
         req_to_token_pool=batch.req_to_token_pool,
     )
 
-    gathered: torch.Tensor = gather_out_cache_loc_extend(
-        batch.req_to_token_pool,
-        req_pool_indices_tensor=req_pool_indices_device,
-        req_pool_indices_cpu=req_pool_indices_cpu,
-        prefix_lens_tensor=prefix_lens_device,
-        prefix_lens_cpu=prefix_lens_cpu,
-        seq_lens_tensor=batch.seq_lens,
-        seq_lens_cpu=batch.seq_lens_cpu,
-        extend_lens_tensor=extend_lens_device,
-        extend_lens_cpu=extend_lens_cpu,
-        extend_num_tokens=batch.extend_num_tokens,
-        out_dtype=out_cache_loc.dtype,
-    )
-    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+    debug_memory_pool: bool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
+    if uses_page_aligned_alloc or debug_memory_pool:
+        gathered: torch.Tensor = gather_out_cache_loc_extend(
+            batch.req_to_token_pool,
+            req_pool_indices_tensor=req_pool_indices_device,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            prefix_lens_tensor=prefix_lens_device,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens_tensor=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            extend_lens_tensor=extend_lens_device,
+            extend_lens_cpu=extend_lens_cpu,
+            extend_num_tokens=batch.extend_num_tokens,
+            out_dtype=out_cache_loc.dtype,
+        )
+    if debug_memory_pool:
         assert gathered.numel() == batch.extend_num_tokens
         assert bool(torch.all(gathered != 0))
-        if uses_aligned_lens:
+        if uses_page_aligned_alloc:
             for req_pool_index, alloc_start, alloc_end in zip(
                 req_pool_indices,
                 alloc_start_lens_cpu.tolist(),
@@ -656,7 +656,10 @@ def alloc_for_extend(
                     req_pool_index, alloc_start:alloc_end
                 ]
                 assert bool(torch.all(allocated_slots != 0))
-    out_cache_loc = gathered
+        else:
+            torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+    if uses_page_aligned_alloc:
+        out_cache_loc = gathered
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -693,7 +696,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     bs: int = seq_lens_gpu.shape[0]
     allocator_page: int = _alloc_page_size(batch)
     allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if not _is_npu and allocator_page > 1:
+    uses_page_aligned_alloc: bool = not _is_npu and allocator_page > 1
+    if uses_page_aligned_alloc:
         _ensure_page_aligned_allocation_supported(
             allocator,
             page_size=allocator_page,
@@ -717,8 +721,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         locs = seq_lens_gpu.clone()
         locs_cpu = batch.seq_lens_cpu.clone()
 
-    uses_page_aligned_alloc: bool = False
-    if allocator_page > 1 and not _is_npu:
+    if uses_page_aligned_alloc:
         assert token_per_req == 1
         allocated_old_cpu: torch.Tensor = torch.tensor(
             [req.kv.kv_allocated_len for req in batch.reqs],
@@ -765,8 +768,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
                 locs_cpu[crossing_indices_cpu],
                 allocated_old_cpu[crossing_indices_cpu],
             )
-        uses_page_aligned_alloc = True
-
     batch.maybe_evict_swa()
 
     if allocator_page == 1:
@@ -829,13 +830,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         for req, allocated_len in zip(batch.reqs, allocated_next_cpu.tolist()):
             req.kv.kv_allocated_len = allocated_len
 
-    gather_dtype: torch.dtype = (
-        out_dtype if uses_page_aligned_alloc else out_cache_loc.dtype
-    )
-    gathered: torch.Tensor = batch.req_to_token_pool.req_to_token[
-        batch.req_pool_indices, locs
-    ].to(gather_dtype)
+    if uses_page_aligned_alloc:
+        out_cache_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, locs
+        ].to(out_dtype)
+    assert out_cache_loc is not None
     if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        gathered: torch.Tensor = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, locs
+        ].to(out_cache_loc.dtype)
         assert bool(torch.all(gathered != 0))
         if allocator_page == 1 or _is_npu:
             torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
@@ -864,8 +867,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
                     req.kv_committed_len,
                     allocator_page,
                 )
-    out_cache_loc = gathered
-
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
         maybe_write_dsv4_decode(
@@ -1013,15 +1014,16 @@ def alloc_for_spec_decode(
 
     row_count: int = req_to_token.shape[0]
     row_width: int = req_to_token.shape[1]
-    allocation_nxt_kv_lens_values: list[int] = []
+    cur_kv_lens_values: list[int] = cur_kv_lens_cpu.tolist()
+    allocation_nxt_kv_lens_values: list[int] = allocation_nxt_kv_lens_cpu.tolist()
     allocation_deltas: list[int] = []
-    for index, req in enumerate(reqs):
+    for index, (req, cur_kv_len, allocation_nxt_kv_len) in enumerate(
+        zip(reqs, cur_kv_lens_values, allocation_nxt_kv_lens_values)
+    ):
         req_pool_idx: Optional[int] = req.req_pool_idx
         assert req_pool_idx is not None
         assert 1 <= req_pool_idx < row_count, f"{req_pool_idx=}, {row_count=}, {index=}"
         assert req.kv is not None, f"missing kv allocation state for request {index}"
-        cur_kv_len: int = int(cur_kv_lens_cpu[index])
-        allocation_nxt_kv_len: int = int(allocation_nxt_kv_lens_cpu[index])
         assert req.kv.kv_allocated_len == cur_kv_len, (
             f"request {index} allocation watermark mismatch: "
             f"host={req.kv.kv_allocated_len}, cpu_mirror={cur_kv_len}"
@@ -1044,7 +1046,6 @@ def alloc_for_spec_decode(
                 f"request {index} allocation delta is not page-aligned: "
                 f"{allocation_delta=}, {allocator_page=}"
             )
-        allocation_nxt_kv_lens_values.append(allocation_nxt_kv_len)
         allocation_deltas.append(allocation_delta)
 
     allocation_num_needed_tokens: int = sum(allocation_deltas)

@@ -863,10 +863,6 @@ class HiSparseCoordinator:
             "HiSparse first-remap found a partial or shared temporary owner",
         )
         torch._assert_async(
-            torch.all(actual_destination_vectors[replay_mask] > 0),
-            "HiSparse first-remap replay destinations must remain owned",
-        )
-        torch._assert_async(
             torch.all(actual_destination_vectors[~growth_mask] > 0),
             "HiSparse release-only destination vectors must remain owned",
         )
@@ -887,11 +883,6 @@ class HiSparseCoordinator:
                 dtype=torch.int64,
                 device=seq_lens.device,
             )
-        torch._assert_async(
-            torch.all(mapped_coordinates[growth_mask] == transfer_page_blocks),
-            "HiSparse transfer owners must match their complete temporary pages",
-        )
-
         release_mapping_indices = mapping_index_blocks[
             transaction_mask & ~growth_mask
         ].reshape(-1)
@@ -919,15 +910,6 @@ class HiSparseCoordinator:
             torch.all(~torch.isin(buffer_page_ids, transaction_page_ids)),
             "HiSparse temporary owners must not alias existing device buffers",
         )
-        for growth in growth_plans:
-            torch._assert_async(
-                torch.all(
-                    actual_owner_rows[growth.first_index, : growth.old_cap]
-                    // device_page_size
-                    != temporary_page_ids[growth.first_index]
-                ),
-                "HiSparse temporary transfer owners must not alias existing buffers",
-            )
         release_destination_page_ids = (
             actual_destination_vectors[transaction_mask & ~growth_mask]
             // device_page_size

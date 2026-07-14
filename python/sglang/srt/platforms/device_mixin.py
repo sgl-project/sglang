@@ -132,6 +132,9 @@ class DeviceMixin:
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
 
+    def is_unspecified(self) -> bool:
+        return self._enum == PlatformEnum.UNSPECIFIED
+
     def is_cuda_alike(self) -> bool:
         """True for CUDA, ROCm, or MUSA (all expose CUDA-like APIs)."""
         return self._enum in (
