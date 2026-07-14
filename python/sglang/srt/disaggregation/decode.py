@@ -1615,11 +1615,11 @@ def alloc_for_decode_prealloc(
             else torch.tensor([-1], dtype=torch.int64, device=device)
         )
         if uses_swa_tail:
-            from sglang.srt.hardware_backend.npu.allocator_npu import (
-                alloc_extend_swa_tail_npu,
+            from sglang.srt.mem_cache.allocator.swa import (
+                alloc_extend_swa_tail_legacy_npu,
             )
 
-            kv_loc = alloc_extend_swa_tail_npu(
+            kv_loc = alloc_extend_swa_tail_legacy_npu(
                 allocator,
                 prefix_lens=torch.tensor(
                     [alloc_prefix_len], dtype=torch.int64, device=device
