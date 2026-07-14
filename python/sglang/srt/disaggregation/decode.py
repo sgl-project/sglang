@@ -68,6 +68,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import assert_alloc_extend_lens_page_aligned
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
@@ -1559,15 +1560,21 @@ def alloc_for_decode_prealloc_hisparse(
     swa_tail_len: int,
 ) -> torch.Tensor:
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
+    prefix_lens_cpu: torch.Tensor = torch.tensor([0], dtype=torch.int64)
+    seq_lens_cpu: torch.Tensor = torch.tensor([alloc_fill_len], dtype=torch.int64)
+    assert_alloc_extend_lens_page_aligned(
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+        extend_num_tokens=alloc_fill_len,
+        page_size=allocator.page_size,
+    )
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
         req.kv.kv_allocated_len = alloc_fill_len
     device = allocator.device
     prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
     seq_lens = torch.tensor([alloc_fill_len], dtype=torch.int64, device=device)
-    seq_lens_cpu = torch.tensor([alloc_fill_len], dtype=torch.int64)
     last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
@@ -1606,6 +1613,17 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
 ) -> torch.Tensor:
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
+    alloc_prefix_len: int = 0 if uses_swa_tail else total_prefix_len
+    prefix_lens_cpu: torch.Tensor = torch.tensor(
+        [alloc_prefix_len], dtype=torch.int64
+    )
+    seq_lens_cpu: torch.Tensor = torch.tensor([alloc_fill_len], dtype=torch.int64)
+    assert_alloc_extend_lens_page_aligned(
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+        extend_num_tokens=alloc_fill_len - alloc_prefix_len,
+        page_size=allocator.page_size,
+    )
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
@@ -1626,11 +1644,11 @@ def alloc_for_decode_prealloc(
             # SWA budget in that case may slightly under-estimate.
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                prefix_lens_cpu=prefix_lens_cpu,
                 seq_lens=torch.tensor(
                     [alloc_fill_len], dtype=torch.int64, device=device
                 ),
-                seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
+                seq_lens_cpu=seq_lens_cpu,
                 last_loc=last_loc,
                 extend_num_tokens=alloc_fill_len,
                 swa_tail_len=swa_tail_len,
@@ -1642,11 +1660,11 @@ def alloc_for_decode_prealloc(
                 prefix_lens=torch.tensor(
                     [total_prefix_len], dtype=torch.int64, device=device
                 ),
-                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                prefix_lens_cpu=prefix_lens_cpu,
                 seq_lens=torch.tensor(
                     [alloc_fill_len], dtype=torch.int64, device=device
                 ),
-                seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
+                seq_lens_cpu=seq_lens_cpu,
                 last_loc=last_loc,
                 extend_num_tokens=alloc_fill_len - total_prefix_len,
             )

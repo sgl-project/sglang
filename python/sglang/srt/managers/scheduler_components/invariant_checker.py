@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
+    is_npu,
     raise_error_or_warn,
 )
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -35,9 +36,30 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+
+
+def _assert_kv_allocation_watermark_page_aligned(
+    *,
+    allocated_len: int,
+    committed_len: int,
+    alloc_page_size: int,
+    label: str,
+) -> None:
+    if _is_npu:
+        return
+
+    assert allocated_len % alloc_page_size == 0, (
+        f"kv_allocated_len must be page-aligned: {label}, "
+        f"{allocated_len=}, {alloc_page_size=}"
+    )
+    assert allocated_len >= ceil_align(committed_len, alloc_page_size), (
+        f"kv_allocated_len must cover committed KV: {label}, "
+        f"{allocated_len=}, {committed_len=}, {alloc_page_size=}"
+    )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -250,9 +272,16 @@ class SchedulerInvariantChecker:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+                alloc_page_size: int = self.token_to_kv_pool_allocator.page_size
+                _assert_kv_allocation_watermark_page_aligned(
+                    allocated_len=allocated_len,
+                    committed_len=req.kv_committed_len,
+                    alloc_page_size=alloc_page_size,
+                    label=f"req {req.rid}",
+                )
+                if alloc_page_size > 1:
+                    allocated_len = ceil_align(allocated_len, alloc_page_size)
+                    assert req.cache_protected_len % alloc_page_size == 0
 
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
@@ -309,6 +338,12 @@ class SchedulerInvariantChecker:
 
         def _add_owner(req_or_slot, label, rpi, committed, allocated):
             assert 0 <= committed <= allocated <= row_width
+            _assert_kv_allocation_watermark_page_aligned(
+                allocated_len=allocated,
+                committed_len=committed,
+                alloc_page_size=self.token_to_kv_pool_allocator.page_size,
+                label=label,
+            )
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []

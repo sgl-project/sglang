@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.disaggregation import decode
+from sglang.srt.mem_cache import allocation
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -39,6 +40,35 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
             locations = decode.alloc_for_decode_prealloc(
                 req=req,
                 allocator=allocator,
+                total_prefix_len=4,
+                prefix_len=4,
+                prefix_indices=torch.tensor([5, 6, 7, 8], dtype=torch.int64),
+                fill_len=5,
+                delta_len=1,
+                uses_swa_tail=False,
+                swa_tail_len=0,
+            )
+
+        self.assertEqual(req.kv.kv_allocated_len, 8)
+        self.assertEqual(locations.numel(), 4)
+        self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
+        self.assertEqual(allocator.calls[0]["extend_num_tokens"], 4)
+
+    def test_decode_prealloc_rejects_misalignment_before_watermark_write(self) -> None:
+        """PD preallocation rejects a partial prefix before mutating request state."""
+        allocator = _Allocator()
+        req = SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=4, swa_evicted_seqlen=0)
+        )
+
+        with (
+            mock.patch.object(decode, "_is_npu", False),
+            mock.patch.object(allocation, "_is_npu", False),
+            self.assertRaisesRegex(AssertionError, "prefix lens"),
+        ):
+            decode.alloc_for_decode_prealloc(
+                req=req,
+                allocator=allocator,
                 total_prefix_len=3,
                 prefix_len=3,
                 prefix_indices=torch.tensor([5, 6, 7], dtype=torch.int64),
@@ -48,10 +78,8 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
                 swa_tail_len=0,
             )
 
-        self.assertEqual(req.kv.kv_allocated_len, 8)
-        self.assertEqual(locations.numel(), 5)
-        self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
-        self.assertEqual(allocator.calls[0]["extend_num_tokens"], 5)
+        self.assertEqual(req.kv.kv_allocated_len, 4)
+        self.assertEqual(allocator.calls, [])
 
     def test_hisparse_prealloc_rounds_logical_capacity(self) -> None:
         """HiSparse preallocation publishes slots through the aligned endpoint."""
@@ -99,7 +127,10 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
         allocator = _Allocator()
         req = SimpleNamespace(kv=None)
 
-        with mock.patch.object(decode, "_is_npu", True):
+        with (
+            mock.patch.object(decode, "_is_npu", True),
+            mock.patch.object(allocation, "_is_npu", True),
+        ):
             locations = decode.alloc_for_decode_prealloc(
                 req=req,
                 allocator=allocator,

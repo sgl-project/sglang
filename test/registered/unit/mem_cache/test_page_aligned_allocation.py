@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
     alloc_for_spec_decode,
+    alloc_paged_token_slots_extend,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
@@ -25,6 +26,34 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPageAlignedAllocation(unittest.TestCase):
+    def test_extend_entry_rejects_misalignment_before_eviction(self) -> None:
+        """Extend rejects a malformed page request before eviction or allocation."""
+        allocator = SimpleNamespace(
+            page_size=4,
+            alloc_extend=mock.Mock(
+                side_effect=AssertionError("allocator must not mutate")
+            ),
+        )
+        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(allocation_module, "evict_from_tree_cache") as evict,
+            self.assertRaisesRegex(AssertionError, "prefix lens"),
+        ):
+            alloc_paged_token_slots_extend(
+                tree_cache=tree_cache,
+                prefix_lens=torch.tensor([2], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([2], dtype=torch.int64),
+                seq_lens=torch.tensor([8], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([8], dtype=torch.int64),
+                last_loc=torch.tensor([11], dtype=torch.int64),
+                extend_num_tokens=6,
+            )
+
+        evict.assert_not_called()
+        allocator.alloc_extend.assert_not_called()
+
     def test_extend_separates_physical_and_forward_lengths(self) -> None:
         """Extend publishes aligned capacity but gathers only logical tokens."""
         req = SimpleNamespace(
@@ -234,6 +263,36 @@ class TestPageAlignedAllocation(unittest.TestCase):
         self.assertEqual(producer.call_args.args[4].tolist(), [8])
         self.assertEqual(producer.call_args.args[6], 4)
         self.assertEqual(req.kv.kv_allocated_len, 8)
+
+    def test_spec_decode_rejects_misaligned_watermark_before_allocation(self) -> None:
+        """Spec decode rejects a malformed watermark before any allocator lookup."""
+        allocator = SimpleNamespace(page_size=4)
+        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((2, 16), dtype=torch.int32)
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=3))
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(allocation_module, "get_last_loc") as get_last_loc,
+            self.assertRaisesRegex(AssertionError, "prefix lens"),
+        ):
+            alloc_for_spec_decode(
+                tree_cache=tree_cache,
+                req_to_token_pool=req_to_token_pool,
+                reqs=[req],
+                req_pool_indices=torch.tensor([1], dtype=torch.int64),
+                cur_kv_lens=torch.tensor([3], dtype=torch.int64),
+                cur_kv_lens_cpu=torch.tensor([3], dtype=torch.int64),
+                nxt_kv_lens=torch.tensor([5], dtype=torch.int64),
+                nxt_kv_lens_cpu=torch.tensor([5], dtype=torch.int64),
+                num_needed_tokens=2,
+                batch=SimpleNamespace(device=torch.device("cpu")),
+            )
+
+        get_last_loc.assert_not_called()
+        self.assertEqual(req.kv.kv_allocated_len, 3)
 
     def test_release_accepts_only_the_committed_partial_page(self) -> None:
         """Release permits over-allocation only through the committed page."""

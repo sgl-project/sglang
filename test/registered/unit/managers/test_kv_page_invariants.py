@@ -2,9 +2,16 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.managers.scheduler_components import (
+    invariant_checker as invariant_checker_module,
+)
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    _assert_kv_allocation_watermark_page_aligned,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -91,16 +98,48 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :3] = torch.tensor(
             [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
         )
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 3, 3)])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeReq("a", 0, 3, _PAGE_SIZE)]
+        )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
         rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 1, 1)])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeReq("a", 0, 1, _PAGE_SIZE)]
+        )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
+
+    def test_misaligned_watermark_raises(self) -> None:
+        """A non-NPU request owner must publish page-aligned capacity."""
+        chk, rtt, tc, alloc = _make_checker()
+        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 1, 3)])
+
+        with self.assertRaisesRegex(AssertionError, "must be page-aligned"):
+            chk._check_kv_page_invariants()
+
+    def test_watermark_must_cover_committed_page(self) -> None:
+        """A request watermark must cover the page containing committed KV."""
+        with self.assertRaisesRegex(AssertionError, "must cover committed KV"):
+            _assert_kv_allocation_watermark_page_aligned(
+                allocated_len=_PAGE_SIZE,
+                committed_len=_PAGE_SIZE + 1,
+                alloc_page_size=_PAGE_SIZE,
+                label="req a",
+            )
+
+    def test_npu_watermark_uses_legacy_real_length(self) -> None:
+        """NPU watermark validation preserves the legacy real-length carve-out."""
+        with mock.patch.object(invariant_checker_module, "_is_npu", True):
+            _assert_kv_allocation_watermark_page_aligned(
+                allocated_len=3,
+                committed_len=3,
+                alloc_page_size=_PAGE_SIZE,
+                label="req a",
+            )
 
 
 if __name__ == "__main__":
