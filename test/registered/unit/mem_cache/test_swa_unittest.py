@@ -104,21 +104,8 @@ def _build_swa_tree(
     return tree, allocator, req_to_token_pool
 
 
-def _swa_alloc(allocator, need_size):
-    """SWA-pool alloc that also works for page_size > 1 (built-in alloc asserts page_size == 1)."""
-    if allocator.page_size == 1:
-        return allocator.alloc(need_size)
-
-    assert need_size % allocator.page_size == 0
-    full_indices = allocator.full_attn_allocator.alloc(need_size)
-    swa_indices = allocator.swa_attn_allocator.alloc(need_size)
-    assert full_indices is not None and swa_indices is not None
-    allocator.full_to_swa_index_mapping[full_indices] = swa_indices
-    return full_indices
-
-
 def _insert(tree, allocator, token_ids):
-    indices = _swa_alloc(allocator, len(token_ids))
+    indices = allocator.alloc(len(token_ids))
     assert indices is not None
     tree.insert(InsertParams(key=RadixKey(array("q", token_ids)), value=indices))
 
@@ -288,7 +275,8 @@ class TestSWA(unittest.TestCase):
             sliding_window_size=page_size,
         )
 
-        full_indices = _swa_alloc(allocator, page_size)
+        full_indices = allocator.alloc(page_size)
+        self.assertIsNotNone(full_indices)
         self.assertEqual(allocator.swa_available_size(), 16 - page_size)
 
         allocator.free_swa(full_indices[:1])
