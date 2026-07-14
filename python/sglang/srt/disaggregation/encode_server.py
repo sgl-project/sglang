@@ -281,9 +281,7 @@ class MMEncoder:
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
-        self.model_type = getattr(
-            self.model_config.hf_config, "model_type", "unknown"
-        ).lower()
+        self.model_type = self.model_config.hf_config.model_type.lower()
 
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank

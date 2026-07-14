@@ -784,7 +784,7 @@ class WaitingImageRequest:
                 # No data available yet, wait a bit and retry
                 return
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
+            if recv_obj.error_msg is not None:
                 logger.warning(
                     f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
                 )
@@ -1123,7 +1123,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 return
 
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
+            if recv_obj.error_msg is not None:
                 logger.warning(f"Received error for {self.rid}: {recv_obj.error_msg}")
                 self.error_msg = recv_obj.error_msg
                 self.error_code = recv_obj.error_code
@@ -1442,9 +1442,7 @@ class MMReceiverBase(ABC):
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
 
         self.model_type = (
-            getattr(hf_config, "model_type", "").lower()
-            if hf_config is not None
-            else None
+            hf_config.model_type.lower() if hf_config is not None else None
         )
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
@@ -1465,7 +1463,7 @@ class MMReceiverBase(ABC):
             self.embedding_pool = None
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
             if pool_mb and pool_mb > 0 and scheduler is not None:
-                gpu_id = getattr(scheduler, "gpu_id", 0)
+                gpu_id = scheduler.ps.gpu_id
                 try:
                     self.embedding_pool = MooncakeEmbeddingPool(
                         self.embeddings_engine, gpu_id, pool_mb * 1024 * 1024
@@ -1484,7 +1482,7 @@ class MMReceiverBase(ABC):
                     server_args,
                     hf_config,
                     model_config=(
-                        getattr(self.scheduler, "model_config", None)
+                        self.scheduler.model_config
                         if self.scheduler is not None
                         else None
                     ),
@@ -1501,7 +1499,7 @@ class MMReceiverBase(ABC):
         import_processors("sglang.srt.multimodal.processors")
 
         extra_kwargs = {}
-        if getattr(server_args, "tokenizer_backend", None) is not None:
+        if server_args.tokenizer_backend is not None:
             extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
 
         _processor = None
@@ -1627,10 +1625,10 @@ class MMReceiverBase(ABC):
                 if not parts:
                     continue
                 recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-                if getattr(recv_obj, "error_msg", None) is not None:
+                if recv_obj.error_msg is not None:
                     logger.warning(
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
-                        f"error_code={getattr(recv_obj, 'error_code', None)}"
+                        f"error_code={recv_obj.error_code}"
                     )
                     self._cleanup_mooncake_buffer(req_id)
                     return None
@@ -1900,7 +1898,7 @@ class MMReceiverBase(ABC):
             f"Pre-allocating GPU buffer for mooncake RDMA: "
             f"req_id={req_id}, size={total_bytes} bytes"
         )
-        gpu_id = getattr(self.scheduler, "gpu_id", 0)
+        gpu_id = self.scheduler.ps.gpu_id
         embeddings = torch.empty(total_bytes, dtype=torch.uint8, device=gpu_id)
         self.embeddings_engine.register(
             embeddings.data_ptr(),
@@ -2021,7 +2019,7 @@ class MMReceiverHTTP(MMReceiverBase):
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
-            gpu_id = getattr(self.scheduler, "gpu_id", 0)
+            gpu_id = self.scheduler.ps.gpu_id
             return self._process_waiting_requests(
                 recv_reqs,
                 WaitingImageRDMARequest,

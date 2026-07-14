@@ -209,7 +209,7 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
-        req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
+        req_to_token_pool = self.scheduler.req_to_token_pool
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
@@ -431,7 +431,7 @@ class SchedulerDisaggregationPrefillMixin:
         if prefetch is None:
             return
         for req in batch.reqs:
-            room = getattr(req, "bootstrap_room", None)
+            room = req.bootstrap_room
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 

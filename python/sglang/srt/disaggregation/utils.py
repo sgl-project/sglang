@@ -816,7 +816,7 @@ def setup_state_kv_args(
                         ring_lens,
                         ring_item_lens,
                     )
-            if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
+            if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_c128_state_buf_infos()
                 )
