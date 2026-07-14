@@ -593,10 +593,8 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
-            compressed_cache_locs = (
-                self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
-                    out_cache_loc
-                )
+            compressed_cache_locs = self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
+                out_cache_loc
             )
             # ROCm: the decode remap creates a temporary hisparse device slot per
             # new token (via the page_size==1 allocator path). Free the stale
@@ -787,9 +785,11 @@ class HiSparseCoordinator:
         full_logical_blocks = self.req_to_token_pool.req_to_token[
             first_req_pool_indices[:, None], full_semantic_position_blocks
         ]
-        expected_mapping_index_blocks = allocator.translate_latest_cache_locs_to_compressed(
-            full_logical_blocks
-        ).to(dtype=torch.int64)
+        expected_mapping_index_blocks = (
+            allocator.translate_latest_cache_locs_to_compressed(full_logical_blocks).to(
+                dtype=torch.int64
+            )
+        )
         torch._assert_async(
             torch.all(expected_mapping_index_blocks == mapping_index_blocks),
             "HiSparse first-remap key blocks must match allocated request rows",

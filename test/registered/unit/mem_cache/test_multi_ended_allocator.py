@@ -1480,9 +1480,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         self.assertIsNotNone(out)
         assert out is not None
         consumed_pages = free_before[:2]
-        self.assertTrue(
-            torch.equal(out.view(2, PS)[:, 0] // PS, consumed_pages)
-        )
+        self.assertTrue(torch.equal(out.view(2, PS)[:, 0] // PS, consumed_pages))
         v2p_values = full_alloc.virtual_to_physical[consumed_pages]
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
             self.assertNotEqual(
@@ -1557,12 +1555,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             int(full_alloc.free_virtual_ids.numel()),
             int(free_before.numel()),
         )
-        self.assertEqual(
-            int(full_alloc.virtual_to_physical[allocated_page].item()), -1
-        )
-        self.assertEqual(
-            int(full_alloc.physical_to_virtual[physical_page].item()), -1
-        )
+        self.assertEqual(int(full_alloc.virtual_to_physical[allocated_page].item()), -1)
+        self.assertEqual(int(full_alloc.physical_to_virtual[physical_page].item()), -1)
 
     # 12. translate_kv_loc preserves token-level identity end-to-end.
     def test_paged_translate_kv_loc_token_round_trip(self):

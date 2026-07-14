@@ -86,9 +86,7 @@ class _FakeHiSparseAllocator:
         self.translate_latest_calls += 1
         if self.compress_ratio == 1:
             return latest_cache_locs
-        return (
-            latest_cache_locs - (self.compress_ratio - 1)
-        ) // self.compress_ratio
+        return (latest_cache_locs - (self.compress_ratio - 1)) // self.compress_ratio
 
     def collect_owned_hisparse_page_ids(
         self,
