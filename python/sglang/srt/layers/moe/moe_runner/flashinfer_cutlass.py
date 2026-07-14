@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -23,7 +24,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 

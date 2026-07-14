@@ -521,6 +521,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "llama",
             dllm_algorithm="LowConfidence",
             disable_radix_cache=True,
+            attention_backend="triton",
         )
         self.assertEqual(sa.attention_backend, "flashinfer")  # materialized
         self.assertIn(
@@ -1825,9 +1826,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "deepep"},
@@ -1837,9 +1836,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "megamoe"},
