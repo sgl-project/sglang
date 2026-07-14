@@ -37,6 +37,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
@@ -1239,13 +1240,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.forward_mode.is_target_verify()
             and self.model_runner.spec_algorithm.is_dflash_family()
         )
-        # Exception: breakable-graph verify replays (captured forward metadata)
-        # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead.
-        read_done_post_replay = (
-            publish_read_done
-            and forward_batch.forward_mode.is_target_verify()
-            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        # Hybrid linear-attention DECODE keeps reading shared recurrent state
+        # during replay. Breakable-graph verify with captured forward metadata
+        # likewise re-reads req_to_token during replay. In both cases, publish
+        # the event only after replay finishes.
+        is_mambaish_decode = (
+            forward_batch.forward_mode.is_decode()
+            and mambaish_config(self.model_runner.model_config) is not None
+        )
+        read_done_post_replay = publish_read_done and (
+            is_mambaish_decode
+            or (
+                forward_batch.forward_mode.is_target_verify()
+                and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            )
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
