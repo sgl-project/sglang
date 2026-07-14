@@ -1876,12 +1876,20 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2490,16 +2498,14 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
+                req.finished_reason = FINISH_ABORT(
+                    "Request waiting timeout reached.",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self._release_waiting_queue_abort_resources(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
-                        },
+                        finished_reason=req.finished_reason.to_json(),
                         rid=req.rid,
                     ),
                     req,
@@ -2510,6 +2516,37 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+
+    def _release_waiting_queue_abort_resources(self, req: Req):
+        if not isinstance(getattr(req, "finished_reason", None), FINISH_ABORT):
+            req.finished_reason = FINISH_ABORT()
+
+        if self.enable_hicache_storage:
+            # Release prefetch events associated with the request
+            self.tree_cache.release_aborted_request(req.rid)
+        elif self.enable_hierarchical_cache:
+            self.tree_cache.terminate_prefetch(req.rid)
+
+        # For disaggregation decode mode, the request in the waiting queue has
+        # KV cache allocated.
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            release_kv_cache(req, self.tree_cache)
+
+        # For disaggregation prefill mode, free the metadata buffer index.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            disagg_kv_sender = getattr(req, "disagg_kv_sender", None)
+            if disagg_kv_sender is not None and hasattr(disagg_kv_sender, "abort"):
+                disagg_kv_sender.abort()
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+
+        # For mamba radix cache
+        if (
+            req.mamba_pool_idx is not None
+            and self.disaggregation_mode != DisaggregationMode.DECODE
+        ):
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def handle_embedding_request(
         self,
@@ -4024,33 +4061,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
+            self._release_waiting_queue_abort_resources(req)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-            # For mamba radix cache
-            if (
-                req.mamba_pool_idx is not None
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
