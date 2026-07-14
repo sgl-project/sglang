@@ -48,14 +48,6 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     full_concat_embeddings,
 )
-from sglang.multimodal_gen.runtime.utils.vision import (
-    load_image,
-    load_video,
-    normalize,
-    numpy_to_pt,
-    pil_to_numpy,
-    resize,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
@@ -79,6 +71,14 @@ from sglang.multimodal_gen.runtime.realtime.states import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import (
+    load_image,
+    load_video,
+    normalize,
+    numpy_to_pt,
+    pil_to_numpy,
+    resize,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)

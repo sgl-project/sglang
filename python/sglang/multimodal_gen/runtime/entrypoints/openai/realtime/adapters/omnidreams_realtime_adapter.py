@@ -29,6 +29,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
 )
+from sglang.multimodal_gen.runtime.realtime.control_signals import (
+    ControlSignalQueue,
+    ControlSignalSamplingParams,
+)
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     normalize,
@@ -36,11 +41,6 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     pil_to_numpy,
     resize,
 )
-from sglang.multimodal_gen.runtime.realtime.control_signals import (
-    ControlSignalQueue,
-    ControlSignalSamplingParams,
-)
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
