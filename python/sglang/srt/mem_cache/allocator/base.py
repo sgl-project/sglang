@@ -86,8 +86,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         expected_device = torch.device(self.device)
         actual_device = free_index.device
         device_matches = actual_device == expected_device or (
-            expected_device.index is None
-            and actual_device.type == expected_device.type
+            expected_device.index is None and actual_device.type == expected_device.type
         )
         assert device_matches, (
             f"{type(self).__name__}.free indices are on {actual_device}, "

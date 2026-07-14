@@ -431,8 +431,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 <= self.full_attn_allocator.size
             )
             assert (
-                self.swa_attn_allocator.available_size()
-                <= self.swa_attn_allocator.size
+                self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
             )
             return
 
@@ -490,9 +489,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if _is_npu:
             pages = torch.unique(indices // self.page_size)
         else:
-            pages = (
-                indices[:: self.page_size].to(dtype=torch.int64) // self.page_size
-            )
+            pages = indices[:: self.page_size].to(dtype=torch.int64) // self.page_size
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )
