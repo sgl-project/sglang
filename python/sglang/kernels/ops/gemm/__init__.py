@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
@@ -108,7 +109,122 @@ def dsv3_router_gemm(
     return impl(hidden_states, router_weights, out_dtype, output)
 
 
-__all__ = ["fp8_scaled_mm", "dsv3_fused_a_gemm", "dsv3_router_gemm"]
+class Nvfp4GemmOp(BaseFusedOp):
+    """NVFP4 dense GEMM: one FlashInfer ``mm_fp4`` sub-kernel per backend.
+
+    All four backends share one underlying call (``flashinfer.mm_fp4``) with
+    a different ``backend=`` string; each is still registered as its own
+    :class:`KernelBackend` so callers (e.g. ``--fp4-gemm-backend``) can force
+    one explicitly via ``forward(..., backend=KernelBackend.FLASHINFER_CUTLASS)``.
+    A Marlin weight-only fallback exists but is a structurally different,
+    dequant-based code path selected upstream by the caller, so it is not a
+    backend of this op.
+    """
+
+    op = "gemm.nvfp4"
+    priority = (
+        KernelBackend.FLASHINFER_CUTEDSL,
+        KernelBackend.FLASHINFER_CUTLASS,
+        KernelBackend.FLASHINFER_TRTLLM,
+        KernelBackend.FLASHINFER_CUDNN,
+    )
+    capabilities = {
+        KernelBackend.FLASHINFER_CUTEDSL: _CUDA,
+        KernelBackend.FLASHINFER_CUTLASS: _CUDA,
+        KernelBackend.FLASHINFER_TRTLLM: _CUDA,
+        KernelBackend.FLASHINFER_CUDNN: _CUDA,
+    }
+    descriptions = {
+        KernelBackend.FLASHINFER_CUTEDSL: "FlashInfer CuTe DSL NVFP4 GEMM (SM100).",
+        KernelBackend.FLASHINFER_CUTLASS: "FlashInfer CUTLASS NVFP4 GEMM.",
+        KernelBackend.FLASHINFER_TRTLLM: "FlashInfer TRTLLM NVFP4 GEMM.",
+        KernelBackend.FLASHINFER_CUDNN: "FlashInfer cuDNN NVFP4 GEMM.",
+    }
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_sf: torch.Tensor,
+        weight_sf: torch.Tensor,
+        alpha: torch.Tensor,
+        out_dtype: torch.dtype,
+        out_features: int,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "gemm.nvfp4: no pure-torch reference; requires flashinfer's mm_fp4 "
+            "(or a weight-only Marlin fallback, selected separately by the caller)."
+        )
+
+    def _call_flashinfer(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_sf: torch.Tensor,
+        weight_sf: torch.Tensor,
+        alpha: torch.Tensor,
+        out_dtype: torch.dtype,
+        out_features: int,
+        backend: str,
+    ) -> torch.Tensor:
+        from flashinfer import mm_fp4
+
+        # `out_features` is only used by callers for fake-mode shape inference
+        # (see modelopt_quant.fp4_gemm); flashinfer's `mm_fp4` doesn't take it.
+        return mm_fp4(
+            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+        )
+
+    def forward_flashinfer_cutedsl(self, *args, **kwargs) -> torch.Tensor:
+        return self._call_flashinfer(*args, **kwargs, backend="cute-dsl")
+
+    def forward_flashinfer_cutlass(self, *args, **kwargs) -> torch.Tensor:
+        return self._call_flashinfer(*args, **kwargs, backend="cutlass")
+
+    def forward_flashinfer_trtllm(self, *args, **kwargs) -> torch.Tensor:
+        return self._call_flashinfer(*args, **kwargs, backend="trtllm")
+
+    def forward_flashinfer_cudnn(self, *args, **kwargs) -> torch.Tensor:
+        return self._call_flashinfer(*args, **kwargs, backend="cudnn")
+
+
+_NVFP4_GEMM = register_fused_op(Nvfp4GemmOp(), __name__, "_NVFP4_GEMM")
+
+
+def nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+    backend: Optional[KernelBackend] = None,
+) -> torch.Tensor:
+    """Dense NVFP4 GEMM via FlashInfer's ``mm_fp4``.
+
+    Pass ``backend=`` to force a specific FlashInfer sub-kernel; omit it to
+    auto-select.
+    """
+    return _NVFP4_GEMM.forward(
+        input,
+        weight,
+        input_sf,
+        weight_sf,
+        alpha,
+        out_dtype,
+        out_features,
+        backend=backend,
+    )
+
+
+__all__ = [
+    "fp8_scaled_mm",
+    "dsv3_fused_a_gemm",
+    "dsv3_router_gemm",
+    "Nvfp4GemmOp",
+    "nvfp4_gemm",
+]
 
 
 # LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);

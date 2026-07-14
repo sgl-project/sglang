@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.gemm import nvfp4_gemm
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.utils.common import (
     get_device_capability,
@@ -168,88 +168,14 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
     return FP4_GEMM_RUNNER_BACKEND
 
 
-try:
-    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
-
-    enable_flashinfer_fp4_gemm = True
-except ImportError:
-    flashinfer_fp4_gemm = None
-    enable_flashinfer_fp4_gemm = False
-
-
-class Fp4GemmOp(BaseFusedOp):
-    """NVFP4 dense GEMM: one FlashInfer ``mm_fp4`` sub-kernel per
-    ``--fp4-gemm-backend`` value. The Marlin (weight-only) fallback is a
-    structurally different, dequant-based code path (`apply_fp4_marlin_linear`
-    in `marlin_utils_fp4.py`) selected upstream at the call site via
-    `get_fp4_gemm_runner_backend().is_marlin()`, so it is not a backend of
-    this op.
-    """
-
-    op = "gemm.nvfp4"
-    priority = (
-        KernelBackend.FLASHINFER_CUTEDSL,
-        KernelBackend.FLASHINFER_CUTLASS,
-        KernelBackend.FLASHINFER_TRTLLM,
-        KernelBackend.FLASHINFER_CUDNN,
-    )
-    descriptions = {
-        KernelBackend.FLASHINFER_CUTEDSL: "FlashInfer CuTe DSL NVFP4 GEMM (SM100).",
-        KernelBackend.FLASHINFER_CUTLASS: "FlashInfer CUTLASS NVFP4 GEMM.",
-        KernelBackend.FLASHINFER_TRTLLM: "FlashInfer TRTLLM NVFP4 GEMM.",
-        KernelBackend.FLASHINFER_CUDNN: "FlashInfer cuDNN NVFP4 GEMM.",
-    }
-
-    def backend_eligible(self, backend: KernelBackend, *args, **kwargs) -> bool:
-        return enable_flashinfer_fp4_gemm
-
-    def forward_native(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        input_sf: torch.Tensor,
-        weight_sf: torch.Tensor,
-        alpha: torch.Tensor,
-        out_dtype: torch.dtype,
-        out_features: int,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            "gemm.nvfp4: no pure-torch reference; NVFP4 GEMM requires flashinfer's "
-            "mm_fp4 (or the Marlin weight-only fallback, selected separately)."
-        )
-
-    def _call_flashinfer(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        input_sf: torch.Tensor,
-        weight_sf: torch.Tensor,
-        alpha: torch.Tensor,
-        out_dtype: torch.dtype,
-        out_features: int,
-        backend: str,
-    ) -> torch.Tensor:
-        # `out_features` only feeds the fake-mode shape inference on the
-        # `fp4_gemm` custom op (see modelopt_quant.py); flashinfer's `mm_fp4`
-        # does not take it.
-        return flashinfer_fp4_gemm(
-            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
-        )
-
-    def forward_flashinfer_cutedsl(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="cute-dsl")
-
-    def forward_flashinfer_cutlass(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="cutlass")
-
-    def forward_flashinfer_trtllm(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="trtllm")
-
-    def forward_flashinfer_cudnn(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="cudnn")
-
-
-_FP4_GEMM = Fp4GemmOp()
+# NVFP4 GEMM itself (the FlashInfer `mm_fp4` sub-kernels, one per backend) lives
+# in `sglang.kernels.ops.gemm.Nvfp4GemmOp` — it's a torch-free-import kernel
+# primitive, not srt-level state. This module only owns the srt-level
+# `--fp4-gemm-backend` -> `KernelBackend` translation. The Marlin (weight-only)
+# fallback is a structurally different, dequant-based code path
+# (`apply_fp4_marlin_linear` in `marlin_utils_fp4.py`) selected upstream at the
+# call site via `get_fp4_gemm_runner_backend().is_marlin()`, so it isn't part
+# of this translation. FlashInfer is a required dependency for NVFP4.
 
 _FP4_RUNNER_TO_KERNEL_BACKEND = {
     Fp4GemmRunnerBackend.FLASHINFER_CUDNN: KernelBackend.FLASHINFER_CUDNN,
@@ -269,12 +195,7 @@ def dispatch_fp4_gemm(
     out_features: int,
 ) -> torch.Tensor:
     """Dispatch a dense NVFP4 GEMM to the FlashInfer sub-kernel selected by
-    ``--fp4-gemm-backend`` (via `Fp4GemmOp`, a `sglang.kernels.fused_op.BaseFusedOp`).
-    """
-    if not enable_flashinfer_fp4_gemm:
-        raise RuntimeError(
-            "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."
-        )
+    ``--fp4-gemm-backend`` (via `sglang.kernels.ops.gemm.nvfp4_gemm`)."""
     fp4_backend = get_fp4_gemm_runner_backend()
     kernel_backend = _FP4_RUNNER_TO_KERNEL_BACKEND.get(fp4_backend)
     if kernel_backend is None:
@@ -282,7 +203,7 @@ def dispatch_fp4_gemm(
             f"fp4_gemm: unsupported --fp4-gemm-backend={fp4_backend} "
             "(expected one of the flashinfer_* backends)"
         )
-    return _FP4_GEMM.forward(
+    return nvfp4_gemm(
         input,
         weight,
         input_sf,

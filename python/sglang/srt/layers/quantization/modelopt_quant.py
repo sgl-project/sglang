@@ -32,7 +32,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp4_utils import (
     dispatch_fp4_gemm,
-    enable_flashinfer_fp4_gemm,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
@@ -1688,11 +1687,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
         x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
 
-        w = layer.weight
-        w_scale_interleaved = layer.weight_scale_interleaved
-        if enable_flashinfer_fp4_gemm:
-            w = layer.weight.T
-            w_scale_interleaved = layer.weight_scale_interleaved.T
+        w = layer.weight.T
+        w_scale_interleaved = layer.weight_scale_interleaved.T
 
         out = fp4_gemm(
             x_fp4,
