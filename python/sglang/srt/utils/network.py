@@ -222,9 +222,21 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    try:
+        mem = psutil.virtual_memory()
+        total_mem = mem.total / 1024**3
+        available_mem = mem.available / 1024**3
+    except Exception as e:
+        # psutil chokes on malformed /proc/meminfo lines. Seen on GB300
+        # (arm64) kernels: the value of "ShadowCallStack:" is printed with a
+        # fixed 8-char width, so once it reaches 8 digits the separating
+        # space disappears ("ShadowCallStack:10006144 kB") and psutil raises
+        # ValueError parsing "kB". Sizing the ZMQ buffers is a heuristic --
+        # fall back to OS defaults instead of failing server startup.
+        logger.warning(
+            "psutil.virtual_memory() failed (%s); using default ZMQ buffer size", e
+        )
+        total_mem = available_mem = 0
     if total_mem > 32 and available_mem > 16:
         buf_size = int(0.5 * 1024**3)
     else:
