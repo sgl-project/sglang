@@ -1104,7 +1104,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
     PAGE_SIZE = 8
 
-    def _build(self, n_full_pages=16, n_swa_pages=8, full_layer_num=2, swa_layer_num=2):
+    def _build(
+        self,
+        n_full_pages=16,
+        n_swa_pages=8,
+        full_layer_num=2,
+        swa_layer_num=2,
+        lazy_compaction: bool = False,
+    ):
         full_spec = MHASubPoolSpec(
             name="full",
             layer_num=full_layer_num,
@@ -1143,6 +1150,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
+            lazy_compaction=lazy_compaction,
         )
         swa_alloc = MultiEndedAllocator(
             kvcache=swa_kv,
@@ -1151,6 +1159,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
+            lazy_compaction=lazy_compaction,
         )
         full_alloc.bind_peer(swa_alloc)
         swa_alloc.bind_peer(full_alloc)
@@ -1297,13 +1306,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             v_page = t // self.PAGE_SIZE
             self.assertNotEqual(int(full_alloc.virtual_to_physical[v_page].item()), -1)
 
-    # 5. free() recovers pages via unique(// page_size) — matches upstream.
+    # 5. free() consumes complete page blocks through strided representatives.
     # REGRESSION: `allocated_count()` MUST return
     # TOKENS, not pages -- matching upstream's convention that all external
     # capacity methods report tokens. At page_size > 1, returning pages
     # here breaks the leak invariant
     # (`available + evictable + ... == total`, with all terms in tokens).
-    def test_paged_free_unique_by_page(self):
+    def test_paged_free_uses_complete_page_blocks(self):
+        """Paged eager free releases each complete page exactly once."""
         _, full_alloc, _, full_kv, _ = self._build()
         a = full_alloc.alloc(self.PAGE_SIZE * 2)  # 2 pages = 2*PS tokens
         allocated_count_before = full_alloc.allocated_count()
@@ -1311,11 +1321,49 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(allocated_count_before, 2 * self.PAGE_SIZE)
         # Internal page count.
         self.assertEqual(full_alloc._allocated_pages(), 2)
-        # Free a SUBSET of tokens — but covering all tokens of both pages.
-        # (Matches the upstream contract: caller passes coherent ranges.)
+        # Free all tokens from both complete pages.
+        # The allocator consumes one strided representative per coherent page block.
         full_alloc.free(a)
         self.assertEqual(full_alloc.allocated_count(), 0)
         self.assertEqual(full_alloc._allocated_pages(), 0)
+
+    def test_paged_lazy_free_uses_complete_page_blocks(self):
+        """Paged lazy free releases strided pages while preserving v2p and p2v."""
+        _, full_alloc, _, _, _ = self._build(lazy_compaction=True)
+        indices = full_alloc.alloc(self.PAGE_SIZE * 2)
+        virtual_pages = indices[:: self.PAGE_SIZE] // self.PAGE_SIZE
+        physical_pages = full_alloc.virtual_to_physical[virtual_pages].clone()
+
+        full_alloc.free(indices)
+
+        self.assertTrue(torch.all(full_alloc.virtual_to_physical[virtual_pages] == -1))
+        self.assertTrue(torch.all(full_alloc.physical_to_virtual[physical_pages] == -1))
+        self.assertCountEqual(
+            full_alloc._free_phys_pages.tolist(),
+            physical_pages.tolist(),
+        )
+        self.assertEqual(full_alloc.live_page_count, 0)
+
+    def test_paged_free_rejects_partial_page_in_eager_and_lazy_modes(self):
+        """Paged eager and lazy free reject partial input before mapping mutation."""
+        for lazy_compaction in (False, True):
+            with self.subTest(lazy_compaction=lazy_compaction):
+                _, full_alloc, _, _, _ = self._build(
+                    lazy_compaction=lazy_compaction
+                )
+                indices = full_alloc.alloc(self.PAGE_SIZE)
+                virtual_page = indices[0] // self.PAGE_SIZE
+                physical_page = full_alloc.virtual_to_physical[virtual_page].clone()
+
+                with self.assertRaisesRegex(AssertionError, "complete page blocks"):
+                    full_alloc.free(indices[:-1])
+
+                self.assertTrue(
+                    torch.equal(
+                        full_alloc.virtual_to_physical[virtual_page],
+                        physical_page,
+                    )
+                )
 
     # 6. take_physical overflow check (grow-up direction).
     def test_paged_take_physical_overflow_check(self):
