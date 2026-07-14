@@ -97,6 +97,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
+    def validate_main_page_aligned_alloc(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support page-aligned main allocation"
+        )
+
     def resize(self, config) -> None:
         self.size = config.max_total_num_tokens
         if self.page_size > 1:

@@ -324,6 +324,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def validate_main_page_aligned_alloc(self) -> None:
+        return None
+
     def alloc(self, need_size: int):
         assert self.is_not_in_free_group
         assert need_size >= 0, f"{need_size=}"
@@ -597,6 +600,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def validate_main_page_aligned_alloc(self) -> None:
+        return None
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)

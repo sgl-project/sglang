@@ -710,6 +710,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- alloc --
 
+    def validate_main_page_aligned_alloc(self) -> None:
+        return None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         """Allocate `need_size` virtual TOKEN ids (id-owner only). Returns
         token-granular, page-structured ids, or None on shortfall.
@@ -1808,6 +1811,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def validate_main_page_aligned_alloc(self) -> None:
+        return None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedMambaAlloc.alloc"):
             return self.full_attn_allocator.alloc(need_size)
@@ -2178,6 +2184,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def validate_main_page_aligned_alloc(self) -> None:
+        return None
 
     def translate_kv_loc(
         self,

@@ -218,6 +218,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def validate_main_page_aligned_alloc(self) -> None:
+        return None
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
