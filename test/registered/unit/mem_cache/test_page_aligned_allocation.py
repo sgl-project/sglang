@@ -279,7 +279,9 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 "alloc_paged_token_slots_extend",
                 return_value=physical_slots,
             ) as legacy_producer,
-            mock.patch.object(allocation_module, "alloc_token_slots") as direct_producer,
+            mock.patch.object(
+                allocation_module, "alloc_token_slots"
+            ) as direct_producer,
             mock.patch.object(
                 allocation_module,
                 "_compute_dsv4_state_lens",
@@ -297,7 +299,9 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         validate.assert_not_called()
         direct_producer.assert_not_called()
-        self.assertEqual(legacy_producer.call_args.kwargs["prefix_lens_cpu"].tolist(), [2])
+        self.assertEqual(
+            legacy_producer.call_args.kwargs["prefix_lens_cpu"].tolist(), [2]
+        )
         self.assertEqual(legacy_producer.call_args.kwargs["seq_lens_cpu"].tolist(), [5])
         self.assertEqual(legacy_producer.call_args.kwargs["last_loc"].tolist(), [12])
         self.assertEqual(legacy_producer.call_args.kwargs["extend_num_tokens"], 3)
