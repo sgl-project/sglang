@@ -28,17 +28,24 @@ limitations under the License.
 // "two_dot"/"grouped" variants (128+64 chained tl.dot), so the nope half can
 // come out bitwise identical to them.
 //
-// Phase-1 design (correctness first):
+// Phase-2 design (2 CTAs/SM + double-buffered B):
 //   grid = (ceil(T / 128), H); one CTA = two WGMMA warpgroups (256 threads)
 //   owning a 128-row m-tile of one head (warpgroup w computes rows
-//   [64w, 64w+64)).  A tile [128, K] bf16 is cp.async'd to smem once; the
-//   N=512 output is produced in four BN=128 n-slabs, each slab loading B
-//   [128, K] bf16 to smem (single-buffered, shared by both warpgroups) and
-//   running an SS WGMMA m64n128k16 chain per warpgroup.  The B-slab load of
-//   slab nb+1 overlaps the fp8 store epilogue of slab nb; the rope path
-//   overlaps the initial cp.async.  smem = (128 + 128) * K * 2 bytes = 96 KB
-//   at K=192, so 2 CTAs/SM cover the remaining load/compute serialization
-//   across CTAs.
+//   [64w, 64w+64)).  The A tile [128, K] bf16 is cp.async'd to smem once (L2
+//   evict_first: streamed) and the rope path runs under that load's wait.
+//   The N=512 output is produced in N_SLABS n-slabs of BN columns; the B
+//   slab [BN, K] bf16 is double-buffered (L2 evict_last: re-read by every
+//   CTA of the head) and prefetched one full round ahead.  Per round, the
+//   fp8 stage-write -> barrier -> refill-issue -> coalesced-flush order
+//   makes one barrier serve both the stage handoff and the CTA-wide WGMMA
+//   drain of the buffer being refilled, and the flush plus the next round's
+//   gemm overlap the refill.  BN is sized so that A + 2 B buffers + the fp8
+//   stage fit in half an SM's smem, keeping 2 CTAs co-resident per SM
+//   (register cap 128 via launch bounds; measured faster than every
+//   1-CTA/SM variant tried, including wider CTAs and dual-accumulator
+//   cross-round software pipelines): K=192 -> BN=64 (104 KB), K=128 ->
+//   BN=128 (112 KB).  The round loop is left un-unrolled when N_SLABS > 4:
+//   full unrolling blows the 128-register budget and spills to local.
 
 #pragma once
 
@@ -50,6 +57,7 @@ limitations under the License.
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_bf16.h>
+#include <type_traits>
 
 namespace qprep_sm90 {
 
@@ -81,16 +89,39 @@ __host__ __device__ __forceinline__ constexpr int ceil_div_i(int a, int b) {
 // Device helpers
 // ---------------------------------------------------------------------------
 
-// 16-byte cp.async.cg with zero-fill when pred is false (same instruction
-// family as the sparse-prefill producer; no L2 policy in phase 1).
-__device__ __forceinline__ void cp_async_16_zfill(void* smem_dst, const void* gmem_src, bool pred) {
-  uint32_t dst_addr = cute::cast_smem_ptr_to_uint(smem_dst);
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_addr), "l"(gmem_src), "r"(pred ? 16 : 0));
+// L2 eviction policies (same helpers as the sparse-prefill kernel): A/rope
+// are streamed once (evict_first); the per-head w_kc slice is re-read from L2
+// by every CTA of the head (evict_last).
+__device__ __forceinline__ int64_t createpolicy_evict_last() {
+  int64_t res;
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0; \n\t" : "=l"(res) :);
+  return res;
 }
 
-__device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src) {
+__device__ __forceinline__ int64_t createpolicy_evict_first() {
+  int64_t res;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0; \n\t" : "=l"(res) :);
+  return res;
+}
+
+// 16-byte cp.async.cg with an L2 cache policy, zero-filling when pred is
+// false (same instruction family as the sparse-prefill producer).
+__device__ __forceinline__ void
+cp_async_16_zfill(void* smem_dst, const void* gmem_src, bool pred, int64_t cache_policy) {
   uint32_t dst_addr = cute::cast_smem_ptr_to_uint(smem_dst);
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_addr), "l"(gmem_src));
+  asm volatile(
+      "cp.async.cg.shared.global.L2::cache_hint.L2::256B [%0], [%1], 16, %2, %3;\n" ::"r"(dst_addr),
+      "l"(gmem_src),
+      "r"(pred ? 16 : 0),
+      "l"(cache_policy));
+}
+
+__device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src, int64_t cache_policy) {
+  uint32_t dst_addr = cute::cast_smem_ptr_to_uint(smem_dst);
+  asm volatile(
+      "cp.async.cg.shared.global.L2::cache_hint.L2::256B [%0], [%1], 16, %2;\n" ::"r"(dst_addr),
+      "l"(gmem_src),
+      "l"(cache_policy));
 }
 
 // Pack two fp32 into two fp8_e4m3 bytes with round-to-nearest + satfinite.
@@ -117,13 +148,20 @@ __global__ void qprep_bf16_fp8_kernel(__grid_constant__ const QprepBf16Fp8Sm90Pa
 
 template <int K_DIM>
 struct QprepBf16Fp8Kernel {
-  static constexpr int BM = 128;     // m-tile rows (two WGMMA warpgroups)
-  static constexpr int BN = 128;     // n-slab width (WGMMA m64n128k16)
+  static constexpr int BM = 128;  // m-tile rows (two WGMMA warpgroups)
+  // n-slab width: sized so that A + 2 B buffers + the fp8 stage fit in half
+  // an SM's smem -> 2 CTAs/SM (measured worth more than any intra-CTA
+  // pipelining): K=128 fits BN=128 (112 KB); K=192 needs BN=64 (104 KB).
+  static constexpr int BN = (K_DIM > 128) ? 64 : 128;
   static constexpr int N_OUT = 512;  // kv_lora_rank
   static constexpr int ROPE = 64;    // qk_rope_head_dim
   static constexpr int NUM_THREADS = 256;
   static constexpr int N_SLABS = N_OUT / BN;
   static constexpr int LOAD_ROWS_PER_PASS = NUM_THREADS / 8;  // 16B-chunk loaders
+  // 2 CTAs/SM co-residency (register cap 128 via launch bounds).  Measured
+  // faster than every 1-CTA/SM variant tried (wider CTAs, dual-accumulator
+  // cross-round software pipelines).
+  static constexpr int MIN_CTAS = 2;
 
   static_assert(K_DIM % 64 == 0, "K must tile the SW128 bf16 GMMA atom (64 cols)");
   static_assert(N_OUT % BN == 0);
@@ -135,16 +173,21 @@ struct QprepBf16Fp8Kernel {
       decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<bf16>{}, Shape<Int<BN>, Int<K_DIM>>{}, Step<_1, _2>{}));
 
   // Two warpgroups stacked along M: threads [128w, 128w+128) own rows
-  // [64w, 64w+64) of the m-tile.
-  using TiledMMA_t = decltype(make_tiled_mma(
-      SM90_64x128x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{}, Layout<Shape<_2, _1, _1>>{}));
+  // [64w, 64w+64) of the m-tile.  The atom's N width must match BN.
+  using MmaAtom_t = std::conditional_t<
+      BN == 128,
+      SM90_64x128x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>,
+      SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>>;
+  using TiledMMA_t = decltype(make_tiled_mma(MmaAtom_t{}, Layout<Shape<_2, _1, _1>>{}));
 
   struct SharedStorage {
-    array_aligned<bf16, cosize_v<SmemLayoutA>, 128> a;
-    array_aligned<bf16, cosize_v<SmemLayoutB>, 128> b;
+    array_aligned<bf16, cosize_v<SmemLayoutA>, 128> a;     // resident A m-block
+    array_aligned<bf16, cosize_v<SmemLayoutB>, 128> b[2];  // double-buffered B slab
     // fp8 output staging for one n-slab: scattered per-thread u16 epilogue
     // writes land here, then leave as coalesced 16B global stores (the direct
     // u16 global stores 4x-amplify the store sectors and throttle the LSU).
+    // Single buffer: the end-of-round B wait barrier separates one round's
+    // copy-out reads from the next round's stage writes.
     array_aligned<uint8_t, BM * BN, 16> c_stage;
   };
 
@@ -154,7 +197,8 @@ struct QprepBf16Fp8Kernel {
   // swizzle is applied (16B chunks stay contiguous under the swizzle).
   // -------------------------------------------------------------------------
   template <typename SmemT>
-  static __device__ __forceinline__ void load_a_tile(SmemT& sA, const bf16* gA, int64_t a_s0, int m_residue, int tid) {
+  static __device__ __forceinline__ void
+  load_a_tile(SmemT& sA, const bf16* gA, int64_t a_s0, int m_residue, int tid, int64_t cache_policy) {
     const int cthr = tid % 8, rthr = tid / 8;
     CUTE_UNROLL
     for (int mi = 0; mi < BM / LOAD_ROWS_PER_PASS; ++mi) {
@@ -164,13 +208,14 @@ struct QprepBf16Fp8Kernel {
       CUTE_UNROLL
       for (int ki = 0; ki < K_DIM / 64; ++ki) {
         const int col = cthr * 8 + 64 * ki;
-        cp_async_16_zfill(&sA(row, col), g + col, pred);
+        cp_async_16_zfill(&sA(row, col), g + col, pred, cache_policy);
       }
     }
   }
 
   template <typename SmemT>
-  static __device__ __forceinline__ void load_b_slab(SmemT& sB, const bf16* gB_head, int64_t b_s2, int nb, int tid) {
+  static __device__ __forceinline__ void
+  load_b_slab(SmemT& sB, const bf16* gB_head, int64_t b_s2, int nb, int tid, int64_t cache_policy) {
     const int cthr = tid % 8, rthr = tid / 8;
     const bf16* g0 = gB_head + (int64_t)nb * BN * b_s2;
     CUTE_UNROLL
@@ -180,7 +225,7 @@ struct QprepBf16Fp8Kernel {
       CUTE_UNROLL
       for (int ki = 0; ki < K_DIM / 64; ++ki) {
         const int col = cthr * 8 + 64 * ki;
-        cp_async_16(&sB(nrow, col), g + col);
+        cp_async_16(&sB(nrow, col), g + col, cache_policy);
       }
     }
   }
@@ -232,23 +277,21 @@ struct QprepBf16Fp8Kernel {
   }
 
   // Staged variant: XOR-swizzle the 16B chunk index by the row so the u16
-  // stage writes (8 distinct rows per warp) land in distinct banks, while the
-  // 16B copy-out reads stay conflict-free row segments.
+  // stage writes (8 distinct rows per warp) spread across banks, while the
+  // 16B copy-out reads stay conflict-free row segments.  The XOR must be
+  // masked to the chunks actually present in a BN-wide row.
+  static constexpr int STAGE_CHUNK_MASK = BN / 16 - 1;
   static __device__ __forceinline__ int stage_off(int r, int c) {
-    return r * BN + ((((c >> 4) ^ (r & 7)) << 4) | (c & 15));
+    const int phys = ((c >> 4) ^ r) & STAGE_CHUNK_MASK;
+    return r * BN + (phys << 4) + (c & 15);
   }
 
+  // Stage-write half: fp32 acc -> bf16 -> fp8 u16 writes into the swizzled
+  // smem stage.  Reads only the accumulator, so it can run while the next
+  // round's WGMMA chain and the B refill are in flight.  The caller provides
+  // the __syncthreads() handoff before stage_flush.
   template <typename TC>
-  static __device__ __forceinline__ void store_slab_staged(
-      TC const& acc,
-      uint8_t* stage,
-      uint8_t* gO,
-      int64_t o_s0,
-      int n0,
-      int row_base,
-      int col_base,
-      int m_residue,
-      int tid) {
+  static __device__ __forceinline__ void stage_write(TC const& acc, uint8_t* stage, int row_base, int col_base) {
     CUTE_UNROLL
     for (int rp = 0; rp < 2; ++rp) {
       const int row = row_base + 8 * rp;  // OOB rows staged but never copied out
@@ -259,7 +302,11 @@ struct QprepBf16Fp8Kernel {
         *reinterpret_cast<uint16_t*>(stage + stage_off(row, col_base + 8 * j)) = f32x2_to_bf16x2_to_e4m3x2(f0, f1);
       }
     }
-    __syncthreads();
+  }
+
+  // Copy-out half: coalesced 16B stores of the staged fp8 slab.
+  static __device__ __forceinline__ void
+  stage_flush(const uint8_t* stage, uint8_t* gO, int64_t o_s0, int n0, int m_residue, int tid) {
     constexpr int CHUNKS_PER_ROW = BN / 16;
     constexpr int NUM_CHUNKS = BM * BN / 16;
     CUTE_UNROLL
@@ -281,40 +328,48 @@ struct QprepBf16Fp8Kernel {
   static __device__ __forceinline__ void
   rope_path(const bf16* gR, uint8_t* gO, const QprepBf16Fp8Sm90Params& p, int m_residue, int tid) {
     const int cthr = tid % 8, rthr = tid / 8;
+    constexpr int PASSES = BM / LOAD_ROWS_PER_PASS;
+    if (p.rope_vec16 && p.out_vec16) {
+      // Fast path: batch-issue every row's uint4 load first so the load
+      // latencies pipeline (one exposed latency instead of PASSES chained
+      // load-use stalls), then convert + store.
+      uint4 raw[PASSES];
+      CUTE_UNROLL
+      for (int mi = 0; mi < PASSES; ++mi) {
+        const int row = rthr + LOAD_ROWS_PER_PASS * mi;
+        if (row >= m_residue) continue;
+        raw[mi] = *reinterpret_cast<const uint4*>(gR + (int64_t)row * p.r_s0 + cthr * 8);
+      }
+      CUTE_UNROLL
+      for (int mi = 0; mi < PASSES; ++mi) {
+        const int row = rthr + LOAD_ROWS_PER_PASS * mi;
+        if (row >= m_residue) continue;
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(&raw[mi]);
+        uint16_t packed[4];
+        CUTE_UNROLL
+        for (int i = 0; i < 4; ++i) {
+          const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&w[i]);
+          packed[i] = f32x2_to_e4m3x2_rn_satfinite(__low2float(v), __high2float(v));
+        }
+        // out_vec16 guarantees 16B-aligned rows; N_OUT + 8*cthr keeps 8B
+        // alignment, so the 8-byte chunk goes out as one coalesced store.
+        *reinterpret_cast<uint64_t*>(gO + (int64_t)row * p.o_s0 + N_OUT + cthr * 8) =
+            *reinterpret_cast<const uint64_t*>(packed);
+      }
+      return;
+    }
+    // Unaligned fallback: element strides only guarantee 2B alignment.
     CUTE_UNROLL
-    for (int mi = 0; mi < BM / LOAD_ROWS_PER_PASS; ++mi) {
+    for (int mi = 0; mi < PASSES; ++mi) {
       const int row = rthr + LOAD_ROWS_PER_PASS * mi;
       if (row >= m_residue) continue;
       const bf16* g = gR + (int64_t)row * p.r_s0 + cthr * 8;
       uint8_t* o = gO + (int64_t)row * p.o_s0 + N_OUT + cthr * 8;
-      __nv_bfloat162 v[4];
-      if (p.rope_vec16) {
-        const uint4 raw = *reinterpret_cast<const uint4*>(g);
-        v[0] = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
-        v[1] = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
-        v[2] = *reinterpret_cast<const __nv_bfloat162*>(&raw.z);
-        v[3] = *reinterpret_cast<const __nv_bfloat162*>(&raw.w);
-      } else {
-        const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(g);
-        CUTE_UNROLL
-        for (int i = 0; i < 4; ++i) {
-          v[i] = __nv_bfloat162(gh[2 * i], gh[2 * i + 1]);
-        }
-      }
-      uint16_t packed[4];
+      const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(g);
       CUTE_UNROLL
       for (int i = 0; i < 4; ++i) {
-        packed[i] = f32x2_to_e4m3x2_rn_satfinite(__low2float(v[i]), __high2float(v[i]));
-      }
-      if (p.out_vec16) {
-        // out_vec16 guarantees 16B-aligned rows; N_OUT + 8*cthr keeps 8B
-        // alignment, so the 8-byte chunk goes out as one coalesced store.
-        *reinterpret_cast<uint64_t*>(o) = *reinterpret_cast<const uint64_t*>(packed);
-      } else {
-        CUTE_UNROLL
-        for (int i = 0; i < 4; ++i) {
-          *reinterpret_cast<uint16_t*>(o + 2 * i) = packed[i];
-        }
+        const __nv_bfloat162 v = __nv_bfloat162(gh[2 * i], gh[2 * i + 1]);
+        *reinterpret_cast<uint16_t*>(o + 2 * i) = f32x2_to_e4m3x2_rn_satfinite(__low2float(v), __high2float(v));
       }
     }
   }
@@ -332,47 +387,91 @@ struct QprepBf16Fp8Kernel {
     extern __shared__ char smem_raw[];
     SharedStorage& ss = *reinterpret_cast<SharedStorage*>(smem_raw);
     Tensor sA = make_tensor(make_smem_ptr(ss.a.data()), SmemLayoutA{});
-    Tensor sB = make_tensor(make_smem_ptr(ss.b.data()), SmemLayoutB{});
+    Tensor sB0 = make_tensor(make_smem_ptr(ss.b[0].data()), SmemLayoutB{});
+    Tensor sB1 = make_tensor(make_smem_ptr(ss.b[1].data()), SmemLayoutB{});
 
     const bf16* gA = reinterpret_cast<const bf16*>(p.q_nope) + (int64_t)m0 * p.a_s0 + (int64_t)h * p.a_s1;
     const bf16* gB = reinterpret_cast<const bf16*>(p.w_kc) + (int64_t)h * p.b_s0;
     const bf16* gR = reinterpret_cast<const bf16*>(p.q_rope) + (int64_t)m0 * p.r_s0 + (int64_t)h * p.r_s1;
     uint8_t* gO = reinterpret_cast<uint8_t*>(p.out) + (int64_t)m0 * p.o_s0 + (int64_t)h * p.o_s1;
 
-    // Issue A tile + first B slab, then run the rope path over the async loads.
-    load_a_tile(sA, gA, p.a_s0, m_residue, tid);
-    load_b_slab(sB, gB, p.b_s2, 0, tid);
+    const int64_t policy_stream = createpolicy_evict_first();
+    const int64_t policy_keep = createpolicy_evict_last();
+
+    // Issue the A block + B slab 0 (group 0), then B slab 1 (group 1), then
+    // run the rope path over the in-flight async loads.
+    load_a_tile(sA, gA, p.a_s0, m_residue, tid, policy_stream);
+    load_b_slab(sB0, gB, p.b_s2, 0, tid, policy_keep);
+    cp_async_fence();
+    load_b_slab(sB1, gB, p.b_s2, 1, tid, policy_keep);
     cp_async_fence();
 
+    // Rope in the prologue: its global-load latency hides under the wait for
+    // the A/B cp.async stream (measured better than placing it after the
+    // first gemm commit on the 1-CTA/SM K=192 path).
     rope_path(gR, gO, p, m_residue, tid);
 
-    cp_async_wait<0>();
+    cp_async_wait<1>();  // A tile + B0 done; B1 still in flight
     __syncthreads();
 
     TiledMMA_t tiled_mma;
-    Tensor acc = partition_fragment_C(tiled_mma, Shape<Int<BM>, Int<BN>>{});
     const int row_base = (tid / 128) * 64 + ((tid % 128) / 32) * 16 + ((tid % 32) / 4);
     const int col_base = (tid % 4) * 2;
 
-    CUTE_UNROLL
-    for (int nb = 0; nb < N_SLABS; ++nb) {
-      gemm_ss(tiled_mma, sA, sB, acc, tid);
+    {
+      // Single accumulator: 2-CTA/SM co-residency covers the epilogue
+      // latency (measured faster than every cross-round dual-accumulator
+      // pipeline variant, which needs >128 regs and forfeits co-residency);
+      // the B double-buffer still prefetches slab nb+1 a full round ahead.
+      Tensor acc = partition_fragment_C(tiled_mma, Shape<Int<BM>, Int<BN>>{});
+      gemm_ss(tiled_mma, sA, sB0, acc, tid);
       warpgroup_commit_batch();
-      warpgroup_wait<0>();
-      __syncthreads();  // every thread's WGMMA drained -> sB reusable (WAR)
-      if (nb + 1 < N_SLABS) {
-        load_b_slab(sB, gB, p.b_s2, nb + 1, tid);
-        cp_async_fence();
-      }
-      // fp8 store epilogue overlaps the next slab's cp.async.
-      if (p.out_vec16) {
-        store_slab_staged(acc, ss.c_stage.data(), gO, p.o_s0, nb * BN, row_base, col_base, m_residue, tid);
+
+      auto round_body = [&](int nb) __attribute__((always_inline)) {
+        warpgroup_wait<0>();  // gemm(nb) drained
+        if (p.out_vec16) {
+          // Single barrier: stage handoff + CTA-wide WGMMA drain of B[nb%2].
+          stage_write(acc, ss.c_stage.data(), row_base, col_base);
+          __syncthreads();
+          if (nb + 2 < N_SLABS) {
+            load_b_slab((nb % 2 == 0) ? sB0 : sB1, gB, p.b_s2, nb + 2, tid, policy_keep);
+            cp_async_fence();
+          }
+          stage_flush(ss.c_stage.data(), gO, p.o_s0, nb * BN, m_residue, tid);
+        } else {
+          __syncthreads();
+          if (nb + 2 < N_SLABS) {
+            load_b_slab((nb % 2 == 0) ? sB0 : sB1, gB, p.b_s2, nb + 2, tid, policy_keep);
+            cp_async_fence();
+          }
+          store_slab_direct(acc, gO, p.o_s0, nb * BN, row_base, col_base, m_residue);
+        }
+        if (nb + 1 < N_SLABS) {
+          // Slab nb+1 resident (leave the nb+2 refill in flight, if any),
+          // then commit the next round's gemm.  The barrier also separates
+          // this round's stage_flush reads from the next stage_write.
+          if (nb + 2 < N_SLABS) {
+            cp_async_wait<1>();
+          } else {
+            cp_async_wait<0>();
+          }
+          __syncthreads();
+          gemm_ss(tiled_mma, sA, (nb % 2 == 0) ? sB1 : sB0, acc, tid);
+          warpgroup_commit_batch();
+        }
+      };
+      if constexpr (N_SLABS <= 4) {
+        CUTE_UNROLL
+        for (int nb = 0; nb < N_SLABS; ++nb) {
+          round_body(nb);
+        }
       } else {
-        store_slab_direct(acc, gO, p.o_s0, nb * BN, row_base, col_base, m_residue);
-      }
-      if (nb + 1 < N_SLABS) {
-        cp_async_wait<0>();
-        __syncthreads();
+        // Fully unrolling 8 rounds blows the 128-register budget (2 CTAs/SM
+        // launch bound) and spills to local memory.
+        CUTE_NO_UNROLL
+        for (int nb = 0; nb < N_SLABS; ++nb) {
+          round_body(nb);
+        }
       }
     }
 #else
@@ -404,7 +503,7 @@ struct QprepBf16Fp8Kernel {
 };
 
 template <typename Kernel>
-__global__ void __launch_bounds__(Kernel::NUM_THREADS, 1)
+__global__ void __launch_bounds__(Kernel::NUM_THREADS, Kernel::MIN_CTAS)
     qprep_bf16_fp8_kernel(__grid_constant__ const QprepBf16Fp8Sm90Params params) {
   Kernel::devfunc(params);
 }
