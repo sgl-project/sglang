@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -10,6 +11,7 @@ from typing import (
     Optional,
     Tuple,
     TypeAlias,
+    Union,
 )
 
 import torch
@@ -18,6 +20,7 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -2062,7 +2065,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
@@ -2621,7 +2624,7 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
 
@@ -2716,13 +2719,34 @@ class DeepseekSparseAttnBackend(
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
 
+        # Decode context parallel (DCP): each rank attends only to its own
+        # shard of the indexer's top-k selection (position-owner rule, same
+        # convention as layers/dcp/layout.py), then returns partial (out, lse)
+        # for the generic online-softmax merge in forward_mla.py to combine
+        # across dcp ranks. Speculative decoding is out of scope here: CUDA
+        # already rejects --dcp-size > 1 with any --speculative-algorithm
+        # (server_args.py::_handle_dcp_validation), and this call is only
+        # reached via forward_decode (is_prefill=False) for plain decode.
+        dcp_decode_active = (
+            not is_prefill
+            and forward_batch.forward_mode.is_decode()
+            and get_parallel().dcp_enabled
+        )
+        if dcp_decode_active:
+            page_table_1, dcp_local_seq_lens = self._dcp_shard_page_table_decode(
+                page_table_1
+            )
+
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
-        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        if dcp_decode_active:
+            seq_lens = dcp_local_seq_lens
+        else:
+            seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
         if (
             dsa_use_prefill_cp(forward_batch)
@@ -2747,9 +2771,98 @@ class DeepseekSparseAttnBackend(
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            return_lse=dcp_decode_active,
         )
 
-        return out
+        if not dcp_decode_active:
+            return out
+
+        out, lse = out
+        # [bs, 1, H, D] -> [bs, H, D]; lse is already [bs, H].
+        out = out.squeeze(1)
+
+        # The TRT-LLM kernel doesn't handle seq_lens == 0 rows cleanly (stale
+        # workspace data instead of a clean zero -- see the same fixup used by
+        # trtllm_mla_backend.py's chunked-prefix-cache path); a row can end up
+        # with zero *locally owned* top-k entries when dcp_size doesn't evenly
+        # divide its per-row valid top-k count. Force out=0, lse=-inf so the
+        # cross-rank LSE merge ignores it.
+        cum_seq_lens = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=out.device
+        )
+        fixup_zero_kv_rows(out, lse, dcp_local_seq_lens, cum_seq_lens, 1)
+
+        # cp_lse_ag_out_rs_mla (the generic DCP merge forward_mla.py calls for
+        # every MLA-family backend) uses a base-2 (log2/exp2) online-softmax
+        # combine, matching FlashInfer-MLA's/FlashMLA's own LSE convention.
+        # The TRT-LLM sparse MLA kernel's returned LSE is natural-log (base-e)
+        # -- confirmed empirically (a natural-log merge of DCP-sharded partials
+        # reproduces the unsharded output; a base-2 merge of the raw values
+        # does not). Rescaling by log2(e) is an exact log-base change (not an
+        # approximation): exp2((a-b)*log2(e)) == exp(a-b).
+        lse = lse * math.log2(math.e)
+
+        return out, lse
+
+    def _dcp_shard_page_table_decode(
+        self, page_table_1: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Shard a decode top-k page table across DCP ranks.
+
+        Applies the same position-owner rule used throughout
+        layers/dcp/layout.py (`filter_dcp_local_kv_indices`: an entry is owned
+        by rank ``value % dcp_size == dcp_rank``, and the rank-local physical
+        address is ``value // dcp_size``) to the *selected* top-k physical
+        locations, rather than the full context. This matches the paged
+        allocator's actual addressing under DCP (verified directly against
+        `PagedTokenToKVPoolAllocator.alloc`, mem_cache/allocator/paged.py):
+        with `page_size = server_page_size * dcp_size` and
+        `size = sizes.max_total_num_tokens * dcp_size`
+        (mem_cache/kv_cache_configurator.py), `num_pages = size // page_size`
+        is dcp-size-*independent* (it cancels), so `out_cache_loc` values
+        range up to `dcp_size` times the physical `DSATokenToKVPool` tensor's
+        row count (`size=sizes.max_total_num_tokens`, undivided) -- i.e. the
+        KV cache is genuinely address-sharded, not replicated, under DCP.
+        Confirmed numerically end-to-end against the real TRT-LLM kernel with
+        a faithfully-simulated per-rank physical buffer (own row count =
+        physical capacity, populated only at `loc // dcp_size` for owned
+        `loc`s): dividing reproduces the unsharded ground truth (~0.4 abs
+        diff, bf16 noise); not dividing does not (~5.2 abs diff).
+
+        Owned entries are compacted to the front of each row (padded with -1
+        after) so the result keeps the same [bs, topk] shape and the "first N
+        columns are valid" layout the TRT-LLM kernel already expects -- no
+        CUDA-graph buffer resize and no data-dependent shapes (mask/sort/sum
+        only, no host sync).
+
+        NOTE: this assumes `set_mla_kv_buffer` (memory_pool.py), which
+        `_forward_trtllm` uses to write KV, performs the matching
+        `loc % dcp_size == dcp_rank` masked / `loc // dcp_size` translated
+        write. As of this change it does neither -- it writes the raw,
+        unmasked `out_cache_loc` directly, which (per the addressing above)
+        would write out of the physical tensor's bounds for any token whose
+        `out_cache_loc >= sizes.max_total_num_tokens`. That gap is shared
+        infrastructure (also used by dense MLA's fp8/extend paths) and is
+        NOT fixed by this change; DCP + DSA will not be correct end-to-end
+        until it is.
+
+        Returns (local_page_table_1, local_seq_lens): local_seq_lens is the
+        per-row count of owned entries, to be passed as the kernel's seq_lens.
+        """
+        dcp_size = get_parallel().attn_dcp_size
+        dcp_rank = get_parallel().attn_dcp_rank
+        owned = (page_table_1 >= 0) & (page_table_1 % dcp_size == dcp_rank)
+        local_loc = torch.where(owned, page_table_1 // dcp_size, page_table_1)
+        order = torch.argsort((~owned).to(torch.int8), dim=-1, stable=True)
+        local_page_table_1 = torch.gather(local_loc, 1, order)
+        local_seq_lens = owned.sum(dim=-1).to(torch.int32)
+        col = torch.arange(page_table_1.shape[1], device=page_table_1.device)
+        local_page_table_1 = torch.where(
+            col.unsqueeze(0) < local_seq_lens.unsqueeze(1).to(torch.int64),
+            local_page_table_1,
+            torch.full_like(local_page_table_1, -1),
+        )
+        return local_page_table_1, local_seq_lens
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
