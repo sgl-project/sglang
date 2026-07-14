@@ -1772,7 +1772,10 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        if _is_xpu:
+            from sgl_kernel import flash_mla_sparse_prefill as flash_mla_sparse_fwd
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
@@ -1850,6 +1853,9 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
+        # The XPU op only returns (out, max_logits, lse) when
+        # ``return_softmax_lse`` is set; CUDA returns the 3-tuple by default.
+        extra_kwargs = {"return_softmax_lse": True} if _is_xpu else {}
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
@@ -1858,6 +1864,7 @@ class DeepseekV4AttnBackend(
             d_v=self.head_dim_v,
             attn_sink=attn_sink,
             topk_length=combined_lens,
+            **extra_kwargs,
         )
         return o
 
