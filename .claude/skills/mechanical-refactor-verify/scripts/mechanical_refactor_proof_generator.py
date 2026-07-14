@@ -1535,7 +1535,12 @@ def _main(argv: list[str]) -> int:
             recipe, _git_output(["log", "-1", "--format=%s", target], root)
         )
     )
-    relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
+    relocates = bool(
+        recipe.moves
+        or recipe.extracts
+        or recipe.scatter_extracts
+        or recipe.extract_functions
+    )
     if not (recipe.supported and relocates):
         print("UNSUPPORTED: " + "; ".join(recipe.notes), file=sys.stderr)
         return 1
