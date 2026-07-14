@@ -842,14 +842,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return None
         return getattr(hf_config, "index_topk", None)
 
-    def decode_num_tokens_per_bs(
+    def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
             if num_draft_tokens is None:
                 num_draft_tokens = self.server_args.speculative_num_draft_tokens
-            return self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            return self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                 num_draft_tokens, self.is_draft_worker
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
@@ -857,9 +857,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_bs = self.decode_num_tokens_per_bs()
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
-        return max(capture_bs) * num_tokens_per_bs
+        num_tokens_per_req = self.decode_num_tokens_per_req()
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+        return max(capture_bs) * num_tokens_per_req
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -2237,7 +2237,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         Phase 2 (dense LoRA batch metadata) is handled later in
         CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        because it needs capture-time parameters (max_bs, num_tokens_per_req)
         that are only available at that stage.
         """
         from sglang.srt.lora.layers import FusedMoEWithLoRA
@@ -2654,20 +2654,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         role = "draft" if self.is_draft_worker else "target"
         if self.spec_algorithm.is_speculative():
             capture_name = f"{role} verify"
-            num_tokens_per_bs = (
-                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            num_tokens_per_req = (
+                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                     self.server_args.speculative_num_draft_tokens,
                     self.is_draft_worker,
                 )
             )
         else:
             capture_name = f"{role} decode"
-            num_tokens_per_bs = 1
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+            num_tokens_per_req = 1
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
             f"Capture {capture_name} {graph_backend[self.device]} begin. "
-            f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
+            f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
             f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
 
@@ -2739,8 +2739,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
-        # Disable prefill CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
+        # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
+        # expose it as ``language_model`` rather than ``model``.
+        try:
+            language_model = resolve_language_model(self.model)
+        except AttributeError:
             logger.warning(
                 "Disable prefill CUDA graph because the model is not a language model"
             )
@@ -2753,9 +2756,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+        # Collect attention layers and moe layers from the model. Keep a VLM
+        # wrapper that exposes ``language_model`` unchanged: assigning it to
+        # ``model`` would register a duplicate module alias and duplicate the
+        # model's state-dict namespace.
+        if hasattr(self.model, "model"):
+            self.model.model = language_model
 
         # Find the module that owns the decoder `layers`. Models wrap it at
         # varying depths: a direct text model exposes `.layers`, a CausalLM

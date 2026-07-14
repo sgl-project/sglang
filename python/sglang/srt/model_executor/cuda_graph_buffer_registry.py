@@ -100,7 +100,7 @@ class FillContext:
 
     Carries both the bs-axis and tokens-axis raw/padded counts so a hook can
     derive values regardless of its own slot's axis — e.g. the padded token
-    count (``padded_num_tokens`` == padded_bs * num_tokens_per_bs), which the
+    count (``padded_num_tokens`` == padded_bs * num_tokens_per_req), which the
     global-num-tokens fill and the local-num-token-non-padded transform need.
     """
 
