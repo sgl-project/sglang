@@ -38,7 +38,6 @@ import torch.distributed
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -64,6 +63,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -72,9 +72,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import (
-    compute_dp_attention_world_info,
-)
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -226,7 +224,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -389,6 +387,7 @@ class Scheduler(
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
+            dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
@@ -749,12 +748,7 @@ class Scheduler(
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
-            tp_rank=self.ps.tp_rank,
-            moe_ep_rank=self.ps.moe_ep_rank,
-            pp_rank=self.ps.pp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
-            moe_dp_rank=self.ps.moe_dp_rank,
-            dp_rank=self.ps.dp_rank,
+            ps=self.ps,
             nccl_port=self.nccl_port,
         )
 
@@ -778,13 +772,9 @@ class Scheduler(
         draft_worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
-            tp_rank=self.ps.tp_rank,
-            moe_ep_rank=self.ps.moe_ep_rank,
+            ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
-            dp_rank=self.ps.dp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
-            moe_dp_rank=self.ps.moe_dp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
@@ -1139,6 +1129,12 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # The PD metadata wire schema must match on P and D even when only D
+        # enables spec decoding; a seedless prefill writes the invalid sentinel.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *8 headroom for MiniMax-M3; *2 for other models.
@@ -1154,6 +1150,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1199,6 +1196,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1296,70 +1294,15 @@ class Scheduler(
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
+        self.ngram_embedding_manager = (
+            self.tp_worker.model_runner.ngram_embedding_manager
+        )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.token_table
+            self.token_table = self.tp_worker.model_runner.ngram_embedding_manager.table
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
-
-    def _maybe_prepare_ngram_embedding(
-        self, batch: Optional[ScheduleBatch]
-    ) -> Optional[ScheduleBatch]:
-        """Fill the token table for ngram embedding before a forward pass."""
-        if batch is None or not self.use_ngram_embedding:
-            return batch
-        batch.ne_token_table = self.token_table
-        if batch.forward_mode == ForwardMode.EXTEND:
-            all_tokens = []
-            column_starts = []
-            request_lengths = []
-            for req in batch.reqs:
-                start = len(req.prefix_indices)
-                end = start + req.extend_range.length
-                fill_ids = req.origin_input_ids + req.output_ids
-                if start == 0:
-                    tokens = fill_ids[start:end]
-                    column_starts.append(0)
-                elif start < self.ngram_embedding_n:
-                    tokens = fill_ids[0:end]
-                    column_starts.append(0)
-                else:
-                    # Prepend n-1 tokens before prefix_len for n-gram context
-                    tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
-                    column_starts.append(start - self.ngram_embedding_n + 1)
-                all_tokens.extend(tokens)
-                request_lengths.append(len(tokens))
-            dtype = self.token_table.dtype
-            device = self.token_table.device
-            update_token_table(
-                ne_token_table=self.token_table,
-                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
-                row_indices=batch.req_pool_indices,
-                column_starts=torch.tensor(
-                    column_starts, dtype=torch.int32, device=device
-                ),
-                req_lens=torch.tensor(
-                    request_lengths, dtype=torch.int32, device=device
-                ),
-                ignore_tokens=None,
-            )
-            # Mark the chunked (not-yet-finished) prefill request so sample()
-            # skips writing its pseudo next-token into the ngram token table.
-            # Use self.chunked_req identity (not req.is_chunked) to avoid
-            # overlap-scheduling timing issues.
-            if self.chunked_req is not None:
-                skip_token_table_update = [
-                    req is self.chunked_req for req in batch.reqs
-                ]
-                batch.ne_skip_token_table_update = (
-                    torch.tensor(
-                        skip_token_table_update, dtype=torch.bool, device=device
-                    )
-                    if any(skip_token_table_update)
-                    else None
-                )
-        return batch
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2799,7 +2742,9 @@ class Scheduler(
         )
 
         # Handle ngram embedding
-        ret = self._maybe_prepare_ngram_embedding(ret)
+        ret = self.ngram_embedding_manager.prepare_for_forward(
+            ret, chunked_req=self.chunked_req
+        )
 
         if ret:
             set_schedule_time_batch(ret)
@@ -3390,6 +3335,9 @@ class Scheduler(
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info.future_dsa_topk_indices_available = (
+                        batch.spec_info.dsa_topk_indices is not None
+                    )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)

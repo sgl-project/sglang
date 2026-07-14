@@ -2,6 +2,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -73,7 +74,7 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
 
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
-    config = model_runner.hybrid_gdn_config
+    config = hybrid_gdn_config(model_runner.model_config)
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13

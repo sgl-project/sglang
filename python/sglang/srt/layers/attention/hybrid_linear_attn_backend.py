@@ -3,6 +3,7 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mamba2_config
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
@@ -684,7 +685,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        config = model_runner.mamba2_config
+        config = mamba2_config(model_runner.model_config)
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
         self.conv_states_shape = (

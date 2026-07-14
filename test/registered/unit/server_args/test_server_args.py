@@ -1197,6 +1197,64 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
 
+class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
+    """The BCG "multimodal model" rule exempts archs on the BCG multimodal
+    opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""
+
+    def _handled_args(self, *, architectures, is_multimodal, allowlisted):
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=architectures),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=is_multimodal,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+            is_multimodal_breakable_cuda_graph_supported=allowlisted,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_multimodal_arch_disables_prefill_breakable(self):
+        args = self._handled_args(
+            architectures=["Qwen3VLForConditionalGeneration"],
+            is_multimodal=True,
+            allowlisted=False,
+        )
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_allowlisted_multimodal_arch_keeps_prefill_breakable(self):
+        args = self._handled_args(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            is_multimodal=True,
+            allowlisted=True,
+        )
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_allowlist_membership(self):
+        from sglang.srt.configs.model_config import (
+            is_multimodal_breakable_cuda_graph_supported,
+        )
+
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3_5MoeForConditionalGeneration"]
+            )
+        )
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3_5ForConditionalGeneration"]
+            )
+        )
+        self.assertFalse(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3VLForConditionalGeneration"]
+            )
+        )
+
+
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.

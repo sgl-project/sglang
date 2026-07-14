@@ -3645,8 +3645,12 @@ class ServerArgs:
             ),
             # DP-attn × BCG capture/replay not yet validated.
             ("DP attention", lambda: self._resolved().enable_dp_attention),
-            # Multimodal prefill replay faults under BCG.
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
+            (
+                "multimodal model",
+                lambda: self.get_model_config().is_multimodal
+                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            ),
         ]
         for name, predicate in rules:
             if predicate():
@@ -5200,7 +5204,7 @@ class ServerArgs:
 
         mode = strategy_to_legacy_mode[self.cp_strategy]
         use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
+            self._resolved(), "attention_backend", None
         ) in ("dsa", "dsv4")
         if use_dsa_legacy_aliases:
             self.enable_dsa_prefill_context_parallel = True
