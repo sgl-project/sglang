@@ -638,7 +638,9 @@ class HiSparseCoordinator:
             net_extra = new_cap - old_cap - page_size
             assert net_extra >= 0
             growths.append(
-                _DeviceBufferGrowth(boundary_index, req_index, old_cap, new_cap, net_extra)
+                _DeviceBufferGrowth(
+                    boundary_index, req_index, old_cap, new_cap, net_extra
+                )
             )
             torch._assert_async(
                 torch.all(owner_rows[boundary_index, :old_cap] > 0),
@@ -725,7 +727,9 @@ class HiSparseCoordinator:
                 :, growth.req_index, growth.old_cap : growth.new_cap
             ] = self.req_to_device_buffer[
                 growth.req_index, growth.old_cap : growth.new_cap
-            ].to(torch.int32)
+            ].to(
+                torch.int32
+            )
         mapping[mapping_index_blocks] = destinations
 
     def _eager_backup_previous_token(
