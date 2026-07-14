@@ -113,6 +113,13 @@ class HfModelConfigParser(ModelConfigParserBase):
         ]:
             config.model_type = "longcat_flash"
 
+        if (
+            config.architectures is not None
+            and "StripedHyena2" in str(config.architectures)
+            and "evo2" in str(model)
+        ):
+            config.model_type = "evo2"
+
         text_config = get_hf_text_config(config=config)
 
         if isinstance(model, str) and text_config is not None:

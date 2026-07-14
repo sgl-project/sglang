@@ -6,6 +6,7 @@ from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.configs.evo2 import Evo2Config
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
@@ -68,6 +69,7 @@ __all__ = [
     "InternS2PreviewConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
+    "Evo2Config",
     "FalconH1Config",
     "GraniteMoeHybridConfig",
     "Lfm2Config",
