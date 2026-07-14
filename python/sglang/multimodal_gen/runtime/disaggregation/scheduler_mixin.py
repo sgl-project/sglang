@@ -940,7 +940,6 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("compute",))
                         self._broadcast_req_to_all_ranks(req)
-                    _init_disagg_request_scheduler(self, req)
                     self._disagg_terminal_denoiser_compute(
                         req, request_id, role_name
                     )
@@ -1342,8 +1341,8 @@ class SchedulerDisaggMixin:
         (:meth:`_disagg_non_rank0_event_loop`).
         """
         if self._disagg_role == RoleType.DENOISER:
-            # Initialize scheduler timesteps (same as rank 0)
-            _init_disagg_request_scheduler(self, req)
+            if not self._is_glm_terminal_denoiser():
+                _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
                 if self._is_glm_terminal_denoiser():
