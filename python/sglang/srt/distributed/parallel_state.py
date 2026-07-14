@@ -1701,6 +1701,14 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
 
 
+def is_pdmux_prefill_enabled() -> bool:
+    return _ENABLE_PDMUX_P_TP
+
+
+def is_pdmux_enabled() -> bool:
+    return _PDMUX_PREFILL_TP_GROUP is not None
+
+
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
         assert (

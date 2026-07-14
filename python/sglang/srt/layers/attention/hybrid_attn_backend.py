@@ -21,6 +21,7 @@ class HybridAttnBackend(AttentionBackend):
         self.model_runner = model_runner
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.max_prefill_plan_tokens = prefill_backend.max_prefill_plan_tokens
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
