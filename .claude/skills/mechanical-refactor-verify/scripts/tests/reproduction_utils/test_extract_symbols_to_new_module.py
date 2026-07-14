@@ -144,6 +144,30 @@ def test_extract_symbols_to_new_module_asserts_unknown_drop_assign(
         _apply(r, tmp_path)
 
 
+def test_extract_symbols_to_new_module_header_accepts_a_typechecking_block(
+    tmp_path: Path,
+) -> None:
+    """An authored header may carry an `if TYPE_CHECKING:` import block; the audit accepts it
+    and the block is reproduced verbatim in the new module."""
+    (tmp_path / "src.py").write_text("def moved(x):\n    return x\n")
+    header = (
+        "from __future__ import annotations\n"
+        "\n"
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from other import Thing\n"
+        "\n"
+    )
+    r = Repro("b", "t").extract_symbols_to_new_module(
+        "src.py", "new.py", symbols=["moved"], header=header, order=["moved"]
+    )
+    _apply(r, tmp_path)
+    new_out = (tmp_path / "new.py").read_text()
+    assert "if TYPE_CHECKING:\n    from other import Thing\n" in new_out
+    assert "def moved(x):\n    return x\n" in new_out
+
+
 # --- extract_function ----------------------------------------------------------
 
 

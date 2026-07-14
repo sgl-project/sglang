@@ -40,6 +40,26 @@ def test_move_assign_pastes_above_the_named_sibling(tmp_path: Path) -> None:
     )
 
 
+def test_move_assign_relocates_an_annotated_constant(tmp_path: Path) -> None:
+    """An annotated module constant (AnnAssign) is cut verbatim with its annotation intact."""
+    (tmp_path / "src.py").write_text(
+        "import os\n\nLIMIT: int = 480\n\n\ndef stay():\n    return LIMIT\n"
+    )
+    (tmp_path / "dst.py").write_text("import sys\n\n\ndef keep():\n    return 1\n")
+    r = Repro("b", "t").move_assign("LIMIT", src="src.py", dst="dst.py")
+    _apply(r, tmp_path)
+    assert "LIMIT" not in (tmp_path / "src.py").read_text().split("def stay")[0]
+    assert (tmp_path / "dst.py").read_text() == (
+        "import sys\n"
+        "\n"
+        "LIMIT: int = 480\n"
+        "\n"
+        "\n"
+        "def keep():\n"
+        "    return 1\n"
+    )
+
+
 def test_move_assign_missing_source_raises(tmp_path: Path) -> None:
     """A name with no module-level assignment in the source fails loudly."""
     (tmp_path / "src.py").write_text("x = 1\n")
