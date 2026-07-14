@@ -265,9 +265,7 @@ class TestHiSparseDirectAllocator(unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertEqual(len(allocator.logical_attn_allocator.freed), 1)
                 self.assertTrue(
-                    torch.all(
-                        allocator.full_to_hisparse_device_index_mapping == 0
-                    )
+                    torch.all(allocator.full_to_hisparse_device_index_mapping == 0)
                 )
 
 
