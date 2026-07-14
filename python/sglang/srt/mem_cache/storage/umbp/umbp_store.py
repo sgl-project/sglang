@@ -930,6 +930,15 @@ class UMBPStore(HiCacheStorage):
                 "size is capped by distributed.staging_buffer_size."
             )
             return False
+        # NOTE(layer_first): this only handles the page_first layout, where a
+        # host pool exposes a single contiguous `kv_buffer` that we can register
+        # for RDMA in one shot. If UMBP later supports a layer_first layout, or
+        # side pools that expose multiple buffers via get_hybrid_pool_buffer()
+        # (e.g. DSAIndexerPoolHost, whose buffer lives in
+        # index_k_with_scale_buffer rather than kv_buffer), this branch must be
+        # extended to register every per-layer / per-buffer region. Otherwise
+        # such pools bypass zero-copy and silently fall back to the slower
+        # staging-buffer path.
         kv_buffer = getattr(host_pool, "kv_buffer", None)
         if kv_buffer is None:
             return False
