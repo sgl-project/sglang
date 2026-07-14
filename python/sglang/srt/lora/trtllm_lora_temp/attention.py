@@ -10,11 +10,11 @@ preserved and called for batches where two-stream isn't active.
 import torch
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.lora.trtllm_lora_temp import (
     get_lora_side_stream,
     get_original_column_forward,
@@ -24,6 +24,7 @@ from sglang.srt.lora.trtllm_lora_temp import (
     is_two_stream_active,
     lora_overlap_alloc_stream,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 def qkv_proj_lora_forward(self, input_: torch.Tensor):
@@ -36,10 +37,8 @@ def qkv_proj_lora_forward(self, input_: torch.Tensor):
     if not self.set_lora or not is_two_stream_active(input_):
         return get_original_qkv_forward()(self, input_)
 
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        qkv_lora_b_fwd,
-        sgemm_lora_a_fwd,
-    )
+    from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
+    from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import sgemm_lora_a_fwd
 
     bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
     side_stream = get_lora_side_stream()
@@ -93,7 +92,7 @@ def row_parallel_lora_forward(
     if self.base_layer.input_is_parallel:
         input_parallel = input_
     else:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         splitted_input = split_tensor_along_last_dim(
             input_, num_partitions=self.base_layer.tp_size
         )
@@ -127,6 +126,7 @@ def row_parallel_lora_forward(
         self.base_layer.reduce_results
         and self.base_layer.tp_size > 1
         and not skip_all_reduce
+        and not should_skip_mlp_all_reduce()
     )
 
     if should_reduce:
@@ -238,7 +238,7 @@ def replicated_lora_forward(self, x: torch.Tensor):
             base_output=output,
         )
     else:
-        from sglang.srt.lora.trtllm_lora_temp.triton_ops import qkv_lora_b_fwd
+        from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
 
         output = qkv_lora_b_fwd(
             lora_a_output,

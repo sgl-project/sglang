@@ -72,6 +72,12 @@ def _get_flashinfer_gdn_kernels():
     )
 
 
+def is_flashinfer_gdn_prefill_available() -> bool:
+    """Return whether the kernel loader can construct the prefill path."""
+    available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
+    return bool(available and prefill_fn is not None)
+
+
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------

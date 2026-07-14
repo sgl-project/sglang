@@ -776,9 +776,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # act_fn:
         if self.moe_runner_config.activation == "npu_swiglu_oai":
-            from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+            from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai_triton
 
-            hidden_states = swiglu_oai(layer, hidden_states)
+            # `hidden_states` is the gmm1 output of shape [num_tokens, 2 * inter].
+            # Pass the gate_up dim from the activation itself instead of letting
+            # swiglu_oai() derive it from layer.w13_weight.shape[2]: w13_weight is
+            # now stored un-transposed (transposed on the fly for the grouped
+            # matmuls above), so shape[2] is `hidden`, not the gate_up dim, which
+            # makes the kernel's view(-1, dim) reshape fail.
+            hidden_states = swiglu_oai_triton(
+                hidden_states,
+                hidden_states.shape[-1],
+                self.moe_runner_config.gemm1_alpha,
+                self.moe_runner_config.gemm1_clamp_limit,
+            )
         elif self.moe_runner_config.activation == "silu":
             if self.moe_runner_config.gemm1_clamp_limit is not None:
                 from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
