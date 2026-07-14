@@ -185,6 +185,7 @@ QUANTIZATION_CHOICES = [
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
+    "humming",
 ]
 
 
@@ -261,6 +262,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "humming",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -294,7 +296,6 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "cutlass",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -1116,6 +1117,16 @@ class ServerArgs:
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
     reasoning_parser: Optional[str] = None
+    default_chat_template_kwargs: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Default chat template kwargs applied to every request when not "
+            "overridden per-request. Keys must match what the model's chat template "
+            "expects (e.g. enable_thinking, thinking, reasoning_effort). Per-request "
+            "chat_template_kwargs takes precedence.",
+            type_parser=json.loads,
+        ),
+    ] = None
     strip_thinking_cache: A[
         bool,
         "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",
@@ -1424,7 +1435,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
         ),
@@ -1977,9 +1988,9 @@ class ServerArgs:
         Optional[str],
         "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
     ] = None
-    enable_deepep_waterfill: A[
+    enable_waterfill: A[
         bool,
-        "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+        "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
     elastic_ep_rejoin: A[
         bool,
@@ -1992,7 +2003,7 @@ class ServerArgs:
     disable_shared_experts_fusion: A[
         bool,
         Arg(
-            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: Waterfill (--enable-waterfill) routes the shared expert as an extra MoE slot, so the shared expert is not separated from the MoE path when Waterfill is enabled.",
             resolvable=True,
         ),
     ] = False
@@ -2810,6 +2821,13 @@ class ServerArgs:
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
 
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
@@ -2909,7 +2927,7 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
@@ -3627,8 +3645,12 @@ class ServerArgs:
             ),
             # DP-attn × BCG capture/replay not yet validated.
             ("DP attention", lambda: self._resolved().enable_dp_attention),
-            # Multimodal prefill replay faults under BCG.
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
+            (
+                "multimodal model",
+                lambda: self.get_model_config().is_multimodal
+                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            ),
         ]
         for name, predicate in rules:
             if predicate():
@@ -5182,7 +5204,7 @@ class ServerArgs:
 
         mode = strategy_to_legacy_mode[self.cp_strategy]
         use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
+            self._resolved(), "attention_backend", None
         ) in ("dsa", "dsv4")
         if use_dsa_legacy_aliases:
             self.enable_dsa_prefill_context_parallel = True
@@ -5402,19 +5424,19 @@ class ServerArgs:
         MoE layer on one (DP) rank. Single source of truth for both the
         standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
         budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_bs is
+        capture, and decode/verify bounds; num_tokens_per_req is
         speculative_num_draft_tokens under speculative decoding, else 1.
         """
         if self.speculative_algorithm:
-            num_tokens_per_bs = self.speculative_num_draft_tokens or 1
+            num_tokens_per_req = self.speculative_num_draft_tokens or 1
         else:
-            num_tokens_per_bs = 1
+            num_tokens_per_req = 1
         prefill_tokens = self.max_prefill_tokens
         cg_config = self.cuda_graph_config
         if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
             prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_bs
+        decode_tokens = decode_max_bs * num_tokens_per_req
         return max(prefill_tokens, decode_tokens)
 
     def max_prefill_buffer_tokens(self) -> int:
@@ -5435,7 +5457,7 @@ class ServerArgs:
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
-        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
         from sglang.srt.arg_groups.overrides import resolved_view
 
         view = resolved_view(self)
@@ -5492,6 +5514,10 @@ class ServerArgs:
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
         a2a_backend = resolved_view(self).moe_a2a_backend
+        if self.enable_waterfill:
+            self.enforce_shared_experts_fusion = True
+            logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
@@ -5508,11 +5534,6 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            if self.enable_deepep_waterfill:
-                self.enforce_shared_experts_fusion = True
-                logger.info(
-                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
-                )
 
         if a2a_backend == "mooncake":
             logger.warning(
