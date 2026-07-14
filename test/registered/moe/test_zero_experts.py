@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
+from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

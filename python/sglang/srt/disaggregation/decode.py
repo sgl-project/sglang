@@ -143,6 +143,10 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
+        # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
+        # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
+        # inheriting ReqToTokenPool.alloc, which bumps it.
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -171,6 +175,7 @@ class DecodeReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -181,6 +186,7 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -1628,9 +1634,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
+            output_token_sampling_mask_len,
+            output_token_sampling_mask_idx,
+            output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
@@ -1724,6 +1734,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if (
+                output_dsa_topk_indices is not None
+                and torch.all(output_dsa_topk_indices < 0).item()
+            ):
+                output_dsa_topk_indices = None
+            decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
         if decode_req.req.return_logprob and not replayed_boundary:
             decode_req.req.logprob.output_token_logprobs_val.append(
@@ -1742,6 +1758,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+        if decode_req.req.return_sampling_mask:
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
+            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+            if sampling_mask_len < 0:
+                decode_req.req.output_token_sampling_mask.append(None)
+                decode_req.req.output_token_sampling_logprobs.append(None)
+            else:
+                decode_req.req.output_token_sampling_mask.append(
+                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
+                )
+                decode_req.req.output_token_sampling_logprobs.append(
+                    float(output_token_sampling_logprobs[0].item())
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None

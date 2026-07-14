@@ -122,6 +122,7 @@ def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
+        "DeepseekV4ForCausalLMDSpark",
     )
 
 
@@ -247,12 +248,14 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
+        speculative_algorithm: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -449,6 +452,9 @@ class ModelConfig:
         self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
             is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
+        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -528,6 +534,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
+            speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
 
@@ -547,8 +554,23 @@ class ModelConfig:
             is_draft_model
             and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
         ):
-            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
-            self.hf_config.num_nextn_predict_layers = 1
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+
+            # A dspark-bundled checkpoint may also carry MTP layers; the
+            # selected algorithm decides which draft arch to load.
+            if checkpoint_bundles_dspark_draft(self.hf_config) and (
+                self.speculative_algorithm in (None, "DSPARK")
+            ):
+                self.hf_config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+                logger.info(
+                    "Draft checkpoint bundles a DSpark head; loading draft arch "
+                    "DeepseekV4ForCausalLMDSpark."
+                )
+            else:
+                self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+                self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
@@ -636,7 +658,12 @@ class ModelConfig:
             logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
 
             self.is_deepseek_v4_arch = any(
-                arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
+                arch
+                in [
+                    "DeepseekV4ForCausalLM",
+                    "DeepseekV4ForCausalLMNextN",
+                    "DeepseekV4ForCausalLMDSpark",
+                ]
                 for arch in self.hf_config.architectures
             )
 
@@ -786,6 +813,7 @@ class ModelConfig:
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMDSpark" in self.hf_config.architectures
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
@@ -1320,6 +1348,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "humming",
             "quark_mxfp4",
         ]
         compatible_quantization_methods = {
@@ -1715,6 +1744,7 @@ multimodal_model_archs = [
 piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
+    "DeepseekV4ForCausalLMDSpark",
     "Qwen3NextForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
@@ -1726,8 +1756,16 @@ piecewise_cuda_graph_disabled_model_archs = [
 # cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
 multimodal_piecewise_cuda_graph_supported_model_archs = [
     "Cohere2VisionForConditionalGeneration",
+    "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
+]
+
+# Multimodal archs whose LM prefill is validated under breakable CUDA graph;
+# embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+multimodal_breakable_cuda_graph_supported_model_archs = [
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1796,6 +1834,14 @@ def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str])
     )
 
 
+def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill breakable CUDA graph enabled."""
+    return any(
+        arch in multimodal_breakable_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
 # SequenceClassification models that use CrossEncodingPooler
 _cross_encoding_pooler_archs = [
     "BertForSequenceClassification",
@@ -1844,6 +1890,7 @@ def is_hybrid_swa_model(
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
+        "DeepseekV4ForCausalLMDSpark",
         "GptOssForCausalLM",
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
@@ -1854,6 +1901,7 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "MellumForCausalLM",
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
@@ -1925,15 +1973,9 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
+        or "LagunaForCausalLM" in model_architectures
+        or "MellumForCausalLM" in model_architectures
     ):
-        layer_types = getattr(hf_text_config, "layer_types", [])
-        swa_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "sliding_attention"
-        ]
-        full_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "full_attention"
-        ]
-    elif "LagunaForCausalLM" in model_architectures:
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"
