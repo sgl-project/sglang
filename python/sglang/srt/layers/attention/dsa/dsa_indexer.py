@@ -1112,7 +1112,10 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_target_verify()
+        )
 
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
@@ -1222,7 +1225,20 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[1] == k_offset
 
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            cu_seqlens_q = None
+            if metadata.attn_metadata.page_table_1.shape[0] == q_offset:
+                # Token-expanded verify/extend rows use a page-table row per query
+                # row. The fused PAGED top-k transform derives its batch size from
+                # cu_seqlens_q, so present each row as a length-1 sequence.
+                cu_seqlens_q = torch.ones(
+                    q_offset, dtype=torch.int32, device=q_fp8.device
+                )
+            raw_topk_result = metadata.topk_transform(
+                logits,
+                self.index_topk,
+                ks=ks,
+                cu_seqlens_q=cu_seqlens_q,
+            )
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -1993,9 +2009,19 @@ class Indexer(MultiPlatformOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
-                )
+                if _is_hip and forward_batch.forward_mode.is_target_verify():
+                    topk_result = self._get_topk_ragged(
+                        enable_dual_stream,
+                        forward_batch,
+                        layer_id,
+                        q_fp8,
+                        weights,
+                        metadata,
+                    )
+                else:
+                    topk_result = self._get_topk_paged(
+                        forward_batch, layer_id, q_fp8, weights, metadata
+                    )
             else:
                 if (
                     forward_batch.attn_cp_metadata is not None

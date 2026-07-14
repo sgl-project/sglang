@@ -413,6 +413,29 @@ class TestDSAIndexer(CustomTestCase):
 
         return forward_batch
 
+    def test_target_verify_ragged_qk_ranges_use_extended_kv_offsets(self):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.device = self.device
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            input_ids=torch.zeros(4, dtype=torch.int64, device=self.device),
+            req_pool_indices=torch.arange(2, device=self.device),
+            seq_lens=torch.tensor([10, 20], dtype=torch.int32, device=self.device),
+            out_cache_loc=torch.arange(4, device=self.device),
+            seq_lens_sum=30,
+            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int32, device="cpu"),
+            extend_seq_lens_cpu=[1, 3],
+        )
+
+        (ks, ke), token_to_batch_idx = backend._cal_indexer_k_start_end(
+            forward_batch
+        )
+
+        self.assertEqual(ks.tolist(), [0, 11, 11, 11])
+        self.assertEqual(ke.tolist(), [11, 32, 33, 34])
+        self.assertEqual(token_to_batch_idx.tolist(), [0, 1, 1, 1])
+
     def _verify_topk_output(self, topk_indices, batch_size, q_len, topk):
         """Verify the topk indices output shape and basic properties."""
         self.assertIsNotNone(topk_indices)
