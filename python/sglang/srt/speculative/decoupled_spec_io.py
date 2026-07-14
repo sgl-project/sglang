@@ -78,7 +78,7 @@ class VerifyCommit:
 
     Enumeration-side interpretation
     -------------------------------
-    Under the enumeration data plane (DraftEnumerationBuffer) the verifier
+    Under the enumeration data plane (DraftEnumerationBufferBatch) the verifier
     GPU-selects one enumerated chain per verify round, so the newly committed
     tokens are the accepted draft tokens followed by the bonus token:
 
@@ -136,90 +136,121 @@ class DraftClose:
 
 
 @dataclass
-class DraftEnumerationBuffer:
-    """Drafter pushes a full enumeration block for one request, one round ahead.
+class DraftEnumerationBufferBatch:
+    """One drafter -> one verifier enumeration push for a whole batch, one round ahead.
 
     Instead of streaming draft tail tokens one at a time, the drafter
-    pre-enumerates, from a single committed base, every chain the verifier could
-    possibly select in the next verify round and pushes the whole block at once.
-    The verifier then GPU-selects the matching chain; a branch that does not
-    match is simply never selected, so a wrong guess is never committed.
+    pre-enumerates, from each request's single committed base, every chain the
+    verifier could possibly select in the next verify round and pushes the whole
+    batch at once. The verifier then GPU-selects the matching chain per row; a
+    branch that does not match is simply never selected, so a wrong guess is
+    never committed.
 
-    Enumeration dimensions
-    ----------------------
+    Parallel-array batch
+    --------------------
+    This is one wire message carrying a whole batch in the SGLang parallel-array
+    idiom (mirroring io_struct.py BatchTokenIDOutput: a single rids[] plus
+    parallel per-row fields, not a list of per-request objects). Row i is
+    described by rids[i] and base_committed_lens[i]; its enumerated block lives
+    in the shared flat tokens buffer at offset i * row_stride.
+
+    src_drafter_rank and dst_verifier_rank are scalars because a wire message
+    has exactly one sender and one destination: the drafter groups its outputs
+    per destination verifier at send time (mirroring how DraftControlBatch is
+    keyed on a single dst_drafter_rank). Aggregation across drafters happens on
+    the verifier side, by collecting the multiple messages it receives keyed on
+    their differing src_drafter_rank.
+
+    Enumeration dimensions (batch-uniform, from the global spec config)
+    -------------------------------------------------------------------
     - num_steps (K): speculative_num_steps, the draft chain length per case.
     - fanout (F): speculative_fanout, the number of bonus-token guesses the
       drafter enumerates per accept case.
     - accept cases (K + 1): the possible accept lengths of the *previous* round
-      that this block is drafted against, 0 .. K inclusive.
+      that a block is drafted against, 0 .. K inclusive.
 
     tokens layout
     -------------
-    tokens is a flat tuple of (K + 1) * F * K vocab ids laid out as
-    [accept_case][guess][step]:
+    tokens is a single flat tuple of batch_size * row_stride vocab ids, where
+    row_stride = (K + 1) * F * K. Row i occupies tokens[i * row_stride : (i + 1)
+    * row_stride]; within a row the block is laid out as [accept_case][guess][step]:
 
-        flat_index = (accept_case * F + guess) * K + step
+        flat_index = i * row_stride + (accept_case * F + guess) * K + step
 
     with accept_case in [0, K], guess in [0, F), step in [0, K). The value at
-    that index is the draft token the drafter proposes for chain
+    that index is the draft token the drafter proposes for row i's chain
     (accept_case, guess) at position step.
 
-    base_committed_len is the verifier committed length this block was drafted
+    base_committed_lens[i] is the verifier committed length row i was drafted
     from; it is the staleness version. The verifier judges usability entirely on
-    GPU by comparing base_committed_len against its current committed length
+    GPU by comparing base_committed_lens against its current committed length
     together with the bonus-token match, so no host round-trip is needed to
-    decide whether the block is fresh.
+    decide whether a row is fresh.
     """
 
     src_drafter_rank: int
     dst_verifier_rank: int
-    request_id: str
-    base_committed_len: int
     num_steps: int
     fanout: int
+    rids: list[str] = field(default_factory=list)
+    base_committed_lens: list[int] = field(default_factory=list)
     tokens: tuple[int, ...] = ()
 
     @property
-    def draft_key(self) -> DraftReqKey:
-        return DraftReqKey(
-            src_verifier_rank=int(self.dst_verifier_rank),
-            request_id=self.request_id,
-        )
+    def row_stride(self) -> int:
+        return (int(self.num_steps) + 1) * int(self.fanout) * int(self.num_steps)
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.rids)
 
     @property
     def num_tokens(self) -> int:
-        return (int(self.num_steps) + 1) * int(self.fanout) * int(self.num_steps)
+        return self.batch_size * self.row_stride
+
+    def draft_key(self, i: int) -> DraftReqKey:
+        return DraftReqKey(
+            src_verifier_rank=int(self.dst_verifier_rank),
+            request_id=self.rids[i],
+        )
+
+    def row_tokens(self, i: int) -> tuple[int, ...]:
+        return self.tokens[i * self.row_stride : (i + 1) * self.row_stride]
 
     def validate(self) -> None:
         if int(self.num_steps) < 1:
             raise ValueError(
-                "DraftEnumerationBuffer num_steps must be >= 1: "
-                f"request_id={self.request_id} num_steps={self.num_steps}"
+                "DraftEnumerationBufferBatch num_steps must be >= 1: "
+                f"batch_size={self.batch_size} num_steps={self.num_steps}"
             )
         if int(self.fanout) < 1:
             raise ValueError(
-                "DraftEnumerationBuffer fanout must be >= 1: "
-                f"request_id={self.request_id} fanout={self.fanout}"
+                "DraftEnumerationBufferBatch fanout must be >= 1: "
+                f"batch_size={self.batch_size} fanout={self.fanout}"
             )
-        if int(self.base_committed_len) < 0:
+        if len(self.rids) != len(self.base_committed_lens):
             raise ValueError(
-                "DraftEnumerationBuffer base_committed_len must be non-negative: "
-                f"request_id={self.request_id} "
-                f"base_committed_len={self.base_committed_len}"
+                "DraftEnumerationBufferBatch rids and base_committed_lens must "
+                "have equal length: "
+                f"len(rids)={len(self.rids)} "
+                f"len(base_committed_lens)={len(self.base_committed_lens)}"
             )
+        for i, base_committed_len in enumerate(self.base_committed_lens):
+            if int(base_committed_len) < 0:
+                raise ValueError(
+                    "DraftEnumerationBufferBatch base_committed_lens must be "
+                    "non-negative: "
+                    f"request_id={self.rids[i]} "
+                    f"base_committed_len={base_committed_len}"
+                )
         if len(self.tokens) != self.num_tokens:
             raise ValueError(
-                "DraftEnumerationBuffer tokens length must equal "
-                "(num_steps + 1) * fanout * num_steps: "
-                f"request_id={self.request_id} "
+                "DraftEnumerationBufferBatch tokens length must equal "
+                "batch_size * (num_steps + 1) * fanout * num_steps: "
+                f"batch_size={self.batch_size} "
                 f"num_steps={self.num_steps} fanout={self.fanout} "
                 f"expected={self.num_tokens} actual={len(self.tokens)}"
             )
-
-
-@dataclass
-class DraftEnumerationBufferBatch:
-    buffers: list[DraftEnumerationBuffer] = field(default_factory=list)
 
 
 @dataclass
