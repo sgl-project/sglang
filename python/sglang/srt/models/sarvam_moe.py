@@ -14,7 +14,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -27,8 +26,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -63,7 +60,12 @@ from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -82,7 +84,7 @@ if _is_cuda:
         from sgl_kernel import bmm_fp8, merge_state_v2
 
         from sglang.jit_kernel.concat_mla import concat_mla_k
-        from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+        from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
         _has_concat_mla_k = True
@@ -208,16 +210,12 @@ class SarvamMoEMLP(nn.Module):
         self,
         x,
         forward_batch: ForwardBatch = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         if x.shape[0] == 0:
             return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -233,7 +231,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 2.5)
         self.score_function = getattr(config, "score_function", "sigmoid")
         self.n_group = getattr(config, "n_group", None)
@@ -274,8 +272,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -319,8 +316,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
     ) -> torch.Tensor:
         del gemm_output_zero_allocator
@@ -331,13 +326,9 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
-            return self.forward_normal_dual_stream(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal_dual_stream(hidden_states)
         else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states)
 
     def get_moe_weights(self):
         return [
@@ -363,8 +354,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         current_stream = torch.cuda.current_stream()
@@ -378,8 +367,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states + shared_out
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -387,8 +374,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -420,8 +405,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -449,8 +432,8 @@ class SarvamMoEMLAAttention(nn.Module):
         self.alt_stream = alt_stream
         self.quant_config = quant_config
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -466,7 +449,7 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_server_args().kv_cache_dtype
 
         self._server_args = None
         self.current_attention_backend = None
@@ -624,7 +607,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
     def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
         if self._server_args is None:
-            self._server_args = get_global_server_args()
+            self._server_args = get_server_args()
         if forward_batch.forward_mode.is_decode_or_idle():
             self.current_attention_backend = (
                 self._server_args.decode_attention_backend
@@ -780,7 +763,7 @@ class SarvamMoEMLAAttention(nn.Module):
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self._server_args is None:
-            self._server_args = get_global_server_args()
+            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
         forward_method = get_attn_forward_method(self._server_args, forward_batch)
@@ -894,7 +877,7 @@ class SarvamMoEMLAAttention(nn.Module):
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self._server_args is None:
-            self._server_args = get_global_server_args()
+            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
         forward_method = get_attn_forward_method(self._server_args, forward_batch)
 
@@ -952,7 +935,7 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator = inner_state
 
         if self._server_args is None:
-            self._server_args = get_global_server_args()
+            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
         forward_method = get_attn_forward_method(self._server_args, forward_batch)
@@ -1079,7 +1062,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -1115,25 +1098,27 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
-            and not use_reduce_scatter
-            and not should_allreduce_fusion
+            and not mlp_reduce_scatter
+            and not fuse_mlp_allreduce
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if should_allreduce_fusion:
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1154,7 +1139,7 @@ class SarvamMLAModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1243,7 +1228,7 @@ class SarvamMLAForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

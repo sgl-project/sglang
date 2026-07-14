@@ -1,24 +1,29 @@
-"""
-Correctness test for the JIT custom all-reduce (v2) kernel.
+"""Correctness test for the JIT custom all-reduce (v2) kernel.
 
-The test compares the JIT custom all-reduce output against NCCL all-reduce
-for various tensor sizes and dtypes, in both eager and CUDA-graph modes.
+Compares the JIT custom all-reduce output against NCCL all-reduce for a sweep
+of tensor sizes, dtypes, and algorithms, in both eager and CUDA-graph modes.
 
-Usage:
-    python -m pytest test_jit_custom_all_reduce.py -v
+Usage::
 
-This file doubles as the torchrun worker script.  The test class launches
-    torchrun --nproc_per_node=N <this_file>
-and asserts that all worker processes exit successfully.
+    # Run the test on the default world sizes (2, 4, 8 GPUs):
+    python tests/test_custom_all_reduce.py
+    # Pick a specific world size (or comma-separated list), e.g. the rarer
+    # odd / non-power-of-two counts that the default sweep skips:
+    python tests/test_custom_all_reduce.py --num-gpu 3
+    python tests/test_custom_all_reduce.py --num-gpu 2,4,6,8
+    # Extra pytest args (forwarded to each torchrun worker):
+    python tests/test_custom_all_reduce.py -k bfloat16
 """
 
 from __future__ import annotations
 
+import atexit
 import itertools
 import logging
-import multiprocessing as mp
+import multiprocessing
 import os
-from typing import Dict, Optional, Tuple
+from multiprocessing.context import SpawnProcess
+from typing import List
 
 import pytest
 import torch
@@ -30,7 +35,9 @@ from sglang.jit_kernel.all_reduce import (
     _jit_custom_all_reduce_pull_module,
     _jit_custom_all_reduce_push_module,
 )
-from sglang.jit_kernel.tests.utils import multiprocess_main, multiprocess_test
+from sglang.jit_kernel.mp import register_comm_cleanup
+from sglang.jit_kernel.tests.utils import multigpu_pytest_main
+from sglang.jit_kernel.utils import cache_once, get_ci_test_range
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -38,7 +45,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    suite="base-b-kernel-unit-8-gpu-h200",
+    stage="base-b-kernel-unit",
+    runner_config="8-gpu-h200",
 )
 register_cuda_ci(
     est_time=300,
@@ -47,7 +55,7 @@ register_cuda_ci(
 )
 
 # ---------------------------------------------------------------------------
-# Test parameters (shared between test class and worker)
+# Test parameters
 # ---------------------------------------------------------------------------
 
 TEST_SIZES = [
@@ -59,181 +67,172 @@ TEST_SIZES = [
     4 * 1024,
     32 * 1024,
     256 * 1024,
-    2 * 1024 * 1024,  # 2M elements
-    4 * 1024 * 1024,  # 4M elements
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-SHOTS = [
+TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
-USE_GRAPH_OPTIONS = [True, False]
-TEST_CONFIG = itertools.product(TEST_SIZES, TEST_DTYPES, SHOTS, USE_GRAPH_OPTIONS)
+USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
 TEST_LOOP = 16
 
-# ---------------------------------------------------------------------------
-# Test class (runs via pytest, launches torchrun subprocesses)
-# ---------------------------------------------------------------------------
-
-
-def _compile_one(dtype: torch.dtype, world_size: int):
-    _jit_custom_all_reduce_push_module(dtype, world_size)
-    _jit_custom_all_reduce_pull_module(dtype, world_size)
-
-
-def _precompile_kernels() -> None:
-    # NOTE: even when device count < 8, we should be able to compile all
-    process_map: Dict[Tuple[torch.dtype, int], mp.Process] = {}
-    COMPILE_SPACE = itertools.product(TEST_DTYPES, [2, 3, 4, 5, 6, 7, 8])
-    mp.set_start_method("spawn")
-    for config in COMPILE_SPACE:
-        process_map[config] = mp.Process(target=_compile_one, args=config)
-    for process in process_map.values():
-        process.start()
-    for (dtype, world_size), process in process_map.items():
-        process.join()
-        if process.exitcode != 0:
-            raise RuntimeError(f"Custom All Reduce {world_size=} {dtype=} failed")
-
-
-@pytest.mark.parametrize("nproc", [1, 2, 3, 4, 5, 6, 7, 8])
-def test_custom_allreduce(nproc: int) -> None:
-    if nproc == 1:  # NOTE: special case to speed up tests
-        return _precompile_kernels()
-
-    device_count = torch.cuda.device_count()
-    if device_count < nproc:
-        pytest.skip(
-            f"Requires at least {nproc} GPUs, but only {device_count} available"
-        )
-    multiprocess_test(__file__, nproc)
-
+TEST_SIZES = get_ci_test_range(TEST_SIZES, [16, 1024, 32 * 1024, 2 * 1024 * 1024])
+TEST_DTYPES = get_ci_test_range(TEST_DTYPES, [torch.bfloat16])
 
 # ---------------------------------------------------------------------------
-# Worker logic (executed by each torchrun process)
+# Parallel JIT precompile (outer process, before any torchrun child starts)
 # ---------------------------------------------------------------------------
 
 
-def init_distributed():
-    """Initialize distributed groups via torchrun env vars.
+def _compile_one(dtype: torch.dtype, world_size: int) -> None:
+    """Compile both (push, pull) variants for a single (dtype, world_size).
 
-    Returns (rank, device, cpu_group, nccl_group, comm).
+    Top-level so it survives ``spawn`` pickling. Compiled artifacts are
+    cached on disk by ``tvm_ffi``; torchrun children will reuse them.
     """
+    _jit_custom_all_reduce_pull_module(dtype, world_size)
+    _jit_custom_all_reduce_push_module(dtype, world_size)
+
+
+def _precompile_kernels(num_gpus: List[int]) -> None:
+    """Fan out one process per (dtype, world_size) to warm the JIT cache.
+
+    Without this, every torchrun child serial-compiles its kernels on first
+    use, multiplying the wall-clock cost of the run by ~(#dtypes * #ranks).
+    """
+    ctx = multiprocessing.get_context("spawn")
+    procs: list[tuple[torch.dtype, int, SpawnProcess]] = []
+    for dtype, world_size in itertools.product(TEST_DTYPES, num_gpus):
+        p = ctx.Process(target=_compile_one, args=(dtype, world_size))
+        p.start()
+        procs.append((dtype, world_size, p))
+    for dtype, world_size, p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"Custom-all-reduce precompile failed for "
+                f"{dtype=} {world_size=} (exit {p.exitcode})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Per-rank distributed setup (run once per torchrun worker)
+# ---------------------------------------------------------------------------
+
+
+@cache_once
+def _init_cpu_group_once() -> dist.ProcessGroup:
+    """Initialize gloo world group + cuda device for this rank."""
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    rank = local_rank
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo")
     ps._WORLD = coord = ps.init_world_group(
         ranks=list(range(world_size)),
         local_rank=local_rank,
         backend="nccl",
     )
-
+    atexit.register(dist.destroy_process_group)
     cpu_group = coord.cpu_group
-    nccl_group = coord.device_group
-    assert nccl_group is not None
+    assert isinstance(cpu_group, dist.ProcessGroup)
+    # Suppress chatty internal logging for cleaner test output.
+    logging.disable(logging.INFO)
+    # Use a non-default stream (mirrors prior behavior).
+    torch.cuda.set_stream(torch.cuda.Stream())
+    return cpu_group
 
-    max_size = max(TEST_SIZES) * 4
+
+@cache_once
+def _init_nccl_group_once() -> dist.ProcessGroup:
+    _init_cpu_group_once()
+    coord = ps._WORLD
+    assert coord is not None and coord.device_group is not None
+    return coord.device_group
+
+
+@cache_once
+def _init_comm_once() -> CustomAllReduceV2:
+    cpu_group = _init_cpu_group_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    max_size = max(TEST_SIZES) * max(
+        torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
+    )
     comm = CustomAllReduceV2(cpu_group, device, max_size, max_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+    register_comm_cleanup(comm)
+    return comm
 
-    return rank, device, cpu_group, nccl_group, comm
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("algo", TEST_ALGOS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
 @torch.inference_mode()
-def worker_test(
-    device: torch.device,
-    nccl_group: dist.ProcessGroup,
-    comm: CustomAllReduceV2,
+def test_custom_all_reduce(
     size: int,
     dtype: torch.dtype,
-    use_graph: bool,
     algo: AllReduceAlgo,
-) -> Optional[RuntimeError]:
+    use_graph: bool,
+) -> None:
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     comm.override_algo = algo
 
-    def get_run_graph_fn():
+    if use_graph:
         graph = torch.cuda.CUDAGraph()
         graph_inp = torch.zeros((TEST_LAYERS, size), dtype=dtype, device=device)
-        out_jits = []
+        outs: list[torch.Tensor] = []
         with comm.capture():
             with torch.cuda.graph(graph):
                 for i in range(TEST_LAYERS):
-                    out_jits.append(comm.custom_all_reduce(graph_inp[i]))
-                out_jit = torch.stack(out_jits)
+                    outs.append(comm.custom_all_reduce(graph_inp[i]))
+                out_jit_stack = torch.stack(outs)
         torch.cuda.synchronize()
 
-        def run_graph(x: torch.Tensor) -> torch.Tensor:
+        def run(x: torch.Tensor) -> torch.Tensor:
             graph_inp.copy_(x)
             graph.replay()
-            return out_jit.clone()
+            return out_jit_stack.clone()
 
-        return run_graph
+    else:
 
-    def get_run_eager_fn():
-        def run_eager(x: torch.Tensor) -> torch.Tensor:
+        def run(x: torch.Tensor) -> torch.Tensor:
             eager_inp = x.clone()
-            out_eagers = []
+            outs = []
             for i in range(TEST_LAYERS):
-                out_eagers.append(comm.custom_all_reduce(eager_inp[i]))
+                outs.append(comm.custom_all_reduce(eager_inp[i]))
                 torch.cuda.synchronize()
-            return torch.stack(out_eagers)
+            return torch.stack(outs)
 
-        return run_eager
-
-    run_fn = get_run_graph_fn() if use_graph else get_run_eager_fn()
-    num_errors = 0
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
         assert comm.should_custom_ar(inp[0])
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
-        out_jit = run_fn(inp)
-        num_errors += not torch.all(out_jit == out_ref)
-    if num_errors > 0:
-        return RuntimeError(
-            f"Test failed for {size=}, {dtype=}, {algo=}, "
-            f"{use_graph=} with {num_errors} errors. "
-        )
-    return None
-
-
-def worker_main() -> None:
-    """Entry point for each torchrun worker process."""
-    rank, device, cpu_group, nccl_group, comm = init_distributed()
-
-    torch.cuda.set_stream(torch.cuda.Stream())
-
-    logging.disable(logging.INFO)  # Suppress internal logging for cleaner test output
-    items = list(enumerate(TEST_CONFIG))
-    for i, (size, dtype, algo, use_graph) in items:
-        error = worker_test(device, nccl_group, comm, size, dtype, use_graph, algo)
-        if error is not None:
-            print(
-                f"Worker {rank} failed for {size=}, {dtype=}, "
-                f"{algo=}, {use_graph=}, iteration={i}\n"
-                f"Error: {error}"
-            )
-        # communicate the result to rank 0 for logging
-        result = torch.tensor([int(error is not None)])
-        dist.all_reduce(result, group=cpu_group)
-        failed = bool(result.item())
-        if failed:
-            raise RuntimeError(
-                f"Test failed on rank {rank} for config: "
-                f"{size=}, {dtype=}, {algo=}, {use_graph=}"
-            )
-
-    comm.close()
-    dist.destroy_process_group()
+        out_jit = run(inp)
+        # Exact equality, since values are small integers within bf16 precision.
+        torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
-    multiprocess_main(__file__, worker_main)
+    # Only sweep the common world sizes (2, 4, 8) by default: testing every
+    # count in 2..8 serially overruns the per-file CI time budget, and 3/5/6/7
+    # are rare in practice. Use --num-gpu to exercise them explicitly.
+    multigpu_pytest_main(
+        __name__,
+        __file__,
+        num_gpus=(2, 4, 8),
+        pre_launch_fn=_precompile_kernels,
+    )

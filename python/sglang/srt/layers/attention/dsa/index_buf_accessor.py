@@ -4,8 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
@@ -190,7 +190,7 @@ class GetKAndS:
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
         page_size = pool.page_size
         index_head_dim = pool.index_head_dim
@@ -253,134 +253,10 @@ class GetKAndS:
         )
 
 
-class SetK:
-    @classmethod
-    def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
-
-    @classmethod
-    def slow(
-        cls,
-        pool: "DSATokenToKVPool",
-        buf: torch.Tensor,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-    ):
-        for i in range(len(loc)):
-            page_index = loc[i] // pool.page_size
-            offset = loc[i] % pool.page_size
-            buf[
-                page_index,
-                offset * pool.index_head_dim : (offset + 1) * pool.index_head_dim,
-            ] = index_k[i].view(torch.uint8)
-
-    @classmethod
-    def torch_fast(
-        cls,
-        pool: "DSATokenToKVPool",
-        buf: torch.Tensor,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-    ):
-        (num_tokens_to_write,) = loc.shape
-        buf_numel_per_page = buf.shape[1]
-        num_k_bytes_per_token = pool.index_head_dim
-
-        # loc: (num_tokens_to_write,), int32, element := the token index to write to
-        loc_page_index = loc // pool.page_size
-        loc_token_offset_in_page = loc % pool.page_size
-
-        flat_buf = buf.flatten()
-        flat_indices = (
-            (loc_page_index * buf_numel_per_page)[:, None]
-            + (loc_token_offset_in_page * num_k_bytes_per_token)[:, None]
-            + torch.arange(num_k_bytes_per_token, dtype=torch.int32, device="cuda")[
-                None, :
-            ]
-        )
-        num_k_bytes_total = num_tokens_to_write * num_k_bytes_per_token
-        flat_indices = flat_indices.flatten()[:num_k_bytes_total]
-        flat_buf[flat_indices] = index_k.view(torch.uint8).flatten()
-
-
-class SetS:
-    @classmethod
-    def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
-
-    @classmethod
-    def slow(
-        cls,
-        pool: "DSATokenToKVPool",
-        buf: torch.Tensor,
-        loc: torch.Tensor,
-        index_k_scale: torch.Tensor,
-    ):
-        for i in range(len(loc)):
-            page_index = loc[i] // pool.page_size
-            offset = loc[i] % pool.page_size
-            start = pool.page_size * pool.index_head_dim
-            buf[page_index, start + offset * 4 : start + (offset + 1) * 4] = (
-                index_k_scale[i].view(torch.uint8)
-            )
-
-    @classmethod
-    def torch_fast(
-        cls,
-        pool: "DSATokenToKVPool",
-        buf: torch.Tensor,
-        loc: torch.Tensor,
-        index_k_scale: torch.Tensor,
-    ):
-        (num_tokens_to_write,) = loc.shape
-        buf_numel_per_page = buf.shape[1]
-        num_s_bytes_per_token = 4
-        s_offset_in_page = pool.page_size * pool.index_head_dim
-
-        # loc: (num_tokens_to_write,), int32, element := the token index to write to
-        loc_page_index = loc // pool.page_size
-        loc_token_offset_in_page = loc % pool.page_size
-
-        flat_buf = buf.flatten()
-        flat_indices = (
-            (loc_page_index * buf_numel_per_page)[:, None]
-            + s_offset_in_page
-            + (loc_token_offset_in_page * num_s_bytes_per_token)[:, None]
-            + torch.arange(num_s_bytes_per_token, dtype=torch.int32, device="cuda")[
-                None, :
-            ]
-        )
-        number_s_bytes_total = num_tokens_to_write * num_s_bytes_per_token
-        flat_indices = flat_indices.flatten()[:number_s_bytes_total]
-        flat_buf[flat_indices] = index_k_scale.view(torch.uint8).flatten()
-
-
 class SetKAndS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        if 0:
-            # print("SetK, SetS comparison test")
-            buf_cloned = buf.clone()
-            cls.vanilla(*args, **kwargs, buf=buf)
-            cls.triton(*args, **kwargs, buf=buf_cloned)
-
-            def _clear_token_0(target):
-                target[0, :128] = target[0, 64 * 128 : 64 * 128 + 4] = 0
-
-            _clear_token_0(buf)
-            _clear_token_0(buf_cloned)
-
-            assert torch.all(
-                buf == buf_cloned
-            ), f"{buf=} {buf_cloned=} {kwargs['loc'].to_list()=}"
-            return
-
         cls.triton(*args, **kwargs, buf=buf)
-
-    @classmethod
-    def vanilla(cls, pool, buf, loc, index_k, index_k_scale):
-        SetK.execute(pool=pool, buf=buf, loc=loc, index_k=index_k)
-        SetS.execute(pool=pool, buf=buf, loc=loc, index_k_scale=index_k_scale)
 
     @classmethod
     def triton(cls, pool, buf, loc, index_k, index_k_scale):

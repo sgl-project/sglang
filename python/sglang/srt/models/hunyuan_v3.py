@@ -19,9 +19,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_world_size,
-    get_tensor_model_parallel_world_size,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -47,6 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -100,8 +98,8 @@ class HYV3MoEFused(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.tp_size = get_moe_tensor_parallel_world_size()
-        self.ep_size = get_moe_expert_parallel_world_size()
+        self.tp_size = get_parallel().moe_tp_size
+        self.ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.n_routed_experts = config.num_experts
@@ -258,7 +256,7 @@ class HYV3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -425,7 +423,7 @@ class HYV3Model(nn.Module):
             prefix=f"{prefix}.embed_tokens",
         )
 
-        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
+        self.alt_stream = get_stream("alt") if is_cuda() else None
 
         self.layers = nn.ModuleList(
             [

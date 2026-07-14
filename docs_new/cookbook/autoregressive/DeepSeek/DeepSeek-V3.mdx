@@ -377,7 +377,7 @@ print(final_response.choices[0].message.content)
 
 #### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
 
-SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding#EAGLE-Decoding). With this optimization, decoding speed improves by up to **1.8×** at batch size 1 and **1.5×** at batch size 32 on H200 TP8.
+SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding#eagle-decoding). With this optimization, decoding speed improves by up to **1.8×** at batch size 1 and **1.5×** at batch size 32 on H200 TP8.
 
 **Enable with:**
 
@@ -424,8 +424,8 @@ For multi-node serving and hardware-specific examples:
 - [8× A100 AWQ](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
 - [16× A100 INT8](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32× L40S INT8](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
-- [Xeon 6980P CPU](../../../docs/hardware-platforms/cpu_server#example-running-deepseek-r1)
-- [4× Atlas 800I A3 (int8)](../../../docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example#running-deepseek-with-pd-disaggregation-on-4-x-atlas-800i-a3)
+- [Xeon 6980P CPU](../../../docs/hardware-platforms/cpu_server#example-running-deepseek-v3-1-terminus)
+- [4× Atlas 800I A3 (int8)](../../../docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1#multi-node-pd-disaggregation-deployment)
 
 **Blog references for large-scale deployment:**
 

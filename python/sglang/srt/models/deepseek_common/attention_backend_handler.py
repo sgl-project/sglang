@@ -1,6 +1,9 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -8,7 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
@@ -43,15 +46,14 @@ def handle_attention_ascend(attn, forward_batch):
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
-        if hasattr(attn, "indexer"):
+        if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:
-        if hasattr(attn, "indexer"):
+        if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:
             return AttnForwardMethod.MLA_NPU
@@ -112,7 +114,7 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 def handle_attention_fa3(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")
@@ -151,6 +153,11 @@ def handle_attention_tokenspeed_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
+    # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
+    # kernels; route through the MHA path (radix_attention swaps attn_mqa for
+    # its attn_mha companion) so capture/replay use valid head/dim metadata.
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+        return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
         return AttnForwardMethod.MHA
     else:
@@ -176,7 +183,7 @@ def handle_attention_triton(attn, forward_batch):
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (
