@@ -14,13 +14,13 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 11K+1.5K | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
+| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 11k+1.5k | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
+| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
 
 ## Optimal Configuration
 
@@ -38,7 +38,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: BF16
 
-**Dataset**: 11K+1.5K
+**Dataset**: 11k+1.5k
 
 **TPOT**: 8ms
 
@@ -77,7 +77,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -135,7 +134,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50.1ms
 
@@ -175,7 +174,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1

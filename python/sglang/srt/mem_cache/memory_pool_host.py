@@ -581,6 +581,26 @@ class MambaPoolHost(HostKVCache):
                 element_size_list.append(conv_element_sizes[j])
         return ptr_list, element_size_list
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        temporal_stride = (
+            self.num_mamba_layers
+            * self.temporal_state_elem_size
+            * self.temporal_dtype.itemsize
+        )
+        if self.temporal_buffer.data_ptr() % page_size_bytes != 0:
+            return False
+        if temporal_stride % page_size_bytes != 0:
+            return False
+        for buf, elem_size in zip(self.conv_buffer, self.conv_state_elem_sizes):
+            conv_stride = self.num_mamba_layers * elem_size * self.conv_dtype.itemsize
+            if buf.data_ptr() % page_size_bytes != 0:
+                return False
+            if conv_stride % page_size_bytes != 0:
+                return False
+        return True
+
 
 # ---- V4 Compressed KV Host Pools ----
 
@@ -1044,6 +1064,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
+        return (
+            self.kv_buffer.data_ptr() % page_size_bytes == 0
+            and page_bytes % page_size_bytes == 0
+        )
+
 
 class DeepSeekV4StateHostPool(HostKVCache):
     """Host pool for V4 CompressStatePool page rows."""
@@ -1413,6 +1442,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        page_bytes = self.layer_num * self.state_page_bytes * self.dtype.itemsize
+        return (
+            self.kv_buffer.data_ptr() % page_size_bytes == 0
+            and page_bytes % page_size_bytes == 0
+        )
+
 
 @dataclass
 class PoolEntry:
@@ -1487,6 +1525,9 @@ class HostPoolGroup:
 
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        return self.anchor_entry.host_pool.is_stride_page_aligned(page_size_bytes)
 
     def clear(self) -> None:
         for entry in self.entries:
@@ -1950,3 +1991,14 @@ class DSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        page_stride_bytes = (
+            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
+        )
+        return (
+            self.index_k_with_scale_buffer.data_ptr() % page_size_bytes == 0
+            and page_stride_bytes % page_size_bytes == 0
+        )
