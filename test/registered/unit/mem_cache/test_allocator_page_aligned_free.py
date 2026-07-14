@@ -177,6 +177,9 @@ class TestAllocatorPageAlignedFree(unittest.TestCase):
             allocator.free(free_index)
 
         allocator.swa_attn_allocator.free.assert_not_called()
+        helper_source = inspect.getsource(allocator_base._validate_page_aligned_free)
+        self.assertNotIn("free_index[free_index > 0]", helper_source)
+        self.assertIn("torch.sort", helper_source)
 
 
 if __name__ == "__main__":

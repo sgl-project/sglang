@@ -43,9 +43,16 @@ def _validate_page_aligned_free(
         return
 
     if ignore_non_positive:
-        free_index = free_index[free_index > 0]
-        if free_index.numel() == 0:
-            return
+        assert page_size == 1
+        sorted_indices = torch.sort(free_index.to(dtype=torch.int64)).values
+        duplicate_positive = (sorted_indices[1:] == sorted_indices[:-1]) & (
+            sorted_indices[1:] > 0
+        )
+        torch._assert_async(
+            torch.all(~duplicate_positive),
+            "free requires unique, aligned, complete page blocks",
+        )
+        return
 
     page_blocks = free_index.reshape(-1, page_size).to(dtype=torch.int64)
     page_starts = page_blocks[:, 0]
