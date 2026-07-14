@@ -955,9 +955,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
     def test_alloc_extend_swa_tail_accepts_asymmetric_capacity(self) -> None:
         """A long full allocation can share capacity with a short SWA tail."""
-        allocator, full_allocator, swa_allocator = (
-            _build_asymmetric_tail_allocator()
-        )
+        allocator, full_allocator, swa_allocator = _build_asymmetric_tail_allocator()
 
         token_ids = allocator.alloc_extend_swa_tail(
             extend_num_tokens=12,
@@ -977,12 +975,10 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
     def test_alloc_extend_swa_tail_rechecks_capacity_after_flush(self) -> None:
         """Lazy compaction rechecks asymmetric capacity after both flushes."""
-        allocator, full_allocator, swa_allocator = (
-            _build_asymmetric_tail_allocator(
-                lazy_compaction=True,
-                gap_bytes=5,
-                gap_bytes_after_flush=6,
-            )
+        allocator, full_allocator, swa_allocator = _build_asymmetric_tail_allocator(
+            lazy_compaction=True,
+            gap_bytes=5,
+            gap_bytes_after_flush=6,
         )
 
         token_ids = allocator.alloc_extend_swa_tail(
@@ -998,8 +994,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
     def test_alloc_extend_swa_tail_rolls_back_full_on_swa_failure(self) -> None:
         """A SWA binding failure frees full tokens and clears inverse history."""
-        allocator, full_allocator, swa_allocator = (
-            _build_asymmetric_tail_allocator(raise_on_swa_alloc=True)
+        allocator, full_allocator, swa_allocator = _build_asymmetric_tail_allocator(
+            raise_on_swa_alloc=True
         )
 
         with self.assertRaisesRegex(
