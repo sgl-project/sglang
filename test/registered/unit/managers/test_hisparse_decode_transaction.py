@@ -61,9 +61,7 @@ class _FakeHiSparseAllocator:
         self.compress_ratio = compress_ratio
         self.supports_page_aligned_alloc = supports_page_aligned_alloc
         self.logical_attn_allocator = _FakeChildAllocator(page_size=page_size)
-        self.hisparse_attn_allocator = _FakeChildAllocator(
-            page_size=device_page_size
-        )
+        self.hisparse_attn_allocator = _FakeChildAllocator(page_size=device_page_size)
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(2048, dtype=torch.int64),
@@ -110,9 +108,7 @@ class _FakeHiSparseAllocator:
         self.clear_calls.append(mapping_indices.clone())
         self.full_to_hisparse_device_index_mapping[mapping_indices] = 0
 
-    def release_owned_hisparse_pages(
-        self, *, owned_page_ids: torch.Tensor
-    ) -> None:
+    def release_owned_hisparse_pages(self, *, owned_page_ids: torch.Tensor) -> None:
         self.release_calls.append(owned_page_ids.clone())
         self.hisparse_attn_allocator.available += (
             owned_page_ids.numel() * self.hisparse_device_page_size
@@ -280,7 +276,9 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         self.assertEqual(allocator.collect_calls, [])
         self.assertEqual(allocator.release_calls, [])
 
-    def test_extra_allocation_failure_preserves_mapping_buffer_and_capacity(self) -> None:
+    def test_extra_allocation_failure_preserves_mapping_buffer_and_capacity(
+        self,
+    ) -> None:
         """Net-extra OOM leaves the temporary owner transaction untouched."""
         coordinator = _make_coordinator()
         allocator = coordinator.token_to_kv_pool_allocator
@@ -294,9 +292,9 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
             buffer_start=100,
         )
         allocator.hisparse_attn_allocator.fail_next = True
-        mapping_before = (
-            allocator.full_to_hisparse_device_index_mapping[logical_page].clone()
-        )
+        mapping_before = allocator.full_to_hisparse_device_index_mapping[
+            logical_page
+        ].clone()
         buffer_before = coordinator.req_to_device_buffer.clone()
 
         with self.assertRaisesRegex(RuntimeError, "net allocation failed"):
@@ -342,9 +340,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
                 req_pool_indices=[0],
             )
 
-        self.assertEqual(
-            int(coordinator.req_device_buffer_token_locs[0, 0, 8]), 105
-        )
+        self.assertEqual(int(coordinator.req_device_buffer_token_locs[0, 0, 8]), 105)
         self.assertEqual(allocator.clear_calls, [])
         self.assertEqual(allocator.collect_calls, [])
         self.assertEqual(allocator.materialize_calls, [])
@@ -372,7 +368,9 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         release_call_count = len(allocator.release_calls)
         self.assertEqual(len(allocator.collect_calls), 1)
         allocator.collect_calls.clear()
-        published = allocator.full_to_hisparse_device_index_mapping[logical_page].clone()
+        published = allocator.full_to_hisparse_device_index_mapping[
+            logical_page
+        ].clone()
         _run_page_aligned_map(
             coordinator,
             seq_lens=[5],
@@ -544,17 +542,13 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(
-                allocator.full_to_hisparse_device_index_mapping[
-                    first_logical_page
-                ],
+                allocator.full_to_hisparse_device_index_mapping[first_logical_page],
                 coordinator.req_to_device_buffer[0, 4:8],
             )
         )
         self.assertTrue(
             torch.equal(
-                allocator.full_to_hisparse_device_index_mapping[
-                    second_logical_page
-                ],
+                allocator.full_to_hisparse_device_index_mapping[second_logical_page],
                 coordinator.req_to_device_buffer[1, 4:8],
             )
         )
@@ -610,14 +604,10 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
                 out_cache_locs=[39],
                 req_pool_indices=[0],
             )
-        self.assertEqual(
-            int(page_internal.req_device_buffer_token_locs[0, 0, 4]), 103
-        )
+        self.assertEqual(int(page_internal.req_device_buffer_token_locs[0, 0, 4]), 103)
         self.assertEqual(page_internal.token_to_kv_pool_allocator.clear_calls, [])
         self.assertEqual(page_internal.token_to_kv_pool_allocator.collect_calls, [])
-        self.assertEqual(
-            page_internal.token_to_kv_pool_allocator.materialize_calls, []
-        )
+        self.assertEqual(page_internal.token_to_kv_pool_allocator.materialize_calls, [])
 
         active = _make_coordinator(
             page_size=8,
@@ -710,9 +700,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         allocator.logical_attn_allocator.available = 8
         allocator.hisparse_attn_allocator.available = 2
 
-        with patch(
-            "sglang.srt.managers.schedule_batch.evict_from_tree_cache"
-        ) as evict:
+        with patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache") as evict:
             self.assertTrue(ScheduleBatch.check_decode_mem(batch))
             allocator.hisparse_attn_allocator.available = 1
             self.assertFalse(ScheduleBatch.check_decode_mem(batch))
@@ -751,19 +739,13 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         allocator.logical_attn_allocator.available = 4
         allocator.hisparse_attn_allocator.available = 7
 
-        with patch(
-            "sglang.srt.managers.schedule_batch.evict_from_tree_cache"
-        ) as evict:
-            self.assertTrue(
-                ScheduleBatch.check_decode_mem(batch, selected_indices=[1])
-            )
+        with patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache") as evict:
+            self.assertTrue(ScheduleBatch.check_decode_mem(batch, selected_indices=[1]))
             self.assertFalse(
                 ScheduleBatch.check_decode_mem(batch, selected_indices=[0])
             )
             allocator.hisparse_attn_allocator.available = 8
-            self.assertTrue(
-                ScheduleBatch.check_decode_mem(batch, selected_indices=[0])
-            )
+            self.assertTrue(ScheduleBatch.check_decode_mem(batch, selected_indices=[0]))
 
         self.assertEqual(evict.call_args_list[0].args[1], 4)
         self.assertEqual(evict.call_args_list[1].args[1], 8)
@@ -790,9 +772,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
                     side_effect=AssertionError("direct path must remain disabled")
                 )
 
-                with patch(
-                    "sglang.srt.managers.hisparse_coordinator._is_hip", False
-                ):
+                with patch("sglang.srt.managers.hisparse_coordinator._is_hip", False):
                     coordinator.map_last_loc_to_buffer(
                         seq_lens=torch.tensor([1], dtype=torch.int64),
                         out_cache_loc=torch.tensor([16], dtype=torch.int64),
