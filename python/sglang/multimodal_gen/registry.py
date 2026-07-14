@@ -68,6 +68,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -129,6 +130,7 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
@@ -786,6 +788,15 @@ def _register_configs():
         pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
         hf_model_paths=[
             "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            # Since LongLive-2.0-5B does not have official diffusers release
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
         ],
     )
     register_configs(
