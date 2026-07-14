@@ -3221,10 +3221,36 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if tgt_loc.numel() == 0:
             return
 
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
+        # index_k_with_scale_buffer is PAGE-indexed: dim-0 is the page, and within a page
+        # row the page_size tokens are laid out as a block of index_head_dim-byte fp8 keys
+        # followed by a block of 4-byte fp32 scales (see _create_index_buffers). tgt/src
+        # are per-token locations, so map each to its (page, offset) and move both
+        # sub-slices. A plain per-token row copy would index the page dim with token
+        # locations -- correct only for page_size == 1; this handles page_size > 1
+        # (all CUDA DSA uses 64) too.
+        ps = self.page_size
+        hd = self.index_head_dim
+        tgt = tgt_loc.reshape(-1).long()
+        src = src_loc.reshape(-1).long()
+        tgt_page, tgt_off = tgt // ps, tgt % ps
+        src_page, src_off = src // ps, src % ps
+        # Page-dim OOB probe, mirroring the token-dim check in super().move_kv_cache:
+        # index_k_with_scale_buffer is page-indexed, so bound the derived page ids by num_pages.
+        num_pages = self.index_k_with_scale_buffer[0].shape[0]
+        maybe_detect_oob(tgt_page, 0, num_pages, "move_kv_cache tgt_page (DSA index)")
+        maybe_detect_oob(src_page, 0, num_pages, "move_kv_cache src_page (DSA index)")
         for index_k in self.index_k_with_scale_buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            num_pages = index_k.shape[0]
+            row_stride = index_k.stride(0)
+            base = index_k.storage_offset()
+            fp8 = index_k.as_strided((num_pages, ps, hd), (row_stride, hd, 1), base)
+            scale = index_k.as_strided(
+                (num_pages, ps, 4), (row_stride, 4, 1), base + ps * hd
+            )
+            # RHS advanced-indexing gathers into a fresh tensor before the LHS write,
+            # so overlapping src/tgt token locations are safe.
+            fp8[tgt_page, tgt_off] = fp8[src_page, src_off]
+            scale[tgt_page, tgt_off] = scale[src_page, src_off]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
