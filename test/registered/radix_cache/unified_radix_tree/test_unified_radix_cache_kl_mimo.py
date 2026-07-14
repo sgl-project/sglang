@@ -1,4 +1,4 @@
-"""MiMo DFlash HiCache host load-back accuracy regression test."""
+"""MiMo V2.5 HiCache host load-back accuracy regression test."""
 
 import random
 import unittest
@@ -18,12 +18,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-MIMO_MODEL = "XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
-MIMO_DFLASH_MODEL = f"{MIMO_MODEL}/dflash"
+MIMO_MODEL = "XiaomiMiMo/MiMo-V2.5"
 MIMO_LAUNCH_TIMEOUT = 3600
 
-# This model needs eight H200 GPUs. The test is intentionally in extra-b: it
-# exercises the 1T MiMo backbone and its DFlash drafter end to end.
+# MiMo V2.5 is pre-cached on the eight-H200 runner. The test is intentionally
+# in extra-b because it exercises the asymmetric MHA host pool end to end.
 register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
 
 
@@ -45,28 +44,32 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
             timeout=MIMO_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
-                "--tp-size",
+                "--tp",
                 "8",
-                "--ep-size",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
-                "--quantization",
-                "fp8",
-                "--attention-backend",
-                "fa3",
-                "--speculative-algorithm",
-                "DFLASH",
-                "--speculative-draft-model-path",
-                MIMO_DFLASH_MODEL,
-                "--speculative-num-draft-tokens",
-                "8",
-                "--page-size",
-                str(cls.page_size),
-                "--chunked-prefill-size",
-                str(cls.prompt_len),
+                "--dp",
+                "2",
+                "--enable-dp-attention",
+                "--enable-dp-lm-head",
+                "--mm-enable-dp-encoder",
                 "--mem-fraction-static",
                 "0.65",
+                "--chunked-prefill-size",
+                "16384",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--enable-multi-layer-eagle",
+                "--reasoning-parser",
+                "mimo",
+                "--tool-call-parser",
+                "mimo",
+                "--page-size",
+                str(cls.page_size),
                 "--max-total-tokens",
                 str(cls.max_total_tokens),
                 "--max-running-requests",
@@ -80,7 +83,6 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
                 "kernel",
                 "--hicache-mem-layout",
                 "page_first",
-                "--disable-overlap-schedule",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
