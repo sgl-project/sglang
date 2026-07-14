@@ -112,6 +112,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_layers,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
@@ -236,6 +237,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
+        self._fused_input_proj_cpu_enabled = LazyValue(
+            lambda: (
+                _is_cpu
+                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
+                and self.in_proj_ba.weight.dtype == torch.bfloat16
+                and self.in_proj_qkvz.bias is None
+                and self.in_proj_ba.bias is None
+                and use_intel_amx_backend(self.in_proj_qkvz)
+                and use_intel_amx_backend(self.in_proj_ba)
+            )
+        )
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -500,6 +512,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
+        elif self._fused_input_proj_cpu_enabled.value:
+            projected_states_qkvz, projected_states_ba = (
+                torch.ops.sgl_kernel.fused_input_proj_cpu(
+                    hidden_states,
+                    self.in_proj_qkvz.weight,
+                    self.in_proj_ba.weight,
+                    True,
+                )
+            )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
