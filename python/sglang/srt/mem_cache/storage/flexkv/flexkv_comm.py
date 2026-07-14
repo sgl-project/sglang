@@ -639,6 +639,19 @@ class FlexKVLayerDoneCounter:
         producer_id = self._task_to_producer.pop(task_id, None)
         self.consumer_index = producer_id if producer_id is not None else -1
 
+    def abort_prepared_transfer(self, task_id: int, producer_id: int) -> None:
+        if not 0 <= producer_id < self.num_counters:
+            raise ValueError(
+                f"Invalid producer_id={producer_id}, must be in "
+                f"[0, {self.num_counters})"
+            )
+        self._task_to_producer.pop(task_id, None)
+        if self.consumer_index == producer_id:
+            self.consumer_index = -1
+        event = self.events[producer_id]
+        event._finished = True
+        event.wait_remaining = [1] * self.num_layers
+
     def wait_until(self, threshold: int) -> None:
         if self.consumer_index < 0:
             return

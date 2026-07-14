@@ -872,6 +872,8 @@ class FlexKVConnector:
         slot_mapping_cpu: Optional[torch.Tensor] = None
         page_starts: List[int] = []
         producer_id = -1
+        counter_registration_attempted = False
+        counter_registration_applied = False
 
         if self._poison_reason is not None:
             local_status = 0
@@ -930,6 +932,7 @@ class FlexKVConnector:
             local_reason = "lookup or slot manifest differs across ranks"
 
         if local_status == 1 and layerwise and pending is not None:
+            counter_registration_attempted = True
             try:
                 self._register_layerwise_counter(
                     pending=pending,
@@ -938,9 +941,26 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 local_status = 0
                 local_reason = str(exc)
+            else:
+                counter_registration_applied = True
 
         combined_status = self._sync_ctx.all_reduce_min(local_status)
         if combined_status == 0:
+            if counter_registration_attempted and pending is not None:
+                try:
+                    self._abort_layerwise_counter(
+                        pending=pending,
+                        producer_id=producer_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    registration_state = (
+                        "applied" if counter_registration_applied else "partially applied"
+                    )
+                    local_reason = (
+                        f"FlexKV layerwise {registration_state} registration rollback "
+                        f"failed: {exc}"
+                    )
+                    self._poison_reason = local_reason
             if pending is not None and self._sync_ctx.is_sync_leader:
                 assert self.kv_manager is not None
                 try:
@@ -1056,6 +1076,21 @@ class FlexKVConnector:
                 producer_id=normalized_producer_id,
             )
         counter.set_consumer(pending.task_id)
+
+    def _abort_layerwise_counter(
+        self, *, pending: _PendingFlexKVLookup, producer_id: int
+    ) -> None:
+        counter = self.layer_done_counter
+        if counter is None:
+            raise RuntimeError("FlexKV layerwise counter is not initialized")
+        normalized_producer_id = self._normalize_counter_id(
+            producer_id,
+            num_counters=counter.num_counters,
+        )
+        counter.abort_prepared_transfer(
+            task_id=pending.task_id,
+            producer_id=normalized_producer_id,
+        )
 
     def _validate_lookup_match(
         self,
