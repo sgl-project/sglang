@@ -2973,6 +2973,9 @@ class ServerArgs:
 
         materialize_declarations(self)
 
+    def alloc_page_size(self) -> int:
+        return self.page_size * max(self.dcp_size, 1)
+
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return

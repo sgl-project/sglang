@@ -17,21 +17,24 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.max_speculative_num_draft_tokens
-    page_size = server_args.page_size
+    alloc_page_size = server_args.alloc_page_size()
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
+    if alloc_page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
         return max(spec_steps * spec_topk, spec_tokens)
     else:
         # spec v2 tree (page>1, topk>1): worst-case page-aligned footprint per
         # topk branch is ceil((page_size-1 + num_steps) / page) pages, each branch
         # duplicated -- reserve for all topk branches.
         num_new_pages_per_topk = (
-            (page_size - 1) + spec_steps + page_size - 1
-        ) // page_size
-        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
+            (alloc_page_size - 1) + spec_steps + alloc_page_size - 1
+        ) // alloc_page_size
+        return max(
+            num_new_pages_per_topk * alloc_page_size * spec_topk,
+            spec_tokens,
+        )
 
 
 def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
@@ -53,8 +56,8 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
     if (
         server_args.speculative_algorithm is not None
-        and server_args.page_size > 1
+        and server_args.alloc_page_size() > 1
         and (server_args.speculative_eagle_topk or 1) > 1
     ):
         extra = max(extra, get_alloc_reserve_per_decode(server_args))
-    return extra
+    return extra + server_args.alloc_page_size() - 1
