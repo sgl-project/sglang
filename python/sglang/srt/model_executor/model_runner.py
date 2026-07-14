@@ -65,12 +65,6 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.eplb.lplb_solver import (
-    LPLBSolver,
-    assert_lplb_supported_model,
-    clear_global_lplb_solvers,
-    set_global_lplb_solver,
-)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
@@ -87,8 +81,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -133,6 +125,11 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
     resolve_sliding_window_size,
+)
+from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    check_quantized_moe_compatibility,
+    init_lplb_solvers,
+    prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
@@ -188,7 +185,6 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_bool_env_var,
     init_cublas,
     is_host_cpu_arm64,
     is_npu,
@@ -214,7 +210,6 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -512,7 +507,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
-            self._init_lplb_solvers()
+            init_lplb_solvers(model_config=self.model_config)
 
         # Expert parallelism
         self.eplb_manager = (
@@ -531,7 +526,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
-        self._prepare_moe_topk()
+        prepare_moe_topk(
+            model=self.model,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            moe_ep_size=self.moe_ep_size,
+            moe_ep_rank=self.moe_ep_rank,
+        )
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
@@ -824,42 +825,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def check_quantized_moe_compatibility(self):
-        if (
-            quantization_config := getattr(
-                self.model_config.hf_config, "quantization_config", None
-            )
-        ) is not None and (
-            weight_block_size := quantization_config.get("weight_block_size", None)
-        ) is not None:
-            weight_block_size_n = weight_block_size[0]
-
-            if self.tp_size % self.moe_ep_size != 0:
-                raise ValueError(
-                    f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
-                )
-            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_dp_size
-
-            moe_intermediate_size = getattr(
-                self.model_config.hf_text_config, "moe_intermediate_size", None
-            )
-            if moe_intermediate_size is None:
-                return
-
-            if moe_intermediate_size % moe_tp_size != 0:
-                raise ValueError(
-                    f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
-                )
-
-            if (
-                not envs.SGLANG_SHARED_EXPERT_TP1.get()
-                and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
-                and not _use_aiter
-            ):
-                raise ValueError(
-                    f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                    f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
-                    f"You can fix this by setting arguments `--tp` and `--ep` correctly."
-                )
+        check_quantized_moe_compatibility(
+            model_config=self.model_config,
+            tp_size=self.tp_size,
+            moe_ep_size=self.moe_ep_size,
+            moe_dp_size=self.moe_dp_size,
+        )
 
     def init_torch_distributed(self):
         result = bootstrap.init_torch_distributed(
@@ -1043,81 +1014,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.tp_rank,
         )
-
-    def _prepare_moe_topk(self):
-        balancer_cls = None
-        num_prepared = 0
-        num_routed_experts = None
-        for module in self.model.modules():
-            if not isinstance(module, (TopK, HashTopK)):
-                continue
-            if not module.enable_waterfill or module.waterfill_balancer is not None:
-                continue
-            if num_routed_experts is None:
-                num_routed_experts = getattr(
-                    self.model_config.hf_config, "n_routed_experts", None
-                )
-                if num_routed_experts is None:
-                    raise ValueError(
-                        "Waterfill requires model config n_routed_experts."
-                    )
-            if balancer_cls is None:
-                from sglang.srt.layers.moe.waterfill import WaterfillBalancer
-
-                balancer_cls = WaterfillBalancer
-            # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
-            # Redundant experts therefore need to be included in the per-rank
-            # expert count used for Waterfill's shared-expert slot remapping.
-            num_physical_routed_experts = (
-                num_routed_experts + self.server_args.ep_num_redundant_experts
-            )
-            if isinstance(module, TopK):
-                routed_scaling_factor = module.topk_config.routed_scaling_factor
-            else:
-                routed_scaling_factor = module.routed_scaling_factor
-            module.waterfill_balancer = balancer_cls(
-                num_routed_experts=num_physical_routed_experts,
-                world_size=self.moe_ep_size,
-                rank=self.moe_ep_rank,
-                layer_id=module.layer_id,
-                routed_scaling_factor=(
-                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
-                ),
-            )
-            num_prepared += 1
-        if num_prepared:
-            log_info_on_rank0(
-                logger, f"Prepared {num_prepared} Waterfill TopK modules."
-            )
-
-    def _init_lplb_solvers(self):
-        """Initialize per-layer LPLB solvers from current expert location metadata."""
-        from sglang.srt.distributed import get_moe_ep_group
-
-        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
-        # don't participate in the EP all-reduce (would deadlock under DP-
-        # attention). Failure here happens before any forward pass.
-        architectures = getattr(self.model_config.hf_config, "architectures", None)
-        if architectures:
-            assert_lplb_supported_model(architectures[0])
-
-        metadata = get_global_expert_location_metadata()
-        if metadata is None:
-            return
-        clear_global_lplb_solvers()
-        ep_group = get_moe_ep_group()
-        for lid in range(metadata.num_layers):
-            solver = LPLBSolver(
-                phy2log=metadata.physical_to_logical_map[lid],
-                log2phy=metadata.logical_to_all_physical_map[lid],
-                num_gpus=metadata.ep_size,
-                ep_group=ep_group,
-                logical_to_all_physical_map_num_valid=(
-                    metadata.logical_to_all_physical_map_num_valid[lid]
-                ),
-            )
-            set_global_lplb_solver(lid, solver)
-        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
