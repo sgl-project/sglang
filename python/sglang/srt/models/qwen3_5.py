@@ -610,13 +610,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        linear_attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        # Pass quant_config through unchanged. ModelOptFp4Config.is_layer_excluded()
+        # already decides per-prefix whether a layer is quantized or kept in BF16,
+        # so forcing this to None here would break checkpoints that DO quantize
+        # linear attention (uniform W4A4). NVIDIA's MoE-only NVFP4 checkpoints list
+        # attention modules in exclude_modules, so is_layer_excluded() returns
+        # UnquantizedLinearMethod for them and behavior is unchanged for those.
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, layer_id, linear_attn_quant_config, alt_stream, prefix
+            config, layer_id, quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
@@ -787,11 +788,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        # Pass quant_config through unchanged. ModelOptFp4Config.is_layer_excluded()
+        # already decides per-prefix whether a layer is quantized or kept in BF16,
+        # so forcing this to None here would break checkpoints that DO quantize
+        # full attention (uniform W4A4). NVIDIA's MoE-only NVFP4 checkpoints list
+        # attention modules in exclude_modules, so is_layer_excluded() returns
+        # UnquantizedLinearMethod for them and behavior is unchanged for those.
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -799,7 +801,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=attn_quant_config,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -809,13 +811,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            quant_config=attn_quant_config,
+            quant_config=quant_config,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
+        # Also pass quant_config to RadixAttention so a FP8-KV quant method (if
+        # any) registers k_scale/v_scale params here; otherwise baked KV scales
+        # from the checkpoint have nowhere to load into and default to 1.0.
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -823,6 +828,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
+            quant_config=quant_config,
         )
 
         # Dense MLP for non-MoE variant
