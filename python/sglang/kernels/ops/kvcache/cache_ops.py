@@ -668,6 +668,16 @@ def absorbed_bmm_concat_cast_q_fp8(
     assert n_dim % block_n == 0, "N must be a multiple of block_n"
     assert q_nope.stride(2) == 1 and q_rope.stride(2) == 1
     assert q_fp8_pad.stride(2) == 1
+    # Hand-written SM90 WGMMA kernel (opt-in only; "auto" never routes here).
+    # Same fp32 -> bf16 -> fp8 epilogue; bitwise identical to "two_dot" on
+    # SM90.  Requires K in {128, 192} and the production N-major w_kc layout
+    # (see the wrapper's asserts); the Triton variants remain the
+    # general-strides fallback.
+    if variant == "cuda":
+        from sglang.jit_kernel.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
+
+        q8kv8_qprep_fwd(q_fp8_pad, q_nope, w_kc, q_rope, num_heads)
+        return
     # "grouped" takes its own persistent launch (and, unlike the K_MODE
     # variants, also accepts power-of-2 K when requested explicitly; "auto"
     # keeps routing power-of-2 K to the single-dot fast path below).
