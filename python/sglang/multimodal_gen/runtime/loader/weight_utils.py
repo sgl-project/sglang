@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 from collections import defaultdict
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from pathlib import Path
 
 import filelock
@@ -27,6 +27,7 @@ except ImportError:
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -183,12 +184,20 @@ def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
     use_runai_model_streamer: bool | None = None,
+    key_filter: Callable[[str], bool] | None = None,
+    clone_streamed_tensors: bool = True,
+    weight_load_plan: WeightLoadPlan | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
-    device = "cpu" if to_cpu else str(get_local_torch_device())
+    if weight_load_plan is not None:
+        checkpoint_device = torch.device(weight_load_plan.checkpoint_load_device)
+        to_cpu = checkpoint_device.type == "cpu"
+        device = str(checkpoint_device)
+    else:
+        device = "cpu" if to_cpu else str(get_local_torch_device())
     if use_runai_model_streamer is None:
         use_runai_model_streamer = (
             HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
@@ -233,13 +242,24 @@ def safetensors_weights_iterator(
     _raise_if_duplicate_safetensors_keys(hf_weights_files)
 
     if use_runai_model_streamer:
+        logger.info(
+            "Loading safetensors with Run:ai Model Streamer to %s",
+            "cpu" if to_cpu else device,
+        )
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(hf_weights_files)
+            if to_cpu:
+                streamer.stream_files(hf_weights_files)
+            else:
+                streamer.stream_files(hf_weights_files, device=device)
             for name, tensor in streamer.get_tensors():
+                if key_filter is not None and not key_filter(name):
+                    continue
                 if to_cpu:
                     yield name, tensor.clone().detach()
+                elif clone_streamed_tensors:
+                    yield name, tensor.clone().detach()
                 else:
-                    yield name, tensor.to(device)
+                    yield name, tensor
     else:
         for st_file in tqdm(
             hf_weights_files,
@@ -249,6 +269,8 @@ def safetensors_weights_iterator(
         ):
             with safe_open(st_file, framework="pt", device=device) as f:
                 for name in f.keys():  # noqa: SIM118
+                    if key_filter is not None and not key_filter(name):
+                        continue
                     param = f.get_tensor(name)
                     yield name, param
 
