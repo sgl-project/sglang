@@ -473,8 +473,8 @@ class GlmImageAttention(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dtype = encoder_hidden_states.dtype
 
-        batch_size, text_seq_length, embed_dim = encoder_hidden_states.shape
-        batch_size, image_seq_length, embed_dim = hidden_states.shape
+        batch_size, text_seq_length, _ = encoder_hidden_states.shape
+        _, image_seq_length, _ = hidden_states.shape
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         # 1. QKV projections
@@ -506,7 +506,7 @@ class GlmImageAttention(torch.nn.Module):
                     dim=-1,
                 )
                 # apply_flashinfer_rope_qk_inplace is inplace kernel and q_img/k_img are views of query/key, so we need not copy back
-                q_out, k_out = apply_flashinfer_rope_qk_inplace(
+                apply_flashinfer_rope_qk_inplace(
                     q_img, k_img, cos_sin_cache, is_neox=True
                 )
             else:
@@ -696,7 +696,7 @@ class GlmImageRotaryPosEmbed(nn.Module):
         self.theta = theta
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_channels, height, width = hidden_states.shape
+        _, _, height, width = hidden_states.shape
         height, width = height // self.patch_size, width // self.patch_size
         device = hidden_states.device
 
@@ -919,7 +919,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if kv_caches is not None:
             kv_caches.set_mode(kv_caches_mode)
 
-        batch_size, num_channels, height, width = hidden_states.shape
+        batch_size, _, height, width = hidden_states.shape
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -1097,7 +1097,6 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         output = hidden_states.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
 
         return output.float()
-        # float()
         # reference: https://github.com/zRzRzRzRzRzRzR/diffusers/blob/6cfc83b4abc5b083fef56a18ec4700f48ba3aaba/src/diffusers/pipelines/glm_image/pipeline_glm_image.py#L737
 
 

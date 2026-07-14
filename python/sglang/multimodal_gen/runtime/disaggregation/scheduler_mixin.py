@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     send_tensors,
+    unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     create_transfer_engine,
@@ -62,6 +63,14 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
 logger = init_logger(__name__)
+
+
+def _advertised_pool_work_endpoint(server_args) -> str:
+    host = server_args.host or server_args.disagg_p2p_hostname or "127.0.0.1"
+    if host == "0.0.0.0":
+        host = server_args.disagg_p2p_hostname or "127.0.0.1"
+    return server_args.pool_work_endpoint.replace("0.0.0.0", host)
+
 
 # ---------------------------------------------------------------------------
 # Field extraction: split Req into tensors (transfer buffer) and scalars (JSON)
@@ -438,6 +447,32 @@ class SchedulerDisaggMixin:
 
         sa = self.server_args
 
+        if self._is_glm_terminal_denoiser():
+            self._preallocated_slots = {}
+            max_batch_size = (
+                max(1, sa.batching_max_size)
+                if sa.batching_mode == "dynamic"
+                else 1
+            )
+            register_msg = TransferRegisterMsg(
+                role=self._disagg_role.value,
+                work_endpoint=_advertised_pool_work_endpoint(sa),
+                max_batch_size=max_batch_size,
+            )
+            self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+            self._compute_ready_queue = queue.Queue(maxsize=4)
+            self._recv_prefetch_thread = threading.Thread(
+                target=self._recv_prefetch_loop,
+                daemon=True,
+                name="recv-prefetch-glm-terminal-denoiser",
+            )
+            self._recv_prefetch_thread.start()
+            logger.info(
+                "GLM terminal denoiser registered with max_batch_size=%d",
+                max_batch_size,
+            )
+            return
+
         # Pool size: configurable, default 256 MiB
         pool_size = getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
 
@@ -502,8 +537,9 @@ class SchedulerDisaggMixin:
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
-            work_endpoint=sa.pool_work_endpoint,
+            work_endpoint=_advertised_pool_work_endpoint(sa),
             preallocated_slots=preallocated_slot_info,
+            max_batch_size=max(1, sa.batching_max_size),
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
         logger.info(
@@ -602,6 +638,10 @@ class SchedulerDisaggMixin:
             try:
                 raw_frames = self._pool_work_pull.recv_multipart()
                 frames = [bytes(f) for f in raw_frames]
+
+                if not is_transfer_message(frames):
+                    self._compute_ready_queue.put(("relay_compute", frames))
+                    continue
 
                 msg = decode_transfer_msg(frames)
                 msg_type = msg.get("msg_type", "")
@@ -889,6 +929,21 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("skip",))
                     self._handle_transfer_msg(data)
+
+                elif msg_type == "relay_compute":
+                    local_device = (
+                        f"{current_platform.device_type}:{self.worker.local_rank}"
+                    )
+                    tensors, scalar_fields = unpack_tensors(data, device=local_device)
+                    request_id = scalar_fields.get("request_id", "unknown")
+                    req = self._build_disagg_req(scalar_fields, tensors)
+                    if is_multi_rank:
+                        self._broadcast_to_all_ranks(("compute",))
+                        self._broadcast_req_to_all_ranks(req)
+                    _init_disagg_request_scheduler(self, req)
+                    self._disagg_terminal_denoiser_compute(
+                        req, request_id, role_name
+                    )
 
                 self._consecutive_error_count = 0
 
@@ -1291,7 +1346,12 @@ class SchedulerDisaggMixin:
             _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
-                self.worker.execute_forward([req], return_req=True)
+                if self._is_glm_terminal_denoiser():
+                    req.save_output = False
+                    req.return_file_paths_only = False
+                    self.worker.execute_forward([req])
+                else:
+                    self.worker.execute_forward([req], return_req=True)
 
         elif self._disagg_role == RoleType.DECODER:
             req.save_output = False
@@ -1445,6 +1505,46 @@ class SchedulerDisaggMixin:
             "Transfer DENOISER: processed %s in %.2f s, staged for decoder",
             request_id,
             duration_s,
+        )
+
+    def _is_glm_terminal_denoiser(self: Scheduler) -> bool:
+        return (
+            self._disagg_role == RoleType.DENOISER
+            and self.worker.pipeline.pipeline_name == "GlmImagePipeline"
+        )
+
+    def _disagg_terminal_denoiser_compute(
+        self: Scheduler, req: Req, request_id: str, role_name: str
+    ) -> None:
+        start_time = time.monotonic()
+        with self._disagg_trace_dispatch(req):
+            output_batch = self.worker.execute_forward([req])
+
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.audio is not None:
+            tensor_fields["audio"] = output_batch.audio
+        if output_batch.audio_sample_rate is not None:
+            scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
+        if output_batch.output_file_paths is not None:
+            scalar_fields["output_file_paths"] = output_batch.output_file_paths
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+        scalar_fields["peak_memory_mb"] = output_batch.peak_memory_mb
+        send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
+
+        if self._disagg_metrics:
+            if output_batch.error:
+                self._disagg_metrics.record_request_failed(request_id)
+            else:
+                self._disagg_metrics.record_request_complete(request_id)
+        logger.debug(
+            "Terminal %s: processed %s in %.2f s",
+            role_name,
+            request_id,
+            time.monotonic() - start_time,
         )
 
     def _disagg_decoder_compute(

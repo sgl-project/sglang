@@ -122,6 +122,37 @@ sglang serve --model-path ... --disagg-role server \
     --decoder-urls  "tcp://10.0.0.5:35000"
 ```
 
+### GLM-Image AR-to-DiT fan-out
+
+GLM-Image can batch AR generation in the head and fan the resulting prior
+tokens out to terminal denoiser workers. Each terminal worker runs prompt/glyph
+preparation, DiT, and VAE decoding locally; no latent or embedding tensors are
+transferred.
+
+```bash
+# Two terminal workers, each on two devices with SP=2
+sglang serve --model-path /models/GLM-Image --disagg-role denoiser \
+  --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19001 \
+  --num-gpus 2 --base-gpu-id 0 --denoiser-sp 2 \
+  --batching-max-size 2 --attention-backend fa
+
+sglang serve --model-path /models/GLM-Image --disagg-role denoiser \
+  --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19002 \
+  --num-gpus 2 --base-gpu-id 2 --denoiser-sp 2 \
+  --batching-max-size 2 --attention-backend fa
+
+# Public head; --encoder-urls and --decoder-urls are intentionally omitted
+sglang serve --model-path /models/GLM-Image --disagg-role server \
+  --srt-encoder-url http://127.0.0.1:30020 \
+  --denoiser-urls "tcp://127.0.0.1:19001;tcp://127.0.0.1:19002" \
+  --batching-mode dynamic --batching-max-size 4 --batching-delay-ms 10 \
+  --host 0.0.0.0 --port 30010 --scheduler-port 19655
+```
+
+With four compatible requests, the head sends one batch of four to the AR
+endpoint and dispatches two concurrent batches of two to the terminal workers.
+Partial groups are dispatched as `2+1`, `2`, or `1` after the batching delay.
+
 ## Port Convention
 
 Result endpoints are derived deterministically from the head node's `--scheduler-port` (default: 5555):
@@ -140,6 +171,9 @@ Role instances derive their result endpoint automatically from `--disagg-server-
 Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferred via a P2P transfer engine. The DiffusionServer only routes lightweight control messages (alloc/push/ready); actual tensor data flows directly between instances.
 
 **mooncake-transfer-engine** is required for disaggregated diffusion. It provides RDMA for direct GPU-to-GPU data movement.
+
+The GLM-Image AR-to-DiT fan-out mode is an exception: it relays only prior
+token IDs and request metadata over ZMQ and does not require Mooncake.
 
 ```bash
 pip install mooncake-transfer-engine

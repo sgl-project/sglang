@@ -16,6 +16,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     filter_modules_for_role,
     get_module_role,
 )
+from sglang.multimodal_gen.runtime.dynamic_batching import (
+    merge_generation_reqs,
+    slice_generation_req,
+)
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines.glm_image import GlmImagePipeline
 from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
@@ -39,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines.wan_i2v_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
@@ -355,26 +360,61 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
             },
         )
 
-    def test_glm_image_encoder_keeps_vae_and_transformer(self):
+    def test_glm_image_ar_encoder_only_keeps_ar_components(self):
         extras = self._get_extra_modules(GlmImagePipeline, RoleType.ENCODER, "ti2i")
         filtered = filter_modules_for_role(
             GlmImagePipeline._required_config_modules,
             RoleType.ENCODER,
             extra_allowed_modules=extras,
         )
-        self.assertEqual(extras, {"vae", "transformer"})
+        self.assertEqual(extras, set())
         self.assertEqual(
             set(filtered),
             {
                 "text_encoder",
                 "tokenizer",
-                "vae",
                 "vision_language_encoder",
                 "processor",
-                "transformer",
                 "scheduler",
             },
         )
+
+    def test_glm_image_terminal_denoiser_keeps_local_components(self):
+        extras = self._get_extra_modules(
+            GlmImagePipeline, RoleType.DENOISER, "ti2i"
+        )
+        filtered = filter_modules_for_role(
+            GlmImagePipeline._required_config_modules,
+            RoleType.DENOISER,
+            extra_allowed_modules=extras,
+        )
+        self.assertEqual(extras, {"text_encoder", "tokenizer", "vae"})
+        self.assertEqual(
+            set(filtered),
+            {"text_encoder", "tokenizer", "vae", "transformer", "scheduler"},
+        )
+
+    def test_glm_fanout_shard_sizes(self):
+        for request_count, expected_sizes in (
+            (1, [1]),
+            (2, [2]),
+            (3, [2, 1]),
+            (4, [2, 2]),
+        ):
+            reqs = [
+                Req(request_id=f"req-{index}", prompt=f"prompt-{index}", seed=index)
+                for index in range(request_count)
+            ]
+            merged = merge_generation_reqs(reqs)
+            self.assertIsNotNone(merged)
+            merged.prior_token_id = torch.arange(request_count).reshape(-1, 1)
+            sizes = []
+            for start in range(0, request_count, 2):
+                end = min(request_count, start + 2)
+                shard = slice_generation_req(merged, start, end, request_count)
+                sizes.append(len(shard.prompt))
+                self.assertEqual(shard.prior_token_id.shape[0], end - start)
+            self.assertEqual(sizes, expected_sizes)
 
     def test_wan_ti2v_denoiser_keeps_vae(self):
         for pipeline_cls in (WanImageToVideoPipeline, WanImageToVideoDmdPipeline):

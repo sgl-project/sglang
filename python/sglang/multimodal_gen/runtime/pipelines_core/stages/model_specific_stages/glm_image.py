@@ -11,6 +11,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 from torch.nn.utils.rnn import pad_sequence
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -403,8 +404,9 @@ class GlmImageAR(PipelineStage):
         width: int,
         server_args: ServerArgs,
         factor: int = 32,
+        device: torch.device | None = None,
     ) -> list[torch.Tensor]:
-        device = get_local_torch_device()
+        device = device or get_local_torch_device()
         height = (height // factor) * factor
         width = (width // factor) * factor
 
@@ -538,28 +540,19 @@ class GlmImageAR(PipelineStage):
             prior_token_ids = []
             prior_token_image_ids = []
             for prompt, seed in zip(prompts, seeds, strict=True):
-                if seed is None:
+                rng_devices = []
+                if device.type == "cuda":
+                    rng_devices.append(torch.cuda.current_device())
+                with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                    torch.manual_seed(seed)
                     prior_token_id, image_token_ids = self.generate_prior_tokens(
                         prompt=prompt,
                         image=ar_condition_images,
                         height=height,
                         width=width,
                         server_args=server_args,
+                        seed=seed,
                     )
-                else:
-                    rng_devices = []
-                    if device.type == "cuda":
-                        rng_devices.append(torch.cuda.current_device())
-                    with torch.random.fork_rng(devices=rng_devices, enabled=True):
-                        torch.manual_seed(int(seed))
-                        prior_token_id, image_token_ids = self.generate_prior_tokens(
-                            prompt=prompt,
-                            image=ar_condition_images,
-                            height=height,
-                            width=width,
-                            server_args=server_args,
-                            seed=seed,
-                        )
                 prior_token_ids.append(prior_token_id)
                 prior_token_image_ids.append(image_token_ids)
 
@@ -1117,3 +1110,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.width = width
 
         return batch
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER

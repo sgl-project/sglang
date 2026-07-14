@@ -1,8 +1,12 @@
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    DecodingStage,
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
     GlmImageAR,
     GlmImageBeforeDenoisingStage,
@@ -11,6 +15,12 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+class GlmImageTerminalDecodingStage(DecodingStage):
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
 
 
 class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
@@ -53,7 +63,15 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        self.add_standard_decoding_stage()
+        if self._disagg_role == RoleType.DENOISER:
+            self.add_stage(
+                GlmImageTerminalDecodingStage(
+                    vae=self.get_module("vae"), pipeline=self
+                ),
+                "decoding_stage",
+            )
+        else:
+            self.add_standard_decoding_stage()
 
 
 EntryClass = [GlmImagePipeline]

@@ -7,10 +7,19 @@ import pickle
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
+import torch
 import zmq
+from transformers import AutoProcessor
+from zmq.utils.monitor import recv_monitor_message
 
+from sglang.multimodal_gen.runtime.dynamic_batching import (
+    can_dynamic_batch,
+    merge_generation_reqs,
+    slice_generation_req,
+)
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
 )
@@ -20,6 +29,7 @@ from sglang.multimodal_gen.runtime.disaggregation.request_state import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
+    send_tensors,
     unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
@@ -34,6 +44,22 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _GlmClientEntry:
+    request_id: str
+    client_identity: bytes
+    req: object
+    enqueue_time: float
+
+
+@dataclass
+class _GlmShardEntry:
+    request_id: str
+    req: object
+    clients: list[_GlmClientEntry]
+    batch_size: int
 
 
 @dataclass
@@ -92,6 +118,8 @@ class DiffusionServer:
         denoiser_capacity: int = 2,
         decoder_capacity: int = 4,
         p2p_mode: bool = True,
+        server_args=None,
+        glm_ar_fanout: bool = False,
     ):
         self._frontend_endpoint = frontend_endpoint
         self._encoder_work_endpoints = encoder_work_endpoints
@@ -108,9 +136,9 @@ class DiffusionServer:
 
         self._tracker = RequestTracker()
         self._dispatcher = PoolDispatcher(
-            num_encoders=self._num_encoders,
+            num_encoders=max(1, self._num_encoders),
             num_denoisers=self._num_denoisers,
-            num_decoders=self._num_decoders,
+            num_decoders=max(1, self._num_decoders),
             policy_name=dispatch_policy_name,
         )
 
@@ -133,6 +161,52 @@ class DiffusionServer:
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
 
         self._transfer_mode = p2p_mode
+        self._glm_ar_fanout = glm_ar_fanout
+        self._server_args = server_args
+        self._glm_ar_queue: deque[_GlmClientEntry] = deque()
+        self._glm_shard_queue: deque[_GlmShardEntry] = deque()
+        self._glm_shards: dict[str, _GlmShardEntry] = {}
+        self._glm_shard_workers: dict[str, int] = {}
+        self._glm_worker_batch_sizes = [1] * self._num_denoisers
+        self._glm_worker_available = [not glm_ar_fanout] * self._num_denoisers
+        self._glm_ar_executor: ThreadPoolExecutor | None = None
+        self._glm_ar_future: Future | None = None
+        self._glm_ar_clients: list[_GlmClientEntry] = []
+        self._glm_ar_stage = None
+        self._glm_batch_max_size = 1
+        self._glm_batch_delay_s = 0.0
+        self._glm_adaptive_delay_max_s = None
+        self._glm_arrival_ewma_s = None
+        self._glm_last_arrival_s = None
+
+        if glm_ar_fanout:
+            if server_args is None:
+                raise ValueError("server_args is required for GLM AR fan-out")
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+                GlmImageAR,
+            )
+
+            processor = AutoProcessor.from_pretrained(
+                server_args.model_path, subfolder="processor"
+            )
+            self._glm_ar_stage = GlmImageAR(
+                processor=processor, vision_language_encoder=None
+            )
+            self._glm_batch_max_size = (
+                max(1, server_args.batching_max_size)
+                if server_args.batching_mode == "dynamic"
+                else 1
+            )
+            self._glm_batch_delay_s = server_args.batching_delay_ms / 1000.0
+            adaptive_ms = getattr(
+                server_args, "batching_adaptive_delay_max_ms", None
+            )
+            self._glm_adaptive_delay_max_s = (
+                adaptive_ms / 1000.0 if adaptive_ms is not None else None
+            )
+            self._glm_ar_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="glm-ar-fanout"
+            )
         self._transfer_state: dict[str, _TransferRequestState] = {}
 
         # Per-instance registration: instance_idx -> {session_id, pool_ptr, pool_size}
@@ -197,6 +271,8 @@ class DiffusionServer:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        if self._glm_ar_executor is not None:
+            self._glm_ar_executor.shutdown(wait=False, cancel_futures=True)
 
     def _event_loop(self) -> None:
         frontend, _ = get_zmq_socket(
@@ -209,9 +285,16 @@ class DiffusionServer:
             encoder_pushes.append(sock)
 
         denoiser_pushes: list[zmq.Socket] = []
+        denoiser_monitors: list[zmq.Socket] = []
         for i, ep in enumerate(self._denoiser_work_endpoints):
             sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
             denoiser_pushes.append(sock)
+            if self._glm_ar_fanout:
+                denoiser_monitors.append(
+                    sock.get_monitor_socket(
+                        events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
+                    )
+                )
 
         decoder_pushes: list[zmq.Socket] = []
         for i, ep in enumerate(self._decoder_work_endpoints):
@@ -233,6 +316,8 @@ class DiffusionServer:
         poller.register(encoder_result_pull, zmq.POLLIN)
         poller.register(denoiser_result_pull, zmq.POLLIN)
         poller.register(decoder_result_pull, zmq.POLLIN)
+        for monitor in denoiser_monitors:
+            poller.register(monitor, zmq.POLLIN)
 
         self._encoder_pushes = encoder_pushes
         self._denoiser_pushes = denoiser_pushes
@@ -246,6 +331,7 @@ class DiffusionServer:
             + encoder_pushes
             + denoiser_pushes
             + decoder_pushes
+            + denoiser_monitors
         )
 
         try:
@@ -266,7 +352,16 @@ class DiffusionServer:
                 if decoder_result_pull in events:
                     self._handle_role_result(decoder_result_pull, RoleType.DECODER)
 
-                self._drain_all_queues()
+                for worker_idx, monitor in enumerate(denoiser_monitors):
+                    if monitor in events:
+                        self._handle_glm_worker_monitor(worker_idx, monitor)
+
+                if self._glm_ar_fanout:
+                    self._poll_glm_ar_result()
+                    self._drain_glm_ar_queue()
+                    self._drain_glm_shard_queue()
+                else:
+                    self._drain_all_queues()
 
         except Exception:
             logger.exception("DiffusionServer event loop error")
@@ -285,7 +380,9 @@ class DiffusionServer:
             self._handle_transfer_result(frames, role)
             return
 
-        if role == RoleType.DECODER:
+        if self._glm_ar_fanout and role == RoleType.DENOISER:
+            self._handle_glm_shard_result_frames(frames)
+        elif role == RoleType.DECODER:
             self._handle_decoder_result_frames(frames)
         else:
             # Non-transfer frames from encoder/denoiser are error results
@@ -378,6 +475,21 @@ class DiffusionServer:
             self._tracker.transition(request_id, RequestState.ENCODER_WAITING)
         except ValueError:
             pass
+        if self._glm_ar_fanout:
+            now = time.monotonic()
+            if self._glm_last_arrival_s is not None:
+                interval = now - self._glm_last_arrival_s
+                self._glm_arrival_ewma_s = (
+                    interval
+                    if self._glm_arrival_ewma_s is None
+                    else 0.8 * self._glm_arrival_ewma_s + 0.2 * interval
+                )
+            self._glm_last_arrival_s = now
+            self._glm_ar_queue.append(
+                _GlmClientEntry(request_id, client_identity, req, now)
+            )
+            return
+
         self._encoder_tta.append(
             _EncoderTTAEntry(
                 request_id=request_id,
@@ -389,6 +501,305 @@ class DiffusionServer:
             "DiffusionServer: queued %s to encoder_tta",
             request_id,
         )
+
+    def _glm_wait_limit_s(self, batch_size: int) -> float:
+        if self._glm_adaptive_delay_max_s is None:
+            return self._glm_batch_delay_s
+        if self._glm_arrival_ewma_s is None:
+            return min(
+                self._glm_adaptive_delay_max_s,
+                max(self._glm_batch_delay_s, self._glm_batch_delay_s * 4),
+            )
+        missing = max(0, self._glm_batch_max_size - batch_size)
+        return min(
+            self._glm_adaptive_delay_max_s,
+            max(self._glm_batch_delay_s, self._glm_arrival_ewma_s * missing),
+        )
+
+    def _drain_glm_ar_queue(self) -> None:
+        if self._glm_ar_future is not None or not self._glm_ar_queue:
+            return
+
+        base = self._glm_ar_queue[0]
+        indices = [0]
+        for index in range(1, len(self._glm_ar_queue)):
+            if len(indices) >= self._glm_batch_max_size:
+                break
+            candidate = self._glm_ar_queue[index]
+            if can_dynamic_batch(base.req, candidate.req):
+                indices.append(index)
+
+        waited = time.monotonic() - base.enqueue_time
+        if (
+            len(indices) < self._glm_batch_max_size
+            and waited < self._glm_wait_limit_s(len(indices))
+        ):
+            return
+
+        clients = [self._glm_ar_queue[index] for index in indices]
+        for index in reversed(indices):
+            del self._glm_ar_queue[index]
+        merged = merge_generation_reqs([entry.req for entry in clients])
+        if merged is None:
+            for client in clients:
+                self._complete_with_error(
+                    client.request_id,
+                    "GLM AR fan-out could not merge compatible requests",
+                )
+            return
+
+        group_id = f"glm-fanout::{time.monotonic_ns()}"
+        merged.request_id = group_id
+        self._glm_ar_clients = clients
+        for client in clients:
+            try:
+                self._tracker.transition(
+                    client.request_id, RequestState.ENCODER_RUNNING
+                )
+            except ValueError:
+                pass
+        self._glm_ar_future = self._glm_ar_executor.submit(
+            self._execute_glm_ar_batch, merged
+        )
+        logger.info("GLM AR fan-out dispatched batch size=%d", len(clients))
+
+    def _execute_glm_ar_batch(self, merged_req):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+            _expand_prompts_and_seeds,
+        )
+
+        prompts, seeds = _expand_prompts_and_seeds(merged_req)
+        prior_token_ids = self._glm_ar_stage.generate_prior_tokens_batch(
+            prompts=prompts,
+            seeds=seeds,
+            height=merged_req.height,
+            width=merged_req.width,
+            server_args=self._server_args,
+            device=torch.device("cpu"),
+        )
+        merged_req.prior_token_id = torch.cat(prior_token_ids, dim=0)
+        merged_req.prior_token_image_ids = None
+        return merged_req
+
+    def _poll_glm_ar_result(self) -> None:
+        future = self._glm_ar_future
+        if future is None or not future.done():
+            return
+        clients = self._glm_ar_clients
+        self._glm_ar_future = None
+        self._glm_ar_clients = []
+        try:
+            merged = future.result()
+        except Exception as error:
+            for client in clients:
+                self._complete_with_error(client.request_id, f"GLM AR error: {error}")
+            return
+
+        for client in clients:
+            try:
+                self._tracker.transition(client.request_id, RequestState.ENCODER_DONE)
+                self._tracker.transition(
+                    client.request_id, RequestState.DENOISING_WAITING
+                )
+            except ValueError:
+                pass
+
+        healthy_capacities = [
+            capacity
+            for index, capacity in enumerate(self._glm_worker_batch_sizes)
+            if self._glm_worker_available[index]
+        ]
+        worker_cap = max(healthy_capacities, default=1)
+        if any(
+            client.req.num_outputs_per_prompt > worker_cap for client in clients
+        ):
+            for client in clients:
+                self._complete_with_error(
+                    client.request_id,
+                    "num_outputs_per_prompt exceeds denoiser batch capacity",
+                )
+            return
+        total = len(clients)
+        start = 0
+        output_start = 0
+        while start < total:
+            end = start
+            output_count = 0
+            while end < total:
+                candidate_count = clients[end].req.num_outputs_per_prompt
+                if output_count and output_count + candidate_count > worker_cap:
+                    break
+                output_count += candidate_count
+                end += 1
+            output_end = output_start + output_count
+            shard_req = slice_generation_req(merged, start, end, total)
+            shard_req.prior_token_id = merged.prior_token_id[
+                output_start:output_end
+            ]
+            output_paths = shard_req.extra.get("dynamic_batch_output_paths")
+            if isinstance(output_paths, list):
+                shard_req.extra["dynamic_batch_output_paths"] = output_paths[
+                    output_start:output_end
+                ]
+            shard_id = shard_req.request_id
+            shard_clients = clients[start:end]
+            shard_req.extra["fanout_child_request_ids"] = [
+                client.request_id for client in shard_clients
+            ]
+            shard = _GlmShardEntry(
+                shard_id, shard_req, shard_clients, output_count
+            )
+            self._glm_shards[shard_id] = shard
+            self._glm_shard_queue.append(shard)
+            start = end
+            output_start = output_end
+
+    def _drain_glm_shard_queue(self) -> None:
+        from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
+            extract_transfer_fields,
+        )
+
+        while self._glm_shard_queue:
+            shard = self._glm_shard_queue[0]
+            available_slots = [
+                slots
+                if self._glm_worker_available[index]
+                and self._glm_worker_batch_sizes[index] >= shard.batch_size
+                else 0
+                for index, slots in enumerate(self._denoiser_free_slots)
+            ]
+            worker_idx = self._dispatcher.select_denoiser_with_capacity(
+                available_slots
+            )
+            if worker_idx is None:
+                return
+            shard = self._glm_shard_queue.popleft()
+            self._denoiser_free_slots[worker_idx] -= 1
+            self._glm_shard_workers[shard.request_id] = worker_idx
+            tensor_fields, scalar_fields = extract_transfer_fields(shard.req)
+            tensor_fields["prior_token_id"] = shard.req.prior_token_id
+            scalar_fields["request_id"] = shard.request_id
+            send_tensors(
+                self._denoiser_pushes[worker_idx], tensor_fields, scalar_fields
+            )
+            for client_index, client in enumerate(shard.clients):
+                try:
+                    self._tracker.transition(
+                        client.request_id,
+                        RequestState.DENOISING_RUNNING,
+                        denoiser_instance=(
+                            worker_idx if client_index == 0 else None
+                        ),
+                    )
+                except ValueError:
+                    pass
+            logger.info(
+                "GLM fan-out dispatched shard size=%d to denoiser[%d]",
+                len(shard.clients),
+                worker_idx,
+            )
+
+    def _handle_glm_worker_monitor(
+        self, worker_idx: int, monitor: zmq.Socket
+    ) -> None:
+        event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)["event"]
+        if event == zmq.EVENT_DISCONNECTED:
+            self._glm_worker_available[worker_idx] = False
+            logger.warning("GLM denoiser[%d] disconnected", worker_idx)
+        elif event == zmq.EVENT_CONNECTED:
+            registered = worker_idx in self._denoiser_peers
+            self._glm_worker_available[worker_idx] = registered
+            if registered and worker_idx not in self._glm_shard_workers.values():
+                self._denoiser_free_slots[worker_idx] = 1
+            logger.info(
+                "GLM denoiser[%d] connected (registered=%s)",
+                worker_idx,
+                registered,
+            )
+
+    @staticmethod
+    def _slice_output_value(value, start: int, end: int, total: int):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)) and len(value) == total:
+            return value[start:end]
+        if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == total:
+            return value[start:end]
+        return value
+
+    @staticmethod
+    def _output_size(value) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return len(value)
+        if hasattr(value, "shape") and len(value.shape) > 0:
+            return int(value.shape[0])
+        return None
+
+    def _handle_glm_shard_result_frames(self, frames: list) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+            OutputBatch,
+        )
+
+        tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        shard_id = scalar_fields.get("request_id")
+        shard = self._glm_shards.pop(shard_id, None)
+        worker_idx = self._glm_shard_workers.pop(shard_id, None)
+        if worker_idx is not None:
+            self._denoiser_free_slots[worker_idx] = 1
+        if shard is None:
+            logger.warning("Unknown GLM fan-out shard result: %s", shard_id)
+            return
+
+        error = scalar_fields.get("error")
+        output = tensor_fields.get("output")
+        audio = tensor_fields.get("audio")
+        output_paths = scalar_fields.get("output_file_paths")
+        total = sum(client.req.num_outputs_per_prompt for client in shard.clients)
+        for name, value in (("output", output), ("output_file_paths", output_paths)):
+            size = self._output_size(value)
+            if size is not None and size != total:
+                error = (
+                    f"GLM fan-out {name} size mismatch: got {size}, expected {total}"
+                )
+                output = None
+                audio = None
+                output_paths = None
+                break
+        start = 0
+        for client in shard.clients:
+            count = client.req.num_outputs_per_prompt
+            end = start + count
+            result = OutputBatch(
+                output=self._slice_output_value(output, start, end, total),
+                output_file_paths=self._slice_output_value(
+                    output_paths, start, end, total
+                ),
+                audio=self._slice_output_value(audio, start, end, total),
+                audio_sample_rate=scalar_fields.get("audio_sample_rate"),
+                error=error,
+                peak_memory_mb=scalar_fields.get("peak_memory_mb", 0.0),
+            )
+            with self._lock:
+                identity = self._pending.pop(client.request_id, None)
+            if identity is not None:
+                self._frontend.send_multipart(
+                    [identity, b"", pickle.dumps(result)]
+                )
+            try:
+                self._tracker.transition(
+                    client.request_id, RequestState.DENOISING_DONE
+                )
+                self._tracker.transition(
+                    client.request_id,
+                    RequestState.FAILED if error else RequestState.DONE,
+                    error=error,
+                )
+            except ValueError:
+                pass
+            self._tracker.remove(client.request_id)
+            start = end
 
     def _handle_decoder_result_frames(self, frames: list) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -578,6 +989,19 @@ class DiffusionServer:
             self._decoder_tta = deque(
                 e for e in self._decoder_tta if e.request_id not in timed_set
             )
+            if self._glm_ar_fanout:
+                self._glm_ar_queue = deque(
+                    entry
+                    for entry in self._glm_ar_queue
+                    if entry.request_id not in timed_set
+                )
+                for shard_id, shard in list(self._glm_shards.items()):
+                    if any(
+                        client.request_id in timed_set for client in shard.clients
+                    ):
+                        worker_idx = self._glm_shard_workers.get(shard_id)
+                        if worker_idx is not None:
+                            self._glm_worker_available[worker_idx] = False
 
     def _free_slot_for_record(self, record) -> None:
         if (
@@ -667,6 +1091,11 @@ class DiffusionServer:
         prealloc = msg.get("preallocated_slots", [])
         info["free_preallocated_slots"] = list(prealloc)
         peers[idx] = info
+        if role == RoleType.DENOISER and self._glm_ar_fanout:
+            self._glm_worker_available[idx] = True
+            self._glm_worker_batch_sizes[idx] = max(
+                1, int(msg.get("max_batch_size", 1))
+            )
 
         logger.info(
             "DiffusionServer transfer: registered %s[%d] work_endpoint=%s "
@@ -1054,7 +1483,7 @@ class DiffusionServer:
     def get_stats(self) -> dict:
         with self._lock:
             pending_count = len(self._pending)
-        return {
+        stats = {
             "role": "diffusion_server",
             "transfer_mode": self._transfer_mode,
             "num_encoders": self._num_encoders,
@@ -1074,3 +1503,14 @@ class DiffusionServer:
             "decoder_peers": len(self._decoder_peers),
             "tracker": self._tracker.snapshot(),
         }
+        if self._glm_ar_fanout:
+            stats.update(
+                {
+                    "glm_ar_queue_depth": len(self._glm_ar_queue),
+                    "glm_ar_in_flight": self._glm_ar_future is not None,
+                    "glm_shard_queue_depth": len(self._glm_shard_queue),
+                    "glm_worker_batch_sizes": list(self._glm_worker_batch_sizes),
+                    "glm_worker_available": list(self._glm_worker_available),
+                }
+            )
+        return stats

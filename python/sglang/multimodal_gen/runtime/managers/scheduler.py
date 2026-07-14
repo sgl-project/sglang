@@ -16,6 +16,11 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.dynamic_batching import (
+    build_dynamic_batch_signature,
+    can_dynamic_batch,
+    merge_generation_reqs,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -492,21 +497,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         marked with `batch_sig_exclude`, plus generation-affecting
         `extra.diffusers_kwargs`.
         """
-        signature_items = self._sampling_param_signature_items(req)
-        if signature_items is None:
-            return None
-
-        if req.extra:
-            diffusers_kwargs = req.extra.get("diffusers_kwargs")
-            if diffusers_kwargs:
-                signature_items.append(
-                    (
-                        "diffusers_kwargs",
-                        self._freeze_signature_value(diffusers_kwargs),
-                    )
-                )
-
-        return tuple(signature_items)
+        return build_dynamic_batch_signature(req)
 
     def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
         cached = getattr(req, "_dynamic_batch_sig", None)
@@ -585,30 +576,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
-        if base_req.is_warmup or candidate_req.is_warmup:
-            return False
-
-        if self._has_realtime_session(base_req) or self._has_realtime_session(
-            candidate_req
-        ):
-            return False
-
-        if not isinstance(base_req.prompt, str) or not isinstance(
-            candidate_req.prompt, str
-        ):
-            return False
-
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
-            return False
-        if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
-            return False
-
-        base_sig = self._get_cached_signature(base_req)
-        cand_sig = self._get_cached_signature(candidate_req)
-        return base_sig is not None and base_sig == cand_sig
+        return can_dynamic_batch(base_req, candidate_req)
 
     def _record_batch_dispatch_metrics(
         self,
@@ -741,31 +709,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         Per-request seeds and output paths are stored in `extra` so downstream
         stages can preserve request ordering.
         """
-        if len(reqs) <= 1:
-            return reqs[0] if reqs else None
-
-        base_req = reqs[0]
-        for req in reqs[1:]:
-            if not self._can_dynamic_batch(base_req, req):
-                return None
-
-        merged_req = deepcopy(base_req)
-        merged_req.prompt = [req.prompt for req in reqs]
-
-        merged_req.extra = deepcopy(merged_req.extra)
-        merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
-        merged_req.return_file_paths_only = base_req.return_file_paths_only
-        if merged_req.return_file_paths_only:
-            dynamic_output_paths: list[str] = []
-            for req in reqs:
-                for output_idx in range(req.num_outputs_per_prompt):
-                    dynamic_output_paths.append(
-                        req.output_file_path(req.num_outputs_per_prompt, output_idx)
-                    )
-            merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
-        merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
-
-        return merged_req
+        return merge_generation_reqs(reqs)
 
     @staticmethod
     def _count_first_dim(value: Any) -> int | None:
