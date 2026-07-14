@@ -130,9 +130,7 @@ class TestSWAEvictFloorAlignment(unittest.TestCase):
         cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=10)
 
         self.assertEqual(len(allocator.freed), 2)
-        self.assertTrue(
-            torch.equal(torch.cat(allocator.freed), torch.arange(10))
-        )
+        self.assertTrue(torch.equal(torch.cat(allocator.freed), torch.arange(10)))
 
     def test_pure_swa_radix_reader_rejects_misaligned_floor_before_free(self):
         """The PureSWA radix reader fails before freeing a malformed boundary."""
