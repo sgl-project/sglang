@@ -307,12 +307,12 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
+        real_len = req.extend_range.end
+        allocated_len = req.kv.kv_allocated_len
         if self.is_dsv4_hisparse:
-            allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
-            allocated_len = req.kv.kv_allocated_len
-            page_size = self.mem_pool_device.page_size
+            page_size = self.token_to_kv_pool_allocator.hisparse_device_page_size
             # Allocate only enough for current tokens (page-aligned).
             # When prefill already fills device_buffer_size, include the reserved page.
             alloc_size = min(
@@ -322,22 +322,29 @@ class HiSparseCoordinator:
             if alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
 
-        compressed_logical_indices = (
+        ordered_real_mapping_indices = (
+            self.mem_pool_device.translate_loc_from_full_to_compressed(
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :real_len]
+            )
+        )
+        allocated_mapping_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
                 self.req_to_token_pool.req_to_token[req.req_pool_idx, :allocated_len]
             )
         )
-        compressed_len = len(compressed_logical_indices)
 
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
-            compressed_logical_indices, alloc_size
+            ordered_real_mapping_indices=ordered_real_mapping_indices,
+            allocated_mapping_indices=allocated_mapping_indices,
+            need_size=alloc_size,
         )
         if buffer_indices is None:
             logger.error(
                 "HiSparse: alloc_device_buffer failed for req %s "
-                "(compressed_len=%d, alloc_size=%d)",
+                "(real_mapping_len=%d, allocated_mapping_len=%d, alloc_size=%d)",
                 req.rid,
-                compressed_len,
+                len(ordered_real_mapping_indices),
+                len(allocated_mapping_indices),
                 alloc_size,
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
@@ -496,7 +503,13 @@ class HiSparseCoordinator:
                     (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
                 ]
                 if stale_locs.numel() > 0:
-                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+                    stale_mapping_indices = compressed_locs[
+                        (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
+                    ]
+                    self.token_to_kv_pool_allocator.release_hisparse_ownership(
+                        mapping_indices=stale_mapping_indices,
+                        unique_page_owners=True,
+                    )
 
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
@@ -729,9 +742,9 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = req.extend_range.end
+        allocated_len = req.kv.kv_allocated_len
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.req_pool_idx, :allocated_len
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
@@ -760,29 +773,28 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
 
-        # Use kv_allocated_len (not seqlen): under speculative decoding the
-        # allocator can over-allocate beyond the committed seqlen, and those
-        # extra slots may carry stale mapping entries pointing at buffer slots
-        # we just freed via free_hisparse_indices(all_hi). If left set, the
-        # subsequent release_kv_cache -> allocator.free -> free_hisparse path
-        # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
-
-        # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
-
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :allocated_len
         ]
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            allocated_locs
+        allocated_mapping_indices = (
+            self.mem_pool_device.translate_loc_from_full_to_compressed(allocated_locs)
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+
+        def clear_device_buffer_owner() -> None:
+            self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
+            self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
+            self.req_to_device_buffer[req.req_pool_idx, :] = 0
+            self.req_device_buffer_size[req.req_pool_idx] = 0
+
+        self.token_to_kv_pool_allocator.release_hisparse_ownership(
+            mapping_indices=allocated_mapping_indices,
+            extra_owned_coordinates=self.req_to_device_buffer[
+                req.req_pool_idx, :current_cap
+            ],
+            clear_extra_owner=clear_device_buffer_owner,
+        )
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
@@ -793,10 +805,6 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)

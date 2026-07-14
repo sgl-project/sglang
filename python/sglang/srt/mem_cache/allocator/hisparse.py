@@ -1,4 +1,5 @@
 import weakref
+from collections.abc import Callable
 
 import torch
 
@@ -10,6 +11,182 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
+
+
+def _stable_unique_page_ids(page_ids: torch.Tensor) -> torch.Tensor:
+    if page_ids.numel() == 0:
+        return page_ids.to(dtype=torch.int64)
+
+    unique_page_ids, inverse = torch.unique(
+        page_ids.to(dtype=torch.int64), sorted=False, return_inverse=True
+    )
+    positions = torch.arange(
+        page_ids.numel(), dtype=torch.int64, device=page_ids.device
+    )
+    first_positions = torch.full_like(unique_page_ids, page_ids.numel())
+    first_positions.scatter_reduce_(
+        0, inverse, positions, reduce="amin", include_self=True
+    )
+    return unique_page_ids[torch.argsort(first_positions)]
+
+
+class _HiSparsePageOwnership:
+    def __init__(
+        self,
+        *,
+        mapping: torch.Tensor,
+        child_allocator: PagedTokenToKVPoolAllocator,
+        page_size: int,
+    ) -> None:
+        assert child_allocator.is_not_in_free_group
+        assert page_size > 0
+        self.mapping = mapping
+        self.child_allocator = child_allocator
+        self.page_size = page_size
+
+    def release(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        extra_owned_coordinates: torch.Tensor | None = None,
+        clear_extra_owner: Callable[[], None] | None = None,
+        unique_page_owners: bool = False,
+    ) -> None:
+        coordinates = self.mapping[mapping_indices]
+        if extra_owned_coordinates is not None:
+            coordinates = torch.cat([coordinates, extra_owned_coordinates])
+        owned_page_ids = self._owned_page_ids(
+            coordinates, unique_page_owners=unique_page_owners
+        )
+        self._clear_owners_and_release(
+            mapping_indices=mapping_indices,
+            owned_page_ids=owned_page_ids,
+            clear_extra_owner=clear_extra_owner,
+        )
+
+    def take_device_buffer(
+        self,
+        *,
+        ordered_real_mapping_indices: torch.Tensor,
+        allocated_mapping_indices: torch.Tensor,
+        need_size: int,
+        newest_position: int | None,
+    ) -> torch.Tensor | None:
+        assert need_size % self.page_size == 0
+        ordered_real_coordinates = self.mapping[ordered_real_mapping_indices]
+        ordered_real_coordinates = ordered_real_coordinates[
+            ordered_real_coordinates > 0
+        ].to(dtype=torch.int64)
+        allocated_coordinates = self.mapping[allocated_mapping_indices]
+        allocated_page_ids = self._owned_page_ids(allocated_coordinates)
+
+        if (
+            newest_position is not None
+            and ordered_real_coordinates.numel() > newest_position + 1
+        ):
+            ordered_real_coordinates = ordered_real_coordinates.clone()
+            newest_coordinate = ordered_real_coordinates[-1].clone()
+            ordered_real_coordinates[-1] = ordered_real_coordinates[newest_position]
+            ordered_real_coordinates[newest_position] = newest_coordinate
+
+        ordered_prefix = ordered_real_coordinates[:need_size]
+        semantic_page_ids = self._owned_page_ids(ordered_prefix)
+        semantic_blocks = self._full_page_blocks(semantic_page_ids)
+        completion_candidates = semantic_blocks[
+            ~torch.isin(semantic_blocks, ordered_prefix)
+        ]
+        completion_size = need_size - ordered_prefix.numel()
+        semantic_completion = completion_candidates[:completion_size]
+
+        remaining_size = (
+            need_size - ordered_prefix.numel() - semantic_completion.numel()
+        )
+        assert remaining_size % self.page_size == 0
+        padding_page_ids = allocated_page_ids[
+            ~torch.isin(allocated_page_ids, semantic_page_ids)
+        ]
+        retained_padding_page_ids = padding_page_ids[
+            : remaining_size // self.page_size
+        ]
+        retained_padding_blocks = self._full_page_blocks(retained_padding_page_ids)
+
+        new_size = remaining_size - retained_padding_blocks.numel()
+        assert new_size % self.page_size == 0
+        if new_size > 0:
+            new_blocks = self.child_allocator.alloc(new_size)
+            if new_blocks is None:
+                return None
+            new_blocks = new_blocks.to(dtype=torch.int64)
+        else:
+            new_blocks = allocated_page_ids[:0]
+
+        retained_page_ids = torch.cat(
+            [semantic_page_ids, retained_padding_page_ids]
+        )
+        surplus_page_ids = allocated_page_ids[
+            ~torch.isin(allocated_page_ids, retained_page_ids)
+        ]
+        buffer_indices = torch.cat(
+            [
+                ordered_prefix,
+                semantic_completion,
+                retained_padding_blocks,
+                new_blocks,
+            ]
+        )
+        assert buffer_indices.numel() == need_size
+        torch._assert_async(
+            torch.all(buffer_indices > 0),
+            "HiSparse device buffers must contain positive coordinates",
+        )
+
+        self._clear_owners_and_release(
+            mapping_indices=allocated_mapping_indices,
+            owned_page_ids=surplus_page_ids,
+        )
+        return buffer_indices
+
+    def _owned_page_ids(
+        self,
+        coordinates: torch.Tensor,
+        *,
+        unique_page_owners: bool = False,
+    ) -> torch.Tensor:
+        positive_coordinates = coordinates[coordinates > 0].to(dtype=torch.int64)
+        page_ids = positive_coordinates // self.page_size
+        if unique_page_owners:
+            assert self.page_size == 1
+            return page_ids
+        return _stable_unique_page_ids(page_ids)
+
+    def _full_page_blocks(self, owned_page_ids: torch.Tensor) -> torch.Tensor:
+        if owned_page_ids.numel() == 0:
+            return owned_page_ids
+
+        offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=owned_page_ids.device
+        )
+        return (owned_page_ids[:, None] * self.page_size + offsets).reshape(-1)
+
+    def _release_owned_page_ids(self, owned_page_ids: torch.Tensor) -> None:
+        assert self.child_allocator.is_not_in_free_group
+        full_page_blocks = self._full_page_blocks(owned_page_ids)
+        assert full_page_blocks.numel() % self.page_size == 0
+        if full_page_blocks.numel() == 0:
+            return
+        self.child_allocator.free(full_page_blocks)
+
+    def _clear_owners_and_release(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        owned_page_ids: torch.Tensor,
+        clear_extra_owner: Callable[[], None] | None = None,
+    ) -> None:
+        self.mapping[mapping_indices] = 0
+        if clear_extra_owner is not None:
+            clear_extra_owner()
+        self._release_owned_page_ids(owned_page_ids)
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -58,6 +235,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=self.device),
             ]
         )
+        self._page_ownership = _HiSparsePageOwnership(
+            mapping=self.full_to_hisparse_device_index_mapping,
+            child_allocator=self.hisparse_attn_allocator,
+            page_size=self.page_size,
+        )
 
         self.free_pages = None
         self.release_pages = None
@@ -75,6 +257,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def size(self) -> int:
         return self._size_full
+
+    @property
+    def hisparse_device_page_size(self) -> int:
+        return self.page_size
 
     def available_size(self) -> int:
         return min(
@@ -127,48 +313,38 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
-        assert need_size % self.page_size == 0
+    def alloc_device_buffer(
+        self,
+        *,
+        ordered_real_mapping_indices: torch.Tensor,
+        allocated_mapping_indices: torch.Tensor,
+        need_size: int,
+    ) -> torch.Tensor | None:
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
-        else:
-            # page alignment, claiming the residual space for an incomplete page
-            page_residual_length = len(hisparse_indices) % self.page_size
-            if page_residual_length != 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
-                )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
-        return buffer_indices
+        return self._page_ownership.take_device_buffer(
+            ordered_real_mapping_indices=ordered_real_mapping_indices,
+            allocated_mapping_indices=allocated_mapping_indices,
+            need_size=need_size,
+            newest_position=None,
+        )
 
-    def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        # disable free group mechanism for device buffer free
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+    def release_hisparse_ownership(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        extra_owned_coordinates: torch.Tensor | None = None,
+        clear_extra_owner: Callable[[], None] | None = None,
+        unique_page_owners: bool = False,
+    ) -> None:
+        self._page_ownership.release(
+            mapping_indices=mapping_indices,
+            extra_owned_coordinates=extra_owned_coordinates,
+            clear_extra_owner=clear_extra_owner,
+            unique_page_owners=unique_page_owners,
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -236,10 +412,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def free_hisparse(self, free_indices: torch.Tensor):
-        hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[free_indices] = 0
+        self.release_hisparse_ownership(mapping_indices=free_indices)
 
     def clear(self):
         self.logical_attn_allocator.clear()
@@ -248,12 +421,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
-
-    def free_group_begin(self):
-        return
-
-    def free_group_end(self):
-        return
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -317,6 +484,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=self.device),
             ]
         )
+        self._page_ownership = _HiSparsePageOwnership(
+            mapping=self.full_to_hisparse_device_index_mapping,
+            child_allocator=self.hisparse_attn_allocator,
+            page_size=self.hisparse_page_size,
+        )
 
         self.need_sort = logical_attn_allocator.need_sort
         self.free_pages = None
@@ -340,6 +512,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def size_swa(self) -> int:
         return self.logical_attn_allocator.size_swa
+
+    @property
+    def hisparse_device_page_size(self) -> int:
+        return self.hisparse_page_size
 
     @property
     def full_to_swa_index_mapping(self):
@@ -424,60 +600,34 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_tail_end=swa_tail_end,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
-        assert need_size % self.hisparse_page_size == 0
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
+    def alloc_device_buffer(
+        self,
+        *,
+        ordered_real_mapping_indices: torch.Tensor,
+        allocated_mapping_indices: torch.Tensor,
+        need_size: int,
+    ) -> torch.Tensor | None:
+        return self._page_ownership.take_device_buffer(
+            ordered_real_mapping_indices=ordered_real_mapping_indices,
+            allocated_mapping_indices=allocated_mapping_indices,
+            need_size=need_size,
+            newest_position=need_size - self.hisparse_page_size,
+        )
 
-        device_buffer_size = need_size - self.hisparse_page_size
-        P = len(hisparse_indices)
-        if P > device_buffer_size + 1:
-            newest_src = hisparse_indices[P - 1].clone()
-            old_at_dbs = hisparse_indices[device_buffer_size].clone()
-            hisparse_indices[device_buffer_size] = newest_src
-            hisparse_indices[P - 1] = old_at_dbs
-
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            surplus = hisparse_indices[need_size:]
-            if surplus.numel() > 0:
-                buffer_pages = torch.unique(buffer_indices // self.hisparse_page_size)
-                surplus_pages = torch.unique(surplus // self.hisparse_page_size)
-                pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
-                if pure_surplus.numel() > 0:
-                    self.hisparse_attn_allocator.is_not_in_free_group = True
-                    self.hisparse_attn_allocator.free(
-                        pure_surplus * self.hisparse_page_size
-                    )
-        else:
-            page_residual_length = len(hisparse_indices) % self.hisparse_page_size
-            if page_residual_length != 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.hisparse_page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
-                )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
-        return buffer_indices
-
-    def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+    def release_hisparse_ownership(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        extra_owned_coordinates: torch.Tensor | None = None,
+        clear_extra_owner: Callable[[], None] | None = None,
+        unique_page_owners: bool = False,
+    ) -> None:
+        self._page_ownership.release(
+            mapping_indices=mapping_indices,
+            extra_owned_coordinates=extra_owned_coordinates,
+            clear_extra_owner=clear_extra_owner,
+            unique_page_owners=unique_page_owners,
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
@@ -559,12 +709,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def free_compressed(self, compressed_indices: torch.Tensor):
-        hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
-            compressed_indices
-        )
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[compressed_indices] = 0
+        self.release_hisparse_ownership(mapping_indices=compressed_indices)
 
     def free_hisparse(self, free_indices: torch.Tensor):
         compressed_indices = (

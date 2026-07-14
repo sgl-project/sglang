@@ -524,12 +524,19 @@ class TestHiSparseUnit(unittest.TestCase):
             ((fill_len + self.page_size - 1) // self.page_size) * self.page_size,
             DEVICE_BUFFER_SIZE,
         )
-        buf_idx = self.allocator.alloc_device_buffer(kv_loc, need_size)
+        buf_idx = self.allocator.alloc_device_buffer(
+            ordered_real_mapping_indices=kv_loc,
+            allocated_mapping_indices=kv_loc,
+            need_size=need_size,
+        )
         self.assertIsNotNone(buf_idx)
         mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
         self.assertTrue(torch.all(mapping_after == 0), "Mapping should be cleared")
 
-        self.allocator.free_hisparse_indices(buf_idx)
+        self.allocator.release_hisparse_ownership(
+            mapping_indices=kv_loc,
+            extra_owned_coordinates=buf_idx,
+        )
         self.allocator.logical_attn_allocator.free(kv_loc)
         self._assert_sizes_restored(initial, "alloc_free_cycle")
 
