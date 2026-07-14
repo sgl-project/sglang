@@ -11,13 +11,13 @@ from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.jit_kernel.hadamard import hadamard_transform
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
+    precompute_freqs_cis,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
-)
-from sglang.srt.layers.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
-    precompute_freqs_cis,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 

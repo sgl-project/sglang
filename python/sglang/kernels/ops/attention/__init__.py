@@ -64,3 +64,23 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+# RoPE / QK-norm fusion kernels migrated from srt/layers top-level strays
+# (RFC #29630, Phase 2.5); registered for inventory.
+for _mod, _fn in [
+    ("deepseek_v4_rope", "precompute_freqs_cis"),
+    ("fused_qk_norm_rope_store", "fused_qk_norm_rope_swa_store"),
+    ("fused_qk_rmsnorm_rope_gate", "fused_qk_gemma_rmsnorm_rope_gate"),
+    ("fused_qk_norm", "fused_qk_norm"),
+    ("rotary_triton", "triton_mrope_fused"),
+    ("rotary_triton", "triton_ernie45_rope_fused_inplace"),
+    ("mrope", "apply_interleaved_rope_triton"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
