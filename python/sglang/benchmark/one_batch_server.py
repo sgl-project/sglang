@@ -108,6 +108,7 @@ class BenchArgs:
     temperature: float = 0.0
     return_logprob: bool = False
     client_stream_interval: int = 1
+    request_timeout: int = DEFAULT_TIMEOUT
     input_len_step_percentage: float = 0.0
     base_url: str = ""
     local_tokenizer_path: str = ""
@@ -160,6 +161,12 @@ class BenchArgs:
             "--client-stream-interval",
             type=int,
             default=BenchArgs.client_stream_interval,
+        )
+        parser.add_argument(
+            "--request-timeout",
+            type=int,
+            default=BenchArgs.request_timeout,
+            help="HTTP request timeout in seconds for each benchmark case.",
         )
         parser.add_argument(
             "--input-len-step-percentage",
@@ -532,6 +539,7 @@ def run_one_case(
     temperature: float,
     return_logprob: bool,
     stream_interval: int,
+    request_timeout: int,
     input_len_step_percentage: float,
     run_name: str,
     result_filename: str,
@@ -729,7 +737,7 @@ def run_one_case(
         gen_url,
         json=payload,
         stream=True,
-        timeout=DEFAULT_TIMEOUT,
+        timeout=request_timeout,
     ) as response:
         response.raise_for_status()
 
@@ -781,7 +789,7 @@ def run_one_case(
         last_gen_throughput = -1
         acc_length = -1
     else:
-        response = requests.get(url + "/server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(url + "/server_info", timeout=request_timeout)
         response.raise_for_status()
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
@@ -1081,6 +1089,7 @@ def run_benchmark_internal(
                 temperature=bench_args.temperature,
                 return_logprob=bench_args.return_logprob,
                 stream_interval=bench_args.client_stream_interval,
+                request_timeout=bench_args.request_timeout,
                 input_len_step_percentage=bench_args.input_len_step_percentage,
                 run_name="",
                 result_filename="",
@@ -1125,6 +1134,7 @@ def run_benchmark_internal(
                     temperature=bench_args.temperature,
                     return_logprob=bench_args.return_logprob,
                     stream_interval=bench_args.client_stream_interval,
+                    request_timeout=bench_args.request_timeout,
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
@@ -1174,6 +1184,7 @@ def run_benchmark_internal(
                             temperature=bench_args.temperature,
                             return_logprob=bench_args.return_logprob,
                             stream_interval=bench_args.client_stream_interval,
+                            request_timeout=bench_args.request_timeout,
                             input_len_step_percentage=bench_args.input_len_step_percentage,
                             run_name=bench_args.run_name,
                             result_filename=bench_args.result_filename,

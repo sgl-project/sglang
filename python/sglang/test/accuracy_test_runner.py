@@ -31,6 +31,7 @@ class AccuracyTestParams:
     top_k: Optional[int] = None
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
+    aime25_data_path: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +90,7 @@ def _run_simple_eval(
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
     api: Optional[str] = None,
+    aime25_data_path: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
@@ -115,6 +117,9 @@ def _run_simple_eval(
 
         if api is not None:
             args.api = api
+
+        if aime25_data_path is not None:
+            args.aime25_data_path = aime25_data_path
 
         if max_tokens is not None:
             args.max_tokens = max_tokens
@@ -498,6 +503,7 @@ def run_accuracy_test(
             top_k=params.top_k,
             repeat=params.repeat,
             api=params.api,
+            aime25_data_path=params.aime25_data_path,
         )
 
     if not success:

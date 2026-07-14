@@ -9,10 +9,13 @@ The American Invitational Mathematics Examination (AIME) is a challenging
 competition math exam. All answers are integers from 000 to 999.
 """
 
+import json
 import re
+from pathlib import Path
 from typing import Optional
 
 from sglang.test import simple_eval_common as common
+from sglang.test.aime25_hard_subset import normalize_aime25_rows
 from sglang.test.simple_eval_common import (
     ANSWER_PATTERN,
     HTML_JINJA,
@@ -31,6 +34,23 @@ Note: AIME answers are always integers from 000 to 999 (inclusive). If you get a
 
 Remember to put your answer on its own line after "Answer:", and express your answer as an integer from 000 to 999.
 """.strip()
+
+
+def _read_aime25_jsonl(data_path: str | Path) -> list[dict[str, str]]:
+    rows = []
+    with Path(data_path).expanduser().open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{data_path}:{line_no}: invalid JSON: {exc}") from exc
+    return [
+        {"question": row["problem"], "answer": row["expected_answer"]}
+        for row in normalize_aime25_rows(rows)
+    ]
 
 
 def normalize_aime_answer(answer: str) -> Optional[str]:
@@ -58,27 +78,31 @@ class AIME25Eval(Eval):
         self,
         num_examples: Optional[int],
         num_threads: int,
+        data_path: Optional[str | Path] = None,
     ):
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "The 'datasets' package is required for AIME25 evaluation. "
-                "Please install it with: pip install datasets"
-            )
+        if data_path:
+            examples = _read_aime25_jsonl(data_path)
+        else:
+            try:
+                from datasets import load_dataset
+            except ImportError:
+                raise ImportError(
+                    "The 'datasets' package is required for AIME25 evaluation. "
+                    "Please install it with: pip install datasets"
+                )
 
-        # Load AIME 2025 dataset from HuggingFace
-        dataset1 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
-        dataset2 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
-        examples1 = [
-            {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset1
-        ]
-        examples2 = [
-            {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset2
-        ]
-        examples = examples1 + examples2
+            # Load AIME 2025 dataset from HuggingFace
+            dataset1 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
+            dataset2 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
+            examples1 = [
+                {"question": row["question"], "answer": str(row["answer"])}
+                for row in dataset1
+            ]
+            examples2 = [
+                {"question": row["question"], "answer": str(row["answer"])}
+                for row in dataset2
+            ]
+            examples = examples1 + examples2
 
         if num_examples:
             examples = examples[: min(num_examples, len(examples))]

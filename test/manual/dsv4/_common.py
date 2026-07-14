@@ -29,6 +29,10 @@ AIME25 knobs (env vars):
     DSV4_AIME25_NUM_THREADS       (default 512   -> --num-threads)
     DSV4_AIME25_SCORE_METRIC      (default "score"; sgl-eval JSON key under "aggregate")
     DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides per-variant default)
+    DSV4_AIME25_FROM_DATASET      (default ""; path passed to sgl-eval --from-dataset)
+    DSV4_AIME25_HARD_ONLY         (default 0; generate a small hard-problem subset)
+    DSV4_AIME25_HARD_IDS          (default dsv4-flash preset; comma-separated ids)
+    DSV4_AIME25_HARD_SCORE_THRESHOLD (default 0.70; used for hard-only subset)
 
 GSM8K sanity knobs (env vars):
     DSV4_GSM8K_NUM_EXAMPLES       (default 50    -> --num-examples)
@@ -69,6 +73,11 @@ from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.aime25_hard_subset import (
+    parse_problem_ids,
+    select_aime25_rows,
+    write_jsonl,
+)
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -98,6 +107,17 @@ AIME25_MAX_TOKENS = int(os.environ.get("DSV4_AIME25_MAX_TOKENS", "65536"))
 AIME25_NUM_THREADS = int(os.environ.get("DSV4_AIME25_NUM_THREADS", "512"))
 AIME25_SCORE_METRIC = os.environ.get("DSV4_AIME25_SCORE_METRIC", "score")
 AIME25_SCORE_THRESHOLD = float(os.environ.get("DSV4_AIME25_SCORE_THRESHOLD", "0.0"))
+AIME25_FROM_DATASET = os.environ.get("DSV4_AIME25_FROM_DATASET", "")
+AIME25_HARD_ONLY = os.environ.get("DSV4_AIME25_HARD_ONLY", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+AIME25_HARD_IDS = os.environ.get("DSV4_AIME25_HARD_IDS")
+AIME25_HARD_SCORE_THRESHOLD = float(
+    os.environ.get("DSV4_AIME25_HARD_SCORE_THRESHOLD", "0.70")
+)
 
 GSM8K_NUM_EXAMPLES = int(os.environ.get("DSV4_GSM8K_NUM_EXAMPLES", "50"))
 GSM8K_N_REPEATS = int(os.environ.get("DSV4_GSM8K_N_REPEATS", "1"))
@@ -136,6 +156,29 @@ def multinode_args(nnodes: int) -> List[str]:
         "--dist-init-addr",
         addr,
     ]
+
+
+def _build_aime25_hard_dataset(out_dir: Path) -> Path:
+    """Build a small sgl-eval --from-dataset JSONL from bundled sgl-eval data."""
+    try:
+        from sgl_eval.evals._loader import load_bundled
+    except ImportError as exc:
+        raise unittest.SkipTest(
+            "DSV4_AIME25_HARD_ONLY requires the sgl-eval Python package"
+        ) from exc
+
+    examples = load_bundled("aime25")(None)
+    rows = [
+        {
+            "id": ex.id,
+            "problem": ex.inputs["problem"],
+            "expected_answer": ex.target,
+        }
+        for ex in examples
+    ]
+    problem_ids = parse_problem_ids(AIME25_HARD_IDS)
+    selected = select_aime25_rows(rows, problem_ids)
+    return write_jsonl(selected, out_dir / "aime25-hard-subset.jsonl")
 
 
 class DSV4Aime25TestBase(CustomTestCase):
@@ -185,16 +228,21 @@ class DSV4Aime25TestBase(CustomTestCase):
             max_tokens=GSM8K_MAX_TOKENS,
             num_threads=GSM8K_NUM_THREADS,
             num_examples=GSM8K_NUM_EXAMPLES,
+            from_dataset=None,
             metric=GSM8K_SCORE_METRIC,
             threshold=GSM8K_SCORE_THRESHOLD,
         )
 
     def test_aime25(self):
         """Full AIME25 accuracy run; threshold gated by Flash vs Pro base."""
+        out_dir = Path(SGL_EVAL_OUT_DIR)
+        from_dataset = AIME25_FROM_DATASET
+        if AIME25_HARD_ONLY and not from_dataset:
+            from_dataset = str(_build_aime25_hard_dataset(out_dir))
         threshold = (
             AIME25_SCORE_THRESHOLD
             if AIME25_SCORE_THRESHOLD > 0
-            else self.SCORE_THRESHOLD
+            else AIME25_HARD_SCORE_THRESHOLD if from_dataset else self.SCORE_THRESHOLD
         )
         self._run_sgl_eval(
             eval_name="aime25",
@@ -204,6 +252,7 @@ class DSV4Aime25TestBase(CustomTestCase):
             max_tokens=AIME25_MAX_TOKENS,
             num_threads=AIME25_NUM_THREADS,
             num_examples=None,
+            from_dataset=from_dataset,
             metric=AIME25_SCORE_METRIC,
             threshold=threshold,
         )
@@ -217,6 +266,7 @@ class DSV4Aime25TestBase(CustomTestCase):
         max_tokens,
         num_threads,
         num_examples,
+        from_dataset,
         metric,
         threshold,
     ):
@@ -225,7 +275,7 @@ class DSV4Aime25TestBase(CustomTestCase):
 
         out_dir = Path(SGL_EVAL_OUT_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
-        glob_pattern = f"sgl_eval_{eval_name}_*.json"
+        glob_pattern = f"sgl_eval_{eval_name}_*"
         before = set(out_dir.glob(glob_pattern))
 
         cmd = [
@@ -249,6 +299,8 @@ class DSV4Aime25TestBase(CustomTestCase):
         ]
         if num_examples is not None:
             cmd += ["--num-examples", str(num_examples)]
+        if from_dataset:
+            cmd += ["--from-dataset", str(from_dataset)]
 
         print(f"[{type(self).__name__}] + {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, check=True)
@@ -257,6 +309,8 @@ class DSV4Aime25TestBase(CustomTestCase):
         if not new:
             self.fail(f"sgl-eval produced no new {eval_name} JSON in {out_dir}")
         result_path = new[-1]
+        if result_path.is_dir():
+            result_path = result_path / "metrics.json"
         with open(result_path) as f:
             result = json.load(f)
         print(

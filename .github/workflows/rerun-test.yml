@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: "20"
+      test_timeout:
+        description: "Run-test step timeout minutes"
+        required: false
+        type: string
+        default: "60"
       grace_blackwell:
         description: "Set GRACE_BLACKWELL for the install step (cuda only)"
         required: false
@@ -125,7 +130,7 @@ jobs:
           bash ${{ inputs.install_script }}
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: ${{ fromJson(inputs.test_timeout) }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
