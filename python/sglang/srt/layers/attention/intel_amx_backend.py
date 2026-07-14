@@ -20,11 +20,14 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         super().__init__()
         self.forward_metadata = None
+        self.extend_metadata = None
+        self.draft_decode_metadata = None
         self.device = model_runner.device
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.max_context_len = model_runner.model_config.context_len
 
         # full->SWA translated out_cache_loc, computed once per forward (the only
         # set_kv_buffer is in eager forward_extend; decode writes KV in-kernel).
@@ -51,6 +54,68 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
+        # Number of KV splits used by decode_attention_cpu; attn_logits is
+        # sized [bs, num_head, num_kv_splits, v_head_dim + 1] to match.
+        self.num_kv_splits = 8
+
+        # speculative decoding params
+        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+
+    def _build_extend_metadata(self, forward_batch: ForwardBatch):
+        """Resolve (seq_lens, extend_seq_lens, extend_start_loc, tree_mask) for
+        forward_extend, once per forward pass.
+
+        In TARGET_VERIFY mode the batch carries no extend_* fields, so they are
+        derived from spec_info (mirrors the CUDA unified path in
+        triton_backend.py); each request extends by exactly num_draft_tokens
+        tokens. Outside spec decoding the fields are passed through.
+        """
+        bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens
+        tree_mask = None
+
+        if forward_batch.forward_mode.is_target_verify():
+            spec_info = forward_batch.spec_info
+            if spec_info is None:
+                raise RuntimeError(
+                    "spec_info is unset in TARGET_VERIFY mode; the extend_* "
+                    "metadata can only be derived from spec_info for "
+                    "speculative verify batches."
+                )
+            num_draft_tokens = spec_info.draft_token_num
+            extend_seq_lens = torch.full(
+                (bs,), num_draft_tokens, dtype=torch.int32, device=self.device
+            )
+            # Uniform extend lengths: start locations form a plain range.
+            extend_start_loc = torch.arange(
+                0,
+                bs * num_draft_tokens,
+                num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            seq_lens = forward_batch.seq_lens + num_draft_tokens
+            # Speculative verify with a token tree: each draft token may only
+            # attend to its ancestors among the draft tokens (the committed
+            # prefix stays fully visible).
+            #
+            # NOTE: unlike triton_backend.py, which forwards spec_info.custom_mask
+            # unconditionally, the mask is gated on tree_topk here. tree_topk == 1
+            # means the draft tokens form a simple chain whose visibility is
+            # exactly the kernel's built-in causal masking, and skipping the explicit
+            # mask lets extend_attention_cpu take its faster mask-free path. EAGLE
+            # has tree_topk == topk (> 1 for real trees); NGRAM has tree_topk == -1
+            # (irregular tree); both need the mask.
+            if spec_info.tree_topk != 1:
+                custom_mask = spec_info.custom_mask
+                if custom_mask is not None and custom_mask.numel() > 0:
+                    tree_mask = custom_mask
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            extend_start_loc = forward_batch.extend_start_loc
+
+        return seq_lens, extend_seq_lens, extend_start_loc, tree_mask
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
 
@@ -59,7 +124,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             (
                 bs,
                 self.num_head,
-                8,  # self.num_kv_splits,
+                self.num_kv_splits,
                 self.v_head_dim + 1,
             ),
             dtype=torch.float32,
@@ -67,8 +132,13 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         if forward_batch.forward_mode.is_decode_or_idle():
             max_extend_len = None
+            self.extend_metadata = None
+        elif forward_batch.forward_mode.is_target_verify():
+            max_extend_len = self.num_draft_tokens
+            self.extend_metadata = self._build_extend_metadata(forward_batch)
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            self.extend_metadata = self._build_extend_metadata(forward_batch)
         self.forward_metadata = (attn_logits, max_extend_len)
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -97,7 +167,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             (
                 bs,
                 self.num_head,
-                8,  # self.num_kv_splits,
+                self.num_kv_splits,
                 self.v_head_dim + 1,
             ),
             dtype=torch.float32,
@@ -105,6 +175,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         max_extend_len = None
         self.forward_metadata = (attn_logits, max_extend_len)
+        self.extend_metadata = None
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -136,6 +207,10 @@ class IntelAMXAttnBackend(AttentionBackend):
                 layer, KVWriteLoc(cache_loc, swa_loc), k, v
             )
 
+        # Precomputed once per forward pass in init_forward_metadata (spec
+        # verify batches carry no extend_* fields; see _build_extend_metadata).
+        seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
+
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -146,9 +221,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
@@ -156,6 +231,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
+            tree_mask,
         )
         return o
 
@@ -170,6 +246,13 @@ class IntelAMXAttnBackend(AttentionBackend):
         sinks=None,
     ):
         attn_logits, _ = self.forward_metadata
+
+        if self.draft_decode_metadata is not None:
+            req_to_token, seq_lens, req_pool_indices = self.draft_decode_metadata
+        else:
+            req_to_token = self.req_to_token_pool.req_to_token
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
@@ -191,9 +274,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             v,
             cache_loc,
             attn_logits,
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
@@ -205,3 +288,67 @@ class IntelAMXAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
+
+
+class IntelAMXMultiStepDraftBackend:
+    """
+    Wrap multiple intel amx attention backends as one for multiple consecutive
+    draft decoding steps.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        from sgl_kernel import build_draft_decode_metadata_cpu
+
+        self.build_draft_decode_metadata = build_draft_decode_metadata_cpu
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends: list[IntelAMXAttnBackend] = []
+        for _ in range(self.speculative_num_steps - 1):
+            self.attn_backends.append(IntelAMXAttnBackend(model_runner))
+        self.device = model_runner.device
+        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        num_seqs = forward_batch.batch_size
+        topk = self.topk
+        bs = num_seqs * topk
+        num_steps = self.speculative_num_steps
+        req_to_token = self.attn_backends[0].req_to_token_pool.req_to_token
+        seq_lens = forward_batch.seq_lens
+        pool_len = self.pool_len
+        num_head = self.attn_backends[0].num_head
+        v_head_dim = self.attn_backends[0].v_head_dim
+        device = self.device
+
+        # Build expanded req_to_token via C++ kernel
+        req_to_token_draft = self.build_draft_decode_metadata(
+            req_to_token,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            topk,
+            num_steps,
+            pool_len,
+        )
+
+        req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)
+
+        num_kv_splits = self.attn_backends[0].num_kv_splits
+        for step in range(num_steps - 1):
+            # Each candidate sees prefix + (step + 1) draft tokens.
+            seq_lens_expanded = seq_lens.repeat_interleave(topk) + step + 1
+            attn_logits = torch.zeros(
+                (bs, num_head, num_kv_splits, v_head_dim + 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.attn_backends[step].forward_metadata = (attn_logits, None)
+            self.attn_backends[step].draft_decode_metadata = (
+                req_to_token_draft,
+                seq_lens_expanded,
+                req_pool_indices_expanded,
+            )
