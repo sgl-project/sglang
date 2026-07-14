@@ -500,6 +500,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cd /sgl-workspace/mori; \
   git checkout "${MORI_COMMIT}"; \
   git submodule update --init --recursive; \
+  # UMBP always adds its gtest targets (src/umbp/tests) regardless of BUILD_TESTS.
+  # gtest_discover_tests runs those binaries at build time to enumerate tests, but
+  # the image build host has no GPU (hipErrorNoDevice), so discovery produces empty
+  # output and CMake JSON parsing aborts the build. Gate UMBP tests on BUILD_TESTS
+  # (OFF here) to match how the top-level tests/cpp subdir is handled.
+  sed -i "s|add_subdirectory(tests)|if(BUILD_TESTS)\n  add_subdirectory(tests)\nendif()|" src/umbp/CMakeLists.txt; \
   python3 setup.py develop; \
   python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))" > /etc/ld.so.conf.d/torch.conf; \
   ldconfig; \
