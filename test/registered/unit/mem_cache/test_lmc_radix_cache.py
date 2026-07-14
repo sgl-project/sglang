@@ -323,10 +323,7 @@ class TestLMCachePageAlignedLoadBack(CustomTestCase):
                     self.assertEqual(len(last_node.children), 0)
                     self.assertEqual(harness.cache.evictable_size_, 0)
                     self.assertEqual(
-                        [
-                            slots.tolist()
-                            for slots in harness.allocator.free_calls
-                        ],
+                        [slots.tolist() for slots in harness.allocator.free_calls],
                         [list(range(100, 108))],
                     )
 
@@ -399,7 +396,9 @@ class TestLMCachePageAlignedLoadBack(CustomTestCase):
                 patch.object(module, "LMCacheLayerwiseConnector") as connector,
                 patch.object(module, "LayerTransferCounter") as counter,
             ):
-                with self.assertRaisesRegex(ValueError, "requires allocator page size 1"):
+                with self.assertRaisesRegex(
+                    ValueError, "requires allocator page size 1"
+                ):
                     IPLMCRadixCache(object())
 
             get_global_args.assert_not_called()
@@ -445,7 +444,9 @@ class TestLMCachePageAlignedLoadBack(CustomTestCase):
                         patch.object(
                             module,
                             "get_global_server_args",
-                            return_value=SimpleNamespace(lmcache_config_file="cfg.yaml"),
+                            return_value=SimpleNamespace(
+                                lmcache_config_file="cfg.yaml"
+                            ),
                         ),
                         patch.object(
                             module,
