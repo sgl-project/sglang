@@ -48,7 +48,7 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     full_concat_embeddings,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import (
+from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     load_video,
     normalize,

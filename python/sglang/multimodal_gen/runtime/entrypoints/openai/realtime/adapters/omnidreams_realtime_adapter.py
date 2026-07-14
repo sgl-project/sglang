@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import (
+from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     normalize,
     numpy_to_pt,

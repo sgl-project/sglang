@@ -24,7 +24,7 @@ import numpy as np
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.runtime.models.vision_utils import (
+from sglang.multimodal_gen.runtime.utils.vision import (
     normalize,
     numpy_to_pt,
     pil_to_numpy,
