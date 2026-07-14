@@ -9,7 +9,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
+
+register_cpu_ci(est_time=30, suite="base-b-test-cpu")
 
 
 def run_distributed_test(rank, world_size, master_port, output_writer, fn):
