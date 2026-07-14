@@ -239,21 +239,6 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
 }
 
-inline int getSMVersion(int device_id) {
-  int sm_major = 0;
-  int sm_minor = 0;
-#ifndef USE_ROCM
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-#else
-  // SM (compute-capability) version is CUDA-only; the cudaDevAttr* enums are not
-  // declared under HIP, so this must be compiled out for hipcc (DeepSeek-V4 JIT
-  // kernels include this header). ROCm dispatches on gfx arch, not SM version.
-  (void)device_id;
-#endif
-  return sm_major * 10 + sm_minor;
-}
-
 inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
   if (required_bytes == 0) return {};
   DLDataType u8 = {kDLUInt, 8, 1};
