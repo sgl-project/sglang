@@ -2877,6 +2877,7 @@ class ServerArgs:
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
+        self._disable_prefill_cuda_graph_for_hpc_ops_fp8()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
@@ -3700,6 +3701,29 @@ class ServerArgs:
             "the trtllm_mla attention backend (a captured prefill graph forces a "
             "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
             "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+            self.cuda_graph_config.prefill.backend,
+        )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+    def _disable_prefill_cuda_graph_for_hpc_ops_fp8(self):
+        """The hpc_ops FP8 KV path threads the fused-RoPE Q scales to attention
+        through Python state, which a captured prefill graph replay skips (only
+        kernels are replayed). Disable the prefill graph for that combo; the
+        decode graph replays the whole forward (RoPE included) and is
+        unaffected."""
+        if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
+            return
+        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+        if self.attention_backend != "hpc_ops" or self.kv_cache_dtype not in (
+            "fp8_e4m3",
+            "fp8",
+        ):
+            return
+        logger.warning(
+            "Disabling the prefill CUDA graph (%s) for hpc_ops with an FP8 KV "
+            "cache (a captured prefill graph replay skips the fused-RoPE Q "
+            "scale plumbing); the decode CUDA graph stays enabled.",
             self.cuda_graph_config.prefill.backend,
         )
         self.cuda_graph_config.prefill.backend = Backend.DISABLED
