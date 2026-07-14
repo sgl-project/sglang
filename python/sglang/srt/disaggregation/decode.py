@@ -1959,6 +1959,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self._maybe_prepare_ngram_embedding(batch)
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1997,6 +1998,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self._maybe_prepare_ngram_embedding(batch)
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
