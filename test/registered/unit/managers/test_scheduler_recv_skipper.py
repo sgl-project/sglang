@@ -55,8 +55,8 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         skipper = SchedulerRecvSkipper.maybe_create(_server_args(50))
         self.assertTrue(skipper.handle(ForwardMode.EXTEND))
 
-    def test_derive_global_forward_mode(self):
-        derive = SchedulerRecvSkipper.derive_global_forward_mode
+    def test_derive_forward_mode(self):
+        derive = SchedulerRecvSkipper.derive_forward_mode
         decode = ForwardMode.DECODE.value
         extend = ForwardMode.EXTEND.value
         mixed = ForwardMode.MIXED.value
@@ -79,7 +79,7 @@ class TestSchedulerRecvSkipper(CustomTestCase):
 
     def test_derived_mode_is_rank_invariant(self):
         # Permutations of the gathered list must not change the result.
-        derive = SchedulerRecvSkipper.derive_global_forward_mode
+        derive = SchedulerRecvSkipper.derive_forward_mode
         modes = [
             ForwardMode.DECODE.value,
             ForwardMode.IDLE.value,
@@ -99,26 +99,23 @@ class TestRecvSkipperLastForwardMode(CustomTestCase):
 
     def test_non_dp_uses_local_mode(self):
         batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, global_forward_modes=None
+            forward_mode=ForwardMode.DECODE, recv_skipper_forward_mode=None
         )
         self.assertEqual(_last_forward_mode(False, batch), ForwardMode.DECODE)
 
-    def test_dp_derives_from_gathered_modes_not_local(self):
+    def test_dp_uses_synced_mode_not_local(self):
         # The rank-local mode (IDLE here) differs across ranks and must be
-        # ignored in favor of the gathered per-rank modes.
+        # ignored in favor of the mode derived from the all-gather.
         batch = SimpleNamespace(
             forward_mode=ForwardMode.IDLE,
-            global_forward_modes=[
-                ForwardMode.EXTEND.value,
-                ForwardMode.IDLE.value,
-            ],
+            recv_skipper_forward_mode=ForwardMode.EXTEND,
         )
         self.assertEqual(_last_forward_mode(True, batch), ForwardMode.EXTEND)
 
-    def test_dp_without_gathered_modes_returns_none(self):
+    def test_dp_without_synced_mode_returns_none(self):
         # SGLANG_SCHEDULER_SKIP_ALL_GATHER is global, so None stays consistent.
         batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, global_forward_modes=None
+            forward_mode=ForwardMode.DECODE, recv_skipper_forward_mode=None
         )
         self.assertIsNone(_last_forward_mode(True, batch))
 

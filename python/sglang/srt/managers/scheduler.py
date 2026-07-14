@@ -1757,16 +1757,14 @@ class Scheduler(
     def _recv_skipper_last_forward_mode(self) -> Optional[ForwardMode]:
         # The recv decision must be identical on every rank in the
         # request-broadcast collectives. Local forward modes differ across DP
-        # ranks (IDLE vs DECODE), so derive from the gathered per-rank modes.
+        # ranks (IDLE vs DECODE), so use the mode derived from the MLP sync
+        # all-gather. It is None when the all-gather was skipped
+        # (SGLANG_SCHEDULER_SKIP_ALL_GATHER) -- that env is global, so the
+        # value stays rank-consistent.
         if self.last_batch is None:
             return None
         if self.server_args.enable_dp_attention:
-            modes = self.last_batch.global_forward_modes
-            if modes is None:
-                # All-gather skipped (SGLANG_SCHEDULER_SKIP_ALL_GATHER); the
-                # env is global, so None stays rank-consistent.
-                return None
-            return SchedulerRecvSkipper.derive_global_forward_mode(modes)
+            return self.last_batch.recv_skipper_forward_mode
         return self.last_batch.forward_mode
 
     def init_request_receiver(self) -> None:

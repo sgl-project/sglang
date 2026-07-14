@@ -11,6 +11,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -48,7 +49,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
-    global_forward_modes: list[int] = None
+    recv_skipper_forward_mode: Optional[ForwardMode] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -112,11 +113,12 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(cpu_data[:, 2].min().item())
         self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(cpu_data[:, 6].min().item())
-        self.global_forward_modes = cpu_data[:, 5].tolist()
+        forward_modes = cpu_data[:, 5].tolist()
+        self.recv_skipper_forward_mode = SchedulerRecvSkipper.derive_forward_mode(
+            forward_modes
+        )
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(
-                self.global_forward_modes
-            )
+            self.dp_cooperation_info = DPCooperationInfo.create(forward_modes)
 
 
 def _update_gather_batch(
@@ -256,7 +258,7 @@ def prepare_mlp_sync_batch_raw(
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and not skip_all_gather:
-        local_batch.global_forward_modes = mlp_sync_info.global_forward_modes
+        local_batch.recv_skipper_forward_mode = mlp_sync_info.recv_skipper_forward_mode
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info

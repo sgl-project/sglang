@@ -17,7 +17,7 @@ class SchedulerRecvSkipper:
         return SchedulerRecvSkipper(server_args)
 
     @staticmethod
-    def derive_global_forward_mode(
+    def derive_forward_mode(
         global_forward_modes: List[int],
     ) -> Optional[ForwardMode]:
         """Collapse the gathered per-DP-rank forward modes into one
