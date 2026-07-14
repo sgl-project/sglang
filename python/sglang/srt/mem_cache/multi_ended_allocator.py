@@ -2360,10 +2360,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 - swa_allocator._byte_high_frontier(),
             )
         required_bytes = (
-            max(0, full_page_count - full_holes)
-            * full_allocator.entry_bytes_per_page
-            + max(0, swa_page_count - swa_holes)
-            * swa_allocator.entry_bytes_per_page
+            max(0, full_page_count - full_holes) * full_allocator.entry_bytes_per_page
+            + max(0, swa_page_count - swa_holes) * swa_allocator.entry_bytes_per_page
         )
         return required_bytes <= gap_bytes
 
