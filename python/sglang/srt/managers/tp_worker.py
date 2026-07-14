@@ -314,7 +314,6 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers
-
         if (
             envs.SGLANG_ENABLE_PP_SPEC.get()
             and is_draft_worker

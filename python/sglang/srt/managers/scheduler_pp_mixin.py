@@ -1161,7 +1161,9 @@ class SchedulerPPMixin:
             # the seq state per-rid onto the live batch, stash the bonus
             # tokens that root the next verify chain, and rebuild a result the
             # spec output processor can consume (CPU tensors).
-            fwd_batch = mb_metadata.fwd_batch if mb_metadata.fwd_batch else batch
+            fwd_batch = (
+                mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
+            )
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
@@ -1211,7 +1213,9 @@ class SchedulerPPMixin:
         batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
         if is_spec:
             # Spec prefill round: the sampled first token roots round 1's chain.
-            fwd_batch = mb_metadata.fwd_batch if mb_metadata.fwd_batch else batch
+            fwd_batch = (
+                mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
+            )
             self._pp_spec_store_bonus(fwd_batch, batch.input_ids)
         else:
             # PP rank 0 also relays into output_tokens_buf so the next iter's

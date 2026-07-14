@@ -7046,13 +7046,14 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-
             if not envs.SGLANG_ENABLE_PP_SPEC.get():
                 assert (
                     self.disable_overlap_schedule and self.speculative_algorithm is None
                 ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
             else:
-                assert self.disable_overlap_schedule
+                assert (
+                    self.disable_overlap_schedule
+                ), "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
                 # The PP relay slices spec results with the configured
                 # num_draft_tokens; adaptive spec changes it at runtime.
                 assert not self.speculative_adaptive, (

@@ -631,7 +631,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.pp_size > 1:
-
             if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
                 assert (
                     self.support_pp

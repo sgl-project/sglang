@@ -364,7 +364,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-
         if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
             # This branch skips the hot-token-map / EAGLE3 head wiring below.
             assert self.hot_token_id is None and not (
