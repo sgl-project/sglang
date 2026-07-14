@@ -370,7 +370,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
-        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        self.attn_dp_size = (
+            server_args.dp_size if server_args.enable_dp_attention else 1
+        )
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.attn_cp_rank = attn_cp_rank
@@ -1280,7 +1282,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
-                attention_data_parallel_size=self.dp_size,
+                attention_data_parallel_size=self.attn_dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
@@ -3012,7 +3014,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
-                self.gpu_id if self.dp_size is not None and self.dp_size > 1 else None
+                self.gpu_id
+                if self.attn_dp_size is not None and self.attn_dp_size > 1
+                else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
