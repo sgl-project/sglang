@@ -234,6 +234,9 @@ from sglang.jit_kernel.fused_a_gemm import (
 
 logger = logging.getLogger(__name__)
 
+# One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
+_moe_quant_once_logged = False
+
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
@@ -1493,70 +1496,86 @@ class DeepseekV2MoE(nn.Module):
     def _moe_quant_once_enabled(self) -> bool:
         """SGLANG_OPT_MOE_QUANT_ONCE: quantize the (dp-gathered) MoE input to
         per-token-group-128 fp8 once per layer and feed both the fused shared
-        expert's fp8 GEMM (cutlass w8a8 linear) and the routed experts' triton
-        fused runner, instead of quantizing the same [T, hidden] tensor twice
-        with different scale layouts."""
+        expert's fp8 GEMM (cutlass or deepgemm w8a8 linear) and the routed
+        experts' triton fused runner, instead of quantizing the same
+        [T, hidden] tensor twice with different scale layouts."""
         if self._moe_quant_once is None:
-            self._moe_quant_once = self._compute_moe_quant_once_enabled()
+            self._moe_quant_once, reason = self._compute_moe_quant_once_enabled()
+            global _moe_quant_once_logged
+            if envs.SGLANG_OPT_MOE_QUANT_ONCE.get() and not _moe_quant_once_logged:
+                _moe_quant_once_logged = True
+                logger.info(
+                    "SGLANG_OPT_MOE_QUANT_ONCE: %s (layer %s)",
+                    "ENGAGED" if self._moe_quant_once else f"INELIGIBLE: {reason}",
+                    self.layer_id,
+                )
         return self._moe_quant_once
 
-    def _compute_moe_quant_once_enabled(self) -> bool:
+    def _compute_moe_quant_once_enabled(self) -> Tuple[bool, str]:
+        """Returns (eligible, reason); reason names the first failing check."""
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
         from sglang.srt.layers.quantization.fp8_utils import (
             cutlass_w8a8_block_fp8_linear_with_fallback,
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
         if not envs.SGLANG_OPT_MOE_QUANT_ONCE.get():
-            return False
+            return False, "env off"
         if not _is_cuda:
-            return False
+            return False, "not CUDA"
         if self._enable_a2a_moe or self._fuse_shared_experts_inside_sbo:
-            return False
-        # Shared-expert side: fp8 block-128 weights served by the cutlass
-        # w8a8 linear backend (the only one taught to accept a pre-quantized
-        # (q, scale) tuple).
+            return False, "a2a MoE or SBO shared-expert fusion"
+        # Shared-expert side: fp8 block-128 weights served by a w8a8 linear
+        # backend taught to accept a pre-quantized (q, scale) tuple: cutlass
+        # or deepgemm (fp32 scales only, i.e. not UE8M0/Blackwell).
         if self.num_fused_shared_experts != 0 or not hasattr(self, "shared_experts"):
-            return False
+            return False, "no separate shared experts"
         if not self.shared_experts_is_fp8:
-            return False
+            return False, "shared experts not fp8"
         if self.shared_experts_weight_block_size != [128, 128]:
-            return False
+            return False, "shared weight block size != [128, 128]"
         gate_up = self.shared_experts.gate_up_proj
         if not isinstance(gate_up.quant_method, Fp8LinearMethod):
-            return False
-        if (
-            gate_up.quant_method.w8a8_block_fp8_linear
-            is not cutlass_w8a8_block_fp8_linear_with_fallback
-        ):
-            return False
-        if gate_up.weight.shape[0] % 128 != 0 or gate_up.weight.shape[1] % 128 != 0:
-            return False
+            return False, "shared gate_up quant method not Fp8LinearMethod"
+        linear_fn = gate_up.quant_method.w8a8_block_fp8_linear
+        if linear_fn is cutlass_w8a8_block_fp8_linear_with_fallback:
+            if gate_up.weight.shape[0] % 128 != 0 or gate_up.weight.shape[1] % 128 != 0:
+                return False, "gate_up weight shape unsupported by cutlass"
+        elif linear_fn is deepgemm_w8a8_block_fp8_linear_with_fallback:
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                return False, "DeepGEMM UE8M0 scales (Blackwell) unsupported"
+            if gate_up.weight.shape[0] % 64 != 0 or gate_up.weight.shape[1] % 128 != 0:
+                return False, "gate_up weight shape unsupported by deepgemm"
+        else:
+            return False, f"w8a8 linear backend {linear_fn.__name__} unsupported"
         # Routed side: standard dispatcher + triton fused func with dynamic
         # per-token-group-128 fp8 activation quant.
         experts = self.experts
         if not isinstance(experts, FusedMoE):
-            return False
+            return False, "experts not FusedMoE"
         quant_method = experts.quant_method
         if not isinstance(quant_method, Fp8MoEMethod):
-            return False
+            return False, "experts quant method not Fp8MoEMethod"
         if not quant_method.block_quant or quant_method.use_mxfp8:
-            return False
+            return False, "experts not block-quant fp8"
         if quant_method.quant_config.weight_block_size != [128, 128]:
-            return False
+            return False, "experts weight block size != [128, 128]"
         # Fp8MoEMethod only sets .runner for runner backends it drives itself.
         runner = getattr(quant_method, "runner", None)
         if runner is None or not runner.runner_backend.is_triton():
-            return False
+            return False, "MoE runner backend not triton"
         if runner.fused_func is None or runner.lora_enabled:
-            return False
+            return False, "triton fused func unavailable (or LoRA enabled)"
         if not isinstance(experts.dispatcher, StandardDispatcher):
-            return False
+            return False, "dispatcher not StandardDispatcher"
         if experts.moe_runner_config.apply_router_weight_on_input:
-            return False
+            return False, "apply_router_weight_on_input"
         if experts.w13_input_scale is not None:
-            return False
-        return True
+            return False, "static w13 input scale"
+        return True, "ok"
 
     def _maybe_quant_moe_input_once(
         self, hidden_states: torch.Tensor

@@ -809,7 +809,33 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    if input_scale is not None:
+        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
+        # the fp8 per-token-group-128 q with rows padded to a multiple of 4
+        # and ``input_scale`` the matching column-major fp32 scales
+        # (stride == (1, padded_rows)) -- identical to the MN-major
+        # TMA-aligned layout this path's own quant would produce below.
+        # Output keeps the padded row count; the caller slices back.
+        # UE8M0 packed scales (Blackwell DeepGEMM) use a different layout;
+        # the caller gates on it.
+        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        assert input.dtype == torch.float8_e4m3fn
+        assert weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0, (
+            "pre-quantized fp8 input requires DeepGEMM-supported weight shapes "
+            f"(got {tuple(weight.shape)})"
+        )
+        input_2d = input.view(-1, input.shape[-1])
+        output = w8a8_block_fp8_matmul_deepgemm(
+            input_2d,
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
