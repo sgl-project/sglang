@@ -97,7 +97,7 @@ If `--output-file` is specified, all configurations will be summarized in Markdo
   - The fused operator internally uses "oneshot"/"twoshot" two trigger methods; oneshot is enabled by default and twoshot is tested simultaneously.
 - FP8/FP4:
   - FP8 uses sglang's FP8 tools and dtype, with underlying platform selection of `e4m3`/`e4m3fnuz` etc.
-  - FP4 uses sgl-kernel's `scaled_fp4_quant`, requiring corresponding platform support.
+  - FP4 uses sglang's `fp4_quantize` (FlashInfer-backed), requiring corresponding platform support.
 - CUDA Graph:
   - Uses sglang's `graph_capture()` to prepare capture-ready state for communication, then uses `torch.cuda.graph` to capture kernels, reducing measurement jitter.
 

@@ -16,9 +16,9 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `Makefile`
 - `benchmark/deepseek_v3/README.md`
 - `docker/rocm.Dockerfile`
-- `docs/get_started/install.md`
-- `docs/platforms/amd_gpu.md`
-- `docs/platforms/ascend_npu.md`
+- `docs_new/docs/get-started/install.mdx`
+- `docs_new/docs/hardware-platforms/amd_gpu.mdx`
+- `docs_new/docs/hardware-platforms/ascend-npus/ascend_npu.mdx`
 - `python/pyproject.toml`
 - `python/pyproject_other.toml`
 - `python/pyproject_npu.toml`
@@ -69,7 +69,7 @@ python scripts/release/bump_kernel_version.py 0.4.0
    ```bash
    grep -r "0.5.4rc0" python/sglang/version.py
    grep -r "0.5.4rc0" python/pyproject.toml
-   grep -r "0.5.4rc0" docs/get_started/install.md
+   grep -r "0.5.4rc0" docs_new/docs/get-started/install.mdx
    ```
 
 4. **Reset changes (if testing):**
