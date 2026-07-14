@@ -24,15 +24,15 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
-from sglang.srt.layers.gemma4_fused_ops import (
+from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
+)
+from sglang.srt.distributed import (
+    get_pp_group,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
