@@ -125,9 +125,9 @@ class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
 
     supports_fp8 / support_cuda_graph / support_piecewise_cuda_graph keep the
     conservative SRTPlatform defaults (all False), so they are not repeated
-    here. Only is_pin_memory_available is overridden: the base defaults to
-    True, but CPU has no GPU to pin host memory to.
+    here. is_pin_memory_available is repeated for explicitness: CPU has no GPU
+    to pin host memory to.
     """
 
-    def is_pin_memory_available(self) -> bool:
+    def is_pin_memory_available(self, device=None) -> bool:
         return False

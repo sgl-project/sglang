@@ -4,12 +4,16 @@ Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+import inspect
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from transformers import PretrainedConfig
+from transformers.image_processing_utils import BaseImageProcessor
 
+from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -25,6 +29,33 @@ from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_comp
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# _patch_image_processor_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestImageProcessorKwargsPatch(unittest.TestCase):
+    def test_filters_unsupported_kwargs_and_caches_signature(self):
+        class StrictImageProcessor(BaseImageProcessor):
+            model_input_names = ["pixel_values"]
+
+            def preprocess(self, images, accepted=None):
+                return {"images": images, "accepted": accepted}
+
+        processor = StrictImageProcessor()
+        with patch.object(
+            hf_transformers_patches.inspect,
+            "signature",
+            wraps=inspect.signature,
+        ) as signature:
+            first = processor("first", accepted=True, device="cuda")
+            second = processor("second", accepted=False, device="cuda")
+
+        self.assertEqual(first, {"images": "first", "accepted": True})
+        self.assertEqual(second, {"images": "second", "accepted": False})
+        self.assertEqual(signature.call_count, 1)
 
 
 # ---------------------------------------------------------------------------

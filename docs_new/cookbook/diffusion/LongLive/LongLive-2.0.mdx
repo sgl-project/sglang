@@ -1,0 +1,109 @@
+---
+title: LongLive 2.0
+description: "Serve LongLive 2.0 distilled text-to-video and image-to-video models with SGLang-diffusion."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[LongLive 2.0](https://nvlabs.github.io/LongLive/LongLive2/) is a distilled few-step text-to-video and image-to-video model from NVIDIA, built on Wan2.2-TI2V-5B. SGLang serves the Diffusers-format conversion for single-prompt and multi-shot video generation.
+
+For more details, check the [LongLive 2.0 paper](https://arxiv.org/abs/2605.18739) and [LongLive 2.0 GitHub](https://github.com/NVlabs/LongLive). The model weights are released under the NVIDIA Open Model License.
+
+## 2. SGLang-diffusion Installation
+
+Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-diffusion/installation) for installation instructions.
+
+## 3. Deployment
+
+```bash Command
+sglang serve --model-path Rabinovich/LongLive-2.0-5B-Diffusers
+```
+
+If the GPU runs out of memory, move the text encoder, VAE, and DiT to CPU between stages:
+
+```bash Command
+sglang serve \
+  --model-path Rabinovich/LongLive-2.0-5B-Diffusers \
+  --dit-cpu-offload \
+  --text-encoder-cpu-offload \
+  --vae-cpu-offload
+```
+
+`Rabinovich/LongLive-2.0-5B-Diffusers` is the Diffusers-format conversion of the official `Efficient-Large-Model/LongLive-2.0-5B` weights.
+
+## 4. Generation
+
+### 4.1 Single prompt
+
+Generate one clip without starting a server:
+
+```bash Command
+sglang generate \
+  --model-path Rabinovich/LongLive-2.0-5B-Diffusers \
+  --prompt "A quiet street at dusk" \
+  --num-frames 61 \
+  --save-output \
+  --output-path outputs
+```
+
+61 frames is 16 latent frames, which is two causal blocks of 8.
+
+### 4.2 Multi-shot long video
+
+Multi-shot prompts are sampling parameters, so pass them through the Python API:
+
+```python Python
+from sglang import DiffGenerator
+
+gen = DiffGenerator.from_pretrained("Rabinovich/LongLive-2.0-5B-Diffusers")
+result = gen.generate(sampling_params_kwargs={
+    "shot_prompts": [
+        "A husky walks down a sunlit hallway.",
+        "The husky turns and looks at the camera.",
+        "Two dogs play together on a carpet.",
+    ],
+    "chunks_per_shot": 4,
+    "num_frames": 381,  # 3 shots x 4 chunks x 8 = 96 latent frames -> 381 frames
+    "scene_cut_prefix": "The scene transitions. ",
+    "multi_shot_sink": True,
+    "multi_shot_rope_offset": 8.0,
+    "save_output": True,
+    "output_path": "outputs",
+})
+```
+
+Each shot runs for `chunks_per_shot` causal blocks before the next prompt is used. The multi-shot defaults mirror the original LongLive prompt-block settings.
+
+### 4.3 Key parameters
+
+These are SGLang request parameters. Original LongLive configs use latent-frame `num_output_frames`; SGLang exposes output-video `num_frames`.
+
+- `num_frames`: 61 in the examples. This maps to 16 latent frames, while the original release config defaults to 128 latent frames.
+- `num_inference_steps`: 4, matching original `sampling_steps`.
+- `guidance_scale`: 1.0, matching the original inference config.
+- `height` / `width`: 704 / 1280 by default, matching original latent H/W 44 / 80 with 16x spatial compression.
+- `shot_prompts`, `chunks_per_shot`, `scene_cut_prefix`, `multi_shot_sink`, and `multi_shot_rope_offset`: SGLang request fields for the original prompt-block and multi-shot behavior.
+
+### 4.4 Image-to-video
+
+Pass a first frame with `--image-path` to condition the clip on an image:
+
+```bash Command
+sglang generate \
+  --model-path Rabinovich/LongLive-2.0-5B-Diffusers \
+  --prompt "A quiet street at dusk" \
+  --image-path first_frame.png \
+  --num-frames 61 \
+  --save-output \
+  --output-path outputs
+```
+
+The image is used as the first-frame condition.
+
+## 5. Notes
+
+- `num_frames` must map to a whole number of causal blocks. The latent frame count is `(num_frames - 1) / 4 + 1` and must be divisible by 8. For example, 61, 125, and 189 frames give 16, 32, and 48 latent frames.
+- SGLang supports T2V sizes 1280x704, 704x1280, 832x480, and 480x832.
+- I2V request images follow the Wan TI2V preprocessing path in SGLang. This is different from the original LongLive dataset resize path.
+- For multi-shot runs, set `num_frames` to match `len(shot_prompts) * chunks_per_shot * 8` latent frames, that is `num_frames = (len(shot_prompts) * chunks_per_shot * 8 - 1) * 4 + 1`.

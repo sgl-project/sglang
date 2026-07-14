@@ -8,6 +8,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -15,7 +16,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,

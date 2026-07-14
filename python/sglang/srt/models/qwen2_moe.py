@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.layernorm.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -48,7 +49,6 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -91,7 +91,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -209,14 +209,10 @@ class Qwen2MoeMLP(nn.Module):
     def forward(
         self,
         x,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -396,7 +392,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return topk_output
         shared_weights, shared_scale = shared
 
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 
@@ -545,8 +541,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        use_reduce_scatter: bool = False,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -591,8 +585,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.tp_size > 1
             and not should_skip_post_experts_all_reduce(
                 is_tp_path=True,
-                use_reduce_scatter=use_reduce_scatter,
-                should_allreduce_fusion=should_allreduce_fusion,
             )
             and not get_moe_a2a_backend().is_flashinfer()
         ):
@@ -810,11 +802,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch

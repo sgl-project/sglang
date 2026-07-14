@@ -42,6 +42,8 @@ class AttentionBackend(ABC):
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
 
+    supports_ragged_verify_graph: bool = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

@@ -240,7 +240,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
+                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_req
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (

@@ -155,9 +155,10 @@ def _uninstall_wait_stream_hook():
 
 def _weak_ref_if_tensor(x):
     """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    pass-through for non-tensors. Weak-ref'ing captured args lets the shared
-    mempool reclaim per-layer intermediates between segments — storage stays
-    alive for each segment CUDAGraph's lifetime via its pool use_count.
+    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
+    captured args lets the shared mempool reclaim per-layer intermediates
+    between segments — storage stays alive for each segment CUDAGraph's
+    lifetime via its pool use_count.
 
     weak_ref_tensors is imported lazily because it hard-raises on
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
@@ -166,19 +167,31 @@ def _weak_ref_if_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
         return weak_ref_tensors(x)
+    if isinstance(x, tuple):
+        return tuple(_weak_ref_if_tensor(e) for e in x)
+    if isinstance(x, list):
+        return [_weak_ref_if_tensor(e) for e in x]
     return x
 
 
 def _copy_output(dst: Any, src: Any) -> Any:
     """Copy src output into dst in-place where possible.
 
-    Handles plain tensors, dataclass/object with tensor attributes,
-    and dicts of tensors. Returns dst if in-place copy succeeded,
-    otherwise returns src.
+    Handles plain tensors, tuples/lists of tensors, dataclass/object with
+    tensor attributes, and dicts of tensors. Returns dst if in-place copy
+    succeeded, otherwise returns src.
     """
     if torch.is_tensor(dst) and torch.is_tensor(src):
         dst.copy_(src)
         return dst
+
+    if (
+        isinstance(dst, (tuple, list))
+        and isinstance(src, (tuple, list))
+        and len(dst) == len(src)
+    ):
+        copied = [_copy_output(d, s) for d, s in zip(dst, src)]
+        return tuple(copied) if isinstance(dst, tuple) else copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
@@ -220,13 +233,17 @@ def eager_on_graph(enable: bool):
             # writes real data into them.
             output = inner(*args, **kwargs)
 
-            # Weak-ref the closure state. Storage lives with the segment
-            # CUDAGraphs' mempool pin; Python refs don't need to prevent
-            # pool reuse across layers.
+            # Weak-ref captured inputs produced by graph segments. Their storage
+            # is pinned by the segment CUDAGraphs' mempool use-count, so Python
+            # refs do not need to keep every intermediate alive.
             captured_inner = inner
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            captured_output = _weak_ref_if_tensor(output)
+            # The eager break output is different: it is allocated between graph
+            # captures and is the static input address consumed by the next
+            # captured segment. Keep a strong reference so replay can safely
+            # copy fresh eager output into that bridge buffer.
+            captured_output = output
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)

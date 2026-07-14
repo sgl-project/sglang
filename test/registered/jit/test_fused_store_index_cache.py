@@ -42,7 +42,7 @@ except ImportError:
     _is_hip = False
 
 try:
-    from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
     _is_fp8_fnuz = is_fp8_fnuz()
 except ImportError:

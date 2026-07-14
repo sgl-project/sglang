@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 _FP8_INFO = torch.finfo(_FP8_DTYPE)

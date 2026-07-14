@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _IS_FNUZ = is_fp8_fnuz()
 _FP8_MAX = 240.0 if _IS_FNUZ else 448.0

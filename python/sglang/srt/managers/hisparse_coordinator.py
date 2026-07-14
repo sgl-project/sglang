@@ -18,10 +18,8 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.memory_pool_host import (
-    DeepSeekV4PagedHostPool,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()

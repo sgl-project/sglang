@@ -57,6 +57,80 @@ from sglang.utils import is_in_ci
 logger = init_logger(__name__)
 
 
+_NON_WEIGHT_DIFFUSERS_COMPONENT_HINTS = (
+    "tokenizer",
+    "scheduler",
+    "processor",
+    "feature_extractor",
+)
+_WEIGHT_FILE_PATTERNS = (
+    "*.safetensors",
+    "*.bin",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+)
+
+
+def _is_diffusers_component_entry(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(item is None or isinstance(item, str) for item in value)
+    )
+
+
+def _is_weight_bearing_diffusers_component(key: str, value: Any) -> bool:
+    if (
+        key.startswith("_")
+        or not _is_diffusers_component_entry(value)
+        or not any(item is not None for item in value)
+    ):
+        return False
+
+    key_lower = key.lower()
+    return not any(hint in key_lower for hint in _NON_WEIGHT_DIFFUSERS_COMPONENT_HINTS)
+
+
+def _get_declared_weight_component_dirs(model_path: str) -> list[str]:
+    model_index_path = os.path.join(model_path, "model_index.json")
+    if not os.path.exists(model_index_path):
+        return []
+
+    try:
+        with open(model_index_path) as f:
+            model_index = json.load(f)
+    except Exception as exc:
+        logger.warning(
+            "Failed to read model_index.json at %s: %s", model_index_path, exc
+        )
+        return []
+
+    return [
+        key
+        for key, value in model_index.items()
+        if _is_weight_bearing_diffusers_component(key, value)
+    ]
+
+
+def _has_local_weight_files(component_path: str) -> bool:
+    return any(
+        glob.glob(os.path.join(component_path, pattern))
+        for pattern in _WEIGHT_FILE_PATTERNS
+    )
+
+
+def _get_missing_declared_weight_components(model_path: str) -> list[str]:
+    missing_files = []
+    for component_dir in _get_declared_weight_component_dirs(model_path):
+        component_path = os.path.join(model_path, component_dir)
+        if not os.path.isdir(component_path):
+            missing_files.append(f"{component_dir}/")
+        elif not _has_local_weight_files(component_path):
+            missing_files.append(f"{component_dir}/<weights>")
+    return missing_files
+
+
 def _check_index_files_for_missing_shards(
     model_path: str,
 ) -> tuple[bool, list[str], list[str]]:
@@ -74,6 +148,15 @@ def _check_index_files_for_missing_shards(
     """
     missing_files = []
     checked_subdirs = []
+    checked_subdir_set = set()
+
+    def _record_checked_subdir(dir_path: str) -> None:
+        subdir = os.path.basename(dir_path)
+        if not subdir:
+            subdir = "."
+        if subdir not in checked_subdir_set:
+            checked_subdirs.append(subdir)
+            checked_subdir_set.add(subdir)
 
     # Add common subdirectories for diffusers models
     try:
@@ -85,6 +168,10 @@ def _check_index_files_for_missing_shards(
     # Check the root directory and all subdirectories that might contain model weights
     dirs_to_check = [model_path]
 
+    for component_dir in _get_declared_weight_component_dirs(model_path):
+        _record_checked_subdir(os.path.join(model_path, component_dir))
+    missing_files.extend(_get_missing_declared_weight_components(model_path))
+
     for subdir in subdirs:
         subdir_path = os.path.join(model_path, subdir)
         if os.path.isdir(subdir_path):
@@ -95,7 +182,7 @@ def _check_index_files_for_missing_shards(
         index_files = glob.glob(os.path.join(dir_path, "*.safetensors.index.json"))
 
         for index_file in index_files:
-            checked_subdirs.append(os.path.basename(dir_path))
+            _record_checked_subdir(dir_path)
             try:
                 with open(index_file) as f:
                     index_data = json.load(f)
@@ -227,12 +314,13 @@ def _verify_diffusers_model_complete(path: str) -> bool:
     component_keys = [
         key
         for key, value in model_index.items()
-        if isinstance(value, (list, tuple))
-        and len(value) == 2
-        and all(isinstance(item, str) for item in value)
+        if _is_diffusers_component_entry(value)
+        and any(item is not None for item in value)
     ]
     if component_keys:
-        return all(os.path.exists(os.path.join(path, key)) for key in component_keys)
+        return all(
+            os.path.exists(os.path.join(path, key)) for key in component_keys
+        ) and not _get_missing_declared_weight_components(path)
 
     return os.path.exists(os.path.join(path, "transformer")) and os.path.exists(
         os.path.join(path, "vae")

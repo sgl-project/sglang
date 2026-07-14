@@ -41,7 +41,12 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -74,12 +79,10 @@ class SDARMLP(nn.Module):
         )
         self.act_fn = SiluAndMul()
 
-    def forward(self, hidden_states: torch.Tensor, use_reduce_scatter: bool = False):
+    def forward(self, hidden_states: torch.Tensor):
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(
-            hidden_states, skip_all_reduce=use_reduce_scatter
-        )
+        hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
 
@@ -333,10 +336,11 @@ class SDARBlock(nn.Module):
             forward_batch,
         )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, use_reduce_scatter=use_reduce_scatter)
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.mlp(hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch

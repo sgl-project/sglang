@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
@@ -12,6 +13,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -50,6 +55,15 @@ def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
         seen[real_path] = path
         ordered.append(path)
     return ordered
+
+
+@dataclass
+class _HybridPoolContext:
+    host_pool: HostKVCache
+    is_zero_copy: bool
+    bounce_set: Optional[torch.Tensor] = None
+    bounce_get: Optional[torch.Tensor] = None
+    bounce_page_bytes: int = 0
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -142,6 +156,9 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set: Optional[torch.Tensor] = None
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
+        self._logical_anchor = False
+        self._hybrid_pool_ctx: dict[PoolName, _HybridPoolContext] = {}
+        self.registered_pools: dict[PoolName, HostKVCache] = {}
         cleanup_dirs = (
             self.file_manager.iter_all_base_dirs()
             if self.file_manager is not None
@@ -168,11 +185,55 @@ class HiCacheNixl(HiCacheStorage):
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
+    def _get_component_key(
+        self, key: str, component_name: Optional[PoolName] = None
+    ) -> str:
+        if component_name in (None, PoolName.KV):
+            return self._get_suffixed_key(key)
+        return f"{self._get_suffixed_key(key)}_{component_name}"
+
+    def _get_component_keys(
+        self, keys: List[str], pool_name: Optional[PoolName] = None
+    ) -> List[str]:
+        return [self._get_component_key(key, pool_name) for key in keys]
+
+    def _get_hybrid_component_keys(
+        self, keys: List[str], pool_name: PoolName, key_multiplier: int
+    ) -> List[str]:
+        if key_multiplier == 1:
+            return self._get_component_keys(keys, pool_name)
+
+        if pool_name == PoolName.MAMBA:
+            suffixes = [f"_{pool_name}_temporal"] + [
+                f"_{pool_name}_conv_{i}" for i in range(key_multiplier - 1)
+            ]
+        elif key_multiplier == 2:
+            suffixes = [f"_{pool_name}_k", f"_{pool_name}_v"]
+        else:
+            suffixes = [f"_{pool_name}_{i}" for i in range(key_multiplier)]
+
+        return [
+            f"{self._get_suffixed_key(key)}{suffix}"
+            for key in keys
+            for suffix in suffixes
+        ]
+
     def _create_query_tuple(self, key: str) -> tuple:
         """Build the NIXL query_memory tuple for a single key."""
         if self.backend_selector.mem_type == "FILE":
             return (0, 0, 0, self.file_manager.get_file_path(key))
         return (0, 0, 0, key)
+
+    def _query_keys_exist(self, keys: List[str]) -> List[bool]:
+        if not keys:
+            return []
+        tuples = [self._create_query_tuple(key) for key in keys]
+        query_res = self.agent.query_memory(
+            tuples,
+            self.backend_selector.backend_name,
+            mem_type=self.backend_selector.mem_type,
+        )
+        return [res is not None for res in query_res]
 
     def _xfer_and_wait(
         self,
@@ -273,12 +334,37 @@ class HiCacheNixl(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self._logical_anchor = False
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
         self.is_zero_copy = self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
         ]
+
+        kv = getattr(mem_pool_host, "kv_buffer", None)
+        if kv is None:
+            # DeepSeek V4 uses a LogicalHostPool as the KV anchor. It has no
+            # actual KV bytes; component pools carry the data through v2 APIs.
+            # Still write a small marker object per page so batch_exists_v2 can
+            # use the anchor key to gate sidecar lookups.
+            self.is_zero_copy = False
+            self._logical_anchor = True
+            marker_numel = 4096 if self.needs_page_alignment else 1
+            pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
+            self._bounce_page_bytes = marker_numel
+            self._bounce_set = self._alloc_registered(
+                marker_numel, torch.uint8, pin_memory, "logical_anchor_set"
+            )
+            self._bounce_get = self._alloc_registered(
+                marker_numel, torch.uint8, pin_memory, "logical_anchor_get"
+            )
+            self._bounce_set.fill_(1)
+            logger.info(
+                "HiCacheNixl: registered logical anchor pool with %d-byte markers",
+                self._bounce_page_bytes,
+            )
+            return
 
         if self.needs_page_alignment and self.is_zero_copy:
             # Check that the kv_buffer base AND per-page strides are multiples of
@@ -297,7 +383,6 @@ class HiCacheNixl(HiCacheStorage):
                 self.is_zero_copy = False
 
         if self.is_zero_copy:
-            kv = mem_pool_host.kv_buffer
             self._pre_register_host(
                 kv.data_ptr(), kv.numel() * kv.element_size(), "kv_buffer"
             )
@@ -321,6 +406,179 @@ class HiCacheNixl(HiCacheStorage):
             f"HiCacheNixl: pre-registered host regions for "
             f"layout={mem_pool_host.layout} zero_copy={self.is_zero_copy}"
         )
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.KV:
+            return
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
+        is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
+        if is_zero_copy:
+            for i, buf in enumerate(host_pool.get_hybrid_pool_buffer()):
+                self._pre_register_host(
+                    buf.data_ptr(),
+                    buf.numel() * buf.element_size(),
+                    f"{host_pool_name}_buffer_{i}",
+                )
+            self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
+                host_pool=host_pool, is_zero_copy=True
+            )
+        else:
+            sample = host_pool.get_dummy_flat_data_page()
+            page_numel = sample.numel()
+            page_bytes = page_numel * sample.element_size()
+            del sample
+
+            pin_memory = bool(getattr(host_pool, "pin_memory", False))
+            bounce_set = self._alloc_registered(
+                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_set"
+            )
+            bounce_get = self._alloc_registered(
+                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_get"
+            )
+            self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
+                host_pool=host_pool,
+                is_zero_copy=False,
+                bounce_set=bounce_set,
+                bounce_get=bounce_get,
+                bounce_page_bytes=page_bytes,
+            )
+
+        logger.info(
+            "HiCacheNixl: registered hybrid host pool %s zero_copy=%s",
+            host_pool_name,
+            is_zero_copy,
+        )
+
+    def _hybrid_pool_supports_zero_copy(
+        self, host_pool: HostKVCache, host_pool_name: PoolName
+    ) -> bool:
+        if not (
+            hasattr(host_pool, "get_page_buffer_meta")
+            and hasattr(host_pool, "get_hybrid_pool_buffer")
+        ):
+            return False
+        buffers = host_pool.get_hybrid_pool_buffer()
+        if not buffers:
+            return False
+        if self.needs_page_alignment and not host_pool.is_stride_page_aligned(4096):
+            logger.warning(
+                "HiCacheNixl: O_DIRECT is active but hybrid pool %s is not "
+                "OS-page-aligned. Falling back to bounce buffers.",
+                host_pool_name,
+            )
+            return False
+        return True
+
+    def _get_bounce_slot_buffers(
+        self, buf: torch.Tensor, page_bytes: int, page_num: int
+    ) -> List[tuple]:
+        base = buf.data_ptr()
+        return [(base + i * page_bytes, page_bytes) for i in range(page_num)]
+
+    def _get_hybrid_key_multiplier(
+        self, pool_name: PoolName, host_pool: HostKVCache
+    ) -> int:
+        if pool_name == PoolName.MAMBA:
+            return 1 + len(getattr(host_pool, "conv_buffer", []) or [])
+        if hasattr(host_pool, "v_buffer"):
+            return 2
+        return 1
+
+    def _get_hybrid_zero_copy_buffers(
+        self, transfer: PoolTransfer, ctx: _HybridPoolContext
+    ) -> tuple[List[str], List[tuple], int]:
+        """Build NIXL keys and memory descriptors for zero-copy hybrid transfers.
+
+        The host pool returns one or more physical buffers per logical cache page
+        depending on the pool type, for example K/V buffers for SWA or temporal
+        plus convolution buffers for Mamba. This helper expands each logical page
+        key into component-level storage keys, validates that the expanded keys
+        match the host-pool metadata, and returns `(key_strs, host_buffers,
+        key_multiplier)`.
+        """
+        ptr_list, size_list = ctx.host_pool.get_page_buffer_meta(transfer.host_indices)
+        page_num = len(transfer.keys or [])
+        if page_num == 0 or len(ptr_list) % page_num != 0:
+            logger.error(
+                "HiCacheNixl: hybrid pool %s metadata mismatch: pages=%s ptrs=%s",
+                transfer.name,
+                page_num,
+                len(ptr_list),
+            )
+            return [], [], 0
+        key_multiplier = len(ptr_list) // page_num
+        key_strs = self._get_hybrid_component_keys(
+            transfer.keys or [], transfer.name, key_multiplier
+        )
+        if len(key_strs) != len(ptr_list):
+            logger.error(
+                "HiCacheNixl: hybrid pool %s key/meta mismatch: keys=%s ptrs=%s",
+                transfer.name,
+                len(key_strs),
+                len(ptr_list),
+            )
+            return [], [], 0
+        return key_strs, list(zip(ptr_list, size_list)), key_multiplier
+
+    def _prepare_pool_transfer(
+        self, transfer: PoolTransfer, for_write: bool
+    ) -> tuple[Optional[HostKVCache], List[str], List[tuple], List[int], int]:
+        ctx = self._hybrid_pool_ctx.get(transfer.name)
+        if ctx is None:
+            logger.error("Host pool %s is not registered in HiCacheNixl", transfer.name)
+            return None, [], [], [], 0
+
+        host_pool = ctx.host_pool
+        keys = transfer.keys or []
+        host_indices = transfer.host_indices
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        expected = len(keys) * page_size
+        if host_indices is None or host_indices.numel() != expected:
+            logger.error(
+                "Pool %s indices length mismatch: expected %s, got %s",
+                transfer.name,
+                expected,
+                host_indices.numel() if host_indices is not None else 0,
+            )
+            return host_pool, [], [], [], 0
+
+        if ctx.is_zero_copy:
+            key_strs, host_buffers, key_multiplier = self._get_hybrid_zero_copy_buffers(
+                transfer, ctx
+            )
+            page_offsets = [
+                host_indices[i * page_size].item() for i in range(len(keys))
+            ]
+            return host_pool, key_strs, host_buffers, page_offsets, key_multiplier
+
+        if len(keys) > STORAGE_BATCH_SIZE:
+            logger.error(
+                "HiCacheNixl: hybrid pool %s batch size %s exceeds bounce buffer capacity %s",
+                transfer.name,
+                len(keys),
+                STORAGE_BATCH_SIZE,
+            )
+            return host_pool, [], [], [], 0
+
+        page_offsets = [host_indices[i * page_size].item() for i in range(len(keys))]
+        bounce = ctx.bounce_set if for_write else ctx.bounce_get
+        if bounce is None:
+            logger.error(
+                "Hybrid pool %s bounce buffer is not registered", transfer.name
+            )
+            return host_pool, [], [], [], 0
+
+        if for_write:
+            for i, page_offset in enumerate(page_offsets):
+                src = host_pool.get_data_page(page_offset, flat=True)
+                bounce[i].copy_(src)
+
+        host_buffers = self._get_bounce_slot_buffers(
+            bounce, ctx.bounce_page_bytes, len(page_offsets)
+        )
+        key_strs = self._get_component_keys(keys, transfer.name)
+        return host_pool, key_strs, host_buffers, page_offsets, 1
 
     def _alloc_registered(
         self,
@@ -366,6 +624,7 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set = None
         self._bounce_get = None
         self._bounce_page_bytes = None
+        self._hybrid_pool_ctx.clear()
 
     def __del__(self):
         try:
@@ -391,18 +650,12 @@ class HiCacheNixl(HiCacheStorage):
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
 
-        tuples = [self._create_query_tuple(key) for key in key_list]
+        exists_results = self._query_keys_exist(key_list)
 
-        query_res = self.agent.query_memory(
-            tuples,
-            self.backend_selector.backend_name,
-            mem_type=self.backend_selector.mem_type,
-        )
-
-        for i in range(len(query_res)):
-            if query_res[i] is None:
+        for i, exists in enumerate(exists_results):
+            if not exists:
                 return i // key_denominator
-        return len(query_res) // key_denominator
+        return len(exists_results) // key_denominator
 
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
         # Each key maps to a `_k` entry, plus a `_v` entry on non-MLA models
@@ -477,11 +730,14 @@ class HiCacheNixl(HiCacheStorage):
 
         bounce = self._bounce_set if op == "set" else self._bounce_get
         if op == "set":
-            for i in range(page_num):
-                src = self.mem_pool_host.get_data_page(
-                    host_indices[i * page_size], flat=True
-                )
-                bounce[i].copy_(src)
+            if self._logical_anchor:
+                bounce[:page_num].fill_(1)
+            else:
+                for i in range(page_num):
+                    src = self.mem_pool_host.get_data_page(
+                        host_indices[i * page_size], flat=True
+                    )
+                    bounce[i].copy_(src)
 
         host_buffers = self._bounce_slot_buffers(bounce, page_num)
         key_list = [self._get_suffixed_key(key) for key in keys]
@@ -530,6 +786,9 @@ class HiCacheNixl(HiCacheStorage):
             if self.is_mla_model:
                 return results
             return [(results[2 * i] and results[2 * i + 1]) for i in range(page_num)]
+
+        if self._logical_anchor:
+            return results
 
         # non zero copy: copy data from the get-side bounce buffer to mem_pool_host
         for i in range(page_num):
@@ -619,4 +878,136 @@ class HiCacheNixl(HiCacheStorage):
             elapsed_ms,
         )
 
+        return results
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = self.batch_exists(keys, extra_info)
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            if transfer.name not in self.registered_pools:
+                final_pages = 0
+                break
+
+            ctx = self._hybrid_pool_ctx.get(transfer.name)
+            if ctx is None:
+                final_pages = 0
+                break
+            key_multiplier = (
+                self._get_hybrid_key_multiplier(transfer.name, ctx.host_pool)
+                if ctx.is_zero_copy
+                else 1
+            )
+            component_keys = self._get_hybrid_component_keys(
+                keys[:kv_pages], transfer.name, key_multiplier
+            )
+            exists_results = self._query_keys_exist(component_keys)
+            page_exists = self._page_results(exists_results, key_multiplier)
+
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    @staticmethod
+    def _page_results(results: List[bool], key_multiplier: int) -> List[bool]:
+        if key_multiplier <= 1:
+            return results
+        return [
+            all(results[i : i + key_multiplier])
+            for i in range(0, len(results), key_multiplier)
+        ]
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
+                self._prepare_pool_transfer(transfer, for_write=False)
+            )
+            if host_pool is None or not key_strs:
+                results[transfer.name] = [False] * len(transfer.keys or [])
+                continue
+
+            start_time = time.perf_counter()
+            transfer_results = self._batch_xfer(
+                key_strs, key_strs, host_buffers, "READ"
+            )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            self._log_xfer_stats(
+                f"batch_get_v2[{transfer.name}]",
+                len(transfer.keys or []),
+                transfer.host_indices,
+                [size for _, size in host_buffers],
+                elapsed_ms,
+            )
+            ctx = self._hybrid_pool_ctx[transfer.name]
+            page_results = self._page_results(transfer_results, key_multiplier)
+            if not ctx.is_zero_copy:
+                for ok, page_offset, data_page in zip(
+                    page_results, page_offsets, ctx.bounce_get
+                ):
+                    if not ok:
+                        break
+                    host_pool.set_from_flat_data_page(page_offset, data_page)
+            results[transfer.name] = page_results
+        return results
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
+                transfer, for_write=True
+            )
+            if not key_strs:
+                results[transfer.name] = [False] * len(transfer.keys or [])
+                continue
+
+            start_time = time.perf_counter()
+            transfer_results = self._batch_xfer(
+                key_strs, key_strs, host_buffers, "WRITE"
+            )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            self._log_xfer_stats(
+                f"batch_set_v2[{transfer.name}]",
+                len(transfer.keys or []),
+                transfer.host_indices,
+                [size for _, size in host_buffers],
+                elapsed_ms,
+            )
+            results[transfer.name] = self._page_results(
+                transfer_results, key_multiplier
+            )
         return results

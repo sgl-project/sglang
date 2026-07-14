@@ -3,11 +3,11 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8LinearMethod,
 )
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
 from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     input_to_float8,

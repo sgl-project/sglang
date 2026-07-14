@@ -204,6 +204,8 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Whether to return output-token sampling support and renormalized logprobs.
+    return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
@@ -436,6 +438,8 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.return_sampling_mask is None:
+            self.return_sampling_mask = False
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -600,6 +604,9 @@ class GenerateReqInput:
         self.top_logprobs_num = normalize_param(
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
+        self.return_sampling_mask = normalize_param(
+            self.return_sampling_mask, False, "return_sampling_mask"
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -715,6 +722,7 @@ class GenerateReqInput:
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
+            return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -798,6 +806,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
+    # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
+    return_sampling_mask: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1230,6 +1240,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
+    # Per-request chunks of output-token sampling supports. None when no request
+    # in the batch asks for return_sampling_mask.
+    output_token_sampling_mask: Optional[List[List]]
+    # Per-request chunks of selected-token logprobs renormalized over the
+    # corresponding sampling supports. None when sampling masks are not returned.
+    output_token_sampling_logprobs: Optional[List[List]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1274,8 +1290,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
+    spec_num_block_accept_tokens: Optional[List[int]] = None
+    spec_num_cap_tokens: Optional[List[int]] = None
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+    spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
@@ -1306,6 +1325,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
+    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
+    # None when sampling masks are not returned.
+    output_token_sampling_mask: Optional[List[List]]
+    output_token_sampling_logprobs: Optional[List[List]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1349,8 +1372,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
+    spec_num_block_accept_tokens: Optional[List[int]] = None
+    spec_num_cap_tokens: Optional[List[int]] = None
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+    spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

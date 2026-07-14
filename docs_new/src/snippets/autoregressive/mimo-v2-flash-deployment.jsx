@@ -101,11 +101,11 @@ export const MiMoV2FlashDeployment = () => {
     }
 
     const commandPrefix = isMI355X
-      ? 'PYTHONPATH=/sgl-workspace/aiter SGLANG_USE_AITER=0 USE_ROCM_AITER_ROPE_BACKEND=0'
-      : 'SGLANG_ENABLE_SPEC_V2=1';
+      ? 'PYTHONPATH=/sgl-workspace/aiter SGLANG_USE_AITER=0 USE_ROCM_AITER_ROPE_BACKEND=0 '
+      : '';
     const tpSize = isMI355X ? 4 : 8;
 
-    let cmd = `${commandPrefix} sglang serve \\\n`;
+    let cmd = `${commandPrefix}sglang serve \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp-size ${tpSize}`;

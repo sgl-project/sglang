@@ -59,7 +59,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
 
     def test_from_args_treats_missing_speculative_draft_tokens_as_zero(self) -> None:
-        """per_forward_write_entry_capacity is floored by max_prefill_tokens when batch * tokens_per_bs is smaller."""
+        """per_forward_write_entry_capacity is floored by max_prefill_tokens when batch * tokens_per_req is smaller."""
         server_args = self._make_server_args(max_bs=2)
         server_args.speculative_num_draft_tokens = None
 

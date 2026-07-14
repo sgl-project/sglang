@@ -52,12 +52,12 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 
 <Deployment config={config} benchmarks={benchmarks} />
 
-<Note>
-  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 1-1-2 = 2); high-throughput has no spec.
-</Note>
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.2.
+</Warning>
 
 <Note>
-  **NVFP4 (B300 / GB300)** deploys on the dev image **`lmsysorg/sglang:dev-glm52-nvfp4`** — the command panel's **Docker** toggle selects it automatically. The FP8 / BF16 recipes use the release **`lmsysorg/sglang:latest`** (the `docker pull` in Install above).
+  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 2-1-3 = 2); high-throughput has no spec.
 </Note>
 
 ## Playground
@@ -107,7 +107,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 - **DeepSeek Sparse Attention (DSA).** GLM-5.2 uses the `glm_moe_dsa` architecture; SGLang auto-selects the DSA attention backends (`flashmla_sparse` prefill, `fa3` decode, `sgl-kernel` indexer topk). No attention-backend flag is needed on the supported hardware. SGLang also auto-selects the KV-cache dtype for DSA models — `fp8_e4m3` on Blackwell (B200/GB300/B300, which then routes DSA through the TensorRT-LLM backend) and `bf16` on Hopper (H200) — so no `--kv-cache-dtype` flag is required.
 - **MTP / speculative decoding.** The checkpoint ships one nextn layer. Enable EAGLE MTP for lower latency (`--speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6` for low-latency; `1-1-2` for balanced). The config's `index_share_for_mtp_iteration` reuses the DSA indexer's topk across draft steps (effective only at `--speculative-eagle-topk 1`). **Tune the draft length to the accept length.** GLM-5.2's MTP head is strong — accept length runs high (4+ in many workloads, near-saturating at 5–6 in low-latency runs). Watch the server's reported **accept length** and adjust `--speculative-num-steps` / `--speculative-num-draft-tokens` accordingly: while accept length stays close to the draft-token count there is headroom to push them higher (more accepted tokens per step); if it falls well below, lower them — every rejected draft token is wasted verification compute.
-- **Context Parallelism (CP) for long prefill.** DSA prefill CP splits the long-prefill attention across `--attn-cp-size` ranks. On **Hopper (H200)** this gives a large prefill-latency win at long context — e.g. round-robin CP (`--tp 8 --attn-cp-size 8 --enable-dsa-prefill-context-parallel --dsa-prefill-cp-mode round-robin-split`) cut 64K-token prefill TTFT roughly **2.5–2.8×** vs. plain TP8 in our testing. Trade-offs: CP partitions the KV pool (lower max context at the same `--mem-fraction-static`) and adds some decode-side overhead, so it pays off only for long sequences. **CP is currently verified on Hopper only** — the Blackwell (sm100) DSA-CP FP8 rope kernel is not yet adapted, so leave CP off on B200/B300/GB300.
+- **Context Parallelism (CP) for long prefill.** DSA prefill CP splits the long-prefill attention across `--attn-cp-size` ranks. This gives a large prefill-latency win at long context — e.g. interleaved CP (`--tp 8 --attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave`) cut 64K-token prefill TTFT roughly **2.5–2.8×** vs. plain TP8 in our testing. Trade-offs: CP partitions the KV pool (lower max context at the same `--mem-fraction-static`) and adds some decode-side overhead, so it pays off only for long sequences.
 - **Memory.** The FP8 weights are large (MoE total, not active params). Start around `--mem-fraction-static 0.8` on H200 (TP8) and tune up; raise it for the 4-GPU GB300 single-node layout (TP4).
 - **DP-Attention + DeepEP** for the balanced/high-throughput strategies spreads attention across data-parallel ranks and routes MoE through DeepEP.
 - **BF16 weights need more GPUs.** The full-precision build (`zai-org/GLM-5.2`, ~1.5 TB) does not fit a single 8×H200 / 8×B200 / 4×GB300 node. It fits single-node on **8×B300** (TP8, ~2.1 TB HBM) — **verified**; on the smaller GPUs it needs a **multi-node** layout (e.g. 2×8×H200 or 2×8×B200 at TP16, 2×4×GB300 at TP8), and those **multi-node BF16 recipes are still proposed/inferred** (`verified: false`). FP8 is the recommended deployment. Use the same DSA / MTP / chunked-prefill guidance as FP8. On B300, BF16 low-latency matches FP8 (the sm103 FP8 path is not yet optimized), but FP8 wins at the balanced/high-throughput points.

@@ -25,8 +25,6 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
-    dcp_enabled,
-    get_attention_dcp_world_size,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
@@ -647,7 +645,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
-            return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
+            return_lse=(
+                forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
+            ),
         )
         if isinstance(o, tuple):
             out, lse = o
@@ -662,7 +662,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size
-            * get_attention_dcp_world_size()
+            * get_parallel().attn_dcp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -733,7 +733,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-            if dcp_enabled():
+            if get_parallel().dcp_enabled:
                 plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,

@@ -172,7 +172,7 @@ SGLANG_USE_AITER=0 sglang serve --model-path google/gemma-4-E4B-it \
 
 For `gemma-4-31B-it` and `gemma-4-26B-A4B-it`, the same commands above work on MI300X, MI325X, and MI355X without additional command-line changes.
 
-> **Status**: AMD benchmarks are available in [Section 5.1](#51-speed-benchmark).
+> **Status**: AMD benchmarks are available in [Section 5.1](#5-1-speed-benchmark).
 
 ## 4. Model Invocation
 
@@ -187,7 +187,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it \
 
 #### Speculative Decoding (MTP) Server Commands
 
-Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#31-basic-configuration).
+Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#3-1-basic-configuration).
 
 ```bash Command
 # Gemma 4 E2B + MTP

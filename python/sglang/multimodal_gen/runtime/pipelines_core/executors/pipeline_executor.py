@@ -57,6 +57,10 @@ class PipelineExecutor(ABC):
         batch: Any,
         server_args: ServerArgs,
     ) -> None:
+        if isinstance(batch, list):
+            if not batch:
+                return
+            batch = batch[0]
         self.component_residency_manager.begin_request(stages, batch, server_args)
 
     def before_stage(

@@ -20,7 +20,8 @@ jobs:
         include:
           - gpu_arch: gfx950
             rocm_tag: rocm700-mi35x
-            sglang_image_tag: v0.5.10-rocm700-mi35x
+            sglang_image_repo: rocm/sgl-dev
+            sglang_image_tag: v0.5.14-rocm700-mi35x-20260627
           - gpu_arch: gfx942
             rocm_tag: rocm700-mi30x
             sglang_image_tag: v0.5.10-rocm700-mi30x
@@ -54,6 +55,7 @@ jobs:
           docker build . \
             -f docker/Dockerfile.rocm \
             --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+            --build-arg SGLANG_IMAGE_REPO=${{ matrix.sglang_image_repo || 'lmsysorg/sglang' }} \
             --build-arg SGLANG_IMAGE_TAG=${{ matrix.sglang_image_tag }} \
             --build-arg MILES_COMMIT=${{ steps.miles.outputs.sha }} \
             -t rocm/sgl-dev:${dated} \

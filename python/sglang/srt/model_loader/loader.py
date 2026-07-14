@@ -241,7 +241,7 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
+        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -268,6 +268,8 @@ def _get_quantization_config(
                 quant_config = HybridFp8NvFp4Config(
                     fp8_config=quant_config, nvfp4_config=nvfp4_config
                 )
+        elif quant_config.get_name() == "humming":
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
 
@@ -817,10 +819,7 @@ class DefaultModelLoader(BaseModelLoader):
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
-            with temp_set_env(
-                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-            ):
+            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
@@ -1255,7 +1254,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 per_token_group_quant_fp8,
             )
 

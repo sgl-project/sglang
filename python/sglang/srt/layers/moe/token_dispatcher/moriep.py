@@ -39,7 +39,7 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 # Blockwise quantization group sizes: number of elements sharing one scale factor
 FP8_BLOCK_SIZE = 128

@@ -16,8 +16,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
-from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,
@@ -1074,32 +1074,36 @@ def general_mm_embed_routine(
                 if forward_batch.mm_inputs[i] is not None
             ]
             server_args = get_server_args()
-            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
-                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-                input_embeds, other_info = _embed_mm_inputs_with_split(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
-            else:
-                input_embeds, other_info = embed_mm_inputs(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
+            # Makes VLM profiles directly attributable: this range includes
+            # encoder/ViT execution and multimodal feature placement, while
+            # the language model range below excludes both.
+            with torch.profiler.record_function("sglang.vlm.mm_embedding"):
+                if server_args and server_args.enable_adaptive_dispatch_to_encoder:
+                    # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                    input_embeds, other_info = _embed_mm_inputs_with_split(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
+                else:
+                    input_embeds, other_info = embed_mm_inputs(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
 
             # add for qwen3_vl deepstack
             if use_deepstack:
@@ -1143,12 +1147,13 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    hidden_states = language_model(
-        input_ids=None,
-        forward_batch=forward_batch,
-        input_embeds=input_embeds,
-        **kwargs,
-    )
+    with torch.profiler.record_function("sglang.vlm.language_model_prefill"):
+        hidden_states = language_model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
     return hidden_states
 
 

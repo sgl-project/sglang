@@ -61,6 +61,7 @@ class CanaryManager:
         self._swa_allocator: Optional[SWATokenToKVPoolAllocator] = swa_allocator
         self._outer_step_counter: int = 0
         self._active_single_forward_manager_index: Optional[int] = None
+        self._model_forward_bracket_depth: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -181,6 +182,22 @@ class CanaryManager:
                 f"{self._active_single_forward_manager_index}; nested or mismatched bracket"
             )
             self._active_single_forward_manager_index = None
+
+    @contextlib.contextmanager
+    def model_forward_bracket_scope(self) -> Iterator[bool]:
+        """Return whether this is the outermost patched ``model.forward`` call.
+
+        Some model implementations enter another patched forward from inside the
+        top-level forward (for example, a vision-language model calling its inner
+        language model). Kv-canary owns one pre/post bracket per active
+        SingleForwardManager; nested brackets would run a second pre-op while the
+        phase checker is already in the first bracket.
+        """
+        self._model_forward_bracket_depth += 1
+        try:
+            yield self._model_forward_bracket_depth == 1
+        finally:
+            self._model_forward_bracket_depth -= 1
 
     def pre_ops_maybe_inside_graph(
         self, forward_batch: ForwardBatch

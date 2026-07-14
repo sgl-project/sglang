@@ -6,13 +6,15 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for Qwen3.6-35B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.6-35B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_35b_a3b).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 254K+1K | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 254k+1k | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k) |
 
 ### High Throughput
 
@@ -20,12 +22,12 @@ This page focuses on optimal configuration and benchmark results for Qwen3.6-35B
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 2 | PD Mixed | 984K+1K | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 2 | PD Mixed | 984k+1k | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k) |
 
 ## Optimal Configuration
 
@@ -80,7 +82,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -117,7 +118,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -178,7 +179,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=10
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -215,7 +215,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -241,7 +241,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 50ms
 
@@ -278,7 +278,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=20
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -315,7 +314,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -340,7 +339,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -375,7 +374,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -415,7 +413,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -443,7 +441,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 254K+1K
+**Dataset**: 254k+1k
 
 **TPOT**: 16.1ms
 
@@ -478,7 +476,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -513,7 +510,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -538,7 +535,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -574,7 +571,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -611,7 +607,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -636,7 +632,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 50ms
 
@@ -671,7 +667,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -709,7 +704,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -734,7 +729,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 64K+1K (90% prefix cache hit rate)
+**Dataset**: 64k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -771,7 +766,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -810,7 +804,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -838,7 +832,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 984K+1K
+**Dataset**: 984k+1k
 
 **TPOT**: 40.91ms
 
@@ -874,7 +868,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -910,7 +903,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

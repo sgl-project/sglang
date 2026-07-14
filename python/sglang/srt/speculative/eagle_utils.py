@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+    verify_tree_greedy_kernel_triton,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     alloc_paged_token_slots_extend_npu,
 )
@@ -21,10 +25,6 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.triton_ops.spec_tree import (
-    sgl_build_tree_kernel_efficient_triton,
-    verify_tree_greedy_kernel_triton,
-)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -504,15 +504,15 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_extend_cache_locs_func,
+    )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations

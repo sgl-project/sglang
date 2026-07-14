@@ -50,7 +50,7 @@ try:
         from deep_ep import Buffer, Config
 
     if not _is_npu:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 

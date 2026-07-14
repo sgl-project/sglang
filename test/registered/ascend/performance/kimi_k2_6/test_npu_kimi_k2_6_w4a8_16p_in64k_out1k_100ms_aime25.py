@@ -27,7 +27,6 @@ ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
     "HCCL_BUFFSIZE": "4400",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
@@ -118,6 +117,7 @@ class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(TestNpuPerfMultiNodePdMixTestCa
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 100
     output_token_throughput = 160
 

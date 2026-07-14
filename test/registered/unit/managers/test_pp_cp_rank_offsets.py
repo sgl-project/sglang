@@ -18,26 +18,18 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 def _make_ps(**overrides) -> ParallelState:
     defaults = dict(
-        tp_rank=0,
         tp_size=8,
         pp_rank=1,
         pp_size=2,
         dp_rank=None,
-        dp_size=1,
-        attn_tp_rank=0,
         attn_tp_size=2,
-        attn_cp_rank=0,
         attn_cp_size=2,
         attn_dp_rank=1,
         attn_dp_size=2,
-        moe_ep_rank=0,
-        moe_ep_size=1,
         moe_dp_rank=None,
-        moe_dp_size=1,
-        gpu_id=0,
     )
     defaults.update(overrides)
-    return ParallelState(**defaults)
+    return ParallelState.trivial(**defaults)
 
 
 def _fake_group() -> SimpleNamespace:

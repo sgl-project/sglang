@@ -198,7 +198,7 @@ sglang serve \
 
 This BF16 setting applies only to the compressed attention state pools and reduces the GPU memory footprint of each compressed-state slot. It does not change model weight precision or the main KV cache dtype. With automatic pool sizing and no explicit capacity cap, the same memory budget holds more slots, and the startup log shows larger `c4_state` and `c128_state` pool sizes. Keep the default `float32` setting for the most conservative behavior.
 
-**EPLB + DeepEP Waterfill (Experimental)**
+**EPLB + Waterfill (Experimental)**
 
 For recorded/static EPLB reproduction, first record an expert-distribution file by following
 [Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api.mdx#capture-expert-selection-distribution-in-moe-models).
@@ -211,7 +211,7 @@ For non-PD reproduction, use:
 --moe-a2a-backend deepep \
 --deepep-mode auto \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 ```
 
 For PD-Disagg reproduction, use `normal` mode on the prefill server and
@@ -223,21 +223,21 @@ flag to both commands:
 --moe-a2a-backend deepep \
 --deepep-mode normal \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 
 # decode
 --moe-a2a-backend deepep \
 --deepep-mode low_latency \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 ```
 
 You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
 EPLB placement.
 
-MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
-the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
-requires `--moe-a2a-backend deepep`.
+Waterfill also supports MegaMOE. Use `--moe-a2a-backend megamoe
+--enable-waterfill` to keep the MegaMOE backend while applying Waterfill to the
+fused shared expert slot.
 
 **FP4 Indexer (Experimental)**
 

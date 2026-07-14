@@ -26,7 +26,6 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "TASK_QUEUE_ENABLE": "1",
     "ASCEND_USE_FIA": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_NPU_FUSED_MOE_MODE": "2",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "140000",
@@ -108,6 +107,7 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
+    seed = 1
     repeat_rate = 0.9
     tpot = 50
     output_token_throughput = 390.5859

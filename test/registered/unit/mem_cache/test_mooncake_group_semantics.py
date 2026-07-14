@@ -42,14 +42,14 @@ def _fake_mooncake_modules(fake_store_cls, replicate_config_cls):
     }
 
 
-def _fake_memory_pool_host_module():
-    memory_pool_host = types.ModuleType("sglang.srt.mem_cache.memory_pool_host")
+def _fake_pool_host_mla_module():
+    pool_host_mla = types.ModuleType("sglang.srt.mem_cache.pool_host.mla")
 
     class MLATokenToKVPoolHost:
         pass
 
-    memory_pool_host.MLATokenToKVPoolHost = MLATokenToKVPoolHost
-    return memory_pool_host
+    pool_host_mla.MLATokenToKVPoolHost = MLATokenToKVPoolHost
+    return pool_host_mla
 
 
 def _fake_pool_host_module():
@@ -68,8 +68,8 @@ def _fake_pool_host_module():
 
 def _fake_host_pool_modules():
     return {
-        "sglang.srt.mem_cache.memory_pool_host": _fake_memory_pool_host_module(),
         "sglang.srt.mem_cache.pool_host": _fake_pool_host_module(),
+        "sglang.srt.mem_cache.pool_host.mla": _fake_pool_host_mla_module(),
     }
 
 
