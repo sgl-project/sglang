@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -24,6 +25,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -267,6 +269,179 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
     return is_sm90_supported() or is_blackwell_supported()
 
 
+# --- BaseFusedOp (RFC #29630 / #30044) multi-backend GEMM contract ---------
+#
+# ``--fp8-gemm-backend`` is still surfaced to users as the ``Fp8GemmRunnerBackend``
+# enum below (unchanged); these two ops just replace the hand-rolled if/elif
+# dispatch chains with the shared ``sglang.kernels.fused_op.BaseFusedOp``
+# contract, so backend eligibility (hardware + library availability) lives in
+# one ``backend_eligible`` override per op instead of being duplicated across
+# ``_dispatch_explicit_backend``/``_dispatch_auto_backend``-style functions.
+# The actual kernel-calling functions (``deepgemm_w8a8_block_fp8_linear_with_fallback``,
+# ``cutlass_w8a8_block_fp8_linear_with_fallback``, ...) are unchanged and are
+# simply referenced from ``forward_<backend>`` methods below.
+
+_FP8_RUNNER_TO_KERNEL_BACKEND: dict = {
+    Fp8GemmRunnerBackend.DEEP_GEMM: KernelBackend.DEEPGEMM,
+    Fp8GemmRunnerBackend.FLASHINFER_TRTLLM: KernelBackend.FLASHINFER_TRTLLM,
+    Fp8GemmRunnerBackend.FLASHINFER_CUTLASS: KernelBackend.FLASHINFER_CUTLASS,
+    Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM: KernelBackend.FLASHINFER_DEEPGEMM,
+    Fp8GemmRunnerBackend.CUTLASS: KernelBackend.CUDA_AOT,
+    Fp8GemmRunnerBackend.AITER: KernelBackend.AITER,
+    Fp8GemmRunnerBackend.TRITON: KernelBackend.TRITON,
+}
+
+
+class Fp8BlockwiseGemmOp(BaseFusedOp):
+    """Blockwise (``weight_block_size``) FP8 GEMM, one backend per ``--fp8-gemm-backend`` value."""
+
+    op = "gemm.fp8_blockwise"
+    # Mirrors the auto-selection order previously hardcoded in
+    # `_dispatch_auto_backend`: DeepGEMM > FlashInfer TRTLLM/CUTLASS > CUTLASS > AITER > Triton.
+    priority = (
+        KernelBackend.DEEPGEMM,
+        KernelBackend.FLASHINFER_TRTLLM,
+        KernelBackend.CUDA_AOT,
+        KernelBackend.AITER,
+        KernelBackend.TRITON,
+    )
+    descriptions = {
+        KernelBackend.DEEPGEMM: "DeepGEMM JIT-compiled blockwise FP8 GEMM.",
+        KernelBackend.FLASHINFER_TRTLLM: "FlashInfer TRTLLM blockwise FP8 GEMM (SM100/SM103).",
+        KernelBackend.FLASHINFER_CUTLASS: "FlashInfer CUTLASS blockwise FP8 GEMM (SM120).",
+        KernelBackend.FLASHINFER_DEEPGEMM: "FlashInfer DeepGEMM swapAB blockwise FP8 GEMM (SM90).",
+        KernelBackend.CUDA_AOT: "CUTLASS blockwise FP8 GEMM (sgl_kernel wheel).",
+        KernelBackend.AITER: "AITER (CK / aiter-triton) blockwise FP8 GEMM (ROCm).",
+        KernelBackend.TRITON: "Triton blockwise FP8 GEMM (fallback, widely compatible).",
+    }
+
+    def backend_eligible(self, backend: KernelBackend, *args, **kwargs) -> bool:
+        if backend == KernelBackend.DEEPGEMM:
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        if backend == KernelBackend.FLASHINFER_TRTLLM:
+            return is_sm100_supported() and is_flashinfer_available()
+        if backend == KernelBackend.FLASHINFER_CUTLASS:
+            return is_blackwell_supported() and is_flashinfer_available()
+        if backend == KernelBackend.FLASHINFER_DEEPGEMM:
+            return is_sm90_supported() and is_flashinfer_available()
+        if backend == KernelBackend.CUDA_AOT:
+            return _check_cutlass_block_fp8_hardware_support()
+        if backend == KernelBackend.AITER:
+            return _use_aiter
+        return True
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        block_size: List[int],
+        weight_scale: torch.Tensor,
+        input_scale: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Pure-torch reference: dequantize the weight, then a plain fp32 matmul."""
+        assert input_scale is None
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+        input_2d = input.view(-1, input.shape[-1]).to(torch.float32)
+        weight_dequant = block_quant_dequant(
+            weight, weight_scale.to(torch.float32), block_size, torch.float32
+        )
+        output = input_2d @ weight_dequant.t()
+        if bias is not None:
+            output = output + bias
+        return output.to(dtype=input.dtype).view(*output_shape)
+
+    def forward_deepgemm(self, *args, **kwargs) -> torch.Tensor:
+        return deepgemm_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
+
+    def forward_flashinfer_trtllm(self, *args, **kwargs) -> torch.Tensor:
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
+
+    def forward_flashinfer_cutlass(self, *args, **kwargs) -> torch.Tensor:
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
+
+    def forward_flashinfer_deepgemm(self, *args, **kwargs) -> torch.Tensor:
+        return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
+
+    def forward_cuda_aot(self, *args, **kwargs) -> torch.Tensor:
+        return cutlass_w8a8_block_fp8_linear_with_fallback(*args, **kwargs)
+
+    def forward_aiter(self, *args, **kwargs) -> torch.Tensor:
+        return aiter_w8a8_block_fp8_linear(*args, **kwargs)
+
+    def forward_triton(self, *args, **kwargs) -> torch.Tensor:
+        return triton_w8a8_block_fp8_linear(*args, **kwargs)
+
+
+class Fp8Mxfp8GemmOp(BaseFusedOp):
+    """MXFP8 dense-linear GEMM, one backend per ``--fp8-gemm-backend`` value."""
+
+    op = "gemm.fp8_mxfp8_dense"
+    priority = (
+        KernelBackend.DEEPGEMM,
+        KernelBackend.FLASHINFER_CUTLASS,
+        KernelBackend.AITER,
+        KernelBackend.TRITON,
+    )
+    descriptions = {
+        KernelBackend.DEEPGEMM: "DeepGEMM MXFP8 dense linear (Hopper).",
+        KernelBackend.FLASHINFER_CUTLASS: "FlashInfer CUTLASS MXFP8 dense linear (Blackwell).",
+        KernelBackend.FLASHINFER_TRTLLM: "FlashInfer TRTLLM MXFP8 dense linear (Blackwell).",
+        KernelBackend.AITER: "AMD gfx95 dot_scaled MXFP8 dense linear.",
+        KernelBackend.TRITON: "Triton MXFP8 dense linear (fallback, widely compatible).",
+    }
+
+    def backend_eligible(self, backend: KernelBackend, *args, **kwargs) -> bool:
+        if backend == KernelBackend.DEEPGEMM:
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        if backend in (
+            KernelBackend.FLASHINFER_CUTLASS,
+            KernelBackend.FLASHINFER_TRTLLM,
+        ):
+            return is_blackwell_supported() and is_flashinfer_available()
+        if backend == KernelBackend.AITER:
+            return _is_hip and _is_gfx95_supported
+        return True
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        # No pure-torch MXFP8 reference is implemented; Triton is the widest
+        # portable backend (works across CUDA and ROCm) so it stands in here.
+        return triton_mxfp8_blockscaled_linear(
+            input, weight, weight_scale, input_scale, bias, output_dtype
+        )
+
+    def forward_deepgemm(self, *args, **kwargs) -> torch.Tensor:
+        return _deepgemm_w8a8_mxfp8_linear_with_fallback(*args, **kwargs)
+
+    def forward_flashinfer_cutlass(self, *args, **kwargs) -> torch.Tensor:
+        return flashinfer_mxfp8_blockscaled_linear(*args, **kwargs)
+
+    def forward_flashinfer_trtllm(self, *args, **kwargs) -> torch.Tensor:
+        return flashinfer_mxfp8_blockscaled_linear(*args, **kwargs)
+
+    def forward_aiter(self, *args, **kwargs) -> torch.Tensor:
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            dot_scaled_mxfp8_blockscaled_linear,
+        )
+
+        return dot_scaled_mxfp8_blockscaled_linear(*args, **kwargs)
+
+    def forward_triton(self, *args, **kwargs) -> torch.Tensor:
+        return triton_mxfp8_blockscaled_linear(*args, **kwargs)
+
+
+_FP8_BLOCKWISE_GEMM = Fp8BlockwiseGemmOp()
+_FP8_MXFP8_GEMM = Fp8Mxfp8GemmOp()
+
+
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
@@ -425,30 +600,56 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     This function selects the backend based on:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
+
+    Backend selection/eligibility is delegated to `Fp8BlockwiseGemmOp`
+    (a `sglang.kernels.fused_op.BaseFusedOp`); this just resolves the backend
+    once (matching the previous one-shot dispatch) and binds it into a plain
+    callable so callers keep caching a single function per layer.
     """
-    backend = get_fp8_gemm_runner_backend()
+    runner_backend = get_fp8_gemm_runner_backend()
 
-    if backend.is_auto():
-        return _dispatch_auto_backend()
+    if runner_backend.is_auto():
+        kernel_backend = _FP8_BLOCKWISE_GEMM.resolve_backend()
+        return partial(_FP8_BLOCKWISE_GEMM.forward, backend=kernel_backend)
 
-    return _dispatch_explicit_backend(backend)
+    if runner_backend is Fp8GemmRunnerBackend.FLASHINFER:
+        raise RuntimeError(
+            "--fp8-gemm-backend=flashinfer is only valid for per-tensor/per-channel "
+            "FP8 checkpoints, not block-quantized ones. Use flashinfer_trtllm, "
+            "flashinfer_cutlass, flashinfer_deepgemm, or auto instead."
+        )
+
+    kernel_backend = _FP8_RUNNER_TO_KERNEL_BACKEND.get(runner_backend)
+    if kernel_backend is None:
+        raise ValueError(f"Unknown FP8 GEMM backend: {runner_backend}")
+    if not _FP8_BLOCKWISE_GEMM.backend_eligible(kernel_backend):
+        raise RuntimeError(
+            f"--fp8-gemm-backend={runner_backend.value} was requested, but this "
+            "hardware/software environment does not support it."
+        )
+
+    return partial(_FP8_BLOCKWISE_GEMM.forward, backend=kernel_backend)
+
+
+# Explicit `--fp8-gemm-backend` values handled by `Fp8Mxfp8GemmOp`; anything
+# else (including `auto`) falls through to the AMD-gfx95/Triton default below,
+# matching the pre-BaseFusedOp dispatch.
+_FP8_MXFP8_EXPLICIT_BACKEND: dict = {
+    Fp8GemmRunnerBackend.DEEP_GEMM: KernelBackend.DEEPGEMM,
+    Fp8GemmRunnerBackend.FLASHINFER_CUTLASS: KernelBackend.FLASHINFER_CUTLASS,
+    Fp8GemmRunnerBackend.FLASHINFER_TRTLLM: KernelBackend.FLASHINFER_TRTLLM,
+    Fp8GemmRunnerBackend.TRITON: KernelBackend.TRITON,
+}
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
-    backend = get_fp8_gemm_runner_backend()
-    if backend.is_deep_gemm():
-        return _deepgemm_w8a8_mxfp8_linear_with_fallback
-    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
-        return flashinfer_mxfp8_blockscaled_linear
-    elif backend.is_triton():
-        return triton_mxfp8_blockscaled_linear
-    elif _is_hip and _is_gfx95_supported:
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-            dot_scaled_mxfp8_blockscaled_linear,
-        )
-
-        return dot_scaled_mxfp8_blockscaled_linear
-    return triton_mxfp8_blockscaled_linear
+    runner_backend = get_fp8_gemm_runner_backend()
+    kernel_backend = _FP8_MXFP8_EXPLICIT_BACKEND.get(runner_backend)
+    if kernel_backend is not None:
+        return partial(_FP8_MXFP8_GEMM.forward, backend=kernel_backend)
+    if _is_hip and _is_gfx95_supported:
+        return partial(_FP8_MXFP8_GEMM.forward, backend=KernelBackend.AITER)
+    return partial(_FP8_MXFP8_GEMM.forward, backend=KernelBackend.TRITON)
 
 
 def _deepgemm_w8a8_mxfp8_linear_with_fallback(
@@ -495,97 +696,6 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
-
-
-def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
-    """Dispatch based on explicitly selected backend."""
-    if backend.is_flashinfer():
-        raise RuntimeError(
-            "--fp8-gemm-backend=flashinfer is only valid for per-tensor/per-channel "
-            "FP8 checkpoints. For block-quantized (blockwise) FP8 checkpoints, use "
-            "flashinfer_trtllm, flashinfer_cutlass, flashinfer_deepgemm, or auto instead."
-        )
-
-    elif backend.is_flashinfer_trtllm():
-        if not (is_sm100_supported() and is_flashinfer_available()):
-            raise RuntimeError(
-                "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
-                "but FlashInfer is not available or not supported on this hardware. "
-                "FlashInfer TRTLLM FP8 GEMM requires SM100/SM103 GPUs and FlashInfer."
-            )
-        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-
-    elif backend.is_flashinfer_cutlass():
-        if not (is_blackwell_supported() and is_flashinfer_available()):
-            raise RuntimeError(
-                "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
-                "but FlashInfer is not available or not supported on this hardware. "
-                "FlashInfer CUTLASS FP8 GEMM requires Blackwell GPUs and FlashInfer."
-            )
-        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-
-    elif backend.is_flashinfer_deepgemm():
-        if not (is_sm90_supported() and is_flashinfer_available()):
-            raise RuntimeError(
-                "FlashInfer DeepGEMM with swapAB requested via --fp8-gemm-backend=flashinfer_deepgemm, "
-                "but it's not available. This backend requires Hopper (SM90) GPUs and FlashInfer "
-                "to be installed."
-            )
-        return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
-
-    elif backend.is_cutlass():
-        if not _check_cutlass_block_fp8_hardware_support():
-            raise RuntimeError(
-                "CUTLASS block FP8 requested via --fp8-gemm-backend=cutlass, "
-                "but hardware does not support it. CUTLASS block FP8 requires "
-                "Hopper (SM90+) GPUs with CUDA 12.0+."
-            )
-        return cutlass_w8a8_block_fp8_linear_with_fallback
-
-    elif backend.is_aiter():
-        if not _use_aiter:
-            raise RuntimeError(
-                "AITER backend requested via --fp8-gemm-backend=aiter, "
-                "but AITER is not available. AITER requires AMD GPUs with "
-                "SGLANG_USE_AITER=1 environment variable set."
-            )
-        return aiter_w8a8_block_fp8_linear
-
-    elif backend.is_deep_gemm():
-        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            raise RuntimeError(
-                "DeepGEMM backend requested via --fp8-gemm-backend=deep_gemm, "
-                "but DeepGEMM is not available. This usually means the deep_gemm package "
-                "is not installed or has been disabled via SGLANG_ENABLE_JIT_DEEPGEMM=0."
-            )
-        return deepgemm_w8a8_block_fp8_linear_with_fallback
-
-    elif backend.is_triton():
-        return triton_w8a8_block_fp8_linear
-
-    else:
-        raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
-
-
-def _dispatch_auto_backend() -> Callable:
-    """Auto-select the best backend based on hardware capabilities."""
-    # Priority order for auto selection:
-    # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
-    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
-    # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
-
-    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
-        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-    elif _check_cutlass_block_fp8_hardware_support():
-        return cutlass_w8a8_block_fp8_linear_with_fallback
-    elif _use_aiter:
-        return aiter_w8a8_block_fp8_linear
-    else:
-        return triton_w8a8_block_fp8_linear
 
 
 def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
@@ -1704,6 +1814,73 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
+class Fp8PerTensorGemmOp(BaseFusedOp):
+    """Terminal per-tensor/per-channel FP8 GEMM call (the ``cutlass_fp8_supported``
+    branch of `apply_fp8_linear`): CUTLASS (sgl_kernel `fp8_scaled_mm`) vs Triton.
+
+    The FlashInfer per-tensor branch (`apply_fp8_linear_flashinfer`, gated by
+    `use_flashinfer_fp8()`) is intentionally not a backend of this op: it
+    quantizes `input` itself and is taken as an early return in
+    `apply_fp8_linear` *before* `qinput`/`x_scale` exist, so it doesn't share
+    this op's calling convention. `--fp8-gemm-backend=flashinfer` still fully
+    selects it, just outside this particular `BaseFusedOp`.
+    """
+
+    op = "gemm.fp8_pertensor"
+    priority = (KernelBackend.CUDA_AOT, KernelBackend.TRITON)
+    descriptions = {
+        KernelBackend.CUDA_AOT: "CUTLASS per-tensor/per-channel FP8 GEMM (sgl_kernel fp8_scaled_mm).",
+        KernelBackend.TRITON: "Triton per-tensor/per-channel FP8 GEMM.",
+    }
+
+    def forward_native(
+        self,
+        qinput: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Pure-torch reference: dequantize both operands, then matmul."""
+        x_scale_col = x_scale.reshape(-1, 1).to(torch.float32)
+        w_scale_row = weight_scale.reshape(1, -1).to(torch.float32)
+        output = (qinput.to(torch.float32) * x_scale_col) @ (
+            weight.to(torch.float32) * w_scale_row
+        )
+        if bias is not None:
+            output = output + bias
+        return output.to(out_dtype)
+
+    def forward_cuda_aot(
+        self,
+        qinput: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return fp8_scaled_mm(
+            qinput, weight, x_scale, weight_scale, out_dtype=out_dtype, bias=bias
+        )
+
+    def forward_triton(
+        self,
+        qinput: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        qinput = qinput.view(-1, qinput.shape[-1])
+        return triton_scaled_mm(qinput, weight, x_scale, weight_scale, out_dtype, bias)
+
+
+_FP8_PERTENSOR_GEMM = Fp8PerTensorGemmOp()
+
+
 def use_flashinfer_fp8() -> bool:
     return (
         is_blackwell_supported()
@@ -1836,21 +2013,20 @@ def apply_fp8_linear(
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if not cutlass_compatible_b or gemm_backend.is_triton():
-            # Massage the input to be 2D
-            qinput = qinput.view(-1, qinput.shape[-1])
-            output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, input.dtype, bias
-            )
-        else:
-            output = fp8_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                out_dtype=input.dtype,
-                bias=bias,
-            )
+        pertensor_backend = (
+            KernelBackend.TRITON
+            if (not cutlass_compatible_b or gemm_backend.is_triton())
+            else KernelBackend.CUDA_AOT
+        )
+        output = _FP8_PERTENSOR_GEMM.forward(
+            qinput,
+            weight,
+            x_scale,
+            weight_scale,
+            input.dtype,
+            bias=bias,
+            backend=pertensor_backend,
+        )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only

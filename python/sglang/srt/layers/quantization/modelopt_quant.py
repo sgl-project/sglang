@@ -31,6 +31,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    dispatch_fp4_gemm,
+    enable_flashinfer_fp4_gemm,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
@@ -99,12 +101,8 @@ def _make_per_tensor_scale_parameter(
 
 
 try:
-    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
-
-    enable_flashinfer_fp4_gemm = True
 except ImportError:
-    enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
@@ -137,15 +135,8 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    if not enable_flashinfer_fp4_gemm:
-        raise RuntimeError(
-            "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."
-        )
-    fp4_backend = get_fp4_gemm_runner_backend()
-    # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-    backend = fp4_backend.get_flashinfer_backend()
-    return flashinfer_fp4_gemm(
-        input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+    return dispatch_fp4_gemm(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
     )
 
 

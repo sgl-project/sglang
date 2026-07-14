@@ -31,10 +31,19 @@ class KernelBackend(str, Enum):
     TORCH_COMPILE = "torch_compile"  # torch.compile(forward_native)
     TRITON = "triton"
     CUDA_JIT = "cuda_jit"  # sglang.jit_kernel
-    CUDA_AOT = "cuda_aot"  # sgl_kernel wheel
+    CUDA_AOT = "cuda_aot"  # sgl_kernel wheel (also covers vendored CUTLASS kernels)
     CUTE_DSL = "cute_dsl"
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer"  # FlashInfer auto-tuned wrapper (e.g. bmm_fp8/mm_fp4)
     DEEPGEMM = "deepgemm"
+    AITER = "aiter"  # ROCm AITER (CK / aiter-triton)
+    MARLIN = "marlin"  # Marlin weight-only fallback kernels
+    # Named FlashInfer GEMM sub-kernels that are independently selectable
+    # (unlike the generic FLASHINFER wrapper, which auto-tunes internally).
+    FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
+    FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     # TODO(RFC #29630): backends for other hardware (hip_c / npu / cpu-avx, ...)
 
 
