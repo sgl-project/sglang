@@ -77,7 +77,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             dsa_seed_topk=None,
         )
         runner.capture_bs = [1, CAPTURE_BS]
-        runner.num_tokens_per_bs = 1
+        runner.num_tokens_per_req = 1
         runner.speculative_num_steps = NUM_STEPS
         runner.seq_len_fill_value = SEQ_LEN_FILL_VALUE
         runner.require_mlp_tp_gather = False
