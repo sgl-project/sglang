@@ -3,7 +3,10 @@ from collections.abc import Callable
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    _validate_page_aligned_free,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
@@ -492,6 +495,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def free(self, free_index: torch.Tensor):
+        _validate_page_aligned_free(free_index, page_size=self.page_size)
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
@@ -826,6 +830,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def free(self, free_index: torch.Tensor):
+        _validate_page_aligned_free(free_index, page_size=self.page_size)
         if free_index.numel() == 0:
             return
 

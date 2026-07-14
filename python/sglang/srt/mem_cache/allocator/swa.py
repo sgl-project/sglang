@@ -1,6 +1,9 @@
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    _validate_page_aligned_free,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -385,6 +388,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
+        if not _is_npu:
+            _validate_page_aligned_free(free_index, page_size=self.page_size)
         if free_index.numel() == 0:
             return
 
@@ -414,6 +419,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
+        if not _is_npu:
+            _validate_page_aligned_free(free_index, page_size=self.page_size)
         if free_index.numel() == 0:
             return
 
@@ -428,7 +435,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
-        pages = torch.unique(indices // self.page_size)
+        if _is_npu:
+            pages = torch.unique(indices // self.page_size)
+        else:
+            pages = indices[:: self.page_size].to(dtype=torch.int64) // self.page_size
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )
@@ -558,18 +568,28 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
+        sanitized_free_index = free_index[free_index > 0]
+        _validate_page_aligned_free(
+            sanitized_free_index,
+            page_size=self.page_size,
+        )
+        if sanitized_free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
-            self.swa_attn_allocator.free(free_index[free_index > 0])
+            self.swa_attn_allocator.free(sanitized_free_index)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(sanitized_free_index)
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
+        sanitized_free_index = free_index[free_index > 0]
+        _validate_page_aligned_free(
+            sanitized_free_index,
+            page_size=self.page_size,
+        )
+        if sanitized_free_index.numel() == 0:
             return
-        self.swa_attn_allocator.free(free_index[free_index > 0])
+        self.swa_attn_allocator.free(sanitized_free_index)
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
