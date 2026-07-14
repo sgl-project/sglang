@@ -63,6 +63,12 @@ class BatchMetricsWindow:
     reject_reasons: Counter[str] = field(default_factory=Counter)
 
 
+# Marks Req fields whose leading dim is the prompt batch. Multi-output
+# generation broadcasts them to the sample batch; see
+# expand_conditioning_to_sample_batch.
+PER_PROMPT_CONDITIONING = {"per_prompt_conditioning": True}
+
+
 @dataclass(init=False)
 class Req:
     """
@@ -81,7 +87,9 @@ class Req:
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image encoder hidden states
-    image_embeds: list[torch.Tensor] = field(default_factory=list)
+    image_embeds: list[torch.Tensor] = field(
+        default_factory=list, metadata=PER_PROMPT_CONDITIONING
+    )
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
@@ -92,20 +100,44 @@ class Req:
 
     output_file_ext: str | None = None
     # Primary encoder embeddings
-    prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
-    negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor | None] | None = None
-    negative_attention_mask: list[torch.Tensor | None] | None = None
+    prompt_embeds: list[torch.Tensor] | torch.Tensor = field(
+        default_factory=list, metadata=PER_PROMPT_CONDITIONING
+    )
+    negative_prompt_embeds: list[torch.Tensor] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    prompt_attention_mask: list[torch.Tensor | None] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    negative_attention_mask: list[torch.Tensor | None] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
     # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
-    prompt_embeds_mask: list[torch.Tensor | None] | None = None
-    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
-    prompt_seq_lens: list[list[int]] | None = None
-    negative_prompt_seq_lens: list[list[int]] | None = None
-    clip_embedding_pos: list[torch.Tensor] | None = None
-    clip_embedding_neg: list[torch.Tensor] | None = None
+    prompt_embeds_mask: list[torch.Tensor | None] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    prompt_seq_lens: list[list[int]] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    negative_prompt_seq_lens: list[list[int]] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    clip_embedding_pos: list[torch.Tensor] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
+    clip_embedding_neg: list[torch.Tensor] | None = field(
+        default=None, metadata=PER_PROMPT_CONDITIONING
+    )
 
-    pooled_embeds: list[torch.Tensor] = field(default_factory=list)
-    neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
+    pooled_embeds: list[torch.Tensor] = field(
+        default_factory=list, metadata=PER_PROMPT_CONDITIONING
+    )
+    neg_pooled_embeds: list[torch.Tensor] = field(
+        default_factory=list, metadata=PER_PROMPT_CONDITIONING
+    )
 
     # Additional text-related parameters
     max_sequence_length: int | None = None
@@ -432,6 +464,131 @@ class Req:
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
         logger.info(debug_str)
+
+
+# Universal conditioning fields, derived from the PER_PROMPT_CONDITIONING
+# marks on the Req field declarations. Fields specific to a model family are
+# declared on its PipelineConfig via `extra_per_sample_conditioning_fields`.
+_PER_PROMPT_CONDITIONING_FIELDS = tuple(
+    f.name for f in fields(Req) if f.metadata.get("per_prompt_conditioning")
+)
+
+
+def _expand_conditioning_tensor(
+    tensor: torch.Tensor,
+    prompt_batch_size: int,
+    sample_batch_size: int,
+    name: str,
+) -> torch.Tensor:
+    current = tensor.shape[0]
+    if current == sample_batch_size:
+        return tensor
+    if current != prompt_batch_size:
+        raise ValueError(
+            f"{name} has batch dim {current} (shape {tuple(tensor.shape)}); "
+            f"expected {prompt_batch_size} (per-prompt) or "
+            f"{sample_batch_size} (per-sample)."
+        )
+    repeats = sample_batch_size // prompt_batch_size
+    return tensor.repeat_interleave(repeats, dim=0)
+
+
+def _expand_conditioning_seq_lens(
+    seq_lens: list[int],
+    prompt_batch_size: int,
+    sample_batch_size: int,
+    name: str,
+) -> list[int]:
+    if len(seq_lens) == sample_batch_size:
+        return seq_lens
+    if len(seq_lens) != prompt_batch_size:
+        raise ValueError(
+            f"{name} has {len(seq_lens)} entries; expected {prompt_batch_size} "
+            f"(per-prompt) or {sample_batch_size} (per-sample)."
+        )
+    repeats = sample_batch_size // prompt_batch_size
+    return [entry for entry in seq_lens for _ in range(repeats)]
+
+
+def _expand_conditioning_item(
+    item,
+    prompt_batch_size: int,
+    sample_batch_size: int,
+    name: str,
+):
+    """Expand one per-encoder entry: a tensor, a per-prompt seq-lens list, or None."""
+    if item is None:
+        return None
+    if isinstance(item, torch.Tensor):
+        return _expand_conditioning_tensor(
+            item, prompt_batch_size, sample_batch_size, name
+        )
+    if isinstance(item, list):
+        return _expand_conditioning_seq_lens(
+            item, prompt_batch_size, sample_batch_size, name
+        )
+    raise ValueError(f"{name} has unsupported conditioning type {type(item).__name__}.")
+
+
+def expand_conditioning_to_sample_batch(
+    batch: Req,
+    extra_fields: tuple[str, ...] = (),
+) -> None:
+    """Broadcast per-prompt conditioning to the per-sample batch dim.
+
+    Text/image encoders produce conditioning with one row per prompt, while
+    latents (and everything else the denoising loop consumes) carry one row
+    per sample (``batch_size = n_prompts * num_outputs_per_prompt``). This
+    aligns the two once, in a model-agnostic place: row ``p`` of each
+    conditioning tensor is repeated to rows ``[p*n, (p+1)*n)``, matching the
+    per-sample seed and latent layout produced by input validation and latent
+    preparation.
+
+    ``extra_fields`` names model-specific conditioning fields to broadcast in
+    addition to the universal ones (see
+    ``PipelineConfig.extra_per_sample_conditioning_fields``).
+
+    No-op unless ``num_outputs_per_prompt > 1``. Idempotent: fields already at
+    the sample batch dim are left untouched.
+    """
+    num_outputs = batch.num_outputs_per_prompt
+    if num_outputs is None or num_outputs <= 1:
+        return
+
+    if batch.prompt is None:
+        raise ValueError(
+            "num_outputs_per_prompt > 1 is not supported for prompt-embeds-only "
+            "requests; pass a prompt or expand the embeds batch yourself."
+        )
+    prompt_batch_size = len(batch.prompt) if isinstance(batch.prompt, list) else 1
+    sample_batch_size = prompt_batch_size * num_outputs
+
+    for field_name in _PER_PROMPT_CONDITIONING_FIELDS + tuple(extra_fields):
+        value = getattr(batch, field_name)
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            setattr(
+                batch,
+                field_name,
+                _expand_conditioning_tensor(
+                    value, prompt_batch_size, sample_batch_size, field_name
+                ),
+            )
+            continue
+        setattr(
+            batch,
+            field_name,
+            [
+                _expand_conditioning_item(
+                    item,
+                    prompt_batch_size,
+                    sample_batch_size,
+                    f"{field_name}[{index}]",
+                )
+                for index, item in enumerate(value)
+            ],
+        )
 
 
 @dataclass
