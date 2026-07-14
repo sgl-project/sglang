@@ -165,6 +165,64 @@ def _dequantize_k_cache_fast_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
+@triton.jit
+def _dequantize_k_cache_paged_hip_raw_kernel(
+    output_ptr,
+    quant_ptr,
+    page_table_ptr,
+    output_stride_0: int,
+    quant_stride_0: int,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    src_token = tl.load(page_table_ptr + token_id).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < DIM
+    # quant_ptr is an FP8-typed view; the HIP DSA MLA latent is stored as a plain
+    # bf16->fp8 cast with NO per-tile scales (see memory_pool.set_mla_kv_buffer
+    # HIP branch / mla_buffer.set_mla_kv_buffer_fp8_quant_kernel), so dequant is a
+    # paged gather + fp8->bf16 upcast (scale == 1.0).
+    src = tl.load(
+        quant_ptr + src_token * quant_stride_0 + offs, mask=mask, other=0.0
+    ).to(tl.float32)
+    tl.store(
+        output_ptr + token_id * output_stride_0 + offs,
+        src.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _dequantize_k_cache_paged_hip_raw(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+) -> torch.Tensor:
+    """HIP DSA fp8 MLA latent (no per-tile scales): paged gather + fp8->bf16 cast.
+
+    quant_k_cache: [.., 1, dim_quant] FP8 (dim_quant == kv_lora_rank + qk_rope_head_dim,
+                   e.g. 512 + 64 = 576), laid out as [nope | rope] with scale == 1.0.
+    Returns: [num_tokens, 1, dim_quant] bf16, where [:, :, :512]=nope, [:, :, 512:]=rope.
+    """
+    dim_quant = quant_k_cache.shape[-1]
+    quant_2d = quant_k_cache.reshape(-1, dim_quant)
+    num_tokens = page_table_1_flattened.shape[0]
+    output = torch.empty(
+        (num_tokens, 1, dim_quant), dtype=torch.bfloat16, device=quant_k_cache.device
+    )
+    page_table_1_flattened = page_table_1_flattened.to(torch.int32)
+    BLOCK = triton.next_power_of_2(dim_quant)
+    _dequantize_k_cache_paged_hip_raw_kernel[(num_tokens,)](
+        output,
+        quant_2d,
+        page_table_1_flattened,
+        output.stride(0),
+        quant_2d.stride(0),
+        DIM=dim_quant,
+        BLOCK=BLOCK,
+    )
+    return output
+
+
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -179,6 +237,11 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
+    # HIP stores the DSA fp8 MLA latent raw (nope+rope cast to fp8, no per-tile
+    # scales) so dim_quant == kv_lora_rank + qk_rope_head_dim (512 + 64 = 576),
+    # unlike the CUDA 656B layout (512 fp8 + 16 scale + 128 bf16 rope).
+    if dim_quant == 576:
+        return _dequantize_k_cache_paged_hip_raw(quant_k_cache, page_table_1_flattened)
     assert (
         dim_quant == 656
     ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
