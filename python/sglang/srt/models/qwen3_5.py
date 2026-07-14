@@ -286,7 +286,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
+            dtype=torch.get_default_dtype(),
             **(
                 {"activation": self.output_gate_type}
                 if self.output_gate_type is not None
