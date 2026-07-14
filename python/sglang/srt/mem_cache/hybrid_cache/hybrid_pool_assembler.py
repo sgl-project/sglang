@@ -18,9 +18,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DSAIndexerPoolHost,
     HostPoolGroup,
     LogicalHostPool,
-    MambaPoolHost,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
