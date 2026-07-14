@@ -753,6 +753,7 @@ def _allocate_page_aligned_decode(
         crossing_req_pool_indices,
         crossing_write_locs,
     )
+    # TODO(temporary-inside-chain): Replace this legacy crossing-page producer with direct page allocation.
     page_starts = alloc_paged_token_slots_decode(
         tree_cache=batch.tree_cache,
         seq_lens=crossing_write_locs + 1,
@@ -967,6 +968,7 @@ def alloc_for_spec_decode(
             device_type = getattr(
                 batch.device, "type", str(batch.device).split(":", 1)[0]
             )
+            # TODO(temporary-inside-chain): Replace the non-NPU page-aligned spec producer with its direct hook.
             out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
                 tree_cache,
                 cur_kv_lens,
