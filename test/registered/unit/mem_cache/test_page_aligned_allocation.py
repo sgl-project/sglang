@@ -670,9 +670,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         with (
             mock.patch.object(allocation_module, "_is_npu", False),
-            mock.patch.object(
-                allocation_module, "alloc_token_slots"
-            ) as direct_alloc,
+            mock.patch.object(allocation_module, "alloc_token_slots") as direct_alloc,
             mock.patch.object(
                 allocation_module, "assign_req_to_token_pool_func"
             ) as writer,
@@ -754,7 +752,9 @@ class TestPageAlignedAllocation(unittest.TestCase):
             mock.patch.object(
                 allocation_module, "get_last_loc", return_value=torch.tensor([3])
             ) as get_last_loc,
-            mock.patch.dict(allocation_module.ALLOC_EXTEND_FUNCS, {"npu": legacy_alloc}),
+            mock.patch.dict(
+                allocation_module.ALLOC_EXTEND_FUNCS, {"npu": legacy_alloc}
+            ),
             mock.patch.object(allocation_module, "alloc_token_slots") as direct_alloc,
             mock.patch.object(allocation_module, "assign_req_to_token_pool_func"),
         ):
