@@ -166,10 +166,14 @@ if _is_hip:
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
-    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
+    import sglang.third_party.triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+    from sglang.third_party.triton_kernels.numerics import InFlexData
+    from sglang.third_party.triton_kernels.tensor import (
+        FP4,
+        convert_layout,
+        wrap_torch_tensor,
+    )
+    from sglang.third_party.triton_kernels.tensor_details import layout
 
     value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
         mx_axis=1
@@ -806,7 +810,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_kernels:
 
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+            from sglang.third_party.triton_kernels.matmul_ogs import (
+                FlexCtx,
+                PrecisionConfig,
+            )
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -882,7 +889,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+            from sglang.third_party.triton_kernels.numerics_details.mxfp import (
+                upcast_from_mxfp,
+            )
 
             w13_weight = upcast_from_mxfp(
                 layer.w13_weight,
@@ -1307,7 +1316,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             assert (
                 layer.moe_ep_size == 1
-            ), "Expert parallel is not supported when using triton kernels"
+            ), "Expert parallel is not supported when using triton_kernels"
             quant_info = TritonKernelsQuantInfo(
                 w13_weight=(
                     self.w13_weight_triton_tensor

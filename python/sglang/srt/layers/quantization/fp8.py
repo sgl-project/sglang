@@ -1679,8 +1679,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return qweight, scale
 
         def _swizzle_mxfp8_sf(scale, num_warps):
-            from triton_kernels.tensor import convert_layout, wrap_torch_tensor
-            from triton_kernels.tensor_details import layout
+            from sglang.third_party.triton_kernels.tensor import (
+                convert_layout,
+                wrap_torch_tensor,
+            )
+            from sglang.third_party.triton_kernels.tensor_details import layout
 
             scale_layout, scale_layout_opts = (
                 layout.make_default_matmul_mxfp4_w_scale_layout(

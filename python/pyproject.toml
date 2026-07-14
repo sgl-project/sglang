@@ -81,6 +81,7 @@ dependencies = [
   "torchvision",
   "tqdm",
   "transformers==5.12.1",
+  "triton==3.6.0 ; platform_system == 'Linux'", # keep aligned with torch and the bundled triton_kernels copy
   "uvicorn",
   "uvloop",
   "watchfiles",
@@ -191,6 +192,7 @@ killall_sglang = "sglang.cli.killall:main"
 "sglang" = [
   "srt/**/*",
   "jit_kernel/**/*",
+  "third_party/triton_kernels/LICENSE",
   "multimodal_gen/apps/realtime_webui/**/*"
 ]
 

@@ -7,7 +7,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from triton_kernels.matmul_ogs import (
+
+from sglang.srt.utils import is_cuda
+from sglang.third_party.triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
     FusedActivation,
@@ -17,11 +19,9 @@ from triton_kernels.matmul_ogs import (
     ScatterIndx,
     matmul_ogs,
 )
-from triton_kernels.numerics import InFlexData
-from triton_kernels.swiglu import swiglu_fn
-from triton_kernels.tensor import FP4
-
-from sglang.srt.utils import is_cuda
+from sglang.third_party.triton_kernels.numerics import InFlexData
+from sglang.third_party.triton_kernels.swiglu import swiglu_fn
+from sglang.third_party.triton_kernels.tensor import FP4
 
 if is_cuda():
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul

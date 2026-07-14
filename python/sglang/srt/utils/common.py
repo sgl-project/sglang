@@ -4136,11 +4136,11 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    if importlib.util.find_spec("triton_kernels") is None:
+    if importlib.util.find_spec("sglang.third_party.triton_kernels") is None:
         return False
     try:
         ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
+            "sglang.third_party.triton_kernels.tensor_details.ragged_tensor"
         )
     except ModuleNotFoundError:
         return False

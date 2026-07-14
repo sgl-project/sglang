@@ -62,14 +62,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-fmt)
 
-# Triton kernel
-FetchContent_Declare(
-    repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
-    URL_HASH SHA256=be270ed11ca5a8fbd9d7941c5bbe9a23a9f6e2ffd372c8398346928bee464774
-)
-FetchContent_Populate(repo-triton)
-
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
@@ -553,9 +545,3 @@ install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
-
-# ============================ Extra Install: triton kernels ============================= #
-install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
-        DESTINATION "triton_kernels"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)

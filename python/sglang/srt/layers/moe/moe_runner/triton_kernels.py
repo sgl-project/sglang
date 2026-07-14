@@ -1,4 +1,4 @@
-"""Triton kernels MoE runner backend skeleton."""
+"""triton_kernels MoE runner backend skeleton."""
 
 from __future__ import annotations
 
@@ -19,16 +19,15 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
-    from triton_kernels.matmul_ogs import (
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
+    )
+    from sglang.third_party.triton_kernels.matmul_ogs import (
         GatherIndx,
         PrecisionConfig,
         RoutingData,
         ScatterIndx,
-    )
-
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardCombineInput,
-        StandardDispatchOutput,
     )
 
 
@@ -39,7 +38,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class TritonKernelsRunnerInput(RunnerInput):
-    """Input bundle passed to the triton-kernels runner core."""
+    """Input bundle passed to the triton_kernels runner core."""
 
     hidden_states: torch.Tensor
     routing_data: RoutingData
@@ -53,7 +52,7 @@ class TritonKernelsRunnerInput(RunnerInput):
 
 @dataclass
 class TritonKernelsRunnerOutput(RunnerOutput):
-    """Output bundle returned from the triton-kernels runner core."""
+    """Output bundle returned from the triton_kernels runner core."""
 
     hidden_states: torch.Tensor
 
@@ -64,7 +63,7 @@ class TritonKernelsRunnerOutput(RunnerOutput):
 
 @dataclass
 class TritonKernelsQuantInfo(MoeQuantInfo):
-    """Quantization payload consumed by the triton-kernels backend."""
+    """Quantization payload consumed by the triton_kernels backend."""
 
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
@@ -81,7 +80,7 @@ class TritonKernelsQuantInfo(MoeQuantInfo):
 
 
 class TritonKernelsRunnerCore(MoeRunnerCore):
-    """Execute MoE experts via the external triton_kernels package."""
+    """Execute MoE experts via SGLang's internal triton_kernels package."""
 
     def run(
         self,
@@ -97,7 +96,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
         assert (
             self.config.is_gated
-        ), "Only gated MoEs are supported for Triton Kernels runner"
+        ), "Only gated MoEs are supported for the triton_kernels runner"
 
         hidden_states = runner_input.hidden_states
 

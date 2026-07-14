@@ -29,7 +29,9 @@ _is_cuda = torch.cuda.is_available() and torch.version.cuda
 @lru_cache(maxsize=1)
 def _get_triton_mxfp8_upcast():
     try:
-        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
+        from sglang.third_party.triton_kernels.numerics_details.mxfp import (
+            upcast_from_mxfp_torch,
+        )
     except Exception as err:
         raise RuntimeError(
             "MXFP8 dequantization requires triton_kernels with MXFP8 support."

@@ -5,6 +5,7 @@
 - `multimodal_gen`: Inference framework for accelerated image/video generation.
 - `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
 - `test`: The test utilities.
+- `third_party`: Third-party Python modules bundled for internal use.
 - `api.py`: The public APIs.
 - `bench_offline_throughput.py`: Benchmark the performance in the offline mode.
 - `bench_one_batch.py`: Benchmark the latency of running a single static batch without a server.

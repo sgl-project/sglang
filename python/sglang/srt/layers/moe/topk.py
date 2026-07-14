@@ -35,9 +35,15 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import get_parallel
 
 try:
-    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
-    from triton_kernels.tensor import make_ragged_tensor_metadata
-    from triton_kernels.topk import topk as triton_kernels_topk
+    from sglang.third_party.triton_kernels.matmul_ogs import (
+        GatherIndx,
+        RoutingData,
+        ScatterIndx,
+    )
+    from sglang.third_party.triton_kernels.tensor import (
+        make_ragged_tensor_metadata,
+    )
+    from sglang.third_party.triton_kernels.topk import topk as triton_kernels_topk
 
     def routing(
         logits,

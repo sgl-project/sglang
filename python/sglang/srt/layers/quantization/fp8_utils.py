@@ -992,7 +992,9 @@ def triton_w8a8_block_fp8_linear(
 @lru_cache(maxsize=1)
 def _get_triton_mxfp8_downcast():
     try:
-        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+        from sglang.third_party.triton_kernels.numerics_details.mxfp import (
+            downcast_to_mxfp,
+        )
     except Exception as err:
         raise RuntimeError(
             "MXFP8 quantization requires triton_kernels with MXFP8 support."
