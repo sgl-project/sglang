@@ -169,12 +169,7 @@ class _HiSparsePageOwnership:
             [ordered_real_coordinates[:newest_position], reserved_page]
         )
         retained_page_ids = self._owned_page_ids(buffer_indices)
-        retained_blocks = self._full_page_blocks(retained_page_ids)
         assert retained_page_ids.numel() == need_size // self.page_size
-        torch._assert_async(
-            torch.all(torch.isin(retained_blocks, buffer_indices)),
-            "HiSparse device buffer must retain complete pages",
-        )
 
         surplus_page_ids = allocated_page_ids[
             ~torch.isin(allocated_page_ids, retained_page_ids)

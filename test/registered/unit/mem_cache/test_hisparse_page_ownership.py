@@ -96,7 +96,9 @@ class TestHiSparsePageOwnership(unittest.TestCase):
         self.assertEqual(buffer_indices[4].item(), 15)
         self.assertEqual(set(buffer_indices[4:].tolist()), {12, 13, 14, 15})
         self.assertEqual(mapping.tolist(), [0] * 12)
-        self.assertEqual(child_allocator.free.call_args.args[0].tolist(), [8, 9, 10, 11])
+        self.assertEqual(
+            child_allocator.free.call_args.args[0].tolist(), [8, 9, 10, 11]
+        )
 
 
 if __name__ == "__main__":
