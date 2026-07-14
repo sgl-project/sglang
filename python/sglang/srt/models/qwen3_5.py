@@ -1547,6 +1547,32 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
+            if name.endswith(".k_scale") or name.endswith(".v_scale"):
+                # ModelOpt FP4 checkpoints that quantize attention bake per-layer
+                # k_scale/v_scale under q/k_proj, e.g.
+                # "layers.N.self_attn.k_proj.k_scale". The stock
+                # maybe_remap_kv_scale_name() cannot handle this here: it keys off
+                # ".self_attn."/".mixer." still being present in the name, but we
+                # already stripped ".self_attn" a few lines up. Remap directly to
+                # the RadixAttention scale param instead and copy the value; the
+                # non-stacked fallback branch below only loads names that already
+                # match params_dict as-is, so without this the scale would be
+                # silently dropped via ignore_suffixes. This is a no-op for
+                # NVIDIA's MoE-only NVFP4 checkpoints, which do not emit
+                # k_scale/v_scale keys for attention.
+                attn_scale_name = name.replace(
+                    ".k_proj.k_scale", ".attn.k_scale"
+                ).replace(".v_proj.v_scale", ".attn.v_scale")
+                if attn_scale_name in params_dict:
+                    scale_param = params_dict[attn_scale_name]
+                    scale_weight_loader = getattr(scale_param, "weight_loader", None)
+                    if scale_weight_loader is not None:
+                        scale_weight_loader(scale_param, loaded_weight)
+                    else:
+                        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
+                    loaded_params.add(attn_scale_name)
+                    continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
@@ -2012,6 +2038,32 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
                 continue
+
+            if name.endswith(".k_scale") or name.endswith(".v_scale"):
+                # ModelOpt FP4 checkpoints that quantize attention bake per-layer
+                # k_scale/v_scale under q/k_proj, e.g.
+                # "layers.N.self_attn.k_proj.k_scale". The stock
+                # maybe_remap_kv_scale_name() cannot handle this here: it keys off
+                # ".self_attn."/".mixer." still being present in the name, but we
+                # already stripped ".self_attn" a few lines up. Remap directly to
+                # the RadixAttention scale param instead and copy the value; the
+                # non-stacked fallback branch below only loads names that already
+                # match params_dict as-is, so without this the scale would be
+                # silently dropped via ignore_suffixes. This is a no-op for
+                # NVIDIA's MoE-only NVFP4 checkpoints, which do not emit
+                # k_scale/v_scale keys for attention.
+                attn_scale_name = name.replace(
+                    ".k_proj.k_scale", ".attn.k_scale"
+                ).replace(".v_proj.v_scale", ".attn.v_scale")
+                if attn_scale_name in params_dict:
+                    scale_param = params_dict[attn_scale_name]
+                    scale_weight_loader = getattr(scale_param, "weight_loader", None)
+                    if scale_weight_loader is not None:
+                        scale_weight_loader(scale_param, loaded_weight)
+                    else:
+                        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
+                    loaded_params.add(attn_scale_name)
+                    continue
 
             if self.enable_shared_expert_fusion:
                 if "mlp.shared_expert." in name:
