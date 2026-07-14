@@ -95,7 +95,6 @@ sources = [
     "csrc/speculative/speculative_sampling.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/gemm/awq_kernel.cu",
-    "csrc/gemm/bmm_fp8.cu",
     "csrc/gemm/dsv3_fused_a_gemm.cu",
     "csrc/gemm/dsv3_router_gemm_bf16_out.cu",
     "csrc/gemm/dsv3_router_gemm_entry.cu",
