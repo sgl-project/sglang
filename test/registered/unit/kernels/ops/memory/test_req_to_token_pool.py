@@ -5,7 +5,6 @@ import torch
 from sglang.kernels.ops.memory.req_to_token_pool import GatherReqToTokenPool
 from sglang.test.ci.ci_register import register_cuda_ci
 
-
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
@@ -67,9 +66,7 @@ class TestGatherReqToTokenPool(unittest.TestCase):
                         seq_lens=seq_lens,
                         output_dtype=output_dtype,
                     )
-                    vanilla = GatherReqToTokenPool.vanilla(
-                        req_to_token, **arguments
-                    )
+                    vanilla = GatherReqToTokenPool.vanilla(req_to_token, **arguments)
                     triton_output = GatherReqToTokenPool.triton(
                         req_to_token, **arguments
                     )
