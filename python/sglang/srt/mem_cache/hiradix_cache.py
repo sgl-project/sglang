@@ -1505,6 +1505,19 @@ class HiRadixCache(RadixCache):
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
+        # An ALL_PAGES sidecar (DSA indexer) can load shorter than KV; committing
+        # past its hit prefix pairs fresh KV with a stale sidecar page. Clamp to
+        # the prefix here (commit thread), so a best_effort terminate can't race.
+        pool_transfers = getattr(operation, "pool_transfers", None)
+        if pool_transfers:
+            hit_prefix = operation.pool_storage_result.extra_pool_hit_prefix
+            for transfer in pool_transfers:
+                if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                    continue
+                min_completed_tokens = min(
+                    min_completed_tokens,
+                    hit_prefix.get(transfer.name, 0) * self.page_size,
+                )
         # Synchronize workers before mutating host cache tree state.
         completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
         self._all_reduce_attn_groups(

@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
@@ -121,7 +121,11 @@ class PoolTransferResult:
     """Tracks how many pages were successfully processed per pool."""
 
     kv_hit_pages: int
+    # Total hits per pool (sum). For TRAILING_PAGES consumers (SWA/mamba).
     extra_pool_hit_pages: dict[str, int]
+    # Contiguous hit prefix (up to first miss) per pool. For ALL_PAGES consumers
+    # (DSA indexer) that must not commit past a miss; != sum for a hole [T,F,T].
+    extra_pool_hit_prefix: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> PoolTransferResult:
@@ -132,9 +136,15 @@ class PoolTransferResult:
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool."""
+        """Record per-pool hit stats: the total count and the contiguous prefix."""
         self.extra_pool_hit_pages.update(
             {name: sum(rs) for name, rs in results.items()}
+        )
+        self.extra_pool_hit_prefix.update(
+            {
+                name: next((i for i, ok in enumerate(rs) if not ok), len(rs))
+                for name, rs in results.items()
+            }
         )
 
 
