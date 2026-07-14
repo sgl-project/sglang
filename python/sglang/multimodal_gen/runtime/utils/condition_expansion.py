@@ -60,6 +60,12 @@ class PromptToSampleBatchExpander:
             for index, item in enumerate(value)
         ]
 
+    def expand_tensor_fields(self, batch, *field_names: str) -> None:
+        """Expand selected tensor fields in place."""
+        for field_name in field_names:
+            value = getattr(batch, field_name)
+            setattr(batch, field_name, self.expand_tensors(value, field_name))
+
     def expand_sequence_lengths(
         self, value: list[list[int] | None] | None, name: str
     ) -> list[list[int] | None] | None:
@@ -88,3 +94,13 @@ class PromptToSampleBatchExpander:
                     f"{self.sample_batch_size} (per-sample)."
                 )
         return expanded
+
+    def expand_sequence_length_fields(self, batch, *field_names: str) -> None:
+        """Expand selected sequence-length fields in place."""
+        for field_name in field_names:
+            value = getattr(batch, field_name)
+            setattr(
+                batch,
+                field_name,
+                self.expand_sequence_lengths(value, field_name),
+            )

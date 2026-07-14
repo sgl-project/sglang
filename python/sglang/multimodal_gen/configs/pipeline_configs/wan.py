@@ -105,14 +105,13 @@ class WanT2V480PConfig(PipelineConfig):
         if expander is None:
             return
 
-        batch.prompt_embeds = expander.expand_tensors(
-            batch.prompt_embeds, "prompt_embeds"
+        expander.expand_tensor_fields(
+            batch,
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "image_embeds",
+            "image_latent",
         )
-        batch.negative_prompt_embeds = expander.expand_tensors(
-            batch.negative_prompt_embeds, "negative_prompt_embeds"
-        )
-        batch.image_embeds = expander.expand_tensors(batch.image_embeds, "image_embeds")
-        batch.image_latent = expander.expand_tensors(batch.image_latent, "image_latent")
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

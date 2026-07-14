@@ -189,29 +189,19 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         if expander is None:
             return
 
-        batch.prompt_embeds = expander.expand_tensors(
-            batch.prompt_embeds, "prompt_embeds"
+        expander.expand_tensor_fields(
+            batch,
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
         )
-        batch.negative_prompt_embeds = expander.expand_tensors(
-            batch.negative_prompt_embeds, "negative_prompt_embeds"
-        )
-        batch.prompt_attention_mask = expander.expand_tensors(
-            batch.prompt_attention_mask, "prompt_attention_mask"
-        )
-        batch.negative_attention_mask = expander.expand_tensors(
-            batch.negative_attention_mask, "negative_attention_mask"
-        )
-        batch.prompt_embeds_mask = expander.expand_tensors(
-            batch.prompt_embeds_mask, "prompt_embeds_mask"
-        )
-        batch.negative_prompt_embeds_mask = expander.expand_tensors(
-            batch.negative_prompt_embeds_mask, "negative_prompt_embeds_mask"
-        )
-        batch.prompt_seq_lens = expander.expand_sequence_lengths(
-            batch.prompt_seq_lens, "prompt_seq_lens"
-        )
-        batch.negative_prompt_seq_lens = expander.expand_sequence_lengths(
-            batch.negative_prompt_seq_lens, "negative_prompt_seq_lens"
+        expander.expand_sequence_length_fields(
+            batch,
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
         )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
