@@ -3,25 +3,29 @@ from typing import List, Optional, Tuple
 import torch
 
 
-def _is_rdna() -> bool:
-    """True if the current AMD GPU is RDNA (gfx11xx/gfx12xx).
+def _has_custom_ar() -> bool:
+    """True if the custom all-reduce operators are compiled and registered.
 
     The custom/deterministic/quick all-reduce ops are CDNA-only and are omitted
-    from the RDNA build (see sgl-kernel/setup_rocm.py), so their Python wrappers
-    are skipped here too. Multi-GPU all-reduce on RDNA falls back to RCCL.
+    from the RDNA build (see sgl-kernel/setup_rocm.py). Probing the registered
+    ops instead of the device arch avoids initializing CUDA at import time:
+    eagerly calling torch.cuda.get_device_properties(0) here would force CUDA
+    init on device 0, which breaks fork-based multiprocessing and pins the
+    process to device 0 before CUDA_VISIBLE_DEVICES is honored. common_ops is
+    loaded before this module, so the registry is already populated.
     """
-    if torch.version.hip is None or not torch.cuda.is_available():
-        return False
     try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-        return arch.startswith("gfx11") or arch.startswith("gfx12")
+        return hasattr(torch.ops.sgl_kernel, "init_custom_ar")
     except Exception:
         return False
 
 
-_HIP_IS_RDNA = _is_rdna()
+# CDNA ROCm builds compile the custom all-reduce ops; RDNA builds omit them
+# (multi-GPU all-reduce falls back to RCCL). CUDA always has them and is handled
+# by the final `else` branch, so gate the ROCm wrappers on hip + op presence.
+_HAS_CUSTOM_AR = torch.version.hip is not None and _has_custom_ar()
 
-if torch.version.hip is not None and not _HIP_IS_RDNA:
+if _HAS_CUSTOM_AR:
     # ROCM custom allreduce
     def init_custom_ar(
         meta: torch.Tensor,
