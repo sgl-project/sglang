@@ -197,9 +197,9 @@ def _release_overallocated_kv_indices(
     global_server_args = get_server_args()
     spec_algo = global_server_args.speculative_algorithm
 
-    assert 0 <= effective_committed_len <= allocated_end, (
-        f"Unexpected KV cache lengths, {effective_committed_len=}, {allocated_end=}"
-    )
+    assert (
+        0 <= effective_committed_len <= allocated_end
+    ), f"Unexpected KV cache lengths, {effective_committed_len=}, {allocated_end=}"
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
