@@ -307,7 +307,11 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch.spec_info.dsa_topk_indices = topk_indices
                 if seed_buf is not None:
                     sel = forward_batch.spec_info.dsa_seed_topk_select
-                    src = topk_indices if sel is None else topk_indices[sel]
+                    src = (
+                        topk_indices[: seed_buf.shape[0]]
+                        if sel is None
+                        else topk_indices[sel]
+                    )
                     seed_buf[: src.shape[0]].copy_(src)
         finally:
             exit_stack.close()
