@@ -336,3 +336,26 @@ __all__ = [
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
 ]
+
+
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import KernelSpec
+
+# Triton / TileLang kernels migrated from srt/layers top-level strays
+# (RFC #29630, Phase 2.5); registered for inventory.
+_PHASE25_KERNELS = [
+    ("elementwise", "fused_dual_residual_rmsnorm", "triton"),
+    ("elementwise", "fused_rmsnorm", "triton"),
+    ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
+    ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
+    ("mhc_head", "fused_hc_head", "triton"),
+]
+for _mod, _fn, _bk in _PHASE25_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend(_bk),
+            target=f"sglang.kernels.ops.layernorm.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn, _bk
