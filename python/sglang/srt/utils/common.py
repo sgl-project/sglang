@@ -2369,7 +2369,9 @@ def add_prometheus_track_response_middleware(app):
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
+        path, is_handled_path = _get_normalized_fastapi_request_path_for_metrics(
+            request
+        )
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
@@ -2404,6 +2406,19 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
             return route.path, True
 
     return request.url.path, False
+
+
+def _get_normalized_fastapi_request_path_for_metrics(request) -> Tuple[str, bool]:
+    """Return a route path suitable for metrics labels.
+
+    Handled requests use FastAPI's route template. Unhandled requests are
+    collapsed to a single label to prevent unbounded cardinality growth.
+    """
+    path, is_handled_path = _get_fastapi_request_path(request)
+    if not is_handled_path:
+        # Collapse arbitrary unknown paths to prevent unbounded cardinality growth.
+        path = "__unhandled__"
+    return path, is_handled_path
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
