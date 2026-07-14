@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from flashinfer import bmm_fp8
+    from sglang.srt.layers.quantization.fp8_utils import bmm_fp8
 
 if _is_hip:
     from sglang.kernels.ops.attention.rocm_mla_decode_rope import (

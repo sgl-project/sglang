@@ -172,8 +172,6 @@ if _is_cuda:
 
     from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
-    # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
-    # flashinfer's AutoTuner-based backend dispatch.
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
         A: torch.Tensor,

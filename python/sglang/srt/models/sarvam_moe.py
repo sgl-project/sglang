@@ -81,11 +81,11 @@ _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
     try:
-        from flashinfer import bmm_fp8
         from sgl_kernel import merge_state_v2
 
         from sglang.jit_kernel.concat_mla import concat_mla_k
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+        from sglang.srt.layers.quantization.fp8_utils import bmm_fp8
 
         _has_fp8_support = True
         _has_concat_mla_k = True
