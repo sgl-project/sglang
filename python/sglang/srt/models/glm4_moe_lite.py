@@ -227,7 +227,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
-            **({"scoring_func": "sigmoid"} if _is_npu else {}),
+            **({"scoring_func": "sigmoid"}),
         )
 
         self.topk = TopK(
