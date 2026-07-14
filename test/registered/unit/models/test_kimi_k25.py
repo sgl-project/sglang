@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -15,6 +16,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.processors.kimi_k25 import (
+    _resize_images_by_source_shape,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -54,6 +58,38 @@ def _image_item(feature, grid_thw):
         feature=feature,
         model_specific_data={"image_grid_thw": torch.tensor(grid_thw)},
     )
+
+
+def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
+    torch.manual_seed(0)
+    indexed_images = [
+        (0, torch.randn(3, 32, 24)),
+        (1, torch.randn(3, 32, 24)),
+        (2, torch.randn(3, 28, 20)),
+    ]
+    expected = [
+        F.interpolate(
+            image.unsqueeze(0), size=(16, 12), mode="bicubic", align_corners=False
+        )
+        for _, image in indexed_images
+    ]
+    real_interpolate = F.interpolate
+    input_shapes = []
+
+    def record_interpolate(image, *args, **kwargs):
+        input_shapes.append(tuple(image.shape))
+        return real_interpolate(image, *args, **kwargs)
+
+    with patch(
+        "sglang.srt.multimodal.processors.kimi_k25.F.interpolate",
+        side_effect=record_interpolate,
+    ):
+        actual = _resize_images_by_source_shape(indexed_images, 16, 12)
+
+    assert input_shapes == [(2, 3, 32, 24), (1, 3, 28, 20)]
+    assert len(actual) == len(expected)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference)
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():

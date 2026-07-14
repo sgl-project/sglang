@@ -146,6 +146,49 @@ def _process_single_image(
     return x, grid_thw
 
 
+def _resize_images_by_source_shape(
+    indexed_images: list[tuple[int, torch.Tensor]],
+    target_height: int,
+    target_width: int,
+) -> list[torch.Tensor]:
+    """Resize images while batching only inputs with an identical source layout.
+
+    A NaViT target-size group can still contain images with different source
+    dimensions.  Interpolation requires a rectangular batch, so preserve the
+    individual path for those images and batch only equal ``(shape, dtype)``
+    inputs.  The returned tensors retain the caller's original image order.
+    """
+    by_source_shape = defaultdict(list)
+    for index, image in indexed_images:
+        by_source_shape[(tuple(image.shape), image.dtype)].append((index, image))
+
+    resized_by_index = {}
+    for images in by_source_shape.values():
+        if len(images) == 1:
+            index, image = images[0]
+            resized_by_index[index] = F.interpolate(
+                image.unsqueeze(0).float(),
+                size=(target_height, target_width),
+                mode="bicubic",
+                align_corners=False,
+            )
+            continue
+
+        source_batch = torch.cat(
+            [image.unsqueeze(0) for _, image in images], dim=0
+        ).float()
+        resized_batch = F.interpolate(
+            source_batch,
+            size=(target_height, target_width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        for local_index, (index, _) in enumerate(images):
+            resized_by_index[index] = resized_batch[local_index : local_index + 1]
+
+    return [resized_by_index[index] for index, _ in indexed_images]
+
+
 def _gpu_preprocess_images(
     images: list[Union[torch.Tensor, Image.Image]],
     resize_configs: list[dict],
@@ -185,21 +228,22 @@ def _gpu_preprocess_images(
             all_patches[idx] = patches
             all_grids[idx] = grid
         else:
-            tensors = []
-            for _, image, _ in group:
+            indexed_images = []
+            for idx, image, _ in group:
                 if isinstance(image, Image.Image):
                     image = _pil_to_cuda_chw(image)
                 else:
                     image = _ensure_chw_rgb(image)
-                tensors.append(image.unsqueeze(0).float())
+                indexed_images.append((idx, image))
 
-            resized = []
-            for t in tensors:
-                r = F.interpolate(
-                    t, size=(target_h, target_w), mode="bicubic", align_corners=False
-                )
-                resized.append(r)
-            batch = torch.cat(resized, dim=0)
+            # One NaViT target group can include several original resolutions.
+            # Batch only source-compatible images, which removes redundant
+            # bicubic launches for common multi-image requests without padding
+            # random-size inputs to a larger source resolution.
+            batch = torch.cat(
+                _resize_images_by_source_shape(indexed_images, target_h, target_w),
+                dim=0,
+            )
 
             pad_h = padded_h - target_h
             pad_w = padded_w - target_w
