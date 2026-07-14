@@ -60,6 +60,7 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
@@ -69,7 +70,6 @@ from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
@@ -1794,9 +1794,9 @@ class AiterAttnBackend(AttentionBackend):
             # EAGLE V2: Fixed num_draft_tokens per batch
             self._ensure_spec_v2_topk_supported()
             seq_lens = seq_lens[:bs]
-            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            num_tokens_per_req = self._resolve_v2_num_draft_tokens()
             extend_lens = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=seq_lens.device
+                (bs,), num_tokens_per_req, dtype=torch.int32, device=seq_lens.device
             )
 
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -1815,7 +1815,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = num_tokens_per_bs
+            max_q_len = num_tokens_per_req
 
             if self.use_mla and _use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
