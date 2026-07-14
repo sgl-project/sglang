@@ -27,6 +27,7 @@ Design:
     ``aiter_w8a8_block_fp8_linear``).
 """
 
+import contextlib
 import functools
 import importlib
 import inspect
@@ -41,15 +42,79 @@ from torch.library import Library
 
 logger = logging.getLogger(__name__)
 
+
+@contextlib.contextmanager
+def _preserve_global_torch_state():
+    """Snapshot and restore process-global torch defaults.
+
+    ``enable()`` imports a large number of modules (both the explicit
+    registry via ``_resolve_target`` and the auto-discovery
+    ``_force_import_submodules``). Some of those modules mutate
+    process-global torch state at import time — most notably
+    ``torch.set_default_device("cuda")`` — and that mutation is NOT undone
+    by ``disable()`` (which only restores patched *function references*).
+
+    A leaked default device corrupts downstream CPU tensor creation: e.g.
+    a buffer such as ``seq_lens_cpu`` is suddenly allocated on cuda, which
+    surfaces as ``Buffer seq_lens_cpu has different device than before`` in
+    the input-buffer pool and, later, as out-of-bounds GPU memory access
+    faults in index kernels (e.g. ``write_req_to_token_pool_triton``).
+
+    Restoring the default device and dtype around the import-heavy regions
+    keeps these side effects from escaping into the serving path. In the
+    healthy case (nothing mutates the defaults) this is a no-op.
+    """
+    get_default_device = getattr(torch, "get_default_device", None)
+    saved_device = get_default_device() if get_default_device is not None else None
+    saved_dtype = torch.get_default_dtype()
+    try:
+        yield
+    finally:
+        if saved_device is not None:
+            try:
+                torch.set_default_device(saved_device)
+            except Exception:
+                pass
+        try:
+            torch.set_default_dtype(saved_dtype)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 _enabled = False
+# The torch.library.Library is created once and kept alive for the whole
+# process lifetime. It is intentionally NEVER torn down: dropping it destroys
+# the registered custom ops (freeing their OperatorName / schema). A wrapper
+# reference can outlive a disable() — e.g. a module imported lazily *during* a
+# profiling window captured the wrapper via ``from X import Y`` and is not in
+# ``_patches`` to be restored. If the backing op were freed, that leaked
+# wrapper would later dispatch into freed memory and segfault. Keeping the
+# Library (and the monotonic op counter) alive makes such a stale dispatch
+# safe; the ``if not _enabled`` guard in each wrapper then routes it straight
+# to the original function.
 _lib: Optional[Library] = None
+# Monotonic — NEVER reset, so op names from earlier enable() cycles stay valid.
 _op_counter = 0
 # Each entry: (module_obj, attr_name, original_fn)
 _patches: List[Tuple[Any, str, Callable]] = []
+# Persistent cache of built wrappers keyed by qualified function name.
+# Value: (wrapper_fn, original_fn). Reused across enable()/disable() cycles so
+# each op is defined exactly once and a given function maps to a stable wrapper
+# object (so references that leaked across cycles still point at a live op).
+_built_wrappers: dict = {}
+
+
+def _get_or_create_lib() -> Library:
+    """Return the process-wide custom-op Library, creating it on first use."""
+    global _lib
+    if _lib is None:
+        _lib = Library("sglang_profiler", "FRAGMENT")
+    return _lib
+
 
 # ---------------------------------------------------------------------------
 # Registry of kernel entry points to wrap.
@@ -293,7 +358,8 @@ def _register_op(
     Returns None if registration fails.
     """
     try:
-        _lib.define(op_name + schema_str)
+        lib = _get_or_create_lib()
+        lib.define(op_name + schema_str)
 
         def impl(*tensor_args):
             nt_args = _pop_non_tensor_args(op_name)
@@ -301,9 +367,7 @@ def _register_op(
             t_idx = 0
             for pname, param in sig.parameters.items():
                 if skip_self and pname == "self":
-                    if pname in nt_args:
-                        full_kwargs[pname] = nt_args[pname]
-                        continue
+                    continue
                 if pname in tensor_param_names:
                     full_kwargs[pname] = tensor_args[t_idx]
                     t_idx += 1
@@ -317,12 +381,19 @@ def _register_op(
             # through the dispatcher.  Stash it for the caller.
             _stash_return_value(op_name, result)
 
-        _lib.impl(op_name, impl, dispatch_key="CompositeExplicitAutograd")
+        lib.impl(op_name, impl, dispatch_key="CompositeExplicitAutograd")
 
         torch_op = getattr(torch.ops.sglang_profiler, op_name)
 
         @functools.wraps(original_fn)
         def dispatch_wrapper(*args, **kwargs):
+            # When profiling is not active, never route through the custom op.
+            # A wrapper reference may outlive disable() (captured by a module
+            # imported lazily while profiling was on, so _patch_all_references
+            # could not restore it). Falling back to the original keeps such
+            # leaked bindings correct and crash-free.
+            if not _enabled:
+                return original_fn(*args, **kwargs)
             try:
                 bound = sig.bind(*args, **kwargs)
                 bound.apply_defaults()
@@ -333,7 +404,6 @@ def _register_op(
             nt_vals = {}
             for pname, val in bound.arguments.items():
                 if skip_self and pname == "self":
-                    nt_vals[pname] = val
                     continue
                 if pname in tensor_param_names:
                     tensor_args.append(val)
@@ -449,6 +519,10 @@ def _make_record_function_wrapper(
 
     @functools.wraps(original_fn)
     def wrapper(*args, **kwargs):
+        # See dispatch_wrapper: a leaked reference must be a no-op when
+        # profiling is inactive.
+        if not _enabled:
+            return original_fn(*args, **kwargs)
         shape_parts: List[str] = []
         for i, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
@@ -528,6 +602,27 @@ def _force_import_submodules(prefix: str) -> None:
     if pkg_path is None:
         return
 
+    # Snapshot the global defaults once; restore them after *every* import so
+    # a module that calls torch.set_default_device("cuda") at import time
+    # cannot taint subsequently imported modules during discovery (nor leak
+    # into the serving path). The leaf-name skip list below catches the known
+    # offenders, but this restore makes the discovery robust to any other
+    # module with the same import-time side effect.
+    get_default_device = getattr(torch, "get_default_device", None)
+    saved_device = get_default_device() if get_default_device is not None else None
+    saved_dtype = torch.get_default_dtype()
+
+    def _restore_defaults():
+        if saved_device is not None:
+            try:
+                torch.set_default_device(saved_device)
+            except Exception:
+                pass
+        try:
+            torch.set_default_dtype(saved_dtype)
+        except Exception:
+            pass
+
     for _importer, mod_name, _is_pkg in pkgutil.walk_packages(
         pkg_path, prefix=prefix + "."
     ):
@@ -552,6 +647,8 @@ def _force_import_submodules(prefix: str) -> None:
         except Exception:
             # Optional modules may fail to import depending on environment.
             pass
+        finally:
+            _restore_defaults()
 
 
 def _discover_kernel_entry_points() -> List[Tuple[str, str]]:
@@ -638,96 +735,122 @@ def _discover_kernel_entry_points() -> List[Tuple[str, str]]:
 
 def enable():
     """Patch registered kernel entry points to appear as cpu_op."""
-    global _enabled, _lib, _op_counter
+    global _enabled
     with _lock:
         if _enabled:
             return
 
-        _lib = Library("sglang_profiler", "FRAGMENT")
-        _op_counter = 0
+        # NOTE: the Library and op counter are process-persistent (see the
+        # _lib / _op_counter docs). We do NOT recreate or reset them here so
+        # ops registered in earlier cycles stay valid. Only the per-cycle
+        # reference patches are rebuilt.
         _patches.clear()
         _wrapped_ids: set = set()  # track function ids to avoid double-wrapping
 
-        # Merge explicit registry with filtered auto-discovered functions.
-        # Duplicates are harmless — _wrapped_ids prevents double-wrapping.
-        all_entry_points = list(_KERNEL_ENTRY_POINTS) + _discover_kernel_entry_points()
+        # Backstop guard around the import-heavy region. Both the explicit
+        # registry (_resolve_target -> importlib.import_module) and the
+        # auto-discovery (_discover_kernel_entry_points -> _force_import_*)
+        # import modules that may mutate process-global torch defaults at
+        # import time; restore them on exit so the leak cannot escape into
+        # the serving path. (No-op when nothing mutates the defaults.)
+        with _preserve_global_torch_state():
+            # Merge explicit registry with filtered auto-discovered functions.
+            # Duplicates are harmless — _wrapped_ids prevents double-wrapping.
+            all_entry_points = (
+                list(_KERNEL_ENTRY_POINTS) + _discover_kernel_entry_points()
+            )
 
-        for module_path, attr_name in all_entry_points:
-            resolved = _resolve_target(module_path, attr_name)
-            if resolved is None:
-                continue
+            for module_path, attr_name in all_entry_points:
+                resolved = _resolve_target(module_path, attr_name)
+                if resolved is None:
+                    continue
 
-            container, name, original_fn, is_method = resolved
-            is_plain_function = not is_method
+                container, name, original_fn, is_method = resolved
+                is_plain_function = not is_method
 
-            # Skip if this exact function object was already wrapped
-            fn_id = id(original_fn)
-            if fn_id in _wrapped_ids:
-                logger.debug("Skipping duplicate %s.%s", module_path, attr_name)
-                continue
-            _wrapped_ids.add(fn_id)
+                # Skip if this exact function object was already wrapped
+                fn_id = id(original_fn)
+                if fn_id in _wrapped_ids:
+                    logger.debug("Skipping duplicate %s.%s", module_path, attr_name)
+                    continue
+                _wrapped_ids.add(fn_id)
 
-            qualified_name = f"{module_path}.{name}"
+                qualified_name = f"{module_path}.{name}"
 
-            # ── Regular functions ──
-            try:
-                sig = inspect.signature(original_fn)
-            except (ValueError, TypeError):
-                logger.debug(
-                    "Cannot inspect signature of %s — skipping",
-                    qualified_name,
-                )
-                continue
+                # Reuse a wrapper built in a previous cycle if the underlying
+                # function object is unchanged. This keeps each op defined
+                # exactly once and ensures a given function maps to a stable
+                # wrapper, so a reference that leaked across cycles still
+                # targets a live op.
+                wrapper = None
+                cached = _built_wrappers.get(qualified_name)
+                if cached is not None and cached[1] is original_fn:
+                    wrapper = cached[0]
 
-            base = f"{module_path.split('.')[-1]}_{name}"
-            schema_info = _build_schema_from_sig(sig, skip_self=is_method)
+                if wrapper is None:
+                    # ── Regular functions ──
+                    try:
+                        sig = inspect.signature(original_fn)
+                    except (ValueError, TypeError):
+                        logger.debug(
+                            "Cannot inspect signature of %s — skipping",
+                            qualified_name,
+                        )
+                        continue
 
-            wrapper = None
-            if schema_info is not None:
-                # Full tensor annotations → use torch.library custom op
-                schema_str, t_names, nt_names = schema_info
-                op_name = _next_op_name(base)
-                wrapper = _register_op(
-                    op_name,
-                    schema_str,
-                    original_fn,
-                    t_names,
-                    nt_names,
-                    sig,
-                    skip_self=is_method,
-                )
-                if wrapper is not None:
-                    logger.debug(
-                        "Registered %s as custom op %s", qualified_name, op_name
-                    )
+                    base = f"{module_path.split('.')[-1]}_{name}"
+                    schema_info = _build_schema_from_sig(sig, skip_self=is_method)
 
-            if wrapper is None:
-                # Fallback: no annotations or schema registration failed
-                # → use record_function wrapper (shapes in event name)
-                wrapper = _make_record_function_wrapper(
-                    qualified_name,
-                    original_fn,
-                )
-                logger.debug("Registered %s via record_function", qualified_name)
+                    if schema_info is not None:
+                        # Full tensor annotations → use torch.library custom op
+                        schema_str, t_names, nt_names = schema_info
+                        op_name = _next_op_name(base)
+                        wrapper = _register_op(
+                            op_name,
+                            schema_str,
+                            original_fn,
+                            t_names,
+                            nt_names,
+                            sig,
+                            skip_self=is_method,
+                        )
+                        if wrapper is not None:
+                            logger.debug(
+                                "Registered %s as custom op %s", qualified_name, op_name
+                            )
 
-            # --- Apply patches ---
-            if is_plain_function:
-                ref_patches = _patch_all_references(original_fn, wrapper)
-                _patches.extend(ref_patches)
-                if not ref_patches:
+                    if wrapper is None:
+                        # Fallback: no annotations or schema registration failed
+                        # → use record_function wrapper (shapes in event name)
+                        wrapper = _make_record_function_wrapper(
+                            qualified_name,
+                            original_fn,
+                        )
+                        logger.debug(
+                            "Registered %s via record_function", qualified_name
+                        )
+
+                    _built_wrappers[qualified_name] = (wrapper, original_fn)
+
+                # --- Apply patches ---
+                if is_plain_function:
+                    ref_patches = _patch_all_references(original_fn, wrapper)
+                    _patches.extend(ref_patches)
+                    if not ref_patches:
+                        setattr(container, name, wrapper)
+                        _patches.append((container, name, original_fn))
+                else:
                     setattr(container, name, wrapper)
                     _patches.append((container, name, original_fn))
-            else:
-                setattr(container, name, wrapper)
-                _patches.append((container, name, original_fn))
 
-        n_discovered = len(all_entry_points) - len(_KERNEL_ENTRY_POINTS)
+            n_discovered = len(all_entry_points) - len(_KERNEL_ENTRY_POINTS)
+
         _enabled = True
         logger.info(
             "kernel_shape_profiler enabled: %d references patched across "
             "%d entry points (%d explicit + %d auto-discovered)",
             len(_patches),
-            len(all_entry_points),
+            len(_KERNEL_ENTRY_POINTS) + n_discovered,
             len(_KERNEL_ENTRY_POINTS),
             n_discovered,
         )
@@ -735,18 +858,23 @@ def enable():
 
 def disable():
     """Restore all patched functions to originals."""
-    global _enabled, _lib
+    global _enabled
     with _lock:
         if not _enabled:
             return
+        # Flip the flag first so any wrapper invoked concurrently — or one that
+        # leaked past restoration — short-circuits to the original instead of
+        # dispatching into a custom op.
+        _enabled = False
         for container, name, original_fn in reversed(_patches):
             try:
                 setattr(container, name, original_fn)
             except Exception:
                 pass
         _patches.clear()
-        _lib = None
-        _enabled = False
+        # Intentionally keep _lib, _op_counter and _built_wrappers alive: the
+        # registered ops must outlive any wrapper reference that may have
+        # leaked (see module-level _lib docs).
         logger.info("kernel_shape_profiler disabled: all patches restored")
 
 

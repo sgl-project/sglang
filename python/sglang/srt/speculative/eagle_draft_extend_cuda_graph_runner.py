@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.kernel_shape_profiler import enable, is_enabled
 
 _is_hip = is_hip()
 
@@ -106,6 +107,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
+        )
+        self.enable_shape_discovery_for_cuda_graph_profile = (
+            model_runner.server_args.enable_shape_discovery_for_cuda_graph_profile
         )
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -454,11 +458,25 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
-                post_warmup_hook = getattr(
+                base_post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )
+
+                def post_warmup_hook():
+                    if base_post_warmup_hook is not None:
+                        base_post_warmup_hook()
+                    # Activate the kernel shape profiler AFTER warmup runs so
+                    # that lazily-imported modules (e.g. tilelang_kernel) are
+                    # already in sys.modules and auto-discovery can find them.
+                    if (
+                        self.enable_profile_cuda_graph
+                        and self.enable_shape_discovery_for_cuda_graph_profile
+                        and not is_enabled()
+                    ):
+                        enable()
+
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,
