@@ -126,6 +126,8 @@ _TRITON_KERNELS = [
     ("kv_b_lora_absorbed", "step_b_q_fwd"),
     ("kv_b_lora_absorbed", "step_a_v_fwd"),
     ("kv_b_lora_absorbed", "step_b_v_fwd"),
+    ("kv_b_lora_absorbed", "q_side_fused_fwd"),
+    ("kv_b_lora_absorbed", "v_side_fused_fwd"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

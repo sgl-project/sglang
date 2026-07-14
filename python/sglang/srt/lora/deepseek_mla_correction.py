@@ -20,10 +20,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
-    step_a_q_fwd,
-    step_a_v_fwd,
-    step_b_q_fwd,
-    step_b_v_fwd,
+    q_side_fused_fwd,
+    v_side_fused_fwd,
 )
 
 if TYPE_CHECKING:
@@ -74,6 +72,10 @@ def apply_q_correction(
 
       step A_q : ``(S,H,qk_nope) @ B_kc[slot, h] (qk_nope, rank) -> (S,H,rank)``
       step B_q : ``(S,H,rank)    @ A[slot] (rank, kv_lora_rank)  -> += q_nope_out``
+
+    The two steps are fused into a single kernel (keeping the small rank
+    intermediate in registers); it falls back to the split kernels for large
+    ranks or on any launch failure.
     """
     state = _get_state(attn_module)
     if state is None:
@@ -81,8 +83,7 @@ def apply_q_correction(
     A_buf, B_buf, batch_info = state
 
     full_K_per_head = attn_module.qk_nope_head_dim + attn_module.v_head_dim
-    q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
-    return step_b_q_fwd(q_lora_a, A_buf, batch_info, q_nope_out)
+    return q_side_fused_fwd(q_nope, B_buf, A_buf, batch_info, q_nope_out, full_K_per_head)
 
 
 def apply_v_correction(
@@ -102,12 +103,12 @@ def apply_v_correction(
         return attn_bmm_flat
     A_buf, B_buf, batch_info = state
 
-    attn_lora_a = step_a_v_fwd(attn_output, A_buf, batch_info)
     base_view = attn_bmm_flat.view(
         -1, attn_module.num_local_heads, attn_module.v_head_dim
     )
-    step_b_v_fwd(
-        attn_lora_a,
+    v_side_fused_fwd(
+        attn_output,
+        A_buf,
         B_buf,
         batch_info,
         base_view,
