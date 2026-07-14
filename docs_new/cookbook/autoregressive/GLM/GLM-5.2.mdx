@@ -53,7 +53,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Warning>
-  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. The other backend choices (`flashinfer`, `torch`) are not fully verified for GLM-5.2 — keep the default unless you have validated the alternative yourself.
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`, which is what our GLM-5.2 accuracy and benchmark runs cover. The other choices (`flashinfer`, `torch`) haven't been validated as extensively on GLM-5.2 yet, so we recommend starting with the default.
 </Warning>
 
 <Note>
