@@ -764,6 +764,30 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
+    # ROCm/HIP lacks the CUDA/MUSA sampling-verify kernels, so EAGLE verify would
+    # otherwise silently fall back to greedy (argmax), ignoring temperature/top_p.
+    # Default rejection sampling on (routes verify through the Triton chain sampler)
+    # for configs that support it, unless the user opted in or picked an incompatible
+    # option. Conditions mirror the validation below so the flip never triggers a raise.
+    # Read through cfg so the algorithm alias is already resolved (NEXTN -> EAGLE);
+    # write back to server_args, which is the object that actually holds the value.
+    from sglang.srt.utils import is_hip
+
+    if (
+        is_hip()
+        and not cfg.speculative_use_rejection_sampling
+        and cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and cfg.speculative_eagle_topk == 1
+        and cfg.speculative_accept_threshold_single == 1.0
+        and cfg.speculative_accept_threshold_acc == 1.0
+        and not cfg.enable_deterministic_inference
+    ):
+        server_args.speculative_use_rejection_sampling = True
+        logger.info(
+            "ROCm requires rejection sampling for correct EAGLE spec-decode "
+            "sampling; enabling speculative_use_rejection_sampling by default."
+        )
+
     if cfg.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
