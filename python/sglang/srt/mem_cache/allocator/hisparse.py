@@ -84,10 +84,13 @@ class _HiSparsePageOwnership:
             newest_position is not None
             and ordered_real_coordinates.numel() > newest_position + 1
         ):
-            ordered_real_coordinates = ordered_real_coordinates.clone()
-            newest_coordinate = ordered_real_coordinates[-1].clone()
-            ordered_real_coordinates[-1] = ordered_real_coordinates[newest_position]
-            ordered_real_coordinates[newest_position] = newest_coordinate
+            return self._take_device_buffer_with_reserved_newest_page(
+                ordered_real_coordinates=ordered_real_coordinates,
+                allocated_mapping_indices=allocated_mapping_indices,
+                allocated_page_ids=allocated_page_ids,
+                need_size=need_size,
+                newest_position=newest_position,
+            )
 
         ordered_prefix = ordered_real_coordinates[:need_size]
         semantic_page_ids = self._owned_page_ids(ordered_prefix)
@@ -136,6 +139,46 @@ class _HiSparsePageOwnership:
             "HiSparse device buffers must contain positive coordinates",
         )
 
+        self._clear_owners_and_release(
+            mapping_indices=allocated_mapping_indices,
+            owned_page_ids=surplus_page_ids,
+        )
+        return buffer_indices
+
+    def _take_device_buffer_with_reserved_newest_page(
+        self,
+        *,
+        ordered_real_coordinates: torch.Tensor,
+        allocated_mapping_indices: torch.Tensor,
+        allocated_page_ids: torch.Tensor,
+        need_size: int,
+        newest_position: int,
+    ) -> torch.Tensor:
+        assert newest_position == need_size - self.page_size
+        newest_coordinate = ordered_real_coordinates[-1]
+        newest_page_start = (newest_coordinate // self.page_size) * self.page_size
+        newest_page = newest_page_start + torch.arange(
+            self.page_size,
+            dtype=torch.int64,
+            device=ordered_real_coordinates.device,
+        )
+        reserved_page = torch.cat(
+            [newest_coordinate.view(1), newest_page[newest_page != newest_coordinate]]
+        )
+        buffer_indices = torch.cat(
+            [ordered_real_coordinates[:newest_position], reserved_page]
+        )
+        retained_page_ids = self._owned_page_ids(buffer_indices)
+        retained_blocks = self._full_page_blocks(retained_page_ids)
+        assert retained_page_ids.numel() == need_size // self.page_size
+        torch._assert_async(
+            torch.all(torch.isin(retained_blocks, buffer_indices)),
+            "HiSparse device buffer must retain complete pages",
+        )
+
+        surplus_page_ids = allocated_page_ids[
+            ~torch.isin(allocated_page_ids, retained_page_ids)
+        ]
         self._clear_owners_and_release(
             mapping_indices=allocated_mapping_indices,
             owned_page_ids=surplus_page_ids,

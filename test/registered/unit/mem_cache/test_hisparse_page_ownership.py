@@ -74,6 +74,30 @@ class TestHiSparsePageOwnership(unittest.TestCase):
         stable_unique.assert_not_called()
         self.assertEqual(child_allocator.free.call_args.args[0].tolist(), [2, 3])
 
+    def test_dsv4_buffer_retains_complete_hot_and_newest_pages(self) -> None:
+        """DSV4 reserves the newest full page and releases the displaced page."""
+        mapping = torch.arange(4, 16, dtype=torch.int64)
+        child_allocator = mock.Mock(is_not_in_free_group=True)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping,
+            child_allocator=child_allocator,
+            page_size=4,
+        )
+        mapping_indices = torch.arange(12, dtype=torch.int64)
+
+        buffer_indices = ownership.take_device_buffer(
+            ordered_real_mapping_indices=mapping_indices,
+            allocated_mapping_indices=mapping_indices,
+            need_size=8,
+            newest_position=4,
+        )
+
+        self.assertEqual(buffer_indices[:4].tolist(), [4, 5, 6, 7])
+        self.assertEqual(buffer_indices[4].item(), 15)
+        self.assertEqual(set(buffer_indices[4:].tolist()), {12, 13, 14, 15})
+        self.assertEqual(mapping.tolist(), [0] * 12)
+        self.assertEqual(child_allocator.free.call_args.args[0].tolist(), [8, 9, 10, 11])
+
 
 if __name__ == "__main__":
     unittest.main()
