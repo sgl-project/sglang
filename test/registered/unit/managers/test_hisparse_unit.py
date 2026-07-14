@@ -616,6 +616,141 @@ class TestHiSparseUnit(unittest.TestCase):
         self._free_req_slot(req)
         self._assert_sizes_restored(initial, "decode_remap")
 
+    def test_page_aligned_decode_remap_transfers_temporary_page_to_buffer(self):
+        """Page-aligned first remap transfers the full temporary owner into the buffer."""
+        if self.page_size == 1:
+            self.skipTest("page-aligned ownership transfer requires page_size > 1")
+
+        device = self.allocator.device
+        fill_len = self.page_size
+        req = _make_req("page-transfer", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+        self.coordinator._skip_first_backup[req.req_pool_idx] = True
+        device_available_before = (
+            self.allocator.hisparse_attn_allocator.available_size()
+        )
+
+        logical_page = self.allocator.alloc(self.page_size)
+        self.assertIsNotNone(logical_page)
+        temporary_device_page = self.allocator.full_to_hisparse_device_index_mapping[
+            logical_page
+        ].clone()
+        self.req_to_token_pool.write(
+            (
+                req.req_pool_idx,
+                slice(fill_len, fill_len + self.page_size),
+            ),
+            logical_page,
+        )
+        req.kv.kv_allocated_len = fill_len + self.page_size
+        req.kv_committed_len = fill_len + 1
+
+        self.coordinator.map_last_loc_to_buffer(
+            seq_lens=torch.tensor([fill_len + 1], dtype=torch.int64, device=device),
+            out_cache_loc=logical_page[:1],
+            req_pool_indices=torch.tensor(
+                [req.req_pool_idx], dtype=torch.int64, device=device
+            ),
+            seq_lens_cpu=torch.tensor([fill_len + 1], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([req.req_pool_idx], dtype=torch.int64),
+        )
+
+        published_mapping = self.allocator.full_to_hisparse_device_index_mapping[
+            logical_page
+        ]
+        transferred_buffer_page = self.coordinator.req_to_device_buffer[
+            req.req_pool_idx, fill_len : fill_len + self.page_size
+        ]
+        self.assertTrue(torch.equal(published_mapping, transferred_buffer_page))
+        self.assertTrue(torch.equal(transferred_buffer_page, temporary_device_page))
+        self.assertEqual(
+            int(self.coordinator.req_device_buffer_size[req.req_pool_idx]),
+            fill_len + self.page_size,
+        )
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            device_available_before - self.page_size,
+        )
+
+    def test_page_aligned_decode_requirement_counts_only_net_buffer_growth(self):
+        """Padded-boundary budgeting counts the temporary page plus net extra."""
+        if self.page_size == 1:
+            self.skipTest("dual-resource decode budgeting requires page_size > 1")
+
+        committed_len = DEVICE_BUFFER_SIZE - self.page_size
+        req = _make_req("net-growth", list(range(committed_len)))
+        self._alloc_req_slot(req)
+        req.kv.kv_allocated_len = committed_len
+        req.kv_committed_len = committed_len
+        self.coordinator.req_device_buffer_size[req.req_pool_idx] = committed_len
+
+        requirements = self.coordinator.next_decode_allocation_requirements([req])
+
+        self.assertEqual(requirements.logical_need, self.page_size)
+        self.assertEqual(requirements.device_need, 2 * self.page_size)
+
+    def test_terminal_finish_and_retract_release_partial_owner_union_once(self):
+        """Finish and retract release partial mapping and buffer page unions once."""
+        if self.page_size == 1:
+            self.skipTest("partial page ownership requires page_size > 1")
+
+        for terminal_method in ("request_finished", "retract_req"):
+            with self.subTest(terminal_method=terminal_method):
+                initial = self._get_initial_sizes()
+                req = _make_req(terminal_method, list(range(self.page_size)))
+                self._alloc_req_slot(req)
+                logical_page = self.allocator.alloc(self.page_size)
+                self.assertIsNotNone(logical_page)
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, self.page_size)), logical_page
+                )
+                req.kv.kv_allocated_len = self.page_size
+                req.kv_committed_len = self.page_size
+                req.extend_range = Range(0, self.page_size)
+
+                temporary_page = self.allocator.full_to_hisparse_device_index_mapping[
+                    logical_page
+                ].clone()
+                buffer_page = self.allocator.hisparse_attn_allocator.alloc(
+                    self.page_size
+                )
+                self.assertIsNotNone(buffer_page)
+                split = self.page_size // 2
+                self.allocator.full_to_hisparse_device_index_mapping[
+                    logical_page[:split]
+                ] = buffer_page[:split]
+                self.coordinator.req_to_device_buffer[
+                    req.req_pool_idx, : self.page_size
+                ] = buffer_page
+                self.coordinator.req_device_buffer_size[req.req_pool_idx] = (
+                    self.page_size
+                )
+                self.coordinator.req_device_buffer_token_locs[
+                    :, req.req_pool_idx, : self.page_size
+                ] = buffer_page.to(torch.int32)
+
+                getattr(self.coordinator, terminal_method)(req)
+
+                self.assertTrue(
+                    torch.all(
+                        self.allocator.full_to_hisparse_device_index_mapping[
+                            logical_page
+                        ]
+                        == 0
+                    )
+                )
+                self.assertTrue(
+                    torch.all(
+                        self.coordinator.req_to_device_buffer[req.req_pool_idx] == 0
+                    )
+                )
+                self.assertTrue(torch.all(temporary_page > 0))
+                self.allocator.logical_attn_allocator.free(logical_page)
+                self._free_req_slot(req)
+                self._assert_sizes_restored(initial, terminal_method)
+
     # ==================================================================
     # Test: Staging (PD Colocate) path
     # ==================================================================

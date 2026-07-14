@@ -392,6 +392,14 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             device_page_size=self.hisparse_device_page_size,
         )
 
+    def materialize_owned_hisparse_page_blocks(
+        self, *, owned_page_ids: torch.Tensor
+    ) -> torch.Tensor:
+        return _owned_page_ids_to_full_blocks(
+            owned_page_ids,
+            device_page_size=self.hisparse_device_page_size,
+        )
+
     def alloc_device_buffer(
         self,
         *,
@@ -660,9 +668,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
         compressed_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
-                logical_indices
-            )
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
         )
         _validate_page_block_indices(
             compressed_indices,
@@ -670,9 +676,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             page_size=self.hisparse_page_size,
             device=self.full_to_hisparse_device_index_mapping.device,
         )
-        expected_compressed_indices = logical_indices[
-            (logical_indices + 1) % self.compress_ratio == 0
-        ] // self.compress_ratio
+        expected_compressed_indices = (
+            logical_indices[(logical_indices + 1) % self.compress_ratio == 0]
+            // self.compress_ratio
+        )
         torch._assert_async(
             torch.all(compressed_indices == expected_compressed_indices),
             "DeepSeek V4 compressed mapping keys must match the C4 translation",
@@ -683,8 +690,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(logical_indices)
             torch._assert_async(
                 torch.all(
-                    self.full_to_hisparse_device_index_mapping[compressed_indices]
-                    == 0
+                    self.full_to_hisparse_device_index_mapping[compressed_indices] == 0
                 ),
                 "HiSparse mapping must remain unpublished after allocation rollback",
             )
@@ -746,6 +752,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         _release_owned_page_ids(
             self.hisparse_attn_allocator,
             owned_page_ids=owned_page_ids,
+            device_page_size=self.hisparse_device_page_size,
+        )
+
+    def materialize_owned_hisparse_page_blocks(
+        self, *, owned_page_ids: torch.Tensor
+    ) -> torch.Tensor:
+        return _owned_page_ids_to_full_blocks(
+            owned_page_ids,
             device_page_size=self.hisparse_device_page_size,
         )
 

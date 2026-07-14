@@ -112,7 +112,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -131,6 +131,8 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 @lru_cache(maxsize=1)
@@ -2436,8 +2438,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        allocator = self.token_to_kv_pool_allocator
+        coordinator = self.hisparse_coordinator
+        if (
+            coordinator is not None
+            and self.spec_algorithm.is_none()
+            and not _is_npu
+            and allocator.page_size > 1
+            and allocator.supports_page_aligned_alloc
+        ):
+            requests = (
+                self.reqs
+                if selected_indices is None
+                else [self.reqs[index] for index in selected_indices]
+            )
+            requirements = coordinator.next_decode_allocation_requirements(requests)
+            assert requirements.logical_need == num_tokens
+            eviction_need = max(
+                requirements.logical_need,
+                requirements.device_need * coordinator.compress_ratio,
+            )
+            evict_from_tree_cache(self.tree_cache, eviction_need)
+            return (
+                allocator.logical_attn_allocator.available_size()
+                >= requirements.logical_need
+                and allocator.hisparse_attn_allocator.available_size()
+                >= requirements.device_need
+            )
+
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        return allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = retract_all(

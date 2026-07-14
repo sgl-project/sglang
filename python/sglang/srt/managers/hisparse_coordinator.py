@@ -22,11 +22,12 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils import get_device_module, is_hip, is_npu
 
 device_module = get_device_module()
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,20 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
+
+
+class HiSparseDecodeAllocationRequirements(NamedTuple):
+    logical_need: int
+    device_need: int
+
+
+class _DeviceBufferGrowthPlanEntry(NamedTuple):
+    first_index: int
+    req_pool_idx: int
+    old_cap: int
+    new_cap: int
+    grow_size: int
+    net_extra: int
 
 
 class HiSparseCoordinator:
@@ -295,6 +310,44 @@ class HiSparseCoordinator:
             return kv_allocated_len // self.compress_ratio
         return kv_allocated_len
 
+    def next_decode_allocation_requirements(
+        self, reqs: List[Req]
+    ) -> HiSparseDecodeAllocationRequirements:
+        allocator = self.token_to_kv_pool_allocator
+        logical_page_size = allocator.page_size
+        assert not _is_npu
+        assert logical_page_size > 1
+        assert allocator.supports_page_aligned_alloc
+
+        logical_need = 0
+        device_need = 0
+        for req in reqs:
+            assert req.kv is not None
+            assert 0 <= req.kv_committed_len <= req.kv.kv_allocated_len
+            if req.kv_committed_len % logical_page_size != 0:
+                continue
+
+            assert req.kv_committed_len == req.kv.kv_allocated_len
+            logical_need += logical_page_size
+            if self.is_dsv4_hisparse:
+                assert logical_page_size % self.compress_ratio == 0
+                device_need += logical_page_size // self.compress_ratio
+                continue
+
+            growth = self._get_device_buffer_growth(
+                first_index=-1,
+                req_pool_idx=req.req_pool_idx,
+                seq_len=req.kv_committed_len + 1,
+            )
+            device_need += logical_page_size
+            if growth is not None:
+                device_need += growth.net_extra
+
+        return HiSparseDecodeAllocationRequirements(
+            logical_need=logical_need,
+            device_need=device_need,
+        )
+
     def _preload_to_device_buffer(
         self, req: Req, *, real_host_token_count: int
     ) -> None:
@@ -520,6 +573,17 @@ class HiSparseCoordinator:
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
 
+        allocator = self.token_to_kv_pool_allocator
+        if allocator.page_size > 1 and allocator.supports_page_aligned_alloc:
+            self._map_page_aligned_last_loc_to_buffer(
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                req_pool_indices=req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+            )
+            return
+
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
@@ -575,9 +639,6 @@ class HiSparseCoordinator:
             return
 
         active_reqs = seq_lens % self.compress_ratio == 0
-        if not torch.any(active_reqs):
-            return
-
         active_seq_lens = seq_lens[active_reqs]
         active_out_cache_loc = out_cache_loc[active_reqs]
         active_req_pool_indices = req_pool_indices[active_reqs]
@@ -599,6 +660,492 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
+        )
+
+    def _map_page_aligned_last_loc_to_buffer(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        allocator = self.token_to_kv_pool_allocator
+        logical_page_size = allocator.page_size
+        device_page_size = allocator.hisparse_device_page_size
+        assert not _is_npu
+        assert logical_page_size > 1
+        assert allocator.supports_page_aligned_alloc
+        assert device_page_size > 1
+        assert seq_lens.ndim == 1
+        assert out_cache_loc.shape == seq_lens.shape
+        assert req_pool_indices.shape == seq_lens.shape
+        assert seq_lens_cpu.shape == seq_lens.shape
+        assert req_pool_indices_cpu.shape == seq_lens.shape
+
+        if self.is_dsv4_hisparse:
+            assert logical_page_size % self.compress_ratio == 0
+            assert device_page_size == logical_page_size // self.compress_ratio
+            mapped_batch_indices_cpu = [
+                batch_index
+                for batch_index in range(seq_lens_cpu.numel())
+                if int(seq_lens_cpu[batch_index]) % self.compress_ratio == 0
+            ]
+        else:
+            assert device_page_size == logical_page_size
+            mapped_batch_indices_cpu = list(range(seq_lens_cpu.numel()))
+
+        if not mapped_batch_indices_cpu:
+            return
+
+        mapped_batch_indices = torch.tensor(
+            mapped_batch_indices_cpu,
+            dtype=torch.int64,
+            device=seq_lens.device,
+        )
+        mapped_seq_lens = seq_lens[mapped_batch_indices]
+        mapped_out_cache_loc = out_cache_loc[mapped_batch_indices]
+        mapped_req_pool_indices = req_pool_indices[mapped_batch_indices]
+        semantic_positions = mapped_seq_lens - 1
+        if self.is_dsv4_hisparse:
+            semantic_positions = mapped_seq_lens // self.compress_ratio - 1
+
+        first_indices_cpu = [
+            mapped_index
+            for mapped_index, batch_index in enumerate(mapped_batch_indices_cpu)
+            if (
+                (
+                    int(seq_lens_cpu[batch_index]) // self.compress_ratio - 1
+                    if self.is_dsv4_hisparse
+                    else int(seq_lens_cpu[batch_index]) - 1
+                )
+                % device_page_size
+                == 0
+            )
+        ]
+        if not first_indices_cpu:
+            self._validate_current_page_aligned_mappings(
+                semantic_positions=semantic_positions,
+                mapped_out_cache_loc=mapped_out_cache_loc,
+                mapped_req_pool_indices=mapped_req_pool_indices,
+            )
+            return
+
+        first_indices = torch.tensor(
+            first_indices_cpu,
+            dtype=torch.int64,
+            device=seq_lens.device,
+        )
+        first_semantic_positions = semantic_positions[first_indices]
+        first_mapping_indices = allocator.get_last_loc_compressed(
+            mapped_out_cache_loc[first_indices]
+        ).to(dtype=torch.int64)
+        first_req_pool_indices = mapped_req_pool_indices[first_indices]
+        offsets = torch.arange(
+            device_page_size,
+            dtype=torch.int64,
+            device=seq_lens.device,
+        )
+        mapping_index_blocks = first_mapping_indices[:, None] + offsets
+        semantic_position_blocks = first_semantic_positions[:, None] + offsets
+        buffer_positions = semantic_position_blocks.clamp(max=self.device_buffer_size)
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        full_semantic_position_blocks = semantic_position_blocks
+        if self.is_dsv4_hisparse:
+            full_semantic_position_blocks = (
+                semantic_position_blocks * self.compress_ratio + self.compress_ratio - 1
+            )
+
+        torch._assert_async(
+            torch.all(first_mapping_indices % device_page_size == 0),
+            "HiSparse first-remap mapping blocks must be page aligned",
+        )
+        torch._assert_async(
+            torch.all(mapping_index_blocks >= 0),
+            "HiSparse first-remap mapping indices must be non-negative",
+        )
+        torch._assert_async(
+            torch.all(mapping_index_blocks < mapping.numel() - 1),
+            "HiSparse first-remap mapping blocks must stay within the mapping domain",
+        )
+        torch._assert_async(
+            torch.all(semantic_position_blocks >= 0),
+            "HiSparse first-remap semantic positions must be non-negative",
+        )
+        torch._assert_async(
+            torch.all(
+                full_semantic_position_blocks
+                < self.req_to_token_pool.req_to_token.shape[1]
+            ),
+            "HiSparse first-remap semantic positions must stay within request rows",
+        )
+        full_logical_blocks = self.req_to_token_pool.req_to_token[
+            first_req_pool_indices[:, None], full_semantic_position_blocks
+        ]
+        expected_mapping_index_blocks = allocator.get_last_loc_compressed(
+            full_logical_blocks
+        ).to(dtype=torch.int64)
+        torch._assert_async(
+            torch.all(expected_mapping_index_blocks == mapping_index_blocks),
+            "HiSparse first-remap key blocks must match allocated request rows",
+        )
+
+        actual_owner_rows = self.req_to_device_buffer[first_req_pool_indices]
+        predicted_owner_rows = actual_owner_rows.clone()
+        actual_destination_vectors = torch.gather(
+            actual_owner_rows,
+            dim=1,
+            index=buffer_positions,
+        )
+        mapped_coordinates = mapping[mapping_index_blocks]
+        torch._assert_async(
+            torch.all(mapped_coordinates >= 0),
+            "HiSparse decode mapping must not contain negative coordinates",
+        )
+        current_coordinates = mapped_coordinates[:, 0]
+        torch._assert_async(
+            torch.all(current_coordinates > 0),
+            "HiSparse first-remap owners must contain positive coordinates",
+        )
+        temporary_page_ids = current_coordinates // device_page_size
+        expected_temporary_blocks = (
+            temporary_page_ids[:, None] * device_page_size + offsets
+        )
+
+        growth_plans = self._plan_device_buffer_growth(
+            first_indices_cpu=first_indices_cpu,
+            mapped_batch_indices_cpu=mapped_batch_indices_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+        )
+        growth_mask_values = [False] * len(first_indices_cpu)
+        for growth in growth_plans:
+            growth_mask_values[growth.first_index] = True
+            mapped_index = first_indices_cpu[growth.first_index]
+            batch_index = mapped_batch_indices_cpu[mapped_index]
+            assert growth.req_pool_idx == int(req_pool_indices_cpu[batch_index])
+            assert 0 <= growth.old_cap < growth.new_cap <= self.padded_buffer_size
+            torch._assert_async(
+                torch.all(actual_owner_rows[growth.first_index, : growth.old_cap] > 0),
+                "HiSparse existing buffer ownership must be positive before growth",
+            )
+            torch._assert_async(
+                torch.all(
+                    actual_owner_rows[
+                        growth.first_index, growth.old_cap : growth.new_cap
+                    ]
+                    == 0
+                ),
+                "HiSparse buffer growth must target an unowned range",
+            )
+        growth_mask = torch.tensor(
+            growth_mask_values,
+            dtype=torch.bool,
+            device=seq_lens.device,
+        )
+
+        replay_mask = (~growth_mask) & torch.all(
+            mapped_coordinates == actual_destination_vectors,
+            dim=1,
+        )
+        transaction_mask = ~replay_mask
+        valid_transaction_blocks = torch.all(
+            mapped_coordinates == expected_temporary_blocks,
+            dim=1,
+        )
+        torch._assert_async(
+            torch.all(replay_mask | valid_transaction_blocks),
+            "HiSparse first-remap found a partial or shared temporary owner",
+        )
+        torch._assert_async(
+            torch.all(actual_destination_vectors[replay_mask] > 0),
+            "HiSparse first-remap replay destinations must remain owned",
+        )
+        torch._assert_async(
+            torch.all(actual_destination_vectors[~growth_mask] > 0),
+            "HiSparse release-only destination vectors must remain owned",
+        )
+
+        transfer_page_ids = temporary_page_ids[growth_mask]
+        sorted_transfer_page_ids = torch.sort(transfer_page_ids).values
+        torch._assert_async(
+            torch.all(sorted_transfer_page_ids[1:] != sorted_transfer_page_ids[:-1]),
+            "HiSparse buffer growth requires one unique temporary page per request",
+        )
+        if transfer_page_ids.numel() > 0:
+            transfer_page_blocks = allocator.materialize_owned_hisparse_page_blocks(
+                owned_page_ids=transfer_page_ids
+            ).reshape(-1, device_page_size)
+        else:
+            transfer_page_blocks = torch.empty(
+                (0, device_page_size),
+                dtype=torch.int64,
+                device=seq_lens.device,
+            )
+        torch._assert_async(
+            torch.all(mapped_coordinates[growth_mask] == transfer_page_blocks),
+            "HiSparse transfer owners must match their complete temporary pages",
+        )
+
+        release_mapping_indices = mapping_index_blocks[
+            transaction_mask & ~growth_mask
+        ].reshape(-1)
+        if release_mapping_indices.numel() > 0:
+            release_page_ids = allocator.collect_owned_hisparse_page_ids(
+                mapping_indices=release_mapping_indices
+            )
+        else:
+            release_page_ids = torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=seq_lens.device,
+            )
+        torch._assert_async(
+            torch.all(~torch.isin(transfer_page_ids, release_page_ids)),
+            "HiSparse transfer and release owner sets must be disjoint",
+        )
+        transaction_page_ids = temporary_page_ids[transaction_mask]
+        buffer_page_ids = torch.div(
+            actual_owner_rows[transaction_mask],
+            device_page_size,
+            rounding_mode="floor",
+        )
+        torch._assert_async(
+            torch.all(~torch.isin(buffer_page_ids, transaction_page_ids)),
+            "HiSparse temporary owners must not alias existing device buffers",
+        )
+        for growth in growth_plans:
+            torch._assert_async(
+                torch.all(
+                    actual_owner_rows[growth.first_index, : growth.old_cap]
+                    // device_page_size
+                    != temporary_page_ids[growth.first_index]
+                ),
+                "HiSparse temporary transfer owners must not alias existing buffers",
+            )
+        release_destination_page_ids = (
+            actual_destination_vectors[transaction_mask & ~growth_mask]
+            // device_page_size
+        )
+        torch._assert_async(
+            torch.all(~torch.isin(release_destination_page_ids, release_page_ids)),
+            "HiSparse release-only destinations must not alias retired owners",
+        )
+
+        total_net_extra = sum(growth.net_extra for growth in growth_plans)
+        if total_net_extra > 0:
+            extra_indices = allocator.hisparse_attn_allocator.alloc(total_net_extra)
+            if extra_indices is None:
+                logger.error(
+                    "HiSparse device buffer net allocation failed (total_net_extra=%d)",
+                    total_net_extra,
+                )
+                raise RuntimeError(
+                    "HiSparse device buffer net allocation failed "
+                    f"(total_net_extra={total_net_extra})"
+                )
+            self._validate_page_blocks(
+                indices=extra_indices,
+                expected_size=total_net_extra,
+                page_size=device_page_size,
+            )
+        else:
+            extra_indices = torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=seq_lens.device,
+            )
+
+        transfer_offset = 0
+        extra_offset = 0
+        for growth in growth_plans:
+            transfer_block = transfer_page_blocks[transfer_offset]
+            transfer_offset += 1
+            predicted_owner_rows[
+                growth.first_index,
+                growth.old_cap : growth.old_cap + device_page_size,
+            ] = transfer_block
+            if growth.net_extra > 0:
+                extra_end = extra_offset + growth.net_extra
+                predicted_owner_rows[
+                    growth.first_index,
+                    growth.old_cap + device_page_size : growth.new_cap,
+                ] = extra_indices[extra_offset:extra_end]
+                extra_offset = extra_end
+        assert transfer_offset == len(growth_plans)
+        assert extra_offset == total_net_extra
+
+        predicted_destination_vectors = torch.gather(
+            predicted_owner_rows,
+            dim=1,
+            index=buffer_positions,
+        )
+        torch._assert_async(
+            torch.all(predicted_destination_vectors > 0),
+            "HiSparse first-remap destination vectors must remain fully owned",
+        )
+        transaction_mapping_indices = mapping_index_blocks[transaction_mask].reshape(-1)
+        if transaction_mapping_indices.numel() > 0:
+            allocator.clear_hisparse_mapping(
+                mapping_indices=transaction_mapping_indices
+            )
+            mapping_page_ids = torch.div(
+                mapping,
+                device_page_size,
+                rounding_mode="floor",
+            )
+            torch._assert_async(
+                torch.all(~torch.isin(mapping_page_ids, transaction_page_ids)),
+                "HiSparse temporary pages must have no mapping aliases before conversion",
+            )
+
+        for growth in growth_plans:
+            committed_chunk = predicted_owner_rows[
+                growth.first_index, growth.old_cap : growth.new_cap
+            ]
+            self.req_to_device_buffer[
+                growth.req_pool_idx, growth.old_cap : growth.new_cap
+            ] = committed_chunk
+            self.req_device_buffer_token_locs[
+                :, growth.req_pool_idx, growth.old_cap : growth.new_cap
+            ] = committed_chunk.to(torch.int32)
+            self.req_device_buffer_size[growth.req_pool_idx] = growth.new_cap
+
+        committed_owner_rows = self.req_to_device_buffer[first_req_pool_indices]
+        committed_destination_vectors = torch.gather(
+            committed_owner_rows,
+            dim=1,
+            index=buffer_positions,
+        )
+        torch._assert_async(
+            torch.all(committed_destination_vectors == predicted_destination_vectors),
+            "HiSparse committed destination vectors must match their prediction",
+        )
+        if release_page_ids.numel() > 0:
+            allocator.release_owned_hisparse_pages(owned_page_ids=release_page_ids)
+        mapping[mapping_index_blocks[transaction_mask]] = committed_destination_vectors[
+            transaction_mask
+        ]
+
+        self._validate_current_page_aligned_mappings(
+            semantic_positions=semantic_positions,
+            mapped_out_cache_loc=mapped_out_cache_loc,
+            mapped_req_pool_indices=mapped_req_pool_indices,
+        )
+
+    def _validate_current_page_aligned_mappings(
+        self,
+        *,
+        semantic_positions: torch.Tensor,
+        mapped_out_cache_loc: torch.Tensor,
+        mapped_req_pool_indices: torch.Tensor,
+    ) -> None:
+        current_buffer_positions = semantic_positions.clamp(max=self.device_buffer_size)
+        current_destination_coordinates = self.req_to_device_buffer[
+            mapped_req_pool_indices, current_buffer_positions
+        ]
+        current_mapping_indices = (
+            self.token_to_kv_pool_allocator.get_last_loc_compressed(
+                mapped_out_cache_loc
+            ).to(dtype=torch.int64)
+        )
+        torch._assert_async(
+            torch.all(current_destination_coordinates > 0),
+            "HiSparse current decode destinations must remain owned",
+        )
+        torch._assert_async(
+            torch.all(
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    current_mapping_indices
+                ]
+                == current_destination_coordinates
+            ),
+            "HiSparse current decode mappings must target their reserved destinations",
+        )
+        self.req_device_buffer_token_locs[
+            :, mapped_req_pool_indices, self.device_buffer_size
+        ] = current_destination_coordinates.to(torch.int32)
+
+    def _plan_device_buffer_growth(
+        self,
+        *,
+        first_indices_cpu: List[int],
+        mapped_batch_indices_cpu: List[int],
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> List[_DeviceBufferGrowthPlanEntry]:
+        if self.is_dsv4_hisparse:
+            return []
+
+        growth_plans: List[_DeviceBufferGrowthPlanEntry] = []
+        for first_index, mapped_index in enumerate(first_indices_cpu):
+            batch_index = mapped_batch_indices_cpu[mapped_index]
+            growth = self._get_device_buffer_growth(
+                first_index=first_index,
+                req_pool_idx=int(req_pool_indices_cpu[batch_index]),
+                seq_len=int(seq_lens_cpu[batch_index]),
+            )
+            if growth is not None:
+                growth_plans.append(growth)
+        return growth_plans
+
+    def _get_device_buffer_growth(
+        self,
+        *,
+        first_index: int,
+        req_pool_idx: int,
+        seq_len: int,
+    ) -> _DeviceBufferGrowthPlanEntry | None:
+        current_cap = int(self.req_device_buffer_size[req_pool_idx])
+        if seq_len > self.device_buffer_size or seq_len <= current_cap:
+            return None
+
+        page_size = self.mem_pool_device.page_size
+        assert seq_len - 1 == current_cap
+        new_cap = min(
+            ((seq_len + page_size - 1) // page_size) * page_size,
+            self.device_buffer_size,
+        )
+        if new_cap == self.device_buffer_size:
+            new_cap = self.padded_buffer_size
+        grow_size = new_cap - current_cap
+        assert grow_size >= page_size
+        assert grow_size % page_size == 0
+        return _DeviceBufferGrowthPlanEntry(
+            first_index=first_index,
+            req_pool_idx=req_pool_idx,
+            old_cap=current_cap,
+            new_cap=new_cap,
+            grow_size=grow_size,
+            net_extra=grow_size - page_size,
+        )
+
+    def _validate_page_blocks(
+        self,
+        *,
+        indices: torch.Tensor,
+        expected_size: int,
+        page_size: int,
+    ) -> None:
+        assert indices.ndim == 1
+        assert indices.dtype == torch.int64
+        assert indices.device == self.req_to_device_buffer.device
+        assert indices.numel() == expected_size
+        assert expected_size % page_size == 0
+        page_rows = indices.reshape(-1, page_size)
+        offsets = torch.arange(
+            page_size,
+            dtype=torch.int64,
+            device=indices.device,
+        )
+        torch._assert_async(
+            torch.all(page_rows[:, 0] % page_size == 0),
+            "HiSparse extra owner pages must be aligned",
+        )
+        torch._assert_async(
+            torch.all(page_rows == page_rows[:, :1] + offsets),
+            "HiSparse extra owner pages must be complete and consecutive",
         )
 
     def _eager_backup_previous_token(
