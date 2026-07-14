@@ -164,7 +164,7 @@ class MambaComponent(TreeComponent):
         best-effort soft limit.
         """
         cap = self.mamba_max_states_per_path
-        if cap <= 0:
+        if cap < 0:
             return
 
         ct = self.component_type

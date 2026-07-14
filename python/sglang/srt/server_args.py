@@ -2028,10 +2028,10 @@ class ServerArgs:
     mamba_max_states_per_path: A[
         int,
         "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(0 disables the cap). After each insert, the shallowest eligible "
+        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
         "interior states beyond the cap are removed while their full KV remains. "
-        "Tail, fork, and locked nodes are preserved.",
-    ] = 0
+        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
+    ] = -1
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
@@ -2816,6 +2816,8 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._validate_mamba_max_states_per_path()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -2979,6 +2981,14 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _validate_mamba_max_states_per_path(self):
+        value = self.mamba_max_states_per_path
+        if value == 0 or value < -1:
+            raise ValueError(
+                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
+                f"integer, got {value}."
+            )
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:

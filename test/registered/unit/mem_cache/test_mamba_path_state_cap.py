@@ -86,10 +86,10 @@ def _build_unified_chain(cap, length=3):
 
 
 class TestMambaPathStateCap(unittest.TestCase):
-    def test_server_arg_is_opt_in(self):
+    def test_server_arg_defaults_to_unlimited(self):
         self.assertEqual(
             ServerArgs(model_path="dummy").mamba_max_states_per_path,
-            0,
+            -1,
         )
 
     def test_server_arg_cli(self):
@@ -101,6 +101,17 @@ class TestMambaPathStateCap(unittest.TestCase):
         )
 
         self.assertEqual(args.mamba_max_states_per_path, 3)
+
+    def test_server_arg_rejects_zero_and_values_below_negative_one(self):
+        for value in (0, -2):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "must be -1 \\(unlimited\\) or a positive integer",
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    mamba_max_states_per_path=value,
+                )
 
     def test_unified_cache_removes_only_shallow_mamba_state(self):
         component, nodes, cache = _build_unified_chain(cap=2)
@@ -150,8 +161,8 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertIsNotNone(mamba_data.host_value)
         self.assertTrue(cache.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
 
-    def test_unified_cache_zero_disables_cap(self):
-        component, nodes, cache = _build_unified_chain(cap=0)
+    def test_unified_cache_negative_one_disables_cap(self):
+        component, nodes, cache = _build_unified_chain(cap=-1)
 
         component._enforce_path_state_cap(nodes[-1])
 
