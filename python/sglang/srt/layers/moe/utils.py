@@ -106,6 +106,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    HUMMING = "humming"
     AITER = "aiter"
 
     def is_auto(self):
@@ -148,6 +149,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_humming(self):
+        return self == MoeRunnerBackend.HUMMING
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
@@ -268,10 +272,11 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
         if dispatcher_output_dtype is not None:
             return DeepEPOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
+    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
+        or get_moe_runner_backend().is_humming()
     ):
         return DeepEPOutputDtype.BF16
 

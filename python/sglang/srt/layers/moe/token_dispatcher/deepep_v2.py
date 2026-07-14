@@ -40,7 +40,7 @@ except (ImportError, OSError) as exc:
 
 if use_deepep_v2:
     try:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
     except (ImportError, OSError) as exc:

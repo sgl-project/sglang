@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     expand_to_masked_slab,
     masked_slab_to_expand,
 )

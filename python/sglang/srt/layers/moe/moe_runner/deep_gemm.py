@@ -184,8 +184,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
-        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
         )
 
@@ -275,7 +275,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             # Hacky byte-equal fallback that reproduces the optimize-branch
             # code path exactly: bf16 silu_and_mul then a separate per-token
             # group fp8 quant. Kept behind the mega-moe-memory flag.
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
 
@@ -583,8 +583,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
 
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
@@ -653,7 +653,7 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
+    from sglang.kernels.ops.moe.ep_moe_kernels import moe_ep_deepgemm_preprocess
 
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
@@ -714,7 +714,7 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_deepgemm
+    from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states_shape = running_state["hidden_states_shape"]
@@ -800,7 +800,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
 
     (
         hidden_states,
@@ -893,7 +893,7 @@ def post_permute_deep_gemm_to_deepep_normal(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
 
     hidden_states = runner_output.hidden_states
@@ -926,8 +926,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     gemm1_clamp_limit: Optional[float] = None,
     num_real_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_8bit,
     )
 
@@ -969,7 +969,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         and G % 4 == 0
         and D % (group_size * 4) == 0
     ):
-        from sglang.srt.layers.moe.ep_moe.kernels import (
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_packed_fwd,
         )
 
@@ -1087,7 +1087,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import (
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
         ep_expand_init_m_indices_from_psum,
         ep_scatter,
         ep_scatter_from_psum,
@@ -1138,7 +1138,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
             # GEMM bounds compute by per-expert real counts (masked_m), decoupled
             # from the dispatch capacity. Static shapes -> cuda-graph safe.
-            from sglang.srt.layers.moe.ep_moe.kernels import expand_to_masked_slab
+            from sglang.kernels.ops.moe.ep_moe_kernels import expand_to_masked_slab
 
             num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
             slab, slab_scale, masked_m = expand_to_masked_slab(
@@ -1270,7 +1270,7 @@ def post_permute_deep_gemm_to_deepep_v2(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPv2CombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
     from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2CombineInput
 
     if running_state.get("deepep_v2_expanded", False):
@@ -1279,7 +1279,7 @@ def post_permute_deep_gemm_to_deepep_v2(
         if running_state.get("deepep_v2_masked", False):
             # Masked path: GEMM output is the [E_local, max_m, hidden] slab. Repack
             # it back to expanded row order (padding rows zeroed) before combine.
-            from sglang.srt.layers.moe.ep_moe.kernels import masked_slab_to_expand
+            from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(
                 hidden_states,

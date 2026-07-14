@@ -44,7 +44,6 @@ GLM_5_1_PD_SEP_DECODE_ENVS = {
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
     "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "HCCL_BUFFSIZE": "200",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
     "TASK_QUEUE_ENABLE": "0",
@@ -194,6 +193,7 @@ class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBa
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 160
 
