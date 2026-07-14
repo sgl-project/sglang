@@ -44,15 +44,14 @@ class HashTopK(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0
-            and get_global_server_args().enable_deepep_waterfill
+        self.enable_waterfill = (
+            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
-        self.deepep_waterfill_balancer = None
+        self.waterfill_balancer = None
 
-        if self.enable_deepep_waterfill:
+        if self.enable_waterfill:
             # Waterfill appends the shared expert after EPLB maps routed IDs.
             topk -= num_fused_shared_experts
             num_fused_shared_experts = 0
@@ -120,18 +119,18 @@ class HashTopK(nn.Module):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_deepep_waterfill(topk_output, num_tokens=0)
+        return self._apply_waterfill(topk_output, num_tokens=0)
 
-    def _apply_deepep_waterfill(
+    def _apply_waterfill(
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
-        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+        if self.enable_waterfill and self.waterfill_balancer is None:
             raise RuntimeError(
-                "DeepEP waterfill HashTopK must be prepared by ModelRunner before forward."
+                "Waterfill HashTopK must be prepared by ModelRunner before forward."
             )
-        if self.deepep_waterfill_balancer is None:
+        if self.waterfill_balancer is None:
             return topk_output
-        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
+        return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
@@ -268,7 +267,7 @@ class HashTopK(nn.Module):
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        topk_output = self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
         if is_hip():
             _zero_topk_weights_padded_region(
                 topk_output.topk_weights, num_token_non_padded

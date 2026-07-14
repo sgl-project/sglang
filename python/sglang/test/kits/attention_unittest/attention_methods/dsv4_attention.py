@@ -34,10 +34,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -334,7 +332,7 @@ class MockDSV4ModelRunner:
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -358,7 +356,6 @@ class MockDSV4ModelRunner:
             is_embedding=False,
             kv_cache_dtype="auto",
             max_running_requests=None,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -369,7 +366,7 @@ class MockDSV4ModelRunner:
             device=device,
             mem_fraction_static=0.8,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -414,6 +411,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self._kernel_warmed_up = True
 
     @property

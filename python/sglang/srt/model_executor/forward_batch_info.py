@@ -32,10 +32,11 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -48,9 +49,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.model_executor.triton_ops.position import compute_position_triton
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -286,6 +285,9 @@ class NgramEmbeddingInfo:
     req_lens: torch.Tensor
     out_column_starts: torch.Tensor
     out_req_lens: torch.Tensor
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the token table.
+    skip_token_table_update: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -295,6 +297,7 @@ class NgramEmbeddingInfo:
         device: torch.device,
         column_starts=None,
         req_lens=None,
+        skip_token_table_update=None,
     ) -> NgramEmbeddingInfo:
         info = cls(
             token_table=token_table,
@@ -302,6 +305,7 @@ class NgramEmbeddingInfo:
             req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            skip_token_table_update=skip_token_table_update,
         )
         if column_starts is not None:
             info.column_starts[:] = column_starts
@@ -316,6 +320,11 @@ class NgramEmbeddingInfo:
             req_lens=self.req_lens[:bs],
             out_column_starts=self.out_column_starts[:bs],
             out_req_lens=self.out_req_lens[:bs],
+            skip_token_table_update=(
+                self.skip_token_table_update[:bs]
+                if self.skip_token_table_update is not None
+                else None
+            ),
         )
 
 
@@ -434,6 +443,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
+
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
@@ -490,9 +501,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
-
-    # For padding
-    padded_static_len: int = -1  # -1 if not padded
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -900,7 +908,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_global_server_args().enable_mis and any(
+            if get_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1003,6 +1011,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
             column_starts=column_starts,
             req_lens=req_lens,
+            skip_token_table_update=batch.ne_skip_token_table_update,
         )
 
     def compute_spec_mrope_positions(
@@ -1044,6 +1053,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_input: MultimodalInputs,
         seq_len: int,
     ) -> torch.Tensor:
+        # Some generation models precompute decode positions for future tokens.
+        # For example, GLM-Image needs 2D spatial MRoPE positions instead of
+        # sequential delta-based positions.
+        # This is needed for image generation models (e.g. GlmImage) where
+        # decode tokens require 2D spatial MRoPE positions, not sequential.
+        if (
+            mm_input.mrope_positions is not None
+            and mm_input.mrope_positions.shape[1] >= seq_len
+        ):
+            pos = mm_input.mrope_positions[:, seq_len - 1 : seq_len]
+            return pos
+
         # doing below compute on cpu to avoid frequent small kernels
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (
@@ -1056,14 +1077,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
+        rl_on_policy_target = get_server_args().rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if (
-                    mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
-                ):
+                if mm_input is None or rl_on_policy_target is not None:
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -1079,10 +1098,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     batch.extend_lens[batch_idx],
                     batch.prefix_lens[batch_idx],
                 )
-                if (
-                    mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
-                ):
+                if mm_input is None or rl_on_policy_target is not None:
                     # text only
                     mrope_positions = torch.tensor(
                         [
@@ -1158,6 +1174,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        # Prefill breakable CUDA graph requires every DP rank to run the SAME
+        # captured shape. Under SUM_LEN each rank pads to its own local token
+        # count and can select a different capture bucket, so the in-graph DP
+        # collectives (all_gather / reduce_scatter) mismatch across ranks and
+        # corrupt the output. Force MAX_LEN so every rank pads to the global
+        # max and picks the same bucket (mirrors the decode cuda graph
+        # contract, which always runs MAX_LEN).
+        #
+        # Only force MAX_LEN when the batch fits a captured breakable prefill
+        # graph; larger prefills fall back to eager and keep the
+        # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
+        # (all-gathered), so the decision is consistent cluster-wide.
+        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        if (
+            self.can_run_dp_breakable_cuda_graph
+            and self.is_extend_in_batch
+            and prefill_cg.bs
+            and max(global_num_tokens) <= max(prefill_cg.bs)
+        ):
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1214,7 +1250,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                if hybrid_ssm:
+                # Fabricate a single dummy request covering num_tokens for an
+                # empty (idle) rank. Hybrid-SSM families always take this path;
+                # non-hybrid ranks reach it once MAX_LEN is forced for the
+                # prefill breakable CUDA graph (idle + prefill), which needs
+                # every DP rank to run the same captured shape. The `else`
+                # branch handles decode rows padded to a 1-token extend.
+                if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert (
                         self.seq_lens.shape[0] == 0
@@ -1232,6 +1274,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.seq_lens = torch.tensor(
                         [num_tokens], dtype=self.seq_lens.dtype, device=dev
                     )
+                    # orig_seq_lens is not padded by _pad_inputs_to_size, so
+                    # fabricate it to match the dummy request (the breakable
+                    # prefill CUDA graph runner reads it).
+                    self.orig_seq_lens = torch.tensor(
+                        [num_tokens], dtype=self.orig_seq_lens.dtype, device=dev
+                    )
                     self.seq_lens_sum = int(num_tokens)
                     if self.seq_lens_cpu is not None:
                         self.seq_lens_cpu = torch.tensor(
@@ -1241,6 +1289,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
+                    # Count the dummy tokens as real, else MoE topk/all-to-all
+                    # treats this rank as empty and starves later layers.
+                    # (num_token_non_padded is None unless moe_ep_size > 1.)
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
                 else:
                     self.extend_num_tokens = bs
                     self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
@@ -1248,8 +1302,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_start_loc = torch.arange(
                         bs, dtype=torch.int32, device=self.seq_lens.device
                     )
-                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
-                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
@@ -1283,7 +1337,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
-        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.lora_ids is not None:
+            self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -1398,22 +1453,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.req_pool_indices = self.req_pool_indices[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):

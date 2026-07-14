@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from enum import Enum, auto
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -39,11 +38,27 @@ NixlEPCombineInput = DeepEPLLCombineInput
 
 
 class NixlEPBuffer:
-    _buffer = None
-    _hidden_size: Optional[int] = None
-    _num_max_dispatch_tokens_per_rank: Optional[int] = None
-    _num_experts: Optional[int] = None
-    _num_local_experts: Optional[int] = None
+    """Managing facade for the process-wide NIXL EP buffer; the state itself
+    lives on ``ctx.resources``."""
+
+    @classmethod
+    def _state(cls):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        state = buffers.get("nixl_ep_state")
+        if state is None:
+            state = SimpleNamespace(
+                buffer=None,
+                hidden_size=None,
+                num_max_dispatch_tokens_per_rank=None,
+                num_experts=None,
+                num_local_experts=None,
+            )
+            buffers["nixl_ep_state"] = state
+        return state
 
     @classmethod
     def get_nixl_buffer(
@@ -55,13 +70,14 @@ class NixlEPBuffer:
         num_experts: int = -1,
         num_local_experts: int = -1,
     ):
-        if cls._buffer is not None:
-            return cls._buffer
+        state = cls._state()
+        if state.buffer is not None:
+            return state.buffer
 
-        cls._hidden_size = hidden_size
-        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        cls._num_experts = num_experts
-        cls._num_local_experts = num_local_experts
+        state.hidden_size = hidden_size
+        state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        state.num_experts = num_experts
+        state.num_local_experts = num_local_experts
 
         num_rdma_bytes = 0
         if deepep_mode.enable_normal():
@@ -89,30 +105,31 @@ class NixlEPBuffer:
 
         logger.info(
             f"Using NIXL EP (world_size={world_size}, rank={rank}, "
-            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts}) "
+            f"num_experts={state.num_experts}, num_experts_per_rank={state.num_local_experts}) "
         )
 
-        cls._buffer = Buffer(
+        state.buffer = Buffer(
             rank=rank,
             tcp_store_group=tcp_store,
         )
 
-        cls._buffer.update_memory_buffers(
+        state.buffer.update_memory_buffers(
             num_ranks=world_size,
-            num_experts_per_rank=cls._num_local_experts,
+            num_experts_per_rank=state.num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
         all_ranks = list(range(world_size))
-        cls._buffer.connect_ranks(all_ranks)
+        state.buffer.connect_ranks(all_ranks)
 
-        return cls._buffer
+        return state.buffer
 
     @classmethod
     def clean_buffer(cls):
-        cls._buffer.clean_buffer(
-            cls._num_max_dispatch_tokens_per_rank,
-            cls._hidden_size,
-            cls._num_experts,
+        state = cls._state()
+        state.buffer.clean_buffer(
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
         )
 
 

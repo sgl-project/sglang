@@ -85,6 +85,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         self.use_per_token_activation = True
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
+        self.dequant_fp4_to_fp8 = False
         self.activation_scheme = activation_scheme
         self.weight_block_size = weight_block_size
         self.use_mxfp8 = use_mxfp8
@@ -224,7 +225,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight.contiguous(),
             1.0 / weight_scale_2,
             sfLayout=SfLayout.layout_linear,
-            backend="cuda",
+            backend="cute-dsl",
         )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)

@@ -113,12 +113,12 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        self.num_tokens_per_bs = self.topk
+        self.num_tokens_per_req = self.topk
         self.capture_bs, _ = get_batch_sizes_to_capture(
-            model_runner, self.num_tokens_per_bs
+            model_runner, self.num_tokens_per_req
         )
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.num_tokens_per_req
 
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
         self.seq_len_fill_value = (
@@ -227,7 +227,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         del forward, stream_idx, variant_label
         buffers = self.buffers
         request_bs = size
-        expanded_bs = request_bs * self.num_tokens_per_bs
+        expanded_bs = request_bs * self.num_tokens_per_req
 
         req_pool_indices = buffers.req_pool_indices[:expanded_bs]
         positions = buffers.positions[:expanded_bs]
@@ -362,7 +362,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         raw_expanded_bs = forward_batch.batch_size
         raw_bs = (
-            raw_expanded_bs // self.num_tokens_per_bs
+            raw_expanded_bs // self.num_tokens_per_req
             if self.topk > 1
             else raw_expanded_bs
         )
@@ -371,13 +371,13 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = max_num_tokens // (
-                self.num_tokens_per_bs * self.num_tokens_per_bs
+                self.num_tokens_per_req * self.num_tokens_per_req
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
-        expanded_bs = bs * self.num_tokens_per_bs
+        expanded_bs = bs * self.num_tokens_per_req
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.positions.zero_()
