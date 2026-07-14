@@ -467,6 +467,44 @@ class AnthropicServing:
                     if image_part is not None:
                         content_parts.append(image_part)
 
+                elif block.type == "document":
+                    # Local models cannot natively parse binary PDF content.
+                    # We do a best-effort conversion:
+                    #   - text source  → pass the text directly
+                    #   - base64/url   → emit a notice so the model knows a
+                    #                    document was provided but cannot be read
+                    doc_text_parts = []
+                    if block.title:
+                        doc_text_parts.append(f"[Document title: {block.title}]")
+                    if block.context:
+                        doc_text_parts.append(f"[Document context: {block.context}]")
+
+                    source = block.source
+                    if source is not None:
+                        if isinstance(source, BaseModel):
+                            source = source.model_dump(exclude_none=True)
+                        if isinstance(source, dict):
+                            src_type = source.get("type")
+                            if src_type == "text":
+                                text_data = source.get("text") or source.get("data", "")
+                                if text_data:
+                                    doc_text_parts.append(text_data)
+                            elif src_type == "base64":
+                                media_type = source.get("media_type", "application/octet-stream")
+                                doc_text_parts.append(
+                                    f"[Binary document ({media_type}) provided as base64; "
+                                    "content cannot be decoded by this model.]"
+                                )
+                            elif src_type == "url":
+                                url = source.get("url", "")
+                                if url:
+                                    doc_text_parts.append(f"[Document URL: {url}]")
+
+                    if doc_text_parts:
+                        content_parts.append(
+                            {"type": "text", "text": "\n".join(doc_text_parts)}
+                        )
+
                 elif block.type == "search_result":
                     search_text = _text_from_search_result(block.model_dump())
                     if search_text:
