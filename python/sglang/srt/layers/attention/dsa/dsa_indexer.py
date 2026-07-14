@@ -1102,6 +1102,7 @@ class Indexer(MultiPlatformOp):
         if _is_xpu:
             # On XPU, use total_mem budget as the free-memory estimate;
             # dynamic free-memory query is not supported the same way as CUDA.
+            # TODO Use torch.xpu.mem_get_info() when available (planned end of 2026).
             budget_bytes = static_budget
         else:
             free_mem, _ = torch.cuda.mem_get_info(device_index)

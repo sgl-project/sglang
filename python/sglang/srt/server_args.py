@@ -3925,7 +3925,7 @@ class ServerArgs:
                     reserved_mem = max(reserved_mem, 10 * 1024)
                 # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
                 reserved_mem += self.reserve_for_deepep_a2a_mb()
-                # XPU (Intel GPU): oneDNN allocates scratch space for matmul when
+                # XPU: oneDNN allocates scratch space for matmul when
                 # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
                 # headroom so non-aligned prefill lengths don't hit OOM.
                 if is_xpu():
