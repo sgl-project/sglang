@@ -703,6 +703,8 @@ def fused_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     num_fused_shared_experts: int = 0,
+    packed_out: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     if num_fused_shared_experts != 0:
         raise ValueError(
@@ -712,6 +714,10 @@ def fused_topk_cpu(
         raise ValueError(
             "apply_routed_scaling_factor_on_output is not supported for CPU fused topk"
         )
+    if packed_out is not None:
+        raise ValueError("packed_out is not supported for CPU fused topk")
+    if num_token_non_padded is not None:
+        raise ValueError("num_token_non_padded is not supported for CPU fused topk")
 
     # TODO: add c++ kernel for cpu
     # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
