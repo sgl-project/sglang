@@ -958,6 +958,27 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_mla_host_dedup_is_opt_in(self):
+        self.assertFalse(ServerArgs(model_path="dummy").enable_mla_hicache_host_dedup)
+        self.assertTrue(
+            ServerArgs(
+                model_path="dummy", enable_mla_hicache_host_dedup=True
+            ).enable_mla_hicache_host_dedup
+        )
+
+    def test_mla_host_dedup_rejects_dsa_cache_layer_split(self):
+        args = self._make_args(
+            enable_mla_hicache_host_dedup=True,
+            enable_dsa_cache_layer_split=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-mla-hicache-host-dedup cannot be used with "
+            "--enable-dsa-cache-layer-split",
+        ):
+            args._handle_hicache()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
