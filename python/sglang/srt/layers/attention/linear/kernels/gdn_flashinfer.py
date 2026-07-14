@@ -10,6 +10,7 @@ Requires flashinfer >= 0.6.7.
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -20,6 +21,15 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FlashInferGDNExtendPrep:
+    """FlashInfer metadata shared by all GDN layers in an extend forward."""
+
+    ssm_cache_indices: torch.Tensor
+    cu_seqlens: torch.Tensor
+
 
 # ---------------------------------------------------------------------------
 # Lazy import for FlashInfer GDN kernels
@@ -220,6 +230,31 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     # ---- extend (prefill) ----
 
+    def build_extend_prep(
+        self,
+        *,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_pool_size: int,
+    ) -> FlashInferGDNExtendPrep:
+        if self.use_state_pool:
+            # Negative indices are padding markers; slot 0 is reserved for them.
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+            cu_seqlens = query_start_loc
+        else:
+            # SM90 uses the last pool slot as its padding sentinel and requires
+            # int64 sequence offsets.
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                state_pool_size - 1,
+            ).to(torch.int64)
+            cu_seqlens = query_start_loc.to(torch.int64)
+        return FlashInferGDNExtendPrep(
+            ssm_cache_indices=ssm_cache_indices,
+            cu_seqlens=cu_seqlens,
+        )
+
     def extend(
         self,
         q: torch.Tensor,
@@ -231,6 +266,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        prep: Optional[FlashInferGDNExtendPrep] = None,
         **kwargs,
     ) -> tuple:
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
@@ -247,11 +283,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
+        if prep is None:
+            # Preserve direct-call behavior; the backend supplies one shared prep.
+            prep = self.build_extend_prep(
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                state_pool_size=ssm_states.shape[0],
+            )
+        ssm_cache_indices = prep.ssm_cache_indices
+
         if self.use_state_pool:
-            # Negative indices (e.g. -1) are padding markers for slots not yet
-            # assigned to a real sequence; clamp them to 0 (the reserved dummy
-            # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
             initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
             # Pre-allocate bf16 output_state so the kernel compiles and writes the
             # bf16 state path directly, avoiding a fp32 allocation and a subsequent
@@ -266,17 +307,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=None,
                 initial_state=initial_state_fi,
                 output_final_state=True,
-                cu_seqlens=query_start_loc,  # already int32
+                cu_seqlens=prep.cu_seqlens,
                 use_qk_l2norm_in_kernel=False,
                 output_state=output_state_fi,
             )
         else:
-            # SM90: preserve original negative-index handling (remap to last slot).
-            ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                ssm_states.shape[0] - 1,
-            ).to(torch.int64)
             # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
             output_fi, output_state_fi = self._prefill_fn(
@@ -288,7 +323,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=None,
                 initial_state=initial_state_fi,
                 output_final_state=True,
-                cu_seqlens=query_start_loc.to(torch.int64),
+                cu_seqlens=prep.cu_seqlens,
                 use_qk_l2norm_in_kernel=False,
             )
 

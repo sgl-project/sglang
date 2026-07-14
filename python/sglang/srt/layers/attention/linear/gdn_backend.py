@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -31,6 +32,13 @@ if is_cuda() or is_hip():
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _GDNExtendContext:
+    has_initial_states: torch.Tensor
+    kernel_prep: object | None
+
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -265,8 +273,11 @@ class GDNKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        prep: object | None = None,
         **kwargs,
     ) -> tuple:
+        if prep is not None:
+            kwargs["prep"] = prep
         return self.extend_kernel.extend(
             q,
             k,
@@ -277,6 +288,19 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             **kwargs,
+        )
+
+    def build_extend_prep(
+        self,
+        *,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_pool_size: int,
+    ) -> object | None:
+        return self.extend_kernel.build_extend_prep(
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            state_pool_size=state_pool_size,
         )
 
     def target_verify(
@@ -335,12 +359,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self._extend_context: Optional[_GDNExtendContext] = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._extend_context = None
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -473,8 +499,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache_params.intermediate_conv_window[0]
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
-        else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -499,6 +523,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
+
+        if not is_target_verify:
+            if self._extend_context is None:
+                # State-pool layout is shared by all GDN layers, so the first
+                # layer can prepare layout-dependent metadata for the forward.
+                self._extend_context = _GDNExtendContext(
+                    has_initial_states=forward_batch.extend_prefix_lens > 0,
+                    kernel_prep=self.kernel_dispatcher.build_extend_prep(
+                        cache_indices=state_cache_indices,
+                        query_start_loc=query_start_loc,
+                        state_pool_size=ssm_states_contig.shape[0],
+                    ),
+                )
+            extend_context = self._extend_context
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -536,7 +574,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.bias,
                 activation=layer.activation,
                 conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
+                has_initial_state=extend_context.has_initial_states,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
@@ -592,6 +630,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                prep=extend_context.kernel_prep,
             )
 
             if is_npu() and last_recurrent_state is not None:
