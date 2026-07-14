@@ -741,6 +741,10 @@ class Envs:
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
     SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Q8KV8 born-fp8 q-prep codegen: "auto" = per-K Triton dispatch (default);
+    # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
+    # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
+    SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
