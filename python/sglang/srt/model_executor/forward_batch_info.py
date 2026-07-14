@@ -459,6 +459,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Mixed-chunk: number of decode tokens at the batch tail (from
+    # ScheduleBatch.mix_with_running); None for non-mixed batches.
+    num_mixed_decode_tokens: Optional[int] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
@@ -711,6 +714,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            num_mixed_decode_tokens=batch.num_mixed_decode_tokens,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
