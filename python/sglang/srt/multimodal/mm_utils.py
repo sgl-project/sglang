@@ -434,17 +434,13 @@ class DpEncoderDispatch:
 
     def tp_size(self) -> int:
         try:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
-
-            return get_attention_tp_size()
+            return get_parallel().attn_tp_size
         except Exception:
             return 1
 
     def tp_rank(self) -> int:
         try:
-            from sglang.srt.layers.dp_attention import get_attention_tp_rank
-
-            return get_attention_tp_rank()
+            return get_parallel().attn_tp_rank
         except Exception:
             return 0
 
