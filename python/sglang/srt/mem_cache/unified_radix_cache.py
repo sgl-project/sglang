@@ -587,7 +587,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_last_device_node,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -595,7 +594,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_last_device_node,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -851,13 +849,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Repoint by full-attention residency, not the SWA-window-safe match.
-        # A reused prefix can remain full-resident after its SWA window is
-        # tombstoned, so the window-safe match may be shorter than the KV
-        # indices that must be preserved.
-        match_result = self.match_prefix(
-            MatchPrefixParams(key=radix_key, return_full_match=True)
-        )
+        # Match prefix
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -904,9 +897,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> tuple[
-        list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, UnifiedTreeNode
-    ]:
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -917,9 +908,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
-        # Deepest device-resident full-attention node. Component validators can
-        # cap the normal match earlier when SWA is tombstoned.
-        full_last_device_node = node
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
             validators = tuple(
@@ -966,13 +954,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
-                    full_last_device_node = node
                 _update_best_if_valid(node)
                 break
 
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
-                full_last_device_node = child
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -984,7 +970,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_last_device_node,
         )
 
     def _match_post_processor(
@@ -994,7 +979,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
-        full_last_device_node: UnifiedTreeNode,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -1018,22 +1002,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             else best_match_device_node
         )
 
-        if params.return_full_match:
-            # Decode-side repointing needs all full-attention KV indices. Keep
-            # the window-safe length for component finalization below.
-            device_indices = (
-                torch.cat(value) if value else self._empty_match_result.device_indices
-            )
-            last_device_node = full_last_device_node
-        elif best_match_device_value_len > 0:
+        if best_match_device_value_len > 0:
             device_indices = torch.cat(value[:best_match_device_value_len])
-            last_device_node = best_match_device_node
         else:
             device_indices = self._empty_match_result.device_indices
-            last_device_node = best_match_device_node
         result = MatchResult(
             device_indices=device_indices,
-            last_device_node=last_device_node,
+            last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,

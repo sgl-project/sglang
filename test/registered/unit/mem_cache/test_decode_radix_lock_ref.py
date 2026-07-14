@@ -96,6 +96,19 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
 class TestDecodeLockRefScenarios(unittest.TestCase):
     """Test lock_ref balance across decode transfer scenarios."""
 
+    def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue.scheduler = MagicMock(sliding_window_size=127)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+
+        tail_len = queue._swa_tail_len(895)
+
+        self.assertEqual(tail_len, 191)
+        swa_start = 895 - tail_len
+        radix_key_len = (895 // 64) * 64
+        self.assertGreaterEqual(radix_key_len - swa_start, 127)
+
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""
         cache.insert(

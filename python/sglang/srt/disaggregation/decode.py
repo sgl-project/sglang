@@ -399,7 +399,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return seq_len
 
         page_size = self.token_to_kv_pool_allocator.page_size
-        window_start = max(0, seq_len - window_size)
+        # Match the radix-cache eviction margin: keep enough SWA before the
+        # page-aligned insert boundary for the cached key to contain a complete
+        # window. `seq_len - 1` is the last committed position.
+        window_start = max(0, seq_len - 1 - max(window_size, page_size))
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
 
