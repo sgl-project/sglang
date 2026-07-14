@@ -253,7 +253,7 @@ class MambaCheckpointPool:
         for i, c in enumerate(self.conv):
             src = cache.conv[i][:, active_slots]
             if _is_npu:
-                src = src.permute(0, 1, 3, 2)
+                src = src.transpose(2, 3)
             c[:, ckpt_slots] = src
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
@@ -264,7 +264,7 @@ class MambaCheckpointPool:
         for i, c in enumerate(self.conv):
             src = c[:, ckpt_slots].to(cache.conv[i].dtype)
             if _is_npu:
-                src = src.permute(0, 1, 3, 2)
+                src = src.transpose(2, 3) 
             cache.conv[i][:, active_slots] = src
 
     @staticmethod
