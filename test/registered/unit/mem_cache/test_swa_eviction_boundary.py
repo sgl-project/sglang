@@ -108,9 +108,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         cache_protected_len=cache_protected_len,
         kv=SimpleNamespace(
             kv_allocated_len=(
-                (len(token_ids) + tree.page_size - 1)
-                // tree.page_size
-                * tree.page_size
+                (len(token_ids) + tree.page_size - 1) // tree.page_size * tree.page_size
             ),
             swa_evicted_seqlen=0,
         ),

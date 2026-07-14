@@ -98,9 +98,7 @@ class PureSWARadixCache(RadixCache):
         swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
         if swa_evict_floor > 0:
-            swa_evict_floor = (
-                -(-swa_evict_floor // allocator_page) * allocator_page
-            )
+            swa_evict_floor = -(-swa_evict_floor // allocator_page) * allocator_page
 
         if swa_evict_floor > 0 or swa_evicted_seqlen > swa_evict_floor:
             insert_end = min(swa_evict_floor, keys_len)

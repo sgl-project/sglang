@@ -190,9 +190,7 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // allocator_page * allocator_page
-        page_aligned_overall_len = (
-            kv_len_to_handle // allocator_page * allocator_page
-        )
+        page_aligned_overall_len = kv_len_to_handle // allocator_page * allocator_page
 
         if is_insert:
             new_prefix_len = self._insert(
@@ -213,9 +211,7 @@ class RadixCacheCpp(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
-        return CacheFinishedReqResult(
-            unhandled_kv_start=page_aligned_overall_len
-        )
+        return CacheFinishedReqResult(unhandled_kv_start=page_aligned_overall_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
