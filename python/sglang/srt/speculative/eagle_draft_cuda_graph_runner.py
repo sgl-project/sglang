@@ -446,11 +446,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
@@ -665,6 +667,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+        if self.buffers.dsa_seed_topk is not None:
+            forward_batch.spec_info.dsa_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
