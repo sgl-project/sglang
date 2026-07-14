@@ -144,7 +144,7 @@ class HiSparseCoordinator:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-        self.active_reqs = {}
+        self.active_hisparse_reqs = {}
         self.token_to_kv_pool_allocator.set_demote_until_hisparse_available(
             self.demote_until_hisparse_available
         )
@@ -264,8 +264,8 @@ class HiSparseCoordinator:
 
         candidates = [
             req
-            for req_idx, req in self.active_reqs.items()
-            if int(self.req_device_buffer_size[req_idx]) == 0
+            for req_idx, req in self.active_hisparse_reqs.items()
+            if req.hisparse_resident
             and self.host_token_len(req.kv_allocated_len)
             > self._device_buffer_alloc_size(req.kv_allocated_len)
         ]
@@ -284,8 +284,8 @@ class HiSparseCoordinator:
         available = allocator.available_size()
         reclaimable = 0
         page_size = self.mem_pool_device.page_size
-        for req_idx, req in self.active_reqs.items():
-            if int(self.req_device_buffer_size[req_idx]) > 0:
+        for req_idx, req in self.active_hisparse_reqs.items():
+            if not req.hisparse_resident:
                 continue
             host_len = self.host_token_len(req.kv_allocated_len)
             alloc_size = self._device_buffer_alloc_size(req.kv_allocated_len)
@@ -371,6 +371,7 @@ class HiSparseCoordinator:
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
+        req.hisparse_resident = False
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.extend_range.end
@@ -440,7 +441,7 @@ class HiSparseCoordinator:
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
-        self.active_reqs[req.req_pool_idx] = req
+        self.active_hisparse_reqs[req.req_pool_idx] = req
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def host_token_len(self, kv_allocated_len: int) -> int:
@@ -509,6 +510,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        req.hisparse_resident = False
 
     def _grow_device_buffers(
         self,
@@ -609,7 +611,8 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
-            self.active_reqs[req.req_pool_idx] = req
+            req.hisparse_resident = True
+            self.active_hisparse_reqs[req.req_pool_idx] = req
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
@@ -642,9 +645,17 @@ class HiSparseCoordinator:
         active_req_pool_indices = req_pool_indices[active_pos_tensor]
         active_req_pool_indices_cpu = req_pool_indices_cpu[active_positions]
 
-        swap_mask = self.req_device_buffer_size[active_req_pool_indices_cpu] > 0
-        swap_positions = torch.where(swap_mask)[0].tolist()
-        resident_positions = torch.where(~swap_mask)[0].tolist()
+        active_req_indices = active_req_pool_indices_cpu.tolist()
+        resident_positions = [
+            i
+            for i, req_idx in enumerate(active_req_indices)
+            if self.active_hisparse_reqs[int(req_idx)].hisparse_resident
+        ]
+        swap_positions = [
+            i
+            for i, req_idx in enumerate(active_req_indices)
+            if not self.active_hisparse_reqs[int(req_idx)].hisparse_resident
+        ]
 
         if resident_positions:
             resident_seq_lens_cpu = active_seq_lens_cpu[resident_positions]
@@ -656,9 +667,16 @@ class HiSparseCoordinator:
                 need_tokens = num_new_pages * allocator.page_size
                 if not self.demote_until_hisparse_available(need_tokens):
                     raise RuntimeError("HiSparse dynamic decode allocation failed")
-                swap_mask = self.req_device_buffer_size[active_req_pool_indices_cpu] > 0
-                swap_positions = torch.where(swap_mask)[0].tolist()
-                resident_positions = torch.where(~swap_mask)[0].tolist()
+                resident_positions = [
+                    i
+                    for i, req_idx in enumerate(active_req_indices)
+                    if self.active_hisparse_reqs[int(req_idx)].hisparse_resident
+                ]
+                swap_positions = [
+                    i
+                    for i, req_idx in enumerate(active_req_indices)
+                    if not self.active_hisparse_reqs[int(req_idx)].hisparse_resident
+                ]
                 resident_seq_lens_cpu = active_seq_lens_cpu[resident_positions]
                 num_new_pages = int(
                     (resident_seq_lens_cpu % allocator.page_size == 1)
@@ -751,7 +769,7 @@ class HiSparseCoordinator:
         resident_backup_indices = [
             j
             for j, i in enumerate(backup_indices)
-            if int(self.req_device_buffer_size[int(req_pool_indices_cpu[i])]) == 0
+            if self.active_hisparse_reqs[int(req_pool_indices_cpu[i])].hisparse_resident
         ]
         if resident_backup_indices:
             resident_positions = torch.tensor(
@@ -929,6 +947,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
+        req.hisparse_resident = False
 
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
@@ -958,7 +977,7 @@ class HiSparseCoordinator:
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
-        is_resident_req = current_cap == 0
+        is_resident_req = req.hisparse_resident
         if current_cap > 0 or (self.is_dsv4_hisparse and is_resident_req):
             allocated_locs = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :allocated_len
@@ -996,7 +1015,8 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        self.active_reqs.pop(req.req_pool_idx, None)
+        req.hisparse_resident = False
+        self.active_hisparse_reqs.pop(req.req_pool_idx, None)
 
     def swap_in_selected_pages(
         self,
