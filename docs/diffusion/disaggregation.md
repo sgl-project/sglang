@@ -131,22 +131,36 @@ transferred.
 
 ```bash
 # Two terminal workers, each on two devices with SP=2
-sglang serve --model-path /models/GLM-Image --disagg-role denoiser \
+sglang serve --model-path /home/weights/zai-org/GLM-Image/ --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19001 \
   --num-gpus 2 --base-gpu-id 0 --denoiser-sp 2 \
   --cfg-parallel-size 1 --batching-max-size 2 --attention-backend fa
 
-sglang serve --model-path /models/GLM-Image --disagg-role denoiser \
+sglang serve --model-path /home/weights/zai-org/GLM-Image/ --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19002 \
   --num-gpus 2 --base-gpu-id 2 --denoiser-sp 2 \
   --cfg-parallel-size 1 --batching-max-size 2 --attention-backend fa
 
 # Public head; --encoder-urls and --decoder-urls are intentionally omitted
-sglang serve --model-path /models/GLM-Image --disagg-role server \
+sglang serve --model-path /home/weights/zai-org/GLM-Image/ --disagg-role server \
   --srt-encoder-url http://127.0.0.1:30020 \
   --denoiser-urls "tcp://127.0.0.1:19001;tcp://127.0.0.1:19002" \
   --batching-mode dynamic --batching-max-size 4 --batching-delay-ms 10 \
   --host 0.0.0.0 --port 30010 --scheduler-port 19655
+
+sglang serve \
+	--model-path /home/weights/zai-org/GLM-Image/vision_language_encoder/ \
+	--tokenizer-path /home/weights/zai-org/GLM-Image/processor/ \
+	--enable-multimodal \
+	--cuda-graph-bs 4 \
+	--device npu \
+	--attention-backend ascend \
+	--disable-fast-image-processor \
+	--tp-size 2 \
+	--host 0.0.0.0 \
+	--port 30020 \
+    --num-gpus 2 --base-gpu-id 4 \
+	--mem-fraction-static 0.8
 ```
 
 With four compatible requests, the head sends one batch of four to the AR

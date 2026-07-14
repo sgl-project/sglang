@@ -579,6 +579,7 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder result: scheduler_port + 3
     """
     configure_logger(server_args)
+    set_global_server_args(server_args)
 
     is_glm_ar_fanout = (
         type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
