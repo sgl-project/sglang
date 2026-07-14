@@ -253,9 +253,8 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
 
-    # The recv skipper reads this off `last_batch`, which for PREBUILT batches
-    # is the prebuilt batch itself (not its inner idle batch), so set it on
-    # `local_batch` rather than `batch_to_gather`.
+    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
+    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and not skip_all_gather:
         local_batch.global_forward_modes = mlp_sync_info.global_forward_modes
 

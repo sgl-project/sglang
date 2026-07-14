@@ -22,17 +22,12 @@ def _server_args(interval, enable_dp_attention=False):
     )
 
 
-def _fake_scheduler(enable_dp_attention, last_batch):
-    return SimpleNamespace(
+def _last_forward_mode(enable_dp_attention, last_batch):
+    fake_scheduler = SimpleNamespace(
         server_args=SimpleNamespace(enable_dp_attention=enable_dp_attention),
         last_batch=last_batch,
     )
-
-
-def _last_forward_mode(enable_dp_attention, last_batch):
-    return Scheduler._recv_skipper_last_forward_mode(
-        _fake_scheduler(enable_dp_attention, last_batch)
-    )
+    return Scheduler._recv_skipper_last_forward_mode(fake_scheduler)
 
 
 class TestSchedulerRecvSkipper(CustomTestCase):
@@ -41,13 +36,24 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         self.assertIsNone(SchedulerRecvSkipper.maybe_create(_server_args(1)))
 
     def test_enabled_under_dp_attention(self):
-        # Regression: previously this asserted `not enable_dp_attention` and
-        # crashed at startup. It must now construct successfully -- the
-        # scheduler feeds it a mode derived from the gathered per-rank modes.
+        # Regression: the constructor used to assert `not enable_dp_attention`.
         skipper = SchedulerRecvSkipper.maybe_create(
             _server_args(50, enable_dp_attention=True)
         )
         self.assertIsNotNone(skipper)
+
+    def test_decode_accumulates_until_threshold(self):
+        # DECODE weight = 1: recv only every `interval` decode steps.
+        skipper = SchedulerRecvSkipper.maybe_create(_server_args(3))
+        self.assertFalse(skipper.handle(ForwardMode.DECODE))  # counter 1
+        self.assertFalse(skipper.handle(ForwardMode.DECODE))  # counter 2
+        self.assertTrue(skipper.handle(ForwardMode.DECODE))  # counter 3 -> recv, reset
+        self.assertFalse(skipper.handle(ForwardMode.DECODE))  # counter 1 again
+
+    def test_prefill_triggers_recv_immediately(self):
+        # Non-decode passes use the large default weight: recv right away.
+        skipper = SchedulerRecvSkipper.maybe_create(_server_args(50))
+        self.assertTrue(skipper.handle(ForwardMode.EXTEND))
 
     def test_derive_global_forward_mode(self):
         derive = SchedulerRecvSkipper.derive_global_forward_mode
@@ -58,8 +64,7 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         prebuilt = ForwardMode.PREBUILT.value
         verify = ForwardMode.TARGET_VERIFY.value
 
-        # All ranks idle/prebuilt: same bucket as "no last batch" so every
-        # rank (including those whose last_batch is None) agrees.
+        # All ranks idle/prebuilt: same bucket as "no last batch".
         self.assertIsNone(derive([idle, idle]))
         self.assertIsNone(derive([prebuilt, idle]))
 
@@ -73,8 +78,7 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         self.assertEqual(derive([verify, decode]), ForwardMode.DECODE)
 
     def test_derived_mode_is_rank_invariant(self):
-        # The derived mode only depends on the gathered list, which is
-        # identical on every rank -- permutations must not change the result.
+        # Permutations of the gathered list must not change the result.
         derive = SchedulerRecvSkipper.derive_global_forward_mode
         modes = [
             ForwardMode.DECODE.value,
@@ -100,9 +104,8 @@ class TestRecvSkipperLastForwardMode(CustomTestCase):
         self.assertEqual(_last_forward_mode(False, batch), ForwardMode.DECODE)
 
     def test_dp_derives_from_gathered_modes_not_local(self):
-        # Regression: under DP-attention the helper must use the gathered
-        # per-rank modes; the rank-local mode (IDLE here) can differ across
-        # ranks and would desync the recv decision.
+        # The rank-local mode (IDLE here) differs across ranks and must be
+        # ignored in favor of the gathered per-rank modes.
         batch = SimpleNamespace(
             forward_mode=ForwardMode.IDLE,
             global_forward_modes=[
@@ -113,26 +116,11 @@ class TestRecvSkipperLastForwardMode(CustomTestCase):
         self.assertEqual(_last_forward_mode(True, batch), ForwardMode.EXTEND)
 
     def test_dp_without_gathered_modes_returns_none(self):
-        # SGLANG_SCHEDULER_SKIP_ALL_GATHER leaves the field unset; the env is
-        # global, so None is the rank-consistent fallback.
+        # SGLANG_SCHEDULER_SKIP_ALL_GATHER is global, so None stays consistent.
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE, global_forward_modes=None
         )
         self.assertIsNone(_last_forward_mode(True, batch))
-
-    def test_decode_accumulates_until_threshold(self):
-        # DECODE weight = 1: recv only every `interval` decode steps.
-        skipper = SchedulerRecvSkipper.maybe_create(_server_args(3))
-        self.assertFalse(skipper.handle(ForwardMode.DECODE))  # counter 1
-        self.assertFalse(skipper.handle(ForwardMode.DECODE))  # counter 2
-        self.assertTrue(skipper.handle(ForwardMode.DECODE))  # counter 3 -> recv, reset
-        self.assertFalse(skipper.handle(ForwardMode.DECODE))  # counter 1 again
-
-    def test_prefill_triggers_recv_immediately(self):
-        # A non-decode pass (e.g. EXTEND/prefill) uses the large default weight,
-        # so the scheduler polls for new requests right away.
-        skipper = SchedulerRecvSkipper.maybe_create(_server_args(50))
-        self.assertTrue(skipper.handle(ForwardMode.EXTEND))
 
 
 if __name__ == "__main__":
