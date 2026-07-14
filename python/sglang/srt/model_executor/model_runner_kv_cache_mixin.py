@@ -1171,7 +1171,11 @@ class ModelRunnerKVCacheMixin:
 
                         swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
                     else:
-                        swa_allocator_cls = SWATokenToKVPoolAllocator
+                        from sglang.srt.hardware_backend.npu.allocator_npu import (
+                            NPUSWATokenToKVPoolAllocator,
+                        )
+
+                        swa_allocator_cls = NPUSWATokenToKVPoolAllocator
                     self.token_to_kv_pool_allocator = swa_allocator_cls(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,

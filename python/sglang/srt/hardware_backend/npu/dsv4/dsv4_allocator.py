@@ -31,13 +31,13 @@ import torch
 from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.hardware_backend.npu.allocator_npu import (
     NPUPagedTokenToKVPoolAllocator,
+    NPUSWATokenToKVPoolAllocator,
     get_last_loc,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4StateLens
 
 if TYPE_CHECKING:
@@ -98,7 +98,7 @@ def alloc_paged_token_slots_reserve_extend(
     return out_cache_loc
 
 
-class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+class DSV4NPUTokenToKVPoolAllocator(NPUSWATokenToKVPoolAllocator):
     """SWA allocator + c4/c128 KV and compress-state paged allocators for DSV4 on NPU."""
 
     def __init__(

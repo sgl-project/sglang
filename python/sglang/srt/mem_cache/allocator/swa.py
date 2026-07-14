@@ -6,16 +6,8 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
-
-if _is_npu:
-    import torch_npu
-
-    from sglang.srt.hardware_backend.npu.allocator_npu import (
-        NPUPagedTokenToKVPoolAllocator,
-    )
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -60,10 +52,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            if _is_npu:
-                PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
-            else:
-                PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
+            PagedTokenToKVPoolAllocatorClass = self._get_paged_allocator_class()
             self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size,
                 page_size,
@@ -103,6 +92,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+    def _get_paged_allocator_class(
+        self,
+    ) -> type[PagedTokenToKVPoolAllocator]:
+        return PagedTokenToKVPoolAllocator
 
     def available_size(self):
         return min(
@@ -274,50 +268,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             <= self.swa_attn_allocator.available_size() // self.page_size
         )
 
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-        extend_num_tokens: int,
-    ):
-        assert self.page_size > 1
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        if not self.new_pages_available(num_new_pages, num_new_pages):
-            return None
-
-        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
-
-        alloc_full_indices = self.full_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
-        )
-        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            swa_last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
-        )
-        assert alloc_full_indices is not None
-        assert alloc_swa_indices is not None
-
-        self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
-
-        return alloc_full_indices
-
     def alloc_extend_swa_tail(
         self,
         *,
@@ -383,37 +333,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices[win_start:mapped_end],
             alloc_swa_indices,
         )
-        return alloc_full_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-    ):
-        assert self.page_size > 1
-        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
-
-        alloc_full_indices = self.full_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-        alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, swa_last_loc
-        )
-
-        if alloc_full_indices is None or alloc_swa_indices is None:
-            return None
-
-        if _is_npu:
-            indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
-            torch_npu.npu_scatter_nd_update_(
-                self.full_to_swa_index_mapping,
-                indices_2d,
-                alloc_swa_indices.to(torch.int64),
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
