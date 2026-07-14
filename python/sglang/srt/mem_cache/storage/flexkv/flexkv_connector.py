@@ -960,6 +960,7 @@ class FlexKVConnector:
                     logger.warning(
                         "[FlexKV] layerwise pre-launch rollback failed: %s",
                         exc,
+                        exc_info=True,
                     )
                 combined_cleanup_status = self._sync_ctx.all_reduce_min(cleanup_status)
                 if combined_cleanup_status == 0:
