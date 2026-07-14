@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -87,7 +88,24 @@ class FlexKVRadixCache(RadixCache):
         attn_tp_group=None,
         attn_cp_group=None,
     ) -> None:
+        storage_page_size = int(params.page_size)
+        allocator_page_size = int(params.token_to_kv_pool_allocator.page_size)
+        if storage_page_size <= 0 or allocator_page_size <= 0:
+            raise ValueError("FlexKV page sizes must be positive")
+        if allocator_page_size % storage_page_size != 0:
+            raise ValueError(
+                "FlexKV requires the storage page size to divide the allocator "
+                "page size"
+            )
+        enable_layerwise = bool(
+            int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
+        )
+        if enable_layerwise and allocator_page_size > 1:
+            raise ValueError("FlexKV layerwise transfer requires allocator page size 1")
+
         super().__init__(params)
+        self._storage_page_size = storage_page_size
+        self._allocator_page_size = allocator_page_size
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         # ``tp_group`` and ``attn_tp_group`` are sometimes passed
@@ -98,7 +116,8 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector = FlexKVConnector(
             sgl_model_config=model_config,
             server_args=server_args,
-            page_size=params.page_size,
+            page_size=self._storage_page_size,
+            allocator_page_size=self._allocator_page_size,
             kvcache=kvcache,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -162,11 +181,12 @@ class FlexKVRadixCache(RadixCache):
         if self.disable or not key:
             return super().match_prefix(params)
 
-        # FlexKV operates at page granularity — round the lookup query
-        # down to a multiple of ``page_size`` so the hit count we report
-        # back to sglang matches what FlexKV can actually serve.
-        if self.page_size != 1:
-            aligned_len = (len(key) // self.page_size) * self.page_size
+        # FlexKV load-back ownership uses allocator pages, so the query
+        # must not expose a partial allocator page to the connector.
+        if self._allocator_page_size != 1:
+            aligned_len = (
+                len(key) // self._allocator_page_size * self._allocator_page_size
+            )
             key = key[:aligned_len]
 
         base_res = super().match_prefix(params)
