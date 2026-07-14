@@ -7,7 +7,10 @@ import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.moe.token_dispatcher import (
     BaseDispatcher,
     CombineInput,
@@ -20,11 +23,9 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
-from sglang.srt.utils.common import require_mlp_tp_gather
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
@@ -114,11 +115,11 @@ class FlashinferDispatcher(BaseDispatcher):
         # The workspace must fit both:
         #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
         #  (b) the largest decode batch (bounded by max_running_requests, which
-        #      _resolve_max_num_reqs caps at 4096 per DP worker).
+        #      resolve_max_num_reqs caps at 4096 per DP worker).
         # max_running_requests is not yet resolved at model-construction time,
         # so we use 4096 as a floor to cover decode batches and _dummy_run
         # (which warms up at batch_size = req_to_token_pool.size).
-        cps = get_global_server_args().chunked_prefill_size
+        cps = get_server_args().chunked_prefill_size
         default_max_tokens = max(cps if cps and cps > 0 else 4096, 4096)
         self.max_num_tokens = get_int_env_var(
             "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
@@ -127,7 +128,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
         speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
+            get_server_args().speculative_algorithm
         )
         if MOE_NVFP4_DISPATCH and not speculative_algo.is_eagle():
             total_dispatch_payload_size_per_token = (
@@ -200,44 +201,54 @@ class FlashinferDispatcher(BaseDispatcher):
         # runtime_max_tokens_per_rank selection
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # MoeAlltoAll uses fixed-geometry buffers shaped
-        # [ep_size, runtime_max_tokens_per_rank, ...], so every EP rank
-        # must pass the same value.  Three cases:
+        # [ep_size, runtime_max_tokens_per_rank, ...], so every EP rank must pass
+        # the SAME value. This code (Python) runs during eager forwards and during
+        # CUDA-graph *capture*; on *replay* dispatch() is not re-executed and the
+        # value baked at capture is reused. Two cases, both rank-invariant:
         #
-        # Case 1 — max(dp_global):
-        #   DP attention with require_mlp_tp_gather=True.  The scheduler
-        #   all-gathered per-DP-rank token counts into dp_global (a list
-        #   of length dp_size); max() is uniform across all ranks and
-        #   sizes the workspace for the fattest rank.
+        # Case 1 — max(dp_global): DP attention feeding EP. The scheduler
+        #   all-gathers per-DP-rank token counts into dp_global (length dp_size,
+        #   identical on every rank), which differ across ranks, so we must take
+        #   the max. FlashInfer A2A forces require_mlp_tp_gather=True (see
+        #   require_mlp_tp_gather()), so: eager reads the live list; capture sees
+        #   [num_tokens] * dp_size (uniform capture bs) and bakes max() == the
+        #   bucket; replay reuses that baked value and every rank replays the same
+        #   bucket because the decode graph runner sizes it from the cross-rank
+        #   max. Without this, per-rank buckets could diverge -> geometry mismatch
+        #   -> illegal memory access (issue #30242).
         #
-        # Case 2 — self.max_num_tokens (static capacity):
-        #   EP>1 during live (non-capture) inference with
-        #   require_mlp_tp_gather=False.  The scheduler only stored the
-        #   local token count, so x.shape[0] can differ across EP ranks
-        #   that span different DP groups.  The static workspace capacity
-        #   is the same on every rank, so it is always safe.
-        #
-        # Case 3 — x.shape[0] (actual tensor size):
-        #   Everything else: EP=1, sequence-parallel (post-scatter), or
-        #   CUDA graph capture.  In these situations x.shape[0] is the
-        #   same on every EP rank.  During CUDA graph capture
-        #   (get_is_capture_mode()=True) the graph runner ensures all
-        #   ranks capture with the same batch size, so we skip Case 2
-        #   and land here — using x.shape[0] avoids baking the
-        #   (potentially much larger) static max into the captured graph.
+        # Case 2 — x.shape[0]: no per-rank DP list (dp_global absent or scalar).
+        #   This is SP attention feeding EP (tokens are sequence-parallel scattered
+        #   uniformly, so x.shape[0] is already identical on every EP rank), a
+        #   single EP rank, or CUDA-graph capture of those. x.shape[0] is
+        #   rank-invariant here, so it is both correct and right-sized.
         dp_global = get_dp_global_num_tokens()
         if dp_global is not None and len(dp_global) > 1:
             # Case 1
             self.runtime_max_tokens_per_rank = max(dp_global)
-        elif (
-            self.ep_size > 1
-            and not get_is_capture_mode()
-            and not require_mlp_tp_gather(get_global_server_args())
-        ):
-            # Case 2
-            self.runtime_max_tokens_per_rank = self.max_num_tokens
         else:
-            # Case 3
+            # Case 2. Guard against the #30242 failure mode: DP attention must
+            # never land here with ep_size > 1, because there x.shape[0] differs
+            # across ranks and is NOT a safe fixed geometry. DP attention is
+            # routed to Case 1 via require_mlp_tp_gather=True; reaching here with
+            # DP attention on and ep_size > 1 means the DP all-gather was skipped
+            # (e.g. SGLANG_SCHEDULER_SKIP_ALL_GATHER, unsupported) -> fail fast.
+            assert not is_dp_attention_enabled() or self.ep_size == 1, (
+                "FlashInfer A2A: DP attention reached the x.shape[0] fallback "
+                f"with ep_size={self.ep_size} > 1 (dp_global={dp_global}); "
+                "runtime_max_tokens_per_rank would not be rank-invariant."
+            )
             self.runtime_max_tokens_per_rank = x.shape[0]
+
+        # The recv buffer reserves runtime_max_tokens_per_rank slots for THIS
+        # rank, so it must cover this rank's own tokens. This holds in both cases
+        # (Case 1: max(dp_global) >= the local count; Case 2: exactly x.shape[0]),
+        # so a violation signals a sizing/plumbing bug (e.g. an un-adjusted spec
+        # count) rather than a benign case.
+        assert self.runtime_max_tokens_per_rank >= x.shape[0], (
+            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} < "
+            f"x.shape[0]={x.shape[0]}: MoeAlltoAll recv buffer would overflow."
+        )
 
         # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
         # inside moe_a2a. The recv buffer has shape
