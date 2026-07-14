@@ -76,7 +76,7 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
                 "4",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
-                "4",
+                "1.2",
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
