@@ -58,6 +58,11 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative.ragged_verify import (
+    compute_ragged_extend_lengths,
+    compute_uniform_extend_lengths,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -779,26 +784,69 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
-            max_seqlen_q = 1
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                1,
-                dtype=torch.int32,
-                device=device,
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu.tolist()
+                if forward_batch.seq_lens_cpu is not None
+                else forward_batch.seq_lens.cpu().tolist()
             )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            seq_lens_cpu = [int(x) for x in seq_lens_cpu]
+            if ragged_layout is None:
+                lengths = compute_uniform_extend_lengths(
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    extend_len=self.speculative_num_draft_tokens,
+                )
+                verify_lens = torch.full(
+                    (batch_size,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                lengths = compute_ragged_extend_lengths(
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    ragged_layout=ragged_layout,
+                )
+                verify_lens = ragged_layout.verify_lens.to(
+                    device=device, dtype=torch.int32
+                )
 
+            extend_seq_lens_cpu = lengths.extend_seq_lens_cpu
+            max_seqlen_q = max(extend_seq_lens_cpu) if extend_seq_lens_cpu else 1
+            cu_seqlens_q = compute_cu_seqlens(verify_lens)
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            forward_batch.extend_seq_lens = verify_lens
+
+            cache_seqlens_int32 = lengths.seq_lens_extended.to(torch.int32)
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            max_seqlen_k = (
+                max(lengths.seq_lens_cpu_extended)
+                if lengths.seq_lens_cpu_extended
+                else 0
+            )
+
+            total_verify_tokens = int(lengths.num_tokens)
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                verify_lens,
                 cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
+                total_verify_tokens,
                 self.speculative_num_draft_tokens,
             )
-            page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+
+            # Keep target-verify metadata prefill-consistent: one page-table row
+            # per request plus per-request extend lengths. The page-table
+            # expansion happens inside the top-k/page-table transform. This avoids
+            # mixing token-expanded page tables with per-request cu_seqlens and
+            # leaves a clear hook for a future GLM DSA verify-specific kernel.
+            page_table = page_table[:, :max_seqlen_k]
+            indexer_seq_lens_cpu = torch.tensor(
+                lengths.seq_lens_cpu_extended,
+                dtype=torch.int32,
+                device="cpu",
             )
+            indexer_seq_lens = cache_seqlens_int32
         elif forward_batch.forward_mode.is_draft_extend_v2():
             if forward_batch.extend_prefix_lens_cpu is None:
                 assert forward_batch.extend_prefix_lens is not None
@@ -1018,7 +1066,10 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         bs_idx: Optional[List[int]] = None,
     ):
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        if not (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             return None, None
         if forward_batch.batch_size == 0 or (bs_idx is not None and len(bs_idx) == 0):
             empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
@@ -1057,7 +1108,7 @@ class DeepseekSparseAttnBackend(
             )
             kv_len = seq_len
             if forward_batch.forward_mode.is_target_verify():
-                kv_len += self.speculative_num_draft_tokens
+                kv_len += extend_seq_len
             seq_lens_expanded = torch.arange(
                 kv_len - extend_seq_len + 1,
                 kv_len + 1,
@@ -1077,7 +1128,7 @@ class DeepseekSparseAttnBackend(
 
             if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
                 q_offset += extend_seq_len
-                k_offset += seq_len
+                k_offset += kv_len
 
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
@@ -1925,6 +1976,9 @@ class DeepseekSparseAttnBackend(
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
+                # TODO: Add a GLM DSpark verify-specific DSA path so target
+                # verify can use one explicit metadata contract instead of
+                # reusing the prefill page-table transform.
                 page_table_1 = transform_index_page_table_prefill(
                     page_table=metadata.page_table_1,
                     topk_indices=topk_indices,
