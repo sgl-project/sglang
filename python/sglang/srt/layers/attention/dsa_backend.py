@@ -646,7 +646,7 @@ class DeepseekSparseAttnBackend(
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
         # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if _is_hip or not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
         from sglang.jit_kernel.dsv4.topk import plan_topk_v2
 

@@ -3,7 +3,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    normalize_glm_moe_dsa_qk_dims,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,6 +68,44 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.v_head_dim, 96)
         self.assertEqual(model_config.swa_head_dim, 64)
         self.assertEqual(model_config.swa_v_head_dim, 48)
+
+    def test_glm_dsa_qk_rope_dim_is_repaired_after_attribute_map_hydration(self):
+        text_config = _make_text_config(
+            architectures=["GlmMoeDsaForCausalLM"],
+            qk_head_dim=256,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=192,
+        )
+
+        normalize_glm_moe_dsa_qk_dims(text_config)
+
+        self.assertEqual(text_config.qk_rope_head_dim, 64)
+        self.assertEqual(text_config.qk_head_dim, 256)
+
+    def test_glm_dsa_qk_rope_dim_preserves_consistent_config(self):
+        text_config = _make_text_config(
+            architectures=["GlmMoeDsaForCausalLM"],
+            qk_head_dim=256,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+        )
+
+        normalize_glm_moe_dsa_qk_dims(text_config)
+
+        self.assertEqual(text_config.qk_rope_head_dim, 64)
+        self.assertEqual(text_config.qk_head_dim, 256)
+
+    def test_glm_dsa_qk_rope_dim_ignores_other_architectures(self):
+        text_config = _make_text_config(
+            architectures=["MixtralForCausalLM"],
+            qk_head_dim=256,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=192,
+        )
+
+        normalize_glm_moe_dsa_qk_dims(text_config)
+
+        self.assertEqual(text_config.qk_rope_head_dim, 192)
 
 
 if __name__ == "__main__":
