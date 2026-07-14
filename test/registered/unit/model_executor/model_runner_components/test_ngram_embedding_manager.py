@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.model_executor.ngram_token_table import (  # noqa: E402
+from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E402
     update_ngram_token_table_after_sampling,
 )
 
@@ -37,7 +37,7 @@ class TestNgramTokenTableUpdate(CustomTestCase):
         seq_lens = torch.tensor([11, 22, 33, 44], dtype=torch.int64)
 
         with patch(
-            "sglang.srt.model_executor.ngram_token_table.update_token_table"
+            "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager.update_token_table"
         ) as update_mock:
             updated = update_ngram_token_table_after_sampling(
                 ngram_embedding_info=info,
@@ -71,7 +71,7 @@ class TestNgramTokenTableUpdate(CustomTestCase):
         info = _make_ngram_info(2, skip_token_table_update=torch.tensor([True, True]))
 
         with patch(
-            "sglang.srt.model_executor.ngram_token_table.update_token_table"
+            "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager.update_token_table"
         ) as update_mock:
             updated = update_ngram_token_table_after_sampling(
                 ngram_embedding_info=info,
@@ -91,7 +91,7 @@ class TestNgramTokenTableUpdate(CustomTestCase):
         seq_lens = torch.tensor([11, 22, 33], dtype=torch.int64)
 
         with patch(
-            "sglang.srt.model_executor.ngram_token_table.update_token_table"
+            "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager.update_token_table"
         ) as update_mock:
             updated = update_ngram_token_table_after_sampling(
                 ngram_embedding_info=info,
