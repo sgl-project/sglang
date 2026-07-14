@@ -256,36 +256,12 @@ if _is_npu:
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
-MLA_ATTENTION_BACKENDS = [
-    "aiter",
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-    "ascend",
-    "dsa",
-    "nsa",  # Deprecated alias for "dsa"
-    "intel_xpu",
-]
-
-
 TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fn: "fp8_e4m3",
     torch.float8_e4m3fnuz: "fp8_e4m3",
     torch.float8_e5m2: "fp8_e5m2",
     torch.bfloat16: "bf16",
 }
-
-
-def add_mla_attention_backend(backend_name):
-    if backend_name not in MLA_ATTENTION_BACKENDS:
-        MLA_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
 
 
 # Detect stragger ranks in model loading
@@ -306,19 +282,6 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     if hasattr(model, "language_model"):
         return model.language_model
     return model.model
-
-
-class RankZeroFilter(logging.Filter):
-    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
-
-    def __init__(self, is_rank_zero):
-        super().__init__()
-        self.is_rank_zero = is_rank_zero
-
-    def filter(self, record):
-        if record.levelno == logging.INFO:
-            return self.is_rank_zero
-        return True
 
 
 @dataclass
@@ -908,12 +871,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
-        self.attn_backend = None
-        self.decode_attn_backend = None
-        self.decode_attn_backend_group = []
-        self.decode_cuda_graph_runner = None
-        self.graph_mem_usage = 0
-        self.prefill_cuda_graph_runner = None
         self.graph_shared_output = None
 
     def init_attention_backends(self):
@@ -2362,7 +2319,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
-    def max_token_pool_size(self):
+    def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens

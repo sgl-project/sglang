@@ -342,7 +342,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            self.model_runner.effective_max_total_num_tokens - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -454,7 +454,7 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            self.model_runner.effective_max_total_num_tokens - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,
