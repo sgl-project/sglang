@@ -1254,6 +1254,14 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+
+    if "triton" in (prefill, decode):
+        assert kv_cache_dtype == "fp8_e4m3", (
+            "Triton DSA kernels only support fp8_e4m3 KV cache, "
+            f"but got kv_cache_dtype={kv_cache_dtype}. "
+            "Use --kv-cache-dtype fp8_e4m3 with --dsa-prefill-backend triton / --dsa-decode-backend triton."
+        )
+
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."

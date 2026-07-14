@@ -281,11 +281,11 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
-        # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
+        # On HIP, TileLang, AITER, and Triton DSA kernels consume the raw MLA KV layout:
         # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
         if _is_hip and (
-            self.server_args.dsa_prefill_backend in ("tilelang", "aiter")
-            or self.server_args.dsa_decode_backend in ("tilelang", "aiter")
+            self.server_args.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+            or self.server_args.dsa_decode_backend in ("tilelang", "triton", "aiter")
         ):
             return kv_cache_dim
 
