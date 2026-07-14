@@ -94,14 +94,25 @@ class NPUGeluAndMul(BaseActivation):
 
 
 class NPUSwigluOAI(BaseActivation):
-    def __init__(self, layer: Any):
-        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+    def __init__(self, layer: Any, moe_runner_config):
+        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai_triton
 
-        self._kernel = swiglu_oai
-        self._layer = layer
+        self._kernel = swiglu_oai_triton
+        self.moe_runner_config = moe_runner_config
 
     def _apply_activation(self, hidden_states: torch.Tensor):
-        return self._kernel(self._layer, hidden_states), None
+        # hidden_states is the output of the grouped matmul with shape
+        # [num_tokens, 2 * inter].  The old swiglu_oai kernel derived the
+        # gate_up dimension from layer.w13_weight.shape[2], which now fails
+        # because w13_weight is stored un-transposed.  Instead we pass
+        # the gate_up dimension explicitly from the tensor itself.
+        output = self._kernel(
+            hidden_states,
+            hidden_states.shape[-1],                     # gate_up dim = 2 * inter
+            self.moe_runner_config.gemm1_alpha,
+            self.moe_runner_config.gemm1_clamp_limit,
+        )
+        return output, None
 
 
 class NPUSwigluStepAndMul(BaseActivation):
