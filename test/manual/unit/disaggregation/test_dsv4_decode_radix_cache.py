@@ -173,9 +173,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
 
     def cache_unfinished_req(inserted_req, **_kwargs):
         tree_cache.inserted_fill_ids.append(list(inserted_req.get_fill_ids()))
-        tree_cache.inserted_swa_evicted_seqlens.append(
-            inserted_req.swa_evicted_seqlen
-        )
+        tree_cache.inserted_swa_evicted_seqlens.append(inserted_req.swa_evicted_seqlen)
         tree_cache.inserted_force_leaf_creation.append(
             inserted_req.force_radix_leaf_creation
         )

@@ -129,7 +129,7 @@ def maybe_register_hicache_draft(
 
 
 def is_supported_dsv4_decode_radix_mtp(
-    *, spec_algorithm: "SpeculativeAlgorithm", server_args: "ServerArgs"
+    *, spec_algorithm: SpeculativeAlgorithm, server_args: ServerArgs
 ) -> bool:
     return (
         spec_algorithm.is_eagle()
