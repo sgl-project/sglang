@@ -223,11 +223,47 @@ def resolve_cutedsl_standard_scales(
 
 
 def refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
-    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
-    )
-    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    layer._cutedsl_input_scale = used_input_scale
+    with torch.inference_mode(False):
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            resolve_cutedsl_standard_scales(layer)
+        )
+
+    new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+    current_scales = getattr(layer, "_cutedsl_scales", None)
+    current_input_scale = getattr(layer, "_cutedsl_input_scale", None)
+    if current_scales is None:
+        layer._cutedsl_scales = new_scales
+        layer._cutedsl_input_scale = used_input_scale
+        return
+
+    # Decode CUDA graphs capture these tensor addresses, so reloads must update
+    # their values without replacing the tensors.
+    if (
+        not isinstance(current_scales, tuple)
+        or len(current_scales) != len(new_scales)
+        or not isinstance(current_input_scale, torch.Tensor)
+    ):
+        raise RuntimeError(
+            "CuTe DSL scale metadata changed during weight reload; "
+            "CUDA graph recapture is required."
+        )
+    scale_pairs = tuple(zip(current_scales, new_scales))
+    for current, new in (*scale_pairs, (current_input_scale, used_input_scale)):
+        if (
+            not isinstance(current, torch.Tensor)
+            or current.shape != new.shape
+            or current.dtype != new.dtype
+            or current.device != new.device
+        ):
+            raise RuntimeError(
+                "CuTe DSL scale metadata changed during weight reload; "
+                "CUDA graph recapture is required."
+            )
+
+    with torch.no_grad():
+        for current, new in scale_pairs:
+            current.copy_(new)
+        current_input_scale.copy_(used_input_scale)
 
 
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:

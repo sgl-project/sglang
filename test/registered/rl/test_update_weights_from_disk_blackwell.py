@@ -23,6 +23,7 @@ class UpdateWeightsFromDiskBase:
     update_timeout = 120
     idle_timeout = 30
     launch_env = None
+    expect_deterministic_decode = True
     decode_payload = {
         "text": "The capital of France is",
         "sampling_params": {"temperature": 0, "max_new_tokens": 16},
@@ -165,9 +166,10 @@ class UpdateWeightsFromDiskBase:
                             self.assertEqual(self._get_model_info(), self.model)
                             self._assert_non_empty_decode()
                             updated_sig = self._get_decode_logprob_signature()
-                            self._assert_decode_logprob_unchanged(
-                                baseline_sig, updated_sig
-                            )
+                            if self.expect_deterministic_decode:
+                                self._assert_decode_logprob_unchanged(
+                                    baseline_sig, updated_sig
+                                )
                 finally:
                     kill_process_tree(process.pid)
 
@@ -219,6 +221,9 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    # FlashInfer's CuTe DSL MoE finalizes routed experts with atomic scatter-add,
+    # so repeated executions are not bitwise deterministic.
+    expect_deterministic_decode = False
     launch_env = {
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1",
         "FLASHINFER_NVFP4_4OVER6": "1",
