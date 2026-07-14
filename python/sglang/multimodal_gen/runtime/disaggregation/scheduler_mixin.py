@@ -1515,6 +1515,8 @@ class SchedulerDisaggMixin:
     def _disagg_terminal_denoiser_compute(
         self: Scheduler, req: Req, request_id: str, role_name: str
     ) -> None:
+        req.save_output = False
+        req.return_file_paths_only = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             output_batch = self.worker.execute_forward([req])

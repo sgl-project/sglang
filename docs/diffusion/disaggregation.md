@@ -166,7 +166,8 @@ sglang serve \
 With four compatible requests, the head sends one batch of four to the AR
 endpoint, then queues four independent DiT requests. Two terminal workers run
 one request each concurrently and consume the remaining requests as they become
-available.
+available. Workers return decoded pixels to the head, which saves and serves the
+final files from its configured `--output-path`.
 
 ## Port Convention
 
