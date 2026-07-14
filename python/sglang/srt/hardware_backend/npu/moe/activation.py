@@ -94,11 +94,11 @@ class NPUGeluAndMul(BaseActivation):
 
 
 class NPUSwigluOAI(BaseActivation):
-    def __init__(self, layer: Any, moe_runner_config):
+    def __init__(self, moe_runner_config=None):
         from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai_triton
 
         self._kernel = swiglu_oai_triton
-        self.moe_runner_config = moe_runner_config
+        self._moe_runner_config = moe_runner_config
 
     def _apply_activation(self, hidden_states: torch.Tensor):
         # hidden_states is the output of the grouped matmul with shape
@@ -106,14 +106,19 @@ class NPUSwigluOAI(BaseActivation):
         # gate_up dimension from layer.w13_weight.shape[2], which now fails
         # because w13_weight is stored un-transposed.  Instead we pass
         # the gate_up dimension explicitly from the tensor itself.
+        alpha = 1.0
+        clamp = None
+        if self._moe_runner_config is not None:
+            alpha = getattr(self._moe_runner_config, "gemm1_alpha", 1.0)
+            clamp = getattr(self._moe_runner_config, "gemm1_clamp_limit", None)
+
         output = self._kernel(
             hidden_states,
-            hidden_states.shape[-1],                     # gate_up dim = 2 * inter
-            self.moe_runner_config.gemm1_alpha,
-            self.moe_runner_config.gemm1_clamp_limit,
+            hidden_states.shape[-1],  # gate_up dim = 2 * inter
+            alpha,
+            clamp,
         )
         return output, None
-
 
 class NPUSwigluStepAndMul(BaseActivation):
     def __init__(self, clamp_limit: Optional[float] = None):
@@ -166,10 +171,9 @@ def get_swiglu_variant(method: str, **kwargs: Any) -> BaseActivation:
         "gelu_and_mul": NPUGeluAndMul,
     }
     if method == "swiglu_oai":
-        layer = kwargs.pop("layer", None)
-        if layer is None:
-            raise ValueError("layer is required for swiglu_oai activation")
-        return NPUSwigluOAI(layer)
+        # The OAI variant now uses the triton kernel that derives the gate_up
+        # dimension from the tensor itself.  No extra parameters are needed.
+        return NPUSwigluOAI()
     if method == "swiglustep_and_mul":
         clamp_limit = kwargs.pop("clamp_limit", None)
         return NPUSwigluStepAndMul(clamp_limit=clamp_limit)
