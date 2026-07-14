@@ -300,9 +300,7 @@ class NPUSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
         seq_lens_cpu = torch.tensor([extend_num_tokens], dtype=torch.int64)
         prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-        seq_lens = torch.tensor(
-            [extend_num_tokens], dtype=torch.int64, device=device
-        )
+        seq_lens = torch.tensor([extend_num_tokens], dtype=torch.int64, device=device)
         last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
         assert allocator.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
