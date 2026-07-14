@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """CP Decode Attention TP context.
 
 When CP (Context Parallel) mode sets tp_size=1 (repeat weights), decode can
@@ -13,18 +12,29 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
-)
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+# HF architectures whose attention linears are replicated with tp_size=1 under
+# context parallelism, so slicing them to the local CP partition during decode is
+# equivalent to a normal TP-layout GEMM. Any model not on this list must not use
+# CP decode attention TP. Single arch-string source of truth for the whitelist.
+CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
+    # DeepSeek-V4 (DSpark keeps a separate attention path that does not wire up
+    # the decode-slice trigger, so it is intentionally excluded.)
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
+    # GLM-5.x (inherits DeepseekV2 attention; DSA path)
+    "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
+)
 
 _global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
 
@@ -41,10 +51,9 @@ class CpDecodeAttnTpContext:
     """Slices replicated attention weights across CP ranks during decode."""
 
     def __init__(self):
-        dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        disable_attn_tp = envs.SGLANG_CP_DISABLE_DECODE_SLICE.get()
+        enable_attn_tp = get_server_args().enable_cp_decode_attn_tp
 
-        if dsa_enable_prefill_cp and not disable_attn_tp:
+        if enable_attn_tp and get_parallel().attn_cp_size > 1:
             self.decode_tp_rank = get_parallel().attn_cp_rank
             self.decode_tp_size = get_parallel().attn_cp_size
             logger.info("Enable CP decode attention TP")
@@ -64,7 +73,11 @@ class CpDecodeAttnTpContext:
         if not self.is_enabled:
             self.use_decode_attn_tp = False
             return
-        self.use_decode_attn_tp = not dsa_use_prefill_cp(forward_batch)
+        # Skip during prefill context parallel (needs all heads); apply on every
+        # other forward, which includes decode.
+        self.use_decode_attn_tp = not is_cp_v2_active(
+            forward_batch
+        ) and not dsa_use_prefill_cp(forward_batch)
 
     def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
         assert dim in (0, 1)

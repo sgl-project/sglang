@@ -60,6 +60,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
+from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -87,7 +88,6 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
@@ -454,11 +454,7 @@ class MqaAttentionBase(nn.Module):
         self.fuse_wqa_wkv = fuse
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self._attn_sink_local = (
-            self.attn_sink
-            if (self.attn_tp_size == 1 and not get_cp_decode_attn_tp_ctx().is_enabled)
-            else None
-        )
+        self._attn_sink_local: Optional[torch.Tensor] = None
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
