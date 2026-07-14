@@ -844,12 +844,30 @@ class FlexKVRadixCache(RadixCache):
         the source nodes."""
         if self.disable:
             return EvictResult()
+        self.flexkv_connector.ensure_load_back_safe()
         if self._mode is FlexKVMode.IP:
             self.flexkv_connector.ensure_layerwise_evict_safe()
         self._drain_completed_stores()
+        self.flexkv_connector.ensure_load_back_safe()
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
-        self.store_stream.synchronize()
+        local_stream_safe = True
+        try:
+            self.store_stream.synchronize()
+        except Exception as exc:  # noqa: BLE001
+            local_stream_safe = False
+            logger.warning(
+                "[FlexKV] store stream synchronization failed: %s",
+                exc,
+                exc_info=True,
+            )
+        stream_consistent = self.flexkv_connector.coordinate_store_owner_release(
+            local_success=local_stream_safe
+        )
+        if not stream_consistent:
+            reason = "FlexKV store stream synchronization failed on at least one rank"
+            self.flexkv_connector.poison_load_back(reason)
+            raise RuntimeError(reason)
         return super().evict(params)
 
     def check_hicache_events(self) -> None:  # type: ignore[override]
@@ -858,6 +876,7 @@ class FlexKVRadixCache(RadixCache):
         Drains both store completions (so source nodes get unlocked
         quickly) and the launched-load tail (so the FlexKV pipe
         doesn't accumulate)."""
+        self.flexkv_connector.ensure_load_back_safe()
         self._drain_completed_stores()
         if self._mode is FlexKVMode.IP:
             self.flexkv_connector.drain_launched_loads()
@@ -866,11 +885,29 @@ class FlexKVRadixCache(RadixCache):
         completed_rids = self.flexkv_connector.check_completed_stores()
         if not completed_rids:
             return
+        local_success = True
         with self._node_lock:
             for rid in completed_rids:
                 node = self._inflight_store_nodes.pop(rid, None)
-                if node is not None:
+                if node is None:
+                    local_success = False
+                    continue
+                try:
                     self.dec_lock_ref(node)
+                except Exception as exc:  # noqa: BLE001
+                    local_success = False
+                    logger.warning(
+                        "[FlexKV] completed store owner release failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
+        release_consistent = self.flexkv_connector.coordinate_store_owner_release(
+            local_success=local_success
+        )
+        if not release_consistent:
+            reason = "FlexKV store owner release failed on at least one rank"
+            self.flexkv_connector.poison_load_back(reason)
+            raise RuntimeError(reason)
 
     # ------------------------------------------------------------------
     # Optional pass-throughs used by the scheduler

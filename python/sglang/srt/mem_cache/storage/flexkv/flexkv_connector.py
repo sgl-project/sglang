@@ -39,8 +39,6 @@ import torch
 
 from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
     CMD_LAYERWISE,
-    CMD_PUT_META,
-    CMD_STORE_COMPLETE,
     FlexKVComm,
     FlexKVLayerDoneCounter,
     send_fds,
@@ -275,7 +273,8 @@ class FlexKVConnector:
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []
         # Stores
-        self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._inflight_stores: Dict[str, Tuple[int, ...]] = {}
+        self._ambiguous_stores: Dict[str, str] = {}
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_enabled = bool(
@@ -650,6 +649,9 @@ class FlexKVConnector:
     def coordinate_load_publication_step(self, *, local_success: bool) -> bool:
         return self._sync_ctx.all_reduce_min(int(local_success)) == 1
 
+    def coordinate_store_owner_release(self, *, local_success: bool) -> bool:
+        return self._sync_ctx.all_reduce_min(int(local_success)) == 1
+
     def poison_load_back(self, reason: str) -> None:
         self._poison_reason = reason
 
@@ -674,136 +676,301 @@ class FlexKVConnector:
         Returns the FlexKV task id of the in-flight store, or -1 if
         nothing needed to be written.
         """
-        token_ids_np = np.asarray(token_ids, dtype=np.int64)
-        n = len(token_ids_np)
-        if n != len(kv_indices):
-            raise ValueError(
-                f"store_kv: token_ids has {n} entries but kv_indices "
-                f"has {len(kv_indices)} entries"
+        local_reason: Optional[str] = None
+        token_ids_np = np.empty((0,), dtype=np.int64)
+        aligned_kv_indices: Optional[torch.Tensor] = None
+        try:
+            if not rid:
+                raise ValueError("FlexKV store requires a non-empty request id")
+            if rid in self._inflight_stores or rid in self._ambiguous_stores:
+                raise ValueError("FlexKV store request id is already active")
+            token_ids_np = np.asarray(token_ids, dtype=np.int64)
+            if token_ids_np.ndim != 1 or kv_indices.ndim != 1:
+                raise ValueError("FlexKV store inputs must be one-dimensional")
+            if len(token_ids_np) != len(kv_indices):
+                raise ValueError("FlexKV store token ids and indices must have equal length")
+            aligned_len = (
+                len(token_ids_np)
+                // self.storage_page_size
+                * self.storage_page_size
             )
+            token_ids_np = token_ids_np[:aligned_len]
+            aligned_kv_indices = kv_indices[:aligned_len]
+        except Exception as exc:  # noqa: BLE001
+            local_reason = str(exc)
 
-        # Page-align inputs *before* put_match so the FlexKV allocator
-        # only reserves slots that line up with the slot_mapping we send.
-        if self.storage_page_size > 1:
-            aligned_len = n // self.storage_page_size * self.storage_page_size
-            if aligned_len == 0:
-                self._send_pp_put_meta(-1, [])
-                return -1
-            if aligned_len < n:
-                token_ids_np = token_ids_np[:aligned_len]
-                kv_indices = kv_indices[:aligned_len]
-
-        fkv_task_id = -1
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            try:
-                res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[FlexKV] put_match raised: %s", exc)
-                res = None
-            if res is None:
-                self._send_pp_put_meta(-1, [])
-                return -1
-            fkv_task_id, unmatched_mask = res
-
-            self._send_pp_put_meta(fkv_task_id, unmatched_mask)
-
-            if int(unmatched_mask.sum()) > 0:
-                filtered = kv_indices[unmatched_mask]
-                slot_mapping_cpu = self._to_cpu_int64(filtered)
-                self.kv_manager.launch(
-                    task_ids=[fkv_task_id],
-                    slot_mappings=[slot_mapping_cpu],
-                    as_batch=False,
-                    layerwise_transfer=False,
-                )
-                self._inflight_stores[rid] = fkv_task_id
-                return fkv_task_id
+        local_manifest = {
+            "rid": rid,
+            "token_ids": token_ids_np.tolist(),
+            "reason": local_reason,
+        }
+        leader_manifest = local_manifest
+        if self._sync_ctx.needs_sync:
+            leader_manifest = self._sync_ctx.scatter(local_manifest)
+        try:
+            local_preflight_valid = int(
+                local_reason is None
+                and aligned_kv_indices is not None
+                and isinstance(leader_manifest, dict)
+                and local_manifest == leader_manifest
+                and leader_manifest.get("reason") is None
+            )
+        except Exception:  # noqa: BLE001
+            local_preflight_valid = 0
+        if self._sync_ctx.all_reduce_min(local_preflight_valid) == 0:
+            return -1
+        if not token_ids_np.size:
             return -1
 
-        # Non-leader path: receive the unmatched mask + maybe forward
-        # slot_mapping to the remote-side TransferManager.
-        if self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_PUT_META:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_PUT_META, got " f"{payload.get('cmd')}"
+        put_outcome = {
+            "task_id": -1,
+            "unmatched_mask": [],
+            "reason": None,
+        }
+        if self._sync_ctx.is_sync_leader:
+            try:
+                if self.kv_manager is None:
+                    raise RuntimeError("FlexKV KVManager is not initialized")
+                match_result = self.kv_manager.put_match(
+                    token_ids=token_ids_np,
+                    token_mask=None,
                 )
-            fkv_task_id = int(payload["fkv_task_id"])
-            mask_list = payload.get("unmatched_mask", [])
-            unmatched_mask = torch.tensor(mask_list, dtype=torch.bool)
-            if (
-                int(unmatched_mask.sum()) > 0
-                and fkv_task_id >= 0
-                and self._sync_ctx.should_send_slot_mapping_to_remote
-            ):
-                filtered = kv_indices[unmatched_mask]
-                slot_mapping_cpu = self._to_cpu_int64(filtered)
-                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
-                self._inflight_stores[rid] = fkv_task_id
-        return fkv_task_id
+                if match_result is None:
+                    raise RuntimeError("FlexKV put_match returned no result")
+                task_id, unmatched_mask = match_result
+                normalized_task_id = self._normalize_task_id(task_id)
+                put_outcome["task_id"] = normalized_task_id
+                normalized_mask = np.asarray(unmatched_mask, dtype=np.bool_)
+                if normalized_mask.shape != token_ids_np.shape:
+                    raise RuntimeError("FlexKV put_match returned an invalid mask")
+                put_outcome["unmatched_mask"] = normalized_mask.tolist()
+            except Exception as exc:  # noqa: BLE001
+                put_outcome["reason"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            put_outcome = self._sync_ctx.scatter(put_outcome)
+
+        task_id = -1
+        unmatched_mask = np.empty((0,), dtype=np.bool_)
+        local_put_valid = True
+        try:
+            if not isinstance(put_outcome, dict):
+                raise ValueError("FlexKV store match outcome is invalid")
+            reason = put_outcome.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ValueError("FlexKV store match reason is invalid")
+            if reason is None:
+                task_id = self._normalize_task_id(put_outcome.get("task_id"))
+                unmatched_mask = np.asarray(
+                    put_outcome.get("unmatched_mask"),
+                    dtype=np.bool_,
+                )
+                if unmatched_mask.shape != token_ids_np.shape:
+                    raise ValueError("FlexKV store match mask differs across ranks")
+            elif put_outcome.get("task_id") != -1:
+                task_id = self._normalize_task_id(put_outcome.get("task_id"))
+        except Exception:  # noqa: BLE001
+            local_put_valid = False
+
+        put_valid = self._sync_ctx.all_reduce_min(int(local_put_valid)) == 1
+        if not put_valid:
+            if not self._cancel_prelaunch_store(task_id=task_id):
+                self.poison_load_back(
+                    "FlexKV store match validation and cancellation failed"
+                )
+            return -1
+        if put_outcome["reason"] is not None:
+            if task_id >= 0 and not self._cancel_prelaunch_store(task_id=task_id):
+                self.poison_load_back(
+                    "FlexKV store match failure cancellation failed"
+                )
+            return -1
+        if not unmatched_mask.any():
+            return -1
+
+        slot_mapping_cpu: Optional[torch.Tensor] = None
+        local_mapping_valid = True
+        try:
+            if aligned_kv_indices is None:
+                raise RuntimeError("FlexKV store indices are unavailable")
+            mask_tensor = torch.as_tensor(
+                unmatched_mask,
+                dtype=torch.bool,
+                device=aligned_kv_indices.device,
+            )
+            slot_mapping_cpu = self._to_cpu_int64(aligned_kv_indices[mask_tensor])
+            if slot_mapping_cpu.numel() != int(unmatched_mask.sum()):
+                raise RuntimeError("FlexKV store slot mapping has an invalid length")
+            if self._sync_ctx.should_send_slot_mapping_to_remote:
+                self._send_slot_mapping_to_remote(task_id, slot_mapping_cpu)
+        except Exception as exc:  # noqa: BLE001
+            local_mapping_valid = False
+            logger.warning(
+                "[FlexKV] store pre-launch mapping failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        mapping_valid = self._sync_ctx.all_reduce_min(int(local_mapping_valid)) == 1
+        if not mapping_valid:
+            if not self._cancel_prelaunch_store(task_id=task_id):
+                self.poison_load_back(
+                    "FlexKV store pre-launch cancellation failed"
+                )
+            return -1
+
+        launch_outcome = {
+            "observation_task_ids": [],
+            "reason": None,
+        }
+        if self._sync_ctx.is_sync_leader:
+            try:
+                if self.kv_manager is None or slot_mapping_cpu is None:
+                    raise RuntimeError("FlexKV store launch is not prepared")
+                launch_outcome["observation_task_ids"] = self._normalize_task_ids(
+                    self.kv_manager.launch(
+                        task_ids=[task_id],
+                        slot_mappings=[slot_mapping_cpu],
+                        as_batch=False,
+                        layerwise_transfer=False,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                launch_outcome["reason"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            launch_outcome = self._sync_ctx.scatter(launch_outcome)
+
+        observation_task_ids: Tuple[int, ...] = ()
+        local_launch_valid = True
+        try:
+            if not isinstance(launch_outcome, dict):
+                raise ValueError("FlexKV store launch outcome is invalid")
+            reason = launch_outcome.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ValueError("FlexKV store launch reason is invalid")
+            raw_observation_task_ids = launch_outcome.get("observation_task_ids")
+            if reason is None:
+                observation_task_ids = tuple(
+                    self._normalize_task_ids(raw_observation_task_ids)
+                )
+                active_task_ids = {
+                    task_id
+                    for task_ids in self._inflight_stores.values()
+                    for task_id in task_ids
+                }
+                if active_task_ids.intersection(observation_task_ids):
+                    raise ValueError("FlexKV reused an active store observation id")
+            else:
+                observation_task_ids = tuple(
+                    self._normalize_task_ids_allow_empty(raw_observation_task_ids)
+                )
+        except Exception:  # noqa: BLE001
+            local_launch_valid = False
+
+        launch_valid = self._sync_ctx.all_reduce_min(int(local_launch_valid)) == 1
+        if launch_valid and launch_outcome.get("reason") is None:
+            self._inflight_stores[rid] = observation_task_ids
+            return observation_task_ids[0]
+
+        if not launch_valid:
+            observation_task_ids = ()
+        ambiguous_reason = (
+            str(launch_outcome.get("reason"))
+            if launch_valid
+            else "FlexKV store launch validation differs across ranks"
+        )
+        self._inflight_stores[rid] = observation_task_ids
+        self._ambiguous_stores[rid] = ambiguous_reason
+        self.poison_load_back(ambiguous_reason)
+        return task_id
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
-        completed_rids: List[str] = []
-        completed_dict: Dict[int, Any] = {}
-
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            if self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                try:
-                    completed_dict = self.kv_manager.try_wait(
-                        task_ids=list(fk_to_rid.keys())
+        tracked_stores = {
+            rid: list(task_ids) for rid, task_ids in self._inflight_stores.items()
+        }
+        outcome = {
+            "tracked_stores": tracked_stores,
+            "completed_rids": [],
+            "reason": None,
+        }
+        if self._sync_ctx.is_sync_leader:
+            try:
+                observation_task_ids = [
+                    task_id
+                    for task_ids in self._inflight_stores.values()
+                    for task_id in task_ids
+                ]
+                if observation_task_ids:
+                    if self.kv_manager is None:
+                        raise RuntimeError("FlexKV KVManager is not initialized")
+                    responses = self.kv_manager.wait(
+                        task_ids=observation_task_ids,
+                        timeout=0,
+                        completely=True,
                     )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("[FlexKV] check_completed_stores: %s", exc)
-                    completed_dict = {}
-                for fk_tid in completed_dict:
-                    rid = fk_to_rid[fk_tid]
-                    completed_rids.append(rid)
-                    self._inflight_stores.pop(rid, None)
-
-        if self._sync_ctx.is_pp_sender:
-            self._sync_ctx.scatter_pp(
-                {
-                    "cmd": CMD_STORE_COMPLETE,
-                    "completed_fk_ids": list(completed_dict),
-                }
-            )
-        elif self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_STORE_COMPLETE:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_STORE_COMPLETE, got "
-                    f"{payload.get('cmd')}"
-                )
-            fk_ids = payload.get("completed_fk_ids", [])
-            if fk_ids and self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                for fk_tid in fk_ids:
-                    if fk_tid in fk_to_rid:
-                        rid = fk_to_rid[fk_tid]
-                        completed_rids.append(rid)
-                        self._inflight_stores.pop(rid, None)
-
+                    normalized_responses = self._normalize_terminal_responses(
+                        responses=responses,
+                        expected_task_ids=tuple(observation_task_ids),
+                    )
+                    completed_rids: List[str] = []
+                    for rid, task_ids in self._inflight_stores.items():
+                        statuses = [
+                            normalized_responses[task_id].status
+                            for task_id in task_ids
+                        ]
+                        if statuses and all(
+                            status is KVResponseStatus.SUCCESS for status in statuses
+                        ):
+                            completed_rids.append(rid)
+                        elif any(
+                            status
+                            not in (KVResponseStatus.SUCCESS, KVResponseStatus.TIMEOUT)
+                            for status in statuses
+                        ):
+                            raise RuntimeError(
+                                f"FlexKV store {rid} completed unsuccessfully"
+                            )
+                    outcome["completed_rids"] = completed_rids
+            except TimeoutError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                outcome["reason"] = f"FlexKV store terminal wait failed: {exc}"
         if self._sync_ctx.needs_sync:
-            completed_rids = self._sync_ctx.scatter(completed_rids)
-        return completed_rids
+            outcome = self._sync_ctx.scatter(outcome)
 
-    def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
-        """Block until a single store task identified by ``rid`` finishes."""
-        fkv_task_id = self._inflight_stores.pop(rid, -1)
-        if fkv_task_id < 0:
-            return True
-        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
-            return True
+        local_valid = True
+        completed_rids: List[str] = []
         try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[FlexKV] wait_store: %s", exc)
-            return False
-        return (
-            fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-        )
+            if not isinstance(outcome, dict):
+                raise ValueError("FlexKV store terminal outcome is invalid")
+            if outcome.get("tracked_stores") != tracked_stores:
+                raise ValueError("FlexKV store tracking differs across ranks")
+            completed_rids = outcome.get("completed_rids")
+            if not isinstance(completed_rids, list) or len(set(completed_rids)) != len(
+                completed_rids
+            ):
+                raise ValueError("FlexKV completed store ids are invalid")
+            if any(rid not in self._inflight_stores for rid in completed_rids):
+                raise ValueError("FlexKV completed an untracked store")
+            reason = outcome.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ValueError("FlexKV store terminal reason is invalid")
+        except Exception:  # noqa: BLE001
+            local_valid = False
+            completed_rids = []
+
+        terminal_valid = self._sync_ctx.all_reduce_min(int(local_valid)) == 1
+        if not terminal_valid:
+            reason = "FlexKV store terminal validation differs across ranks"
+            self.poison_load_back(reason)
+            raise RuntimeError(reason)
+        if outcome.get("reason") is not None:
+            self.poison_load_back(str(outcome.get("reason")))
+            raise RuntimeError(str(outcome.get("reason")))
+
+        for rid in completed_rids:
+            self._inflight_stores.pop(rid, None)
+        return completed_rids
 
     # ------------------------------------------------------------------
     # Public API — prefetch
@@ -883,6 +1050,7 @@ class FlexKVConnector:
         local_safe = int(
             self._poison_reason is None
             and not self._ambiguous_loads
+            and not self._ambiguous_stores
             and not self._launched_load_tids
             and not self._inflight_stores
             and not has_active_store_nodes
@@ -911,6 +1079,7 @@ class FlexKVConnector:
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
         self._inflight_stores.clear()
+        self._ambiguous_stores.clear()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
 
@@ -934,6 +1103,31 @@ class FlexKVConnector:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _cancel_prelaunch_store(self, *, task_id: int) -> bool:
+        outcome = {"success": False, "reason": None}
+        if self._sync_ctx.is_sync_leader:
+            try:
+                if self.kv_manager is None:
+                    raise RuntimeError("FlexKV KVManager is not initialized")
+                self.kv_manager.cancel([task_id])
+                outcome["success"] = True
+            except Exception as exc:  # noqa: BLE001
+                outcome["reason"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            outcome = self._sync_ctx.scatter(outcome)
+
+        local_valid = int(
+            isinstance(outcome, dict)
+            and isinstance(outcome.get("success"), bool)
+            and (
+                outcome.get("reason") is None
+                or isinstance(outcome.get("reason"), str)
+            )
+        )
+        if self._sync_ctx.all_reduce_min(local_valid) == 0:
+            return False
+        return bool(outcome["success"])
 
     def _prepare_load(
         self,
@@ -1389,21 +1583,6 @@ class FlexKVConnector:
             indexer_layout=indexer_layout,
         )
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
-
-    def _send_pp_put_meta(self, fkv_task_id: int, unmatched_mask) -> None:
-        if not self._sync_ctx.is_pp_active:
-            return
-        if hasattr(unmatched_mask, "tolist"):
-            mask_list = unmatched_mask.tolist()
-        else:
-            mask_list = list(unmatched_mask)
-        self._sync_ctx.scatter_pp(
-            {
-                "cmd": CMD_PUT_META,
-                "fkv_task_id": fkv_task_id,
-                "unmatched_mask": mask_list,
-            }
-        )
 
     def _send_slot_mapping_to_remote(
         self, task_id: int, slot_mapping_cpu: torch.Tensor
