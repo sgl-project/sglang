@@ -153,6 +153,7 @@ class GatherReqToTokenPool:
             req_to_token.shape[0] > 0 and req_to_token.shape[1] > 0
         ), f"{req_to_token.shape=}"
 
+        assert req_pool_indices.ndim == 1, f"{req_pool_indices.shape=}"
         num_reqs = req_pool_indices.shape[0]
         device_tensors = (
             req_pool_indices,
