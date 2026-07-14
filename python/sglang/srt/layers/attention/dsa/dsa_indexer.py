@@ -1347,6 +1347,14 @@ class Indexer(MultiPlatformOp):
             or forward_batch.forward_mode.is_decode_or_idle()
         )
         x_meta = x[0] if isinstance(x, tuple) else x
+        if forward_batch.forward_mode.is_decode_or_idle() and layer_id == 0:
+            import os
+
+            if os.environ.get("SGLANG_KONLY_DEBUG", "0") == "1":
+                logger.info(
+                    "[KONLY] decode k-only fired (skip-indexer): num_tok=%d",
+                    x_meta.shape[0],
+                )
 
         # Fast path: only compute and store k cache, skip all q and weights ops.
         # num_tokens (graph contract) slices to the unpadded count.
