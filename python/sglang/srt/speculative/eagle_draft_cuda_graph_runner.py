@@ -231,7 +231,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk = (
             torch.zeros(
-                self.eagle_worker.get_dsa_seed_topk_shape(self.max_bs),
+                (self.max_bs, self.eagle_worker.dsa_index_topk),
                 dtype=torch.int32,
                 device=model_runner.device,
             )

@@ -279,21 +279,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
 
-    def get_dsa_seed_topk_shape(self, num_tokens: int) -> Tuple[int, ...]:
-        """Return the platform-native shape of a draft DSA top-k seed.
-
-        CUDA DSA publishes one top-k list per token. Ascend sparse attention
-        expects TND sparse indices whose N dimension matches the index KV cache;
-        that cache uses one MQA head, independently of ``index_n_heads``.
-        """
-        if self.dsa_index_topk is None:
-            raise ValueError(
-                "DSA top-k seed reuse requires `index_topk` in the model config."
-            )
-        if _is_npu:
-            return (num_tokens, 1, self.dsa_index_topk)
-        return (num_tokens, self.dsa_index_topk)
-
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
         # top_scores_index are runtime-invariant. Must be rebuilt after any
@@ -900,12 +885,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
-        """Return a lazily-grown eager draft-extend DSA seed buffer."""
-        required_shape = self.get_dsa_seed_topk_shape(num_tokens)
+        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
-                required_shape,
+                (num_tokens, self.dsa_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
