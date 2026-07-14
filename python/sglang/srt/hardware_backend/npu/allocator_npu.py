@@ -697,8 +697,7 @@ class NPUSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             self.free_group.append(free_index)
         assert (
-            self.full_attn_allocator.available_size()
-            <= self.full_attn_allocator.size
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
