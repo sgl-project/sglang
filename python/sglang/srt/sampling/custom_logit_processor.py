@@ -8,6 +8,8 @@ import dill
 import orjson
 import torch
 
+from sglang.srt.utils.common import safe_pickle_loads
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -18,7 +20,10 @@ def _cache_from_str(json_str: str):
     This function is cached to avoid redundant deserialization.
     """
     data = orjson.loads(json_str)
-    return dill.loads(bytes.fromhex(data["callable"]))
+    callable_cls = safe_pickle_loads(bytes.fromhex(data["callable"]))
+    if not (isinstance(callable_cls, type) and issubclass(callable_cls, CustomLogitProcessor)):
+        raise ValueError(f"Invalid custom logit processor: must be a CustomLogitProcessor subclass, got {type(callable_cls).__name__}")
+    return callable_cls
 
 
 class CustomLogitProcessor(ABC):
