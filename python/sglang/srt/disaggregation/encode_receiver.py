@@ -1469,7 +1469,7 @@ class MMReceiverBase(ABC):
             self.embedding_pool = None
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
             if pool_mb and pool_mb > 0 and scheduler is not None:
-                gpu_id = getattr(scheduler, "gpu_id", 0)
+                gpu_id = getattr(getattr(scheduler, "ps", None), "gpu_id", 0)
                 try:
                     self.embedding_pool = MooncakeEmbeddingPool(
                         self.embeddings_engine, gpu_id, pool_mb * 1024 * 1024
@@ -1904,7 +1904,7 @@ class MMReceiverBase(ABC):
             f"Pre-allocating GPU buffer for mooncake RDMA: "
             f"req_id={req_id}, size={total_bytes} bytes"
         )
-        gpu_id = getattr(self.scheduler, "gpu_id", 0)
+        gpu_id = getattr(getattr(self.scheduler, "ps", None), "gpu_id", 0)
         embeddings = torch.empty(total_bytes, dtype=torch.uint8, device=gpu_id)
         self.embeddings_engine.register(
             embeddings.data_ptr(),
@@ -2025,7 +2025,7 @@ class MMReceiverHTTP(MMReceiverBase):
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
-            gpu_id = getattr(self.scheduler, "gpu_id", 0)
+            gpu_id = getattr(getattr(self.scheduler, "ps", None), "gpu_id", 0)
             return self._process_waiting_requests(
                 recv_reqs,
                 WaitingImageRDMARequest,
