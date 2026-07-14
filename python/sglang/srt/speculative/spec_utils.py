@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -36,6 +37,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
@@ -648,7 +650,7 @@ def commit_mamba_states_after_verify(
     commit hook.
     """
     model_runner = target_worker.model_runner
-    if model_runner.mambaish_config is None:
+    if mambaish_config(model_runner.model_config) is None:
         return
     attn_backend = model_runner.attn_backend
     if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
@@ -717,3 +719,14 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
         eagle_prepare_for_decode(batch)
+
+
+def get_plan_stream(
+    device: str,
+) -> Tuple[Any, contextlib.AbstractContextManager]:
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()
