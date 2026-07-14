@@ -124,9 +124,7 @@ class TestSWAEvictFloorAlignment(unittest.TestCase):
         req = _make_req(canonical_floor)
         req.kv.swa_evicted_seqlen = canonical_floor
 
-        result = cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=10
-        )
+        result = cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=10)
         allocator.free(
             cache.req_to_token_pool.req_to_token[
                 req.req_pool_idx, result.unhandled_kv_start : 10

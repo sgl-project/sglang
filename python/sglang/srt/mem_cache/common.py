@@ -198,8 +198,7 @@ def _release_overallocated_kv_indices(
     spec_algo = global_server_args.speculative_algorithm
 
     assert 0 <= effective_committed_len <= allocated_end, (
-        f"Unexpected KV cache lengths, {effective_committed_len=}, "
-        f"{allocated_end=}"
+        f"Unexpected KV cache lengths, {effective_committed_len=}, {allocated_end=}"
     )
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
@@ -211,8 +210,10 @@ def _release_overallocated_kv_indices(
                 f"{req.kv.kv_allocated_len=}"
             )
         else:
-            assert effective_committed_len <= allocated_end <= ceil_align(
-                effective_committed_len, allocator_page
+            assert (
+                effective_committed_len
+                <= allocated_end
+                <= ceil_align(effective_committed_len, allocator_page)
             ), (
                 f"Unexpected overallocated KV cache, {req.kv_committed_len=}, "
                 f"{req.kv.kv_allocated_len=}"

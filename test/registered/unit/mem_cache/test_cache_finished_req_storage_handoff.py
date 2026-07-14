@@ -36,9 +36,7 @@ class TestCacheFinishedReqStorageHandoff(unittest.TestCase):
             "flexkv.integration.config": _make_module(
                 "flexkv.integration.config", FlexKVConfig=object
             ),
-            "flexkv.kvmanager": _make_module(
-                "flexkv.kvmanager", KVManager=object
-            ),
+            "flexkv.kvmanager": _make_module("flexkv.kvmanager", KVManager=object),
             "flexkv.server": _make_module("flexkv.server"),
             "flexkv.server.client": _make_module(
                 "flexkv.server.client", KVTPClient=object
@@ -80,9 +78,7 @@ class TestCacheFinishedReqStorageHandoff(unittest.TestCase):
         external_modules: dict[str, ModuleType] = {
             "lmcache": _make_module("lmcache"),
             "lmcache.integration": _make_module("lmcache.integration"),
-            "lmcache.integration.sglang": _make_module(
-                "lmcache.integration.sglang"
-            ),
+            "lmcache.integration.sglang": _make_module("lmcache.integration.sglang"),
             "lmcache.integration.sglang.multi_process_adapter": _make_module(
                 "lmcache.integration.sglang.multi_process_adapter",
                 LMCacheMPConnector=object,
