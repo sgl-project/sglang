@@ -93,10 +93,10 @@ class TimestepPreparationStage(PipelineStage):
         scheduler_template = self.scheduler
         if batch.rollout:
             from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
-                resolve_rollout_scheduler,
+                rollout_scheduler_for,
             )
 
-            scheduler_template = resolve_rollout_scheduler(self.scheduler)
+            scheduler_template = rollout_scheduler_for(self.scheduler)
         scheduler = get_or_create_request_scheduler(batch, scheduler_template)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
