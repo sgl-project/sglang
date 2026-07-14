@@ -149,7 +149,7 @@ class SchedulerProfilerManager:
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
-                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps
+                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None

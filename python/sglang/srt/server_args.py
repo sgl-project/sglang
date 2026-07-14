@@ -185,6 +185,7 @@ QUANTIZATION_CHOICES = [
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
+    "humming",
 ]
 
 
@@ -219,9 +220,15 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
+    "ascend",
+    "fa3",
+    "fa4",
+    "flashinfer",
+    "triton",
+]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -255,6 +262,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "humming",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -266,6 +274,13 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+]
+
+MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
+    "cutlass",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -281,7 +296,6 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "cutlass",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -292,6 +306,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -364,6 +379,10 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_mxfp8_moe_runner_backend_choices(choices):
+    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_fp8_gemm_runner_backend_choices(choices):
@@ -736,6 +755,19 @@ class ServerArgs:
         int,
         "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
     ] = 10
+    retraction_policy: A[
+        str,
+        Arg(
+            help=(
+                "The decode retraction policy to use when the KV cache is full. "
+                "'length' preserves the existing behavior and retracts short-output, "
+                "long-input requests first. 'priority' retracts lower-priority "
+                "requests first, using the same priority direction as priority "
+                "scheduling."
+            ),
+            choices=RETRACTION_POLICY_CHOICES,
+        ),
+    ] = "length"
     schedule_conservativeness: A[
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
@@ -1085,6 +1117,16 @@ class ServerArgs:
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
     reasoning_parser: Optional[str] = None
+    default_chat_template_kwargs: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Default chat template kwargs applied to every request when not "
+            "overridden per-request. Keys must match what the model's chat template "
+            "expects (e.g. enable_thinking, thinking, reasoning_effort). Per-request "
+            "chat_template_kwargs takes precedence.",
+            type_parser=json.loads,
+        ),
+    ] = None
     strip_thinking_cache: A[
         bool,
         "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",
@@ -1393,7 +1435,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
         ),
@@ -1634,7 +1676,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1670,6 +1712,37 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_block_size: A[
+        Optional[int],
+        "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
+    ] = None
+    speculative_dspark_sps_table_path: A[
+        Optional[str],
+        "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
+        "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
+        "scheduler (cap-accept / compact). Omit for an uninitialized flat "
+        "constant-SPS table: the budget degenerates to verify-all (zero throughput "
+        "gain by itself).",
+    ] = None
+    speculative_dspark_confidence_sts_path: A[
+        Optional[str],
+        "DSPARK only. Optional path to a per-position STS (sequential temperature "
+        "scaling) calibration JSON, fit offline with sglang.benchmark.dspark_sts_fit. "
+        "Calibrates the confidence-head survival probabilities the ragged-verify "
+        "scheduler consumes. Omit to use identity (no calibration); losslessness is "
+        "unaffected either way.",
+    ] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: A[
+        bool,
+        "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "
+        "the total verify-token count reaches the cuda-graph tier the forward is "
+        "already padded to: round the dp-max scheduled total up to the captured "
+        "token bucket and let the top-k allocator admit that many real draft tokens "
+        "(confidence-ordered). This recovers the padding the forward pays for anyway "
+        "-- both the cuda-graph bucket round-up and the dp cross-rank max -- turning "
+        "it into extra real verification at the same step time. Off by default; when "
+        "off the schedule is byte-for-byte unchanged.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -1919,9 +1992,9 @@ class ServerArgs:
         Optional[str],
         "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
     ] = None
-    enable_deepep_waterfill: A[
+    enable_waterfill: A[
         bool,
-        "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+        "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
     elastic_ep_rejoin: A[
         bool,
@@ -1934,7 +2007,7 @@ class ServerArgs:
     disable_shared_experts_fusion: A[
         bool,
         Arg(
-            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert through DeepEP as an extra MoE slot, so shared expert is not separated from the MoE path when Waterfill is enabled.",
+            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: Waterfill (--enable-waterfill) routes the shared expert as an extra MoE slot, so the shared expert is not separated from the MoE path when Waterfill is enabled.",
             resolvable=True,
         ),
     ] = False
@@ -2339,6 +2412,13 @@ class ServerArgs:
         Optional[str],
         "The diffusion LLM algorithm configurations. Must be a YAML file.",
     ] = None
+    dllm_fdfo: A[
+        bool,
+        Arg(
+            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM inference. Enabled by default; use --no-dllm-fdfo to fall back to synchronous block scheduling.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -2382,9 +2462,9 @@ class ServerArgs:
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
     ] = 1
-    optimistic_prefill_retries: A[
+    optimistic_prefill_attempts: A[
         int,
-        "Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        "Number of optimistic prefill forward passes that skip the bootstrap wait.",
     ] = 0
 
     # -------------------------------------------------------------------------
@@ -2745,6 +2825,13 @@ class ServerArgs:
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
 
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
@@ -2844,7 +2931,7 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
@@ -3430,6 +3517,21 @@ class ServerArgs:
         """
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
+
+        # Breakable is the general CUDA default, but it is not compatible with
+        # multimodal prefill. Models on this allowlist have had their decoder
+        # prefill validated under tc_piecewise; the vision encoder remains
+        # eager outside the captured LM forward.
+        if (
+            self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+        ):
+            logger.info(
+                "Using tc_piecewise CUDA graph for validated multimodal "
+                "decoder prefill."
+            )
+            self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+
         if self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
@@ -3547,8 +3649,12 @@ class ServerArgs:
             ),
             # DP-attn × BCG capture/replay not yet validated.
             ("DP attention", lambda: self._resolved().enable_dp_attention),
-            # Multimodal prefill replay faults under BCG.
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
+            (
+                "multimodal model",
+                lambda: self.get_model_config().is_multimodal
+                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            ),
         ]
         for name, predicate in rules:
             if predicate():
@@ -5197,10 +5303,31 @@ class ServerArgs:
         if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
+            original_chunked_prefill_size = self.chunked_prefill_size
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                f"DP attention is enabled. chunked prefill size is adjusted "
+                f"from {original_chunked_prefill_size} to {self.chunked_prefill_size}."
             )
+
+            # The prefill CUDA graph max_bs was derived from the pre-DP-division
+            # chunked_prefill_size in _handle_gpu_memory_settings (which runs
+            # before this handler). Re-clamp it (and the captured shape list) to
+            # the per-DP-rank chunked_prefill_size so breakable CUDA graph
+            # capture never exceeds the MoE all-to-all's max_num_tokens budget,
+            # which is also sized from the DP-adjusted chunked_prefill_size.
+            prefill_cfg = self.cuda_graph_config.prefill
+            if (
+                prefill_cfg.backend != Backend.DISABLED
+                and prefill_cfg.max_bs is not None
+                and prefill_cfg.max_bs > self.chunked_prefill_size
+                and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
+            ):
+                prefill_cfg.max_bs = self.chunked_prefill_size
+                if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
+                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
+                        prefill_cfg.max_bs
+                    )
 
         # The dp-lm-head validation moved to the resolution pipeline
         # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
@@ -5301,19 +5428,19 @@ class ServerArgs:
         MoE layer on one (DP) rank. Single source of truth for both the
         standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
         budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_bs is
+        capture, and decode/verify bounds; num_tokens_per_req is
         speculative_num_draft_tokens under speculative decoding, else 1.
         """
         if self.speculative_algorithm:
-            num_tokens_per_bs = self.speculative_num_draft_tokens or 1
+            num_tokens_per_req = self.speculative_num_draft_tokens or 1
         else:
-            num_tokens_per_bs = 1
+            num_tokens_per_req = 1
         prefill_tokens = self.max_prefill_tokens
         cg_config = self.cuda_graph_config
         if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
             prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_bs
+        decode_tokens = decode_max_bs * num_tokens_per_req
         return max(prefill_tokens, decode_tokens)
 
     def max_prefill_buffer_tokens(self) -> int:
@@ -5334,7 +5461,7 @@ class ServerArgs:
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
-        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
         from sglang.srt.arg_groups.overrides import resolved_view
 
         view = resolved_view(self)
@@ -5391,6 +5518,10 @@ class ServerArgs:
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
         a2a_backend = resolved_view(self).moe_a2a_backend
+        if self.enable_waterfill:
+            self.enforce_shared_experts_fusion = True
+            logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
@@ -5407,11 +5538,6 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            if self.enable_deepep_waterfill:
-                self.enforce_shared_experts_fusion = True
-                logger.info(
-                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
-                )
 
         if a2a_backend == "mooncake":
             logger.warning(
@@ -5656,26 +5782,6 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
-
-        # Step 3: HiCache is not yet supported with the DeepSeek-V4 hip unified_kv
-        # layout, so fall back to the default tilelang FlashMLA backend.
-        self._resolve_unified_kv_hicache_compatibility()
-
-    def _resolve_unified_kv_hicache_compatibility(self):
-        # The DeepSeek-V4 unified_kv layout (SGLANG_HACK_FLASHMLA_BACKEND=
-        # unified_kv_triton) keeps swa/c4/c128 in a single per-layer buffer and
-        # has no HiCache host-pool support yet, so reset the backend to the
-        # default (tilelang) so the server still starts.
-        if not self.enable_hierarchical_cache:
-            return
-
-        if envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton":
-            envs.SGLANG_HACK_FLASHMLA_BACKEND.set("tilelang")
-            logger.warning(
-                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton is not yet "
-                "compatible with --enable-hierarchical-cache; falling back to "
-                "SGLANG_HACK_FLASHMLA_BACKEND=tilelang."
-            )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -6151,9 +6257,10 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                if attention_backend not in ["fa3", "triton"]:
+                deepseek_deterministic_attention_backends = ["fa3", "triton"]
+                if attention_backend not in deepseek_deterministic_attention_backends:
                     raise ValueError(
-                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {deepseek_deterministic_attention_backends} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
@@ -6343,21 +6450,21 @@ class ServerArgs:
 
         # Handle optimistic prefill validation
         if (
-            self.optimistic_prefill_retries > 0
+            self.optimistic_prefill_attempts > 0
             and self.disaggregation_mode == "prefill"
         ):
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
             elif self.enable_hierarchical_cache:
                 logger.warning("Optimistic prefill does not support hierarchical cache")
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
             elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
                     "Optimistic prefill does not support models that use "
                     "mamba radix cache."
                 )
-                self.optimistic_prefill_retries = 0
+                self.optimistic_prefill_attempts = 0
 
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -6428,14 +6535,26 @@ class ServerArgs:
                 os.environ[key] = value
                 logger.info("Auto-set %s=%s (from --crash-dump-folder)", key, value)
 
-                if key == "CUDA_COREDUMP_FILE":
-                    # cuda curedump cannot write to a folder that does not exist,
-                    # so we have to create the folder first.
-                    hostname = socket.gethostname()
-                    os.makedirs(
-                        os.path.join(self.crash_dump_folder, hostname),
-                        exist_ok=True,
-                    )
+        coredump_dir = os.path.dirname(
+            os.environ["CUDA_COREDUMP_FILE"].replace("%h", socket.gethostname())
+        )
+        if "%" in coredump_dir:
+            logger.warning(
+                "Cannot pre-create CUDA coredump directory %s: only %%h is "
+                "supported in the directory part of CUDA_COREDUMP_FILE; "
+                "coredumps may fail to write.",
+                coredump_dir,
+            )
+        elif coredump_dir:
+            try:
+                os.makedirs(coredump_dir, exist_ok=True)
+            except OSError as e:
+                logger.warning(
+                    "Failed to create CUDA coredump directory %s: %s; "
+                    "coredumps may fail to write.",
+                    coredump_dir,
+                    e,
+                )
 
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
@@ -6693,6 +6812,11 @@ class ServerArgs:
             attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
         ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
+
+    def get_tokenizer_worker_class(self):
+        from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+
+        return TokenizerWorker
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
@@ -7023,6 +7147,10 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
+        if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
+            raise ValueError(
+                "--retraction-policy priority requires --enable-priority-scheduling"
+            )
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -7451,6 +7579,7 @@ class ServerArgs:
             return None
         if not host or not (0 < port < 65536):
             return None
+
         return {
             "publisher": cfg.publisher,
             "endpoint_host": host,

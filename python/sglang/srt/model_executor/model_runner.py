@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -101,6 +102,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -132,7 +134,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -389,6 +390,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.capture_tail_hooks = []
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -421,9 +423,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         self.eagle_draft_num_layers = None
-        self.dflash_use_aux_hidden_state = False
-        self.dflash_target_layer_ids = None
-        self.dflash_draft_num_layers = None
+        self.dflash_family_use_aux_hidden_state = False
+        self.dflash_family_target_layer_ids = None
+        self.dflash_family_draft_num_layers = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -463,10 +465,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # if there is no aux layer, set to None
                     self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
-            # Select target layers to capture for building DFlash context features.
+            # Select target layers to capture for building draft context features.
             draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
@@ -484,8 +486,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if target_num_layers is None:
                 raise ValueError(
-                    "DFLASH requires target num_hidden_layers in config. "
-                    f"Got target={target_num_layers}."
+                    "Block-draft-with-target-kv spec requires target num_hidden_layers "
+                    f"in config. Got target={target_num_layers}."
                 )
             target_num_layers = int(target_num_layers)
 
@@ -494,18 +496,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and trained_target_layers != target_num_layers
             ):
                 logger.warning(
-                    "DFLASH draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
+                    "Draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
                     "selecting capture layers based on the runtime target model.",
                     trained_target_layers,
                     target_num_layers,
                 )
 
-            self.dflash_use_aux_hidden_state = True
-            self.dflash_draft_num_layers = int(draft_num_layers)
-            self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
+            target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+
+            if self.spec_algorithm.is_dspark():
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    parse_dspark_draft_config,
+                )
+
+                dspark_draft_config = parse_dspark_draft_config(
+                    draft_hf_config=draft_model_config.hf_config
+                )
+                if not dspark_draft_config.require_markov():
+                    raise ValueError(
+                        "DSPARK requires markov_rank > 0 in the draft config, "
+                        f"got markov_rank={dspark_draft_config.markov_rank}."
+                    )
+                if dspark_draft_config.target_layer_ids is not None:
+                    target_layer_ids = list(dspark_draft_config.target_layer_ids)
+
+            self.dflash_family_use_aux_hidden_state = True
+            self.dflash_family_draft_num_layers = int(draft_num_layers)
+            self.dflash_family_target_layer_ids = target_layer_ids
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -670,7 +690,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
+                    "Initial expert_location_metadata:\n%s",
+                    format_expert_location_layout(
+                        get_global_expert_location_metadata()
+                    ),
                 )
 
             set_global_expert_distribution_recorder(
@@ -744,14 +767,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
+        if self.is_draft_worker and model_has_mtp_layers:
+            model_num_layers = getattr(
+                self.model, "num_stages", self.model_config.num_nextn_predict_layers
+            )
+        else:
+            model_num_layers = max(
                 self.model_config.num_hidden_layers,
                 self.model_config.num_attention_layers,
             )
-        )
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
         elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
@@ -818,14 +842,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return None
         return getattr(hf_config, "index_topk", None)
 
-    def decode_num_tokens_per_bs(
+    def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
             if num_draft_tokens is None:
                 num_draft_tokens = self.server_args.speculative_num_draft_tokens
-            return self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            return self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                 num_draft_tokens, self.is_draft_worker
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
@@ -833,9 +857,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_bs = self.decode_num_tokens_per_bs()
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
-        return max(capture_bs) * num_tokens_per_bs
+        num_tokens_per_req = self.decode_num_tokens_per_req()
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+        return max(capture_bs) * num_tokens_per_req
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -1051,13 +1075,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.set_eagle3_layers_to_capture(
                 self.eagle_aux_hidden_state_layer_ids
             )
-        if self.dflash_use_aux_hidden_state:
-            if not hasattr(self.model, "set_dflash_layers_to_capture"):
-                raise ValueError(
-                    f"Model {self.model.__class__.__name__} does not implement "
-                    "set_dflash_layers_to_capture, which is required for DFLASH."
+        if self.dflash_family_use_aux_hidden_state:
+            if self.spec_algorithm.is_dspark() and hasattr(
+                self.model, "set_dspark_layers_to_capture"
+            ):
+                self.model.set_dspark_layers_to_capture(
+                    self.dflash_family_target_layer_ids
                 )
-            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+            elif hasattr(self.model, "set_dflash_layers_to_capture"):
+                self.model.set_dflash_layers_to_capture(
+                    self.dflash_family_target_layer_ids
+                )
+            else:
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} implements neither "
+                    "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
+                    "one of which is required for DFLASH/DSPARK."
+                )
 
     def remote_instance_init_transfer_engine(self):
         try:
@@ -1597,10 +1631,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         for module in self.model.modules():
             if not isinstance(module, (TopK, HashTopK)):
                 continue
-            if (
-                not module.enable_deepep_waterfill
-                or module.deepep_waterfill_balancer is not None
-            ):
+            if not module.enable_waterfill or module.waterfill_balancer is not None:
                 continue
             if num_routed_experts is None:
                 num_routed_experts = getattr(
@@ -1608,14 +1639,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 if num_routed_experts is None:
                     raise ValueError(
-                        "DeepEP waterfill requires model config n_routed_experts."
+                        "Waterfill requires model config n_routed_experts."
                     )
             if balancer_cls is None:
-                from sglang.srt.layers.moe.deepep_waterfill import (
-                    DeepEPWaterfillBalancer,
-                )
+                from sglang.srt.layers.moe.waterfill import WaterfillBalancer
 
-                balancer_cls = DeepEPWaterfillBalancer
+                balancer_cls = WaterfillBalancer
             # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
             # Redundant experts therefore need to be included in the per-rank
             # expert count used for Waterfill's shared-expert slot remapping.
@@ -1626,7 +1655,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 routed_scaling_factor = module.topk_config.routed_scaling_factor
             else:
                 routed_scaling_factor = module.routed_scaling_factor
-            module.deepep_waterfill_balancer = balancer_cls(
+            module.waterfill_balancer = balancer_cls(
                 num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
@@ -1638,7 +1667,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_prepared += 1
         if num_prepared:
             log_info_on_rank0(
-                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
+                logger, f"Prepared {num_prepared} Waterfill TopK modules."
             )
 
     def _init_lplb_solvers(self):
@@ -2205,7 +2234,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         Phase 2 (dense LoRA batch metadata) is handled later in
         CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        because it needs capture-time parameters (max_bs, num_tokens_per_req)
         that are only available at that stage.
         """
         from sglang.srt.lora.layers import FusedMoEWithLoRA
@@ -2611,20 +2640,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         role = "draft" if self.is_draft_worker else "target"
         if self.spec_algorithm.is_speculative():
             capture_name = f"{role} verify"
-            num_tokens_per_bs = (
-                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            num_tokens_per_req = (
+                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                     self.server_args.speculative_num_draft_tokens,
                     self.is_draft_worker,
                 )
             )
         else:
             capture_name = f"{role} decode"
-            num_tokens_per_bs = 1
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+            num_tokens_per_req = 1
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
             f"Capture {capture_name} {graph_backend[self.device]} begin. "
-            f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
+            f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
             f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
 
@@ -2696,8 +2725,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner = self.eager_runner
             return
 
-        # Disable prefill CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
+        # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
+        # expose it as ``language_model`` rather than ``model``.
+        try:
+            language_model = resolve_language_model(self.model)
+        except AttributeError:
             logger.warning(
                 "Disable prefill CUDA graph because the model is not a language model"
             )
@@ -2710,9 +2742,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+        # Collect attention layers and moe layers from the model. Keep a VLM
+        # wrapper that exposes ``language_model`` unchanged: assigning it to
+        # ``model`` would register a duplicate module alias and duplicate the
+        # model's state-dict namespace.
+        if hasattr(self.model, "model"):
+            self.model.model = language_model
 
         # Find the module that owns the decoder `layers`. Models wrap it at
         # varying depths: a direct text model exposes `.layers`, a CausalLM
@@ -3050,7 +3085,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.server_args.elastic_ep_backend is not None:
+        if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
         return output

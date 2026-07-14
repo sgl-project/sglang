@@ -60,14 +60,15 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    NextBatchPlan,
+    ScheduleBatch,
+)
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    EvictParams,
-)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -142,6 +143,10 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
+        # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
+        # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
+        # inheriting ReqToTokenPool.alloc, which bumps it.
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -170,6 +175,7 @@ class DecodeReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -180,6 +186,7 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -1281,11 +1288,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if self.scheduler.enable_hisparse:
-            # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
-            # so the logical pool is the binding constraint for admission control.
-            available_size = (
-                self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
-            )
+            logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
+            if self._uses_swa_tail_prealloc() and hasattr(
+                logical_allocator, "full_available_size"
+            ):
+                available_size = logical_allocator.full_available_size()
+            else:
+                # HiSparse pre-alloc only allocates logical indices, so the
+                # logical pool is the binding constraint for admission control.
+                available_size = logical_allocator.available_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1467,14 +1478,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+            seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+            seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+            last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+            if self._uses_swa_tail_prealloc():
+                swa_tail_len = self._swa_tail_len(fill_len)
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                    swa_tail_len=swa_tail_len,
+                )
+                req.swa_evicted_seqlen = fill_len - swa_tail_len
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                )
 
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
@@ -1605,6 +1634,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
+            output_token_sampling_mask_len,
+            output_token_sampling_mask_idx,
+            output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
             output_hidden_states,
@@ -1719,6 +1751,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+        if decode_req.req.return_sampling_mask:
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
+            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+            if sampling_mask_len < 0:
+                decode_req.req.output_token_sampling_mask.append(None)
+                decode_req.req.output_token_sampling_logprobs.append(None)
+            else:
+                decode_req.req.output_token_sampling_mask.append(
+                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
+                )
+                decode_req.req.output_token_sampling_logprobs.append(
+                    float(output_token_sampling_logprobs[0].item())
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
@@ -1900,8 +1947,12 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
+            plan = self.get_next_disagg_decode_batch_to_run(
+                running_batch=self.running_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -1934,10 +1985,16 @@ class SchedulerDisaggregationDecodeMixin:
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
+            plan = self.get_next_disagg_decode_batch_to_run(
+                running_batch=self.running_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, last_batch=self.last_batch
+            )
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
@@ -1958,7 +2015,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -1976,11 +2033,11 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler,
-    ) -> Optional[ScheduleBatch]:
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -1988,28 +2045,28 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = new_prebuilt_batch
+                if running_batch.is_empty():
+                    running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
-                        self.running_batch.hisparse_coordinator = (
-                            self.hisparse_coordinator
-                        )
+                        running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
-                    self.running_batch.merge_batch(new_prebuilt_batch)
+                    running_batch.merge_batch(new_prebuilt_batch)
 
         # Schedule decode batch
-        if self.running_batch.is_empty():
+        if running_batch.is_empty():
             ret = None
         else:
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
+            running_batch = self.update_running_batch(running_batch)
+            ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
-        return ret
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_prebuilt_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2020,9 +2077,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            self.policy.calc_priority(self.waiting_queue, running_batch)
 
-        curr_batch_size = self.running_batch.batch_size()
+        curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
