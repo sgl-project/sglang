@@ -1006,10 +1006,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
                 kv_indices = (
-                    dst_kv_indices[:host_transfer_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
+                    dst_kv_indices[:host_transfer_len].cpu().numpy().astype(np.int32)
                 )
             else:
                 # Only send delta indices (beyond prefix) to prefill.

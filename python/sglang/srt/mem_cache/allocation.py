@@ -84,83 +84,69 @@ def write_cache_indices(
     assert req_to_token.ndim == 2, f"{req_to_token.shape=}"
     assert req_to_token.dtype == torch.int32, f"{req_to_token.dtype=}"
     assert req_to_token.is_contiguous(), f"{req_to_token.stride()=}"
-    assert req_to_token.shape[0] > 0 and req_to_token.shape[1] > 0, (
-        f"{req_to_token.shape=}"
-    )
+    assert (
+        req_to_token.shape[0] > 0 and req_to_token.shape[1] > 0
+    ), f"{req_to_token.shape=}"
     assert out_cache_loc.ndim == 1, f"{out_cache_loc.shape=}"
-    assert out_cache_loc.dtype in (torch.int32, torch.int64), (
-        f"{out_cache_loc.dtype=}"
-    )
+    assert out_cache_loc.dtype in (torch.int32, torch.int64), f"{out_cache_loc.dtype=}"
     assert out_cache_loc.is_contiguous(), f"{out_cache_loc.stride()=}"
-    assert out_cache_loc.device == req_to_token.device, (
-        f"{out_cache_loc.device=}, {req_to_token.device=}"
-    )
-    assert all(tensor.ndim == 1 for tensor in device_inputs + cpu_inputs), (
-        f"shapes={[tensor.shape for tensor in device_inputs + cpu_inputs]}"
-    )
+    assert (
+        out_cache_loc.device == req_to_token.device
+    ), f"{out_cache_loc.device=}, {req_to_token.device=}"
     assert all(
-        tensor.shape == (num_reqs,) for tensor in device_inputs + cpu_inputs
-    ), (
+        tensor.ndim == 1 for tensor in device_inputs + cpu_inputs
+    ), f"shapes={[tensor.shape for tensor in device_inputs + cpu_inputs]}"
+    assert all(tensor.shape == (num_reqs,) for tensor in device_inputs + cpu_inputs), (
         f"{num_reqs=}, "
         f"shapes={[tensor.shape for tensor in device_inputs + cpu_inputs]}"
     )
     assert all(
         tensor.dtype == torch.int64 for tensor in device_inputs + cpu_inputs
-    ), (
-        f"dtypes={[tensor.dtype for tensor in device_inputs + cpu_inputs]}"
-    )
-    assert all(tensor.is_contiguous() for tensor in device_inputs + cpu_inputs), (
-        f"strides={[tensor.stride() for tensor in device_inputs + cpu_inputs]}"
-    )
-    assert all(tensor.device == req_to_token.device for tensor in device_inputs), (
-        f"{req_to_token.device=}, devices={[tensor.device for tensor in device_inputs]}"
-    )
-    assert all(tensor.device.type == "cpu" for tensor in cpu_inputs), (
-        f"devices={[tensor.device for tensor in cpu_inputs]}"
-    )
-    assert len(prefix_tensors) == num_reqs, (
-        f"{len(prefix_tensors)=}, {num_reqs=}"
-    )
-    assert all(tensor.ndim == 1 for tensor in prefix_tensors), (
-        f"shapes={[tensor.shape for tensor in prefix_tensors]}"
-    )
-    assert all(tensor.dtype == torch.int64 for tensor in prefix_tensors), (
-        f"dtypes={[tensor.dtype for tensor in prefix_tensors]}"
-    )
-    assert all(tensor.is_contiguous() for tensor in prefix_tensors), (
-        f"strides={[tensor.stride() for tensor in prefix_tensors]}"
-    )
+    ), f"dtypes={[tensor.dtype for tensor in device_inputs + cpu_inputs]}"
+    assert all(
+        tensor.is_contiguous() for tensor in device_inputs + cpu_inputs
+    ), f"strides={[tensor.stride() for tensor in device_inputs + cpu_inputs]}"
+    assert all(
+        tensor.device == req_to_token.device for tensor in device_inputs
+    ), f"{req_to_token.device=}, devices={[tensor.device for tensor in device_inputs]}"
+    assert all(
+        tensor.device.type == "cpu" for tensor in cpu_inputs
+    ), f"devices={[tensor.device for tensor in cpu_inputs]}"
+    assert len(prefix_tensors) == num_reqs, f"{len(prefix_tensors)=}, {num_reqs=}"
+    assert all(
+        tensor.ndim == 1 for tensor in prefix_tensors
+    ), f"shapes={[tensor.shape for tensor in prefix_tensors]}"
+    assert all(
+        tensor.dtype == torch.int64 for tensor in prefix_tensors
+    ), f"dtypes={[tensor.dtype for tensor in prefix_tensors]}"
+    assert all(
+        tensor.is_contiguous() for tensor in prefix_tensors
+    ), f"strides={[tensor.stride() for tensor in prefix_tensors]}"
 
     assert bool(torch.all(req_pool_indices_cpu >= 0)), f"{req_pool_indices_cpu=}"
-    assert bool(torch.all(req_pool_indices_cpu < req_to_token.shape[0])), (
-        f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
-    )
-    assert bool(torch.all(prefix_write_lens_cpu >= 0)), (
-        f"{prefix_write_lens_cpu=}"
-    )
-    assert bool(torch.all(alloc_start_lens_cpu >= prefix_write_lens_cpu)), (
-        f"{prefix_write_lens_cpu=}, {alloc_start_lens_cpu=}"
-    )
-    assert bool(torch.all(alloc_end_lens_cpu >= alloc_start_lens_cpu)), (
-        f"{alloc_start_lens_cpu=}, {alloc_end_lens_cpu=}"
-    )
-    assert bool(torch.all(alloc_extend_lens_cpu >= 0)), (
-        f"{alloc_extend_lens_cpu=}"
-    )
-    assert bool(torch.all(alloc_end_lens_cpu <= req_to_token.shape[1])), (
-        f"{alloc_end_lens_cpu=}, row_width={req_to_token.shape[1]}"
-    )
+    assert bool(
+        torch.all(req_pool_indices_cpu < req_to_token.shape[0])
+    ), f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
+    assert bool(torch.all(prefix_write_lens_cpu >= 0)), f"{prefix_write_lens_cpu=}"
+    assert bool(
+        torch.all(alloc_start_lens_cpu >= prefix_write_lens_cpu)
+    ), f"{prefix_write_lens_cpu=}, {alloc_start_lens_cpu=}"
+    assert bool(
+        torch.all(alloc_end_lens_cpu >= alloc_start_lens_cpu)
+    ), f"{alloc_start_lens_cpu=}, {alloc_end_lens_cpu=}"
+    assert bool(torch.all(alloc_extend_lens_cpu >= 0)), f"{alloc_extend_lens_cpu=}"
+    assert bool(
+        torch.all(alloc_end_lens_cpu <= req_to_token.shape[1])
+    ), f"{alloc_end_lens_cpu=}, row_width={req_to_token.shape[1]}"
     assert torch.equal(
         alloc_end_lens_cpu - alloc_start_lens_cpu,
         alloc_extend_lens_cpu,
     ), (
-        f"{alloc_start_lens_cpu=}, {alloc_end_lens_cpu=}, "
-        f"{alloc_extend_lens_cpu=}"
+        f"{alloc_start_lens_cpu=}, {alloc_end_lens_cpu=}, " f"{alloc_extend_lens_cpu=}"
     )
     alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
     assert alloc_extend_num_tokens == out_cache_loc.numel(), (
-        f"{alloc_extend_num_tokens=}, "
-        f"out_numel={out_cache_loc.numel()}"
+        f"{alloc_extend_num_tokens=}, " f"out_numel={out_cache_loc.numel()}"
     )
     prefix_write_lens: list[int] = prefix_write_lens_cpu.tolist()
     assert all(
@@ -188,9 +174,9 @@ def write_cache_indices(
             "xpu",
             "musa",
         )
-        assert req_to_token.device.type in supported_accelerator_types, (
-            f"{req_to_token.device=}"
-        )
+        assert (
+            req_to_token.device.type in supported_accelerator_types
+        ), f"{req_to_token.device=}"
         assert all(
             tensor.device.type in supported_accelerator_types
             for tensor in device_inputs
@@ -585,12 +571,8 @@ def alloc_for_extend(
     prefix_tensors: list[torch.Tensor] = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu: torch.Tensor = torch.tensor(
-        batch.prefix_lens, dtype=torch.int64
-    )
-    extend_lens_cpu: torch.Tensor = torch.tensor(
-        batch.extend_lens, dtype=torch.int64
-    )
+    prefix_lens_cpu: torch.Tensor = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    extend_lens_cpu: torch.Tensor = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device: torch.Tensor = prefix_lens_cpu.to(
         batch.device, non_blocking=True
     )
@@ -628,9 +610,7 @@ def alloc_for_extend(
         alloc_start_lens_device = alloc_start_lens_cpu.to(
             batch.device, non_blocking=True
         )
-        alloc_end_lens_device = alloc_end_lens_cpu.to(
-            batch.device, non_blocking=True
-        )
+        alloc_end_lens_device = alloc_end_lens_cpu.to(batch.device, non_blocking=True)
         alloc_extend_lens_device = alloc_extend_lens_cpu.to(
             batch.device, non_blocking=True
         )
@@ -1078,14 +1058,10 @@ def alloc_for_spec_decode(
     allocation_num_needed_tokens: int
     if not _is_npu and allocator_page > 1:
         allocation_nxt_kv_lens_cpu = (
-            (nxt_kv_lens_cpu + allocator_page - 1)
-            // allocator_page
-            * allocator_page
+            (nxt_kv_lens_cpu + allocator_page - 1) // allocator_page * allocator_page
         )
         allocation_nxt_kv_lens = (
-            (nxt_kv_lens + allocator_page - 1)
-            // allocator_page
-            * allocator_page
+            (nxt_kv_lens + allocator_page - 1) // allocator_page * allocator_page
         )
         allocation_num_needed_tokens = int(
             (allocation_nxt_kv_lens_cpu - cur_kv_lens_cpu).sum().item()
