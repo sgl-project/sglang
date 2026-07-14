@@ -182,7 +182,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         coordinator._eager_backup_previous_token = mock.Mock()
 
         with mock.patch.object(hisparse_coordinator_module, "_is_npu", False):
-            coordinator.map_last_loc_to_buffer(
+            coordinator.map_latest_cache_loc_to_buffer(
                 seq_lens=torch.tensor([12, 12], dtype=torch.int64),
                 out_cache_loc=torch.tensor([11, 19], dtype=torch.int64),
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),

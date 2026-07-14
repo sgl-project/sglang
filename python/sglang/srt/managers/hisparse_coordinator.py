@@ -474,7 +474,7 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
-    def map_last_loc_to_buffer(
+    def map_latest_cache_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
@@ -503,7 +503,7 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
-            compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+            compressed_cache_locs = self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
                 out_cache_loc
             )
             # ROCm: the decode remap creates a temporary hisparse device slot per
@@ -514,13 +514,13 @@ class HiSparseCoordinator:
             # top_k_device_locs, so stale mapping entries are harmless there.
             if _is_hip:
                 previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
-                    compressed_locs
+                    compressed_cache_locs
                 )
                 stale_locs = previous_locs[
                     (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
                 ]
                 if stale_locs.numel() > 0:
-                    stale_mapping_indices = compressed_locs[
+                    stale_mapping_indices = compressed_cache_locs[
                         (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
                     ]
                     self.token_to_kv_pool_allocator.release_hisparse_ownership(
@@ -529,7 +529,7 @@ class HiSparseCoordinator:
                     )
 
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                compressed_locs
+                compressed_cache_locs
             ] = reserved_buffer_loc
             return
 
@@ -553,12 +553,14 @@ class HiSparseCoordinator:
             :, active_req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
 
-        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-            active_out_cache_loc
+        compressed_cache_locs = (
+            self.token_to_kv_pool_allocator.translate_latest_cache_locs_to_compressed(
+                active_out_cache_loc
+            )
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
-            reserved_buffer_loc
-        )
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            compressed_cache_locs
+        ] = reserved_buffer_loc
 
     def _rehome_page_boundary_owners(
         self,
@@ -592,7 +594,7 @@ class HiSparseCoordinator:
         semantic_positions = boundary_seq_lens - 1
         if self.is_dsv4_hisparse:
             semantic_positions = boundary_seq_lens // self.compress_ratio - 1
-        first_mapping_indices = allocator.get_last_loc_compressed(
+        first_mapping_indices = allocator.translate_latest_cache_locs_to_compressed(
             out_cache_loc[boundary_batch_indices]
         ).to(torch.int64)
         offsets = torch.arange(page_size, dtype=torch.int64, device=seq_lens.device)

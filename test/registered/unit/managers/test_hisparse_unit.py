@@ -268,7 +268,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         For long-sequence tests (fill_len > DEVICE_BUFFER_SIZE) where the
         "newest token" reserved slot is not populated (it requires an actual
-        decode step + map_last_loc_to_buffer), callers should pass
+        decode step + map_latest_cache_loc_to_buffer), callers should pass
         ``fill_len - 1`` as the effective pool size so position fill_len-1 is
         never randomly selected.
         """
@@ -418,7 +418,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         # Pass fill_len-1 so position fill_len-1 ("newest token") is never
         # randomly selected — its reserved device-buffer slot is only valid
-        # after map_last_loc_to_buffer in a real decode step.
+        # after map_latest_cache_loc_to_buffer in a real decode step.
         tokens = self._build_topk_tokens(fill_len - 1)
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
@@ -453,7 +453,7 @@ class TestHiSparseUnit(unittest.TestCase):
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
         # Step 1: load the first TOP_K positions from host (no newest token —
-        # the reserved slot is only valid after map_last_loc_to_buffer which is
+        # the reserved slot is only valid after map_latest_cache_loc_to_buffer which is
         # called during an actual decode step, not modelled here).
         tokens_s1 = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
         locs1 = self._swap_in_selected_pages(
@@ -560,7 +560,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_sizes_restored(initial, "page_size_one_alloc_free_cycle")
 
     def test_decode_remap_frees_stale_page_size_one_mapping(self):
-        """map_last_loc_to_buffer frees the temporary alloc() hisparse slot."""
+        """map_latest_cache_loc_to_buffer frees the temporary alloc() hisparse slot."""
         if self.page_size != 1:
             self.skipTest("page_size=1 decode remap path is ROCm-specific")
 
@@ -586,7 +586,7 @@ class TestHiSparseUnit(unittest.TestCase):
         req.kv.kv_allocated_len = seq_len
         req.kv_committed_len = seq_len
 
-        self.coordinator.map_last_loc_to_buffer(
+        self.coordinator.map_latest_cache_loc_to_buffer(
             seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
             out_cache_loc=out_loc,
             req_pool_indices=torch.tensor(

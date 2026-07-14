@@ -418,8 +418,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             install_retained_owner=install_retained_owner,
         )
 
-    def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return last_locs
+    def translate_latest_cache_locs_to_compressed(
+        self, latest_cache_locs: torch.Tensor
+    ):
+        return latest_cache_locs
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
@@ -733,12 +735,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             install_retained_owner=install_retained_owner,
         )
 
-    def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return (last_locs - 3) // self.compress_ratio
+    def translate_latest_cache_locs_to_compressed(
+        self, latest_cache_locs: torch.Tensor
+    ):
+        return (latest_cache_locs - 3) // self.compress_ratio
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self.hisparse_kvcache._translate_loc_to_hisparse_device(
-            self.get_last_loc_compressed(last_locs)
+            self.translate_latest_cache_locs_to_compressed(last_locs)
         )
 
     def alloc_extend(

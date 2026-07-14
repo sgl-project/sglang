@@ -32,7 +32,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         # _build_hisparse_decode_batch builds a ScheduleBatch off the normal
         # extend path, so it must populate the req_pool_indices_cpu host mirror
         # in lockstep with the device tensor. A missing mirror crashes hisparse
-        # decode bookkeeping (map_last_loc_to_buffer -> _grow_device_buffers
+        # decode bookkeeping (map_latest_cache_loc_to_buffer -> _grow_device_buffers
         # indexes req_pool_indices_cpu).
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.device = "cpu"
@@ -69,7 +69,7 @@ class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):
     def test_host_bookkeeping_requires_req_pool_indices_cpu(self):
         # Why the mirror must exist: hisparse host bookkeeping indexes
         # req_pool_indices_cpu element-wise (int(req_pool_indices_cpu[i]) in
-        # _eager_backup_previous_token, the first thing map_last_loc_to_buffer
+        # _eager_backup_previous_token, the first thing map_latest_cache_loc_to_buffer
         # runs each decode step). A missing mirror (None) raises TypeError there
         # -- the exact nightly failure the scheduler-side fix prevents. Asserting
         # the crash directly keeps the "mirror is required" contract honest, with
@@ -80,7 +80,7 @@ class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):
         req_pool_indices = torch.tensor([0], dtype=torch.int64)
         out_cache_loc = torch.tensor([0], dtype=torch.int64)
         with self.assertRaises(TypeError):
-            coord.map_last_loc_to_buffer(
+            coord.map_latest_cache_loc_to_buffer(
                 seq_lens,
                 out_cache_loc,
                 req_pool_indices,

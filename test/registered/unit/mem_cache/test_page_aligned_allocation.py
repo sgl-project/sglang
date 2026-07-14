@@ -210,7 +210,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
                     "_is_npu",
                     is_npu,
                 ):
-                    coordinator.map_last_loc_to_buffer(
+                    coordinator.map_latest_cache_loc_to_buffer(
                         seq_lens=torch.tensor([1], dtype=torch.int64),
                         out_cache_loc=torch.tensor([1], dtype=torch.int64),
                         req_pool_indices=torch.tensor([0], dtype=torch.int64),
