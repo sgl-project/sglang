@@ -1224,7 +1224,12 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1252,17 +1257,38 @@ class FusedMoE(torch.nn.Module):
                 )
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
-                return self.forward_impl(hidden_states, topk_output)
+                return self.forward_impl(
+                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                )
         else:
-            return self.forward_impl(hidden_states, topk_output)
+            return self.forward_impl(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        if (
+            pre_quant_input is not None
+            and dispatch_output.format.is_standard()
+            and dispatch_output.hidden_states_scale is None
+        ):
+            # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
+            # passthrough, so the caller's pre-quantized (q, scale) pair still
+            # matches dispatch_output.hidden_states; attach it for the triton
+            # fused runner to skip its own activation quant.
+            dispatch_output = dispatch_output._replace(
+                hidden_states_pre_quant=pre_quant_input
+            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

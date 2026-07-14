@@ -752,10 +752,27 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
     # TODO: add more robust shape check here
     shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+
+    if input_scale is not None:
+        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
+        # the fp8 per-token-group-128 q (rows possibly padded to a multiple
+        # of 4), ``input_scale`` the matching column-major scales
+        # (stride(0) == 1). Output keeps the (padded) row count; the caller
+        # slices back to the true token count.
+        assert shape_supported, (
+            "pre-quantized fp8 input requires cutlass-supported weight shapes "
+            f"(got {tuple(weight.shape)})"
+        )
+        assert input.dtype == torch.float8_e4m3fn
+        input_2d = input.view(-1, input.shape[-1])
+        output = fp8_blockwise_scaled_mm(
+            input_2d, weight.T, input_scale, weight_scale.T, out_dtype=torch.bfloat16
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
 
     if not shape_supported:
         # fallback to triton

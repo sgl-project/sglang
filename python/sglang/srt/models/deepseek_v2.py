@@ -300,6 +300,7 @@ class DeepseekV2MLP(nn.Module):
         x,
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
+        gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -329,17 +330,24 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
-        if (
-            gemm_output_zero_allocator is not None
-            and x.shape[0] <= 256
-            and self.gate_up_proj.weight.dtype == torch.uint8
-        ):
-            y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
-            x = (x, None, y)
+        if gateup_pre_quant is not None:
+            # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
+            # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
+            # inside the fp8 linear method. q rows may be padded to a multiple
+            # of 4; the caller slices the MLP output back.
+            gate_up, _ = self.gate_up_proj(gateup_pre_quant)
+        else:
+            if (
+                gemm_output_zero_allocator is not None
+                and x.shape[0] <= 256
+                and self.gate_up_proj.weight.dtype == torch.uint8
+            ):
+                y = gemm_output_zero_allocator.allocate(
+                    x.shape[0] * self.gate_up_proj.output_size_per_partition
+                ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+                x = (x, None, y)
 
-        gate_up, _ = self.gate_up_proj(x)
+            gate_up, _ = self.gate_up_proj(x)
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -823,6 +831,9 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
+        # forward (weights and runner are final by then). None = undecided.
+        self._moe_quant_once: Optional[bool] = None
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -934,6 +945,13 @@ class DeepseekV2MoE(nn.Module):
         #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
         use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
         current_stream = torch.cuda.current_stream()
+        # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE) must happen on the main
+        # stream BEFORE the alt-stream fork so both consumers see it.
+        pre_quant_input = (
+            None
+            if use_flashinfer_trtllm_bypass
+            else self._maybe_quant_moe_input_once(hidden_states)
+        )
         self.alt_stream.wait_stream(current_stream)
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
@@ -976,6 +994,10 @@ class DeepseekV2MoE(nn.Module):
             )
         elif use_flashinfer_trtllm_bypass:
             final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
+        elif pre_quant_input is not None:
+            final_hidden_states = self.experts(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
         if (
@@ -989,7 +1011,9 @@ class DeepseekV2MoE(nn.Module):
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
+                hidden_states,
+                gemm_output_zero_allocator,
+                pre_quant_input=pre_quant_input,
             )
 
         current_stream.wait_stream(self.alt_stream)
@@ -1045,13 +1069,22 @@ class DeepseekV2MoE(nn.Module):
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
         if hidden_states.shape[0] > 0:
+            # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
+            # the shared expert also runs here on the same tensor.
+            pre_quant_input = (
+                None
+                if skip_shared_experts
+                else self._maybe_quant_moe_input_once(hidden_states)
+            )
             if (
                 not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
                 shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    pre_quant_input=pre_quant_input,
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
@@ -1067,6 +1100,7 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         else:
+            pre_quant_input = None
             shared_output = None
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
@@ -1102,10 +1136,17 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_output,
-        )
+        if pre_quant_input is not None:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+            )
         if (
             not _is_cuda
             and not _is_musa
@@ -1123,7 +1164,9 @@ class DeepseekV2MoE(nn.Module):
             and not skip_shared_experts
         ):
             shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
+                hidden_states,
+                gemm_output_zero_allocator,
+                pre_quant_input=pre_quant_input,
             )
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
@@ -1427,14 +1470,114 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def _forward_shared_experts(
-        self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+        self,
+        hidden_states,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            if pre_quant_input is not None:
+                # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
+                # multiple of 4; the padded rows flow through the MLP (all ops
+                # are row-local) and are sliced off here.
+                out = self.shared_experts(
+                    hidden_states, gateup_pre_quant=pre_quant_input
+                )
+                return out[: hidden_states.shape[0]]
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
         else:
             return None
+
+    def _moe_quant_once_enabled(self) -> bool:
+        """SGLANG_OPT_MOE_QUANT_ONCE: quantize the (dp-gathered) MoE input to
+        per-token-group-128 fp8 once per layer and feed both the fused shared
+        expert's fp8 GEMM (cutlass w8a8 linear) and the routed experts' triton
+        fused runner, instead of quantizing the same [T, hidden] tensor twice
+        with different scale layouts."""
+        if self._moe_quant_once is None:
+            self._moe_quant_once = self._compute_moe_quant_once_enabled()
+        return self._moe_quant_once
+
+    def _compute_moe_quant_once_enabled(self) -> bool:
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
+        from sglang.srt.layers.quantization.fp8_utils import (
+            cutlass_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        if not envs.SGLANG_OPT_MOE_QUANT_ONCE.get():
+            return False
+        if not _is_cuda:
+            return False
+        if self._enable_a2a_moe or self._fuse_shared_experts_inside_sbo:
+            return False
+        # Shared-expert side: fp8 block-128 weights served by the cutlass
+        # w8a8 linear backend (the only one taught to accept a pre-quantized
+        # (q, scale) tuple).
+        if self.num_fused_shared_experts != 0 or not hasattr(self, "shared_experts"):
+            return False
+        if not self.shared_experts_is_fp8:
+            return False
+        if self.shared_experts_weight_block_size != [128, 128]:
+            return False
+        gate_up = self.shared_experts.gate_up_proj
+        if not isinstance(gate_up.quant_method, Fp8LinearMethod):
+            return False
+        if (
+            gate_up.quant_method.w8a8_block_fp8_linear
+            is not cutlass_w8a8_block_fp8_linear_with_fallback
+        ):
+            return False
+        if gate_up.weight.shape[0] % 128 != 0 or gate_up.weight.shape[1] % 128 != 0:
+            return False
+        # Routed side: standard dispatcher + triton fused func with dynamic
+        # per-token-group-128 fp8 activation quant.
+        experts = self.experts
+        if not isinstance(experts, FusedMoE):
+            return False
+        quant_method = experts.quant_method
+        if not isinstance(quant_method, Fp8MoEMethod):
+            return False
+        if not quant_method.block_quant or quant_method.use_mxfp8:
+            return False
+        if quant_method.quant_config.weight_block_size != [128, 128]:
+            return False
+        # Fp8MoEMethod only sets .runner for runner backends it drives itself.
+        runner = getattr(quant_method, "runner", None)
+        if runner is None or not runner.runner_backend.is_triton():
+            return False
+        if runner.fused_func is None or runner.lora_enabled:
+            return False
+        if not isinstance(experts.dispatcher, StandardDispatcher):
+            return False
+        if experts.moe_runner_config.apply_router_weight_on_input:
+            return False
+        if experts.w13_input_scale is not None:
+            return False
+        return True
+
+    def _maybe_quant_moe_input_once(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Quantize hidden_states once (per-token-group-128 fp8, rows padded to
+        a multiple of 4, column-major scales) for both the shared-expert GEMM
+        and the routed dispatch, or return None when ineligible."""
+        if hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16:
+            return None
+        if not self._moe_quant_once_enabled():
+            return None
+        if is_in_tc_piecewise_cuda_graph():
+            # The piecewise MoE op quantizes internally; a pre-quant here
+            # would be dead work.
+            return None
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8_row_padded,
+        )
+
+        q, s = sglang_per_token_group_quant_fp8_row_padded(hidden_states, 128)
+        return q, s
 
     def op_gate(self, state):
         if state.hidden_states_mlp_input.shape[0] > 0:

@@ -1040,6 +1040,14 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+    # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
+    # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
+    # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
+    # instead of quantizing the same [T, hidden] tensor twice with different
+    # scale layouts. Only engages on CUDA with fp8 block-128 weights, the
+    # standard dispatcher, and the triton MoE runner; falls back silently
+    # otherwise.
+    SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)

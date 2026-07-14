@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -68,6 +68,11 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
+    # SGLANG_OPT_MOE_QUANT_ONCE: optional pre-quantized (q, scale) pair for
+    # ``hidden_states`` (per-token-group-128 fp8, q rows possibly padded to a
+    # multiple of 4). Consumed by the standard->triton fused runner so it can
+    # skip its own activation quant; ``hidden_states`` itself stays bf16.
+    hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
