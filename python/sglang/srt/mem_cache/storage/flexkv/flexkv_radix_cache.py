@@ -63,6 +63,12 @@ class FlexKVMode(enum.Enum):
     IP = enum.auto()  # in-process layerwise transfer
 
 
+class _LoadPublicationClassification(enum.IntEnum):
+    INVALID = 0
+    FRESH = 1
+    EXACT_FULL = 2
+
+
 @dataclass
 class _LoadBackMarker:
     """State carried from a hit-producing ``match_prefix`` to its
@@ -73,6 +79,16 @@ class _LoadBackMarker:
     key: RadixKey
     value_numel: int  # device tokens already present at lookup time
     expected_slots: int
+
+
+@dataclass
+class _ProvisionalLoadPublication:
+    parent: TreeNode
+    new_node: TreeNode
+    child_key: object
+    parent_was_evictable_leaf: bool
+    child_attached: bool = False
+    size_added: bool = False
 
 
 class FlexKVRadixCache(RadixCache):
@@ -501,73 +517,130 @@ class FlexKVRadixCache(RadixCache):
     ) -> Tuple[torch.Tensor, TreeNode]:
         loaded_length = int(loaded_slots.numel())
         target_key = key[: value_numel + loaded_length]
-        current_match = super().match_prefix(MatchPrefixParams(key=target_key))
-        current_length = int(current_match.device_indices.numel())
-        current_parent = current_match.last_device_node
+        local_classification = _LoadPublicationClassification.INVALID
+        current_parent: Optional[TreeNode] = None
+        current_loaded_slots: Optional[torch.Tensor] = None
+        try:
+            current_match = super().match_prefix(MatchPrefixParams(key=target_key))
+            current_length = int(current_match.device_indices.numel())
+            current_parent = current_match.last_device_node
+            if current_length == len(target_key):
+                current_loaded_slots = current_match.device_indices[value_numel:]
+                if int(current_loaded_slots.numel()) == loaded_length:
+                    local_classification = (
+                        _LoadPublicationClassification.EXACT_FULL
+                    )
+            elif current_length == value_numel:
+                child_key = target_key[value_numel:].child_key(self.page_size)
+                if current_parent.children.get(child_key) is None:
+                    local_classification = _LoadPublicationClassification.FRESH
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FlexKV] load publication revalidation failed: %s",
+                exc,
+                exc_info=True,
+            )
 
-        if current_length == len(target_key):
+        common_classification = (
+            self.flexkv_connector.coordinate_load_publication_classification(
+                int(local_classification)
+            )
+        )
+        if (
+            common_classification is None
+            or common_classification == _LoadPublicationClassification.INVALID
+        ):
+            cleanup_success = self._cleanup_unpublished_load_slots(
+                loaded_slots,
+                can_release=True,
+            )
+            if not self.flexkv_connector.coordinate_load_publication_step(
+                local_success=cleanup_success
+            ):
+                self.flexkv_connector.poison_load_back(
+                    "FlexKV load publication cleanup differs across ranks"
+                )
             if self._mode is FlexKVMode.IP:
-                self._quarantine_load_slots(loaded_slots)
+                self.flexkv_connector.poison_load_back(
+                    "FlexKV layerwise load publication is inconsistent across ranks"
+                )
+            raise RuntimeError(
+                "FlexKV load publication is invalid or inconsistent across ranks"
+            )
+
+        if common_classification == _LoadPublicationClassification.EXACT_FULL:
+            cleanup_success = self._cleanup_unpublished_load_slots(
+                loaded_slots,
+                can_release=True,
+            )
+            cleanup_consistent = (
+                self.flexkv_connector.coordinate_load_publication_step(
+                    local_success=cleanup_success
+                )
+            )
+            if not cleanup_consistent:
+                self.flexkv_connector.poison_load_back(
+                    "FlexKV exact-collision cleanup failed on at least one rank"
+                )
+                raise RuntimeError("FlexKV exact-collision cleanup failed")
+            if self._mode is FlexKVMode.IP:
+                self.flexkv_connector.poison_load_back(
+                    "FlexKV layerwise load collided with an existing Radix entry"
+                )
                 raise RuntimeError(
                     "FlexKV layerwise load collided with an existing Radix entry"
                 )
-            current_loaded_slots = current_match.device_indices[value_numel:]
-            if int(current_loaded_slots.numel()) != loaded_length:
-                self._release_load_slots(loaded_slots)
-                raise RuntimeError(
-                    "FlexKV MP load collided with a non-exact Radix suffix"
-                )
-            self._release_load_slots(loaded_slots)
             return current_loaded_slots, current_parent
 
-        if current_length != value_numel:
-            if self._mode is FlexKVMode.IP:
-                self._quarantine_load_slots(loaded_slots)
-            else:
-                self._release_load_slots(loaded_slots)
-            raise RuntimeError(
-                "FlexKV load publication found a stale or partial Radix prefix"
-            )
-
-        new_node = TreeNode(priority=current_parent.priority)
-        new_node.key = target_key[value_numel:]
-        new_node.value = loaded_slots
-        new_node.parent = current_parent
-        child_key = new_node.key.child_key(self.page_size)
-        if current_parent.children.get(child_key) is not None:
-            if self._mode is FlexKVMode.IP:
-                self._quarantine_load_slots(loaded_slots)
-            else:
-                self._release_load_slots(loaded_slots)
-            raise RuntimeError("FlexKV load publication collided with a Radix child")
-
-        parent_was_evictable_leaf = current_parent in self.evictable_leaves
-        child_attached = False
-        size_added = False
+        provisional: Optional[_ProvisionalLoadPublication] = None
         try:
-            current_parent.children[child_key] = new_node
-            child_attached = True
-            self.evictable_size_ += loaded_length
-            size_added = True
-            self._update_leaf_status(current_parent)
-            self._update_leaf_status(new_node)
-        except Exception:  # noqa: BLE001
-            if child_attached and current_parent.children.get(child_key) is new_node:
-                current_parent.children.pop(child_key)
-            if size_added:
-                self.evictable_size_ -= loaded_length
-            self.evictable_leaves.discard(new_node)
-            if parent_was_evictable_leaf:
-                self.evictable_leaves.add(current_parent)
-            else:
-                self.evictable_leaves.discard(current_parent)
+            provisional = self._prepare_provisional_load_publication(
+                target_key=target_key,
+                value_numel=value_numel,
+                loaded_slots=loaded_slots,
+                current_parent=current_parent,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FlexKV] provisional load publication setup failed: %s",
+                exc,
+                exc_info=True,
+            )
+        attach_success = provisional is not None and (
+            self._attach_provisional_load_publication(provisional)
+        )
+        attach_consistent = self.flexkv_connector.coordinate_load_publication_step(
+            local_success=attach_success
+        )
+        if not attach_consistent:
+            rollback_success = provisional is None or (
+                self._rollback_provisional_load_publication(provisional)
+            )
+            rollback_consistent = (
+                self.flexkv_connector.coordinate_load_publication_step(
+                    local_success=rollback_success
+                )
+            )
+            cleanup_success = self._cleanup_unpublished_load_slots(
+                loaded_slots,
+                can_release=rollback_success,
+            )
+            cleanup_consistent = (
+                self.flexkv_connector.coordinate_load_publication_step(
+                    local_success=cleanup_success
+                )
+            )
+            if not rollback_consistent or not cleanup_consistent:
+                self.flexkv_connector.poison_load_back(
+                    "FlexKV load publication rollback failed on at least one rank"
+                )
             if self._mode is FlexKVMode.IP:
-                self._quarantine_load_slots(loaded_slots)
-            else:
-                self._release_load_slots(loaded_slots)
-            raise
+                self.flexkv_connector.poison_load_back(
+                    "FlexKV layerwise load publication failed on at least one rank"
+                )
+            raise RuntimeError("FlexKV load publication failed on at least one rank")
 
-        for event_node in (current_parent, new_node):
+        for event_node in (provisional.parent, provisional.new_node):
             try:
                 self._record_store_event(event_node)
             except Exception as exc:  # noqa: BLE001
@@ -577,7 +650,96 @@ class FlexKVRadixCache(RadixCache):
                     exc_info=True,
                 )
 
-        return loaded_slots, new_node
+        return loaded_slots, provisional.new_node
+
+    def _prepare_provisional_load_publication(
+        self,
+        *,
+        target_key: RadixKey,
+        value_numel: int,
+        loaded_slots: torch.Tensor,
+        current_parent: TreeNode,
+    ) -> _ProvisionalLoadPublication:
+        new_node = TreeNode(priority=current_parent.priority)
+        new_node.key = target_key[value_numel:]
+        new_node.value = loaded_slots
+        new_node.parent = current_parent
+        return _ProvisionalLoadPublication(
+            parent=current_parent,
+            new_node=new_node,
+            child_key=new_node.key.child_key(self.page_size),
+            parent_was_evictable_leaf=current_parent in self.evictable_leaves,
+        )
+
+    def _attach_provisional_load_publication(
+        self, publication: _ProvisionalLoadPublication
+    ) -> bool:
+        try:
+            if publication.parent.children.get(publication.child_key) is not None:
+                raise RuntimeError("FlexKV load publication collided with a Radix child")
+            publication.parent.children[publication.child_key] = publication.new_node
+            publication.child_attached = True
+            self.evictable_size_ += len(publication.new_node.key)
+            publication.size_added = True
+            self._update_leaf_status(publication.parent)
+            self._update_leaf_status(publication.new_node)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FlexKV] provisional load publication failed: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    def _rollback_provisional_load_publication(
+        self, publication: _ProvisionalLoadPublication
+    ) -> bool:
+        try:
+            if publication.child_attached:
+                if (
+                    publication.parent.children.get(publication.child_key)
+                    is not publication.new_node
+                ):
+                    raise RuntimeError(
+                        "FlexKV provisional Radix child changed before rollback"
+                    )
+                publication.parent.children.pop(publication.child_key)
+                publication.child_attached = False
+            if publication.size_added:
+                self.evictable_size_ -= len(publication.new_node.key)
+                publication.size_added = False
+            self.evictable_leaves.discard(publication.new_node)
+            if publication.parent_was_evictable_leaf:
+                self.evictable_leaves.add(publication.parent)
+            else:
+                self.evictable_leaves.discard(publication.parent)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FlexKV] provisional load publication rollback failed: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    def _cleanup_unpublished_load_slots(
+        self,
+        loaded_slots: torch.Tensor,
+        *,
+        can_release: bool,
+    ) -> bool:
+        if self._mode is FlexKVMode.IP:
+            self._quarantine_load_slots(loaded_slots)
+            return True
+        if not can_release:
+            self._quarantine_load_slots(loaded_slots)
+            return False
+        try:
+            self._release_load_slots(loaded_slots)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # cache_finished_req (STORE)
@@ -693,10 +855,6 @@ class FlexKVRadixCache(RadixCache):
     def release_aborted_request(self, rid: str) -> None:
         """Clean up tracking for an aborted request without invoking FlexKV."""
         self._load_markers.pop(rid, None)
-        with self._node_lock:
-            node = self._inflight_store_nodes.pop(rid, None)
-        if node is not None:
-            self.dec_lock_ref(node)
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
 

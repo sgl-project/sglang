@@ -600,6 +600,23 @@ class FlexKVConnector:
                 "Cannot evict FlexKV slots while layerwise loads are active"
             )
 
+    def coordinate_load_publication_classification(
+        self, local_classification: int
+    ) -> Optional[int]:
+        minimum_classification = self._sync_ctx.all_reduce_min(local_classification)
+        maximum_classification = -self._sync_ctx.all_reduce_min(
+            -local_classification
+        )
+        if minimum_classification != maximum_classification:
+            return None
+        return minimum_classification
+
+    def coordinate_load_publication_step(self, *, local_success: bool) -> bool:
+        return self._sync_ctx.all_reduce_min(int(local_success)) == 1
+
+    def poison_load_back(self, reason: str) -> None:
+        self._poison_reason = reason
+
     # ------------------------------------------------------------------
     # Public API — store
     # ------------------------------------------------------------------
