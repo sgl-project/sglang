@@ -159,7 +159,7 @@ class TestQueryNumaNodeForXpu(unittest.TestCase):
         self.assertEqual(self._query(2, mask="0,1"), [])
 
     def test_malformed_mask_falls_back_to_unmasked_order(self):
-        # Composite "x.y" entries are unparseable -> keep unmasked order,
+        # Composite "x.y" entries are unparsable -> keep unmasked order,
         # so device 2 still resolves to node 1.
         self.assertEqual(self._query(2, mask="0.0,1.0"), [1])
 
