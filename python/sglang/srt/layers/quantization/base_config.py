@@ -182,6 +182,13 @@ class QuantizationConfig(ABC):
         cls, hf_quant_config, user_quant
     ) -> Optional[str]:
         """Shared ModelOpt quantization method override logic."""
+        # If user explicitly specified a non-modelopt quantization (e.g. unquant, fp8),
+        # respect that choice and don't override.
+        # NOTE: user_quant=None means "user didn't specify" — let checkpoint detection proceed.
+        # user_quant="unquant" means "user explicitly chose no quantization" — don't override.
+        # Return None here means "don't override" — self.quantization keeps its original value.
+        if user_quant is not None and user_quant not in ("modelopt", "modelopt_mixed"):
+            return None
         if hf_quant_config is None:
             return None
 
