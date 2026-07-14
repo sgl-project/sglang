@@ -3,7 +3,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.hisparse import _HiSparsePageOwnership
+from sglang.srt.mem_cache.allocator.hisparse import (
+    _HiSparsePageOwnership,
+    _stable_unique_page_ids,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -29,12 +32,17 @@ class TestHiSparsePageOwnership(unittest.TestCase):
             page_size=4,
         )
 
-        ownership.release(
-            mapping_indices=torch.tensor([1, 2, 3]),
-            extra_owned_coordinates=buffer_owner,
-            clear_extra_owner=lambda: buffer_owner.zero_(),
-        )
+        with mock.patch(
+            "sglang.srt.mem_cache.allocator.hisparse._stable_unique_page_ids",
+            wraps=_stable_unique_page_ids,
+        ) as stable_unique:
+            ownership.release(
+                mapping_indices=torch.tensor([1, 2, 3]),
+                extra_owned_coordinates=buffer_owner,
+                clear_extra_owner=lambda: buffer_owner.zero_(),
+            )
 
+        stable_unique.assert_called_once()
         child_allocator.free.assert_called_once()
 
     def test_release_keeps_device_child_out_of_logical_free_group(self) -> None:
