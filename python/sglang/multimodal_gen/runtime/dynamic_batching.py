@@ -135,15 +135,5 @@ def slice_generation_req(req: Req, start: int, end: int, total: int) -> Req:
         value = shard.extra.get(key)
         if isinstance(value, list) and len(value) == total:
             shard.extra[key] = value[start:end]
-    for name in ("prior_token_id", "prior_token_image_ids"):
-        value = getattr(req, name, None)
-        if isinstance(value, list) and len(value) == total:
-            setattr(shard, name, deepcopy(value[start:end]))
-        elif (
-            isinstance(value, torch.Tensor)
-            and value.ndim > 0
-            and value.shape[0] == total
-        ):
-            setattr(shard, name, value[start:end])
     shard.request_id = f"{req.request_id}::shard::{start}:{end}"
     return shard

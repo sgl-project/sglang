@@ -654,7 +654,6 @@ class DiffusionServer:
             self._denoiser_free_slots[worker_idx] -= 1
             self._glm_shard_workers[shard.request_id] = worker_idx
             tensor_fields, scalar_fields = extract_transfer_fields(shard.req)
-            tensor_fields["prior_token_id"] = shard.req.prior_token_id
             scalar_fields["request_id"] = shard.request_id
             send_tensors(
                 self._denoiser_pushes[worker_idx], tensor_fields, scalar_fields
