@@ -1481,6 +1481,13 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     }
 )
 
+_FLASHINFER_PURE_ALLREDUCE_ARCHS = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+    }
+)
+
 
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
@@ -1503,7 +1510,10 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         logger.info(
             f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
         )
-        return {"flashinfer_allreduce_fusion_backend": "auto", "enable_flashinfer_pure_allreduce": True}
+        result: dict = {"flashinfer_allreduce_fusion_backend": "auto"}
+        if model_arch in _FLASHINFER_PURE_ALLREDUCE_ARCHS:
+            result["enable_flashinfer_pure_allreduce"] = True
+        return result
     return {}
 
 
