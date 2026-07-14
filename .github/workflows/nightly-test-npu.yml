@@ -239,10 +239,6 @@ jobs:
           - name: glm4_7_flash_1p_aime25
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_aime25.py
-#          # glm4_6v_flash accuracy tests
-#          - name: glm4_6v_flash_1p_mmmu
-#            runner: linux-aarch64-a3-2
-#            test_case: test/registered/ascend/accuracy/glm4_6v_flash/test_npu_glm4_6v_flash_1p_mmmu.py
           # qwen3_vl_8b_thinking accuracy tests
           - name: qwen3_vl_8b_thinking_1p_mmmu
             runner: linux-aarch64-a3-2
