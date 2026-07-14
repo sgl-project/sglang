@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.attention.nsa.triton_decode.triton_mla_kernels_decode_optimized import (
+from sglang.kernels.ops.attention.nsa_triton_decode.triton_mla_kernels_decode_optimized import (
     triton_sparse_attn_decode,
 )
 
