@@ -273,7 +273,7 @@ class FlexKVConnector:
         self._poison_reason: Optional[str] = None
         self._inflight_loads: Dict[int, int] = {}  # producer_id -> rid hashlike
         self._completed_layerwise: List[int] = []
-        self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
+        self._launched_load_tids: List[int] = []
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         # Prefetches
@@ -517,73 +517,92 @@ class FlexKVConnector:
             self._ambiguous_loads[rid] = observation_task_ids
             self._poison_reason = str(outcome["reason"])
             raise FlexKVAmbiguousLoadError(self._poison_reason)
-        if self._sync_ctx.is_sync_leader:
-            self._launched_load_tids.extend(observation_task_ids)
+        self._launched_load_tids.extend(observation_task_ids)
 
         return n, producer_id
 
-    def drain_launched_loads(self, threshold: int = 100) -> None:
+    def drain_launched_loads(self) -> None:
         """Release only layerwise tasks proven fully terminal and successful."""
-        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
-            return
-        if len(self._launched_load_tids) < threshold:
-            return
-        tracked_ids = set(self._launched_load_tids)
-        try:
-            responses = self.kv_manager.wait(
-                task_ids=list(self._launched_load_tids),
-                timeout=0,
-                completely=True,
-            )
-        except TimeoutError:
-            return
-        except Exception as exc:  # noqa: BLE001
-            reason = f"FlexKV layerwise terminal wait failed: {exc}"
-            self._poison_reason = reason
-            for task_id in tracked_ids:
-                self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
-            return
-
-        normalized_responses: Dict[int, Any] = {}
-        try:
-            if responses is None:
-                raise ValueError("FlexKV layerwise terminal wait returned no result")
-            for task_id, response in responses.items():
-                normalized_task_id = self._normalize_task_id(task_id)
-                response_task_id = self._normalize_task_id(response.task_id)
-                if response_task_id != normalized_task_id:
-                    raise ValueError(
-                        "FlexKV layerwise terminal response changed task identity"
-                    )
-                normalized_responses[normalized_task_id] = response
-            if set(normalized_responses) != tracked_ids:
-                raise ValueError(
-                    "FlexKV layerwise terminal wait returned unexpected task ids"
-                )
-        except Exception as exc:  # noqa: BLE001
-            self._poison_reason = str(exc)
-            for task_id in tracked_ids:
-                self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
-            return
-
-        completed_ids: set[int] = set()
-        for task_id, response in normalized_responses.items():
+        tracked_ids = tuple(self._launched_load_tids)
+        outcome = {
+            "tracked_task_ids": list(tracked_ids),
+            "completed_task_ids": [],
+            "reason": None,
+        }
+        if self._sync_ctx.is_sync_leader:
             try:
-                status = response.status
-            except AttributeError:
-                status = None
-            if status is KVResponseStatus.SUCCESS:
-                completed_ids.add(task_id)
-            elif status is not KVResponseStatus.TIMEOUT:
-                self._poison_reason = (
-                    f"FlexKV layerwise task {task_id} completed with status {status}"
+                if tracked_ids:
+                    if self.kv_manager is None:
+                        raise RuntimeError("FlexKV KVManager is not initialized")
+                    responses = self.kv_manager.wait(
+                        task_ids=list(tracked_ids),
+                        timeout=0,
+                        completely=True,
+                    )
+                    normalized_responses = self._normalize_terminal_responses(
+                        responses=responses,
+                        expected_task_ids=tracked_ids,
+                    )
+                    completed_task_ids: List[int] = []
+                    for task_id, response in normalized_responses.items():
+                        if response.status is KVResponseStatus.SUCCESS:
+                            completed_task_ids.append(task_id)
+                        elif response.status is not KVResponseStatus.TIMEOUT:
+                            raise RuntimeError(
+                                f"FlexKV layerwise task {task_id} completed with "
+                                f"status {response.status}"
+                            )
+                    outcome["completed_task_ids"] = completed_task_ids
+            except Exception as exc:  # noqa: BLE001
+                outcome["reason"] = (
+                    f"FlexKV layerwise terminal wait failed: {exc}"
                 )
+        if self._sync_ctx.needs_sync:
+            outcome = self._sync_ctx.scatter(outcome)
+
+        try:
+            outcome_tracked_ids = tuple(
+                self._normalize_task_ids_allow_empty(outcome["tracked_task_ids"])
+            )
+            completed_task_ids = set(
+                self._normalize_task_ids_allow_empty(outcome["completed_task_ids"])
+            )
+            if outcome_tracked_ids != tracked_ids:
+                raise RuntimeError(
+                    "FlexKV layerwise task tracking differs across ranks"
+                )
+            if not completed_task_ids.issubset(set(tracked_ids)):
+                raise RuntimeError(
+                    "FlexKV layerwise drain completed unexpected task ids"
+                )
+        except Exception as exc:  # noqa: BLE001
+            outcome["reason"] = str(exc)
+            completed_task_ids = set()
+
+        reason = outcome["reason"]
+        if reason is not None:
+            self._poison_reason = str(reason)
+            for task_id in tracked_ids:
                 self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
+            return
+
         self._launched_load_tids = [
-            task_id
-            for task_id in self._launched_load_tids
-            if task_id not in completed_ids
+            task_id for task_id in tracked_ids if task_id not in completed_task_ids
         ]
+
+    def ensure_load_back_safe(self) -> None:
+        if self._poison_reason is not None or self._ambiguous_loads:
+            raise RuntimeError(
+                f"FlexKV load-back is poisoned: {self._poison_reason}"
+            )
+
+    def ensure_layerwise_evict_safe(self) -> None:
+        self.drain_launched_loads()
+        self.ensure_load_back_safe()
+        if self._launched_load_tids:
+            raise RuntimeError(
+                "Cannot evict FlexKV slots while layerwise loads are active"
+            )
 
     # ------------------------------------------------------------------
     # Public API — store
@@ -806,10 +825,19 @@ class FlexKVConnector:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def ensure_reset_safe(self) -> None:
-        if self._poison_reason is not None or self._ambiguous_loads:
+    def ensure_reset_safe(self, *, has_active_store_nodes: bool = False) -> None:
+        local_safe = int(
+            self._poison_reason is None
+            and not self._ambiguous_loads
+            and not self._launched_load_tids
+            and not self._inflight_stores
+            and not has_active_store_nodes
+        )
+        combined_safe = self._sync_ctx.all_reduce_min(local_safe)
+        if combined_safe == 0:
             raise RuntimeError(
-                "Cannot reset FlexKV after an ambiguous load: " f"{self._poison_reason}"
+                "Cannot reset FlexKV with ambiguous loads, active layerwise loads, "
+                "or active stores"
             )
 
     def reset(self) -> None:
@@ -827,13 +855,6 @@ class FlexKVConnector:
         self._inflight_loads.clear()
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            for fk_tid in list(self._inflight_stores.values()):
-                if fk_tid >= 0:
-                    try:
-                        self.kv_manager.wait([fk_tid], timeout=20.0)
-                    except Exception:  # noqa: BLE001
-                        pass
         self._inflight_stores.clear()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
@@ -1150,7 +1171,37 @@ class FlexKVConnector:
     def _normalize_task_ids(cls, task_ids: Any) -> List[int]:
         if not isinstance(task_ids, list) or not task_ids:
             raise ValueError("KVManager.launch returned invalid task ids")
-        return [cls._normalize_task_id(task_id) for task_id in task_ids]
+        normalized_task_ids = [cls._normalize_task_id(task_id) for task_id in task_ids]
+        if len(set(normalized_task_ids)) != len(normalized_task_ids):
+            raise ValueError("KVManager.launch returned duplicate task ids")
+        return normalized_task_ids
+
+    @classmethod
+    def _normalize_task_ids_allow_empty(cls, task_ids: Any) -> List[int]:
+        if not isinstance(task_ids, list):
+            raise ValueError("FlexKV task ids must be a list")
+        if not task_ids:
+            return []
+        return cls._normalize_task_ids(task_ids)
+
+    def _normalize_terminal_responses(
+        self,
+        *,
+        responses: Any,
+        expected_task_ids: Tuple[int, ...],
+    ) -> Dict[int, Any]:
+        if not isinstance(responses, dict):
+            raise ValueError("FlexKV terminal wait returned an invalid result")
+        normalized_responses: Dict[int, Any] = {}
+        for task_id, response in responses.items():
+            normalized_task_id = self._normalize_task_id(task_id)
+            response_task_id = self._normalize_task_id(response.task_id)
+            if response_task_id != normalized_task_id:
+                raise ValueError("FlexKV terminal response changed task identity")
+            normalized_responses[normalized_task_id] = response
+        if set(normalized_responses) != set(expected_task_ids):
+            raise ValueError("FlexKV terminal wait returned unexpected task ids")
+        return normalized_responses
 
     @staticmethod
     def _normalize_counter_id(counter_id: Any, *, num_counters: int) -> int:

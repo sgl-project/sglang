@@ -161,7 +161,11 @@ class FlexKVRadixCache(RadixCache):
 
     def reset(self) -> None:  # type: ignore[override]
         if hasattr(self, "flexkv_connector"):
-            self.flexkv_connector.ensure_reset_safe()
+            with self._node_lock:
+                has_active_store_nodes = bool(self._inflight_store_nodes)
+            self.flexkv_connector.ensure_reset_safe(
+                has_active_store_nodes=has_active_store_nodes
+            )
         if hasattr(self, "_quarantined_load_slots") and self._quarantined_load_slots:
             raise RuntimeError("Cannot reset FlexKV while load slots are quarantined")
         if hasattr(self, "flexkv_connector"):
@@ -187,6 +191,7 @@ class FlexKVRadixCache(RadixCache):
         Dispatches to :meth:`_mp_match_prefix` or :meth:`_ip_match_prefix`
         depending on whether layerwise transfer is enabled.
         """
+        self.flexkv_connector.ensure_load_back_safe()
         key = params.key
         if self.disable or not key:
             return super().match_prefix(params)
@@ -449,8 +454,11 @@ class FlexKVRadixCache(RadixCache):
     def _allocate_load_slots(self, *, num_slots: int) -> Optional[torch.Tensor]:
         token_slots: Optional[torch.Tensor] = None
         try:
-            if self.token_to_kv_pool_allocator.available_size() < num_slots:
-                self.evict(EvictParams(num_tokens=num_slots))
+            local_shortage = max(
+                0,
+                num_slots - self.token_to_kv_pool_allocator.available_size(),
+            )
+            self.evict(EvictParams(num_tokens=local_shortage))
             token_slots = self.token_to_kv_pool_allocator.alloc(num_slots)
             if token_slots is None:
                 return None
@@ -585,6 +593,8 @@ class FlexKVRadixCache(RadixCache):
         the source nodes."""
         if self.disable:
             return EvictResult()
+        if self._mode is FlexKVMode.IP:
+            self.flexkv_connector.ensure_layerwise_evict_safe()
         self._drain_completed_stores()
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
