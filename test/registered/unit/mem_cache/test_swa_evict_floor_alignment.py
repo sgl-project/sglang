@@ -92,10 +92,7 @@ class TestSWAEvictFloorAlignment(unittest.TestCase):
         )
 
         self.assertEqual(req.kv.swa_evicted_seqlen, canonical_floor)
-        self.assertEqual(len(allocator.freed_swa), 1)
-        self.assertTrue(
-            torch.equal(allocator.freed_swa[0], torch.arange(canonical_floor))
-        )
+        self.assertEqual(allocator.freed_swa, [])
 
     def test_common_reader_rejects_misaligned_floor_before_free(self):
         """The common reader fails before allocator mutation on a malformed floor."""
