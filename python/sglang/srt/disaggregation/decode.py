@@ -1614,9 +1614,7 @@ def alloc_for_decode_prealloc(
 ) -> torch.Tensor:
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     alloc_prefix_len: int = 0 if uses_swa_tail else total_prefix_len
-    prefix_lens_cpu: torch.Tensor = torch.tensor(
-        [alloc_prefix_len], dtype=torch.int64
-    )
+    prefix_lens_cpu: torch.Tensor = torch.tensor([alloc_prefix_len], dtype=torch.int64)
     seq_lens_cpu: torch.Tensor = torch.tensor([alloc_fill_len], dtype=torch.int64)
     assert_alloc_extend_lens_page_aligned(
         prefix_lens_cpu=prefix_lens_cpu,
