@@ -398,6 +398,85 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+# torch._C._cuda_getCurrentRawStream returns the raw cudaStream_t as an int. It
+# is ~20x cheaper than torch.cuda.current_stream() (which builds a Stream
+# object), which matters because the guard below runs on every all-reduce.
+_get_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+class SingleStreamGuard:
+    """Serializes the all-reduces of one custom all-reduce communicator.
+
+    Both custom all-reduce implementations keep per-communicator, per-block
+    rendezvous state: a two-stage counter, and -- for the JIT one-shot push
+    kernel -- the push buffer itself, which the poll phase re-arms for the next
+    all-reduce. The protocol is correct only while the all-reduces of a
+    communicator are *totally ordered*, i.e. at most one is in flight at a time,
+    which is exactly what issuing them on a single stream provides.
+
+    Two all-reduces of one communicator that execute concurrently -- e.g. issued
+    from two CUDA streams -- alias that state: one kernel's poll phase overwrites
+    (re-arms) the buffer slice the other kernel is still waiting for, and the
+    non-atomic epoch update can leave the ranks permanently out of step. Neither
+    is recoverable, and since the kernels spin-wait, the result is a silent,
+    permanent, 100%-utilization hang that survives SIGTERM (issue #31117).
+
+    This guard makes the second issue *wait* instead of corrupting the first:
+    when the stream changes, it records an event on the previous stream and has
+    the new stream wait on it, which restores the total order. The normal path --
+    one stream forever -- pays only a raw-stream-pointer compare.
+
+    Not covered: two CUDA graphs replayed concurrently on two streams, because a
+    replay makes no host call at all. The kernels bound their own wait for that
+    case and fail with an error instead of hanging (see ``SpinDeadline`` in
+    ``jit_kernel/include/sgl_kernel/distributed/common.cuh``).
+
+    Assumes the all-reduces of one communicator are issued from one host thread,
+    which is how every SGLang path uses them (the model runner owns its group).
+    Two threads racing to issue on one communicator would need a lock here, and
+    that lock would have to span the launch; it is not worth the cost on a path
+    this hot, and the kernels' bound turns that race into an error, not a hang.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device_index = 0 if device.index is None else device.index
+        # Bound once: an attribute lookup, not a branch, on the fast path.
+        self._raw_stream = _get_raw_stream or (
+            lambda index: torch.cuda.current_stream(index).cuda_stream
+        )
+        self._last_stream: Optional[torch.cuda.Stream] = None
+        self._last_raw_stream: Optional[int] = None
+        self._event: Optional[torch.cuda.Event] = None
+
+    def maybe_serialize(self) -> None:
+        """Order this all-reduce behind the previous one if the stream changed.
+
+        Call immediately before issuing. The steady state (one stream forever) is
+        a raw-pointer compare; everything else is in the cold path below.
+        """
+        if self._raw_stream(self.device_index) != self._last_raw_stream:
+            self._switch_stream()
+
+    def _switch_stream(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            # CUDA-graph capture records a dependency graph; it does not execute
+            # anything, so there is nothing in flight to serialize against, and a
+            # dependency on work outside the capture cannot be expressed in the
+            # graph anyway. Leave the eager bookkeeping untouched.
+            return
+        stream = torch.cuda.current_stream(self.device_index)
+        if self._last_stream is not None:
+            if self._event is None:
+                self._event = torch.cuda.Event()
+            # Everything already issued on the previous stream -- in particular
+            # the previous all-reduce of this communicator -- must complete
+            # before this stream may start its own.
+            self._event.record(self._last_stream)
+            stream.wait_event(self._event)
+        self._last_stream = stream
+        self._last_raw_stream = stream.cuda_stream
+
+
 def can_p2p(rank: int, world_size: int) -> bool:
     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
     SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <numeric>
@@ -24,6 +25,25 @@
 namespace host::distributed {
 
 using device::distributed::PullController, device::distributed::PushController;
+
+/// Wall-clock bound (nanoseconds) on the kernels' wait for their peers, from
+/// `SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT` (seconds; 0 disables the bound).
+///
+/// The rendezvous takes microseconds once both peers have launched, so this only
+/// has to be above the worst *launch* skew between the ranks -- a peer stalled on
+/// the host by a JIT compile, a debugger, or a profiler. The default matches the
+/// NCCL watchdog's (`TORCH_NCCL_TIMEOUT`, 600s): a collective that has not landed
+/// after ten minutes is not slow, it is dead, and here it is dead in a way no
+/// amount of waiting recovers from (see `device::distributed::SpinDeadline`).
+inline uint64_t get_spin_timeout_ns() {
+  static const uint64_t value = [] {
+    constexpr double kDefaultSeconds = 600.0;
+    const char* env = std::getenv("SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT");
+    const double seconds = env == nullptr ? kDefaultSeconds : std::strtod(env, nullptr);
+    return seconds <= 0.0 ? uint64_t{0} : static_cast<uint64_t>(seconds * 1e9);
+  }();
+  return value;
+}
 
 struct AllReduceData {
   constexpr AllReduceData() {}

@@ -18,12 +18,15 @@ Usage::
 from __future__ import annotations
 
 import atexit
+import contextlib
 import itertools
 import logging
 import multiprocessing
 import os
+import sys
+import threading
 from multiprocessing.context import SpawnProcess
-from typing import List
+from typing import Iterator, List
 
 import pytest
 import torch
@@ -224,6 +227,113 @@ def test_custom_all_reduce(
         out_jit = run(inp)
         # Exact equality, since values are small integers within bf16 precision.
         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Regression test: concurrent issue on one communicator (issue #31117)
+# ---------------------------------------------------------------------------
+
+CONCURRENT_ITERS = 32
+CONCURRENT_NUMEL = 64 * 1024  # 128 KB in bf16
+# Long enough that a merely slow machine never trips it, short enough to leave
+# room in the per-file CI budget. It is only ever reached by the bug: the
+# healthy path finishes in well under a second.
+DEADLOCK_TIMEOUT_S = 120
+DEADLOCK_EXIT_CODE = 87
+
+
+@contextlib.contextmanager
+def _deadlock_watchdog(what: str) -> Iterator[None]:
+    """Turn a wedged custom all-reduce into a hard, attributable failure.
+
+    The kernels spin-wait on their peers, so a rank whose all-reduce can no
+    longer complete is stuck inside a CUDA call forever: it cannot be
+    interrupted from Python, `pytest.fail()` could not run (and its teardown
+    would hang on the same GPU), and even SIGTERM does not free the device.
+    Hard-exiting the worker is the only reliable escape; torchrun then fails the
+    run with the message printed here.
+    """
+
+    def _fire() -> None:
+        print(
+            f"\nDEADLOCK: {what} made no progress for {DEADLOCK_TIMEOUT_S}s. The "
+            f"custom all-reduce kernels are resident and spinning (the GPU is "
+            f"pinned at 100%): two all-reduces of one communicator were in flight "
+            f"at once and corrupted its rendezvous state (issue #31117).",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(DEADLOCK_EXIT_CODE)
+
+    timer = threading.Timer(DEADLOCK_TIMEOUT_S, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
+@pytest.mark.parametrize("algo", TEST_ALGOS)
+@torch.inference_mode()
+def test_concurrent_issue_on_two_streams(algo: AllReduceAlgo) -> None:
+    """Two streams issue on the SAME communicator with both all-reduces in flight.
+
+    The kernels keep their rendezvous state per communicator and per block (a
+    two-stage counter, and for the one-shot push kernel the push buffer itself,
+    which the poll phase re-arms). The protocol is therefore correct only while
+    the all-reduces of a communicator are totally ordered, which a single stream
+    guarantees and two concurrent streams do not: the kernels alias that state,
+    one poll phase re-arms the buffer the other is still waiting on, and the
+    rendezvous never completes -- a permanent, unkillable, 100%-utilization hang
+    (issue #31117).
+
+    The communicator must serialize the second issue behind the first, so the
+    concurrent issue both terminates and still matches NCCL.
+    """
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    dtype = torch.bfloat16
+
+    # NOTE: 15 * 8 < 128, which is the precision limit for bf16.
+    inputs = [
+        torch.randint(0, 16, (CONCURRENT_NUMEL,), dtype=dtype, device=device)
+        for _ in range(2)
+    ]
+    refs = [inp.clone() for inp in inputs]
+    for ref in refs:
+        dist.all_reduce(ref, group=nccl_group)
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+
+    previous_algo = comm.override_algo
+    comm.override_algo = algo
+    try:
+        outs: list[list[torch.Tensor]] = []
+        with _deadlock_watchdog(f"concurrent custom all-reduce ({algo.name})"):
+            for _ in range(CONCURRENT_ITERS):
+                # Both all-reduces are issued back-to-back with no dependency
+                # between their streams, so without serialization the kernels do
+                # overlap on the device.
+                step = []
+                for inp, stream in zip(inputs, streams):
+                    with torch.cuda.stream(stream):
+                        step.append(comm.custom_all_reduce(inp.clone()))
+                outs.append(step)
+            for stream in streams:
+                torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()  # never returns once the kernels have wedged
+    finally:
+        comm.override_algo = previous_algo
+
+    # Serialized, not just unwedged: a buffer that another kernel re-armed under
+    # us would come back with holes even when the rendezvous happened to finish.
+    for step in outs:
+        for out, ref in zip(step, refs):
+            torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

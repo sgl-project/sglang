@@ -19,6 +19,7 @@ namespace {
 
 using device::distributed::PushController;
 using host::distributed::CustomAllReduceBase, host::distributed::CustomAllReduceRef;
+using host::distributed::get_spin_timeout_ns;
 
 struct AllReducePushData {
   void* __restrict__ buffer[device::distributed::kMaxNumGPU];
@@ -28,6 +29,7 @@ struct AllReducePushData {
   uint32_t num_items;
   uint32_t buffer_bytes;
   uint32_t epoch_bytes;
+  uint64_t spin_timeout_ns;
 };
 
 #define CUSTOM_AR_KERNEL __global__ __launch_bounds__(1024, 1)
@@ -128,10 +130,14 @@ SGL_DEVICE void push_impl(DType* (&push_buf)[kNumGPU], const void* data, uint32_
 }
 
 template <typename DType, uint32_t kNumGPU>
-SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_items) {
+SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_items, uint64_t spin_timeout_ns) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);
   using Storage = AlignedVector<packed_t<DType>, kVecSize>;
+
+  // Bounds the wait below: a peer that never arrives is a bug, not a slow peer.
+  // See `device::distributed::SpinDeadline`.
+  distributed::SpinDeadline deadline(spin_timeout_ns);
 
   for (auto i = blockIdx.x;; i += gridDim.x) {
     const auto offset = i * blockDim.x + threadIdx.x;
@@ -150,6 +156,7 @@ SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_
         }
       }
       if (!has_pos_zero) break;
+      deadline.tick();
     }
 
     const Storage result = distributed::reduce_impl(storage);
@@ -170,7 +177,7 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(
     const PushController __grid_constant__ ctrl) {
   using namespace device;
 
-  const auto [buffer, input, output, rank, num_items, buffer_bytes, epoch_bytes] = params;
+  const auto [buffer, input, output, rank, num_items, buffer_bytes, epoch_bytes, spin_timeout_ns] = params;
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -191,7 +198,7 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(
   for (uint32_t i = 0; i < kNumGPU; ++i) {
     poll_buf[i] = static_cast<DType*>(pointer::offset(buffer[rank], i * buffer_bytes, epoch_offset));
   }
-  poll_impl(poll_buf, output, num_items);
+  poll_impl(poll_buf, output, num_items, spin_timeout_ns);
   ctrl.exit();
 }
 
@@ -224,6 +231,7 @@ struct CustomAllReducePush : public CustomAllReduceBase {
     params.num_items = num_items;
     params.buffer_bytes = m_push_buffer_bytes;
     params.epoch_bytes = kNumGPU * params.buffer_bytes;
+    params.spin_timeout_ns = get_spin_timeout_ns();
 
     RuntimeCheck(input.IsContiguous(), "Input must be contiguous");
     RuntimeCheck(m_num_gpu == kNumGPU, "Number of GPUs mismatch");

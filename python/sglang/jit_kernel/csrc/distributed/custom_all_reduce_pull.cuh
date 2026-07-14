@@ -24,11 +24,13 @@ namespace {
 using device::distributed::PullController;
 using host::distributed::AllReduceData;
 using host::distributed::CustomAllReduceBase, host::distributed::CustomAllReduceRef;
+using host::distributed::get_spin_timeout_ns;
 
 struct AllReduceParams {
   void* __restrict__ output;
   uint32_t rank;
   uint32_t num_items;  // NOTE: support at most 4G, but that's too much
+  uint64_t spin_timeout_ns;
 };
 
 [[maybe_unused]]
@@ -45,7 +47,7 @@ SGL_DEVICE void all_reduce_impl(const AllReduceParams& params, DType* (&input)[k
   constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);
   using DType2 = packed_t<DType>;
   using Storage = AlignedVector<DType2, kVecSize>;
-  const auto& [output, rank, num_items] = params;
+  const auto& [output, rank, num_items, spin_timeout_ns] = params;
 
   for (auto i = blockIdx.x;; i += gridDim.x) {
     const auto offset = i * blockDim.x + threadIdx.x;
@@ -81,11 +83,11 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_kernel(
     input[i] = static_cast<DType*>(data->input[i]);
   device::PDLWaitPrimary<kUsePDL>();
 
-  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU);
+  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU, params.spin_timeout_ns);
   all_reduce_impl</*kBroadcast=*/false>(params, input);
 
   device::PDLTriggerSecondary<kUsePDL>();
-  ctrl.sync</*kFence=*/0, /*kStart=*/0>(params.rank, kNumGPU);
+  ctrl.sync</*kFence=*/0, /*kStart=*/0>(params.rank, kNumGPU, params.spin_timeout_ns);
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
@@ -114,6 +116,7 @@ CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(
       .output = nullptr,  // this is not used for 2-shot all reduce
       .rank = params.rank,
       .num_items = local_length,
+      .spin_timeout_ns = params.spin_timeout_ns,
   };
 
 #pragma unroll
@@ -122,11 +125,11 @@ CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU);
+  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU, params.spin_timeout_ns);
   all_reduce_impl</*kBroadcast=*/true>(local_params, input);
 
   device::PDLTriggerSecondary<kUsePDL>();
-  ctrl.sync</*kFence=*/1, /*kStart=*/0>(params.rank, kNumGPU);
+  ctrl.sync</*kFence=*/1, /*kStart=*/0>(params.rank, kNumGPU, params.spin_timeout_ns);
 }
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
@@ -154,6 +157,7 @@ struct CustomAllReducePull : public CustomAllReduceBase {
         .output = use_2shot ? nullptr : output.data_ptr(),
         .rank = m_rank,
         .num_items = num_items,
+        .spin_timeout_ns = get_spin_timeout_ns(),
     };
 
     RuntimeCheck(input.IsContiguous(), "Input tensor must be contiguous");

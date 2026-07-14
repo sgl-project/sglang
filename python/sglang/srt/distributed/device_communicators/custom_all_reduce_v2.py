@@ -9,6 +9,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_custom_all_reduce_cls
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    SingleStreamGuard,
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
@@ -47,6 +48,8 @@ class CustomAllReduceV2:
     ) -> None:
         _maybe_init_config()
         self.disabled = True
+        # One in-flight all-reduce per communicator; see SingleStreamGuard.
+        self.stream_guard = SingleStreamGuard(device)
         if not can_use_custom_all_reduce_v2(group=group, device=device):
             return
 
@@ -161,6 +164,11 @@ class CustomAllReduceV2:
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
         algo = self._determine_algo(input)
+        # The kernels support exactly one in-flight all-reduce per communicator:
+        # if this issue comes from a different stream than the previous one, order
+        # it behind that one instead of letting the two kernels corrupt the
+        # communicator's shared rendezvous state.
+        self.stream_guard.maybe_serialize()
         return torch.from_dlpack(self.obj.all_reduce(input, algo))
 
     def _determine_algo(self, input: torch.Tensor) -> AllReduceAlgo:
