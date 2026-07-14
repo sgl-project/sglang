@@ -75,6 +75,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "HummingLinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -225,6 +226,7 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+        self.with_bias = bias
         self.quant_method.create_weights(
             self,
             self.input_size,
@@ -331,6 +333,7 @@ class ColumnParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.gather_output = gather_output
         self.use_presharded_weights = use_presharded_weights
 
@@ -522,6 +525,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
     ):
+        self.with_bias = bias
         self.output_sizes = output_sizes
         if tp_rank is None:
             tp_rank = get_parallel().tp_rank
@@ -588,7 +592,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv/mlp).
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -621,8 +625,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
@@ -654,8 +658,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
@@ -731,8 +735,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         """
         Handle special case for models where MLP layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -832,12 +836,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(
-                    loaded_weight=loaded_weight,
-                    shard_id=0,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                )
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint "
+                        "merged-column checkpoint load, got shape "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                if loaded_shard_id is None:
+                    # The checkpoint tensor is already fused-in-checkpoint, so a
+                    # scalar scale applies to the entire merged matrix. Fill
+                    # every logical slot so later reductions only see valid
+                    # scale values.
+                    shard_ids = range(param.data.shape[0])
+                else:
+                    shard_ids = loaded_shard_id
+
+                for shard_id in shard_ids:
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight,
+                        shard_id=shard_id,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
+                    )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
                 self._load_merged_block_scale(param, loaded_weight)
@@ -932,6 +952,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
     ):
+        self.with_bias = bias
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
@@ -1007,8 +1028,8 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         """
         Handle special case for models where QKV layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -1084,7 +1105,19 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
-                param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
+                # The checkpoint tensor is already fused-in-checkpoint, so a scalar
+                # scale applies to the entire QKV matrix. Fill every logical
+                # slot so later reductions only see valid scale values.
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint QKV "
+                        "checkpoint load when loaded_shard_id is None, got "
+                        f"shape {tuple(loaded_weight.shape)}"
+                    )
+                for shard_id in param.qkv_idxs:
+                    param.load_qkv_weight(
+                        loaded_weight=loaded_weight, shard_id=shard_id
+                    )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight)
@@ -1156,7 +1189,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv/mlp).
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -1193,8 +1226,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
 
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
@@ -1250,8 +1283,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
 
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
@@ -1382,6 +1415,7 @@ class RowParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = use_dp_attention_reduce

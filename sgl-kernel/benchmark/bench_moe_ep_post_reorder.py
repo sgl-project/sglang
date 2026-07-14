@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_triton_kernel
 from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
