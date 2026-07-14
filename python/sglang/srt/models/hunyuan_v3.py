@@ -323,7 +323,7 @@ class HYV3Attention(nn.Module):
             None
             if is_cuda()
             and self.head_dim == 128
-            and self.num_heads // self.num_kv_heads in (4, 8)
+            and (self.num_heads, self.num_kv_heads) in ((8, 1), (64, 8))
             else False
         )
         self._hpc_cos_sin_fp32: Optional[torch.Tensor] = None

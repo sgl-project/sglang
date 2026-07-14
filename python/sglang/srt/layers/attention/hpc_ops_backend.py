@@ -50,6 +50,9 @@ if TYPE_CHECKING:
 _SUPPORTED_GQA_GROUP_SIZES = (4, 8)
 _SUPPORTED_HEAD_DIM = 128
 _REQUIRED_PAGE_SIZE = 64
+# The fused QKNorm+RoPE+FP8-quant+StoreKV kernel is specialized per
+# (num_q_heads, num_kv_heads); only these shard shapes exist today.
+FP8_ROPE_SUPPORTED_HEAD_CONFIGS = ((8, 1), (64, 8))
 
 
 @functools.cache
@@ -116,6 +119,19 @@ class HPCOpsAttnBackend(AttentionBackend):
         # HPC-Ops QKNorm+RoPE+quant+StoreKV op produces, so it requires the
         # model to call fused_qk_rope_store_kv_fp8() (wired for HunYuan V3).
         self.use_fp8 = model_runner.kv_cache_dtype == torch.float8_e4m3fn
+        if self.use_fp8:
+            heads = (
+                model_runner.model_config.num_attention_heads // model_runner.tp_size,
+                model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+            )
+            if heads not in FP8_ROPE_SUPPORTED_HEAD_CONFIGS:
+                raise ValueError(
+                    "The hpc_ops FP8 KV cache path requires per-rank "
+                    f"(num_q_heads, num_kv_heads) in "
+                    f"{FP8_ROPE_SUPPORTED_HEAD_CONFIGS} (the fused RoPE+quant "
+                    f"kernel is specialized per shape), got {heads}. Adjust "
+                    "--tp accordingly or use --kv-cache-dtype bfloat16."
+                )
 
         config = model_runner.model_config
         head_dim = config.head_dim
