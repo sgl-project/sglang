@@ -120,6 +120,7 @@ class NPUSwigluOAI(BaseActivation):
         )
         return output, None
 
+
 class NPUSwigluStepAndMul(BaseActivation):
     def __init__(self, clamp_limit: Optional[float] = None):
         self._clamp_limit = clamp_limit
