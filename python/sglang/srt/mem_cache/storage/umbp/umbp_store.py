@@ -872,27 +872,35 @@ class UMBPStore(HiCacheStorage):
                 )
                 self._kv_events_subscriber.start()
 
+        # Name -> HostKVCache map used by the v2 multi-pool path. Populated by
+        # register_mem_host_pool_v2(); initialized here so the v2 lookups never
+        # depend on registration order.
+        self.registered_pools: dict = {}
+        # Whether the KV anchor is a logical-only pool (no physical KV buffer,
+        # e.g. DeepSeek-V4's LogicalHostPool). Set for real in
+        # register_mem_pool_host().
+        self._kv_anchor_is_logical = False
+
     # ------------------------------------------------------------------
     # Host memory pool registration
     # ------------------------------------------------------------------
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        # Ensure the name->pool map used by the v2 multi-pool path exists even
-        # before register_mem_host_pool_v2() is called.
-        if not hasattr(self, "registered_pools"):
-            self.registered_pools = {}
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
 
-        self._zero_copy_registered = False
         # Hybrid logical anchors (e.g. DeepSeek-V4's KV anchor LogicalHostPool)
-        # own only allocation indices and hold no physical KV tensor. There is
-        # nothing to register for RDMA here; the real per-pool buffers are
-        # registered through register_mem_host_pool_v2().
-        if getattr(mem_pool_host, "kv_buffer", None) is None:
+        # own only allocation indices and hold no physical KV tensor. Compute
+        # this once and reuse: there is nothing to register for RDMA here, v1
+        # I/O no-ops on it, and the real per-pool buffers are registered through
+        # register_mem_host_pool_v2().
+        self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
+
+        self._zero_copy_registered = False
+        if self._kv_anchor_is_logical:
             return
 
         # In distributed mode, pre-register the entire host KV buffer with the
@@ -991,8 +999,6 @@ class UMBPStore(HiCacheStorage):
         buffer that must be (a) resolvable by name at v2 I/O time and (b)
         registered with the RDMA IOEngine for zero-copy transfers.
         """
-        if not hasattr(self, "registered_pools"):
-            self.registered_pools = {}
         # KV anchor is either already registered via register_mem_pool_host()
         # (non-hybrid single pool) or purely logical (hybrid group). Skip it.
         if host_pool_name == PoolName.KV:
@@ -1075,7 +1081,7 @@ class UMBPStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+        if self._kv_anchor_is_logical:
             # DeepSeek-V4's KV anchor is logical only; the physical KV data is
             # carried by the v2 side pools, so there is nothing to read here.
             return [True] * len(keys)
@@ -1149,7 +1155,7 @@ class UMBPStore(HiCacheStorage):
             page_count = len(host_indices) // self.mem_pool_host.page_size
             return [True] * page_count
 
-        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+        if self._kv_anchor_is_logical:
             # DeepSeek-V4's KV anchor is logical only; the physical KV data is
             # written by the v2 side pools, so there is nothing to write here.
             return [True] * len(keys)
@@ -1237,7 +1243,7 @@ class UMBPStore(HiCacheStorage):
         never collide.
         """
         pool_name = transfer.name
-        host_pool = getattr(self, "registered_pools", {}).get(pool_name)
+        host_pool = self.registered_pools.get(pool_name)
         if host_pool is None:
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 
@@ -1265,7 +1271,7 @@ class UMBPStore(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+        if self._kv_anchor_is_logical:
             # Logical KV anchor: no physical KV object exists in UMBP, so the
             # usable prefix is bounded entirely by the required side pools.
             kv_pages = len(keys)
@@ -1313,7 +1319,7 @@ class UMBPStore(HiCacheStorage):
         """Unified per-pool zero-copy I/O. Returns {pool_name: per-page bools}."""
         results: dict = {}
         for transfer in transfers:
-            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            host_pool = self.registered_pools.get(transfer.name)
             if host_pool is None:
                 raise ValueError(f"Unregistered UMBP hybrid pool: {transfer.name}")
             keys = transfer.keys or []
@@ -1337,17 +1343,15 @@ class UMBPStore(HiCacheStorage):
             )
 
             if is_set:
-                exist_result = self.client.batch_exists(key_strs)
-                io_results = [True if hit else False for hit in exist_result]
-                missing_idx = [i for i, hit in enumerate(exist_result) if not hit]
-                if missing_idx:
-                    put_results = self.client.batch_put_from_ptr(
-                        [key_strs[i] for i in missing_idx],
-                        [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
+                # UMBP performs its own key-level deduplication, so skip the
+                # extra batch_exists round-trip and put directly (mirrors
+                # batch_set_v1).
+                io_results = [
+                    bool(r)
+                    for r in self.client.batch_put_from_ptr(
+                        key_strs, list(ptr_list), list(element_size_list)
                     )
-                    for idx, res in zip(missing_idx, put_results):
-                        io_results[idx] = bool(res)
+                ]
             else:
                 io_results = [
                     bool(r)
