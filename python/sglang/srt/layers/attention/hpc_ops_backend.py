@@ -13,7 +13,9 @@ constraints:
 
 - NVIDIA Hopper or newer (sm90+)
 - ``--page-size 64``
-- bf16 model dtype and bf16 KV cache
+- bf16 model dtype; bf16 or fp8_e4m3 KV cache (the FP8 path additionally
+  requires the model to run the fused QKNorm+RoPE+quant+StoreKV op via
+  ``fused_qk_rope_store_kv_fp8`` — wired for HunYuan V3)
 - head_dim == 128 and num_q_heads // num_kv_heads in {4, 8}
 - default softmax scaling (``head_dim ** -0.5``), no sliding window,
   no logit cap, decoder-only attention
