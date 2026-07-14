@@ -22,6 +22,7 @@ HW_MAPPING = {
     "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
+    "mlx": HWBackend.MLX,
 }
 
 # Per-commit test suites (run on every PR).
@@ -92,6 +93,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-4-gpu-h100",
         "extra-b-test-deepep-4-gpu-b200",
         "extra-b-test-deepep-8-gpu-h200",
     ],
@@ -105,6 +107,10 @@ PER_COMMIT_SUITES = {
     HWBackend.XPU: [
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
+    ],
+    HWBackend.MLX: [
+        "stage-a-unit-test-mlx",
+        "stage-b-e2e-mlx",
     ],
 }
 
@@ -194,6 +200,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.CPU,
     HWBackend.MUSA,
     HWBackend.XPU,
+    HWBackend.MLX,
 }
 
 

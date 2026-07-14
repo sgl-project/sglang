@@ -45,6 +45,7 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
+            default_chat_template_kwargs=None,
         )
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -282,6 +283,54 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, _ = self.chat._convert_to_internal_request(req)
 
         self.assertFalse(adapted.require_reasoning)
+
+    def test_default_chat_template_kwargs_applied_when_request_unset(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], False)
+
+    def test_default_chat_template_kwargs_overridden_per_request(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], True)
+
+    def test_default_chat_template_kwargs_mirrors_reasoning_effort(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "high"}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "high")
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
@@ -815,6 +864,81 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Should return None since no completion is needed
         self.assertIsNone(result, "Should return None when no completion is needed")
+
+    def test_unstreamed_tool_args_raw_string_no_completion_needed(self):
+        """Test raw JSON string arguments are not JSON-encoded again at finish."""
+
+        mock_parser = Mock()
+        mock_detector = Mock()
+        mock_detector.prev_tool_call_arr = [
+            {"name": "report_template_recognition_commit", "arguments": "{}"}
+        ]
+        mock_detector.streamed_args_for_tool = ["{}"]
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "commit"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "report_template_recognition_commit"},
+                }
+            ],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            index=0,
+        )
+
+        self.assertIsNone(result, "Should not append encoded quotes")
+
+    def test_unstreamed_tool_args_raw_string_completion(self):
+        """Test remaining raw JSON string arguments are sent at finish."""
+
+        mock_parser = Mock()
+        mock_detector = Mock()
+        mock_detector.prev_tool_call_arr = [
+            {
+                "name": "get_weather",
+                "arguments": '{"location": "San Francisco", "unit": "celsius"}',
+            }
+        ]
+        mock_detector.streamed_args_for_tool = ['{"location": "San Francisco"']
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            index=0,
+        )
+
+        self.assertIsNotNone(result, "Should return chunk with remaining arguments")
+        chunk = json.loads(result[6:])
+        tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual(tool_calls[0]["function"]["arguments"], ', "unit": "celsius"}')
 
     def test_unstreamed_tool_args_no_parser_data(self):
         """Test that no completion chunk is sent when parser has no tool call data."""
