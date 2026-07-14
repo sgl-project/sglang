@@ -30,6 +30,8 @@ import os
 import socket
 import struct
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -61,6 +63,26 @@ except ImportError as exc:  # pragma: no cover - runtime check
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _PendingFlexKVLookup:
+    task_id: int
+    expected_slots: int
+
+
+class FlexKVRetrieveStatus(Enum):
+    SUCCESS = "success"
+    DEFINITE_TERMINAL_FAILURE = "definite_terminal_failure"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class FlexKVRetrieveResult:
+    status: FlexKVRetrieveStatus
+    num_slots: int
+    observation_task_ids: Tuple[int, ...] = ()
+    reason: Optional[str] = None
+
+
 class FlexKVConnector:
     """A FlexKV-side façade used by :class:`FlexKVRadixCache`.
 
@@ -84,6 +106,7 @@ class FlexKVConnector:
         sgl_model_config: Any,
         server_args: Any,
         page_size: int,
+        allocator_page_size: int,
         kvcache: Any,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -93,14 +116,27 @@ class FlexKVConnector:
         attn_tp_group: Any = None,
         attn_cp_group: Any = None,
     ) -> None:
-        self.page_size = int(page_size)
+        self.storage_page_size = int(page_size)
+        self.allocator_page_size = int(allocator_page_size)
+        self.enable_layerwise = bool(
+            int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
+        )
+        if self.enable_layerwise and self.allocator_page_size > 1:
+            raise ValueError(
+                "FlexKV layerwise transfer requires allocator page size 1"
+            )
+        if self.allocator_page_size % self.storage_page_size != 0:
+            raise ValueError(
+                "FlexKV requires the storage page size to divide the allocator "
+                "page size"
+            )
 
         # 1. Resolve FlexKV config from env + sglang server args.
         self.flexkv_config = FlexKVConfig.from_env()
         self.rank_info = self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sgl_model_config,
             server_args=server_args,
-            page_size=self.page_size,
+            page_size=self.storage_page_size,
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank if dp_rank is not None else 0,
@@ -194,9 +230,6 @@ class FlexKVConnector:
         self._register_with_retry(kv_caches, indexer_buffers)
 
         # 8. Layerwise transfer plumbing.
-        self.enable_layerwise = bool(
-            int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
-        )
         self._layerwise_socket = build_layerwise_eventfd_socket_path(
             dp_client_id=self.rank_info.dp_client_id,
             pp_rank=self.rank_info.pp_rank,
@@ -219,7 +252,9 @@ class FlexKVConnector:
 
         # 10. Per-rank in-flight tracking.
         # Loads
-        self._pending_lookups: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._pending_lookups: Dict[str, _PendingFlexKVLookup] = {}
+        self._ambiguous_loads: Dict[str, Tuple[int, ...]] = {}
+        self._poison_reason: Optional[str] = None
         self._inflight_loads: Dict[int, int] = {}  # producer_id -> rid hashlike
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
@@ -262,46 +297,52 @@ class FlexKVConnector:
             hit > 0 and the caller didn't ask to track it.
 
         Returns:
-          ``(fkv_task_id, hit_count)``. ``hit_count`` is page-aligned
-          and may be smaller than the raw FlexKV match if the page
-          floor truncated it.
+          ``(fkv_task_id, hit_count)``. ``hit_count`` is the exact
+          allocator-page-aligned match represented by the held task.
         """
-        fkv_task_id = -1
-        hit_length = 0
+        if self._poison_reason is not None:
+            raise RuntimeError(f"FlexKV load-back is poisoned: {self._poison_reason}")
 
+        payload = {"task_id": -1, "hit": 0, "error": None}
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             tids_np = np.asarray(token_ids, dtype=np.int64)
-            mask_np = self._as_numpy_mask(token_mask)
+            mask_np = np.asarray(self._as_numpy_mask(token_mask), dtype=np.bool_)
             try:
                 res = self.kv_manager.get_match(token_ids=tids_np, token_mask=mask_np)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[FlexKV] get_match raised: %s", exc)
-                res = None
-            if res is None:
-                fkv_task_id = -1
-                hit_length = 0
+                payload["error"] = f"FlexKV get_match failed: {exc}"
             else:
-                fkv_task_id, matched_mask = res
-                hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
+                if res is None:
+                    payload["error"] = "FlexKV get_match returned no result"
+                    res = None
+            if res is not None and payload["error"] is None:
+                task_id, matched_mask = res
+                error = self._validate_lookup_match(
+                    token_ids=tids_np,
+                    candidate_mask=mask_np,
+                    task_id=task_id,
+                    matched_mask=matched_mask,
+                )
+                hit_length = (
+                    int(np.asarray(matched_mask, dtype=np.bool_).sum())
+                    if error is None
+                    else 0
+                )
+                payload = {
+                    "task_id": int(task_id),
+                    "hit": hit_length,
+                    "error": error,
+                }
 
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter(
-                {"task_id": fkv_task_id, "hit": hit_length}
-            )
-            fkv_task_id = payload["task_id"]
-            hit_length = payload["hit"]
+            payload = self._sync_ctx.scatter(payload)
 
-        # Page-align: FlexKV transfers whole pages.
-        if hit_length > 0 and self.page_size > 1:
-            aligned = (hit_length // self.page_size) * self.page_size
-            if aligned < hit_length:
-                logger.debug(
-                    "[FlexKV] lookup_kv: page-aligning hit %d -> %d (page=%d)",
-                    hit_length,
-                    aligned,
-                    self.page_size,
-                )
-            hit_length = aligned
+        if payload["error"] is not None:
+            self._poison_reason = str(payload["error"])
+            raise RuntimeError(f"Invalid FlexKV lookup result: {self._poison_reason}")
+
+        fkv_task_id = int(payload["task_id"])
+        hit_length = int(payload["hit"])
 
         # Decide what to do with the held task. Three cases:
         #   1. hit_length > 0 and rid given → stash for retrieve_kv later.
@@ -309,7 +350,10 @@ class FlexKVConnector:
         #   3. hit_length == 0 → no work to do; FlexKV already marked the
         #      empty graph COMPLETED inside get_match, cancel would warn.
         if hit_length > 0 and rid is not None and fkv_task_id >= 0:
-            self._pending_lookups[rid] = fkv_task_id
+            self._pending_lookups[rid] = _PendingFlexKVLookup(
+                task_id=fkv_task_id,
+                expected_slots=hit_length,
+            )
         elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
@@ -319,55 +363,156 @@ class FlexKVConnector:
     def release_pending(self, rid: str) -> None:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""
-        fkv_task_id = self._pending_lookups.pop(rid, -1)
-        if fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
+        pending = self._pending_lookups.pop(rid, None)
+        if pending is not None and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
-            self.kv_manager.cancel([fkv_task_id])
+            try:
+                self.kv_manager.cancel([pending.task_id])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FlexKV] release_pending: %s", exc)
 
     def retrieve_kv(
         self,
         rid: str,
-        slot_mapping: torch.Tensor,
-    ) -> int:
+        slot_mapping: Optional[torch.Tensor],
+    ) -> FlexKVRetrieveResult:
         """Synchronous load: ``launch`` + ``wait``.
 
-        Returns the number of slots actually loaded. The caller is
-        responsible for having allocated ``slot_mapping`` of length
-        equal to ``hit_length`` from a prior ``lookup_kv``.
+        All ranks make one combined pre-launch decision. Once launch has
+        been attempted, every non-success outcome is ambiguous.
         """
-        fkv_task_id = self._pending_lookups.pop(rid, -1)
-        if fkv_task_id < 0:
-            return 0
+        pending = self._pending_lookups.get(rid)
+        local_status = 1
+        local_reason: Optional[str] = None
+        slot_mapping_cpu: Optional[torch.Tensor] = None
+        page_starts: List[int] = []
 
-        slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
-
-        # Cross-node PP receivers must send their slot mapping back to
-        # the TransferManagerOnRemote so the remote side knows where to
-        # land the H2D copies on its own GPUs.
-        if self._sync_ctx.should_send_slot_mapping_to_remote:
-            self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
-
-        n = slot_mapping_cpu.numel()
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            self.kv_manager.launch(
-                task_ids=[fkv_task_id],
-                slot_mappings=[slot_mapping_cpu],
-                as_batch=True,
-                layerwise_transfer=False,
-            )
-            resp = self.kv_manager.wait([fkv_task_id], timeout=30.0)
-            if not (
-                fkv_task_id in resp
-                and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-            ):
-                logger.warning(
-                    "[FlexKV] retrieve_kv: task %d failed/timed out",
-                    fkv_task_id,
+        if self._poison_reason is not None:
+            local_status = 0
+            local_reason = self._poison_reason
+        elif pending is None:
+            local_status = 0
+            local_reason = "missing held lookup"
+        elif slot_mapping is None:
+            local_status = 0
+            local_reason = "allocator could not acquire the exact slot mapping"
+        else:
+            try:
+                slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
+                local_reason = self._validate_slot_mapping(
+                    slot_mapping=slot_mapping_cpu,
+                    expected_slots=pending.expected_slots,
                 )
-                n = 0
+                if local_reason is None:
+                    page_starts = slot_mapping_cpu[
+                        :: self.allocator_page_size
+                    ].tolist()
+                else:
+                    local_status = 0
+            except Exception as exc:  # noqa: BLE001
+                local_status = 0
+                local_reason = str(exc)
+
+        local_manifest = {
+            "task_id": pending.task_id if pending is not None else -1,
+            "expected_slots": pending.expected_slots if pending is not None else -1,
+            "page_starts": page_starts,
+        }
+        leader_manifest = local_manifest
         if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
-        return n
+            leader_manifest = self._sync_ctx.scatter(local_manifest)
+
+        if local_status == 1 and local_manifest != leader_manifest:
+            local_status = 0
+            local_reason = "lookup or slot manifest differs across ranks"
+
+        if (
+            local_status == 1
+            and self._sync_ctx.should_send_slot_mapping_to_remote
+            and pending is not None
+            and slot_mapping_cpu is not None
+        ):
+            try:
+                self._send_slot_mapping_to_remote(pending.task_id, slot_mapping_cpu)
+            except Exception as exc:  # noqa: BLE001
+                local_status = 0
+                local_reason = str(exc)
+
+        combined_status = self._sync_ctx.all_reduce_min(local_status)
+        if combined_status == 0:
+            if pending is not None and self._sync_ctx.is_sync_leader:
+                assert self.kv_manager is not None
+                try:
+                    self.kv_manager.cancel([pending.task_id])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[FlexKV] pre-launch cancel: %s", exc)
+            self._pending_lookups.pop(rid, None)
+            return FlexKVRetrieveResult(
+                status=FlexKVRetrieveStatus.DEFINITE_TERMINAL_FAILURE,
+                num_slots=0,
+                reason=local_reason or "another rank rejected the pre-launch manifest",
+            )
+
+        assert pending is not None and slot_mapping_cpu is not None
+        outcome = {
+            "status": FlexKVRetrieveStatus.AMBIGUOUS.value,
+            "observation_task_ids": [],
+            "reason": None,
+        }
+        if self._sync_ctx.is_sync_leader:
+            assert self.kv_manager is not None
+            try:
+                observation_task_ids = self.kv_manager.launch(
+                    task_ids=[pending.task_id],
+                    slot_mappings=[slot_mapping_cpu],
+                    as_batch=False,
+                    layerwise_transfer=False,
+                )
+                if (
+                    not isinstance(observation_task_ids, list)
+                    or not observation_task_ids
+                    or any(
+                        not isinstance(task_id, int) or task_id < 0
+                        for task_id in observation_task_ids
+                    )
+                ):
+                    raise RuntimeError("KVManager.launch returned invalid task ids")
+                responses = self.kv_manager.wait(
+                    observation_task_ids,
+                    timeout=30.0,
+                    completely=True,
+                )
+                if responses is None or set(responses) != set(observation_task_ids):
+                    raise RuntimeError("KVManager.wait returned unexpected task ids")
+                if any(
+                    responses[task_id].status != KVResponseStatus.SUCCESS
+                    for task_id in observation_task_ids
+                ):
+                    raise RuntimeError("FlexKV load did not complete successfully")
+                outcome = {
+                    "status": FlexKVRetrieveStatus.SUCCESS.value,
+                    "observation_task_ids": observation_task_ids,
+                    "reason": None,
+                }
+            except Exception as exc:  # noqa: BLE001
+                outcome["reason"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            outcome = self._sync_ctx.scatter(outcome)
+
+        self._pending_lookups.pop(rid, None)
+        status = FlexKVRetrieveStatus(outcome["status"])
+        observation_task_ids = tuple(outcome["observation_task_ids"])
+        reason = outcome["reason"]
+        if status is FlexKVRetrieveStatus.AMBIGUOUS:
+            self._ambiguous_loads[rid] = observation_task_ids
+            self._poison_reason = reason or "FlexKV launch outcome is ambiguous"
+
+        return FlexKVRetrieveResult(
+            status=status,
+            num_slots=pending.expected_slots,
+            observation_task_ids=observation_task_ids,
+            reason=reason,
+        )
 
     def start_load_kv_layerwise(
         self,
@@ -382,9 +527,10 @@ class FlexKVConnector:
             "start_load_kv_layerwise called but layerwise transfer is "
             "disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
         )
-        fkv_task_id = self._pending_lookups.pop(rid, -1)
-        if fkv_task_id < 0:
+        pending = self._pending_lookups.pop(rid, None)
+        if pending is None:
             return 0, -1
+        fkv_task_id = pending.task_id
 
         slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         n = slot_mapping_cpu.numel()
@@ -419,14 +565,26 @@ class FlexKVConnector:
             )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            self.kv_manager.launch(
+            observation_task_ids = self.kv_manager.launch(
                 task_ids=[fkv_task_id],
                 slot_mappings=[slot_mapping_cpu],
                 as_batch=True,
                 layerwise_transfer=True,
                 counter_id=producer_id,
             )
-            self._launched_load_tids.append(fkv_task_id)
+            if (
+                not isinstance(observation_task_ids, list)
+                or not observation_task_ids
+                or any(
+                    not isinstance(task_id, int) or task_id < 0
+                    for task_id in observation_task_ids
+                )
+            ):
+                self._poison_reason = (
+                    "FlexKV layerwise launch returned invalid observation task ids"
+                )
+                raise RuntimeError(self._poison_reason)
+            self._launched_load_tids.extend(observation_task_ids)
 
         # Tell the layer hook which counter slot to wait on.
         self.layer_done_counter.set_consumer(fkv_task_id)
@@ -440,10 +598,18 @@ class FlexKVConnector:
         if len(self._launched_load_tids) < threshold:
             return
         try:
-            self.kv_manager.try_wait(task_ids=list(self._launched_load_tids))
+            completed = self.kv_manager.try_wait(
+                task_ids=list(self._launched_load_tids)
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] drain_launched_loads try_wait: %s", exc)
-        self._launched_load_tids.clear()
+            return
+        completed_ids = set(completed or {})
+        self._launched_load_tids = [
+            task_id
+            for task_id in self._launched_load_tids
+            if task_id not in completed_ids
+        ]
 
     # ------------------------------------------------------------------
     # Public API — store
@@ -476,8 +642,10 @@ class FlexKVConnector:
 
         # Page-align inputs *before* put_match so the FlexKV allocator
         # only reserves slots that line up with the slot_mapping we send.
-        if self.page_size > 1:
-            aligned_len = (n // self.page_size) * self.page_size
+        if self.storage_page_size > 1:
+            aligned_len = (
+                n // self.storage_page_size * self.storage_page_size
+            )
             if aligned_len == 0:
                 self._send_pp_put_meta(-1, [])
                 return -1
@@ -642,7 +810,6 @@ class FlexKVConnector:
         return done
 
     def cancel_prefetch(self, rid: str) -> None:
-        self._pending_lookups.pop(rid, None)
         # FlexKV doesn't currently support prefetch cancellation, but
         # we still drop our tracking entry.
         self._ongoing_prefetches.pop(rid, None)
@@ -667,10 +834,18 @@ class FlexKVConnector:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def ensure_reset_safe(self) -> None:
+        if self._poison_reason is not None or self._ambiguous_loads:
+            raise RuntimeError(
+                "Cannot reset FlexKV after an ambiguous load: "
+                f"{self._poison_reason}"
+            )
+
     def reset(self) -> None:
+        self.ensure_reset_safe()
         # Drop pending lookups (cancel their held tasks on the leader).
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            pending = [tid for tid in self._pending_lookups.values() if tid >= 0]
+            pending = [lookup.task_id for lookup in self._pending_lookups.values()]
             if pending:
                 try:
                     self.kv_manager.cancel(pending)
@@ -693,11 +868,15 @@ class FlexKVConnector:
             self.layer_done_counter.reset()
 
     def shutdown(self) -> None:
+        shutdown_complete = False
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 self.kv_manager.shutdown()
+                shutdown_complete = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] kv_manager.shutdown: %s", exc)
+        elif self.kv_manager is None:
+            shutdown_complete = True
         if self._remote_process is not None:
             try:
                 self._remote_process.terminate()
@@ -708,10 +887,67 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] remote process shutdown: %s", exc)
             self._remote_process = None
+        if shutdown_complete:
+            self._ambiguous_loads.clear()
+            self._poison_reason = None
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _validate_lookup_match(
+        self,
+        *,
+        token_ids: np.ndarray,
+        candidate_mask: np.ndarray,
+        task_id: Any,
+        matched_mask: Any,
+    ) -> Optional[str]:
+        if not isinstance(task_id, int) or task_id < 0:
+            return "FlexKV get_match returned an invalid task id"
+        if token_ids.ndim != 1 or candidate_mask.shape != token_ids.shape:
+            return "FlexKV lookup inputs must be matching one-dimensional arrays"
+        matched = np.asarray(matched_mask, dtype=np.bool_)
+        if matched.shape != candidate_mask.shape:
+            return "FlexKV get_match returned a mask with the wrong shape"
+        candidate_positions = np.flatnonzero(candidate_mask)
+        if candidate_positions.size > 0 and not np.array_equal(
+            candidate_positions,
+            np.arange(candidate_positions[0], token_ids.size),
+        ):
+            return "FlexKV lookup candidates must form a contiguous suffix"
+        if np.any(matched & ~candidate_mask):
+            return "FlexKV matched tokens outside the candidate suffix"
+        matched_candidates = matched[candidate_positions]
+        false_positions = np.flatnonzero(~matched_candidates)
+        if false_positions.size > 0 and np.any(
+            matched_candidates[false_positions[0] :]
+        ):
+            return "FlexKV matched mask must be a contiguous candidate prefix"
+        hit_length = int(matched.sum())
+        if hit_length % self.allocator_page_size != 0:
+            return "FlexKV matched mask is not allocator-page-aligned"
+        return None
+
+    def _validate_slot_mapping(
+        self, *, slot_mapping: torch.Tensor, expected_slots: int
+    ) -> Optional[str]:
+        if slot_mapping.ndim != 1 or slot_mapping.numel() != expected_slots:
+            return "FlexKV slot mapping does not match the held lookup"
+        if expected_slots % self.allocator_page_size != 0:
+            return "FlexKV slot mapping length is not allocator-page-aligned"
+        pages = slot_mapping.reshape(-1, self.allocator_page_size)
+        page_starts = pages[:, 0]
+        if torch.any(page_starts % self.allocator_page_size != 0).item():
+            return "FlexKV slot mapping contains an unaligned page start"
+        expected_offsets = torch.arange(
+            self.allocator_page_size,
+            dtype=slot_mapping.dtype,
+            device=slot_mapping.device,
+        )
+        if not torch.equal(pages, page_starts[:, None] + expected_offsets[None, :]):
+            return "FlexKV slot mapping does not contain complete pages"
+        return None
 
     @staticmethod
     def _as_numpy_mask(mask) -> np.ndarray:
@@ -782,8 +1018,8 @@ class FlexKVConnector:
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
-            num_block=num_blocks // self.page_size,
-            tokens_per_block=self.page_size,
+            num_block=num_blocks // self.storage_page_size,
+            tokens_per_block=self.storage_page_size,
             num_head=num_kv_heads,
             head_size=head_size,
             is_mla=is_mla,
