@@ -203,19 +203,17 @@ class TestHiSparseUnit(unittest.TestCase):
         If logical_only=True, uses alloc_logical_only (PD-separated path).
         Returns kv_loc tensor."""
         device = self.allocator.device
-        alloc_fn = (
-            self.allocator.alloc_logical_only
-            if logical_only
-            else self.allocator.alloc_extend
-        )
-        kv_loc = alloc_fn(
-            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-            extend_num_tokens=fill_len,
-        )
+        if logical_only:
+            kv_loc = self.allocator.alloc_logical_only(need_size=fill_len)
+        else:
+            kv_loc = self.allocator.alloc_extend(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
+            )
         self.assertIsNotNone(kv_loc, "KV alloc failed")
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
         req.kv.kv_allocated_len = fill_len

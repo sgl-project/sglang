@@ -111,6 +111,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         is_id_owner: bool,
         page_size: int = 1,
+        virtual_page_count: Optional[int] = None,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
@@ -142,13 +143,18 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # reserved-sink invariant (min_page_index * entry_bytes_per_page >= entry_max).
         self.page_size = page_size
         self.num_pages = max_slots // page_size
+        self.num_virtual_pages: int = (
+            self.num_pages if virtual_page_count is None else virtual_page_count
+        )
+        assert self.num_virtual_pages > 0
+        self.num_virtual_ids = self.num_virtual_pages
         self.min_page_index = (self.min_slot_index + page_size - 1) // page_size
         self.entry_bytes_per_page = self.entry_bytes * page_size
 
         # v2p / p2v sized by PAGES. Page 0 is the padding anchor; trailing row is
         # the -1 sentinel.
         self.virtual_to_physical = torch.full(
-            (self.num_pages + 1,),
+            (self.num_virtual_pages + 1,),
             -1,
             dtype=torch.int64,
             device=device,
@@ -159,8 +165,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        # Back-compat alias (count of virtual PAGES) consulted by is_slot_allocated.
-        self.num_virtual_ids = self.num_pages
 
         self._peer: Optional[MultiEndedAllocator] = None
 
@@ -228,7 +232,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         logger.info(
             "[unified-memory-pool] MultiEndedAllocator(%r) ready: grow=%s, max_slots=%d, "
-            "min_slot_index=%d, page_size=%d, num_pages=%d, min_page_index=%d, "
+            "min_slot_index=%d, page_size=%d, num_pages=%d, "
+            "num_virtual_pages=%d, min_page_index=%d, "
             "entry_bytes=%d, entry_bytes_per_page=%d, is_id_owner=%s, "
             "initial_watermark_page=%d, allocatable_pages=%d",
             self.sub_pool_name,
@@ -237,6 +242,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.min_slot_index,
             self.page_size,
             self.num_pages,
+            self.num_virtual_pages,
             self.min_page_index,
             self.entry_bytes,
             self.entry_bytes_per_page,
@@ -272,7 +278,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if self.is_id_owner:
             self.free_virtual_ids = torch.arange(
                 self.min_page_index,
-                self.num_pages,
+                self.num_virtual_pages,
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -340,7 +346,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def is_slot_allocated(self, slot: int) -> bool:
         """Whether the PAGE containing this virtual id is in use."""
         virt_page = slot // self.page_size
-        if virt_page < 0 or virt_page >= self.num_pages:
+        if virt_page < 0 or virt_page >= self.num_virtual_pages:
             return False
         return int(self.virtual_to_physical[virt_page].item()) != -1
 
@@ -350,6 +356,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"is_id_owner={self.is_id_owner}, page_size={self.page_size}, "
             f"min_page_index={self.min_page_index}, "
             f"num_pages={self.num_pages}, "
+            f"num_virtual_pages={self.num_virtual_pages}, "
             f"watermark_physical={self.watermark_physical}, "
             f"allocated_pages={self._allocated_pages()}"
         )
@@ -2038,6 +2045,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             device=device,
             is_id_owner=False,  # non-owner; consumes virtuals minted by full
             page_size=page_size,
+            virtual_page_count=self.full_attn_allocator.num_virtual_pages,
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
@@ -2268,6 +2276,115 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
             return v_tokens
+
+    def alloc_extend_swa_tail(
+        self,
+        *,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+        swa_tail_end: int,
+    ) -> Optional[torch.Tensor]:
+        with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            assert self.page_size > 1
+            assert extend_num_tokens >= 0
+            assert extend_num_tokens % self.page_size == 0
+            assert 0 <= swa_tail_len <= swa_tail_end <= extend_num_tokens
+
+            win_start = swa_tail_end - swa_tail_len
+            assert win_start % self.page_size == 0
+            mapped_end = (
+                (swa_tail_end + self.page_size - 1) // self.page_size * self.page_size
+            )
+            assert win_start <= swa_tail_end <= mapped_end <= extend_num_tokens
+
+            full_page_count = extend_num_tokens // self.page_size
+            swa_page_count = (mapped_end - win_start) // self.page_size
+            full_allocator = self.full_attn_allocator
+            swa_allocator = self.swa_attn_allocator
+
+            if self.lazy_compaction:
+                full_allocator._flush(urgent=True)
+                swa_allocator._flush(urgent=True)
+
+            if full_page_count > len(full_allocator.free_virtual_ids):
+                return None
+            new_virtual_pages = full_allocator.free_virtual_ids[
+                :full_page_count
+            ].clone()
+            tail_page_start = win_start // self.page_size
+            tail_page_end = mapped_end // self.page_size
+            tail_virtual_pages = new_virtual_pages[tail_page_start:tail_page_end]
+            assert tail_virtual_pages.numel() == swa_page_count
+            torch._assert_async(
+                torch.all(swa_allocator.virtual_to_physical[new_virtual_pages] == -1),
+                "Fresh full virtual pages must be unbound in the SWA allocator",
+            )
+
+            if not self._has_asymmetric_swa_tail_capacity(
+                full_page_count=full_page_count,
+                swa_page_count=swa_page_count,
+            ):
+                return None
+
+            virtual_tokens = full_allocator.alloc(extend_num_tokens)
+            assert virtual_tokens is not None, (
+                "UnifiedSWA.alloc_extend_swa_tail: full allocation failed after "
+                "the asymmetric capacity preflight passed"
+            )
+            assert virtual_tokens.ndim == 1
+            assert virtual_tokens.is_contiguous()
+            assert virtual_tokens.dtype == torch.int64
+            assert virtual_tokens.device == full_allocator.virtual_to_physical.device
+            assert virtual_tokens.numel() == extend_num_tokens
+
+            if tail_virtual_pages.numel() > 0:
+                swa_allocator.alloc_with_virtual(tail_virtual_pages)
+            return virtual_tokens
+
+    def _has_asymmetric_swa_tail_capacity(
+        self,
+        *,
+        full_page_count: int,
+        swa_page_count: int,
+    ) -> bool:
+        full_allocator = self.full_attn_allocator
+        swa_allocator = self.swa_attn_allocator
+        full_hole_count = len(full_allocator._free_phys_pages)
+        swa_hole_count = len(swa_allocator._free_phys_pages)
+        full_extension_room = (
+            full_allocator.num_pages
+            - full_allocator.min_page_index
+            - full_allocator._allocated_pages()
+        )
+        swa_extension_room = (
+            swa_allocator.num_pages
+            - swa_allocator.min_page_index
+            - swa_allocator._allocated_pages()
+        )
+        if full_page_count > full_hole_count + full_extension_room:
+            return False
+        if swa_page_count > swa_hole_count + swa_extension_room:
+            return False
+
+        full_extension_count = max(0, full_page_count - full_hole_count)
+        swa_extension_count = max(0, swa_page_count - swa_hole_count)
+        if full_allocator.grow_direction == "up":
+            shared_gap_bytes = max(
+                0,
+                swa_allocator._byte_low_frontier()
+                - full_allocator._byte_high_frontier(),
+            )
+        else:
+            shared_gap_bytes = max(
+                0,
+                full_allocator._byte_low_frontier()
+                - swa_allocator._byte_high_frontier(),
+            )
+        required_gap_bytes = (
+            full_extension_count * full_allocator.entry_bytes_per_page
+            + swa_extension_count * swa_allocator.entry_bytes_per_page
+        )
+        return required_gap_bytes <= shared_gap_bytes
 
     def alloc_extend(
         self,

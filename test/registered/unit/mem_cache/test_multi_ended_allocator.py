@@ -1052,6 +1052,55 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         swa_alloc.bind_peer(full_alloc)
         return pool, full_alloc, swa_alloc, full_kv, swa_kv
 
+    def _build_unified_swa(
+        self,
+        *,
+        n_full_pages: int = 16,
+        n_swa_pages: int = 16,
+        full_layer_num: int = 2,
+        swa_layer_num: int = 2,
+        lazy_compaction: bool = False,
+    ) -> UnifiedSWATokenToKVPoolAllocator:
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=full_layer_num,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="up",
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa",
+            layer_num=swa_layer_num,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        total = (
+            n_full_pages * self.PAGE_SIZE * full_spec.entry_bytes()
+            + n_swa_pages * self.PAGE_SIZE * swa_spec.entry_bytes()
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeUnifiedSWAKVPool(pool)
+        allocator = UnifiedSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            full_max_total_num_tokens=n_full_pages * self.PAGE_SIZE,
+            swa_max_total_num_tokens=n_swa_pages * self.PAGE_SIZE,
+            page_size=self.PAGE_SIZE,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=lazy_compaction,
+        )
+        return allocator
+
     def _stamp_tokens(
         self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
     ):
@@ -1287,6 +1336,134 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         self.assertLessEqual(
             allocator.available_size(),
             min(fa.available_size(), sa.available_size()),
+        )
+
+    def test_paged_unified_swa_tail_binds_only_exact_tail_virtual_pages(self):
+        """Unified SWA binds the exact tail virtual pages including page padding."""
+        allocator = self._build_unified_swa()
+        page_size = self.PAGE_SIZE
+
+        virtual_tokens = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=3 * page_size,
+            swa_tail_len=page_size + 2,
+            swa_tail_end=2 * page_size + 2,
+        )
+
+        self.assertIsNotNone(virtual_tokens)
+        virtual_pages = virtual_tokens.view(3, page_size)[:, 0] // page_size
+        full_bindings = allocator.full_attn_allocator.virtual_to_physical[virtual_pages]
+        swa_bindings = allocator.swa_attn_allocator.virtual_to_physical[virtual_pages]
+        self.assertTrue(torch.all(full_bindings > 0))
+        self.assertEqual(int(swa_bindings[0].item()), -1)
+        self.assertTrue(torch.all(swa_bindings[1:] > 0))
+
+    def test_paged_unified_swa_tail_capacity_failure_does_not_consume_virtuals(self):
+        """Failed asymmetric preflight leaves request virtual ownership untouched."""
+        allocator = self._build_unified_swa(n_full_pages=8, n_swa_pages=1)
+        page_size = self.PAGE_SIZE
+        free_virtual_ids_before = allocator.full_attn_allocator.free_virtual_ids.clone()
+        full_allocated_before = allocator.full_attn_allocator.allocated_count()
+        swa_allocated_before = allocator.swa_attn_allocator.allocated_count()
+
+        result = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=8 * page_size,
+            swa_tail_len=8 * page_size,
+            swa_tail_end=8 * page_size,
+        )
+
+        self.assertIsNone(result)
+        self.assertTrue(
+            torch.equal(
+                allocator.full_attn_allocator.free_virtual_ids,
+                free_virtual_ids_before,
+            )
+        )
+        self.assertEqual(
+            allocator.full_attn_allocator.allocated_count(), full_allocated_before
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.allocated_count(), swa_allocated_before
+        )
+
+    def test_paged_unified_swa_tail_lazy_path_preserves_asymmetric_binding(self):
+        """Lazy preflight preserves full-only prefix and exact SWA tail bindings."""
+        allocator = self._build_unified_swa(lazy_compaction=True)
+        page_size = self.PAGE_SIZE
+
+        virtual_tokens = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=2 * page_size,
+            swa_tail_len=page_size,
+            swa_tail_end=2 * page_size,
+        )
+
+        self.assertIsNotNone(virtual_tokens)
+        virtual_pages = virtual_tokens.view(2, page_size)[:, 0] // page_size
+        swa_bindings = allocator.swa_attn_allocator.virtual_to_physical[virtual_pages]
+        self.assertEqual(int(swa_bindings[0].item()), -1)
+        self.assertGreater(int(swa_bindings[1].item()), 0)
+
+    def test_paged_unified_swa_unequal_domains_bind_late_tail_eager(self):
+        """Eager SWA binds a late full virtual page beyond its physical domain."""
+        self._assert_unified_swa_unequal_domains_bind_late_tail(lazy_compaction=False)
+
+    def test_paged_unified_swa_unequal_domains_bind_late_tail_lazy(self):
+        """Lazy SWA binds a late full virtual page beyond its physical domain."""
+        self._assert_unified_swa_unequal_domains_bind_late_tail(lazy_compaction=True)
+
+    def _assert_unified_swa_unequal_domains_bind_late_tail(
+        self, *, lazy_compaction: bool
+    ) -> None:
+        allocator = self._build_unified_swa(
+            n_full_pages=4,
+            n_swa_pages=2,
+            full_layer_num=1,
+            swa_layer_num=4,
+            lazy_compaction=lazy_compaction,
+        )
+        page_size = self.PAGE_SIZE
+        full_allocator = allocator.full_attn_allocator
+        swa_allocator = allocator.swa_attn_allocator
+
+        self.assertGreater(full_allocator.num_virtual_pages, swa_allocator.num_pages)
+        self.assertEqual(
+            swa_allocator.num_virtual_pages, full_allocator.num_virtual_pages
+        )
+        self.assertEqual(
+            swa_allocator.virtual_to_physical.numel(),
+            full_allocator.num_virtual_pages + 1,
+        )
+        self.assertEqual(
+            swa_allocator.physical_to_virtual.numel(), swa_allocator.num_pages + 1
+        )
+
+        full_only_tokens = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=3 * page_size,
+            swa_tail_len=0,
+            swa_tail_end=3 * page_size,
+        )
+        self.assertIsNotNone(full_only_tokens)
+        assert full_only_tokens is not None
+        full_only_pages = full_only_tokens.view(3, page_size)[:, 0] // page_size
+
+        tail_tokens = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=page_size,
+            swa_tail_len=page_size,
+            swa_tail_end=page_size,
+        )
+        self.assertIsNotNone(tail_tokens)
+        assert tail_tokens is not None
+        tail_virtual_page = tail_tokens[0] // page_size
+
+        self.assertTrue(
+            torch.all(swa_allocator.virtual_to_physical[full_only_pages] == -1)
+        )
+        self.assertGreaterEqual(int(tail_virtual_page.item()), swa_allocator.num_pages)
+        tail_physical_page = swa_allocator.virtual_to_physical[tail_virtual_page]
+        self.assertGreater(int(tail_physical_page.item()), 0)
+        self.assertLess(int(tail_physical_page.item()), swa_allocator.num_pages)
+        self.assertEqual(
+            int(swa_allocator.physical_to_virtual[tail_physical_page].item()),
+            int(tail_virtual_page.item()),
         )
 
     # 9. REGRESSION: alloc_extend must bind v2p / p2v on

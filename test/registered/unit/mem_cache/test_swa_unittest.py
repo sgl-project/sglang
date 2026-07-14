@@ -1,6 +1,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -270,6 +271,82 @@ class TestSWA(unittest.TestCase):
 
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
+
+    def test_swa_tail_direct_alloc_maps_padding_to_complete_swa_pages(self) -> None:
+        """Tail allocation maps the non-live padding through the page boundary."""
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=32,
+            kv_size_swa=32,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=12,
+            swa_tail_len=6,
+            swa_tail_end=10,
+        )
+
+        self.assertIsNotNone(full_indices)
+        mapping = allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)]
+        self.assertTrue(torch.all(mapping[:4] == 0))
+        self.assertTrue(torch.all(mapping[4:12] > 0))
+        self.assertTrue(torch.all(mapping[10:12] > 0))
+
+        allocator.free(full_indices)
+        self.assertEqual(allocator.full_available_size(), 32)
+        self.assertEqual(allocator.swa_available_size(), 32)
+
+    def test_swa_tail_second_child_failure_rolls_back_full_allocation(self) -> None:
+        """Tail allocation restores the full child if SWA allocation fails."""
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=32,
+            kv_size_swa=32,
+            sliding_window_size=page_size,
+        )
+        full_available_before = allocator.full_available_size()
+
+        with patch.object(allocator.swa_attn_allocator, "alloc", return_value=None):
+            result = allocator.alloc_extend_swa_tail(
+                extend_num_tokens=8,
+                swa_tail_len=4,
+                swa_tail_end=8,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(allocator.full_available_size(), full_available_before)
+        self.assertTrue(torch.all(allocator.full_to_swa_index_mapping[:-1] == 0))
+
+    def test_swa_zero_tail_allocates_only_full_pages(self) -> None:
+        """An empty SWA tail allocates full pages without publishing SWA mapping."""
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=32,
+            kv_size_swa=32,
+            sliding_window_size=page_size,
+        )
+        swa_available_before = allocator.swa_available_size()
+
+        full_indices = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=8,
+            swa_tail_len=0,
+            swa_tail_end=4,
+        )
+
+        self.assertIsNotNone(full_indices)
+        self.assertEqual(allocator.swa_available_size(), swa_available_before)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] == 0
+            )
+        )
 
     def test_swa_radix_cache_1(self):
         # args

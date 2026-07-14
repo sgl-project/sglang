@@ -42,8 +42,10 @@ Prefill GPU  ──RDMA──▶  Decode Host Pool (CPU pinned memory)
 
 For DeepSeek V4, the direct-to-host path writes only C4 KV into the decode host pool. The c4_indexer and C128 KV remain device-to-device transfers.
 
+Logical KV allocation follows the configured allocator page size. The request's allocated watermark can therefore include padding through the end of the final page, while host transfer and DMA still cover only the real token range. Direct-to-host admission allocates logical pages without publishing HiSparse device mappings; device-buffer ownership is established separately.
 
 For ordinary page-sized decode allocation, a newly allocated logical page initially owns a temporary HiSparse device page. The first remap happens before the forward writes the current KV. If the generic HiSparse buffer grows, the complete temporary page becomes the first part of the enlarged buffer and only the remaining net growth is allocated. If no growth is needed, or for DeepSeek V4 C4 storage, all temporary aliases are cleared before the complete temporary page is released. The forward then writes directly to the final owned buffer destination; the remap never copies an unwritten current value.
+
 The decode capacity gate accounts for the logical child and HiSparse device child independently. At a generic padded-buffer boundary, the device peak includes the main temporary page plus only the net extra buffer growth. DeepSeek V4 accounts for device ownership in C4 coordinates. Page-size-one and capability-disabled allocator paths retain their existing allocation behavior.
 
 ## Server Arguments
@@ -67,7 +69,7 @@ Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_t
 
 ## Deployment
 
-HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**. Do not enable `--disaggregation-decode-enable-offload-kvcache` on a HiSparse decode instance; the two decode-side KV ownership lifecycles are incompatible. HiSparse does not currently support any built-in or custom speculative decoding algorithm, and it is rejected at startup on NPU.
+HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**. Do not enable `--disaggregation-decode-enable-offload-kvcache` on a HiSparse decode instance; the two decode-side KV ownership lifecycles are incompatible. HiSparse does not currently support any built-in or custom speculative decoding algorithm, and it is rejected at startup on NPU. NPU disaggregated decode continues to use its real-length SWA-tail allocation path independently of HiSparse.
 
 ### Prefill Instance
 

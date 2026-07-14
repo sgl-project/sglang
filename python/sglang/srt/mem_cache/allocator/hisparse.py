@@ -343,28 +343,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
-    def alloc_logical_only(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
-        """Allocate only logical indices without hisparse device indices.
-
-        Used in the direct-to-host transfer path where KV data is written
-        directly to host memory by the prefill node, skipping GPU staging.
-        """
-        return self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
+    def alloc_logical_only(self, *, need_size: int):
+        assert need_size >= 0, f"{need_size=}"
+        assert need_size % self.page_size == 0, f"{need_size=}, {self.page_size=}"
+        return self.logical_attn_allocator.alloc(need_size)
 
     def collect_owned_hisparse_page_ids(
         self,
@@ -710,25 +692,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return logical_indices
 
-    def alloc_logical_only(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
-        """Allocate decode logical indices without allocating C4 hisparse device pages."""
-        return self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-
+    def alloc_logical_only(self, *, need_size: int):
+        assert need_size >= 0, f"{need_size=}"
+        assert need_size % self.page_size == 0, f"{need_size=}, {self.page_size=}"
+        return self.logical_attn_allocator.alloc(need_size)
 
     def collect_owned_hisparse_page_ids(
         self,

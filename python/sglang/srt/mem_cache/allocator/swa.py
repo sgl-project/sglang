@@ -256,78 +256,69 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_extend_swa_tail(
         self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
+        *,
         extend_num_tokens: int,
         swa_tail_len: int,
         swa_tail_end: int,
     ):
-        """Allocate full KV for the whole extend and SWA KV only for the tail.
-
-        This is used by disaggregated decode preallocation: decode receives full
-        prompt KV for full-attention layers, but only the sliding-window state is
-        transferred for SWA layers.
-        """
         assert self.page_size > 1
-        assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
-        assert len(prefix_lens_cpu) == 1
+        assert extend_num_tokens >= 0
+        assert extend_num_tokens % self.page_size == 0
         assert 0 <= swa_tail_len <= swa_tail_end <= extend_num_tokens
         win_start: int = swa_tail_end - swa_tail_len
         assert win_start % self.page_size == 0
-
-        num_full_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        mapped_end: int = (
+            (swa_tail_end + self.page_size - 1) // self.page_size * self.page_size
         )
-        num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
-        if not self.new_pages_available(num_full_pages, num_swa_pages):
+        assert win_start <= swa_tail_end <= mapped_end <= extend_num_tokens
+        swa_need_size: int = mapped_end - win_start
+        assert swa_need_size % self.page_size == 0
+
+        if extend_num_tokens > self.full_attn_allocator.available_size():
+            return None
+        if swa_need_size > self.swa_attn_allocator.available_size():
             return None
 
-        alloc_full_indices = self.full_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_full_pages,
-        )
-        assert alloc_full_indices is not None
+        alloc_full_indices = self.full_attn_allocator.alloc(extend_num_tokens)
+        if alloc_full_indices is None:
+            return None
+        assert alloc_full_indices.ndim == 1
+        assert alloc_full_indices.is_contiguous()
+        assert alloc_full_indices.dtype == torch.int64
+        assert alloc_full_indices.device == self.full_to_swa_index_mapping.device
+        assert alloc_full_indices.numel() == extend_num_tokens
 
-        if swa_tail_len == 0:
+        if swa_need_size == 0:
+            torch._assert_async(
+                torch.all(
+                    self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)]
+                    == 0
+                ),
+                "SWA tail-free allocation must not publish SWA mappings",
+            )
             return alloc_full_indices
 
-        device = self.device
-        swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
-        swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
-        swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
-
-        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
-            swa_prefix_lens,
-            swa_prefix_lens_cpu,
-            swa_seq_lens,
-            swa_seq_lens_cpu,
-            swa_last_loc,
-            swa_tail_len,
-            num_new_pages=num_swa_pages,
-        )
-        assert alloc_swa_indices is not None
+        alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+        if alloc_swa_indices is None:
+            self.full_attn_allocator.free(alloc_full_indices)
+            torch._assert_async(
+                torch.all(
+                    self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)]
+                    == 0
+                ),
+                "SWA mapping must remain unpublished after allocation rollback",
+            )
+            return None
+        assert alloc_swa_indices.ndim == 1
+        assert alloc_swa_indices.is_contiguous()
+        assert alloc_swa_indices.dtype == torch.int64
+        assert alloc_swa_indices.device == self.full_to_swa_index_mapping.device
+        assert alloc_swa_indices.numel() == swa_need_size
 
         self.set_full_to_swa_mapping(
-            alloc_full_indices[win_start:swa_tail_end], alloc_swa_indices
+            alloc_full_indices[win_start:mapped_end],
+            alloc_swa_indices,
         )
-        if win_start > 0:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[:win_start].to(torch.int64)
-            ] = 0
-        if swa_tail_end < extend_num_tokens:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[swa_tail_end:].to(torch.int64)
-            ] = 0
         return alloc_full_indices
 
     def alloc_decode(

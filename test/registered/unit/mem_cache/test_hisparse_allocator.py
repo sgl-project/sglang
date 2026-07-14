@@ -201,9 +201,21 @@ class TestHiSparseDirectAllocator(unittest.TestCase):
                 logical_indices,
             )
         )
-        self.assertTrue(
-            torch.all(allocator.full_to_hisparse_device_index_mapping == 0)
+        self.assertTrue(torch.all(allocator.full_to_hisparse_device_index_mapping == 0))
+
+    def test_logical_only_alloc_does_not_touch_device_child_or_mapping(self) -> None:
+        """Logical-only allocation consumes only the logical child."""
+        logical_indices = torch.arange(4, 8, dtype=torch.int64)
+        allocator = _make_generic_allocator(
+            logical_allocation=logical_indices,
+            device_allocation=torch.arange(8, 12, dtype=torch.int64),
         )
+
+        result = allocator.alloc_logical_only(need_size=4)
+
+        self.assertTrue(torch.equal(result, logical_indices))
+        self.assertEqual(allocator.hisparse_attn_allocator.alloc_sizes, [])
+        self.assertTrue(torch.all(allocator.full_to_hisparse_device_index_mapping == 0))
 
     def test_zero_direct_alloc_returns_empty_without_child_mutation(self) -> None:
         """Zero-sized direct allocation returns an empty int64 tensor."""
