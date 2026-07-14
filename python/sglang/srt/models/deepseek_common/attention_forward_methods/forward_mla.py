@@ -6,8 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    per_tensor_quant_mla_fp8,
+    per_token_group_quant_mla_deep_gemm_masked_fp8,
+)
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
@@ -19,13 +23,9 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
-    dcp_enabled,
-    get_attention_dcp_world_size,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    per_tensor_quant_mla_fp8,
-    per_token_group_quant_mla_deep_gemm_masked_fp8,
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -64,7 +64,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -175,7 +175,7 @@ def _should_defer_dsa_cp_kv_gather(
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_global_server_args().flashinfer_mla_disable_ragged
+            get_server_args().flashinfer_mla_disable_ragged
         )
 
     def should_run_indexer(
@@ -324,8 +324,12 @@ class DeepseekMLAForwardMixin:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=None,
                                 output_unquantized_inp1=True,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
+                            if _use_aiter_bpreshuffle_gfx95:
+                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
+                                    q_quanted
+                                )
                             q = q_quanted
                         else:
                             q, _, k_nope, _ = fused_rms_fp8_group_quant(
@@ -339,8 +343,10 @@ class DeepseekMLAForwardMixin:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=None,
                                 output_unquantized_inp1=False,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
+                            if _use_aiter_bpreshuffle_gfx95:
+                                q = materialize_bpreshuffle_fp8_scale_tuple(q)
 
                     elif _use_aiter:
                         q, k_nope = fused_qk_rmsnorm_bf16(
@@ -563,7 +569,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if dcp_enabled():
+        if get_parallel().dcp_enabled:
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
@@ -717,7 +723,10 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif forward_batch.forward_mode.is_decode() and dcp_enabled():
+                elif (
+                    forward_batch.forward_mode.is_decode()
+                    and get_parallel().dcp_enabled
+                ):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -791,13 +800,15 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and dcp_enabled():
+        if forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_attention_dcp_world_size(),
+                self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+            attn_output = cp_lse_ag_out_rs_mla(
+                attn_output, lse, get_parallel().dcp_group
+            )
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
@@ -884,8 +895,12 @@ class DeepseekMLAForwardMixin:
                         _bmm_buf,
                         group_size=128,
                         dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=False,
                     )
+                    if _use_aiter_bpreshuffle_gfx95:
+                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                            attn_bmm_output
+                        )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
@@ -897,8 +912,12 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                     group_size=128,
                     dtype_quant=torch.float8_e4m3fn,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                        attn_bmm_output
+                    )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
@@ -985,8 +1004,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().dsa_decode_backend == "trtllm"
-                or get_global_server_args().dsa_prefill_backend == "trtllm"
+                get_server_args().dsa_decode_backend == "trtllm"
+                or get_server_args().dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -1003,7 +1022,7 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
