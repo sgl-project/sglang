@@ -52,6 +52,10 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.2.
+</Warning>
+
 <Note>
   Speed numbers are measured with `--random-range-ratio 1.0` and `--flush-cache`; each benchmark card shows the SGLang version used. B200/GB300 FP8 spec cells measured on `main @ 09ca4fc` pin the EAGLE acceptance length via `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 2-1-3 = 2); other cells use their recorded setup.
 </Note>
