@@ -4,8 +4,8 @@ from fastapi import HTTPException
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
-    _raise_if_image_variant_not_found,
     _fallback_image_urls,
+    _raise_if_image_variant_not_found,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
 )
@@ -102,27 +102,17 @@ def test_select_image_variant_cloud_url_keeps_variant_alignment():
     }
 
     assert (
-        _select_image_variant_cloud_url(item, None)
-        == "https://cdn.example/first.png"
+        _select_image_variant_cloud_url(item, None) == "https://cdn.example/first.png"
     )
     assert _select_image_variant_cloud_url(item, "1") is None
-    assert (
-        _select_image_variant_cloud_url(item, "2")
-        == "https://cdn.example/third.png"
-    )
+    assert _select_image_variant_cloud_url(item, "2") == "https://cdn.example/third.png"
 
 
 def test_select_image_variant_cloud_url_falls_back_to_single_url():
     item = {"url": "https://cdn.example/only.png"}
 
-    assert (
-        _select_image_variant_cloud_url(item, None)
-        == "https://cdn.example/only.png"
-    )
-    assert (
-        _select_image_variant_cloud_url(item, "0")
-        == "https://cdn.example/only.png"
-    )
+    assert _select_image_variant_cloud_url(item, None) == "https://cdn.example/only.png"
+    assert _select_image_variant_cloud_url(item, "0") == "https://cdn.example/only.png"
     assert _select_image_variant_cloud_url(item, "1") is None
 
 

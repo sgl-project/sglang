@@ -105,8 +105,7 @@ def _fallback_image_urls(
     if num_outputs <= 1:
         return [f"/v1/images/{request_id}/content"]
     return [
-        f"/v1/images/{request_id}/content?variant={idx}"
-        for idx in range(num_outputs)
+        f"/v1/images/{request_id}/content?variant={idx}" for idx in range(num_outputs)
     ]
 
 
@@ -287,15 +286,11 @@ async def generations(
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
             preset=_get_extra_field(request, "preset"),
-            progressive_mode=_get_request_field_or_extra(
-                request, "progressive_mode"
-            ),
+            progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
             progressive_levels=_get_request_field_or_extra(
                 request, "progressive_levels"
             ),
-            progressive_delta=_get_request_field_or_extra(
-                request, "progressive_delta"
-            ),
+            progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
