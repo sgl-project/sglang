@@ -1619,7 +1619,10 @@ class ServerArgs:
     ] = False
     enable_flashinfer_pure_allreduce: A[
         bool,
-        "Route pure (non-fused) tensor-parallel all-reduce through FlashInfer kAllReduce when the flashinfer allreduce workspace is already initialized (requires --flashinfer-allreduce-fusion-backend). Falls back to NCCL for non-2D tensors or when the workspace is unavailable.",
+        Arg(
+            help="Route pure (non-fused) tensor-parallel all-reduce through FlashInfer kAllReduce when the flashinfer allreduce workspace is already initialized (requires --flashinfer-allreduce-fusion-backend). Falls back to NCCL for non-2D tensors or when the workspace is unavailable.",
+            resolvable=True,
+        ),
     ] = False
     pre_warm_nccl: A[
         bool,
