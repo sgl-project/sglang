@@ -620,33 +620,19 @@ class HiSparseCoordinator:
             torch.all(valid_owner_state),
             "HiSparse temporary owners must cover complete pages",
         )
-        if self.is_dsv4_hisparse:
-            owned_boundary_indices_cpu = (
-                torch.nonzero(has_temporary_owner, as_tuple=False)
-                .flatten()
-                .to("cpu")
-                .tolist()
-            )
-            if not owned_boundary_indices_cpu:
-                return
-
-            owned_boundary_indices = torch.tensor(
-                owned_boundary_indices_cpu,
-                dtype=torch.int64,
-                device=seq_lens.device,
-            )
-            boundary_batch_indices_cpu = [
-                boundary_batch_indices_cpu[index]
-                for index in owned_boundary_indices_cpu
-            ]
-            boundary_req_indices = boundary_req_indices[owned_boundary_indices]
-            semantic_positions = semantic_positions[owned_boundary_indices]
-            mapping_index_blocks = mapping_index_blocks[owned_boundary_indices]
-            buffer_positions = buffer_positions[owned_boundary_indices]
-            mapped_coordinates = mapped_coordinates[owned_boundary_indices]
-        temporary_page_ids = mapped_coordinates[:, 0] // page_size
-        temporary_blocks = temporary_page_ids[:, None] * page_size + offsets
-        sorted_page_ids = torch.sort(temporary_page_ids).values
+        absent_page_sentinels = -torch.arange(
+            1,
+            mapped_coordinates.shape[0] + 1,
+            dtype=torch.int64,
+            device=seq_lens.device,
+        )
+        temporary_owner_page_ids = torch.where(
+            has_temporary_owner,
+            candidate_page_ids,
+            absent_page_sentinels,
+        )
+        temporary_blocks = candidate_blocks
+        sorted_page_ids = torch.sort(temporary_owner_page_ids).values
         torch._assert_async(
             torch.all(sorted_page_ids[1:] != sorted_page_ids[:-1]),
             "HiSparse temporary pages must have unique request owners",
@@ -695,7 +681,7 @@ class HiSparseCoordinator:
             torch.all(
                 ~torch.isin(
                     existing_destinations[~growth_mask] // page_size,
-                    temporary_page_ids,
+                    temporary_owner_page_ids,
                 )
             ),
             "HiSparse release destinations must not alias temporary pages",
@@ -719,7 +705,7 @@ class HiSparseCoordinator:
                 "HiSparse net-extra allocation must contain complete pages",
             )
         else:
-            extra_indices = temporary_page_ids[:0]
+            extra_indices = temporary_owner_page_ids[:0]
 
         destinations = torch.where(
             growth_mask[:, None], temporary_blocks, existing_destinations
@@ -746,7 +732,7 @@ class HiSparseCoordinator:
 
         allocator.rehome_temporary_hisparse_pages(
             mapping_indices=mapping_index_blocks.reshape(-1),
-            retained_page_ids=temporary_page_ids[growth_mask],
+            retained_page_ids=temporary_owner_page_ids[growth_mask],
             install_retained_owner=install_growth_rows,
         )
         for growth in growths:
@@ -757,7 +743,11 @@ class HiSparseCoordinator:
             ].to(
                 torch.int32
             )
-        mapping[mapping_index_blocks] = destinations
+        mapping[mapping_index_blocks] = torch.where(
+            has_temporary_owner[:, None],
+            destinations,
+            mapped_coordinates,
+        )
 
     def _eager_backup_previous_token(
         self,
