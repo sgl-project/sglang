@@ -825,17 +825,12 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
     # 8. Watermark rollback on partial alloc failure.
     def test_swa_alloc_swa_failure_is_fail_loud(self):
-        """The SWA composite runs a tight JOINT pre-check before allocating, so
-        a swa-side ``alloc_with_virtual`` failure after the full-side alloc can
-        only mean an internal-state inconsistency. By design (``UnifiedSWA.alloc``:
-        "assert rather than silently rollback") that surfaces as a loud error,
-        NOT a silent ``None`` / rollback — masking it would hide the bug. The
-        real ``alloc_with_virtual`` self-asserts on shortfall, so the production
-        path is fail-loud too; here we force the failure to prove it propagates.
-        """
+        """A SWA-side failure is loud and rolls back the full-side allocation."""
         _, allocator, kvcache = self._build()
         sa = allocator.swa_attn_allocator
         original = sa.alloc_with_virtual
+        full_available = allocator.full_attn_allocator.available_size()
+        swa_available = allocator.swa_attn_allocator.available_size()
 
         def _bomb(virtual_ids):
             raise AssertionError("synthetic alloc_with_virtual failure")
@@ -846,6 +841,13 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                 allocator.alloc(3)
         finally:
             sa.alloc_with_virtual = original
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), swa_available
+        )
 
     # -- `out=` parameter regression tests for the SWA composite --
 
@@ -1162,6 +1164,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
     # 7. SWA composite joint byte-budget in page units.
     def test_paged_swa_joint_byte_budget(self):
+        """UnifiedSWA allocates aligned pages within its joint byte budget."""
         from sglang.srt.mem_cache.multi_ended_allocator import (
             UnifiedSWATokenToKVPoolAllocator,
         )
@@ -1227,6 +1230,18 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             allocator.available_size(),
             min(fa.available_size(), sa.available_size()),
         )
+
+        with self.assertRaises(AssertionError):
+            allocator.alloc(-self.PAGE_SIZE)
+        with self.assertRaises(AssertionError):
+            allocator.alloc(1)
+
+        virtual_tokens = allocator.alloc(2 * self.PAGE_SIZE)
+        self.assertIsNotNone(virtual_tokens)
+        virtual_pages = torch.unique(virtual_tokens // self.PAGE_SIZE)
+        self.assertEqual(virtual_pages.numel(), 2)
+        self.assertTrue(bool((fa.virtual_to_physical[virtual_pages] > 0).all()))
+        self.assertTrue(bool((sa.virtual_to_physical[virtual_pages] > 0).all()))
 
     # 9. REGRESSION: alloc_extend must bind v2p / p2v on
     # this allocator. Without binding, `virtual_to_physical[virt_page]`

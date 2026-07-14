@@ -2241,6 +2241,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedSWAAlloc.alloc"):
+            assert need_size >= 0, f"{need_size=}"
+            assert need_size % self.page_size == 0, (
+                f"{need_size=} must be a multiple of {self.page_size=}"
+            )
             # Joint pre-check. Both sides are mutual peers (each side's compaction
             # opens gap for the other), so flush BOTH on shortfall.
             if need_size > self.available_size():
@@ -2257,7 +2261,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 "UnifiedSWA.alloc: full.alloc returned None after joint "
                 "pre-check passed — internal-state inconsistency"
             )
-            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+            swa_allocated = False
+            try:
+                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+                swa_allocated = True
+            finally:
+                if not swa_allocated:
+                    fa.free(v_tokens)
+                    fa.clear_inverse_history()
             return v_tokens
 
     def alloc_extend(

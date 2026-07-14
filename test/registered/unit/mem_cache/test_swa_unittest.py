@@ -6,7 +6,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -139,6 +142,81 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_page_aligned_alloc_publishes_full_swa_mapping(self):
+        """Page allocation publishes every full-to-SWA token mapping."""
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        swa_allocations = []
+        original_alloc = allocator.swa_attn_allocator.alloc
+
+        def _record_swa_alloc(need_size: int) -> torch.Tensor | None:
+            result = original_alloc(need_size)
+            swa_allocations.append(result)
+            return result
+
+        allocator.swa_attn_allocator.alloc = _record_swa_alloc
+        try:
+            full_indices = allocator.alloc(8)
+        finally:
+            allocator.swa_attn_allocator.alloc = original_alloc
+
+        self.assertIsNotNone(full_indices)
+        self.assertEqual(full_indices.numel(), 8)
+        self.assertEqual(len(swa_allocations), 1)
+        self.assertIsNotNone(swa_allocations[0])
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_swa_index_mapping[full_indices],
+                swa_allocations[0],
+            )
+        )
+
+    def test_page_aligned_alloc_validates_size_before_mutation(self):
+        """Invalid or jointly unavailable allocations preserve both children."""
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        full_available = allocator.full_available_size()
+        swa_available = allocator.swa_available_size()
+
+        with self.assertRaises(AssertionError):
+            allocator.alloc(-4)
+        with self.assertRaises(AssertionError):
+            allocator.alloc(2)
+        self.assertIsNone(allocator.alloc(swa_available + 4))
+
+        self.assertEqual(allocator.full_available_size(), full_available)
+        self.assertEqual(allocator.swa_available_size(), swa_available)
+
+    def test_page_aligned_alloc_rolls_back_full_child_failure(self):
+        """A SWA-child failure releases the already allocated full pages."""
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        full_available = allocator.full_available_size()
+        swa_available = allocator.swa_available_size()
+        original_alloc = allocator.swa_attn_allocator.alloc
+
+        def _fail_swa_alloc(need_size: int) -> None:
+            return None
+
+        allocator.swa_attn_allocator.alloc = _fail_swa_alloc
+        try:
+            with self.assertRaises(AssertionError):
+                allocator.alloc(4)
+        finally:
+            allocator.swa_attn_allocator.alloc = original_alloc
+
+        self.assertEqual(allocator.full_available_size(), full_available)
+        self.assertEqual(allocator.swa_available_size(), swa_available)
+
+    def test_pure_swa_rejects_paged_construction(self):
+        """PureSWA remains restricted to the token-granular allocator."""
+        with self.assertRaises(AssertionError):
+            PureSWATokenToKVPoolAllocator(
+                size_swa=16,
+                page_size=4,
+                dtype=torch.float16,
+                device="cpu",
+                kvcache=object(),
+                need_sort=False,
+            )
 
     def test_swa_radix_cache_kv_events(self):
         tree, allocator, _ = _build_swa_tree(

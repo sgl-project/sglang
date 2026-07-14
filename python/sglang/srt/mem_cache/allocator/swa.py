@@ -149,15 +149,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
-        assert self.page_size == 1
+        assert need_size >= 0, f"{need_size=}"
+        assert need_size % self.page_size == 0, f"{need_size=}, {self.page_size=}"
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
             return None
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         assert alloc_full_indices is not None
+
+        alloc_swa_indices = None
+        try:
+            alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        finally:
+            if alloc_swa_indices is None:
+                self.full_attn_allocator.free(alloc_full_indices)
         assert alloc_swa_indices is not None
 
         self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
