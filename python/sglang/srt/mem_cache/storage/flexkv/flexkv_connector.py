@@ -1056,14 +1056,10 @@ class FlexKVConnector:
             raise RuntimeError(reason)
 
         return [
-            rid
-            for rid, state in self._inflight_stores.items()
-            if state.terminal_ready
+            rid for rid, state in self._inflight_stores.items() if state.terminal_ready
         ]
 
-    def prepare_store_finalization(
-        self, rids: List[str]
-    ) -> _StoreFinalizationPlan:
+    def prepare_store_finalization(self, rids: List[str]) -> _StoreFinalizationPlan:
         self.ensure_load_back_safe()
         local_valid = True
         plan = _StoreFinalizationPlan(
@@ -1312,14 +1308,10 @@ class FlexKVConnector:
         ):
             raise ValueError("FlexKV store transition version is invalid")
         remaining_task_ids = tuple(
-            self._normalize_task_ids_allow_empty(
-                new_state.get("remaining_task_ids")
-            )
+            self._normalize_task_ids_allow_empty(new_state.get("remaining_task_ids"))
         )
         successful_task_ids = tuple(
-            self._normalize_task_ids_allow_empty(
-                new_state.get("successful_task_ids")
-            )
+            self._normalize_task_ids_allow_empty(new_state.get("successful_task_ids"))
         )
         terminal_ready = new_state.get("terminal_ready")
         if not isinstance(terminal_ready, bool):
@@ -1341,15 +1333,11 @@ class FlexKVConnector:
         remaining_set = set(remaining_task_ids)
         successful_set = set(newly_successful)
         if remaining_task_ids != tuple(
-            task_id
-            for task_id in state.remaining_task_ids
-            if task_id in remaining_set
+            task_id for task_id in state.remaining_task_ids if task_id in remaining_set
         ):
             raise ValueError("FlexKV store remaining task order changed")
         if newly_successful != tuple(
-            task_id
-            for task_id in state.remaining_task_ids
-            if task_id in successful_set
+            task_id for task_id in state.remaining_task_ids if task_id in successful_set
         ):
             raise ValueError("FlexKV store successful task order changed")
         if terminal_ready != (not remaining_task_ids):
