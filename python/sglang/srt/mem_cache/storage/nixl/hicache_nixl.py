@@ -351,7 +351,7 @@ class HiCacheNixl(HiCacheStorage):
             self.is_zero_copy = False
             self._logical_anchor = True
             marker_numel = 4096 if self.needs_page_alignment else 1
-            pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
+            pin_memory = bool(mem_pool_host.pin_memory)
             self._bounce_page_bytes = marker_numel
             self._bounce_set = self._alloc_registered(
                 marker_numel, torch.uint8, pin_memory, "logical_anchor_set"
@@ -394,7 +394,7 @@ class HiCacheNixl(HiCacheStorage):
             page_numel = sample.numel()
             self._bounce_page_bytes = page_numel * sample.element_size()
             del sample
-            pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
+            pin_memory = bool(mem_pool_host.pin_memory)
             self._bounce_set = self._alloc_registered(
                 page_numel, mem_pool_host.dtype, pin_memory, "bounce_set"
             )
@@ -429,7 +429,7 @@ class HiCacheNixl(HiCacheStorage):
             page_bytes = page_numel * sample.element_size()
             del sample
 
-            pin_memory = bool(getattr(host_pool, "pin_memory", False))
+            pin_memory = bool(host_pool.pin_memory)
             bounce_set = self._alloc_registered(
                 page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_set"
             )
@@ -532,7 +532,7 @@ class HiCacheNixl(HiCacheStorage):
         host_pool = ctx.host_pool
         keys = transfer.keys or []
         host_indices = transfer.host_indices
-        page_size = getattr(host_pool, "page_size", 1) or 1
+        page_size = host_pool.page_size or 1
         expected = len(keys) * page_size
         if host_indices is None or host_indices.numel() != expected:
             logger.error(

@@ -461,7 +461,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
+            priority = req.priority or 0
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )

@@ -38,7 +38,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size
 
         full_kv_pool = getattr(kvcache, "full_kv_pool", None)
-        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+        swa_kv_pool = kvcache.swa_kv_pool
 
         if page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(

@@ -78,7 +78,7 @@ def free_swa_out_of_window_slots(
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
+    evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
@@ -113,7 +113,7 @@ def free_swa_out_of_window_slots(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    if req.skip_radix_cache_insert:
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
@@ -646,7 +646,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(
         req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        is_insert=is_insert and not req.skip_radix_cache_insert,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim

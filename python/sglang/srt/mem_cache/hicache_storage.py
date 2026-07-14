@@ -665,7 +665,7 @@ class HiCacheFile(HiCacheStorage):
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            page_size = host_pool.page_size or 1
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 
