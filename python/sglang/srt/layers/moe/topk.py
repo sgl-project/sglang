@@ -179,8 +179,9 @@ if _is_cuda:
 
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
-        # sgl-kernel-xpu ships pre-#28715 AOT topk kernels (4-arg topk_softmax,
-        # no tvm_ffi topk_sigmoid); use them directly instead of the CUDA wrapper.
+        # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
+        # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
+        # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
         from sgl_kernel import topk_sigmoid, topk_softmax
     else:
         from sglang.kernels.ops.moe import topk_softmax
