@@ -556,13 +556,13 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
-        self.needs_cpu_seq_lens = (
+        spec_alg = model_runner.spec_algorithm
+        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda
             or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
             or self.online_c128_mtp.enabled()
         )
 
-        spec_alg = model_runner.spec_algorithm
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -841,12 +841,14 @@ class DeepseekV4AttnBackend(
                 total_verify_tokens=total_verify_tokens,
             )
         else:
-            assert seq_lens_cpu is not None
+            seq_lens_cpu_list = (
+                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
+            )
             return self.init_forward_metadata_target_verify_old(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu.tolist(),
+                seq_lens_cpu=seq_lens_cpu_list,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
