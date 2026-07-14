@@ -963,8 +963,12 @@ def grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    scoring_func: str = "softmax",
 ):
     assert not apply_routed_scaling_factor_on_output
+    if scoring_func != "softmax":
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,
         gating_output,
