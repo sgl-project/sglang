@@ -37,4 +37,46 @@ export const benchmarks = [
     // MMLU-Pro pass@1 greedy (18.75% no-answer at the 32K cap); GSM8K 8-shot CoT.
     accuracy: { gpqa_pct: 84.91, aime25_pct: 92.50, mmlu_pro_pct: 69.41, gsm8k_pct: 92.34 },
   },
+  {
+    // MI300X ×2 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=2 ep=2 / low-latency.
+    // Measured on AMD Instinct MI300X (8×192 GB), sglang 0.5.13.post1,
+    // docker lmsysorg/sglang:v0.5.13.post1-rocm720-mi30x.
+    // Server flags: --attention-backend triton --mem-fraction-static 0.85
+    //   --kv-cache-dtype fp8_e4m3.
+    // Benchmark: sglang.bench_serving --dataset-name random --random-input-len 1000
+    //   --random-output-len 1000 --warmup-requests 64 --request-rate inf.
+    match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1, num_prompts: 64 },
+        ttft_ms: 210, tpot_ms: 14.94, tokens_per_sec_per_gpu: 33 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 16, num_prompts: 256 },
+        ttft_ms: 167, tpot_ms: 31.80, tokens_per_sec_per_gpu: 243 },
+    ],
+    // sgl-eval GSM8K, --no-thinking, --max-tokens 8192, tp=2 ep=2.
+    // 1319 examples, 94.31% correct, 7.43% truncated (hitting max_tokens), 0% errors.
+    accuracy: { gsm8k_pct: 94.31 },
+  },
+  {
+    // MI300X ×4 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=4 ep=4 / balanced.
+    match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 64, num_prompts: 512 },
+        ttft_ms: 419, tpot_ms: 42.48, tokens_per_sec_per_gpu: 351 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 256, num_prompts: 1024 },
+        ttft_ms: 337, tpot_ms: 71.72, tokens_per_sec_per_gpu: 809 },
+    ],
+  },
+  {
+    // MI300X ×8 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=8 ep=8 / high-throughput.
+    match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1024, num_prompts: 2048 },
+        ttft_ms: 3547, tpot_ms: 239.18, tokens_per_sec_per_gpu: 538 },
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 4096, num_prompts: 4096 },
+        ttft_ms: 18251, tpot_ms: 431.16, tokens_per_sec_per_gpu: 1043 },
+    ],
+  },
 ];

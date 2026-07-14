@@ -440,6 +440,7 @@ ns eval \\
     },
     {
       match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -455,6 +456,7 @@ ns eval \\
     },
     {
       match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -470,6 +472,7 @@ ns eval \\
     },
     {
       match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
