@@ -623,7 +623,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 
 ## References
 
-- `docs/developer_guide/development_jit_kernel_guide.md`
+- `docs_new/docs/developer_guide/development_jit_kernel_guide.mdx`
 - `test/run_suite.py` — suite names, discovery of `test/registered/`, execution entrypoint for CI
 - `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
 - `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`

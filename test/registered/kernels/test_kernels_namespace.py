@@ -45,6 +45,12 @@ EXPECTED_OPS = {
     "moe.moe_align_block_size": {"cuda_aot", "cuda_jit"},
     "moe.topk_softmax": {"cuda_aot"},
     "quantization.sgl_per_token_quant_fp8": {"cuda_aot"},
+    # migrated from srt/layers/quantization (Phase 2.5)
+    "quantization.w8a8_block_fp8_matmul": {"triton"},
+    "quantization.per_token_quant_int8": {"triton"},
+    "quantization.awq_dequantize_triton": {"triton"},
+    "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
+    "moe.pack_topk_ids": {"triton"},
     "quantization.sgl_per_token_group_quant_8bit": {"cuda_aot", "cuda_jit"},
     "quantization.sgl_per_token_group_quant_fp8": {"cuda_aot"},
     "quantization.sgl_per_token_group_quant_int8": {"cuda_aot"},
