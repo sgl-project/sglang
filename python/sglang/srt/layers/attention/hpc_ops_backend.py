@@ -74,6 +74,16 @@ class HPCOpsMetadata(msgspec.Struct):
     # Maximum query length among the batch (1 for decode).
     max_seq_len_q: int = 1
 
+    # --- FP8 pass-through fields ---
+    # Written by fused_qk_rope_store_kv_fp8() and consumed by the attention
+    # call of the same layer (the fused RoPE op runs right before attention,
+    # so the fields always hold the current layer's scales).
+    # Dynamic per-token-per-head Q scale.
+    # shape: extend [bs, num_q_heads, max_seq_len_q_pad128]; decode [tokens, num_q_heads]
+    hpc_q_scale: Optional[torch.Tensor] = None
+    # Split-K flag tensor for FP8 decode. shape: [bs, num_kv_heads], int32
+    hpc_split_k_flag: Optional[torch.Tensor] = None
+
 
 class HPCOpsAttnBackend(AttentionBackend):
     """HPC-Ops paged MHA attention backend (bf16 KV cache)."""
@@ -97,11 +107,15 @@ class HPCOpsAttnBackend(AttentionBackend):
                 f"The hpc_ops attention backend requires --page-size "
                 f"{_REQUIRED_PAGE_SIZE}, got {self.page_size}."
             )
-        if model_runner.kv_cache_dtype != torch.bfloat16:
+        if model_runner.kv_cache_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise ValueError(
-                "The hpc_ops attention backend only supports the bf16 KV cache "
-                f"for now, got {model_runner.kv_cache_dtype}."
+                "The hpc_ops attention backend only supports bf16 or fp8_e4m3 "
+                f"KV cache, got {model_runner.kv_cache_dtype}."
             )
+        # The FP8 path needs per-token-per-head Q scales that only the fused
+        # HPC-Ops QKNorm+RoPE+quant+StoreKV op produces, so it requires the
+        # model to call fused_qk_rope_store_kv_fp8() (wired for HunYuan V3).
+        self.use_fp8 = model_runner.kv_cache_dtype == torch.float8_e4m3fn
 
         config = model_runner.model_config
         head_dim = config.head_dim
@@ -125,6 +139,16 @@ class HPCOpsAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+        # Per-request query prefix sums [0, 1, ..., bs] for the FP8 fused RoPE
+        # op in decode mode; a static buffer so it is CUDA-graph friendly.
+        self._decode_qo_indptr = torch.arange(
+            model_runner.req_to_token_pool.size + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Fallback per-tensor KV scale for checkpoints without kv scales.
+        self._ones_scale = torch.ones(1, dtype=torch.float32, device=self.device)
 
         # CUDA graph state (allocated in init_cuda_graph_state).
         self.decode_cuda_graph_metadata = {}
@@ -243,6 +267,107 @@ class HPCOpsAttnBackend(AttentionBackend):
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
         return k_cache, v_cache
 
+    def _layer_kv_scales(self, layer: RadixAttention):
+        """Per-tensor K/V scales as fp32 [1] tensors (ones when absent)."""
+        k_scale = (
+            layer.k_scale.reshape(1).float()
+            if layer.k_scale is not None
+            else self._ones_scale
+        )
+        v_scale = (
+            layer.v_scale.reshape(1).float()
+            if layer.v_scale is not None
+            else self._ones_scale
+        )
+        return k_scale, v_scale
+
+    def fused_qk_rope_store_kv_fp8(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        qkv: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        q_norm_weight: Optional[torch.Tensor],
+        k_norm_weight: Optional[torch.Tensor],
+        qk_norm_policy: int,
+    ) -> torch.Tensor:
+        """Fused QKNorm + RoPE + FP8 quant + paged-KV write (FP8 mode only).
+
+        Called by the model layer instead of its own norm/rope/KV-write; the
+        dynamic per-token-per-head Q scale and the split-K flag are stashed in
+        the forward metadata and consumed by the attention call of the same
+        layer. Returns the FP8 query of shape [num_tokens, num_q_heads,
+        head_dim]. The subsequent ``self.attn(...)`` call must pass
+        ``save_kv_cache=False`` (K/V are already written here).
+
+        Note: the HPC-Ops RMSNorm hard-codes eps=1e-6; checkpoints with a
+        slightly different rms_norm_eps (e.g. HunYuan V3's 1e-5) accept this
+        approximation, matching the reference HPC-Ops integration.
+        """
+        import hpc
+
+        assert self.use_fp8, "fused_qk_rope_store_kv_fp8 requires fp8 KV cache"
+
+        metadata = self.forward_metadata
+        k_cache, v_cache = self._paged_kv_buffers(layer)
+        k_scale, v_scale = self._layer_kv_scales(layer)
+        is_extend = not forward_batch.forward_mode.is_decode_or_idle()
+
+        num_tokens = qkv.shape[0]
+        if is_extend:
+            q_index = metadata.cu_seqlens_q
+            max_seqlens = metadata.max_seq_len_q
+        else:
+            q_index = self._decode_qo_indptr[: forward_batch.batch_size + 1]
+            max_seqlens = 1
+
+        out_q = torch.empty(
+            (num_tokens, layer.tp_q_head_num, layer.head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=qkv.device,
+        )
+        # QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR: dynamic per-token-per-head
+        # Q quant, static per-tensor K/V quant.
+        quant_policy = hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR.value
+        _, q_scale, split_k_flag = hpc.rope_norm_store_kv_fp8(
+            key_cache=k_cache,
+            value_cache=v_cache,
+            qkv=qkv,
+            cos_sin=cos_sin_cache,
+            num_seqlen_per_req=metadata.cache_seqlens_int32,
+            q_index=q_index,
+            kvcache_indices=metadata.page_table,
+            is_prefill=is_extend,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            quant_policy=quant_policy,
+            max_seqlens=max_seqlens,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            out_q=out_q,
+            qk_norm_policy=qk_norm_policy,
+        )
+        metadata.hpc_q_scale = q_scale
+        metadata.hpc_split_k_flag = split_k_flag
+        return out_q
+
+    def _take_fp8_scales(self, metadata: HPCOpsMetadata):
+        """Pop the per-layer FP8 scales written by the fused RoPE op."""
+        q_scale = metadata.hpc_q_scale
+        split_k_flag = metadata.hpc_split_k_flag
+        if q_scale is None:
+            raise RuntimeError(
+                "The hpc_ops attention backend with an fp8_e4m3 KV cache "
+                "requires the model to run the fused HPC-Ops "
+                "QKNorm+RoPE+quant+StoreKV op (fused_qk_rope_store_kv_fp8), "
+                "which produces the per-token-per-head Q scales. This is "
+                "currently wired for HunYuan V3 only; use "
+                "--kv-cache-dtype bfloat16 for other models."
+            )
+        metadata.hpc_q_scale = None
+        metadata.hpc_split_k_flag = None
+        return q_scale, split_k_flag
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -270,15 +395,31 @@ class HPCOpsAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         k_cache, v_cache = self._paged_kv_buffers(layer)
 
-        o = hpc.attention_with_kvcache_prefill_bf16(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
-            k_cache,
-            v_cache,
-            metadata.cu_seqlens_q,
-            metadata.page_table,
-            metadata.cache_seqlens_int32,
-            metadata.max_seq_len_q,
-        )
+        if self.use_fp8:
+            q_scale, _ = self._take_fp8_scales(metadata)
+            k_scale, v_scale = self._layer_kv_scales(layer)
+            o = hpc.attention_with_kvcache_prefill_fp8(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_cache,
+                q_scale,
+                k_scale,
+                v_scale,
+                metadata.cu_seqlens_q,
+                metadata.page_table,
+                metadata.cache_seqlens_int32,
+                metadata.max_seq_len_q,
+            )
+        else:
+            o = hpc.attention_with_kvcache_prefill_bf16(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_cache,
+                metadata.cu_seqlens_q,
+                metadata.page_table,
+                metadata.cache_seqlens_int32,
+                metadata.max_seq_len_q,
+            )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
@@ -308,14 +449,32 @@ class HPCOpsAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         k_cache, v_cache = self._paged_kv_buffers(layer)
 
-        o = hpc.attention_decode_bf16(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
-            k_cache,
-            v_cache,
-            metadata.page_table,
-            metadata.cache_seqlens_int32,
-            mtp=0,
-            new_kv_included=True,
-            splitk=True,
-        )
+        if self.use_fp8:
+            q_scale, split_k_flag = self._take_fp8_scales(metadata)
+            k_scale, v_scale = self._layer_kv_scales(layer)
+            o = hpc.attention_decode_fp8(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_cache,
+                metadata.page_table,
+                metadata.cache_seqlens_int32,
+                q_scale,
+                k_scale,
+                v_scale,
+                mtp=0,
+                new_kv_included=True,
+                splitk=True,
+                split_flag=split_k_flag,
+            )
+        else:
+            o = hpc.attention_decode_bf16(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_cache,
+                metadata.page_table,
+                metadata.cache_seqlens_int32,
+                mtp=0,
+                new_kv_included=True,
+                splitk=True,
+            )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
