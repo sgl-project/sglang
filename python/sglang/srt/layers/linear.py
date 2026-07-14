@@ -25,9 +25,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -38,8 +38,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -589,7 +588,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv/mlp).
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -732,8 +731,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         """
         Handle special case for models where MLP layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -833,12 +832,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(
-                    loaded_weight=loaded_weight,
-                    shard_id=0,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                )
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint "
+                        "merged-column checkpoint load, got shape "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                if loaded_shard_id is None:
+                    # The checkpoint tensor is already fused-in-checkpoint, so a
+                    # scalar scale applies to the entire merged matrix. Fill
+                    # every logical slot so later reductions only see valid
+                    # scale values.
+                    shard_ids = range(param.data.shape[0])
+                else:
+                    shard_ids = loaded_shard_id
+
+                for shard_id in shard_ids:
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight,
+                        shard_id=shard_id,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
+                    )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
                 self._load_merged_block_scale(param, loaded_weight)
@@ -1008,8 +1023,8 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         """
         Handle special case for models where QKV layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -1085,7 +1100,19 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
-                param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
+                # The checkpoint tensor is already fused-in-checkpoint, so a scalar
+                # scale applies to the entire QKV matrix. Fill every logical
+                # slot so later reductions only see valid scale values.
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint QKV "
+                        "checkpoint load when loaded_shard_id is None, got "
+                        f"shape {tuple(loaded_weight.shape)}"
+                    )
+                for shard_id in param.qkv_idxs:
+                    param.load_qkv_weight(
+                        loaded_weight=loaded_weight, shard_id=shard_id
+                    )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight)
@@ -1157,7 +1184,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv/mlp).
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -1531,7 +1558,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if self.use_dp_attention_reduce:
-            symm_ctx = use_symmetric_memory(get_attention_tp_group())
+            symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1539,14 +1566,22 @@ class RowParallelLinear(LinearBase):
         with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+        # skip_all_reduce: explicit call-site override. Also honor
+        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
+        # the decoder — callers should not thread those flags into modules.
+        if (
+            self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
+        ):
             if self.use_dp_attention_reduce:
-                output = get_attention_tp_group().all_reduce(output_parallel)
+                output = get_parallel().attn_tp_group.all_reduce(output_parallel)
             else:
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_global_server_args().enable_quant_communications
+                        and get_server_args().enable_quant_communications
                     )
                     if forward_batch is not None
                     else False
