@@ -284,6 +284,13 @@ jobs:
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # mimo_v2_flash performance tests
+          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
           - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms
             prefill_size: 1
             decode_size: 1
