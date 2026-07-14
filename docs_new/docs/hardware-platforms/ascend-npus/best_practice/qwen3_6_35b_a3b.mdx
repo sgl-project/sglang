@@ -23,7 +23,6 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
@@ -327,107 +326,6 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### Qwen3.6-35B-A3B 1P IN128K OUT1K PREFIX90 50ms
-
-**Model**: Qwen3.6-35B-A3B
-
-**Hardware**: Atlas 800I A3
-
-**Cards**: 1
-
-**Deploy Mode**: PD Mixed
-
-**Quantization**: BF16
-
-**Dataset**: 128k+1k (90% prefix cache hit rate)
-
-**TPOT**: 50ms
-
-#### Model Deployment
-
-```bash Command
-# ============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
-# ============================================================
-
-MODEL_PATH=/path/to/model-weights
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
-export SGLANG_SET_CPU_AFFINITY=1
-export STREAMS_PER_DEVICE=32
-
-python3 -m sglang.launch_server \
-    --model-path $MODEL_PATH \
-    --host 127.0.0.1 --port 6688 \
-    --tp-size 2 \
-    --nnodes 1 \
-    --attention-backend ascend \
-    --device npu \
-    --chunked-prefill-size 16384 \
-    --max-prefill-tokens 65536 \
-    --trust-remote-code \
-    --enable-prefill-delayer \
-    --mamba-scheduler-strategy extra_buffer \
-    --max-running-requests 103 \
-    --max-mamba-cache-size 85 \
-    --mem-fraction-static 0.85 \
-    --cuda-graph-bs 2 4 8 16 32 48 64 80 96 103 \
-    --enable-multimodal \
-    --mm-attention-backend ascend_attn \
-    --dtype bfloat16 \
-    --mamba-ssm-dtype bfloat16 \
-    --speculative-algorithm NEXTN \
-    --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4 \
-    --reasoning-parser qwen3 \
-    --tool-call-parser qwen3_coder
-```
-
-#### Benchmark
-
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 57600` = `int(64000 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
-`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
-
-```bash Command
-python -m sglang.bench_serving \
-    --dataset-name generated-shared-prefix \
-    --backend sglang \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --gsp-num-groups 1 \
-    --gsp-prompts-per-group 412 \
-    --gsp-system-prompt-len 57600 \
-    --gsp-question-len 6399 \
-    --gsp-output-len 1000 \
-    --max-concurrency 103 \
-    --num-prompts 412 \
-    --request-rate inf
-```
 
 ### Qwen3.6-35B-A3B 1P IN254K OUT1K
 
