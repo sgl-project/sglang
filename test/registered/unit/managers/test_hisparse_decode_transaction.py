@@ -61,7 +61,6 @@ def _make_coordinator(
     coordinator.req_device_buffer_token_locs = torch.zeros(
         (1, rows.shape[0], rows.shape[1]), dtype=torch.int32
     )
-    coordinator._eager_backup_previous_token = lambda *args: None
     return coordinator, child_allocator
 
 
@@ -79,7 +78,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         )
         mapping_before = mapping.clone()
 
-        coordinator.map_last_loc_to_buffer(
+        coordinator._rehome_page_boundary_owners(
             seq_lens=torch.tensor([2], dtype=torch.int64),
             out_cache_loc=torch.tensor([9], dtype=torch.int64),
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
@@ -106,7 +105,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
             extra_allocation=torch.arange(24, 28, dtype=torch.int64),
         )
 
-        coordinator.map_last_loc_to_buffer(
+        coordinator._rehome_page_boundary_owners(
             seq_lens=torch.tensor([5, 5], dtype=torch.int64),
             out_cache_loc=torch.tensor([12, 16], dtype=torch.int64),
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
@@ -148,7 +147,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         rows_before = rows.clone()
 
         with self.assertRaisesRegex(RuntimeError, "net allocation failed"):
-            coordinator.map_last_loc_to_buffer(
+            coordinator._rehome_page_boundary_owners(
                 seq_lens=torch.tensor([5], dtype=torch.int64),
                 out_cache_loc=torch.tensor([12], dtype=torch.int64),
                 req_pool_indices=torch.tensor([0], dtype=torch.int64),

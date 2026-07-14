@@ -485,15 +485,6 @@ class HiSparseCoordinator:
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
 
-        if self.token_to_kv_pool_allocator.page_size > 1:
-            self._rehome_page_boundary_owners(
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                req_pool_indices=req_pool_indices,
-                seq_lens_cpu=seq_lens_cpu,
-                req_pool_indices_cpu=req_pool_indices_cpu,
-            )
-
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
