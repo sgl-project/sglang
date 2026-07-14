@@ -112,6 +112,11 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def backend_supports_multimodal_prefill_cuda_graph(backend: str) -> bool:
+    """Whether a prefill backend can replay the decoder after eager ViT."""
+    return backend == Backend.TC_PIECEWISE
+
+
 def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
     numbered suggestion list. The runner is only constructed for BREAKABLE
@@ -608,16 +613,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
-        if forward_batch.input_embeds is not None:
-            return False
         if forward_batch.replace_embeds is not None:
             return False
-        # The captured graph embeds from input_ids only; multimodal batches
-        # merge mm embeddings in the outer wrapper, which capture bypasses.
-        if forward_batch.mm_inputs is not None and any(
-            x is not None for x in forward_batch.mm_inputs
+        if not backend_supports_multimodal_prefill_cuda_graph(
+            self.prefill_backend_name
         ):
-            return False
+            if forward_batch.input_embeds is not None:
+                return False
+            # Breakable and full capture their layer body directly, so they
+            # cannot run the outer wrapper that combines vision embeddings.
+            if forward_batch.mm_inputs is not None and any(
+                x is not None for x in forward_batch.mm_inputs
+            ):
+                return False
+        # tc_piecewise compiles the language-model inner stack.  Its outer
+        # multimodal wrapper remains eager, runs the ViT, and copies the
+        # composed embeddings into the stable input_embeds slot before the
+        # compiled decoder replay.  Do not reject image prefill on that path.
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
             return False
