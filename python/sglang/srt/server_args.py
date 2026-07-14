@@ -2025,6 +2025,13 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    mamba_max_states_per_path: A[
+        int,
+        "Maximum number of cached Mamba states retained per root-to-tail path "
+        "(0 disables the cap). After each insert, the shallowest eligible "
+        "interior states beyond the cap are removed while their full KV remains. "
+        "Tail, fork, and locked nodes are preserved.",
+    ] = 0
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
