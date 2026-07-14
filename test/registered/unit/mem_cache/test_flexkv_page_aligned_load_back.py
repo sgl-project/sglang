@@ -473,6 +473,95 @@ class TestFlexKVPageAlignedLoadBack(unittest.TestCase):
             cache.inc_lock_ref.assert_not_called()
             cache.dec_lock_ref.assert_not_called()
 
+    def test_cache_finished_preowner_exception_releases_canonical_node(self) -> None:
+        """A pre-owner connector exception releases the canonical source lock."""
+        with _import_flexkv_modules() as (_, radix_module):
+            cache, connector = _make_store_cache(radix_module)
+            connector.store_kv.side_effect = RuntimeError("pre-owner failure")
+            node = object()
+            canonical_indices = torch.tensor([500, 501])
+            req = SimpleNamespace(
+                rid="request",
+                origin_input_ids=[0, 1],
+                output_ids=[],
+                extra_key=None,
+            )
+
+            with (
+                patch.object(
+                    radix_module.RadixCache,
+                    "cache_finished_req",
+                    return_value=radix_module.CacheFinishedReqResult(
+                        unhandled_kv_start=2
+                    ),
+                ),
+                patch.object(
+                    radix_module.RadixCache,
+                    "match_prefix",
+                    return_value=SimpleNamespace(
+                        device_indices=canonical_indices,
+                        last_device_node=node,
+                    ),
+                ),
+                patch.object(torch.cuda, "stream", return_value=MagicMock()),
+                self.assertRaisesRegex(RuntimeError, "pre-owner failure"),
+            ):
+                cache.cache_finished_req(
+                    req,
+                    is_insert=True,
+                    kv_len_to_handle=2,
+                )
+
+            cache.inc_lock_ref.assert_called_once_with(node)
+            cache.dec_lock_ref.assert_called_once_with(node)
+            self.assertNotIn("request", cache._inflight_store_nodes)
+
+    def test_cache_finished_installed_owner_exception_retains_canonical_node(
+        self,
+    ) -> None:
+        """An installed owner keeps the canonical source lock for finalization."""
+        with _import_flexkv_modules() as (_, radix_module):
+            cache, connector = _make_store_cache(radix_module)
+            connector.store_kv.side_effect = RuntimeError("post-owner failure")
+            connector.store_requires_owner_lock.return_value = True
+            node = object()
+            canonical_indices = torch.tensor([600, 601])
+            req = SimpleNamespace(
+                rid="request",
+                origin_input_ids=[0, 1],
+                output_ids=[],
+                extra_key=None,
+            )
+
+            with (
+                patch.object(
+                    radix_module.RadixCache,
+                    "cache_finished_req",
+                    return_value=radix_module.CacheFinishedReqResult(
+                        unhandled_kv_start=2
+                    ),
+                ),
+                patch.object(
+                    radix_module.RadixCache,
+                    "match_prefix",
+                    return_value=SimpleNamespace(
+                        device_indices=canonical_indices,
+                        last_device_node=node,
+                    ),
+                ),
+                patch.object(torch.cuda, "stream", return_value=MagicMock()),
+                self.assertRaisesRegex(RuntimeError, "post-owner failure"),
+            ):
+                cache.cache_finished_req(
+                    req,
+                    is_insert=True,
+                    kv_len_to_handle=2,
+                )
+
+            cache.inc_lock_ref.assert_called_once_with(node)
+            cache.dec_lock_ref.assert_not_called()
+            self.assertIs(cache._inflight_store_nodes["request"], node)
+
     def test_postattempt_store_failure_retains_owner_and_blocks_reset(self) -> None:
         """An attempted store launch poisons ownership instead of clearing it."""
         with _import_flexkv_modules() as (module, _):
