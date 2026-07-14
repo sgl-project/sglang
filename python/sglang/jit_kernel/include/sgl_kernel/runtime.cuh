@@ -79,7 +79,7 @@ inline auto get_cc_minor(int device_id) -> int {
 }
 
 // Return the SM version (major * 10 + minor) for the given device
-inline auto getSMVersion(int device_id) -> int {
+inline auto get_sm_version(int device_id) -> int {
   return get_cc_major(device_id) * 10 + get_cc_minor(device_id);
 }
 
