@@ -493,8 +493,7 @@ class FlexKVRadixCache(RadixCache):
         try:
             local_shortage = max(
                 0,
-                required_slots
-                - self.token_to_kv_pool_allocator.available_size(),
+                required_slots - self.token_to_kv_pool_allocator.available_size(),
             )
         except Exception as exc:  # noqa: BLE001
             local_shortage = required_slots

@@ -577,9 +577,7 @@ class FlexKVConnector:
                 raise RuntimeError(
                     "FlexKV layerwise drain completed unexpected task ids"
                 )
-            if outcome["reason"] is not None and not isinstance(
-                outcome["reason"], str
-            ):
+            if outcome["reason"] is not None and not isinstance(outcome["reason"], str):
                 raise RuntimeError("FlexKV layerwise drain returned an invalid reason")
         except Exception:  # noqa: BLE001
             local_valid = False
