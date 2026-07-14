@@ -30,6 +30,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.nvfp4_k_cache import NVFP4_BYTES_PER_TOKEN
+from sglang.srt.layers.attention.dsv4.nvfp4_k_cache import (
+    DSV4_NVFP4_BYTES_PER_TOKEN,
+)
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -536,6 +539,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         cfg = mr.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
+        self.kv_cache_dtype = mr.kv_cache_dtype
         self.indexer_head_dim = cfg.index_head_dim
         self.context_len = mr.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
@@ -621,7 +625,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes = (
+            DSV4_NVFP4_BYTES_PER_TOKEN
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            else self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        )
 
         quant_block_size = 128
         indexer_bytes = (

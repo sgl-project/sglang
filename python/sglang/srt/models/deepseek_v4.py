@@ -647,6 +647,24 @@ class MQALayer(MqaAttentionBase):
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        if token_to_kv_pool.dsv4_kv_cache_store_nvfp4:
+            # The production fused store emits the legacy FP8+UE8M0 layout.
+            # Keep normalization/RoPE fused, then let the pool scatter-quantize
+            # the resulting BF16 keys into its NVFP4 layout.
+            kv = kv.contiguous()
+            fused_norm_rope_inplace(
+                kv,
+                self.kv_norm.weight.data,
+                self.eps,
+                self.freqs_cis,
+                positions,
+            )
+            token_to_kv_pool.set_swa_key_buffer_radix_fused(
+                layer_id=self.layer_id,
+                swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+                cache_k=kv,
+            )
+            return
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),

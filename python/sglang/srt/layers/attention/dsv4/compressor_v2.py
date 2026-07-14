@@ -472,6 +472,84 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
         )
 
+    def _forward_nvfp4(
+        self,
+        *,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        kv_score_input: torch.Tensor,
+        state_pool,
+        compressor: Compressor,
+        layer_id: int,
+    ) -> None:
+        """Compress to BF16, apply norm/RoPE, then scatter into NVFP4 KV.
+
+        ``compress_norm_rope_store`` only knows the legacy V4 FP8 cache
+        layout. This path deliberately keeps the existing compressor and RoPE
+        math and replaces only the final storage conversion.
+        """
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_inplace_triton,
+        )
+
+        compress_ratio = compressor.ratio
+        head_dim = compressor.head_dim
+        plan = self._get_paged_compress_metadata(compress_ratio)
+        out_loc = self._get_out_loc(compress_ratio)
+
+        is_online = _use_online_compress(compress_ratio)
+        kv_score_buffer = state_pool.kv_score_buffer.kv_score
+        if is_online:
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+        else:
+            coff = 2 if is_overlap_compress(compress_ratio) else 1
+            last_dim = 2 * head_dim * coff
+            assert kv_score_buffer.shape[-1] == last_dim
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape.view(-1, head_dim),
+            plan=plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            is_online=is_online,
+        )
+        if kv_compressed.shape[0] == 0:
+            return
+
+        # Decode plans reserve location 0 for non-boundary tokens. Match the
+        # existing fallback by zeroing those values before the harmless write.
+        if plan.is_decode:
+            plan_raw = plan[1].view(torch.int32)
+            seq_lens_plan = plan_raw[:, 0].to(torch.int32)
+            is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
+            kv_compressed = torch.where(
+                is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
+            )
+
+        positions = _extract_positions_from_plan(plan, compress_ratio).clamp(min=0)
+        fused_norm_rope_inplace_triton(
+            kv_compressed,
+            compressor.norm.weight,
+            compressor.norm.variance_epsilon,
+            compressor.freqs_cis,
+            positions=positions,
+        )
+
+        if plan.is_decode:
+            out_loc_to_store = out_loc
+        else:
+            plan_raw = plan[1].view(torch.int32)
+            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+            out_loc_to_store = out_loc[ragged_ids.long()]
+
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc_to_store,
+            cache_k=kv_compressed,
+        )
+
     def forward_unified(
         self,
         x: torch.Tensor,
@@ -487,6 +565,16 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
+        if token_to_kv_pool.dsv4_kv_cache_store_nvfp4 and not compressor.is_in_indexer:
+            self._forward_nvfp4(
+                token_to_kv_pool=token_to_kv_pool,
+                kv_score_input=kv_score_input,
+                state_pool=state_pool,
+                compressor=compressor,
+                layer_id=layer_id,
+            )
+            return
+
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )

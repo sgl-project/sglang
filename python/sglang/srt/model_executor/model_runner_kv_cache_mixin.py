@@ -359,6 +359,53 @@ class ModelRunnerKVCacheMixin:
             self.num_effective_layers,
         )
 
+    def _load_dsv4_nvfp4_global_scales(self: ModelRunner) -> None:
+        """Copy checkpoint attention scales into every V4 NVFP4 sub-pool."""
+        pool = self.token_to_kv_pool
+        if not getattr(pool, "dsv4_kv_cache_store_nvfp4", False):
+            return
+
+        from sglang.srt.model_executor.model_runner import resolve_language_model
+
+        language_model = resolve_language_model(self.model)
+        layers = getattr(language_model, "layers", None)
+        if layers is None:
+            decoder = getattr(language_model, "decoder", None)
+            layers = [] if decoder is None else [decoder]
+
+        initialized_layer_ids = set()
+        for model_layer in layers:
+            attention = None
+            if hasattr(model_layer, "self_attn"):
+                self_attn = model_layer.self_attn
+                if hasattr(self_attn, "attn"):
+                    attention = self_attn.attn
+                elif hasattr(self_attn, "attn_mqa"):
+                    attention = self_attn.attn_mqa
+            elif hasattr(model_layer, "attn"):
+                attention = model_layer.attn
+            elif hasattr(model_layer, "attention") and hasattr(
+                model_layer.attention, "attn"
+            ):
+                attention = model_layer.attention.attn
+
+            if attention is None or not hasattr(attention, "layer_id"):
+                continue
+            layer_id = attention.layer_id
+            if not self.start_layer <= layer_id < self.end_layer:
+                continue
+            scale = getattr(attention, "k_scale_float", None)
+            if scale is None:
+                scale = getattr(attention, "k_scale", None)
+            pool.set_nvfp4_global_scale(layer_id, 1.0 if scale is None else scale)
+            initialized_layer_ids.add(layer_id)
+
+        logger.info(
+            "Initialized DeepSeek V4 NVFP4 global scales for %d/%d local layers.",
+            len(initialized_layer_ids),
+            self.num_effective_layers,
+        )
+
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
             return 1
@@ -872,6 +919,7 @@ class ModelRunnerKVCacheMixin:
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
             )
+            self._load_dsv4_nvfp4_global_scales()
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()

@@ -1235,7 +1235,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         def _view(arch="DeepseekV4ForCausalLM", **kw):
             hf = SimpleNamespace(architectures=[arch])
-            defaults = dict(kv_cache_dtype="auto", device="cuda")
+            defaults = dict(
+                kv_cache_dtype="auto", device="cuda", fp4_kv_cache_recipe="mxfp4"
+            )
             defaults.update(kw)
             return ResolvedView(
                 SimpleNamespace(
@@ -1255,6 +1257,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16")), {}
         )
+        self.assertEqual(
+            _deepseek_v4_kv_cache_dtype(
+                _view(kv_cache_dtype="fp4_e2m1", fp4_kv_cache_recipe="nvfp4")
+            ),
+            {},
+        )
+        with self.assertRaisesRegex(ValueError, "requires.*nvfp4"):
+            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp4_e2m1"))
         with self.assertRaises(AssertionError):
             _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp8_e5m2"))
         self.assertEqual(

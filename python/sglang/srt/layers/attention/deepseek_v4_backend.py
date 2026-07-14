@@ -44,6 +44,9 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
+from sglang.srt.layers.attention.dsv4.nvfp4_k_cache import (
+    dequantize_dsv4_nvfp4_k_cache_paged,
+)
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -1602,26 +1605,28 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-            swa_window_size = token_to_kv_pool.swa_window_size
-            assert swa_k_cache.ndim == 2
-            k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
-            )
+            is_nvfp4 = token_to_kv_pool.dsv4_kv_cache_store_nvfp4
+            if not is_nvfp4:
+                swa_window_size = token_to_kv_pool.swa_window_size
+                assert swa_k_cache.ndim == 2
+                k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
+                swa_k_cache = swa_k_cache[
+                    :, : swa_window_size * k_cache_total_dim
+                ].view(swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim)
 
-            if extra_k_cache is not None:
-                page_sizes = {
-                    4: token_to_kv_pool.page_size // 4,
-                    128: token_to_kv_pool.page_size // 128,
-                }
-                extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
-                ].view(
-                    extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
-                    1,
-                    k_cache_total_dim,
-                )
+                if extra_k_cache is not None:
+                    page_sizes = {
+                        4: token_to_kv_pool.page_size // 4,
+                        128: token_to_kv_pool.page_size // 128,
+                    }
+                    extra_k_cache = extra_k_cache[
+                        :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    ].view(
+                        extra_k_cache.shape[0],
+                        page_sizes[compress_ratio],
+                        1,
+                        k_cache_total_dim,
+                    )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
@@ -1670,6 +1675,20 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
+            if is_nvfp4:
+                return self._forward_nvfp4_sparse(
+                    q=q,
+                    layer_id=layer_id,
+                    token_to_kv_pool=token_to_kv_pool,
+                    swa_k_cache=swa_k_cache,
+                    swa_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                )
+
             if _is_sm120:
                 from sglang.srt.layers.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
@@ -1714,6 +1733,115 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_nvfp4_sparse(
+        self,
+        *,
+        q: torch.Tensor,
+        layer_id: int,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        swa_k_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dequantize selected V4 entries and run BF16 sparse FlashMLA.
+
+        This is the functional SM90 bring-up path. It avoids expanding the
+        full cache, but unlike the GLM/DSA path it is not yet fused into the
+        native FlashMLA KV consumer.
+        """
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+        q_flat = q.squeeze(1)
+        batch_size = q_flat.shape[0]
+        swa_indices_2d = swa_indices.squeeze(1)
+        swa_width = swa_indices_2d.shape[-1]
+        swa_flat = swa_indices_2d.reshape(-1)
+        extra_width = 0
+        extra_indices_2d = None
+        if extra_k_cache is not None:
+            assert extra_indices is not None and extra_topk_lengths is not None
+            extra_indices_2d = extra_indices.squeeze(1)
+            extra_width = extra_indices_2d.shape[-1]
+
+        num_swa = swa_flat.numel()
+        num_extra = batch_size * extra_width
+        workspace = self.sparse_prefill_workspace.get(num_swa + num_extra)
+        swa_kv = workspace[:num_swa]
+        dequantize_dsv4_nvfp4_k_cache_paged(
+            swa_k_cache,
+            swa_flat,
+            page_size=token_to_kv_pool.swa_window_size,
+            global_scale=token_to_kv_pool.get_swa_nvfp4_global_scale(layer_id),
+            out=swa_kv,
+        )
+
+        extra_kv = None
+        if extra_k_cache is not None:
+            assert extra_indices_2d is not None
+            extra_kv = workspace[num_swa : num_swa + num_extra]
+            dequantize_dsv4_nvfp4_k_cache_paged(
+                extra_k_cache,
+                extra_indices_2d.reshape(-1),
+                page_size=token_to_kv_pool.get_extra_key_page_size(layer_id),
+                global_scale=token_to_kv_pool.get_extra_nvfp4_global_scale(layer_id),
+                out=extra_kv,
+            )
+
+        kv = workspace
+        total_width = swa_width + extra_width
+        positions = torch.arange(
+            total_width, dtype=torch.int32, device=q.device
+        ).unsqueeze(0)
+        swa_lens = (
+            swa_topk_lengths.reshape(-1).to(torch.int32).clamp(min=0, max=swa_width)
+        )
+        if extra_kv is None:
+            total_lens = swa_lens
+            local_indices = (
+                torch.arange(batch_size, dtype=torch.int32, device=q.device)[:, None]
+                * swa_width
+                + positions
+            )
+        else:
+            assert extra_topk_lengths is not None
+            extra_lens = (
+                extra_topk_lengths.reshape(-1)
+                .to(torch.int32)
+                .clamp(min=0, max=extra_width)
+            )
+            total_lens = swa_lens + extra_lens
+            batch_offsets = torch.arange(
+                batch_size, dtype=torch.int32, device=q.device
+            )[:, None]
+            swa_local = batch_offsets * swa_width + positions
+            extra_position = positions - swa_lens[:, None]
+            extra_local = (
+                batch_size * swa_width + batch_offsets * extra_width + extra_position
+            )
+            local_indices = torch.where(
+                positions < swa_lens[:, None], swa_local, extra_local
+            )
+        local_indices = torch.where(
+            positions < total_lens[:, None],
+            local_indices,
+            torch.zeros_like(local_indices),
+        )
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=kv,
+            indices=local_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=total_lens,
+        )
+        return o
 
     def _forward_prefill_sparse(
         self,
@@ -1796,19 +1924,38 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+        if token_to_kv_pool.dsv4_kv_cache_store_nvfp4:
+            if compressed_slice is not None:
+                dequantize_dsv4_nvfp4_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    global_scale=token_to_kv_pool.get_extra_nvfp4_global_scale(
+                        layer_id
+                    ),
+                    out=compressed_slice,
+                )
+            dequantize_dsv4_nvfp4_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                global_scale=token_to_kv_pool.get_swa_nvfp4_global_scale(layer_id),
+                out=swa_slice,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(

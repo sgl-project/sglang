@@ -1434,9 +1434,15 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
         logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
     if view.device == "npu":
         kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "fp4_e2m1" and view.fp4_kv_cache_recipe != "nvfp4":
+        raise ValueError(
+            "DeepSeek V4 with fp4_e2m1 KV cache requires "
+            "--fp4-kv-cache-recipe=nvfp4."
+        )
     assert kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",
+        "fp4_e2m1",
     ], f"{kv_cache_dtype} is not supported for {model_arch}"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}

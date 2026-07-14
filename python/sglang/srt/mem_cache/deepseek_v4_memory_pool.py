@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple
+from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -18,11 +19,16 @@ from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4.nvfp4_k_cache import (
+    DSV4_NVFP4_BYTES_PER_TOKEN,
+    quantize_dsv4_nvfp4_k_cache_into,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +80,25 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.dsv4_kv_cache_store_nvfp4 = is_float4_e2m1fn_x2(dtype)
+        if self.dsv4_kv_cache_store_nvfp4:
+            if qk_nope_head_dim != 448 or qk_rope_head_dim != 64:
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 requires qk_nope_head_dim=448 and "
+                    f"qk_rope_head_dim=64, got {qk_nope_head_dim=} and "
+                    f"{qk_rope_head_dim=}."
+                )
+            self.store_dtype = torch.uint8
 
         self.scale_pad = 1
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
         self._create_buffers()
+        if self.dsv4_kv_cache_store_nvfp4:
+            self.nvfp4_global_scales = torch.ones(
+                self.layer_num, dtype=torch.float32, device=self.device
+            )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -96,6 +115,8 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.dsv4_kv_cache_store_nvfp4:
+            return DSV4_NVFP4_BYTES_PER_TOKEN
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -108,12 +129,19 @@ class DeepSeekV4SingleKVPool(KVCache):
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
-
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+        self.bytes_per_page_padded = (
+            bytes_per_page_non_padded
+            if self.dsv4_kv_cache_store_nvfp4
+            else ceil_div(bytes_per_page_non_padded, 576) * 576
         )
+
+        if self.dsv4_kv_cache_store_nvfp4:
+            assert bytes_per_token == 380
+        else:
+            assert bytes_per_token == 448 + 64 * 2 + 8, (
+                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            )
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(
@@ -129,6 +157,23 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        if self.dsv4_kv_cache_store_nvfp4:
+            scale_pow2 = torch.exp2(
+                cache_nope_fp8_rope_bf16_pack.scale_k_nope_ue8m0.float() - 127.0
+            ).repeat_interleave(64, dim=-1)
+            k_nope = (cache_nope_fp8_rope_bf16_pack.k_nope_fp8.float() * scale_pow2).to(
+                torch.bfloat16
+            )
+            cache_k = torch.cat(
+                (k_nope, cache_nope_fp8_rope_bf16_pack.k_rope_bf16), dim=-1
+            )
+            return quantize_dsv4_nvfp4_k_cache_into(
+                cache_k=cache_k,
+                kv_buffer=self.kv_buffer[layer_id],
+                loc=loc,
+                page_size=self.page_size,
+                global_scale=self.get_nvfp4_global_scale(layer_id),
+            )
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -142,6 +187,14 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.dsv4_kv_cache_store_nvfp4:
+            return quantize_dsv4_nvfp4_k_cache_into(
+                cache_k=cache_k,
+                kv_buffer=self.kv_buffer[layer_id],
+                loc=loc,
+                page_size=self.page_size,
+                global_scale=self.get_nvfp4_global_scale(layer_id),
+            )
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -151,10 +204,38 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        if self.dsv4_kv_cache_store_nvfp4:
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
         return self.kv_buffer[layer_id]
+
+    def get_nvfp4_global_scale(self, layer_id: int) -> torch.Tensor:
+        if not self.dsv4_kv_cache_store_nvfp4:
+            raise RuntimeError("NVFP4 scale requested from a non-NVFP4 DSV4 pool")
+        local_layer_id = layer_id - self.start_layer
+        return self.nvfp4_global_scales[local_layer_id : local_layer_id + 1]
+
+    def set_nvfp4_global_scale(
+        self, layer_id: int, scale: Union[float, torch.Tensor]
+    ) -> None:
+        dst = self.get_nvfp4_global_scale(layer_id)
+        if isinstance(scale, torch.Tensor):
+            if scale.numel() != 1:
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 global scale must contain one value, "
+                    f"got {scale.numel()}."
+                )
+            scale_value = float(scale.detach().to(torch.float32).item())
+        else:
+            scale_value = float(scale)
+        if not math.isfinite(scale_value) or scale_value <= 0.0:
+            raise ValueError(
+                "DeepSeek V4 NVFP4 global scale must be finite and positive, "
+                f"got {scale_value}."
+            )
+        dst.fill_(scale_value)
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
@@ -558,6 +639,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
+        self.dsv4_kv_cache_store_nvfp4 = is_float4_e2m1fn_x2(dtype)
 
         stage_layer_num = len(stage_ratios)
         c4_layer_num = sum(1 for r in stage_ratios if r == 4)
@@ -1064,6 +1146,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
+    def get_swa_nvfp4_global_scale(self, layer_id: int) -> torch.Tensor:
+        assert self.swa_kv_pool is not None
+        return self.swa_kv_pool.get_nvfp4_global_scale(
+            self._swa_local_layer_id(layer_id)
+        )
+
     def set_swa_key_buffer(
         self,
         layer_id: int,
@@ -1084,6 +1172,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.get_key_buffer(compress_layer_id)
+
+    def get_extra_nvfp4_global_scale(self, layer_id: int) -> torch.Tensor:
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.get_nvfp4_global_scale(compress_layer_id)
+
+    def set_nvfp4_global_scale(
+        self, layer_id: int, scale: Union[float, torch.Tensor]
+    ) -> None:
+        assert self.swa_kv_pool is not None
+        self.swa_kv_pool.set_nvfp4_global_scale(
+            self._swa_local_layer_id(layer_id), scale
+        )
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        if compress_kv_pool is not None:
+            compress_kv_pool.set_nvfp4_global_scale(compress_layer_id, scale)
 
     def set_extra_key_buffer(
         self,

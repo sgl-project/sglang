@@ -4907,7 +4907,61 @@ class ServerArgs:
         if self.kv_cache_dtype != "fp4_e2m1":
             return
 
-        from sglang.srt.configs.model_config import is_deepseek_dsa
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+        if is_deepseek_v4(self.get_model_config().hf_config):
+            if not is_cuda():
+                raise RuntimeError(
+                    "DeepSeek V4 NVFP4 KV cache is only supported on CUDA."
+                )
+            import torch
+
+            capability = torch.cuda.get_device_capability()
+            if capability != (9, 0):
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 KV cache currently requires SM90/Hopper, "
+                    f"got compute capability {capability}."
+                )
+            if self.fp4_kv_cache_recipe != "nvfp4":
+                raise ValueError(
+                    "DeepSeek V4 with fp4_e2m1 KV cache requires "
+                    "--fp4-kv-cache-recipe=nvfp4."
+                )
+            if self.enable_hisparse:
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 does not yet support --enable-hisparse."
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 does not yet support speculative decoding."
+                )
+            if self.enable_prefill_cp:
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 does not yet support prefill context parallelism."
+                )
+            if self.page_size != 256:
+                raise ValueError(
+                    "DeepSeek V4 NVFP4 currently requires --page-size=256."
+                )
+            # The bring-up path materializes selected BF16 KV into a shared
+            # backend workspace. Capturing that mutable allocation across the
+            # many V4 graph batch sizes can leave older graphs pointing at a
+            # replaced buffer, so keep this correctness-first fallback eager.
+            if (
+                self.cuda_graph_config.decode.backend != Backend.DISABLED
+                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            ):
+                logger.warning(
+                    "DeepSeek V4 NVFP4 currently uses a selected-KV dequant "
+                    "fallback; disabling CUDA graphs until it has a native "
+                    "graph-safe FlashMLA consumer."
+                )
+            self.disable_cuda_graph = True
+            self.disable_decode_cuda_graph = True
+            self.disable_prefill_cuda_graph = True
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            return
 
         if is_deepseek_dsa(self.get_model_config().hf_config):
             if not is_cuda():
