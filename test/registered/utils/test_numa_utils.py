@@ -26,6 +26,7 @@ register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
 class TestIsNumaAvailable(unittest.TestCase):
     """Tests for _is_numa_available on both NUMA and non-NUMA systems."""
 
+    @patch("sglang.srt.utils.numa_utils._is_xpu", False)
     @patch("sglang.srt.utils.numa_utils._is_cuda", False)
     def test_returns_false_when_not_cuda(self):
         self.assertFalse(_is_numa_available())
@@ -64,6 +65,11 @@ class TestIsNumaAvailable(unittest.TestCase):
         mock_isdir.assert_called_with("/sys/devices/system/node/node1")
 
 
+# Pin _is_xpu=False so the CUDA (pynvml) path is exercised even when this file
+# runs on a real XPU host, where _query_numa_node_for_gpu would otherwise
+# short-circuit into the XPU sysfs branch (see test_numa_utils_xpu.py) and never
+# reach the mocked pynvml.
+@patch("sglang.srt.utils.numa_utils._is_xpu", False)
 class TestQueryNumaNodeForGpu(unittest.TestCase):
     """Tests for _query_numa_node_for_gpu with mocked pynvml."""
 
