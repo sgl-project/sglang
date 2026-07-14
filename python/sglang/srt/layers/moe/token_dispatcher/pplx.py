@@ -87,9 +87,15 @@ class PplxAllToAllManager:
     def _ensure_nvshmem(cls, group: dist.ProcessGroup) -> None:
         if cls._nvshmem_initialized:
             return
-        global_rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        # pplx-kernels resolves the local device from the current CUDA device.
+
+        assert group.size() == dist.get_world_size(), (
+            "moe_a2a_backend='pplx' requires the EP group to span the whole "
+            f"world (got ep_size={group.size()}, world_size={dist.get_world_size()}); "
+            "pipeline parallelism and EP-subset layouts are not supported."
+        )
+
+        global_rank = group.rank()
+        world_size = group.size()
         device = torch.device("cuda", torch.cuda.current_device())
         local_rank = torch.cuda.current_device()
         nvshmem_init(
@@ -148,7 +154,13 @@ class PplxAllToAllManager:
 
         # Use the single-node NVLink path when the EP group fits on one node,
         # otherwise the NVSHMEM internode path.
-        is_internode = world_size > torch.cuda.device_count()
+
+        # pplx forces ep_size == world_size
+        # with pp_size == 1 (enforced in _ensure_nvshmem), so the EP group spans
+        # a single node iff the whole job runs on one node.
+        from sglang.srt.server_args import get_global_server_args
+
+        is_internode = get_global_server_args().nnodes > 1
 
         if is_internode:
             cls._all_to_all = AllToAll.internode(
@@ -180,7 +192,7 @@ class PplxAllToAllManager:
         return cls._all_to_all
 
 
-class _PplxEPDispatcherImpl:
+class _PplxDispatcherImpl:
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -208,7 +220,7 @@ class _PplxEPDispatcherImpl:
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
-        self.params_bytes = 2
+        self.params_bytes = torch.tensor([], dtype=params_dtype).element_size()
         self.deepep_mode = deepep_mode
 
         self.num_max_dispatch_tokens_per_rank = (
@@ -290,10 +302,6 @@ class _PplxEPDispatcherImpl:
         device = hidden_states.device
 
         dp_x, dp_x_scale = self._quantize(hidden_states)
-
-        # pplx pre-allocates dispatch outputs (masked / per-expert batched).
-        # Zero-init: unwritten padding slots (beyond masked_m per expert) must
-        # be zero so the expert GEMM + combine never read uninitialized memory.
         out_expert_num_tokens = torch.zeros(
             self.num_local_experts, dtype=torch.int32, device=device
         )
@@ -305,7 +313,9 @@ class _PplxEPDispatcherImpl:
         out_expert_x_scale = None
         if self.use_fp8:
             scale_dim = self._hidden_dim_scale_bytes() // torch.float32.itemsize
-            out_expert_x_scale = torch.empty(
+            # Zero-init like out_expert_x: padding scale rows beyond masked_m
+            # must not feed uninitialized floats into FP8 dequant (-> NaNs).
+            out_expert_x_scale = torch.zeros(
                 (self.num_local_experts, max_batch_tokens, scale_dim),
                 dtype=torch.float32,
                 device=device,
@@ -407,7 +417,7 @@ class _Stage(Enum):
     AFTER_COMBINE_A = auto()
 
 
-class PplxEPDispatcher(BaseDispatcher):
+class PplxDispatcher(BaseDispatcher):
     """MoE all-to-all dispatcher backed by Perplexity's pplx-kernels.
 
     Reuse the DEEPEP_LL dispatch/combine format so the existing masked
@@ -436,7 +446,7 @@ class PplxEPDispatcher(BaseDispatcher):
                 "pplx MoE A2A backend supports low-latency mode only."
             )
 
-        self._low_latency_dispatcher = _PplxEPDispatcherImpl(
+        self._low_latency_dispatcher = _PplxDispatcherImpl(
             group=group,
             router_topk=router_topk,
             permute_fusion=permute_fusion,
@@ -505,7 +515,7 @@ class PplxEPDispatcher(BaseDispatcher):
         self.quant_config = quant_config
         self._low_latency_dispatcher.set_quant_config(quant_config)
 
-    def _get_impl(self) -> _PplxEPDispatcherImpl:
+    def _get_impl(self) -> _PplxDispatcherImpl:
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
