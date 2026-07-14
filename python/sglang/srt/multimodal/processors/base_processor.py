@@ -422,6 +422,18 @@ class BaseMultimodalProcessor(ABC):
             kwargs["videos"] = videos
             if self.video_config:
                 kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            # Frames may already be sampled by the sglang processor (e.g. the
+            # Qwen-VL preprocess_video) using mm_process_config; in that case
+            # do_sample_frames=False is passed at the top level. HF's
+            # _merge_kwargs does not route a top-level do_sample_frames into
+            # videos_kwargs, so it gets overridden by the video processor
+            # default (do_sample_frames=True) and HF re-samples using
+            # videos_kwargs["fps"], halving the visual tokens. Move it into
+            # videos_kwargs (and pop the top-level one to avoid HF's
+            # "passed two times" error) so it actually takes effect.
+            if kwargs.get("do_sample_frames") is False:
+                kwargs.pop("do_sample_frames", None)
+                kwargs.setdefault("videos_kwargs", {})["do_sample_frames"] = False
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
