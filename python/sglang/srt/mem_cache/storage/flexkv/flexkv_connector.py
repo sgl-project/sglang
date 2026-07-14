@@ -984,10 +984,10 @@ class FlexKVConnector:
                 if payload.get("error") is not None:
                     raise RuntimeError(str(payload["error"]))
                 if payload.get("cmd") != CMD_LAYERWISE:
-                    raise ValueError("FlexKV layerwise counter payload has the wrong tag")
-                received_task_id = self._normalize_task_id(
-                    payload.get("fkv_task_id")
-                )
+                    raise ValueError(
+                        "FlexKV layerwise counter payload has the wrong tag"
+                    )
+                received_task_id = self._normalize_task_id(payload.get("fkv_task_id"))
                 if received_task_id != task_id:
                     raise ValueError(
                         "FlexKV layerwise counter payload changed task identity"
