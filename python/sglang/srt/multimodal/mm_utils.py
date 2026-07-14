@@ -503,7 +503,26 @@ def run_dp_sharded_mrope_vision_model(
     """
     tp_size = get_parallel().attn_tp_size
     if tp_size == 1:
-        return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
+        grid_thw = torch.tensor(
+            grid_thw_list,
+            # MoonViT's 2D RoPE implementation combines the grid metadata
+            # with CUDA activations. Keep the metadata colocated in that
+            # path; other encoders retain their existing CPU contract.
+            device=pixel_values.device if rope_type == "rope_2d" else None,
+        )
+        if rope_type == "rope_2d":
+            image_embeds = vision_model(
+                pixel_values,
+                grid_hw=grid_thw,
+                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
+            )
+            # MoonViT returns one tensor per image. The multi-GPU path below
+            # already concatenates these tensors before returning, so keep the
+            # TP=1 DP-encoder path on the same projector-facing contract.
+            if isinstance(image_embeds, list):
+                return torch.cat(image_embeds, dim=0)
+            return image_embeds
+        return vision_model(pixel_values, grid_thw=grid_thw)
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
@@ -567,8 +586,13 @@ def run_dp_sharded_mrope_vision_model(
     # Run the vision model on the local pixel_values_local
     if rope_type == "rope_2d":
         if pixel_values_local.shape[0] > 0:
+            local_grid_thw = torch.tensor(
+                local_grid_thw_list, device=pixel_values_local.device
+            )
             image_embeds_local = vision_model(
-                pixel_values_local, torch.tensor(local_grid_thw_list)
+                pixel_values_local,
+                grid_hw=local_grid_thw,
+                max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
             )
             if isinstance(image_embeds_local, list):
                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
