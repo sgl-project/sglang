@@ -700,7 +700,19 @@ def fused_topk_cpu(
     renormalize: bool,
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_fused_shared_experts: int = 0,
 ):
+    if num_fused_shared_experts != 0:
+        raise ValueError(
+            f"num_fused_shared_experts must be 0 for CPU fused topk, got: {num_fused_shared_experts}"
+        )
+    if apply_routed_scaling_factor_on_output:
+        raise ValueError(
+            "apply_routed_scaling_factor_on_output is not supported for CPU fused topk"
+        )
+
     # TODO: add c++ kernel for cpu
     # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
     # correction bias. Fall back to the torch-native impl for the rest
