@@ -262,6 +262,35 @@ python -m sglang_router.launch_router \
   --history-backend memory
 ```
 
+Any OpenAI-compatible upstream works the same way. For example, [DaoXE](https://daoxe.com) is a multi-protocol multi-model API gateway (OpenAI-compatible base URL `https://daoxe.com/v1`). The router appends `/v1/...` to `--worker-urls`, so pass the host without the `/v1` suffix (same pattern as `https://api.openai.com`). Use `--api-key` for upstream worker authorization, and an exact account-scoped model ID in client requests:
+
+```bash Command
+export DAOXE_API_KEY=your-daoxe-api-key
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://daoxe.com \
+  --api-key "$DAOXE_API_KEY" \
+  --history-backend memory
+```
+
+Then call the router with the OpenAI Python client. Model IDs are account-scoped — copy them from your DaoXE dashboard or `GET https://daoxe.com/v1/models`:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key=os.environ["DAOXE_API_KEY"],
+)
+completion = client.chat.completions.create(
+    model="your-account-model-id",
+    messages=[{"role": "user", "content": "Hello from SGLang + DaoXE"}],
+)
+print(completion.choices[0].message.content)
+```
+
 OpenAI backend mode expects exactly one `--worker-urls` entry per router instance.
 
 ### Multi-Model Inference Gateway
