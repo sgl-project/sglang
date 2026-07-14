@@ -9,6 +9,7 @@ from PIL import Image
 
 from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
+    _get_normalized_fastapi_request_path_for_metrics,
     _load_image,
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
@@ -24,6 +25,59 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+
+
+def _make_request(app, path: str, method: str = "GET"):
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": method,
+            "path": path,
+            "root_path": "",
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+
+class TestGetNormalizedFastapiRequestPathForMetrics(CustomTestCase):
+    def test_handled_path_returns_route_path(self):
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+        @app.get("/v1/models/{model_id}")
+        def get_model(model_id: str):
+            return {"model_id": model_id}
+
+        path, is_handled_path = _get_normalized_fastapi_request_path_for_metrics(
+            _make_request(app, "/v1/models/test-model")
+        )
+
+        self.assertEqual(path, "/v1/models/{model_id}")
+        self.assertTrue(is_handled_path)
+
+    def test_unhandled_path_collapses_to_single_metric_label(self):
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+        @app.get("/v1/models")
+        def list_models():
+            return {}
+
+        path, is_handled_path = _get_normalized_fastapi_request_path_for_metrics(
+            _make_request(app, "/scanner/probe-specific-path")
+        )
+
+        self.assertEqual(path, "__unhandled__")
+        self.assertFalse(is_handled_path)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
