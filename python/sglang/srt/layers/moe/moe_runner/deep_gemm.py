@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
@@ -27,8 +26,8 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm120_supported,
 )
-from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
@@ -46,6 +45,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_sm120 = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -81,6 +81,14 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     exp = torch.where(is_ru, exp + 1, exp)
     new_x = exp.to(torch.uint8).view(torch.int)
     return new_x.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _tma_align_packed_ue8m0(scale: torch.Tensor) -> torch.Tensor:
+    # SM120's grouped GEMM validates strides in check_sf_layout; the packed
+    # INT32 scales from _cast_to_e8m0_with_rounding_up need TMA alignment.
+    return deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+        scale.view(torch.float32)
+    ).view(torch.int32)
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
@@ -150,7 +158,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             # The SM120 DeepGEMM contiguous GEMM consumes standard-layout
             # activations only; other architectures keep the swizzled layout.
-            self.use_swizzle = not is_sm120_supported()
+            self.use_swizzle = not _is_sm120
 
     def run(
         self,
@@ -431,13 +439,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-            # SM120: _cast_to_e8m0_with_rounding_up produces INT32 with
-            # non-TMA-aligned strides. Apply TMA alignment for SM120's
-            # grouped GEMM which validates strides in check_sf_layout.
-            if is_sm120_supported():
-                hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                    hidden_states_scale.view(torch.float32)
-                ).view(torch.int32)
+            if _is_sm120:
+                hidden_states_scale = _tma_align_packed_ue8m0(hidden_states_scale)
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
@@ -462,40 +465,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
-            # DeepSeek V4: clamped swiglu requires JIT EP activation; the
-            # FAST_ACT fused-quant path doesn't carry a swiglu_limit arg.
+            # DeepSeek V4: the FAST_ACT fused-quant path doesn't carry a
+            # swiglu_limit arg. _varlen_deep_gemm_silu_mul_quant decides
+            # whether to fuse the clamp or apply it separately.
             assert (
                 not _MASKED_GEMM_FAST_ACT
             ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
-
-            # When JIT EP activation can run (hidden_dim/8 >= num_experts),
-            # use fused swiglu_limit path. Otherwise, pass swiglu_limit
-            # through to _varlen_deep_gemm_silu_mul_quant which handles the
-            # fallback (separate clamp + Triton SiLU+Mul+Quant).
-            E_check, _, D2_check = gateup_output.shape
-            can_use_jit = (
-                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-                and (D2_check // 2) // 8 >= E_check
-            )
-
-            if can_use_jit and envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                swiglu_limit_arg = self.swiglu_limit
-            elif can_use_jit:
-                gateup_output = einops.rearrange(
-                    gateup_output, "grp tok hidden -> (grp tok) hidden"
-                )
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-                gateup_output = einops.rearrange(
-                    gateup_output,
-                    "(grp tok) hidden -> grp tok hidden",
-                    grp=num_groups,
-                )
-            else:
-                # JIT kernel can't handle this shape; let the quant
-                # function apply swiglu_limit in its Triton fallback.
-                swiglu_limit_arg = self.swiglu_limit
+            swiglu_limit_arg = self.swiglu_limit
 
         # Act.
         topk_ids_rs = running_state.get("topk_ids")
@@ -1132,10 +1108,13 @@ def _varlen_deep_gemm_silu_mul_quant(
     if gemm1_alpha is not None:
         use_jit_ep_activation = False
 
-    if not use_jit_ep_activation and swiglu_limit is not None:
+    fuse_swiglu_limit = (
+        use_jit_ep_activation and envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
+    )
+    if swiglu_limit is not None and not fuse_swiglu_limit:
         # The JIT EP-activation kernel is the only fused consumer of
-        # swiglu_limit; when it cannot run for this shape (e.g. SM120 TP>=2:
-        # D//8 < num_experts), clamp before the unfused kernel.
+        # swiglu_limit; when it cannot run (fusion off, or shape unsupported,
+        # e.g. SM120 TP>=2: D//8 < num_experts), clamp in-place first.
         _apply_swiglu_limit(
             gateup_output.view(-1, gateup_output.shape[-1]),
             swiglu_limit=swiglu_limit,
@@ -1194,11 +1173,8 @@ def _varlen_deep_gemm_silu_mul_quant(
         # Convert fp32 scales to packed int32 UE8M0 if needed by DeepGEMM
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             down_input_scale = _cast_to_e8m0_with_rounding_up(down_input_scale)
-            # SM120: apply TMA alignment to the packed INT32 scales
-            if is_sm120_supported():
-                down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                    down_input_scale.view(torch.float32)
-                ).view(torch.int32)
+            if _is_sm120:
+                down_input_scale = _tma_align_packed_ue8m0(down_input_scale)
     return down_input, down_input_scale
 
 
