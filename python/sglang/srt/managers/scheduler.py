@@ -38,7 +38,6 @@ import torch.distributed
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -61,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -72,9 +72,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.layers.dp_attention import (
-    compute_dp_attention_world_info,
-)
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -154,6 +152,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
+    decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
@@ -225,7 +224,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -239,6 +238,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -387,6 +387,7 @@ class Scheduler(
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
+            dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
@@ -747,12 +748,7 @@ class Scheduler(
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
-            tp_rank=self.ps.tp_rank,
-            moe_ep_rank=self.ps.moe_ep_rank,
-            pp_rank=self.ps.pp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
-            moe_dp_rank=self.ps.moe_dp_rank,
-            dp_rank=self.ps.dp_rank,
+            ps=self.ps,
             nccl_port=self.nccl_port,
         )
 
@@ -776,13 +772,9 @@ class Scheduler(
         draft_worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
-            tp_rank=self.ps.tp_rank,
-            moe_ep_rank=self.ps.moe_ep_rank,
+            ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
-            dp_rank=self.ps.dp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
-            moe_dp_rank=self.ps.moe_dp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
@@ -884,7 +876,7 @@ class Scheduler(
         min_free_slots = resolve_min_free_slots(
             self.server_args.min_free_slots_delay,
             self.max_running_requests,
-            is_dflash=self.spec_algorithm.is_dflash(),
+            is_dflash_family=self.spec_algorithm.is_dflash_family(),
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
@@ -1137,6 +1129,12 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # The PD metadata wire schema must match on P and D even when only D
+        # enables spec decoding; a seedless prefill writes the invalid sentinel.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *8 headroom for MiniMax-M3; *2 for other models.
@@ -1152,6 +1150,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1197,6 +1196,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1252,11 +1252,23 @@ class Scheduler(
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+            needs_confidence_relay=needs_confidence_relay,
         )
+
+        self._confidence_budget_prepare = None
+        if (
+            needs_confidence_relay
+            and self.enable_overlap
+            and self.draft_worker is not None
+        ):
+            self._confidence_budget_prepare = (
+                self.draft_worker.get_confidence_budget_prepare()
+            )
 
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
@@ -1282,70 +1294,15 @@ class Scheduler(
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
+        self.ngram_embedding_manager = (
+            self.tp_worker.model_runner.ngram_embedding_manager
+        )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.token_table
+            self.token_table = self.tp_worker.model_runner.ngram_embedding_manager.table
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
-
-    def _maybe_prepare_ngram_embedding(
-        self, batch: Optional[ScheduleBatch]
-    ) -> Optional[ScheduleBatch]:
-        """Fill the token table for ngram embedding before a forward pass."""
-        if batch is None or not self.use_ngram_embedding:
-            return batch
-        batch.ne_token_table = self.token_table
-        if batch.forward_mode == ForwardMode.EXTEND:
-            all_tokens = []
-            column_starts = []
-            request_lengths = []
-            for req in batch.reqs:
-                start = len(req.prefix_indices)
-                end = start + req.extend_range.length
-                fill_ids = req.origin_input_ids + req.output_ids
-                if start == 0:
-                    tokens = fill_ids[start:end]
-                    column_starts.append(0)
-                elif start < self.ngram_embedding_n:
-                    tokens = fill_ids[0:end]
-                    column_starts.append(0)
-                else:
-                    # Prepend n-1 tokens before prefix_len for n-gram context
-                    tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
-                    column_starts.append(start - self.ngram_embedding_n + 1)
-                all_tokens.extend(tokens)
-                request_lengths.append(len(tokens))
-            dtype = self.token_table.dtype
-            device = self.token_table.device
-            update_token_table(
-                ne_token_table=self.token_table,
-                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
-                row_indices=batch.req_pool_indices,
-                column_starts=torch.tensor(
-                    column_starts, dtype=torch.int32, device=device
-                ),
-                req_lens=torch.tensor(
-                    request_lengths, dtype=torch.int32, device=device
-                ),
-                ignore_tokens=None,
-            )
-            # Mark the chunked (not-yet-finished) prefill request so sample()
-            # skips writing its pseudo next-token into the ngram token table.
-            # Use self.chunked_req identity (not req.is_chunked) to avoid
-            # overlap-scheduling timing issues.
-            if self.chunked_req is not None:
-                skip_token_table_update = [
-                    req is self.chunked_req for req in batch.reqs
-                ]
-                batch.ne_skip_token_table_update = (
-                    torch.tensor(
-                        skip_token_table_update, dtype=torch.bool, device=device
-                    )
-                    if any(skip_token_table_update)
-                    else None
-                )
-        return batch
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2078,6 +2035,7 @@ class Scheduler(
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
+                return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
@@ -2173,13 +2131,63 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
+        if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        if (
+            req.return_sampling_mask
+            and self.disaggregation_mode != DisaggregationMode.NULL
+            and not self.disagg_metadata_buffers.enable_sampling_mask
+        ):
+            error_msg = (
+                "return_sampling_mask with disaggregation requires "
+                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
+            error_msg = (
+                "return_sampling_mask requires finite top_k; top_p-only sampling "
+                "is valid but can return huge masks in the tail, blowing up "
+                "metadata, so we need a safety cap."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+            # Spec workers do not emit one sampling support per accepted token, so
+            # the returned mask would not align 1:1 with generated tokens. Reject
+            # the combination instead of silently returning a misaligned mask.
+            error_msg = (
+                "return_sampling_mask is not supported with speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if req.return_sampling_mask and self.server_args.sampling_backend == "ascend":
+            # The ascend backend samples from logits directly and never builds the
+            # top-k/top-p support, so it cannot produce a sampling mask.
+            error_msg = (
+                "return_sampling_mask is not supported with the ascend "
+                "sampling backend."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
@@ -2734,7 +2742,9 @@ class Scheduler(
         )
 
         # Handle ngram embedding
-        ret = self._maybe_prepare_ngram_embedding(ret)
+        ret = self.ngram_embedding_manager.prepare_for_forward(
+            ret, chunked_req=self.chunked_req
+        )
 
         if ret:
             set_schedule_time_batch(ret)
@@ -2900,9 +2910,9 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -3242,6 +3252,8 @@ class Scheduler(
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
+                if self._confidence_budget_prepare is not None:
+                    self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3323,6 +3335,9 @@ class Scheduler(
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info.future_dsa_topk_indices_available = (
+                        batch.spec_info.dsa_topk_indices is not None
+                    )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
@@ -3805,6 +3820,11 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+            info_record = self.draft_worker.dump_info_records()
+            if info_record is not None:
+                ret["dspark_info_record"] = info_record
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -3817,6 +3837,8 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "dspark_force_budget_frac",
+                "dspark_clear_info_records",
             ]
         )
 
@@ -3834,6 +3856,30 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "dspark_force_budget_frac":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "set_dspark_forced_budget_frac"
+                ):
+                    logging.warning(
+                        "dspark_force_budget_frac requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+                if v is not None and not (0.0 < float(v) <= 1.0):
+                    logging.warning(
+                        f"dspark_force_budget_frac must be in (0, 1] or null, got {v}."
+                    )
+                    if_success = False
+                    break
+            elif k == "dspark_clear_info_records":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "dspark_clear_info_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -3848,7 +3894,18 @@ class Scheduler(
             self.metrics_reporter.spec_total_num_accept_tokens = (
                 self.metrics_reporter.spec_total_num_forward_ct
             ) = 0
-            get_server_args().override(source="update_server_args", **server_args_dict)
+            # DSpark control keys are worker commands, not server args; route
+            # them to the draft worker and keep them out of the override.
+            remaining = dict(server_args_dict)
+            frac = remaining.pop("dspark_force_budget_frac", None)
+            if "dspark_force_budget_frac" in server_args_dict:
+                self.draft_worker.set_dspark_forced_budget_frac(
+                    None if frac is None else float(frac)
+                )
+            if remaining.pop("dspark_clear_info_records", None):
+                self.draft_worker.clear_info_records()
+            if remaining:
+                get_server_args().override(source="update_server_args", **remaining)
             logger.info(f"Global server args updated! {get_server_args()=}")
 
         server_args = dict(vars(get_server_args()))
