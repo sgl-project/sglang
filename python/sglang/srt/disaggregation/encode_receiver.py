@@ -1780,6 +1780,31 @@ class MMReceiverBase(ABC):
                 )
             obj.need_wait_for_mm_inputs = False
 
+    def _sync_fail_info_across_tp(self, waiting_req: WaitingImageRequest) -> None:
+        """Share encoder error fields across TP ranks before abort.
+
+        The encoder sends ZMQ error signals to each TP rank's receive socket,
+        but they can arrive at different times. ``all_reduce`` on status makes
+        every rank enter FAIL together while only some ranks have populated
+        ``error_msg`` / ``error_code``. attn_tp_rank 0 streams the abort to the
+        client, so merge the best-known payload from all ranks first.
+        """
+        if self.tp_size <= 1 or self.tp_group is None:
+            return
+
+        gathered = self.tp_group.all_gather_object(
+            (waiting_req.error_msg, waiting_req.error_code)
+        )
+        best_msg = waiting_req.error_msg
+        best_code = waiting_req.error_code
+        for msg, code in gathered:
+            if msg is not None:
+                best_msg = msg
+            if code is not None:
+                best_code = code
+        waiting_req.error_msg = best_msg
+        waiting_req.error_code = best_code
+
     # For zmq_to_scheduler
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
@@ -1838,6 +1863,7 @@ class MMReceiverBase(ABC):
             if status_value == WaitingImageRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingImageRequestStatus.FAIL:
+                self._sync_fail_info_across_tp(waiting_req)
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
                 )
