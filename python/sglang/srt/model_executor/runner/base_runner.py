@@ -74,7 +74,7 @@ def _allocate_decode_buffers(
     require_mlp_tp_gather: bool,
     seq_len_fill_value: int,
     encoder_len_fill_value: int,
-    num_tokens_per_bs: int,
+    num_tokens_per_req: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
@@ -92,7 +92,7 @@ def _allocate_decode_buffers(
         mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
         num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
         custom_mask = torch.ones(
-            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
             dtype=torch.bool,
         )
         next_token_logits_buffer = torch.zeros(
@@ -229,7 +229,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.pp_size > 1
+            and mr.ps.pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -280,9 +280,9 @@ class BaseRunner(ABC):
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
-    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
+    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_req: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
-        (max_bs, max_bs * num_tokens_per_bs).
+        (max_bs, max_bs * num_tokens_per_req).
 
         The PP-parallel DeepGEMM warmup sweeps batch sizes far larger than any
         runner's max_bs (up to ~n_sms*block_m), so no pre-allocated runner buffer
@@ -295,7 +295,7 @@ class BaseRunner(ABC):
         return _allocate_decode_buffers(
             device=mr.device,
             max_bs=max_bs,
-            max_num_token=max_bs * num_tokens_per_bs,
+            max_num_token=max_bs * num_tokens_per_req,
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
@@ -309,10 +309,14 @@ class BaseRunner(ABC):
                 if mr.model_config.is_encoder_decoder
                 else 0
             ),
-            num_tokens_per_bs=num_tokens_per_bs,
+            num_tokens_per_req=num_tokens_per_req,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
-            ne_token_table=mr.token_table if mr.use_ngram_embedding else None,
+            ne_token_table=(
+                mr.ngram_embedding_manager.table
+                if mr.ngram_embedding_manager.enabled
+                else None
+            ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
@@ -350,14 +354,14 @@ class BaseRunner(ABC):
         else:
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             if mr.is_draft_worker:
                 if not mr.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+            num_tokens_per_req = (
+                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                     mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
                 )
             )
@@ -365,7 +369,7 @@ class BaseRunner(ABC):
         if mr.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
 
-        num_tokens = batch_size * num_tokens_per_bs
+        num_tokens = batch_size * num_tokens_per_req
 
         # Caller owns the shape: passes a static buffer >= the dummy shape; no
         # allocation, no re-padding (would overflow the reused buffers).
@@ -439,7 +443,7 @@ class BaseRunner(ABC):
                 (batch_size,), dtype=torch.int32, device=mr.device
             )
             extend_start_loc = torch.arange(
-                0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=mr.device
+                0, num_tokens, num_tokens_per_req, dtype=torch.int32, device=mr.device
             )
         else:
             extend_prefix_lens_cpu = None
@@ -454,10 +458,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.pp_rank != 0
-                and mr.attn_cp_size > 1
+                and mr.ps.pp_rank != 0
+                and mr.ps.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
@@ -484,7 +488,7 @@ class BaseRunner(ABC):
             mr.spec_algorithm,
             mr.server_args,
             buffers.custom_mask,
-            num_tokens_per_bs,
+            num_tokens_per_req,
             mr.is_draft_worker,
         )
         if spec_info is not None and (

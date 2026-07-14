@@ -124,11 +124,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
 
   m.def(
-      "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype) -> "
-      "Tensor");
-  m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
-
-  m.def(
       "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
   m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
@@ -158,7 +153,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids) -> ()");
+      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(

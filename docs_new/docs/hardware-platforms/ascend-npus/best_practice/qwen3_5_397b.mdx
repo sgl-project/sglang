@@ -14,21 +14,21 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -46,7 +46,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 20ms
 
@@ -87,7 +87,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -157,7 +156,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 50ms
 
@@ -198,7 +197,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -268,7 +266,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -309,7 +307,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -378,7 +375,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 16K+1K
+**Dataset**: 16k+1k
 
 **TPOT**: 20ms
 
@@ -419,7 +416,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -493,7 +489,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 16K+1K
+**Dataset**: 16k+1k
 
 **TPOT**: 50ms
 
@@ -534,7 +530,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -608,7 +603,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 20ms
 
@@ -649,7 +644,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -722,7 +716,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -763,7 +757,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -836,7 +829,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 20ms
 
@@ -877,7 +870,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -951,7 +943,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 50ms
 
@@ -992,7 +984,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -1066,7 +1057,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K (90% prefix cache hit rate)
+**Dataset**: 64k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1107,7 +1098,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
