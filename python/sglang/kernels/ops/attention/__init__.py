@@ -7,7 +7,7 @@ KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [
@@ -109,6 +109,21 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.sm89_paged_fp8_index_logits",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.attention.dsa.sm89_paged_indexer:"
+            "sm89_paged_fp8_index_logits"
+        ),
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(8, 9), max_sm=(8, 9))}
+        ),
+        description="Exact SM89 paged FP8 DSA index logits for the GLM page-64 layout.",
+    )
+)
 
 # Generic attention kernels migrated in Phase 2.5 (RFC #29630).
 for _mod, _fn in [
