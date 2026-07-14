@@ -581,7 +581,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "SGLang does not support resizing target embeddings for DFLASH yet."
                 )
 
-            tokenizer = getattr(self.target_worker, "tokenizer", None)
+            tokenizer = self.target_worker.tokenizer
             if tokenizer is not None:
                 token_id_from_vocab = tokenizer.get_vocab().get(mask_token, None)
                 if (
@@ -595,7 +595,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
             return resolved_id
 
-        tokenizer = getattr(self.target_worker, "tokenizer", None)
+        tokenizer = self.target_worker.tokenizer
         if tokenizer is None:
             raise RuntimeError(
                 "DFLASH requires tokenizer initialization when dflash_config.mask_token_id is not set "
@@ -603,8 +603,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         resolved_id = None
-        if getattr(tokenizer, "mask_token", None) == mask_token:
-            resolved_id = getattr(tokenizer, "mask_token_id", None)
+        if tokenizer.mask_token == mask_token:
+            resolved_id = tokenizer.mask_token_id
 
         if resolved_id is None:
             # Prefer checking the explicit vocab mapping first.
@@ -615,7 +615,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Mirror the reference DFlash HF demo by adding the mask token to the tokenizer.
             # This is safe only when the resulting id stays within the target model vocab size.
             added = tokenizer.add_special_tokens({"mask_token": mask_token})
-            resolved_id = getattr(tokenizer, "mask_token_id", None)
+            resolved_id = tokenizer.mask_token_id
             if resolved_id is None:
                 resolved_id = tokenizer.convert_tokens_to_ids(mask_token)
 
@@ -1218,7 +1218,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
+        if batch.return_logprob:
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."
             )
