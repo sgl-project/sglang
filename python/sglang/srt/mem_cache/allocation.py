@@ -657,9 +657,7 @@ def alloc_for_extend(
     alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
     allocator = batch.tree_cache.token_to_kv_pool_allocator
     uses_page_aligned_alloc: bool = (
-        not _is_npu
-        and allocator_page > 1
-        and allocator.supports_page_aligned_alloc
+        not _is_npu and allocator_page > 1 and allocator.supports_page_aligned_alloc
     )
     assert_alloc_extend_lens_page_aligned(
         prefix_lens_cpu=alloc_start_lens_cpu,
@@ -916,9 +914,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         )
     elif uses_page_aligned_alloc:
         assert allocator_page == allocator.page_size
-        assert bool(torch.all(allocated_old_cpu >= locs_cpu)), (
-            f"{allocated_old_cpu=}, {locs_cpu=}"
-        )
+        assert bool(
+            torch.all(allocated_old_cpu >= locs_cpu)
+        ), f"{allocated_old_cpu=}, {locs_cpu=}"
         non_crossing_mask_cpu: torch.Tensor = ~crossing_mask_cpu
         assert bool(
             torch.all(
@@ -945,12 +943,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
                 phase="Decode",
             )
             assert allocated_page_blocks_flat.dtype == out_dtype
-            assert (
-                allocated_page_blocks_flat.numel()
-                == crossing_count * allocator_page
-            )
-            allocated_page_blocks: torch.Tensor = (
-                allocated_page_blocks_flat.reshape(crossing_count, allocator_page)
+            assert allocated_page_blocks_flat.numel() == crossing_count * allocator_page
+            allocated_page_blocks: torch.Tensor = allocated_page_blocks_flat.reshape(
+                crossing_count, allocator_page
             )
             crossing_indices: torch.Tensor = crossing_indices_cpu.to(
                 device=batch.device, non_blocking=True
