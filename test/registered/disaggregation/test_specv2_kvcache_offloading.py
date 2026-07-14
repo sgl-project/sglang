@@ -63,7 +63,8 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
-    manager.page_size = page_size
+    manager.storage_page_size = page_size
+    manager.allocator_page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = {}
     manager.ongoing_offload = {}
@@ -89,14 +90,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
             kv_committed_len=20,
             kv_allocated_len=20,  # no overallocation
         )
-        prefill_offloaded_len = 8
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=8, inc_len=0, last_hash=None
+        )
 
-        manager._release_finished_req(req, prefill_offloaded_len)
+        manager._release_finished_req(req)
 
-        # Only one free call: the committed range [8:20]
-        self.assertEqual(len(freed), 1)
-        expected = torch.arange(8, 20, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected))
+        self.assertEqual(len(freed), 2)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 8, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(8, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_with_overallocation(self):
@@ -107,20 +109,19 @@ class TestReleaseFinishedReq(unittest.TestCase):
             kv_committed_len=20,
             kv_allocated_len=28,  # 8 over-allocated slots
         )
-        prefill_offloaded_len = 8
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=8, inc_len=0, last_hash=None
+        )
 
-        manager._release_finished_req(req, prefill_offloaded_len)
+        manager._release_finished_req(req)
 
-        # Two free calls: committed [8:20] and overallocated [20:28]
         self.assertEqual(len(freed), 2)
-        expected_committed = torch.arange(8, 20, dtype=torch.int64)
-        expected_overalloc = torch.arange(20, 28, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_committed))
-        self.assertTrue(torch.equal(freed[1], expected_overalloc))
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 8, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(8, 28, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_overallocation_with_page_alignment(self):
-        """With page_size > 1, start of overallocated range is ceil-aligned."""
+        """A partial committed page remains allocator-owned through its page end."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(
@@ -128,20 +129,18 @@ class TestReleaseFinishedReq(unittest.TestCase):
             kv_committed_len=10,  # not page-aligned
             kv_allocated_len=28,
         )
-        prefill_offloaded_len = 4
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=0, last_hash=None
+        )
 
-        manager._release_finished_req(req, prefill_offloaded_len)
+        manager._release_finished_req(req)
 
-        # Committed range [4:10]
-        # Overallocated: start_p = ceil_align(10, 4) = 12, end_p = 28 => [12:28]
         self.assertEqual(len(freed), 2)
-        expected_committed = torch.arange(4, 10, dtype=torch.int64)
-        expected_overalloc = torch.arange(12, 28, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_committed))
-        self.assertTrue(torch.equal(freed[1], expected_overalloc))
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(4, 28, dtype=torch.int64)))
 
     def test_overallocation_page_aligned_noop(self):
-        """When ceil_align(committed, page_size) >= allocated, no overalloc free."""
+        """The final allocated page is released when committed ends inside it."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(
@@ -149,14 +148,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
             kv_committed_len=10,  # ceil_align(10, 4) = 12
             kv_allocated_len=12,  # same as aligned start
         )
-        prefill_offloaded_len = 4
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=0, last_hash=None
+        )
 
-        manager._release_finished_req(req, prefill_offloaded_len)
+        manager._release_finished_req(req)
 
-        # Only committed [4:10], no overalloc because start_p == end_p
-        self.assertEqual(len(freed), 1)
-        expected_committed = torch.arange(4, 10, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_committed))
+        self.assertEqual(len(freed), 2)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(4, 12, dtype=torch.int64)))
 
     def test_prefix_indices_decremented(self):
         """protected_size_ is decremented by len(req.prefix_indices)."""
@@ -168,8 +168,11 @@ class TestReleaseFinishedReq(unittest.TestCase):
             kv_allocated_len=20,
             prefix_indices_len=5,
         )
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=0, inc_len=0, last_hash=None
+        )
 
-        manager._release_finished_req(req, start_offset=0)
+        manager._release_finished_req(req)
 
         self.assertEqual(manager.tree_cache.protected_size_, 5)
 
@@ -194,7 +197,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             prefill_len=8, inc_len=0, last_hash=None
         )
 
-        manager._release_finished_req(req, start_offset=8)
+        manager._release_finished_req(req)
 
         # Two frees in order: prefill [0:8] then committed [8:20].
         self.assertEqual(len(freed), 2)
@@ -223,7 +226,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             prefill_len=0, inc_len=0, last_hash=None
         )
 
-        manager._release_finished_req(req, start_offset=0)
+        manager._release_finished_req(req)
 
         # Only the committed range [0:10] is freed.
         self.assertEqual(len(freed), 1)
@@ -243,7 +246,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=13,
-            kv_allocated_len=13,
+            kv_allocated_len=16,
             rid=rid,
         )
         # 12 input tokens => prefill_len = 12 // 4 * 4 = 12
@@ -252,10 +255,10 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.finalize_release_on_finish(req)
 
         # finalize creates state, then _release_finished_req frees:
-        #   prefill [0:12] then committed [12:13].
+        #   prefill [0:12] then the final allocator page [12:16].
         self.assertEqual(len(freed), 2)
         expected_prefill = torch.arange(0, 12, dtype=torch.int64)
-        expected_committed = torch.arange(12, 13, dtype=torch.int64)
+        expected_committed = torch.arange(12, 16, dtype=torch.int64)
         self.assertTrue(torch.equal(freed[0], expected_prefill))
         self.assertTrue(torch.equal(freed[1], expected_committed))
         # State is deleted by _release_finished_req on the way out.
