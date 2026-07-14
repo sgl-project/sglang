@@ -17,6 +17,7 @@ if _is_npu:
     )
 
 
+# TODO(temporary-inside-chain): Move this legacy NPU helper to the NPU backend in op30.
 def alloc_extend_swa_tail_legacy_npu(
     allocator: "SWATokenToKVPoolAllocator",
     *,
