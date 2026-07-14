@@ -19,11 +19,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.conditioning import (
-    PromptToSampleBatchExpander,
-)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
+)
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
 )
 from sglang.multimodal_gen.runtime.utils.vision import resize
 from sglang.multimodal_gen.utils import calculate_dimensions

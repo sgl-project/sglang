@@ -676,13 +676,7 @@ class PipelineConfig:
         return batch.negative_prompt_embeds
 
     def expand_conditioning_to_sample_batch(self, batch) -> None:
-        """Expand model-owned conditioning before denoising.
-
-        The default is deliberately a no-op. A model family may override this
-        hook when it has audited which of its conditioning values are batched
-        per prompt and must be expanded for single-request multi-output
-        generation.
-        """
+        """Used for single-request multi-output generation case."""
         return None
 
     def post_denoising_loop(self, latents, batch):

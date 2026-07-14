@@ -18,11 +18,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.conditioning import (
-    PromptToSampleBatchExpander,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
