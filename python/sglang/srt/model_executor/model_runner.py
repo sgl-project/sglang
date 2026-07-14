@@ -30,9 +30,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
-    dsa_layer_skips_topk,
     get_num_indexer_layers,
-    is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -46,6 +44,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    get_healthy_expert_location_src_rank,
     join_process_groups,
     try_recover_ranks,
 )
@@ -117,6 +116,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
@@ -316,9 +316,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.init_remote_instance_weight_transporter()
 
-        self.msprobe_debugger = None
-        if server_args.msprobe_dump_config is not None:
-            self.init_msprobe()
+        self.init_msprobe()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
@@ -327,24 +325,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        # Chunked prefix caching requires an MLA model on a backend whose
-        # kernels read that layout. This is a load-time gate, not a
-        # resolution-time one: out-of-tree platforms register their supported
-        # backends in init_backend(), which runs when this module is imported
-        # — after ServerArgs.__post_init__. Target runner only: a draft
-        # model's (often non-MLA) config must not flip the shared setting.
-        if not self.is_draft_worker and (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            if not server_args.disable_chunked_prefix_cache:
-                server_args.override(
-                    "model_runner.chunked_prefix_cache_gate",
-                    disable_chunked_prefix_cache=True,
-                )
-        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
+        misc_utils.maybe_disable_chunked_prefix_cache(
+            server_args=server_args,
+            use_mla_backend=self.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
+        )
 
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
@@ -402,7 +387,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             join_process_groups()
             broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
+                src_rank=get_healthy_expert_location_src_rank(
                     invoked_in_elastic_ep_rejoin_path=True
                 )
             )
@@ -424,6 +409,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+
+    def init_msprobe(self):
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -473,21 +461,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args,
             max_running_requests=self.max_running_requests,
             device=self.device,
-        )
-
-    def init_msprobe(self):
-        # Init the msprobe
-        try:
-            from msprobe.pytorch import PrecisionDebugger, seed_all
-        except ImportError:
-            logger.warning(
-                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
-                "see https://gitcode.com/Ascend/msprobe for details."
-            )
-            return
-        seed_all(mode=True)
-        self.msprobe_debugger = PrecisionDebugger(
-            config_path=self.server_args.msprobe_dump_config
         )
 
     def init_mindspore_runner(self):
@@ -615,15 +588,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
-        hf_config = self.model_config.hf_text_config
-        if (
-            self.pp_size <= 1
-            or self.pp_rank == 0
-            or not is_deepseek_dsa(hf_config)
-            or not dsa_layer_skips_topk(hf_config, self.layer_info.start_layer)
-        ):
-            return None
-        return getattr(hf_config, "index_topk", None)
+        return misc_utils.resolve_pp_proxy_topk_size(
+            model_config=self.model_config,
+            pp_size=self.pp_size,
+            pp_rank=self.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
 
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
@@ -1176,7 +1146,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
             broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
+                src_rank=get_healthy_expert_location_src_rank(
                     invoked_in_elastic_ep_rejoin_path=False
                 )
             )
@@ -1189,25 +1159,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 src=get_world_group().ranks[0],
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
-
-    def _get_healthy_expert_location_src_rank(
-        self, invoked_in_elastic_ep_rejoin_path: bool
-    ) -> int:
-        world_group = get_world_group()
-        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
-        # A rank that was started as a rejoin rank may later act as a healthy
-        # rank in a subsequent recovery cycle.
-        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
-        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
-
-        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
-            if not is_rejoin_rank:
-                return world_group.ranks[rank_in_group]
-
-        raise RuntimeError(
-            "No healthy rank found for broadcasting expert location metadata. "
-            "All ranks are marked as elastic_ep_rejoin."
-        )
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
