@@ -141,8 +141,8 @@ class DecodeKVCacheOffloadManager:
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
         prefill_offloaded_len = (
             len(req.origin_input_ids)
-            // self.allocator_page_size
-            * self.allocator_page_size
+            // self.storage_page_size
+            * self.storage_page_size
         )
         state = self.offloaded_state.get(req.rid)
         if state is None:
@@ -266,8 +266,11 @@ class DecodeKVCacheOffloadManager:
         # concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
-        state = self.offloaded_state[req.rid]
-        start_offset = state.prefill_len
+        start_offset = (
+            len(req.origin_input_ids)
+            // self.allocator_page_size
+            * self.allocator_page_size
+        )
         kv_committed_len = req.effective_kv_committed_len()
         kv_allocated_len = req.kv.kv_allocated_len
         if (
@@ -347,8 +350,8 @@ class DecodeKVCacheOffloadManager:
         if state is None:
             prefill_len = (
                 len(req.origin_input_ids)
-                // self.allocator_page_size
-                * self.allocator_page_size
+                // self.storage_page_size
+                * self.storage_page_size
             )
         # Prefill-aligned slots are freed by _release_finished_req. Make
         # sure state exists so it can find prefill_len.

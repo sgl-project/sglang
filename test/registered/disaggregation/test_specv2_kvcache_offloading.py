@@ -29,6 +29,7 @@ def _make_mock_req(
     kv_allocated_len: int,
     prefix_indices_len: int = 0,
     rid: int = 0,
+    origin_input_len: int = 0,
 ):
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
@@ -37,11 +38,14 @@ def _make_mock_req(
     req.kv_committed_len = kv_committed_len
     req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
     req.prefix_indices = list(range(prefix_indices_len))
+    req.origin_input_ids = list(range(origin_input_len))
     req.effective_kv_committed_len = lambda: req.kv_committed_len
     return req
 
 
-def _make_manager(pool_size: int, page_size: int = 1):
+def _make_manager(
+    pool_size: int, page_size: int = 1, storage_page_size: int | None = None
+):
     """Create a DecodeKVCacheOffloadManager with mock pools for testing."""
     # Build a real req_to_token tensor so indexing works
     req_to_token = torch.arange(pool_size, dtype=torch.int64).unsqueeze(0)
@@ -63,7 +67,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
-    manager.storage_page_size = page_size
+    manager.storage_page_size = storage_page_size or page_size
     manager.allocator_page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = {}
@@ -89,6 +93,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0,
             kv_committed_len=20,
             kv_allocated_len=20,  # no overallocation
+            origin_input_len=8,
         )
         manager.offloaded_state[req.rid] = OffloadedState(
             prefill_len=8, inc_len=0, last_hash=None
@@ -108,6 +113,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0,
             kv_committed_len=20,
             kv_allocated_len=28,  # 8 over-allocated slots
+            origin_input_len=8,
         )
         manager.offloaded_state[req.rid] = OffloadedState(
             prefill_len=8, inc_len=0, last_hash=None
@@ -128,6 +134,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0,
             kv_committed_len=10,  # not page-aligned
             kv_allocated_len=28,
+            origin_input_len=4,
         )
         manager.offloaded_state[req.rid] = OffloadedState(
             prefill_len=4, inc_len=0, last_hash=None
@@ -147,6 +154,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0,
             kv_committed_len=10,  # ceil_align(10, 4) = 12
             kv_allocated_len=12,  # same as aligned start
+            origin_input_len=4,
         )
         manager.offloaded_state[req.rid] = OffloadedState(
             prefill_len=4, inc_len=0, last_hash=None
@@ -192,6 +200,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             kv_committed_len=20,
             kv_allocated_len=20,
             rid=rid,
+            origin_input_len=8,
         )
         manager.offloaded_state[rid] = OffloadedState(
             prefill_len=8, inc_len=0, last_hash=None
@@ -325,6 +334,38 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(freed, [])
         self.assertNotIn(req.rid, manager.offload_inflight)
 
+    def test_storage_and_allocator_page_boundaries_remain_independent(self):
+        """Storage progress and allocator ownership use their respective pages."""
+        manager, freed = _make_manager(
+            pool_size=16, page_size=4, storage_page_size=2
+        )
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.get_hash_str = MagicMock(return_value="prefill_hash")
+        manager.cache_controller.write = MagicMock(
+            return_value=torch.arange(2, 4, dtype=torch.int64)
+        )
+        manager.request_counter = 0
+        manager.offload_stride = 2
+
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=8,
+            kv_allocated_len=8,
+            rid=6,
+            origin_input_len=6,
+        )
+        req.output_ids = [6, 7, 8]
+
+        self.assertTrue(manager.offload_kv_cache(req))
+        self.assertEqual(manager.offloaded_state[req.rid].prefill_len, 6)
+
+        manager.offload_inflight.clear()
+        manager._release_finished_req(req)
+
+        self.assertEqual(len(freed), 2)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(4, 8, dtype=torch.int64)))
+
     def test_finalize_release_defers_while_offload_is_in_flight(self):
         manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
@@ -374,7 +415,11 @@ class TestReleaseFinishedReq(unittest.TestCase):
     ):
         manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
-            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=4
+            req_pool_idx=0,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            rid=4,
+            origin_input_len=4,
         )
         req.finished.return_value = True
         manager.offloaded_state[req.rid] = OffloadedState(
