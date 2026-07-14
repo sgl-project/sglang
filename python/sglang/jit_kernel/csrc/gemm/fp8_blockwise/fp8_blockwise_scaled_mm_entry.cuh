@@ -1,4 +1,4 @@
-/* Copyright 2025 SGLang Team. All Rights Reserved.
+/* Copyright 2026 SGLang Team. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,22 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <sgl_kernel/tensor.h>
+#include "fp8_blockwise_scaled_mm_sm120.cuh"
 
-void cutlass_scaled_fp4_mm_sm100a_sm120a(
-    tvm::ffi::TensorView D,
-    tvm::ffi::TensorView A,
-    tvm::ffi::TensorView B,
-    tvm::ffi::TensorView A_sf,
-    tvm::ffi::TensorView B_sf,
-    tvm::ffi::TensorView alpha);
-
-void cutlass_scaled_fp4_mm(
-    tvm::ffi::TensorView D,
-    tvm::ffi::TensorView A,
-    tvm::ffi::TensorView B,
-    tvm::ffi::TensorView A_sf,
-    tvm::ffi::TensorView B_sf,
-    tvm::ffi::TensorView alpha) {
-  cutlass_scaled_fp4_mm_sm100a_sm120a(D, A, B, A_sf, B_sf, alpha);
+void fp8_blockwise_scaled_mm(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView mat_a,
+    tvm::ffi::TensorView mat_b,
+    tvm::ffi::TensorView scales_a,
+    tvm::ffi::TensorView scales_b) {
+  fp8_blockwise_scaled_mm_sm120(out, mat_a, mat_b, scales_a, scales_b);
 }
