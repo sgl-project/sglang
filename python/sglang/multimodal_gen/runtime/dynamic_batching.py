@@ -113,6 +113,10 @@ def merge_generation_reqs(reqs: list[Req]) -> Req | None:
 
 def slice_generation_req(req: Req, start: int, end: int, total: int) -> Req:
     shard = deepcopy(req)
+    prompt = req.prompt
+    if isinstance(prompt, list) and len(prompt) == total:
+        shard.prompt = deepcopy(prompt[start:end])
+
     for field in dataclasses.fields(Req):
         value = getattr(req, field.name, None)
         if isinstance(value, list) and len(value) == total:
