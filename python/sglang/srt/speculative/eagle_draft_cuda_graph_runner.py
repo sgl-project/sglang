@@ -69,6 +69,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    dsa_seed_topk: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -228,6 +229,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
+        dsa_seed_topk = (
+            torch.zeros(
+                (self.max_bs, self.eagle_worker.dsa_index_topk),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            if self.eagle_worker.seed_dsa_topk_from_draft_extend
+            else None
+        )
+
         self.buffers = EagleDraftInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -245,6 +256,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
 
@@ -372,6 +384,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
+        if self.buffers.dsa_seed_topk is not None:
+            spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
@@ -427,11 +441,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
@@ -504,6 +520,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
+            if buffers.dsa_seed_topk is not None:
+                buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
@@ -563,6 +581,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if buffers.dsa_seed_topk is not None:
+            seed = forward_batch.spec_info.dsa_topk_indices
+            if seed is not None:
+                buffers.dsa_seed_topk[:raw_bs].copy_(seed)
+            else:
+                buffers.dsa_seed_topk[:raw_bs].zero_()
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.
         if (
@@ -622,6 +646,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+        if self.buffers.dsa_seed_topk is not None:
+            forward_batch.spec_info.dsa_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

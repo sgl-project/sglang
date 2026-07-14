@@ -111,6 +111,7 @@ class RelayPayload:
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     @classmethod
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
@@ -120,6 +121,7 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
+            dsa_topk_indices=draft_input.dsa_topk_indices,
         )
 
 
@@ -168,6 +170,7 @@ class FutureMap:
             self.fwd_prepare_d2h_stream = None
         # Lazy-inited on the first non-empty stash (peeks tensor shapes); non-spec's is a no-op.
         self._forward_buf_initialized = False
+        self.dsa_topk_indices_buf = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
 
@@ -216,6 +219,16 @@ class FutureMap:
                 device=self.device,
             )
 
+    def _maybe_init_dsa_topk_indices_buf(self, payload: RelayPayload) -> None:
+        if self.dsa_topk_indices_buf is not None or payload.dsa_topk_indices is None:
+            return
+        seed0 = payload.dsa_topk_indices[0]
+        self.dsa_topk_indices_buf = torch.empty(
+            (self.req_pool_size, *seed0.shape),
+            dtype=payload.dsa_topk_indices.dtype,
+            device=self.device,
+        )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -255,6 +268,11 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
+        if draft_input.future_dsa_topk_indices_available:
+            assert self.dsa_topk_indices_buf is not None
+            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
+        else:
+            draft_input.dsa_topk_indices = None
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -323,6 +341,7 @@ class FutureMap:
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
+        self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
         )
@@ -338,3 +357,10 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
+        if (
+            self.dsa_topk_indices_buf is not None
+            and payload.dsa_topk_indices is not None
+        ):
+            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
+                self.dsa_topk_indices_buf.dtype
+            )

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
@@ -31,6 +32,13 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def get_dsa_seed_metadata_dim(hf_config) -> int:
+    """Return the model-defined PD seed width, independent of local spec mode."""
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    return get_dsa_index_topk(hf_config)
 
 
 def is_dsv4_c128_online_enabled() -> bool:
@@ -227,8 +235,10 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        output_dsa_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -276,6 +286,15 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            if self.output_dsa_topk_indices_dim > 0:
+                self.output_dsa_topk_indices = torch.full(
+                    (size, self.output_dsa_topk_indices_dim),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                self.output_dsa_topk_indices = None
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -318,6 +337,10 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        if self.output_dsa_topk_indices is not None:
+            ptrs.insert(-1, self.output_dsa_topk_indices.data_ptr())
+            data_lens.insert(-1, self.output_dsa_topk_indices.nbytes)
+            item_lens.insert(-1, self.output_dsa_topk_indices[0].nbytes)
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
@@ -331,6 +354,11 @@ class MetadataBuffers:
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
+            (
+                self.output_dsa_topk_indices[idx].clone()
+                if self.output_dsa_topk_indices is not None
+                else None
+            ),
             self.bootstrap_room[idx].clone(),
         )
 
@@ -395,6 +423,14 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+            if self.output_dsa_topk_indices is not None:
+                dsa_topk_indices = req.output_dsa_topk_indices
+                if dsa_topk_indices is not None:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
+                        dsa_topk_indices
+                    )
+                else:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
