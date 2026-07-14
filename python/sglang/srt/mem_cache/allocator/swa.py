@@ -20,6 +20,8 @@ if _is_npu:
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
+    supports_page_aligned_alloc: bool = True
+
     def __init__(
         self,
         size: int,
@@ -149,16 +151,52 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
-        assert self.page_size == 1
+        assert need_size >= 0, f"{need_size=}"
+        assert need_size % self.page_size == 0, f"{need_size=}, {self.page_size=}"
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
             return None
 
-        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
-        assert alloc_full_indices is not None
-        assert alloc_swa_indices is not None
+        alloc_full_indices: torch.Tensor | None = self.full_attn_allocator.alloc(
+            need_size
+        )
+        alloc_swa_indices: torch.Tensor | None = self.swa_attn_allocator.alloc(
+            need_size
+        )
+        assert alloc_full_indices is not None, (
+            "full allocator returned None after the joint capacity pre-check passed"
+        )
+        assert alloc_swa_indices is not None, (
+            "SWA allocator returned None after the joint capacity pre-check passed"
+        )
+
+        expected_device: torch.device = self.full_to_swa_index_mapping.device
+        allocator_outputs: tuple[tuple[str, torch.Tensor], ...] = (
+            ("full", alloc_full_indices),
+            ("SWA", alloc_swa_indices),
+        )
+        for allocator_name, allocated_indices in allocator_outputs:
+            assert allocated_indices.ndim == 1, (
+                f"{allocator_name} allocation must be flat: "
+                f"shape={allocated_indices.shape}"
+            )
+            assert allocated_indices.is_contiguous(), (
+                f"{allocator_name} allocation must be contiguous: "
+                f"stride={allocated_indices.stride()}"
+            )
+            assert allocated_indices.dtype == torch.int64, (
+                f"{allocator_name} allocation must use torch.int64: "
+                f"dtype={allocated_indices.dtype}"
+            )
+            assert allocated_indices.device == expected_device, (
+                f"{allocator_name} allocation is on {allocated_indices.device}, "
+                f"expected {expected_device}"
+            )
+            assert allocated_indices.numel() == need_size, (
+                f"{allocator_name} allocation returned {allocated_indices.numel()} "
+                f"slots, expected {need_size}"
+            )
 
         self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
         return alloc_full_indices
@@ -416,6 +454,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Single-pool allocator for models whose every layer is sliding-window attention."""
+
+    supports_page_aligned_alloc: bool = False
 
     def __init__(
         self,
