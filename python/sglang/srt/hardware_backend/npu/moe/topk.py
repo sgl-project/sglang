@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.topk import (
     capture_routed_experts_if_allowed,
     select_experts,
 )
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -42,9 +43,50 @@ def fused_topk_npu(
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+    use_npu_moe_gating_top_k = get_bool_env_var("USE_NPU_MOE_GATING_TOP_K")
+
+    # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
+    # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
+    if topk_config.scoring_func == "sqrtsoftplus":
+        if use_npu_moe_gating_top_k:
+            routed_scaling_factor = (
+                topk_config.routed_scaling_factor
+                if topk_config.apply_routed_scaling_factor_on_output
+                else 1.0
+            )
+            topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+                x=router_logits.to(torch.float32),
+                k=topk_config.top_k,
+                bias=(
+                    correction_bias.to(torch.float32)
+                    if correction_bias is not None
+                    else None
+                ),
+                input_ids=None,
+                tid2eid=None,
+                routed_scaling_factor=float(routed_scaling_factor),
+                norm_type=2,
+            )
+        else:
+            scores = torch.nn.functional.softplus(router_logits.float()).sqrt()
+            scores_for_choice = (
+                scores + correction_bias.unsqueeze(0).float()
+                if correction_bias is not None
+                else scores
+            )
+            _, topk_ids = torch.topk(
+                scores_for_choice, k=topk_config.top_k, dim=-1, sorted=False
+            )
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = scores.gather(1, topk_ids)
+            if renormalize:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            elif topk_config.routed_scaling_factor is not None:
+                topk_weights = topk_weights * topk_config.routed_scaling_factor
+        topk_weights = topk_weights.to(torch.float32)
 
     # Fast path: simple top-k without grouped routing and bias
-    if not use_grouped_topk and correction_bias is None:
+    elif not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
@@ -56,26 +98,6 @@ def fused_topk_npu(
                 if topk_config.num_fused_shared_experts == 0
                 else topk_weights[:, :-1]
             )
-        topk_weights = topk_weights.to(torch.float32)
-
-    # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
-    # a torch path. top-k over (scores + bias); weights from un-biased scores.
-    elif topk_config.scoring_func == "sqrtsoftplus":
-        scores = torch.nn.functional.softplus(router_logits.float()).sqrt()
-        scores_for_choice = (
-            scores + correction_bias.unsqueeze(0).float()
-            if correction_bias is not None
-            else scores
-        )
-        _, topk_ids = torch.topk(
-            scores_for_choice, k=topk_config.top_k, dim=-1, sorted=False
-        )
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = scores.gather(1, topk_ids)
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        else:
-            topk_weights = topk_weights * topk_config.routed_scaling_factor
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
