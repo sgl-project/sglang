@@ -253,8 +253,6 @@ class MambaCheckpointPool:
         for i, c in enumerate(self.conv):
             src = cache.conv[i][:, active_slots]
             if _is_npu:
-                # NPU active pool uses (win, dim) layout (ascendc requires dim
-                # last); checkpoint pool stores the original (dim, win) layout.
                 src = src.permute(0, 1, 3, 2)
             c[:, ckpt_slots] = src
 
@@ -266,7 +264,6 @@ class MambaCheckpointPool:
         for i, c in enumerate(self.conv):
             src = c[:, ckpt_slots].to(cache.conv[i].dtype)
             if _is_npu:
-                # Reverse: checkpoint pool is (dim, win), active pool is (win, dim).
                 src = src.permute(0, 1, 3, 2)
             cache.conv[i][:, active_slots] = src
 
