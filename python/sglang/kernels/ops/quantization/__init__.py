@@ -120,3 +120,50 @@ __all__ = [
     "sgl_per_token_group_quant_fp8",
     "sgl_per_token_group_quant_int8",
 ]
+
+
+# Triton / CuTe DSL kernels migrated into this group from
+# srt/layers/quantization (RFC #29630, Phase 2.5); registered for inventory.
+# Import them from their modules.
+_TRITON_KERNELS = [
+    ("fp8_kernel", "per_token_group_quant_8bit"),
+    ("fp8_kernel", "sglang_per_token_group_quant_fp8"),
+    ("fp8_kernel", "sglang_per_token_group_quant_8bit"),
+    ("fp8_kernel", "sglang_per_token_quant_fp8"),
+    ("fp8_kernel", "static_quant_fp8"),
+    ("fp8_kernel", "w8a8_block_fp8_matmul"),
+    ("fp8_kernel", "mxfp8_block_scaled_matmul_triton"),
+    ("fp8_kernel", "per_tensor_quant_mla_fp8"),
+    ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
+    ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),
+    ("fp8_kernel", "per_group_transpose"),
+    ("fp8_kernel", "triton_scaled_mm"),
+    ("int8_kernel", "per_token_quant_int8"),
+    ("int8_kernel", "per_token_group_quant_int8"),
+    ("int8_kernel", "w8a8_block_int8_matmul"),
+    ("awq_triton", "awq_dequantize_triton"),
+    ("awq_triton", "awq_gemm_triton"),
+    ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
+]
+for _mod, _fn in _TRITON_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="quantization.nvfp4_gemm_swiglu_nvfp4_quant",
+        backend=KernelBackend.CUTE_DSL,
+        target=(
+            "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
+            ":nvfp4_gemm_swiglu_nvfp4_quant"
+        ),
+        capability=CapabilityRequirement(requires_cuda=True, min_cuda_arch=(10, 0)),
+        description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
+    )
+)
