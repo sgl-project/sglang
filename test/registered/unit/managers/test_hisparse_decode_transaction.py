@@ -1,8 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.managers import hisparse_coordinator as hisparse_coordinator_module
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -164,6 +166,60 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         self.assertTrue(
             torch.equal(dsv4_child.freed[0], torch.arange(20, 22, dtype=torch.int64))
         )
+
+    def test_dsv4_mixed_existing_and_fresh_pages_publish_normally(self) -> None:
+        """DSV4 skips cleared existing owners while re-homing a fresh peer page."""
+        mapping = torch.zeros(64, dtype=torch.int64)
+        mapping[4:6] = torch.arange(20, 22, dtype=torch.int64)
+        rows = torch.arange(40, 64, dtype=torch.int64).reshape(2, 12)
+        coordinator, child_allocator = _make_coordinator(
+            rows=rows,
+            capacities=torch.tensor([12, 12], dtype=torch.int64),
+            mapping=mapping,
+            extra_allocation=torch.arange(24, 26, dtype=torch.int64),
+            dsv4=True,
+        )
+        coordinator._eager_backup_previous_token = mock.Mock()
+
+        with mock.patch.object(hisparse_coordinator_module, "_is_npu", False):
+            coordinator.map_last_loc_to_buffer(
+                seq_lens=torch.tensor([12, 12], dtype=torch.int64),
+                out_cache_loc=torch.tensor([11, 19], dtype=torch.int64),
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([12, 12], dtype=torch.int64),
+                req_pool_indices_cpu=torch.tensor([0, 1], dtype=torch.int64),
+            )
+
+        self.assertEqual(mapping[2].item(), rows[0, 2].item())
+        self.assertEqual(mapping[3].item(), 0)
+        self.assertTrue(torch.equal(mapping[4:6], rows[1, 2:4]))
+        self.assertEqual(child_allocator.alloc_sizes, [])
+        self.assertTrue(
+            torch.equal(child_allocator.freed[0], torch.arange(20, 22))
+        )
+
+    def test_generic_boundary_rejects_a_missing_temporary_owner(self) -> None:
+        """Generic HiSparse still fails when a direct page has no temporary owner."""
+        mapping = torch.zeros(64, dtype=torch.int64)
+        rows = torch.arange(40, 52, dtype=torch.int64).reshape(1, 12)
+        coordinator, child_allocator = _make_coordinator(
+            rows=rows,
+            capacities=torch.tensor([12], dtype=torch.int64),
+            mapping=mapping,
+            extra_allocation=torch.arange(24, 28, dtype=torch.int64),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "must cover complete pages"):
+            coordinator._rehome_page_boundary_owners(
+                seq_lens=torch.tensor([5], dtype=torch.int64),
+                out_cache_loc=torch.tensor([12], dtype=torch.int64),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+                req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            )
+
+        self.assertEqual(child_allocator.alloc_sizes, [])
+        self.assertEqual(child_allocator.freed, [])
 
     def test_net_extra_failure_preserves_all_owners(self) -> None:
         """A failed net-extra allocation leaves mapping, rows, and capacity intact."""

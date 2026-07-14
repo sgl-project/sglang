@@ -602,16 +602,50 @@ class HiSparseCoordinator:
         )
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
         mapped_coordinates = mapping[mapping_index_blocks]
-        temporary_page_ids = mapped_coordinates[:, 0] // page_size
-        temporary_blocks = temporary_page_ids[:, None] * page_size + offsets
         torch._assert_async(
             torch.all(first_mapping_indices % page_size == 0),
             "HiSparse temporary mapping keys must be page aligned",
         )
+        candidate_page_ids = mapped_coordinates[:, 0] // page_size
+        candidate_blocks = candidate_page_ids[:, None] * page_size + offsets
+        has_temporary_owner = torch.any(mapped_coordinates != 0, dim=1)
+        valid_temporary_owner = torch.all(
+            (mapped_coordinates > 0) & (mapped_coordinates == candidate_blocks),
+            dim=1,
+        )
+        valid_owner_state = valid_temporary_owner
+        if self.is_dsv4_hisparse:
+            valid_owner_state = ~has_temporary_owner | valid_temporary_owner
         torch._assert_async(
-            torch.all(mapped_coordinates == temporary_blocks),
+            torch.all(valid_owner_state),
             "HiSparse temporary owners must cover complete pages",
         )
+        if self.is_dsv4_hisparse:
+            owned_boundary_indices_cpu = (
+                torch.nonzero(has_temporary_owner, as_tuple=False)
+                .flatten()
+                .to("cpu")
+                .tolist()
+            )
+            if not owned_boundary_indices_cpu:
+                return
+
+            owned_boundary_indices = torch.tensor(
+                owned_boundary_indices_cpu,
+                dtype=torch.int64,
+                device=seq_lens.device,
+            )
+            boundary_batch_indices_cpu = [
+                boundary_batch_indices_cpu[index]
+                for index in owned_boundary_indices_cpu
+            ]
+            boundary_req_indices = boundary_req_indices[owned_boundary_indices]
+            semantic_positions = semantic_positions[owned_boundary_indices]
+            mapping_index_blocks = mapping_index_blocks[owned_boundary_indices]
+            buffer_positions = buffer_positions[owned_boundary_indices]
+            mapped_coordinates = mapped_coordinates[owned_boundary_indices]
+        temporary_page_ids = mapped_coordinates[:, 0] // page_size
+        temporary_blocks = temporary_page_ids[:, None] * page_size + offsets
         sorted_page_ids = torch.sort(temporary_page_ids).values
         torch._assert_async(
             torch.all(sorted_page_ids[1:] != sorted_page_ids[:-1]),
