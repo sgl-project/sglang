@@ -12,6 +12,7 @@ from unittest import mock
 
 import sglang.srt.managers.scheduler_components.self_benchmark_decode as self_benchmark_decode_module
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import compute_extend_logprob_start_len
 from sglang.srt.managers.scheduler_components.self_benchmark import (
     SELF_BENCHMARK_DUMMY_TOKEN_ID,
     BenchmarkPhase,
@@ -752,6 +753,23 @@ class TestSelfBenchmark(CustomTestCase):
         self.assertEqual(type(captured["payload"]).__name__, "RelayPayload")
         self.assertEqual(captured["payload"].bonus_tokens.tolist(), [0])
         self.assertIsNone(batch.input_ids)
+
+    def test_synthetic_req_matches_dp_attention_logprob_accounting(self):
+        scheduler = _prepare_decode_scheduler(self._scheduler())
+        benchmark = SelfBenchmark(scheduler)
+        prompt_len = 8
+
+        req = benchmark._new_synthetic_req(prompt_len=prompt_len, max_tokens=2)
+        logprob_start_len = compute_extend_logprob_start_len(
+            logprob_start_len=req.logprob_start_len,
+            prefix_len=0,
+            extend_len=prompt_len,
+            full_untruncated_fill_len=prompt_len,
+        )
+        num_tokens_for_logprob = max(prompt_len - logprob_start_len, 1)
+
+        self.assertFalse(req.return_logprob)
+        self.assertEqual(num_tokens_for_logprob, 1)
 
     def test_synthetic_decode_build_failure_cleans_up_and_reraises(self):
         for cleanup_error in (None, RuntimeError("cleanup failed")):
