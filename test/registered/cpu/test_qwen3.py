@@ -1,10 +1,10 @@
-import unittest
+import sys
 
+import pytest
 import torch
 from utils import precision
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
@@ -85,69 +85,89 @@ def fix_query_key_value_ordering_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
-class TestQwen3(CustomTestCase):
-    def test_fused_qkvzba_split_reshape_cat(self):
-        mixed_qkvz = torch.rand(1024, 12288, dtype=torch.bfloat16)
-        mixed_ba = torch.rand(1024, 64, dtype=torch.bfloat16)
-        head_k_dim = 128
-        head_v_dim = 128
-        num_v_heads = 32
-        num_k_heads = 16
-        attn_tp_size = 1
-        mixed_qkv_ref, z_ref, b_ref, a_ref = fix_query_key_value_ordering_reshape_cat(
+def test_fused_input_proj():
+    batch = 7
+    hidden_size = 256
+    qkvz_dim = 128
+    ba_dim = 64
+    hidden_states = torch.randn(batch, hidden_size, dtype=torch.bfloat16)
+    qkvz_weight = torch.randn(qkvz_dim, hidden_size, dtype=torch.bfloat16)
+    ba_weight = torch.randn(ba_dim, hidden_size, dtype=torch.bfloat16)
+
+    qkvz_ref = torch.nn.functional.linear(hidden_states, qkvz_weight)
+    ba_ref = torch.nn.functional.linear(hidden_states, ba_weight)
+    qkvz, ba = torch.ops.sgl_kernel.fused_input_proj_cpu(
+        hidden_states, qkvz_weight, ba_weight, False
+    )
+
+    atol = rtol = precision[qkvz.dtype]
+    torch.testing.assert_close(qkvz, qkvz_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(ba, ba_ref, atol=atol, rtol=rtol)
+
+
+def test_fused_qkvzba_split_reshape_cat():
+    mixed_qkvz = torch.rand(1024, 12288, dtype=torch.bfloat16)
+    mixed_ba = torch.rand(1024, 64, dtype=torch.bfloat16)
+    head_k_dim = 128
+    head_v_dim = 128
+    num_v_heads = 32
+    num_k_heads = 16
+    attn_tp_size = 1
+    mixed_qkv_ref, z_ref, b_ref, a_ref = fix_query_key_value_ordering_reshape_cat(
+        mixed_qkvz,
+        mixed_ba,
+        num_k_heads,
+        num_v_heads,
+        attn_tp_size,
+        head_k_dim,
+        head_v_dim,
+    )
+    num_heads_qk = num_k_heads // attn_tp_size
+    num_heads_v = num_v_heads // attn_tp_size
+    mixed_qkv, z, b, a = torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+        mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
+    )
+    atol = rtol = precision[mixed_qkv.dtype]
+    torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
+
+
+def test_fused_qkvzba_split_reshape_cat_contiguous():
+    mixed_qkvz = torch.rand(1, 12288, dtype=torch.bfloat16)
+    mixed_ba = torch.rand(1, 64, dtype=torch.bfloat16)
+    head_k_dim = 128
+    head_v_dim = 128
+    num_v_heads = 32
+    num_k_heads = 16
+    attn_tp_size = 1
+    key_dim = head_k_dim * num_k_heads
+    value_dim = head_v_dim * num_v_heads
+    mixed_qkv_ref, z_ref, b_ref, a_ref = (
+        fix_query_key_value_ordering_reshape_cat_contiguous(
             mixed_qkvz,
             mixed_ba,
-            num_k_heads,
+            key_dim,
+            value_dim,
             num_v_heads,
-            attn_tp_size,
-            head_k_dim,
             head_v_dim,
+            attn_tp_size,
         )
-        num_heads_qk = num_k_heads // attn_tp_size
-        num_heads_v = num_v_heads // attn_tp_size
-        mixed_qkv, z, b, a = torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+    )
+    num_heads_qk = num_k_heads // attn_tp_size
+    num_heads_v = num_v_heads // attn_tp_size
+    mixed_qkv, z, b, a = (
+        torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
             mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
         )
-        atol = rtol = precision[mixed_qkv.dtype]
-        torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
-
-    def test_fused_qkvzba_split_reshape_cat_contiguous(self):
-        mixed_qkvz = torch.rand(1, 12288, dtype=torch.bfloat16)
-        mixed_ba = torch.rand(1, 64, dtype=torch.bfloat16)
-        head_k_dim = 128
-        head_v_dim = 128
-        num_v_heads = 32
-        num_k_heads = 16
-        attn_tp_size = 1
-        key_dim = head_k_dim * num_k_heads
-        value_dim = head_v_dim * num_v_heads
-        mixed_qkv_ref, z_ref, b_ref, a_ref = (
-            fix_query_key_value_ordering_reshape_cat_contiguous(
-                mixed_qkvz,
-                mixed_ba,
-                key_dim,
-                value_dim,
-                num_v_heads,
-                head_v_dim,
-                attn_tp_size,
-            )
-        )
-        num_heads_qk = num_k_heads // attn_tp_size
-        num_heads_v = num_v_heads // attn_tp_size
-        mixed_qkv, z, b, a = (
-            torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
-                mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
-            )
-        )
-        atol = rtol = precision[mixed_qkv.dtype]
-        torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
+    )
+    atol = rtol = precision[mixed_qkv.dtype]
+    torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

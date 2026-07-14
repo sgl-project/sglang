@@ -1,4 +1,5 @@
 #include "common.h"
+#include "gemm.h"
 #include "vec.h"
 namespace {
 
@@ -95,6 +96,60 @@ void fused_qkvzba_split_reshape_cat_contiguous_impl(
   });
 }
 
+template <typename scalar_t>
+void fused_input_proj_kernel_impl(
+    scalar_t* __restrict__ out,
+    scalar_t* __restrict__ out2,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ weight2,
+    int64_t M,
+    int64_t N,
+    int64_t N2,
+    int64_t K) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N + N2, BLOCK_N);
+
+  const bool use_brgemm = can_use_brgemm<scalar_t>(M);
+
+  // parallel on [MB, NB]
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    // for brgemm, use float32 for accumulate
+    alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+
+    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t mb_start = mb * BLOCK_M;
+      int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+      int64_t nb_start = nb * BLOCK_N;
+      const bool is_first = nb_start < N;
+      int64_t local_nb_start = is_first ? nb_start : nb_start - N;
+      int64_t nb_size = std::min((is_first ? N : N2) - local_nb_start, BLOCK_N);
+      scalar_t* __restrict__ curr_out = is_first ? out : out2;
+      const scalar_t* __restrict__ curr_weight = is_first ? weight : weight2;
+      int64_t local_out_strideM = is_first ? N : N2;
+
+      tinygemm_kernel<scalar_t>(
+          /*   A */ input + mb_start * K,
+          /*   B */ curr_weight + local_nb_start * K,
+          /*   C */ curr_out + mb_start * local_out_strideM + local_nb_start,
+          /* Ctmp*/ Ctmp,
+          /*   M */ mb_size,
+          /*   N */ nb_size,
+          /*   K */ K,
+          /* lda */ K,
+          /* ldb */ nb_size,
+          /* ldc */ local_out_strideM,
+          /* brg */ use_brgemm);
+    });
+
+    if (use_brgemm) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // mixed_qkvz: [batch, num_heads_qk * head_qk * 2 + num_heads_v * head_v * 2]
@@ -183,4 +238,52 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
         ba_strideB);
   });
   return std::make_tuple(mixed_qkv, z, b, a);
+}
+
+// [projected_states_qkvz |projected_states_ba]
+//   = hidden_states @ [qkvz_weight.T | ba_weight.T] + [qkvz_bias, ba_bias]
+//
+//   hidden_states         : [batch, hidden_size]
+//   qkvz_weight           : [qkvz_dim, hidden_size]
+//   qkvz_bias             : optional [qkvz_dim]
+//   ba_weight             : [ba_dim, hidden_size]
+//   ba_bias               : optional [ba_dim]
+//   projected_states_qkvz : [batch, qkvz_dim]
+//   projected_states_ba   : [batch, ba_dim]
+//
+std::tuple<at::Tensor, at::Tensor>
+fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni) {
+  const auto st = hidden_states.scalar_type();
+  TORCH_CHECK(st == at::ScalarType::BFloat16, "fused_input_proj_cpu only supports BFloat16");
+
+  int64_t batch = hidden_states.size(0);
+  int64_t hidden_size = hidden_states.size(1);
+  int64_t qkvz_dim = qkvz_weight.size(0);
+  int64_t ba_dim = ba_weight.size(0);
+  CHECK_INPUT(hidden_states);
+  CHECK_INPUT_SHAPE_DTYPE<false>(qkvz_weight, {qkvz_dim, hidden_size}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(ba_weight, {ba_dim, hidden_size}, st);
+  TORCH_CHECK(qkvz_dim % block_size_n() == 0, "qkvz_weight out features must be divisible by ", block_size_n());
+  TORCH_CHECK(ba_dim % block_size_n() == 0, "ba_weight out features must be divisible by ", block_size_n());
+  TORCH_CHECK(hidden_size % TILE_K == 0, "hidden_size must be divisible by ", TILE_K);
+
+  // weight prepacking if necessary
+  at::Tensor packed_w = is_vnni ? qkvz_weight : convert_weight_packed(qkvz_weight);
+  at::Tensor packed_w2 = is_vnni ? ba_weight : convert_weight_packed(ba_weight);
+
+  at::Tensor projected_states_qkvz = at::empty({batch, qkvz_dim}, hidden_states.options());
+  at::Tensor projected_states_ba = at::empty({batch, ba_dim}, hidden_states.options());
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_input_proj_cpu", [&] {
+    fused_input_proj_kernel_impl<scalar_t>(
+        projected_states_qkvz.data_ptr<scalar_t>(),
+        projected_states_ba.data_ptr<scalar_t>(),
+        hidden_states.data_ptr<scalar_t>(),
+        packed_w.data_ptr<scalar_t>(),
+        packed_w2.data_ptr<scalar_t>(),
+        batch,
+        qkvz_dim,
+        ba_dim,
+        hidden_size);
+  });
+  return std::make_tuple(projected_states_qkvz, projected_states_ba);
 }

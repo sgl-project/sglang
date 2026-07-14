@@ -490,6 +490,15 @@ def register_fake_ops(tp_size: int):
         a = mixed_ba.new_empty(batch, num_heads_v)
         return mixed_qkv, z, b, a
 
+    @register_cpu_compile_fake("fused_input_proj_cpu")
+    def _(hidden_states, qkvz_weight, ba_weight, is_vnni):
+        batch = hidden_states.shape[0]
+        qkvz_dim = qkvz_weight.shape[0]
+        ba_dim = ba_weight.shape[0]
+        return hidden_states.new_empty(batch, qkvz_dim), hidden_states.new_empty(
+            batch, ba_dim
+        )
+
     @register_cpu_compile_fake("fused_sigmoid_gating_delta_rule_update_cpu")
     def _(
         A_log,
