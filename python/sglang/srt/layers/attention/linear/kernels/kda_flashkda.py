@@ -113,6 +113,14 @@ class FlashKDAKernel(LinearAttnKernelBase):
         is_spec_decode: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        # Backstop only: ServerArgs._validate_mamba_extra_buffer rejects a
+        # non-triton effective prefill backend at config time, so extra_buffer
+        # never reaches this fused kernel with the flag set in practice.
+        assert not kwargs.get("output_intermediate_states"), (
+            "KDA extra_buffer prefix-cache tracking requires the triton prefill "
+            "backend (only chunk_kda exposes the intermediate SSM state); the "
+            "FlashKDA fused kernel does not. Use --linear-attn-prefill-backend triton."
+        )
         if self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):

@@ -175,7 +175,10 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
+        """Returns ``core_attn_out``, or ``(core_attn_out, h)`` when the caller
+        passes ``output_intermediate_states=True`` (extra_buffer prefix-cache
+        tracking; only the Triton prefill kernel supports it)."""
         return self.extend_kernel.extend(
             q,
             k,
@@ -197,6 +200,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        # KDA raw conv[0] is (K-1, channel) (KimiLinearStateShape swaps the axes vs
+        # GDN's (channel, K-1)). The shared extra_buffer track code
+        # (_init_track_conv_indices) reads conv_states_shape[-1] as the K-1 window
+        # length, and forward_extend snapshots into the transposed (channel, K-1)
+        # conv view. Store the TRANSPOSED shape so [-1] == K-1 for both backends.
+        conv_shape = model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        self.conv_states_shape = (conv_shape[-1], conv_shape[-2])
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        # Physical track-dest slots for the conv-window snapshot (extra_buffer
+        # prefix caching). Mirrors GDNAttnBackend.init_forward_metadata.
+        if self.forward_metadata.has_mamba_track_mask:
+            mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            self.forward_metadata.mamba_track_mask_indices = mask_indices
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[mask_indices]
+            )
 
     def forward_decode(
         self,
@@ -314,7 +335,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+        mixed_qkv_t = mixed_qkv.transpose(0, 1)  # [seq, channel] -> [channel, seq]
+        # extra_buffer prefix caching: snapshot the pre-conv window (the last
+        # conv_state_len positions up to the tracked chunk boundary) into the conv
+        # pool for the radix-tracked rows. `conv_states` is the transposed
+        # [slots, channel, K-1] view (KDA's raw conv[0] is [slots, K-1, channel]),
+        # so this matches GDN's [channel, num_tracked] -> [num_tracked, channel]
+        # snapshot exactly.
+        if self.forward_metadata.has_mamba_track_mask:
+            mixed_qkv_to_track = mixed_qkv_t[
+                :, self.forward_metadata.track_conv_indices
+            ].transpose(0, 1)
+            conv_states[self.forward_metadata.conv_states_mask_indices] = (
+                mixed_qkv_to_track
+            )
+        q, k, v = mixed_qkv_t.split(splits, dim=0)
         q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
             splits, dim=0
         )
@@ -382,6 +417,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ),
+            # extra_buffer prefix caching needs the per-chunk-boundary intermediate
+            # SSM state `h`; only the Triton chunk_kda path exposes it (the fused
+            # cutedsl / FlashKDA kernels assert against this flag).
+            output_intermediate_states=self.forward_metadata.has_mamba_track_mask,
         )
+
+        # When tracking, the dispatcher returns (core_attn_out, h); otherwise a
+        # bare tensor. Snapshot h at the tracked chunk boundaries for radix reuse.
+        if self.forward_metadata.has_mamba_track_mask:
+            core_attn_out, h = core_attn_out
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, self.forward_metadata
+            )
 
         return core_attn_out

@@ -1042,6 +1042,7 @@ def chunk_kda_fwd(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    output_intermediate_states: bool = False,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1128,8 +1129,14 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    del Aqk, v_new, h
+    del Aqk, v_new
 
+    # `h` is the per-chunk-boundary intermediate SSM state [B, NT, HV, V, K]
+    # (same tensor GDN's chunk kernel exposes). extra_buffer prefix caching
+    # tracks it at radix track boundaries; recompute paths never need it.
+    if output_intermediate_states:
+        return o, h
+    del h
     return o
 
 
@@ -1147,6 +1154,7 @@ def chunk_kda(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    output_intermediate_states: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -1156,7 +1164,7 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o = chunk_kda_fwd(
+    out = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -1169,5 +1177,7 @@ def chunk_kda(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        output_intermediate_states=output_intermediate_states,
     )
-    return o
+    # (o, h) when output_intermediate_states else o
+    return out

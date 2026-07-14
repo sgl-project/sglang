@@ -155,8 +155,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        output_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
+        """Returns ``core_attn_out`` normally, or ``(core_attn_out, h)`` when
+        ``output_intermediate_states`` (extra_buffer prefix-cache tracking). ``h``
+        is the per-chunk-boundary intermediate SSM state [1, NT, HV, V, K]."""
         return chunk_kda(
             q=q,
             k=k,
@@ -170,4 +174,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            output_intermediate_states=output_intermediate_states,
         )
