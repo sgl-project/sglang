@@ -33,7 +33,21 @@ class NgramVerifyInput(SpecInput):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
+        # DP attention recovers bs = num_tokens // num_tokens_per_req from spec_info
+        # (mirrors EAGLE's verify input); ngram contributes draft_token_num per req.
+        self.num_tokens_per_req = draft_token_num
+        self.num_tokens_for_logprob_per_req = draft_token_num
         self.grammar = grammar
+
+        # The triton/decode attention backends read spec_info.kv_indptr/kv_indices on
+        # the decode-or-idle path (triton_backend.init_forward_metadata): a None
+        # kv_indptr means "build plain metadata from seq_lens". NGRAM's verify runs
+        # through the extend path (generate_attn_arg_prefill) and never populates
+        # these, so expose them as None. This lets an idle DP rank's forward_idle
+        # build plain metadata exactly like a non-spec idle batch (mirrors EAGLE,
+        # whose verify input also leaves kv_indptr None when idle).
+        self.kv_indptr = None
+        self.kv_indices = None
 
         # Inputs for V2 overlap worker
         self.future_indices = future_indices
@@ -43,6 +57,27 @@ class NgramVerifyInput(SpecInput):
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
+        )
+
+    @classmethod
+    def create_idle_input(cls, draft_token_num: int, device: torch.device):
+        # Zero-row verify input for an idle DP rank, so it still runs a
+        # verify-shaped forward and keeps its collectives aligned with ranks that
+        # are actually verifying (mirrors EagleVerifyInput.create_idle_input).
+        return cls(
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            retrieve_index=torch.full(
+                (0, draft_token_num), -1, dtype=torch.long, device=device
+            ),
+            retrieve_next_token=torch.full(
+                (0, draft_token_num), -1, dtype=torch.long, device=device
+            ),
+            retrieve_next_sibling=torch.full(
+                (0, draft_token_num), -1, dtype=torch.long, device=device
+            ),
+            draft_token_num=draft_token_num,
         )
 
     @property
