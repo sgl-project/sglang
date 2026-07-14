@@ -786,12 +786,13 @@ class FlexKVRadixCache(RadixCache):
         new_last_node: Optional[TreeNode] = None
         local_preparation_error: Optional[str] = None
         try:
-            store_len = result.unhandled_kv_start
+            raw_store_len = result.unhandled_kv_start
+            if isinstance(raw_store_len, bool) or not isinstance(raw_store_len, int):
+                raise ValueError("FlexKV store ownership boundary is invalid")
+            store_len = raw_store_len
             all_token_ids = req.origin_input_ids + req.output_ids
             if (
-                isinstance(store_len, bool)
-                or not isinstance(store_len, int)
-                or store_len < 0
+                store_len < 0
                 or store_len > kv_len_to_handle
                 or store_len > len(all_token_ids)
                 or store_len % self._allocator_page_size != 0
@@ -799,8 +800,17 @@ class FlexKVRadixCache(RadixCache):
                 raise ValueError("FlexKV store ownership boundary is invalid")
             token_ids = all_token_ids[:store_len]
             if store_len > 0:
+                match_token_count = store_len + int(self.is_eagle)
+                if match_token_count > len(all_token_ids):
+                    raise ValueError("FlexKV store ownership boundary is invalid")
                 match_result = super().match_prefix(
-                    MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            all_token_ids[:match_token_count],
+                            req.extra_key,
+                            is_bigram=self.is_eagle,
+                        )
+                    )
                 )
                 kv_indices = match_result.device_indices
                 new_last_node = match_result.last_device_node

@@ -154,6 +154,7 @@ def _make_store_cache(radix_module: types.ModuleType) -> tuple[Any, MagicMock]:
     cache = radix_module.FlexKVRadixCache.__new__(radix_module.FlexKVRadixCache)
     cache.device = torch.device("cpu")
     cache._allocator_page_size = 2
+    cache.is_eagle = False
     cache._load_markers = {}
     cache._node_lock = threading.Lock()
     cache._inflight_store_nodes = {}
@@ -385,6 +386,51 @@ class TestFlexKVPageAlignedLoadBack(unittest.TestCase):
 
             store_kwargs = connector.store_kv.call_args.kwargs
             self.assertEqual(store_kwargs["token_ids"], [0, 1])
+            self.assertTrue(torch.equal(store_kwargs["kv_indices"], canonical_indices))
+
+    def test_eagle_store_rematches_with_raw_boundary_token(self) -> None:
+        """Eagle rematch adds one raw token without extending STORE payload."""
+        with _import_flexkv_modules() as (_, radix_module):
+            cache, connector = _make_store_cache(radix_module)
+            cache.is_eagle = True
+            node = object()
+            canonical_indices = torch.tensor([400, 401, 402, 403])
+            req = SimpleNamespace(
+                rid="request",
+                origin_input_ids=[0, 1, 2],
+                output_ids=[3, 4, 5],
+                extra_key=None,
+            )
+
+            with (
+                patch.object(
+                    radix_module.RadixCache,
+                    "cache_finished_req",
+                    return_value=radix_module.CacheFinishedReqResult(
+                        unhandled_kv_start=4
+                    ),
+                ),
+                patch.object(
+                    radix_module.RadixCache,
+                    "match_prefix",
+                    return_value=SimpleNamespace(
+                        device_indices=canonical_indices,
+                        last_device_node=node,
+                    ),
+                ) as match_prefix,
+                patch.object(torch.cuda, "stream", return_value=MagicMock()),
+            ):
+                cache.cache_finished_req(
+                    req,
+                    is_insert=True,
+                    kv_len_to_handle=5,
+                )
+
+            match_key = match_prefix.call_args.args[0].key
+            self.assertTrue(match_key.is_bigram)
+            self.assertEqual(list(match_key.raw_token_ids()), [0, 1, 2, 3, 4])
+            store_kwargs = connector.store_kv.call_args.kwargs
+            self.assertEqual(store_kwargs["token_ids"], [0, 1, 2, 3])
             self.assertTrue(torch.equal(store_kwargs["kv_indices"], canonical_indices))
 
     def test_cache_finished_rematch_failure_enters_connector_preflight(self) -> None:
