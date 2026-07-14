@@ -1,7 +1,0 @@
-{
-    "native_dit_acceleration": "weight_only_fp8",
-    "image_encoder_config": {"impl": "lightvae", "native_acceleration": "disabled"},
-    "encoder_config": {"impl": "lightvae", "native_acceleration": "disabled"},
-    "decoder_config": {"impl": "lighttae"},
-    "text_encoder_config": {"impl": "fp8_w8a8"}
-}

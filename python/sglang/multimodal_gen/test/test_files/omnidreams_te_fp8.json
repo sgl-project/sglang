@@ -1,3 +1,0 @@
-{
-    "text_encoder_config": {"impl": "fp8_w8a8"}
-}

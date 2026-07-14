@@ -237,10 +237,6 @@ class DiffusionSamplingParams:
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
-    # OmniDreams-only: per-frame HD-map conditioning video (URL or list of URLs).
-    # When set, the video harness routes through the dedicated JSON-body helper —
-    # the multipart i2v path drops declared request fields like ``hdmap_path``.
-    hdmap_path: str | list[str] | None = None
 
     # duration
     seconds: int = 1  # for video: duration in seconds
@@ -532,24 +528,6 @@ OMNIDREAMS_I2V_sampling_params = DiffusionSamplingParams(
     output_size="1280x704",
     direct_url_test=True,
     num_frames=13,
-    fps=30,
-    extras={"seed": 42},
-)
-
-# Online HD-map conditioning path (OmniDreams-only). HD-map + first-frame assets
-# are gated NVIDIA AV sample data, so they are supplied via env URLs and the case
-# self-skips when unset (see generate_hdmap_i2v). Point the env vars at any
-# reachable URLs, e.g. a `python -m http.server` over a local sample clip dir.
-OMNIDREAMS_I2V_HDMAP_sampling_params = DiffusionSamplingParams(
-    prompt=(
-        "Suburban environment with residential houses lining both sides of a "
-        "quiet street, double yellow line down the center, parked cars along the "
-        "curb, overcast sky."
-    ),
-    image_path=os.environ.get("SGLANG_OMNIDREAMS_FIRST_FRAME_URL"),
-    hdmap_path=os.environ.get("SGLANG_OMNIDREAMS_HDMAP_URL"),
-    output_size="1280x704",
-    num_frames=29,
     fps=30,
     extras={"seed": 42},
 )
