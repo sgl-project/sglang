@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import builtins
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -31,15 +32,20 @@ def _make_ctx(
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
+    strip_thinking_cache=False,
+    is_eagle=False,
 ):
     server_args = MagicMock()
     server_args.radix_cache_backend = backend
     server_args.enable_streaming_session = enable_streaming
     server_args.enable_lmcache = enable_lmcache
     server_args.enable_flexkv = False
+    server_args.strip_thinking_cache = strip_thinking_cache
+    params = MagicMock()
+    params.is_eagle = is_eagle
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=params,
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
@@ -95,6 +101,42 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
+    def test_rejects_strip_thinking_cache_for_all_swa(self) -> None:
+        """All-SWA routing rejects strip-thinking before backend dispatch."""
+        factory = MagicMock()
+        register_radix_cache_backend("custom", factory)
+
+        with self.assertRaisesRegex(ValueError, "strip-thinking-cache"):
+            create_tree_cache(
+                _make_ctx(
+                    backend="custom",
+                    is_hybrid_swa=True,
+                    full_tokens_per_layer=0,
+                    strip_thinking_cache=True,
+                )
+            )
+
+        factory.assert_not_called()
+
+    def test_allows_strip_thinking_cache_for_hybrid_swa(self) -> None:
+        """Hybrid SWA with full-attention layers remains supported."""
+        cache = MagicMock()
+        cache.supports_streaming_session.return_value = True
+        factory = MagicMock(return_value=cache)
+        register_radix_cache_backend("custom", factory)
+
+        result = create_tree_cache(
+            _make_ctx(
+                backend="custom",
+                is_hybrid_swa=True,
+                full_tokens_per_layer=1,
+                strip_thinking_cache=True,
+            )
+        )
+
+        factory.assert_called_once()
+        self.assertIs(result, cache)
+
     def test_dispatches_to_registered_factory(self):
         cache = MagicMock()
         cache.supports_streaming_session.return_value = True
@@ -213,6 +255,76 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 params=ctx.params, server_args=ctx.server_args
             )
             self.assertIs(result, fake_module.RadixCacheCpp.return_value)
+
+    def test_cpp_radix_cache_rejects_eagle_before_import(self) -> None:
+        """Experimental C++ radix rejects EAGLE before loading its extension."""
+        ctx = _make_ctx(is_eagle=True)
+        target_module = "sglang.srt.mem_cache.radix_cache_cpp"
+        import_attempts: list[str] = []
+        original_import = builtins.__import__
+
+        def tracking_import(
+            name: str,
+            globals: dict[str, object] | None = None,
+            locals: dict[str, object] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            if name == target_module:
+                import_attempts.append(name)
+            return original_import(name, globals, locals, fromlist, level)
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
+                return_value=True,
+            ),
+            patch("builtins.__import__", side_effect=tracking_import),
+            self.assertRaisesRegex(
+                ValueError,
+                "SGLANG_EXPERIMENTAL_CPP_RADIX_TREE is incompatible with EAGLE",
+            ),
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(import_attempts, [])
+
+    def test_unified_radix_cache_rejects_all_swa_before_import(self) -> None:
+        """Unified radix rejects all-SWA before importing its implementation."""
+        ctx = _make_ctx(is_hybrid_swa=True, full_tokens_per_layer=0)
+        target_modules: set[str] = {
+            "sglang.srt.mem_cache.unified_cache_components",
+            "sglang.srt.mem_cache.unified_radix_cache",
+        }
+        import_attempts: list[str] = []
+        original_import = builtins.__import__
+
+        def tracking_import(
+            name: str,
+            globals: dict[str, object] | None = None,
+            locals: dict[str, object] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            if name in target_modules:
+                import_attempts.append(name)
+            return original_import(name, globals, locals, fromlist, level)
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
+                return_value=True,
+            ),
+            patch("builtins.__import__", side_effect=tracking_import),
+            self.assertRaisesRegex(ValueError, "does not support all-SWA"),
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(import_attempts, [])
 
     def test_unified_radix_cache_when_env_flag_set(self):
         ctx = _make_ctx()
