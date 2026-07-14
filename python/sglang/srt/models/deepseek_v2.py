@@ -429,6 +429,13 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def _is_glm_moe_dsa(config) -> bool:
+    """True for GLM-5.2 GlmMoeDsa models -- the ``"GlmMoeDsa"`` substring matches
+    both the main arch ``GlmMoeDsaForCausalLM`` and the NextN draft head
+    ``GlmMoeDsaForCausalLMNextN`` (rewritten in ``configs/model_config.py``)."""
+    return any("GlmMoeDsa" in arch for arch in (config.architectures or []))
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -450,7 +457,11 @@ class MoEGate(nn.Module):
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
-            if quant_config is not None:
+            # GLM-5.2 (GlmMoeDsa) keeps e_score_correction_bias in fp32: its biases
+            # are ~34-valued, where bf16 (ULP 0.25 at that magnitude) collapses 174
+            # distinct biases to ~3 -> wrong top-k expert routing. HF keeps it fp32,
+            # so skip BOTH bf16 downcasts below for GlmMoeDsa (main + NextN draft).
+            if quant_config is not None and not _is_glm_moe_dsa(config):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",

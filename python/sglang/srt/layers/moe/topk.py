@@ -1435,9 +1435,18 @@ def biased_grouped_topk_gpu(
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        # An fp32 correction bias (GlmMoeDsa keeps it fp32; see MoEGate) must not be
+        # re-downcast to bf16 here -- that collapses its ~34-valued biases and corrupts
+        # top-k routing. bf16-bias models keep their dtype: the check scopes this to GLM.
+        if correction_bias.dtype == torch.float32:
+            aiter_gating_output = gating_output.to(torch.float32)
+            aiter_correction_bias = correction_bias
+        else:
+            aiter_gating_output = gating_output
+            aiter_correction_bias = correction_bias.to(dtype=gating_output.dtype)
         aiter_biased_grouped_topk(
-            gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            aiter_gating_output,
+            aiter_correction_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
