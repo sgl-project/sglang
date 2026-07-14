@@ -207,6 +207,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
+from sglang.srt.managers.scheduler_components.recv_skipper import (
+    SchedulerRecvSkipper,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -215,7 +218,6 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
