@@ -872,6 +872,7 @@ class FlexKVConnector:
         slot_mapping_cpu: Optional[torch.Tensor] = None
         page_starts: List[int] = []
         producer_id = -1
+        counter_registration_started = False
 
         if self._poison_reason is not None:
             local_status = 0
@@ -930,6 +931,7 @@ class FlexKVConnector:
             local_reason = "lookup or slot manifest differs across ranks"
 
         if local_status == 1 and layerwise and pending is not None:
+            counter_registration_started = True
             try:
                 self._register_layerwise_counter(
                     pending=pending,
@@ -944,7 +946,11 @@ class FlexKVConnector:
             if layerwise:
                 cleanup_status = 1
                 try:
-                    if pending is not None and producer_id >= 0:
+                    if (
+                        counter_registration_started
+                        and pending is not None
+                        and producer_id >= 0
+                    ):
                         self._abort_layerwise_counter(
                             pending=pending,
                             producer_id=producer_id,
@@ -1019,6 +1025,7 @@ class FlexKVConnector:
                     payload.get("counter_id"),
                     num_counters=counter.num_counters,
                 )
+                counter.ensure_producer_ready(producer_id=producer_id)
             except Exception as exc:  # noqa: BLE001
                 reason = str(exc)
             return _LayerwiseProducerSelection(

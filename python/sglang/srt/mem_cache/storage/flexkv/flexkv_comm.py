@@ -625,6 +625,17 @@ class FlexKVLayerDoneCounter:
         self._task_to_producer[task_id] = counter_id
         self.events[counter_id].reset_for_new_transfer()
 
+    def ensure_producer_ready(self, producer_id: int) -> None:
+        if not 0 <= producer_id < self.num_counters:
+            raise ValueError(
+                f"Invalid producer_id={producer_id}, must be in "
+                f"[0, {self.num_counters})"
+            )
+        if not self.events[producer_id]._finished:
+            raise RuntimeError(
+                f"Producer event {producer_id} is still active and cannot be reused"
+            )
+
     def update_producer(self) -> int:
         self.producer_index = (self.producer_index + 1) % self.num_counters
         assert self.events[
