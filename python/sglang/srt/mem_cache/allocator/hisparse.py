@@ -302,6 +302,22 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        return self.logical_attn_allocator._get_free_page_owner_bounds()
+
+    def _validate_logical_domain_free(
+        self,
+        free_index: torch.Tensor,
+    ) -> None:
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_index(
+            free_index,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+        )
+
     def alloc(self, need_size: int):
         assert self.is_not_in_free_group
         assert need_size >= 0, f"{need_size=}"
@@ -501,6 +517,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return
 
     def free(self, free_index: torch.Tensor):
+        self._validate_logical_domain_free(free_index)
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
@@ -607,6 +624,22 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        return self.logical_attn_allocator._get_free_page_owner_bounds()
+
+    def _validate_logical_domain_free(
+        self,
+        free_index: torch.Tensor,
+    ) -> None:
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_index(
+            free_index,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+        )
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
@@ -620,6 +653,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.logical_attn_allocator.swa_available_size()
 
     def free_swa(self, free_indices: torch.Tensor):
+        self._validate_logical_domain_free(free_indices)
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
@@ -861,6 +895,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def free(self, free_index: torch.Tensor):
+        self._validate_logical_domain_free(free_index)
         if free_index.numel() == 0:
             return
 

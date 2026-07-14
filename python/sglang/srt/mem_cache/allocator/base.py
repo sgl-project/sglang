@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -62,6 +64,132 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def _validate_free_index_metadata(
+        self,
+        free_index: torch.Tensor,
+        *,
+        page_size: int,
+    ) -> None:
+        assert isinstance(free_index, torch.Tensor), (
+            f"{type(self).__name__}.free expects a torch.Tensor, "
+            f"got {type(free_index).__name__}"
+        )
+        assert free_index.ndim == 1, (
+            f"{type(self).__name__}.free expects a 1-D tensor, "
+            f"got shape={free_index.shape}"
+        )
+        assert free_index.dtype in (torch.int32, torch.int64), (
+            f"{type(self).__name__}.free expects int32 or int64 indices, "
+            f"got dtype={free_index.dtype}"
+        )
+        expected_device = torch.device(self.device)
+        actual_device = free_index.device
+        device_matches = actual_device == expected_device or (
+            expected_device.index is None
+            and actual_device.type == expected_device.type
+        )
+        assert device_matches, (
+            f"{type(self).__name__}.free indices are on {actual_device}, "
+            f"expected {expected_device}"
+        )
+        assert isinstance(page_size, int) and page_size > 0, (
+            f"{type(self).__name__}.free requires a positive integer page size, "
+            f"got {page_size}"
+        )
+        assert free_index.numel() % page_size == 0, (
+            f"{type(self).__name__}.free requires complete page blocks: "
+            f"numel={free_index.numel()}, page_size={page_size}"
+        )
+
+    def _extract_validated_free_page_ids(
+        self,
+        free_index: torch.Tensor,
+        *,
+        page_size: int,
+    ) -> torch.Tensor:
+        return free_index[::page_size].to(dtype=torch.int64) // page_size
+
+    def _debug_validate_free_page_blocks(
+        self,
+        free_index: torch.Tensor,
+        page_ids: torch.Tensor,
+        *,
+        page_size: int,
+        owner_page_start: int,
+        owner_page_end: int,
+        live_page_table: torch.Tensor | None = None,
+    ) -> None:
+        if free_index.numel() == 0 or not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            return
+
+        assert 0 <= owner_page_start < owner_page_end
+        blocks = free_index.reshape(-1, page_size).to(dtype=torch.int64)
+        representatives = blocks[:, 0]
+        expected_blocks = representatives[:, None] + torch.arange(
+            page_size,
+            dtype=torch.int64,
+            device=free_index.device,
+        )
+        sorted_page_ids = torch.sort(page_ids).values
+        valid_contract = (
+            torch.all(representatives % page_size == 0)
+            & torch.all(blocks == expected_blocks)
+            & torch.all(page_ids >= owner_page_start)
+            & torch.all(page_ids < owner_page_end)
+            & torch.all(sorted_page_ids[1:] != sorted_page_ids[:-1])
+        )
+        torch._assert_async(
+            valid_contract,
+            f"{type(self).__name__}.free requires unique complete page blocks "
+            f"in owner domain [{owner_page_start}, {owner_page_end})",
+        )
+
+        if live_page_table is not None:
+            safe_page_ids = page_ids.clamp(
+                min=0,
+                max=live_page_table.shape[0] - 1,
+            )
+            valid_live_binding = (
+                (page_ids >= owner_page_start)
+                & (page_ids < owner_page_end)
+                & (live_page_table[safe_page_ids] >= 0)
+            )
+            torch._assert_async(
+                torch.all(valid_live_binding),
+                f"{type(self).__name__}.free requires live page bindings "
+                f"in owner domain [{owner_page_start}, {owner_page_end})",
+            )
+
+    def _debug_validate_free_index(
+        self,
+        free_index: torch.Tensor,
+        *,
+        page_size: int,
+        owner_page_start: int,
+        owner_page_end: int,
+        live_page_table: torch.Tensor | None = None,
+    ) -> None:
+        if free_index.numel() == 0 or not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            return
+
+        free_page_ids = self._extract_validated_free_page_ids(
+            free_index,
+            page_size=page_size,
+        )
+        self._debug_validate_free_page_blocks(
+            free_index,
+            free_page_ids,
+            page_size=page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+            live_page_table=live_page_table,
+        )
+
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not define a free-page owner domain"
+        )
 
     def restore_state(self, state):
         self.free_pages, self.release_pages = state

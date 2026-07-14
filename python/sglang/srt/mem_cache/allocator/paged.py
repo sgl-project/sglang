@@ -32,11 +32,8 @@ from sglang.srt.mem_cache.triton_ops.allocator import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
-    is_hip,
     next_power_of_2,
 )
-
-_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -127,26 +124,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-
-        # Pre-warm the torch.unique HIP kernel used in free(). When a request
-        # finishes with a prompt that already exists in the radix tree (e.g.
-        # bench_serving sending the same warmup+measured prompt), the radix
-        # cache's _insert_helper frees the duplicate KV indices via
-        # token_to_kv_pool_allocator.free(value[start:prefix_len]). That call
-        # path runs `torch.unique(free_index // self.page_size)` on a
-        # ~prompt_len-sized int64 tensor. The first such call on AMD ROCm
-        # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms, which
-        # shows up as a mysterious "second-request slow" (Run 1) for
-        # repeated-prompt benchmarks. Running it once at init time moves
-        # that JIT cost to startup. This is a ROCm-only JIT cost, so the
-        # warm-up is gated on _is_hip and skipped on other platforms.
-        if _is_hip and torch.cuda.is_available():
-            try:
-                _warmup = torch.arange(1024, dtype=torch.int64, device=device)
-                _ = torch.unique(_warmup // page_size)
-                torch.cuda.synchronize()
-            except Exception:
-                pass
         self.clear()
 
     def alloc(self, need_size: int):
@@ -262,11 +239,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return out_indices
 
     def free(self, free_index: torch.Tensor):
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        free_page_indices = self._extract_validated_free_page_ids(
+            free_index,
+            page_size=self.page_size,
+        )
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_page_blocks(
+            free_index,
+            free_page_indices,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+        )
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
@@ -276,6 +265,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        return 1, self.num_pages + 1
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.

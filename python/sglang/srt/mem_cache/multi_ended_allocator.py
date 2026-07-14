@@ -260,6 +260,50 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def peer(self) -> Optional[MultiEndedAllocator]:
         return self._peer
 
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        if self.is_id_owner:
+            return self.min_page_index, self.num_pages
+
+        peer = self.peer
+        assert peer is not None and peer.is_id_owner, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}) requires an "
+            "ID-owning peer for free validation"
+        )
+        peer_page_start, peer_page_end = peer._get_free_page_owner_bounds()
+        owner_page_start = max(0, peer_page_start)
+        owner_page_end = min(
+            peer_page_end,
+            self.virtual_to_physical.shape[0] - 1,
+        )
+        assert owner_page_start < owner_page_end, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}) has no virtual page "
+            f"intersection with peer owner domain "
+            f"[{peer_page_start}, {peer_page_end})"
+        )
+        return owner_page_start, owner_page_end
+
+    def _validate_and_extract_free_virtual_pages(
+        self,
+        free_index: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        free_page_ids = self._extract_validated_free_page_ids(
+            free_index,
+            page_size=self.page_size,
+        )
+        if free_index.numel() == 0:
+            return free_page_ids
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_page_blocks(
+            free_index,
+            free_page_ids,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+            live_page_table=self.virtual_to_physical,
+        )
+        return free_page_ids
+
     # -- state --
 
     def clear(self) -> None:
@@ -918,24 +962,26 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     # -- free with eager compaction --
 
     def free(self, free_index: torch.Tensor) -> None:
-        """Free virtual TOKEN ids: recover virtual PAGE ids, un-map v2p/p2v,
+        """Free complete virtual TOKEN page blocks, un-map v2p/p2v,
         (if id-owner) recycle the page ids, trigger eager compaction.
 
-        `free_index` is token-granular and need not be page-aligned. EAGER mode
-        drops one `wait_stream(forward_stream)` barrier so v2p/p2v writes and the
-        compaction move serialize with the in-flight forward. LAZY mode needs no
-        barrier (a freed `v` has no live reader, so the scatters are
-        disjoint-element from any forward read, atomic on Ampere+/Hopper) and
-        defers compaction to `_flush`.
+        EAGER mode drops one `wait_stream(forward_stream)` barrier so v2p/p2v
+        writes and the compaction move serialize with the in-flight forward.
+        LAZY mode needs no barrier (a freed `v` has no live reader, so the
+        scatters are disjoint-element from any forward read, atomic on
+        Ampere+/Hopper) and defers compaction to `_flush`.
         """
         with record_function("MultiEndedAlloc.free"):
-            if free_index is None or free_index.numel() == 0:
+            if free_index is None:
+                return
+            free_v_pages = self._validate_and_extract_free_virtual_pages(free_index)
+            if free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
                 self.free_group.append(free_index)
                 return
             if self.lazy_compaction:
-                self._free_lazy(free_index)
+                self._free_lazy(free_v_pages)
                 return
             # --- EAGER path ---
             # Near-no-op in normal mode (sampling's CPU sync already drained
@@ -945,9 +991,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 with record_function("MultiEndedAlloc.free.wait_stream"):
                     torch.cuda.current_stream().wait_stream(self.forward_stream)
             with record_function("MultiEndedAlloc.free.v2p_lookup"):
-                free_v_pages = torch.unique(
-                    free_index.detach().to(torch.int64) // self.page_size
-                )
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
             with record_function("MultiEndedAlloc.free.sync_check"):
                 # `.item()` forces a CPU/GPU sync — own trace region to measure it.
@@ -960,24 +1003,18 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
 
-    def _free_lazy(self, free_index: torch.Tensor) -> None:
+    def _free_lazy(self, free_v_pages: torch.Tensor) -> None:
         """Lazy free path: disjoint-element scatters + ONE `torch.cat` onto
         `_free_phys_pages`. No sort, no boundary absorb, no watermark mutation,
         no D2H sync. Boundary absorption is deferred to `_flush`.
 
-        ps==1 skips `torch.unique` (token == page and `free_index` is already
-        unique per caller contract); ps>1 needs it to dedup same-page tokens.
-        Callers must not double-free: a tombstone (-1) here would be cat'd onto
-        the free list.
+        `free_v_pages` is the strided representative of validated complete page
+        blocks. Callers must not double-free: a tombstone (-1) here would be
+        cat'd onto the free list.
         """
         self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc._free_lazy"):
             with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
-                free_v_pages_raw = free_index.detach().to(torch.int64)
-                if self.page_size == 1:
-                    free_v_pages = free_v_pages_raw
-                else:
-                    free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
             # Disjoint-element scatters — no barrier (a freed v has no live reader;
             # per-element scatter writes are atomic).
@@ -1821,6 +1858,23 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        return self.full_attn_allocator._get_free_page_owner_bounds()
+
+    def _validate_full_domain_free(
+        self,
+        free_index: torch.Tensor,
+    ) -> None:
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_index(
+            free_index,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+            live_page_table=self.full_attn_allocator.virtual_to_physical,
+        )
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedMambaAlloc.alloc"):
             return self.full_attn_allocator.alloc(need_size)
@@ -1881,7 +1935,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free(self, free_index: torch.Tensor) -> None:
         with record_function("UnifiedMambaAlloc.free"):
-            if free_index is None or free_index.numel() == 0:
+            if free_index is None:
+                return
+            self._validate_full_domain_free(free_index)
+            if free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
                 self.free_group.append(free_index)
@@ -2473,9 +2530,32 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- free --
 
+    def _validate_and_extract_full_domain_free(
+        self,
+        free_index: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        free_page_ids = self._extract_validated_free_page_ids(
+            free_index,
+            page_size=self.page_size,
+        )
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_page_blocks(
+            free_index,
+            free_page_ids,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+            live_page_table=self.full_attn_allocator.virtual_to_physical,
+        )
+        return free_page_ids
+
     def free(self, free_index: torch.Tensor) -> None:
         with record_function("UnifiedSWAAlloc.free"):
-            if free_index is None or free_index.numel() == 0:
+            if free_index is None:
+                return
+            free_v_pages = self._validate_and_extract_full_domain_free(free_index)
+            if free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
                 self.free_group.append(free_index)
@@ -2485,11 +2565,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # (`swa.v2p_page == -1` from an earlier `free_swa`); the full side needs
             # no filter (it's the lifecycle owner, so every value is still bound).
             v = free_index.detach().to(torch.int64)
-            v_pages = v // self.page_size
-            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+            v_blocks = v.reshape(-1, self.page_size)
+            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[free_v_pages]
             # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
-            live_token_mask = swa_v2p_pages > 0
-            live_tokens = v[live_token_mask]
+            live_tokens = v_blocks[swa_v2p_pages > 0].reshape(-1)
             if live_tokens.numel() > 0:
                 self.swa_attn_allocator.free(live_tokens)
             self.full_attn_allocator.free(v)
@@ -2502,15 +2581,18 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ages past the sliding-window horizon. `swa.v2p_page[v_page] = -1` IS the
         tombstone.
         """
-        if free_index is None or free_index.numel() == 0:
+        if free_index is None:
+            return
+        free_v_pages = self._validate_and_extract_full_domain_free(free_index)
+        if free_index.numel() == 0:
             return
         # Keep only tokens whose virtual PAGE is still bound on swa (calling
         # `swa.free` on an already-tombstoned one would assert).
         v = free_index.detach().to(torch.int64)
-        v_pages = v // self.page_size
+        v_blocks = v.reshape(-1, self.page_size)
         # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-        live = v[swa_v2p_pages > 0]
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[free_v_pages]
+        live = v_blocks[swa_v2p_pages > 0].reshape(-1)
         if live.numel() == 0:
             return
         self.swa_attn_allocator.free(live)

@@ -64,16 +64,34 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
+        self._validate_free_index_metadata(free_index, page_size=self.page_size)
+        free_page_indices = self._extract_validated_free_page_ids(
+            free_index,
+            page_size=self.page_size,
+        )
+        owner_page_start, owner_page_end = self._get_free_page_owner_bounds()
+        self._debug_validate_free_page_blocks(
+            free_index,
+            free_page_indices,
+            page_size=self.page_size,
+            owner_page_start=owner_page_start,
+            owner_page_end=owner_page_end,
+        )
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
             if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
+                self.release_pages = torch.cat(
+                    (self.release_pages, free_page_indices)
+                )
             else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
+                self.free_pages = torch.cat((self.free_pages, free_page_indices))
         else:
             self.free_group.append(free_index)
+
+    def _get_free_page_owner_bounds(self) -> tuple[int, int]:
+        return 1, self.size + 1
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
