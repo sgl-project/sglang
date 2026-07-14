@@ -1149,24 +1149,27 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for block in self.transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-                num_replicated_prefix=num_replicated_prefix,
-            )
-        for block in self.single_transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=singles_freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-                num_replicated_prefix=num_replicated_prefix,
-            )
+        run_transformer_blocks = self.begin_spectrum_step()
+        if run_transformer_blocks:
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+            self.spectrum_record_features(hidden_states)
+        else:
+            hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
 
