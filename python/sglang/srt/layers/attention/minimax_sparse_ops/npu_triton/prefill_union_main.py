@@ -59,11 +59,33 @@ from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decod
 # via env MINIMAX_NPU_TRITON_PREFILL_MAIN_BSQ for the sweep.
 _DEFAULT_BSQ_KERNEL = 4
 _DEFAULT_H_TILE = 8
+_MAX_QUERY_HEAD_ROWS = 32
 # Cap on the per-tile union size (power-of-2 constexpr per launch). Adjacent tokens
 # share ~12-14 of 16 topk blocks -> a 4-token tile's union is ~18-24, so 32 covers
 # p99. If the measured union exceeds this, the wrapper falls back to the per-query
 # decode main for that batch (see ``flash_prefill_union_main_bnsd``).
 _MAX_U_MAX = 64
+
+
+def _choose_prefill_h_tile(gqa_group_size: int, bsq_kernel: int) -> int:
+    """Select the largest power-of-two GQA head tile that fits the NPU UB."""
+    assert gqa_group_size > 0
+    assert bsq_kernel > 0
+
+    max_h_tile = min(
+        _DEFAULT_H_TILE,
+        gqa_group_size,
+        _MAX_QUERY_HEAD_ROWS // bsq_kernel,
+    )
+    assert max_h_tile > 0, (
+        f"bsq_kernel={bsq_kernel} exceeds the "
+        f"query-head row limit={_MAX_QUERY_HEAD_ROWS}"
+    )
+
+    h_tile = 1 << (max_h_tile.bit_length() - 1)
+    while gqa_group_size % h_tile:
+        h_tile //= 2
+    return h_tile
 
 
 def _choose_num_union_chunks(
@@ -578,10 +600,13 @@ def flash_prefill_union_main_bnsd(
 
     if h_tile is None:
         # Pick the largest power-of-2 <= gqa_group_size that keeps the tile in UB.
-        # Constraint (default shapes): BSQ*h_tile <= 32.
-        h_tile = _DEFAULT_H_TILE
+        h_tile = _choose_prefill_h_tile(gqa_group_size, bsq_kernel)
     assert gqa_group_size % h_tile == 0, (
         f"h_tile={h_tile} must divide gqa_group_size={gqa_group_size}"
+    )
+    assert bsq_kernel * h_tile <= _MAX_QUERY_HEAD_ROWS, (
+        f"bsq_kernel={bsq_kernel}, h_tile={h_tile} exceeds "
+        f"query-head row limit={_MAX_QUERY_HEAD_ROWS}"
     )
     num_h_tiles = gqa_group_size // h_tile
 
