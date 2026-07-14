@@ -114,7 +114,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
@@ -734,13 +734,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-            if not cuda_graph_fully_disabled():
-                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
-                # intermediate buffers before init_memory_pool() so memory
-                # profiling accounts for them. The buffers are reused by
-                # any captured graph (decode today; widen here so any
-                # future prefill capture path also picks them up).
-                self._init_lora_cuda_graph_moe_buffers()
 
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
@@ -1692,78 +1685,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
         )
-
-    def _init_lora_cuda_graph_moe_buffers(self):
-        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
-
-        Must be called before init_memory_pool() so that memory profiling
-        sees the reduced available memory and sizes KV cache correctly.
-        All MoE LoRA layers share one set of buffers (managed by the
-        lora_backend) since they execute sequentially during forward.
-
-        Phase 2 (dense LoRA batch metadata) is handled later in
-        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-        because it needs capture-time parameters (max_bs, num_tokens_per_req)
-        that are only available at that stage.
-        """
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-
-        max_bs = self.server_args.cuda_graph_config.decode.max_bs
-        max_loras = self.server_args.max_loras_per_batch
-        for module in self.model.modules():
-            if isinstance(module, FusedMoEWithLoRA):
-                self.lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, self.dtype, module
-                )
-                logger.info(
-                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                    f"(max_bs={max_bs}, max_loras={max_loras})"
-                )
-                break
+        if not cuda_graph_fully_disabled():
+            init_lora_cuda_graph_moe_buffers(
+                server_args=self.server_args,
+                model=self.model,
+                lora_manager=self.lora_manager,
+                dtype=self.dtype,
+            )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
-
-        logger.info(
-            f"LoRA adapter loading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        result = self.lora_manager.load_lora_adapter(lora_ref)
-
-        logger.info(
-            f"LoRA adapter loading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return result
+        return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
         self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
     ):
-        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
-        result = self.lora_manager.load_lora_adapter_from_tensors(
+        return self.lora_manager.load_lora_adapter_from_tensors(
             lora_ref, tensors, config_dict, added_tokens_config
         )
-        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
-        return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
-
-        logger.info(
-            f"LoRA adapter unloading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        result = self.lora_manager.unload_lora_adapter(lora_ref)
-
-        logger.info(
-            f"LoRA adapter unloading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return result
+        return self.lora_manager.unload_lora_adapter(lora_ref)
 
     @property
     def effective_max_total_num_tokens(self):
