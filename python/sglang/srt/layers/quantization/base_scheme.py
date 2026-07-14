@@ -19,6 +19,12 @@ class BaseLinearScheme(ABC):
     of different quantization schemes.
     """
 
+    # Schemes whose parameters only implement the v2 loader API
+    # (load_{column,row,merged_column,qkv}_weight) set this so LinearBase
+    # routes them through weight_loader_v2 without flipping the loader for
+    # every scheme that shares the same LinearMethod class.
+    requires_weight_loader_v2: bool = False
+
     @abstractmethod
     def create_weights(self, *args, **kwargs):
         """

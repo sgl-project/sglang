@@ -75,7 +75,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
-    "QuarkLinearMethod",
     "HummingLinearMethod",
 ]
 
@@ -154,6 +153,10 @@ class LinearBase(torch.nn.Module):
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
     """
+
+    # Set by quant methods that attach a per-layer scheme (e.g. Quark) inside
+    # get_quant_method(), which runs before create_weights() picks the loader.
+    scheme = None
 
     def __init__(
         self,
@@ -366,7 +369,13 @@ class ColumnParallelLinear(LinearBase):
             skip_block_quant_check=skip_block_quant_check,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )
@@ -1440,7 +1449,13 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )

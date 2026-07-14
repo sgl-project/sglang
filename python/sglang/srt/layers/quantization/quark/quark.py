@@ -2,6 +2,7 @@
 
 import fnmatch
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
@@ -49,8 +50,12 @@ def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
       - `exclude_modules` - ModelOpt hf_quant_config.json
       - `exclude`         - AMD Quark export
 
-    All three are fnmatch-style (literal strings work too, `fnmatch.translate`
-    produces an anchored regex match). Returns [] if no key present.
+    Entries are usually fnmatch-style (literal strings work too), but ModelOpt
+    `ignore` lists may already carry `re:`-prefixed regexes (e.g.
+    `re:.*linear_attn\\.in_proj_a$`); those are passed through untouched.
+    Wrapping an already-`re:` entry with another `re:` + `fnmatch.translate`
+    yields a pattern that never matches, silently un-excluding the layer.
+    Returns [] if no key present.
     """
     pats = (
         hf_quant_config.get("ignore")
@@ -58,7 +63,7 @@ def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
         or hf_quant_config.get("exclude")
         or []
     )
-    return ["re:" + fnmatch.translate(p) for p in pats]
+    return [p if p.startswith("re:") else "re:" + fnmatch.translate(p) for p in pats]
 
 
 def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"]:
@@ -112,6 +117,103 @@ def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"
             "checkpoints is not supported at this time."
         )
     return None
+
+
+# Target quant specs used when synthesizing a per-layer config for a
+# MIXED_PRECISION source. The MXFP4 spec is the online-requant target shape
+# recognized by `_is_mx_fp4`; the FP8 spec is the per-tensor W8A8 shape
+# recognized by `_is_fp8_w8a8` (no requantization).
+_MXFP4_TARGET_SPEC: Dict[str, Any] = {
+    "weight": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": False,
+        "scale_format": "e8m0",
+    },
+    "input_tensors": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+        "scale_format": "e8m0",
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+_FP8_PER_TENSOR_SPEC: Dict[str, Any] = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_tensor",
+        "is_dynamic": False,
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_tensor",
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
+def _mixed_precision_layer_map(config: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return {layer_name: quant_algo} for a MIXED_PRECISION source, else None.
+
+    Reads ModelOpt's per-layer `quantized_layers` map (from
+    hf_quant_config.json or config.json's quantization_config). Only the
+    quant_algo string per layer is needed;
+    """
+    if (config.get("quant_algo") or "").upper() != "MIXED_PRECISION":
+        return None
+    quantized_layers = config.get("quantized_layers")
+    if not isinstance(quantized_layers, dict) or not quantized_layers:
+        return None
+    layer_map: Dict[str, str] = {}
+    for name, info in quantized_layers.items():
+        if isinstance(info, dict):
+            layer_map[name] = str(info.get("quant_algo", "")).upper()
+    return layer_map
+
+
+def _build_mixed_precision_layer_quant_config(
+    layer_map: Dict[str, str],
+) -> tuple[Dict[str, Any], bool]:
+    """Collapse a per-layer {name: quant_algo} map into a compact
+    `layer_quant_config` keyed by fnmatch glob patterns.
+    """
+    # suffix tail -> set of algos seen (to detect inconsistency)
+    tail_algos: Dict[str, set] = {}
+    for name, algo in layer_map.items():
+        # Suffix after the last `.layers.<idx>.` (or the whole name if
+        # unindexed); this is the part shared across all layer indices.
+        tail = re.split(r"\.layers\.\d+\.", name, maxsplit=1)[-1]
+        tail_algos.setdefault(tail, set()).add(algo)
+
+    layer_quant_config: Dict[str, Any] = {}
+    has_nvfp4 = False
+    for tail, algos in tail_algos.items():
+        if len(algos) != 1:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} has inconsistent "
+                f"quant algos across layers: {sorted(algos)}. SGLang requires "
+                "all layers in a group to share one algo."
+            )
+        algo = next(iter(algos))
+        pattern = "*" + tail
+        if algo in ("NVFP4", "W4A16_NVFP4"):
+            layer_quant_config[pattern] = _MXFP4_TARGET_SPEC
+            has_nvfp4 = True
+        elif algo == "FP8":
+            layer_quant_config[pattern] = _FP8_PER_TENSOR_SPEC
+        else:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} uses unsupported "
+                f"quant algo {algo!r}; online requantization supports NVFP4 "
+                "(-> MXFP4) and FP8 (kept as-is) only."
+            )
+    return layer_quant_config, has_nvfp4
 
 
 logger = logging.getLogger(__name__)
@@ -265,6 +367,34 @@ class QuarkConfig(QuantizationConfig):
         if config.get("requantization_method") == "quark_mxfp4":
             hf_config = config["hf_config"]
 
+            # Mixed-precision source: only the NVFP4 layers are requantized to
+            # MXFP4; layers in other precisions (e.g. FP8) load through their
+            # own scheme
+            layer_map = _mixed_precision_layer_map(config)
+            if layer_map is not None:
+                layer_quant_config, has_nvfp4 = (
+                    _build_mixed_precision_layer_quant_config(layer_map)
+                )
+                if not has_nvfp4:
+                    raise NotImplementedError(
+                        "MIXED_PRECISION checkpoint has no NVFP4 layers to "
+                        "requantize; load it with its native quantization "
+                        "method instead of --quantization quark_mxfp4."
+                    )
+                source_excludes = _parse_nvfp4_excludes(config)
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type,
+                    source_excludes=source_excludes,
+                    layer_quant_config=layer_quant_config,
+                    packed_modules_mapping=config.get("packed_modules_mapping"),
+                )
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=Nvfp4SourceConfig(),
+                )
+
             nvfp4_src = _detect_nvfp4_source(config)
             if nvfp4_src is not None:
                 source_excludes = _parse_nvfp4_excludes(config)
@@ -365,9 +495,16 @@ class QuarkConfig(QuantizationConfig):
     def _create_online_mxfp4_config(
         model_type: str,
         source_excludes: Optional[list[str]] = None,
+        layer_quant_config: Optional[dict[str, Any]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
     ) -> dict[str, Any]:
         """
         Create a synthetic quant_config for online MXFP4 quantization.
+
+        When `layer_quant_config` is provided (mixed-precision source), the
+        per-layer map is authoritative about which layers are quantized and in
+        what precision, so the model_type-specific default excludes
+        are skipped: non-NVFP4 layers must load through their own scheme
         """
         # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
         # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
@@ -380,7 +517,7 @@ class QuarkConfig(QuantizationConfig):
 
         if source_excludes:
             exclude.extend(source_excludes)
-        else:
+        elif layer_quant_config is None:
             # Exclusion for accuracy adapted from
             # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
             if model_type == "deepseek_v3":
@@ -408,7 +545,7 @@ class QuarkConfig(QuantizationConfig):
                 )
 
         return {
-            "packed_modules_mapping": {},
+            "packed_modules_mapping": packed_modules_mapping or {},
             "exclude": exclude,
             "global_quant_config": {
                 "weight": {
@@ -428,7 +565,7 @@ class QuarkConfig(QuantizationConfig):
                 "output_tensors": None,
                 "bias": None,
             },
-            "layer_quant_config": {},
+            "layer_quant_config": layer_quant_config or {},
             "layer_type_quant_config": {},
             "export": {
                 "kv_cache_group": [],

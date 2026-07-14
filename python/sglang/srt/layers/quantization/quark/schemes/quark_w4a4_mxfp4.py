@@ -169,6 +169,10 @@ OCP_MX_BLOCK_SIZE = 32
 
 class QuarkW4A4MXFP4(QuarkLinearScheme):
 
+    # PackedvLLMParameter / ModelWeightParameter (online and NVFP4->MXFP4
+    # paths) only implement the v2 loader API.
+    requires_weight_loader_v2 = True
+
     def __init__(
         self,
         weight_quant_spec: dict[str, Any],
@@ -218,8 +222,8 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
         layer.logical_widths = output_partition_sizes
 
-        # If dequantization_config is provided, we need to dequantize the source
-        # checkpoint to bf16 and re-quantize to MXFP4 at load time.
+        # If dequantization_config is provided, we dequantize the source
+        # checkpoint and re-quantize to MXFP4 at load time.
         if self.dequantization_config is not None:
             if isinstance(self.dequantization_config, Nvfp4SourceConfig):
                 self._create_weights_from_nvfp4(
@@ -383,15 +387,24 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                     # for gate_up_proj, 3 for qkv_proj). Expand to a per-row
                     # scalar matching layer.weight's output dim so it
                     # broadcasts against the per-block scale.
-                    w_s2 = layer.weight_scale_2.repeat_interleave(
+                    per_row_scale_2 = layer.weight_scale_2.repeat_interleave(
                         torch.tensor(
                             layer.logical_widths, device=layer.weight_scale_2.device
                         )
                     ).view(-1, 1)
-                    bf16 = dequantize_nvfp4(layer.weight, layer.weight_scale, w_s2)
-                    qw, qs = dynamic_mxfp4_quant(bf16)
-                    layer.weight = torch.nn.Parameter(qw, requires_grad=False)
-                    layer.weight_scale = torch.nn.Parameter(qs, requires_grad=False)
+                    # Dequantize to fp32: the intermediate feeds straight into the
+                    # MXFP4 requant
+                    dequantized_weight = dequantize_nvfp4(
+                        layer.weight,
+                        layer.weight_scale,
+                        per_row_scale_2,
+                        out_dtype=torch.float32,
+                    )
+                    mxfp4_weight, mxfp4_scale = dynamic_mxfp4_quant(dequantized_weight)
+                    layer.weight = torch.nn.Parameter(mxfp4_weight, requires_grad=False)
+                    layer.weight_scale = torch.nn.Parameter(
+                        mxfp4_scale, requires_grad=False
+                    )
                     del layer.weight_scale_2
                     del layer._load_device
 

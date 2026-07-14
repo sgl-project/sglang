@@ -106,7 +106,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         original_weight_loader = extra_weight_attrs.get("weight_loader")
-        with_bias = extra_weight_attrs.get("with_bias", False)
 
         # Handle source-checkpoint -> MXFP4 requantization at load time.
         if self.dequantization_config is not None:
@@ -268,14 +267,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # FusedMoE's scale loader dispatches on param.quant_method. NVFP4
         # per-block weight_scale -> GROUP; per-tensor weight_scale_2 -> TENSOR.
         # (The packed weight tensors skip that branch, name has no "scale".)
-        for name, p in params.items():
-            layer.register_parameter(name, p)
+        for name, param in params.items():
+            layer.register_parameter(name, param)
             attrs = dict(extra_weight_attrs)
             if name.endswith("weight_scale_2"):
                 attrs["quant_method"] = FusedMoeWeightScaleSupported.TENSOR.value
             elif name.endswith("weight_scale"):
                 attrs["quant_method"] = FusedMoeWeightScaleSupported.GROUP.value
-            set_weight_attrs(p, attrs)
+            set_weight_attrs(param, attrs)
 
         # NVFP4 checkpoints carry per-expert `input_scale` (activation scale)
         # per projection. MXFP4 uses dynamic activation quant; discard them but
@@ -331,13 +330,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             with layer._nvfp4_loading_lock:
                 layer._nvfp4_loaded_numel += counter.copied_numel
                 total = sum(
-                    getattr(layer, n).numel() for n in bulk_names + scale2_names
+                    getattr(layer, name).numel() for name in bulk_names + scale2_names
                 )
                 if layer._nvfp4_loaded_numel == total:
                     self._requantize_nvfp4_to_mxfp4(layer, "w13")
                     self._requantize_nvfp4_to_mxfp4(layer, "w2")
-                    for n in scale2_names:
-                        delattr(layer, n)
+                    for name in scale2_names:
+                        delattr(layer, name)
                     del layer._load_device
 
         return loader
@@ -363,7 +362,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             else:  # w2: single per-expert per-tensor scalar
                 expert_scale_2 = weight_scale_2[expert_idx]
             dequantized_weight = dequantize_nvfp4(
-                packed_weight[expert_idx], weight_scale[expert_idx], expert_scale_2
+                packed_weight[expert_idx],
+                weight_scale[expert_idx],
+                expert_scale_2,
+                out_dtype=torch.float32,
             )
             requantized_weight, requantized_scale = dynamic_mxfp4_quant(
                 dequantized_weight
