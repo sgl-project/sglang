@@ -4071,7 +4071,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req_to_token_pool.alloc([req])
         req.output_ids = array("q")
         req.kv_committed_len = len(tokens)
-        req.kv_allocated_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
