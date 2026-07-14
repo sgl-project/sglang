@@ -175,9 +175,7 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
         queue.tree_cache = SimpleNamespace()
         queue.scheduler = SimpleNamespace(
             enable_hisparse=False,
-            server_args=SimpleNamespace(
-                disaggregation_decode_enable_radix_cache=False
-            ),
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
         )
         queue._uses_swa_tail_prealloc = mock.Mock(return_value=True)
         queue._swa_tail_len = mock.Mock(return_value=126)
