@@ -377,9 +377,7 @@ class TestLMCacheCanonicalStore(unittest.TestCase):
         cache.store_stream = MagicMock()
         cache.lmcache_connector = MagicMock()
         canonical_indices = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
-        canonical_token_ids = (
-            [10, 11, 12, 13, 14] if is_eagle else [10, 11, 12, 13]
-        )
+        canonical_token_ids = [10, 11, 12, 13, 14] if is_eagle else [10, 11, 12, 13]
         cache.insert(
             InsertParams(
                 key=module.RadixKey(
