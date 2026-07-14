@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -524,15 +525,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
-            return
+            return CacheFinishedReqResult(unhandled_kv_start=0)
+
+        allocator_page = self.token_to_kv_pool_allocator.page_size
+        assert self.page_size == allocator_page
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -555,9 +555,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     write_pos_buf[req.mamba_pool_idx] = 0
             if cache_len is None:
                 cache_len = 0
+            unhandled_kv_start = max(cache_len, req.cache_protected_len)
             if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
 
@@ -618,7 +617,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            unhandled_kv_start = req.cache_protected_len
             mamba_exist = True
 
         if mamba_exist:
@@ -639,6 +638,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(unhandled_kv_start=unhandled_kv_start)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

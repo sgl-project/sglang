@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -436,18 +437,17 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return CacheFinishedReqResult(unhandled_kv_start=0)
+
+        allocator_page = self.token_to_kv_pool_allocator.page_size
+        assert self.page_size == allocator_page
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -456,7 +456,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
-        ).page_aligned(self.page_size)
+        ).page_aligned(allocator_page)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
@@ -477,14 +477,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 kv_indices[req.cache_protected_len : key_len]
             )
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-
         self._tag_session_leaf(req, radix_key, node=session_leaf)
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(unhandled_kv_start=key_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

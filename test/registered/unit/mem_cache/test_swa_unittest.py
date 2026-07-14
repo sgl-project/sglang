@@ -636,8 +636,13 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(
+        result = tree.cache_finished_req(
             req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+        )
+        allocator.free(
+            req_to_token_pool.req_to_token[req.req_pool_idx][
+                result.unhandled_kv_start : req._kv_committed_len
+            ]
         )
 
         self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
@@ -670,14 +675,19 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(
+        result = tree.cache_finished_req(
             req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
+        )
+        allocator.free(
+            req_to_token_pool.req_to_token[req2.req_pool_idx][
+                result.unhandled_kv_start : req2._kv_committed_len
+            ]
         )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:
-        #   overlap range [1:5] -> 4
-        #   tail range [5:]     -> 1
+        #   backend overlap range [1:5] -> 4
+        #   caller tail range [5:]      -> 1
         self.assertEqual(freed_lens, [4, 1])
 
 

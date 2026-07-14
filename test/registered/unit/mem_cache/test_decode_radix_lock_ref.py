@@ -46,6 +46,7 @@ def _make_cache_with_pools(page_size=1):
     """Create a RadixCache with mock pools sufficient for cache_unfinished/finished_req."""
     mock_allocator = MagicMock()
     mock_allocator.device = torch.device("cpu")
+    mock_allocator.page_size = page_size
 
     # req_to_token pool: stores kv indices per request slot
     max_seq_len = 64

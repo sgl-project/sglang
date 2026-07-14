@@ -14,6 +14,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 class _FakeAllocator:
     def __init__(self):
+        self.page_size = 1
         self.freed = []
 
     def free(self, indices):
@@ -37,11 +38,32 @@ class TestPureSWAChunkCache(CustomTestCase):
         )
         cache.token_to_kv_pool_allocator = _FakeAllocator()
 
-        cache.cache_finished_req(_FakeReq(), kv_len_to_handle=8)
+        result = cache.cache_finished_req(_FakeReq(), kv_len_to_handle=8)
 
+        self.assertEqual(result.unhandled_kv_start, 8)
         self.assertEqual(len(cache.token_to_kv_pool_allocator.freed), 1)
         freed = cache.token_to_kv_pool_allocator.freed[0]
         self.assertTrue(torch.equal(freed, torch.tensor([0, 1, 2, 6, 7])))
+
+    def test_finished_req_allows_evicted_boundary_past_cacheable_end(self):
+        """An SWA hole extending past K leaves only its live prefix to free."""
+        cache = PureSWAChunkCache.__new__(PureSWAChunkCache)
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(10, dtype=torch.int64).unsqueeze(0)
+        )
+        cache.token_to_kv_pool_allocator = _FakeAllocator()
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            swa_evict_floor=3,
+            kv=SimpleNamespace(swa_evicted_seqlen=10),
+        )
+
+        result = cache.cache_finished_req(req, kv_len_to_handle=8)
+
+        self.assertEqual(result.unhandled_kv_start, 8)
+        self.assertEqual(len(cache.token_to_kv_pool_allocator.freed), 1)
+        freed = cache.token_to_kv_pool_allocator.freed[0]
+        self.assertTrue(torch.equal(freed, torch.tensor([0, 1, 2])))
 
 
 if __name__ == "__main__":
