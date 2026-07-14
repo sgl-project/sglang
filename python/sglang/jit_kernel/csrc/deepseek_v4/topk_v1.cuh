@@ -53,10 +53,10 @@ SGL_DEVICE void naive_transform(
     const int32_t* __restrict__ page_table,
     int32_t* __restrict__ indices,
     int32_t* __restrict__ raw_indices,  // optional: output raw abs position indices
-    const uint32_t length,
+    const int32_t length,               // signed: negative (padded row) fills everything with -1
     const uint32_t page_bits) {
   static_assert(kTopK <= kTopKBlockSize);
-  if (const auto tx = threadIdx.x; tx < length) {
+  if (const auto tx = threadIdx.x; static_cast<int32_t>(tx) < length) {
     indices[tx] = page_to_indices(page_table, tx, page_bits);
     if (raw_indices != nullptr) {
       raw_indices[tx] = tx;
@@ -236,7 +236,11 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   const uint32_t work_id = blockIdx.x;
 
   /// NOTE: dangerous prefetch seq_len before PDL wait
-  const uint32_t seq_len = seq_lens[work_id];
+  // Kept signed: a negative length (DP-padded / idle-companion row) must not
+  // be reinterpreted as a ~4e9-token row (illegal memory access). The signed
+  // trivial-path comparison below routes it to naive_transform, which fills
+  // the whole row with -1 (no non-negative index qualifies).
+  const int32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
   const auto page_ptr = page_table + work_id * page_table_stride;
   const auto indices_ptr = page_indices + work_id * kTopK;
@@ -244,11 +248,11 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  if (seq_len <= kTopK) {
+  if (seq_len <= static_cast<int32_t>(kTopK)) {
     naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
   } else {
     __shared__ int32_t s_topk_indices[kTopK];
-    radix_topk(score_ptr, s_topk_indices, seq_len);
+    radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len));
     static_assert(kTopK <= kTopKBlockSize);
     const auto tx = threadIdx.x;
     if (kTopK == kTopKBlockSize || tx < kTopK) {
