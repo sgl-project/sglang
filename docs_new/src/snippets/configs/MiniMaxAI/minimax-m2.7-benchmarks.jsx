@@ -53,6 +53,9 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 16, num_prompts: 256 },
         ttft_ms: 167, tpot_ms: 31.80, tokens_per_sec_per_gpu: 243 },
     ],
+    // sgl-eval GSM8K, --no-thinking, --max-tokens 8192, tp=2 ep=2.
+    // 1319 examples, 94.31% correct, 7.43% truncated (hitting max_tokens), 0% errors.
+    accuracy: { gsm8k_pct: 94.31 },
   },
   {
     // MI300X ×4 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=4 ep=4 / balanced.
