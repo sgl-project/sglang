@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2, support_triton
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -47,29 +47,168 @@ def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
     req_pool_indices_cpu: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
-    seq_lens_tensor: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    extend_lens_tensor: torch.Tensor,
-    extend_lens_cpu: torch.Tensor,
+    prefix_write_lens_tensor: torch.Tensor,
+    prefix_write_lens_cpu: torch.Tensor,
+    alloc_start_lens_tensor: torch.Tensor,
+    alloc_start_lens_cpu: torch.Tensor,
+    alloc_end_lens_tensor: torch.Tensor,
+    alloc_end_lens_cpu: torch.Tensor,
+    alloc_extend_lens_tensor: torch.Tensor,
+    alloc_extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
-):
+) -> None:
+    req_to_token: torch.Tensor = req_to_token_pool.req_to_token
+    num_reqs: int = req_pool_indices_cpu.shape[0]
+    device_lens: tuple[torch.Tensor, ...] = (
+        prefix_write_lens_tensor,
+        alloc_start_lens_tensor,
+        alloc_end_lens_tensor,
+        alloc_extend_lens_tensor,
+    )
+    cpu_lens: tuple[torch.Tensor, ...] = (
+        prefix_write_lens_cpu,
+        alloc_start_lens_cpu,
+        alloc_end_lens_cpu,
+        alloc_extend_lens_cpu,
+    )
+    device_inputs: tuple[torch.Tensor, ...] = (
+        req_pool_indices_tensor,
+        *device_lens,
+    )
+    cpu_inputs: tuple[torch.Tensor, ...] = (
+        req_pool_indices_cpu,
+        *cpu_lens,
+    )
+
+    assert req_to_token.ndim == 2, f"{req_to_token.shape=}"
+    assert req_to_token.dtype == torch.int32, f"{req_to_token.dtype=}"
+    assert req_to_token.is_contiguous(), f"{req_to_token.stride()=}"
+    assert req_to_token.shape[0] > 0 and req_to_token.shape[1] > 0, (
+        f"{req_to_token.shape=}"
+    )
+    assert out_cache_loc.ndim == 1, f"{out_cache_loc.shape=}"
+    assert out_cache_loc.dtype in (torch.int32, torch.int64), (
+        f"{out_cache_loc.dtype=}"
+    )
+    assert out_cache_loc.is_contiguous(), f"{out_cache_loc.stride()=}"
+    assert out_cache_loc.device == req_to_token.device, (
+        f"{out_cache_loc.device=}, {req_to_token.device=}"
+    )
+    assert all(tensor.ndim == 1 for tensor in device_inputs + cpu_inputs), (
+        f"shapes={[tensor.shape for tensor in device_inputs + cpu_inputs]}"
+    )
+    assert all(
+        tensor.shape == (num_reqs,) for tensor in device_inputs + cpu_inputs
+    ), (
+        f"{num_reqs=}, "
+        f"shapes={[tensor.shape for tensor in device_inputs + cpu_inputs]}"
+    )
+    assert all(
+        tensor.dtype == torch.int64 for tensor in device_inputs + cpu_inputs
+    ), (
+        f"dtypes={[tensor.dtype for tensor in device_inputs + cpu_inputs]}"
+    )
+    assert all(tensor.is_contiguous() for tensor in device_inputs + cpu_inputs), (
+        f"strides={[tensor.stride() for tensor in device_inputs + cpu_inputs]}"
+    )
+    assert all(tensor.device == req_to_token.device for tensor in device_inputs), (
+        f"{req_to_token.device=}, devices={[tensor.device for tensor in device_inputs]}"
+    )
+    assert all(tensor.device.type == "cpu" for tensor in cpu_inputs), (
+        f"devices={[tensor.device for tensor in cpu_inputs]}"
+    )
+    assert len(prefix_tensors) == num_reqs, (
+        f"{len(prefix_tensors)=}, {num_reqs=}"
+    )
+    assert all(tensor.ndim == 1 for tensor in prefix_tensors), (
+        f"shapes={[tensor.shape for tensor in prefix_tensors]}"
+    )
+    assert all(tensor.dtype == torch.int64 for tensor in prefix_tensors), (
+        f"dtypes={[tensor.dtype for tensor in prefix_tensors]}"
+    )
+    assert all(tensor.is_contiguous() for tensor in prefix_tensors), (
+        f"strides={[tensor.stride() for tensor in prefix_tensors]}"
+    )
+
+    assert bool(torch.all(req_pool_indices_cpu >= 0)), f"{req_pool_indices_cpu=}"
+    assert bool(torch.all(req_pool_indices_cpu < req_to_token.shape[0])), (
+        f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
+    )
+    assert bool(torch.all(prefix_write_lens_cpu >= 0)), (
+        f"{prefix_write_lens_cpu=}"
+    )
+    assert bool(torch.all(alloc_start_lens_cpu >= prefix_write_lens_cpu)), (
+        f"{prefix_write_lens_cpu=}, {alloc_start_lens_cpu=}"
+    )
+    assert bool(torch.all(alloc_end_lens_cpu >= alloc_start_lens_cpu)), (
+        f"{alloc_start_lens_cpu=}, {alloc_end_lens_cpu=}"
+    )
+    assert bool(torch.all(alloc_extend_lens_cpu >= 0)), (
+        f"{alloc_extend_lens_cpu=}"
+    )
+    assert bool(torch.all(alloc_end_lens_cpu <= req_to_token.shape[1])), (
+        f"{alloc_end_lens_cpu=}, row_width={req_to_token.shape[1]}"
+    )
+    assert torch.equal(
+        alloc_end_lens_cpu - alloc_start_lens_cpu,
+        alloc_extend_lens_cpu,
+    ), (
+        f"{alloc_start_lens_cpu=}, {alloc_end_lens_cpu=}, "
+        f"{alloc_extend_lens_cpu=}"
+    )
+    alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
+    assert alloc_extend_num_tokens == out_cache_loc.numel(), (
+        f"{alloc_extend_num_tokens=}, "
+        f"out_numel={out_cache_loc.numel()}"
+    )
+    prefix_write_lens: list[int] = prefix_write_lens_cpu.tolist()
+    assert all(
+        tensor.numel() == prefix_write_len
+        for tensor, prefix_write_len in zip(prefix_tensors, prefix_write_lens)
+    ), (
+        f"prefix_numels={[tensor.numel() for tensor in prefix_tensors]}, "
+        f"{prefix_write_lens=}"
+    )
+    assert all(
+        prefix_write_len == 0 or tensor.device == req_to_token.device
+        for tensor, prefix_write_len in zip(prefix_tensors, prefix_write_lens)
+    ), (
+        f"{req_to_token.device=}, "
+        f"prefix_devices={[tensor.device for tensor in prefix_tensors]}"
+    )
+
+    if num_reqs == 0:
+        return
+
     if support_triton(get_server_args().attention_backend):
-        prefix_pointers = torch.tensor(
+        supported_accelerator_types: tuple[str, ...] = (
+            "cuda",
+            "npu",
+            "xpu",
+            "musa",
+        )
+        assert req_to_token.device.type in supported_accelerator_types, (
+            f"{req_to_token.device=}"
+        )
+        assert all(
+            tensor.device.type in supported_accelerator_types
+            for tensor in device_inputs
+        ), f"devices={[tensor.device for tensor in device_inputs]}"
+        prefix_pointers: torch.Tensor = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
-            pin_memory=is_pin_memory_available(req_to_token_pool.device),
-        ).to(req_to_token_pool.device, non_blocking=True)
+            pin_memory=is_pin_memory_available(req_to_token.device),
+        ).to(req_to_token.device, non_blocking=True)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
             req_pool_indices_tensor,
             prefix_pointers,
-            prefix_lens_tensor,
-            seq_lens_tensor,
-            extend_lens_tensor,
+            prefix_write_lens_tensor,
+            alloc_start_lens_tensor,
+            alloc_end_lens_tensor,
+            alloc_extend_lens_tensor,
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
         )
@@ -77,19 +216,20 @@ def write_cache_indices(
         pt = 0
         for i in range(req_pool_indices_cpu.shape[0]):
             req_idx = req_pool_indices_cpu[i].item()
-            prefix_len = prefix_lens_cpu[i].item()
-            seq_len = seq_lens_cpu[i].item()
-            extend_len = extend_lens_cpu[i].item()
+            prefix_write_len = prefix_write_lens_cpu[i].item()
+            alloc_start = alloc_start_lens_cpu[i].item()
+            alloc_end = alloc_end_lens_cpu[i].item()
+            alloc_extend_len = alloc_extend_lens_cpu[i].item()
 
             req_to_token_pool.write(
-                (req_idx, slice(0, prefix_len)),
+                (req_idx, slice(0, prefix_write_len)),
                 prefix_tensors[i],
             )
             req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
+                (req_idx, slice(alloc_start, alloc_end)),
+                out_cache_loc[pt : pt + alloc_extend_len],
             )
-            pt += extend_len
+            pt += alloc_extend_len
 
 
 def gather_out_cache_loc_extend(
@@ -442,13 +582,66 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    prefix_tensors: list[torch.Tensor] = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
-    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    prefix_lens_cpu: torch.Tensor = torch.tensor(
+        batch.prefix_lens, dtype=torch.int64
+    )
+    extend_lens_cpu: torch.Tensor = torch.tensor(
+        batch.extend_lens, dtype=torch.int64
+    )
+    prefix_lens_device: torch.Tensor = prefix_lens_cpu.to(
+        batch.device, non_blocking=True
+    )
+    extend_lens_device: torch.Tensor = extend_lens_cpu.to(
+        batch.device, non_blocking=True
+    )
+    allocator_page: int = _alloc_page_size(batch)
+    uses_aligned_lens: bool = not _is_npu and allocator_page > 1
+    alloc_start_lens_cpu: torch.Tensor
+    alloc_end_lens_cpu: torch.Tensor
+    alloc_extend_lens_cpu: torch.Tensor
+    alloc_start_lens_device: torch.Tensor
+    alloc_end_lens_device: torch.Tensor
+    alloc_extend_lens_device: torch.Tensor
+    if uses_aligned_lens:
+        alloc_start_lens: list[int] = [
+            max(
+                prefix_len,
+                req.kv.kv_allocated_len if req.kv is not None else 0,
+            )
+            for req, prefix_len in zip(batch.reqs, batch.prefix_lens)
+        ]
+        alloc_end_lens: list[int] = [
+            ceil_align(seq_len, allocator_page)
+            for seq_len in batch.seq_lens_cpu.tolist()
+        ]
+        alloc_extend_lens: list[int] = [
+            alloc_end - alloc_start
+            for alloc_start, alloc_end in zip(alloc_start_lens, alloc_end_lens)
+        ]
+        assert all(extend_len >= 0 for extend_len in alloc_extend_lens)
+        alloc_start_lens_cpu = torch.tensor(alloc_start_lens, dtype=torch.int64)
+        alloc_end_lens_cpu = torch.tensor(alloc_end_lens, dtype=torch.int64)
+        alloc_extend_lens_cpu = torch.tensor(alloc_extend_lens, dtype=torch.int64)
+        alloc_start_lens_device = alloc_start_lens_cpu.to(
+            batch.device, non_blocking=True
+        )
+        alloc_end_lens_device = alloc_end_lens_cpu.to(
+            batch.device, non_blocking=True
+        )
+        alloc_extend_lens_device = alloc_extend_lens_cpu.to(
+            batch.device, non_blocking=True
+        )
+    else:
+        alloc_start_lens_cpu = prefix_lens_cpu
+        alloc_end_lens_cpu = batch.seq_lens_cpu
+        alloc_extend_lens_cpu = extend_lens_cpu
+        alloc_start_lens_device = prefix_lens_device
+        alloc_end_lens_device = batch.seq_lens
+        alloc_extend_lens_device = extend_lens_device
+    alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
@@ -458,22 +651,33 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if _alloc_page_size(batch) == 1:
+    if allocator_page == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
+        last_loc: list[torch.Tensor] = []
+        for index, (req, prefix_tensor, alloc_start) in enumerate(
+            zip(batch.reqs, prefix_tensors, alloc_start_lens_cpu.tolist())
+        ):
+            if uses_aligned_lens and req.kv is not None and alloc_start > 0:
+                req_pool_index = req_pool_indices[index]
+                last_loc.append(
+                    batch.req_to_token_pool.req_to_token[
+                        req_pool_index, alloc_start - 1 : alloc_start
+                    ]
+                )
+            elif len(prefix_tensor) > 0:
+                last_loc.append(prefix_tensor[-1:])
+            else:
+                last_loc.append(torch.tensor([-1], device=batch.device))
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            prefix_lens=alloc_start_lens_device,
+            prefix_lens_cpu=alloc_start_lens_cpu,
+            seq_lens=alloc_end_lens_device,
+            seq_lens_cpu=alloc_end_lens_cpu,
             last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
+            extend_num_tokens=alloc_extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
@@ -481,17 +685,19 @@ def alloc_for_extend(
 
     # Write to req_to_token_pool
     write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices_tensor=req_pool_indices_device,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        prefix_write_lens_tensor=prefix_lens_device,
+        prefix_write_lens_cpu=prefix_lens_cpu,
+        alloc_start_lens_tensor=alloc_start_lens_device,
+        alloc_start_lens_cpu=alloc_start_lens_cpu,
+        alloc_end_lens_tensor=alloc_end_lens_device,
+        alloc_end_lens_cpu=alloc_end_lens_cpu,
+        alloc_extend_lens_tensor=alloc_extend_lens_device,
+        alloc_extend_lens_cpu=alloc_extend_lens_cpu,
+        prefix_tensors=prefix_tensors,
+        req_to_token_pool=batch.req_to_token_pool,
     )
 
     gathered: torch.Tensor = gather_out_cache_loc_extend(
@@ -508,7 +714,18 @@ def alloc_for_extend(
         out_dtype=out_cache_loc.dtype,
     )
     if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-        torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+        assert gathered.numel() == batch.extend_num_tokens
+        assert bool(torch.all(gathered != 0))
+        if uses_aligned_lens:
+            for req_pool_index, alloc_start, alloc_end in zip(
+                req_pool_indices,
+                alloc_start_lens_cpu.tolist(),
+                alloc_end_lens_cpu.tolist(),
+            ):
+                allocated_slots = batch.req_to_token_pool.req_to_token[
+                    req_pool_index, alloc_start:alloc_end
+                ]
+                assert bool(torch.all(allocated_slots != 0))
     out_cache_loc = gathered
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
@@ -522,11 +739,14 @@ def alloc_for_extend(
 
     from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+    for req, allocated_len in zip(batch.reqs, alloc_end_lens_cpu.tolist()):
         if req.kv is None:
-            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+            req.kv = ReqKvInfo(
+                kv_allocated_len=allocated_len,
+                swa_evicted_seqlen=0,
+            )
         else:
-            req.kv.kv_allocated_len = seq_len
+            req.kv.kv_allocated_len = allocated_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -593,14 +813,30 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    seq_lens_gpu = batch.seq_lens
-    bs = seq_lens_gpu.shape[0]
+    seq_lens_gpu: torch.Tensor = batch.seq_lens
+    bs: int = seq_lens_gpu.shape[0]
+    allocator_page: int = _alloc_page_size(batch)
+    locs: torch.Tensor
+    locs_cpu: torch.Tensor
+    if batch.model_config.is_encoder_decoder:
+        assert batch.encoder_lens is not None
+        assert batch.encoder_lens_cpu is not None
+        encoder_lens_cpu: torch.Tensor = torch.tensor(
+            batch.encoder_lens_cpu,
+            dtype=batch.seq_lens_cpu.dtype,
+            device=batch.seq_lens_cpu.device,
+        )
+        locs = batch.encoder_lens + seq_lens_gpu
+        locs_cpu = encoder_lens_cpu + batch.seq_lens_cpu
+    else:
+        locs = seq_lens_gpu.clone()
+        locs_cpu = batch.seq_lens_cpu.clone()
 
-    if _alloc_page_size(batch) == 1:
+    if allocator_page == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
-    else:
-        # Paged allocation
+    # Paged allocation
+    elif _is_npu:
         last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, seq_lens_gpu - 1
         ]
@@ -615,22 +851,133 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
             batch=batch,
         )
+    else:
+        assert token_per_req == 1
+        last_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, locs - 1
+        ]
+        seq_lens_next = locs + 1
+        out_cache_loc = alloc_paged_token_slots_decode(
+            tree_cache=batch.tree_cache,
+            seq_lens=seq_lens_next,
+            seq_lens_cpu=locs_cpu + 1,
+            last_loc=last_loc,
+            token_per_req=token_per_req,
+            req_pool_indices=batch.req_pool_indices,
+            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
+            batch=batch,
+        )
 
     # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
+    if allocator_page == 1 or _is_npu:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
+        for req in batch.reqs:
+            req.kv.kv_allocated_len += token_per_req
     else:
-        locs = seq_lens_gpu.clone()
+        allocated_old_cpu: torch.Tensor = torch.tensor(
+            [req.kv.kv_allocated_len for req in batch.reqs],
+            dtype=locs_cpu.dtype,
+            device=locs_cpu.device,
+        )
+        aligned_mask_cpu: torch.Tensor = allocated_old_cpu % allocator_page == 0
+        aligned_end_cpu: torch.Tensor = (
+            (locs_cpu + allocator_page) // allocator_page * allocator_page
+        )
+        crossing_mask_cpu: torch.Tensor = aligned_mask_cpu & (
+            aligned_end_cpu > allocated_old_cpu
+        )
+        transitional_mask_cpu: torch.Tensor = ~aligned_mask_cpu
+        crossing_indices_cpu: torch.Tensor = torch.nonzero(
+            crossing_mask_cpu, as_tuple=False
+        ).flatten()
+        transitional_indices_cpu: torch.Tensor = torch.nonzero(
+            transitional_mask_cpu, as_tuple=False
+        ).flatten()
+        crossing_indices: torch.Tensor = crossing_indices_cpu.to(
+            device=batch.device, non_blocking=True
+        )
+        transitional_indices: torch.Tensor = transitional_indices_cpu.to(
+            device=batch.device, non_blocking=True
+        )
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+        if crossing_indices.numel() > 0:
+            position_offsets: torch.Tensor = torch.arange(
+                allocator_page,
+                dtype=locs.dtype,
+                device=batch.device,
+            )
+            value_offsets: torch.Tensor = torch.arange(
+                allocator_page,
+                dtype=out_cache_loc.dtype,
+                device=batch.device,
+            )
+            crossing_positions: torch.Tensor = (
+                locs[crossing_indices].unsqueeze(1) + position_offsets
+            )
+            crossing_values: torch.Tensor = (
+                out_cache_loc[crossing_indices].unsqueeze(1) + value_offsets
+            )
+            crossing_req_indices: torch.Tensor = batch.req_pool_indices[
+                crossing_indices
+            ].unsqueeze(1)
+            batch.req_to_token_pool.write(
+                (crossing_req_indices, crossing_positions),
+                crossing_values.to(torch.int32),
+            )
+
+        if transitional_indices.numel() > 0:
+            batch.req_to_token_pool.write(
+                (
+                    batch.req_pool_indices[transitional_indices],
+                    locs[transitional_indices],
+                ),
+                out_cache_loc[transitional_indices].to(torch.int32),
+            )
+
+        aligned_allocated_cpu: torch.Tensor = torch.maximum(
+            allocated_old_cpu,
+            aligned_end_cpu,
+        )
+        transitional_allocated_cpu: torch.Tensor = torch.maximum(
+            allocated_old_cpu,
+            locs_cpu + 1,
+        )
+        allocated_next_cpu: torch.Tensor = torch.where(
+            aligned_mask_cpu,
+            aligned_allocated_cpu,
+            transitional_allocated_cpu,
+        )
+        for req, allocated_len in zip(batch.reqs, allocated_next_cpu.tolist()):
+            req.kv.kv_allocated_len = allocated_len
 
     gathered: torch.Tensor = batch.req_to_token_pool.req_to_token[
         batch.req_pool_indices, locs
     ].to(out_cache_loc.dtype)
     if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-        torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+        assert bool(torch.all(gathered != 0))
+        if allocator_page == 1 or _is_npu:
+            torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+        else:
+            if transitional_indices.numel() > 0:
+                torch.testing.assert_close(
+                    gathered[transitional_indices],
+                    out_cache_loc[transitional_indices],
+                    rtol=0,
+                    atol=0,
+                )
+            if crossing_indices.numel() > 0:
+                assert bool(
+                    torch.all(out_cache_loc[crossing_indices] % allocator_page == 0)
+                )
+            for index, req in enumerate(batch.reqs):
+                if bool(aligned_mask_cpu[index]):
+                    assert req.kv.kv_allocated_len % allocator_page == 0
+                    assert req.kv.kv_allocated_len >= ceil_align(
+                        req.kv_committed_len,
+                        allocator_page,
+                    )
     out_cache_loc = gathered
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
@@ -640,9 +987,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
-
-    for req in batch.reqs:
-        req.kv.kv_allocated_len += token_per_req
 
     return out_cache_loc
 
@@ -728,9 +1072,43 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
-    if num_needed_tokens > 0:
-        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+    allocator_page: int = tree_cache.token_to_kv_pool_allocator.page_size
+    allocation_nxt_kv_lens_cpu: torch.Tensor
+    allocation_nxt_kv_lens: torch.Tensor
+    allocation_num_needed_tokens: int
+    if not _is_npu and allocator_page > 1:
+        allocation_nxt_kv_lens_cpu = (
+            (nxt_kv_lens_cpu + allocator_page - 1)
+            // allocator_page
+            * allocator_page
+        )
+        allocation_nxt_kv_lens = (
+            (nxt_kv_lens + allocator_page - 1)
+            // allocator_page
+            * allocator_page
+        )
+        allocation_num_needed_tokens = int(
+            (allocation_nxt_kv_lens_cpu - cur_kv_lens_cpu).sum().item()
+        )
+    else:
+        allocation_nxt_kv_lens_cpu = nxt_kv_lens_cpu
+        allocation_nxt_kv_lens = nxt_kv_lens
+        allocation_num_needed_tokens = num_needed_tokens
+
+    if allocation_nxt_kv_lens_cpu.numel() > 0:
+        max_allocated_len: int = int(allocation_nxt_kv_lens_cpu.max().item())
+        row_width: int = req_to_token_pool.req_to_token.shape[1]
+        assert max_allocated_len <= row_width, (
+            f"spec decode allocation endpoint ({max_allocated_len}) exceeds "
+            f"req_to_token row width ({row_width}); page_size={allocator_page}"
+        )
+
+    if allocation_num_needed_tokens > 0:
+        if allocator_page == 1:
+            out_cache_loc = alloc_token_slots(
+                tree_cache=tree_cache,
+                num_tokens=allocation_num_needed_tokens,
+            )
         else:
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
@@ -742,10 +1120,10 @@ def alloc_for_spec_decode(
                 tree_cache,
                 cur_kv_lens,
                 cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
+                allocation_nxt_kv_lens,
+                allocation_nxt_kv_lens_cpu,
                 last_loc,
-                num_needed_tokens,
+                allocation_num_needed_tokens,
                 req_pool_indices=req_pool_indices,
                 batch=batch,
             )
@@ -755,10 +1133,13 @@ def alloc_for_spec_decode(
             req_pool_indices,
             req_to_token_pool.req_to_token,
             cur_kv_lens,
-            nxt_kv_lens,
+            allocation_nxt_kv_lens,
             out_cache_loc,
             len(reqs),
         )
 
     for i, req in enumerate(reqs):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+        req.kv.kv_allocated_len = max(
+            req.kv.kv_allocated_len,
+            int(allocation_nxt_kv_lens_cpu[i]),
+        )

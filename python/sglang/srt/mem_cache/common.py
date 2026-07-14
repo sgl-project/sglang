@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
@@ -177,18 +179,25 @@ def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     global_server_args = get_global_server_args()
-    page_size = global_server_args.page_size
+    allocator_page = tree_cache.token_to_kv_pool_allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        if _is_npu:
+            assert start_p == end_p, (
+                f"Unexpected overallocated KV cache, {req.kv_committed_len=}, "
+                f"{req.kv.kv_allocated_len=}"
+            )
+        else:
+            assert start_p <= end_p <= ceil_align(start_p, allocator_page), (
+                f"Unexpected overallocated KV cache, {req.kv_committed_len=}, "
+                f"{req.kv.kv_allocated_len=}"
+            )
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+    if allocator_page > 1:
+        start_p = ceil_align(start_p, allocator_page)
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][

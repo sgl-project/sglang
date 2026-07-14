@@ -56,4 +56,5 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
         and (server_args.speculative_eagle_topk or 1) > 1
     ):
         extra = max(extra, get_alloc_reserve_per_decode(server_args))
-    return extra
+    allocator_page: int = server_args.page_size * max(server_args.dcp_size, 1)
+    return extra + allocator_page - 1
