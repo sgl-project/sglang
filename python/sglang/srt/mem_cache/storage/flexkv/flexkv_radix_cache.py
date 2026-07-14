@@ -909,13 +909,18 @@ class FlexKVRadixCache(RadixCache):
         completed_rids = self.flexkv_connector.check_completed_stores()
         if not completed_rids:
             return
-        local_success = True
+        finalization_plan = self.flexkv_connector.prepare_store_finalization(
+            completed_rids
+        )
         with self._node_lock:
+            local_success = True
+            completed_nodes: dict[str, TreeNode] = {}
             for rid in completed_rids:
-                node = self._inflight_store_nodes.pop(rid, None)
+                node = self._inflight_store_nodes.get(rid)
                 if node is None:
                     local_success = False
                     continue
+                completed_nodes[rid] = node
                 try:
                     self.dec_lock_ref(node)
                 except Exception as exc:  # noqa: BLE001
@@ -925,13 +930,27 @@ class FlexKVRadixCache(RadixCache):
                         exc,
                         exc_info=True,
                     )
-        release_consistent = self.flexkv_connector.coordinate_store_owner_release(
-            local_success=local_success
-        )
-        if not release_consistent:
-            reason = "FlexKV store owner release failed on at least one rank"
-            self.flexkv_connector.poison_load_back(reason)
-            raise RuntimeError(reason)
+            try:
+                release_consistent = (
+                    self.flexkv_connector.coordinate_store_owner_release(
+                        local_success=local_success
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                reason = f"FlexKV store owner release coordination failed: {exc}"
+                self.flexkv_connector.poison_load_back(reason)
+                raise
+            if not release_consistent:
+                reason = "FlexKV store owner release failed on at least one rank"
+                self.flexkv_connector.poison_load_back(reason)
+                raise RuntimeError(reason)
+            for rid, node in completed_nodes.items():
+                if self._inflight_store_nodes.get(rid) is not node:
+                    reason = "FlexKV store owner changed during finalization"
+                    self.flexkv_connector.poison_load_back(reason)
+                    raise RuntimeError(reason)
+                self._inflight_store_nodes.pop(rid, None)
+        self.flexkv_connector.commit_store_finalization(finalization_plan)
 
     # ------------------------------------------------------------------
     # Optional pass-throughs used by the scheduler

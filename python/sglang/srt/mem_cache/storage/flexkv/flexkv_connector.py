@@ -95,6 +95,21 @@ class _LayerwiseProducerSelection:
     reason: Optional[str]
 
 
+@dataclass(frozen=True)
+class _InflightFlexKVStore:
+    version: int
+    remaining_task_ids: Tuple[int, ...]
+    successful_task_ids: Tuple[int, ...]
+    terminal_ready: bool
+
+
+@dataclass(frozen=True)
+class _StoreFinalizationPlan:
+    inflight_stores: Dict[str, _InflightFlexKVStore]
+    owner_required: set[str]
+    ambiguous_stores: Dict[str, str]
+
+
 class FlexKVAmbiguousLoadError(RuntimeError):
     pass
 
@@ -273,7 +288,7 @@ class FlexKVConnector:
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []
         # Stores
-        self._inflight_stores: Dict[str, Tuple[int, ...]] = {}
+        self._inflight_stores: Dict[str, _InflightFlexKVStore] = {}
         self._ambiguous_stores: Dict[str, str] = {}
         self._store_owner_required: set[str] = set()
         # Prefetches
@@ -846,7 +861,12 @@ class FlexKVConnector:
 
         local_owner_install_valid = True
         try:
-            self._inflight_stores[rid] = ()
+            self._inflight_stores[rid] = _InflightFlexKVStore(
+                version=0,
+                remaining_task_ids=(),
+                successful_task_ids=(),
+                terminal_ready=False,
+            )
             self._store_owner_required.add(rid)
         except Exception as exc:  # noqa: BLE001
             local_owner_install_valid = False
@@ -891,20 +911,31 @@ class FlexKVConnector:
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
+        self.ensure_load_back_safe()
         tracked_stores = {
-            rid: list(task_ids) for rid, task_ids in self._inflight_stores.items()
+            rid: self._serialize_store_state(state)
+            for rid, state in self._inflight_stores.items()
         }
         outcome = {
             "tracked_stores": tracked_stores,
-            "completed_rids": [],
+            "transitions": {},
             "reason": None,
         }
         if self._sync_ctx.is_sync_leader:
             try:
+                normalized_responses: Dict[int, Any] = {}
+                if any(
+                    not state.terminal_ready and not state.remaining_task_ids
+                    for state in self._inflight_stores.values()
+                ):
+                    raise RuntimeError(
+                        "FlexKV store terminal drain found an unlaunched state"
+                    )
                 observation_task_ids = [
                     task_id
-                    for task_ids in self._inflight_stores.values()
-                    for task_id in task_ids
+                    for state in self._inflight_stores.values()
+                    if not state.terminal_ready
+                    for task_id in state.remaining_task_ids
                 ]
                 if observation_task_ids:
                     if self.kv_manager is None:
@@ -918,65 +949,204 @@ class FlexKVConnector:
                         responses=responses,
                         expected_task_ids=tuple(observation_task_ids),
                     )
-                    completed_rids: List[str] = []
-                    for rid, task_ids in self._inflight_stores.items():
-                        statuses = [
-                            normalized_responses[task_id].status for task_id in task_ids
-                        ]
-                        if statuses and all(
-                            status is KVResponseStatus.SUCCESS for status in statuses
-                        ):
-                            completed_rids.append(rid)
-                        elif any(
-                            status
-                            not in (KVResponseStatus.SUCCESS, KVResponseStatus.TIMEOUT)
-                            for status in statuses
-                        ):
+                transitions = {}
+                for rid, state in self._inflight_stores.items():
+                    if state.terminal_ready:
+                        continue
+                    newly_successful: List[int] = []
+                    remaining_task_ids: List[int] = []
+                    for task_id in state.remaining_task_ids:
+                        status = normalized_responses[task_id].status
+                        if status is KVResponseStatus.SUCCESS:
+                            newly_successful.append(task_id)
+                        elif status is KVResponseStatus.TIMEOUT:
+                            remaining_task_ids.append(task_id)
+                        else:
                             raise RuntimeError(
-                                f"FlexKV store {rid} completed unsuccessfully"
+                                f"FlexKV store {rid} completed with status {status}"
                             )
-                    outcome["completed_rids"] = completed_rids
-            except TimeoutError:
-                pass
+                    successful_task_ids = (
+                        list(state.successful_task_ids) + newly_successful
+                    )
+                    transitions[rid] = {
+                        "old": self._serialize_store_state(state),
+                        "new": {
+                            "version": state.version + 1,
+                            "remaining_task_ids": remaining_task_ids,
+                            "successful_task_ids": successful_task_ids,
+                            "terminal_ready": not remaining_task_ids,
+                        },
+                    }
+                outcome["transitions"] = transitions
             except Exception as exc:  # noqa: BLE001
                 outcome["reason"] = f"FlexKV store terminal wait failed: {exc}"
-        if self._sync_ctx.needs_sync:
-            outcome = self._sync_ctx.scatter(outcome)
+        try:
+            if self._sync_ctx.needs_sync:
+                outcome = self._sync_ctx.scatter(outcome)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV store terminal publication failed: {exc}"
+            self._poison_stores(reason)
+            raise
 
         local_valid = True
-        completed_rids: List[str] = []
+        prepared_states: Dict[str, _InflightFlexKVStore] = {}
         try:
             if not isinstance(outcome, dict):
                 raise ValueError("FlexKV store terminal outcome is invalid")
             if outcome.get("tracked_stores") != tracked_stores:
                 raise ValueError("FlexKV store tracking differs across ranks")
-            completed_rids = outcome.get("completed_rids")
-            if not isinstance(completed_rids, list) or len(set(completed_rids)) != len(
-                completed_rids
-            ):
-                raise ValueError("FlexKV completed store ids are invalid")
-            if any(rid not in self._inflight_stores for rid in completed_rids):
-                raise ValueError("FlexKV completed an untracked store")
             reason = outcome.get("reason")
             if reason is not None and not isinstance(reason, str):
                 raise ValueError("FlexKV store terminal reason is invalid")
+            transitions = outcome.get("transitions")
+            if not isinstance(transitions, dict):
+                raise ValueError("FlexKV store transitions are invalid")
+            if reason is None:
+                expected_transition_rids = {
+                    rid
+                    for rid, state in self._inflight_stores.items()
+                    if not state.terminal_ready
+                }
+                if set(transitions) != expected_transition_rids:
+                    raise ValueError("FlexKV store transitions are incomplete")
+                for rid, transition in transitions.items():
+                    state = self._inflight_stores[rid]
+                    prepared_states[rid] = self._validate_store_transition(
+                        state=state,
+                        transition=transition,
+                    )
         except Exception:  # noqa: BLE001
             local_valid = False
-            completed_rids = []
+            prepared_states = {}
 
-        terminal_valid = self._sync_ctx.all_reduce_min(int(local_valid)) == 1
+        try:
+            terminal_valid = self._sync_ctx.all_reduce_min(int(local_valid)) == 1
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV store terminal validation failed: {exc}"
+            self._poison_stores(reason)
+            raise
         if not terminal_valid:
             reason = "FlexKV store terminal validation differs across ranks"
-            self.poison_load_back(reason)
+            self._poison_stores(reason)
             raise RuntimeError(reason)
         if outcome.get("reason") is not None:
-            self.poison_load_back(str(outcome.get("reason")))
+            self._poison_stores(str(outcome.get("reason")))
             raise RuntimeError(str(outcome.get("reason")))
 
-        for rid in completed_rids:
-            self._inflight_stores.pop(rid, None)
-            self._store_owner_required.discard(rid)
-        return completed_rids
+        local_commit_valid = True
+        try:
+            for rid, state in prepared_states.items():
+                self._inflight_stores[rid] = state
+        except Exception as exc:  # noqa: BLE001
+            local_commit_valid = False
+            logger.warning(
+                "[FlexKV] store terminal transition commit failed: %s",
+                exc,
+                exc_info=True,
+            )
+        try:
+            commit_valid = self._sync_ctx.all_reduce_min(int(local_commit_valid)) == 1
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV store terminal commit failed: {exc}"
+            self._poison_stores(reason)
+            raise
+        if not commit_valid:
+            reason = "FlexKV store terminal transition commit differs across ranks"
+            self._poison_stores(reason)
+            raise RuntimeError(reason)
+
+        return [
+            rid
+            for rid, state in self._inflight_stores.items()
+            if state.terminal_ready
+        ]
+
+    def prepare_store_finalization(
+        self, rids: List[str]
+    ) -> _StoreFinalizationPlan:
+        self.ensure_load_back_safe()
+        local_valid = True
+        plan = _StoreFinalizationPlan(
+            inflight_stores=self._inflight_stores,
+            owner_required=self._store_owner_required,
+            ambiguous_stores=self._ambiguous_stores,
+        )
+        local_manifest: Dict[str, Dict[str, Any]] = {}
+        try:
+            if len(set(rids)) != len(rids):
+                raise ValueError("FlexKV store finalization contains duplicate ids")
+            local_manifest = {
+                rid: self._serialize_store_state(self._inflight_stores[rid])
+                for rid in rids
+            }
+        except Exception as exc:  # noqa: BLE001
+            local_valid = False
+            logger.warning(
+                "[FlexKV] store finalization manifest failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        leader_manifest = local_manifest
+        try:
+            if self._sync_ctx.needs_sync:
+                leader_manifest = self._sync_ctx.scatter(local_manifest)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV store finalization publication failed: {exc}"
+            self._poison_stores(reason)
+            raise
+        try:
+            if not local_valid:
+                raise ValueError("FlexKV store finalization manifest is invalid")
+            if local_manifest != leader_manifest:
+                raise ValueError("FlexKV store finalization differs across ranks")
+            for rid in rids:
+                state = self._inflight_stores[rid]
+                if (
+                    not state.terminal_ready
+                    or state.remaining_task_ids
+                    or rid not in self._store_owner_required
+                    or rid in self._ambiguous_stores
+                ):
+                    raise ValueError("FlexKV store is not ready for finalization")
+            rid_set = set(rids)
+            plan = _StoreFinalizationPlan(
+                inflight_stores={
+                    rid: state
+                    for rid, state in self._inflight_stores.items()
+                    if rid not in rid_set
+                },
+                owner_required=self._store_owner_required - rid_set,
+                ambiguous_stores={
+                    rid: reason
+                    for rid, reason in self._ambiguous_stores.items()
+                    if rid not in rid_set
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            local_valid = False
+            logger.warning(
+                "[FlexKV] store finalization preparation failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            prepare_valid = self._sync_ctx.all_reduce_min(int(local_valid)) == 1
+        except Exception as exc:  # noqa: BLE001
+            reason = f"FlexKV store finalization validation failed: {exc}"
+            self._poison_stores(reason)
+            raise
+        if not prepare_valid:
+            reason = "FlexKV store finalization preparation differs across ranks"
+            self._poison_stores(reason)
+            raise RuntimeError(reason)
+        return plan
+
+    def commit_store_finalization(self, plan: _StoreFinalizationPlan) -> None:
+        self._inflight_stores = plan.inflight_stores
+        self._store_owner_required = plan.owner_required
+        self._ambiguous_stores = plan.ambiguous_stores
 
     # ------------------------------------------------------------------
     # Public API — prefetch
@@ -1112,6 +1282,90 @@ class FlexKVConnector:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _serialize_store_state(state: _InflightFlexKVStore) -> Dict[str, Any]:
+        return {
+            "version": state.version,
+            "remaining_task_ids": list(state.remaining_task_ids),
+            "successful_task_ids": list(state.successful_task_ids),
+            "terminal_ready": state.terminal_ready,
+        }
+
+    def _validate_store_transition(
+        self,
+        *,
+        state: _InflightFlexKVStore,
+        transition: Any,
+    ) -> _InflightFlexKVStore:
+        if not isinstance(transition, dict):
+            raise ValueError("FlexKV store transition is invalid")
+        if transition.get("old") != self._serialize_store_state(state):
+            raise ValueError("FlexKV store transition changed old state identity")
+        new_state = transition.get("new")
+        if not isinstance(new_state, dict):
+            raise ValueError("FlexKV store transition new state is invalid")
+        version = new_state.get("version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, (int, np.integer))
+            or int(version) != state.version + 1
+        ):
+            raise ValueError("FlexKV store transition version is invalid")
+        remaining_task_ids = tuple(
+            self._normalize_task_ids_allow_empty(
+                new_state.get("remaining_task_ids")
+            )
+        )
+        successful_task_ids = tuple(
+            self._normalize_task_ids_allow_empty(
+                new_state.get("successful_task_ids")
+            )
+        )
+        terminal_ready = new_state.get("terminal_ready")
+        if not isinstance(terminal_ready, bool):
+            raise ValueError("FlexKV store terminal-ready state is invalid")
+        if len(set(remaining_task_ids + successful_task_ids)) != len(
+            remaining_task_ids + successful_task_ids
+        ):
+            raise ValueError("FlexKV store transition reused task ids")
+        old_successful = state.successful_task_ids
+        if successful_task_ids[: len(old_successful)] != old_successful:
+            raise ValueError("FlexKV store transition changed successful task ids")
+        newly_successful = successful_task_ids[len(old_successful) :]
+        if set(newly_successful).intersection(remaining_task_ids):
+            raise ValueError("FlexKV store transition task partition overlaps")
+        if set(newly_successful).union(remaining_task_ids) != set(
+            state.remaining_task_ids
+        ):
+            raise ValueError("FlexKV store transition task partition is incomplete")
+        remaining_set = set(remaining_task_ids)
+        successful_set = set(newly_successful)
+        if remaining_task_ids != tuple(
+            task_id
+            for task_id in state.remaining_task_ids
+            if task_id in remaining_set
+        ):
+            raise ValueError("FlexKV store remaining task order changed")
+        if newly_successful != tuple(
+            task_id
+            for task_id in state.remaining_task_ids
+            if task_id in successful_set
+        ):
+            raise ValueError("FlexKV store successful task order changed")
+        if terminal_ready != (not remaining_task_ids):
+            raise ValueError("FlexKV store terminal-ready state is inconsistent")
+        return _InflightFlexKVStore(
+            version=int(version),
+            remaining_task_ids=remaining_task_ids,
+            successful_task_ids=successful_task_ids,
+            terminal_ready=terminal_ready,
+        )
+
+    def _poison_stores(self, reason: str) -> None:
+        for rid in self._inflight_stores:
+            self._ambiguous_stores[rid] = reason
+        self.poison_load_back(reason)
+
     def _launch_store_after_owner_install(
         self,
         *,
@@ -1155,9 +1409,11 @@ class FlexKVConnector:
                 )
                 active_task_ids = {
                     observation_task_id
-                    for active_rid, task_ids in self._inflight_stores.items()
+                    for active_rid, state in self._inflight_stores.items()
                     if active_rid != rid
-                    for observation_task_id in task_ids
+                    for observation_task_id in (
+                        state.remaining_task_ids + state.successful_task_ids
+                    )
                 }
                 if active_task_ids.intersection(observation_task_ids):
                     raise ValueError("FlexKV reused an active store observation id")
@@ -1170,7 +1426,12 @@ class FlexKVConnector:
 
         launch_valid = self._sync_ctx.all_reduce_min(int(local_launch_valid)) == 1
         if launch_valid and launch_outcome.get("reason") is None:
-            self._inflight_stores[rid] = observation_task_ids
+            self._inflight_stores[rid] = _InflightFlexKVStore(
+                version=1,
+                remaining_task_ids=observation_task_ids,
+                successful_task_ids=(),
+                terminal_ready=False,
+            )
             return observation_task_ids[0]
 
         if not launch_valid:
@@ -1180,7 +1441,12 @@ class FlexKVConnector:
             if launch_valid
             else "FlexKV store launch validation differs across ranks"
         )
-        self._inflight_stores[rid] = observation_task_ids
+        self._inflight_stores[rid] = _InflightFlexKVStore(
+            version=1,
+            remaining_task_ids=observation_task_ids,
+            successful_task_ids=(),
+            terminal_ready=False,
+        )
         self._ambiguous_stores[rid] = ambiguous_reason
         self.poison_load_back(ambiguous_reason)
         return task_id
