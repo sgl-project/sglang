@@ -4,7 +4,7 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -99,6 +100,10 @@ class LMCRadixCache(RadixCache):
     pre-allocated GPU slots.
     """
 
+    # MP is the default. To use the in-process layerwise connector,
+    # set ``LMCRadixCache._mode = LMCacheMode.IP`` here.
+    _mode = LMCacheMode.MP
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -108,6 +113,14 @@ class LMCRadixCache(RadixCache):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(params)
+
+        self._mode = type(self)._mode
+        allocator_page_size = self.token_to_kv_pool_allocator.page_size
+        if self._mode is LMCacheMode.IP and allocator_page_size > 1:
+            raise ValueError(
+                "LMCache layerwise transfer currently requires allocator page "
+                "size 1; use LMCache MP mode for page-aligned allocation"
+            )
 
         cli_lmc_cfg = get_global_server_args().lmcache_config_file or ""
 
@@ -135,9 +148,6 @@ class LMCRadixCache(RadixCache):
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
-        # MP is the default. To use the in-process layerwise connector,
-        # set ``self._mode = LMCacheMode.IP`` here.
-        self._mode = LMCacheMode.MP
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
                 raise ValueError(
@@ -327,60 +337,84 @@ class LMCRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
-        load_fn,  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
+        load_fn: Callable[
+            [torch.Tensor, int], int
+        ],  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Alloc slots, run ``load_fn``, attach a TreeNode for what was loaded.
 
         Returns ``(slots, new_node)`` on success, ``None`` if alloc fails
-        or the load returned zero (slots are freed in either case).
+        or the load returns no complete allocator page.
         """
+        allocator_page_size = self.token_to_kv_pool_allocator.page_size
+        if value_numel % allocator_page_size != 0:
+            raise ValueError(
+                "LMCache load-back requires an allocator-page-aligned radix prefix"
+            )
+
         chunk_size = self.lmcache_connector.chunk_size()
         prefix_pad = value_numel % chunk_size
+        allocated_len = ceil_align(uncached_len, allocator_page_size)
 
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(EvictParams(num_tokens=uncached_len))
+        if self.token_to_kv_pool_allocator.available_size() < allocated_len:
+            self.evict(EvictParams(num_tokens=allocated_len))
 
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        token_slots = self.token_to_kv_pool_allocator.alloc(allocated_len)
         if token_slots is None:
             return None
 
         slot_mapping = torch.empty(
-            value_numel + token_slots.numel(),
+            value_numel + uncached_len,
             dtype=torch.int64,
             device=self.device,
         )
         slot_mapping[:value_numel].fill_(-1)
-        slot_mapping[value_numel:].copy_(token_slots)
+        slot_mapping[value_numel:].copy_(token_slots[:uncached_len])
 
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
-        if num_retrieved > 0:
-            self.token_to_kv_pool_allocator.free(
-                token_slots[(num_retrieved - prefix_pad) :]
-            )
-        else:
+        if num_retrieved <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
+            return None
 
-        if num_retrieved > 0:
-            fetched = num_retrieved - prefix_pad
-            new_node = TreeNode(priority=last_node.priority)
-            start = value_numel
-            end = start + fetched
-            new_node.key = key[start:end]
-            new_node.value = token_slots[:fetched]
-            new_node.parent = last_node
-            last_node.children[new_node.key.child_key(self.page_size)] = new_node
-            self.evictable_size_ += fetched
-            self._update_leaf_status(last_node)
-            self._update_leaf_status(new_node)
+        if num_retrieved < prefix_pad:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            raise ValueError(
+                "LMCache retrieved a positive token count smaller than its prefix pad"
+            )
 
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
+        fetched_len = num_retrieved - prefix_pad
+        if fetched_len > uncached_len:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            raise ValueError(
+                "LMCache retrieved more uncached tokens than the load-back request"
+            )
 
-            return token_slots[:fetched], new_node
+        published_len = fetched_len // allocator_page_size * allocator_page_size
+        if published_len == 0:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return None
 
-        return None
+        start = value_numel
+        end = start + published_len
+        new_node = TreeNode(priority=last_node.priority)
+        new_node.key = key[start:end]
+        new_node.value = token_slots[:published_len]
+        new_node.parent = last_node
+
+        if published_len < allocated_len:
+            self.token_to_kv_pool_allocator.free(token_slots[published_len:])
+
+        last_node.children[new_node.key.child_key(self.page_size)] = new_node
+        self.evictable_size_ += published_len
+        self._update_leaf_status(last_node)
+        self._update_leaf_status(new_node)
+
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
+
+        return token_slots[:published_len], new_node
 
     def _mp_load_back(
         self,

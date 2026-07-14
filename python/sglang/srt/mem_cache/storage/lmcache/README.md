@@ -29,7 +29,7 @@ pip install -e . --no-build-isolation
 
 ## Use LMCache
 
-LMCache supports two transport modes. **MP (multi-process, default)** issues a single blocking retrieve over ZMQ to a standalone daemon that owns the KV store and survives SGLang restarts. **IP (in-process)** uses an embedded layerwise connector — the cache lives and dies with the SGLang process. Mode selection is currently a code-level setting in `LMCRadixCache.__init__` (`self._mode`); only MP is reachable by default.
+LMCache supports two transport modes. **MP (multi-process, default)** issues a single blocking retrieve over ZMQ to a standalone daemon that owns the KV store and survives SGLang restarts. **IP (in-process)** uses an embedded layerwise connector — the cache lives and dies with the SGLang process. Mode selection is currently a code-level setting on `LMCRadixCache._mode`; only MP is reachable by default.
 
 ### MP mode (default): multi-process daemon
 
@@ -59,7 +59,9 @@ For full LMCache config options see https://docs.lmcache.ai/api_reference/config
 
 ### IP mode: in-process
 
-Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, edit `LMCRadixCache.__init__` and set `self._mode = LMCacheMode.IP`.
+Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, set `LMCRadixCache._mode = LMCacheMode.IP` in the source.
+
+IP mode currently requires the actual token allocator page size to be 1. Servers that use larger allocator pages must use MP mode. The constructor rejects unsupported IP configurations before reading LMCache configuration, accessing KV buffers, creating CUDA streams, or constructing a connector. Page-size-one IP mode keeps its existing layerwise transfer lifecycle.
 
 The LMCache config still controls chunk_size and storage; `mp_host` / `mp_port` are ignored on this path. Use the bundled `example_config_ip.yaml`:
 
@@ -69,3 +71,9 @@ python -m sglang.launch_server \
   --enable-lmcache \
   --lmcache-config-file example_config_ip.yaml
 ```
+
+## Page-aligned load-back ownership
+
+MP load-back allocates complete pages using the token allocator's actual page size. Only logical uncached destinations are exposed to LMCache; temporary padding slots are never part of the connector mapping. A trailing cache hit that does not fill its final allocator page is discarded after the blocking retrieve relinquishes the mapping.
+
+The radix node key, device indices returned to the scheduler, evictable-size accounting, and eventual node eviction all use the same complete-page prefix. The remaining allocated pages are returned to the allocator exactly once. This keeps every allocator page owned entirely by either the radix node or the allocator, including when the configured storage page size differs from the actual allocator page size.
