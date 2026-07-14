@@ -1300,6 +1300,10 @@ class CommonKVReceiver(BaseKVReceiver):
                     zmq.SNDTIMEO,
                     envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() * 1000,
                 )
+                sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -1415,6 +1419,41 @@ class CommonKVReceiver(BaseKVReceiver):
                 logger.debug(
                     f"Failed to send abort notification for room {self.bootstrap_room} to {peer}: {e}"
                 )
+
+    def _send_multipart_or_fail(
+        self,
+        bootstrap_info: dict,
+        frames: List[bytes],
+        op_name: str,
+    ) -> bool:
+        """Send `frames` to a prefill bootstrap PUSH socket, bounded by SNDTIMEO.
+
+        On zmq.error.Again (peer dead / send buffer full past SNDTIMEO):
+        log once, record a failure reason on this request, mark it Failed,
+        and return False so the caller skips the rest of the fan-out loop.
+        Returns True on success.
+        """
+        sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+        with lock:
+            try:
+                sock.send_multipart(frames)
+                return True
+            except zmq.error.Again:
+                peer = (
+                    f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+                )
+                timeout_s = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                logger.warning_once(
+                    f"{op_name} to prefill {peer} timed out after {timeout_s}s "
+                    "(peer likely dead). Failing affected requests. "
+                    "Tune SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to change this bound."
+                )
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"{op_name} to prefill {peer} timed out after {timeout_s}s",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
