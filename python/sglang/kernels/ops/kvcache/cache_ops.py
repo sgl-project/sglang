@@ -586,6 +586,18 @@ def absorbed_bmm_concat_cast_q_fp8_grouped_kernel(
 _AUTO_NONPOW2_VARIANT = "two_dot"
 
 
+def _qprep_env_variant():
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_Q8KV8_QPREP_VARIANT.get()
+
+
+# Resolved once at import (matches the module-constant style above).  "auto"
+# keeps the per-K dispatch; "cuda" routes every shape to the hand-written
+# SM90 WGMMA kernel (bitwise-identical to two_dot; 1.16-1.38x faster).
+_ENV_QPREP_VARIANT = None
+
+
 def absorbed_bmm_concat_cast_q_fp8(
     q_fp8_pad: "torch.Tensor",
     q_nope: "torch.Tensor",
@@ -668,6 +680,14 @@ def absorbed_bmm_concat_cast_q_fp8(
     assert n_dim % block_n == 0, "N must be a multiple of block_n"
     assert q_nope.stride(2) == 1 and q_rope.stride(2) == 1
     assert q_fp8_pad.stride(2) == 1
+    # Env override for production dispatch (SGLANG_OPT_Q8KV8_QPREP_VARIANT):
+    # "auto" (default) keeps the per-K Triton dispatch; "cuda" routes every
+    # shape to the WGMMA kernel below.
+    global _ENV_QPREP_VARIANT
+    if _ENV_QPREP_VARIANT is None:
+        _ENV_QPREP_VARIANT = _qprep_env_variant()
+    if variant == "auto" and _ENV_QPREP_VARIANT != "auto":
+        variant = _ENV_QPREP_VARIANT
     # Hand-written SM90 WGMMA kernel (opt-in only; "auto" never routes here).
     # Same fp32 -> bf16 -> fp8 epilogue; bitwise identical to "two_dot" on
     # SM90.  Requires K in {128, 192} and the production N-major w_kc layout
