@@ -281,9 +281,7 @@ class SpeculativeAlgorithm(Enum):
 
             return EAGLEWorkerV2
         elif self.is_standalone():
-            from sglang.srt.speculative.standalone_worker_v2 import (
-                StandaloneWorkerV2,
-            )
+            from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 
             return StandaloneWorkerV2
         elif self.is_ngram():
@@ -315,6 +313,13 @@ class SpecInput(ABC):
     # a field and run __post_init__ -> super().__init__ *after* field
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
+    # ragged_verify_layout) so scheduler/relay/attention code reads them
+    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
