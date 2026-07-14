@@ -116,7 +116,7 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_unified_cache_removes_only_shallow_mamba_state(self):
         component, nodes, cache = _build_unified_chain(cap=2)
 
-        component._enforce_path_state_cap(nodes[-1])
+        component._evict_excess_path_states(nodes[-1])
 
         self.assertEqual(cache.evicted, [nodes[0]])
         self.assertEqual(cache.cascaded, [nodes[0]])
@@ -142,7 +142,7 @@ class TestMambaPathStateCap(unittest.TestCase):
         nodes[0].children["fork"] = fork_child
         nodes[1].component_data[ComponentType.MAMBA].lock_ref = 1
 
-        component._enforce_path_state_cap(nodes[-1])
+        component._evict_excess_path_states(nodes[-1])
 
         self.assertEqual(cache.evicted, [nodes[2]])
         self.assertIsNotNone(nodes[0].component_data[ComponentType.MAMBA].value)
@@ -155,7 +155,7 @@ class TestMambaPathStateCap(unittest.TestCase):
         mamba_data = nodes[0].component_data[ComponentType.MAMBA]
         mamba_data.host_value = torch.tensor([10])
 
-        component._enforce_path_state_cap(nodes[-1])
+        component._evict_excess_path_states(nodes[-1])
 
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
@@ -164,7 +164,7 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_unified_cache_negative_one_disables_cap(self):
         component, nodes, cache = _build_unified_chain(cap=-1)
 
-        component._enforce_path_state_cap(nodes[-1])
+        component._evict_excess_path_states(nodes[-1])
 
         self.assertEqual(cache.evicted, [])
         self.assertTrue(

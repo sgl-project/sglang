@@ -137,7 +137,7 @@ class MambaComponent(TreeComponent):
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
-            self._enforce_path_state_cap(node)
+            self._evict_excess_path_states(node)
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
@@ -150,14 +150,14 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
-            self._enforce_path_state_cap(node)
+            self._evict_excess_path_states(node)
             return
         self.cache.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
 
-    def _enforce_path_state_cap(self, tail: UnifiedTreeNode) -> None:
-        """Remove shallow eligible device checkpoints beyond the path cap.
+    def _evict_excess_path_states(self, tail: UnifiedTreeNode) -> None:
+        """Evict shallow eligible device checkpoints beyond the path cap.
 
         Full KV and any existing host backup are retained. The tail, forks,
         locked nodes, and device leaves are preserved, so the cap is a
