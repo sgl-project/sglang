@@ -224,6 +224,33 @@ class TestSWA(unittest.TestCase):
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
 
+    def test_swa_tail_mapping_uses_real_endpoint_and_clears_padding(self):
+        """SWA-tail mapping excludes both the evicted prefix and padded suffix."""
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=24,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        locations = allocator.alloc_extend_swa_tail(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=get_device()),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([12], dtype=torch.int64, device=get_device()),
+            seq_lens_cpu=torch.tensor([12], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=get_device()),
+            extend_num_tokens=12,
+            swa_tail_len=6,
+            swa_tail_end=10,
+        )
+
+        mapping = allocator.full_to_swa_index_mapping[locations.to(torch.int64)]
+        self.assertTrue(torch.all(mapping[:4] == 0))
+        self.assertTrue(torch.all(mapping[4:10] > 0))
+        self.assertTrue(torch.all(mapping[10:] == 0))
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10

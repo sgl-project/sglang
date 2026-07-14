@@ -24,6 +24,10 @@ class _Allocator:
         self.calls.append(kwargs)
         return torch.arange(int(kwargs["extend_num_tokens"]), dtype=torch.int64)
 
+    def alloc_extend_swa_tail(self, **kwargs: object) -> torch.Tensor:
+        self.calls.append(kwargs)
+        return torch.arange(int(kwargs["extend_num_tokens"]), dtype=torch.int64)
+
 
 class TestDecodePreallocPageAligned(unittest.TestCase):
     def test_decode_prealloc_rounds_physical_endpoint(self) -> None:
@@ -66,6 +70,29 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
         self.assertEqual(req.kv.kv_allocated_len, 8)
         self.assertEqual(locations.numel(), 8)
         self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
+
+    def test_decode_prealloc_aligns_swa_tail_around_real_endpoint(self) -> None:
+        """SWA-tail preallocation separates padded capacity from the real endpoint."""
+        allocator = _Allocator()
+        req = SimpleNamespace(kv=None)
+
+        with mock.patch.object(decode, "_is_npu", False):
+            locations = decode.alloc_for_decode_prealloc(
+                req=req,
+                allocator=allocator,
+                total_prefix_len=0,
+                prefix_len=0,
+                prefix_indices=torch.empty((0,), dtype=torch.int64),
+                fill_len=6,
+                delta_len=6,
+                uses_swa_tail=True,
+                swa_tail_len=2,
+            )
+
+        self.assertEqual(req.kv.kv_allocated_len, 8)
+        self.assertEqual(locations.numel(), 8)
+        self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
+        self.assertEqual(allocator.calls[0]["swa_tail_end"], 6)
 
     def test_npu_prealloc_keeps_continuation_length(self) -> None:
         """NPU preallocation retains its existing real-length continuation."""

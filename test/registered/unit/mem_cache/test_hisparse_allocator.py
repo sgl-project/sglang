@@ -36,6 +36,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             last_loc=last_loc,
             extend_num_tokens=512,
             swa_tail_len=128,
+            swa_tail_end=512,
         )
 
         self.assertIs(result, expected)
@@ -48,6 +49,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertIs(kwargs["last_loc"], last_loc)
         self.assertEqual(kwargs["extend_num_tokens"], 512)
         self.assertEqual(kwargs["swa_tail_len"], 128)
+        self.assertEqual(kwargs["swa_tail_end"], 512)
 
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
@@ -76,10 +78,11 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
     def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
-        fill_len = 512
-        swa_tail_len = 128
-        kv_loc = torch.arange(fill_len, dtype=torch.int64)
-        host_indices = torch.arange(1000, 1000 + fill_len, dtype=torch.int64)
+        fill_len = 510
+        allocated_len = 512
+        swa_tail_len = 126
+        kv_loc = torch.arange(allocated_len, dtype=torch.int64)
+        host_indices = torch.arange(1000, 1000 + allocated_len, dtype=torch.int64)
 
         req = SimpleNamespace(
             rid="req-0",
@@ -109,7 +112,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator = SimpleNamespace(
             device=torch.device("cpu"),
             page_size=64,
-            available_size=MagicMock(return_value=fill_len),
+            available_size=MagicMock(return_value=allocated_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )
@@ -142,10 +145,11 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator.alloc_extend_swa_tail.assert_called_once()
         allocator.alloc_logical_only.assert_not_called()
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
-        self.assertEqual(kwargs["extend_num_tokens"], fill_len)
+        self.assertEqual(kwargs["extend_num_tokens"], allocated_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
+        self.assertEqual(kwargs["swa_tail_end"], fill_len)
         self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
-        self.assertEqual(req.kv.kv_allocated_len, fill_len)
+        self.assertEqual(req.kv.kv_allocated_len, allocated_len)
         self.assertEqual(req.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)

@@ -411,6 +411,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         swa_tail_len: int,
+        swa_tail_end: int,
     ):
         return self.logical_attn_allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -420,6 +421,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc=last_loc,
             extend_num_tokens=extend_num_tokens,
             swa_tail_len=swa_tail_len,
+            swa_tail_end=swa_tail_end,
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):

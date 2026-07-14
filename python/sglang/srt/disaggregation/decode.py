@@ -1558,13 +1558,9 @@ def alloc_for_decode_prealloc_hisparse(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    if _is_npu:
-        alloc_fill_len = fill_len
-    elif uses_swa_tail:
-        # TODO(temporary-inside-chain): Align SWA-tail capacity with its padded mapping.
-        alloc_fill_len = fill_len
-    else:
-        alloc_fill_len = ceil_align(fill_len, allocator.page_size)
+    alloc_fill_len = (
+        fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
+    )
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
@@ -1584,6 +1580,7 @@ def alloc_for_decode_prealloc_hisparse(
             last_loc=last_loc,
             extend_num_tokens=alloc_fill_len,
             swa_tail_len=swa_tail_len,
+            swa_tail_end=fill_len,
         )
         req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
     else:
@@ -1610,13 +1607,9 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    if _is_npu:
-        alloc_fill_len = fill_len
-    elif uses_swa_tail:
-        # TODO(temporary-inside-chain): Align SWA-tail capacity with its padded mapping.
-        alloc_fill_len = fill_len
-    else:
-        alloc_fill_len = ceil_align(fill_len, allocator.page_size)
+    alloc_fill_len = (
+        fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
+    )
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
@@ -1638,11 +1631,14 @@ def alloc_for_decode_prealloc(
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                seq_lens=torch.tensor(
+                    [alloc_fill_len], dtype=torch.int64, device=device
+                ),
+                seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
                 last_loc=last_loc,
-                extend_num_tokens=fill_len,
+                extend_num_tokens=alloc_fill_len,
                 swa_tail_len=swa_tail_len,
+                swa_tail_end=fill_len,
             )
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
