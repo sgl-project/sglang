@@ -28,8 +28,8 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
@@ -195,7 +195,9 @@ class SchedulerBatchResultProcessor:
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
             protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
-            if protected_len > 0 and hasattr(self.token_to_kv_pool_allocator, "free_swa"):
+            if protected_len > 0 and hasattr(
+                self.token_to_kv_pool_allocator, "free_swa"
+            ):
                 donated_full_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :protected_len
                 ]

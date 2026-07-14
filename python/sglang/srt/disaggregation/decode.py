@@ -21,8 +21,8 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import time
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -81,13 +81,13 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
