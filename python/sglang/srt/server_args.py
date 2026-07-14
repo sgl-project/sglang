@@ -5697,18 +5697,50 @@ class ServerArgs:
             if self.deepep_mode == "auto":
                 self.deepep_mode = "low_latency"
                 logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
-            # pplx AllToAll requires at least 2 DP groups (world_size > dp_size).
-            assert (
-                resolved_view(self).ep_size >= 2
-            ), "moe_a2a_backend='pplx' requires ep_size >= 2."
-            logger.warning(
-                f"PPLX MoE is enabled. The expert parallel size is adjusted to "
-                f"be the same as the tensor parallel size[{self.tp_size}]."
+            # pplx-kernels' AllToAll needs numDPGroups (== attention dp_size) > 1;
+            # without DP attention numDPGroups == 1 and construction fails deep in
+            # the kernel. This also implies ep_size >= 2.
+            assert resolved_view(self).enable_dp_attention and self.dp_size >= 2, (
+                "moe_a2a_backend='pplx' requires --enable-dp-attention with at "
+                "least 2 DP groups (--dp-size >= 2)."
             )
+            # pplx runs the masked DeepGEMM expert path (sm_90a): reject other
+            # runners and resolve auto -> deep_gemm. Unquantized bf16 pplx needs
+            # an explicit deep_gemm backend, otherwise the expert layer falls
+            # through to the deprecated masked path and asserts at runtime.
+            assert resolved_view(self).moe_runner_backend in ("deep_gemm", "auto"), (
+                "moe_a2a_backend='pplx' is only supported with --moe-runner-backend "
+                "deep_gemm (or auto)."
+            )
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "deep_gemm"
+                logger.warning("auto set moe_runner_backend=`deep_gemm` for PPLX EP")
+            logger.warning(
+                f"PPLX MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+            # Check per-rank dispatch tokens for pplx
+            # Skip validation if chunked prefill is disabled (i.e., size <= 0)
+            # Skip validation if disaggregation mode is decode
+            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+                assert (
+                    self._required_pplx_dispatch_tokens_per_rank()
+                ) <= envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
+                    "SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 128) "
+                    "must be >= the per-rank pplx dispatch tokens "
+                    "(chunked_prefill_size, or the decode cuda-graph batch size)"
+                )
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
         return self.chunked_prefill_size
+
+    def _required_pplx_dispatch_tokens_per_rank(self) -> int:
+        """Max tokens a single rank dispatches through pplx in one forward."""
+        required = self.chunked_prefill_size
+        if self.cuda_graph_max_bs_decode is not None:
+            required = max(required, self.cuda_graph_max_bs_decode)
+        return required
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
