@@ -938,7 +938,8 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_reference"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -995,6 +996,12 @@
                     ]
                   },
                   {
+                    "group": "DeepReinforce",
+                    "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
+                    ]
+                  },
+                  {
                     "group": "Llama",
                     "pages": [
                       "cookbook/autoregressive/Llama/Llama4",
@@ -1016,6 +1023,12 @@
                       "cookbook/autoregressive/GLM/GLM-4.6V",
                       "cookbook/autoregressive/GLM/GLM-4.5",
                       "cookbook/autoregressive/GLM/GLM-4.5V"
+                    ]
+                  },
+                  {
+                    "group": "Meituan",
+                    "pages": [
+                      "cookbook/autoregressive/Meituan/LongCat-2.0"
                     ]
                   },
                   {
@@ -1192,13 +1205,20 @@
                     ]
                   },
                   {
+                    "group": "LongLive",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
-                    "group": "JoyEcho",
+                    "group": "JoyAI-Echo",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
@@ -1240,7 +1260,8 @@
                     "group": "LingBot World",
                     "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LingBot-World/LingBot-World"
+                      "cookbook/diffusion/LingBot-World/LingBot-World",
+                      "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
                     ]
                   },
                   {
@@ -1248,6 +1269,19 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "VLA (Vision-Language-Action) Models",
+                "pages": [
+                  "cookbook/vla/intro",
+                  {
+                    "group": "OpenPI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/OpenPI/Pi0.5"
                     ]
                   }
                 ]

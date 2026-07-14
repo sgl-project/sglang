@@ -39,8 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
@@ -184,7 +183,7 @@ def _update_device_and_sum_field_from_cpu_field(
         cpu_value
         if isinstance(cpu_value, torch.Tensor)
         else torch.tensor(cpu_value, dtype=old_device_value.dtype)
-    ).to(device=get_global_server_args().device, non_blocking=True)
+    ).to(device=get_server_args().device, non_blocking=True)
     setattr(batch, device_field, new_device_value)
 
     if sum_field is not None:
@@ -336,7 +335,7 @@ def compute_split_indices_for_cuda_graph_replay(
 class TboCudaGraphRunnerPlugin:
     def __init__(self):
         self._tbo_children_num_token_non_padded = torch.zeros(
-            (2,), dtype=torch.int32, device=get_global_server_args().device
+            (2,), dtype=torch.int32, device=get_server_args().device
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
@@ -634,7 +633,7 @@ class TboForwardBatchPreparer:
             sum_field=None,
         )
         _, child_b.extend_start_loc = compute_position(
-            get_flags().attn.backend,
+            get_server_args().attention_backend,
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -733,11 +732,10 @@ class TboForwardBatchPreparer:
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
-            "padded_static_len",
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
-            "reuse_mtp_topk_indices",  # forward-level flag, inherited by both child batches
+            "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
         ]:
             output_dict[key] = getattr(batch, key)
 
@@ -760,7 +758,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            get_global_server_args().moe_dense_tp_size == 1
+            get_server_args().moe_dense_tp_size == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index
@@ -835,7 +833,7 @@ class TboForwardBatchPreparer:
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
         return torch.tensor([value_a, value_b], dtype=torch.int32).to(
-            device=get_global_server_args().device, non_blocking=True
+            device=get_server_args().device, non_blocking=True
         )
 
     @classmethod
