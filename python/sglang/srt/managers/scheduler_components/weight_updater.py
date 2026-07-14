@@ -330,6 +330,11 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        # During RL, the following calls to memory_saver_adapter.pause() may pause
+        # inference allocations to make room for training while asynchronous GPU work
+        # is still in flight. Synchronize before their backing memory is unmapped.
+        torch.get_device_module().synchronize()
+
         for tag in tags:
             self.offload_tags.add(tag)
 
@@ -360,8 +365,6 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
-
-        torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
 
