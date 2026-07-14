@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -97,7 +97,7 @@ def start_sidecar(server_args) -> Sidecar:
     assert module_name is not None
     sidecar_args = build_sidecar_args(server_args)
     proc = mp.get_context("spawn").Process(
-        name="sglang_sidecar",
+        name=f"sglang_sidecar_{module_name}",
         target=_run_sidecar,
         args=(module_name, sidecar_args),
     )

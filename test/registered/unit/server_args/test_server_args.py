@@ -1538,10 +1538,8 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(sa.grpc_port, 45000)
 
     def test_sidecar_uses_native_grpc_endpoint(self):
-        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
-        sa._handle_deprecated_args()
         self.assertEqual(
-            build_sidecar_args(sa),
+            build_sidecar_args(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
             ["--sglang-endpoint", "http://127.0.0.1:50051"],
         )
 
