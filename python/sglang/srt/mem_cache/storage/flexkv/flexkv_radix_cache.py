@@ -799,6 +799,7 @@ class FlexKVRadixCache(RadixCache):
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:
             return result
+        self.flexkv_connector.ensure_load_back_safe()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]

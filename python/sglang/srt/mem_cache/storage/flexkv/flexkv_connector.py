@@ -695,6 +695,7 @@ class FlexKVConnector:
         Returns the FlexKV task id of the in-flight store, or -1 if
         nothing needed to be written.
         """
+        self.ensure_load_back_safe()
         local_reason: Optional[str] = None
         token_ids_np = np.empty((0,), dtype=np.int64)
         aligned_kv_indices: Optional[torch.Tensor] = None
