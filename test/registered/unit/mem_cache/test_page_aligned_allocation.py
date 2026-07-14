@@ -241,6 +241,76 @@ class TestPageAlignedAllocation(unittest.TestCase):
         self.assertEqual(gather.call_args.kwargs["extend_num_tokens"], 3)
         self.assertEqual(req.kv.kv_allocated_len, 8)
 
+    def test_extend_npu_preserves_legacy_paged_routing(self) -> None:
+        """NPU extend retains legacy paged allocation and DSV4 state routing."""
+        req = SimpleNamespace(
+            prefix_indices=torch.tensor([11, 12], dtype=torch.int64),
+            kv=SimpleNamespace(kv_allocated_len=2, swa_evicted_seqlen=0),
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((1, 16), dtype=torch.int32),
+            alloc=lambda _: [0],
+        )
+        validate = mock.Mock(side_effect=AssertionError("NPU must bypass main hook"))
+        allocator = SimpleNamespace(
+            page_size=4,
+            validate_main_page_aligned_alloc=validate,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            prefix_lens=[2],
+            extend_lens=[3],
+            extend_num_tokens=3,
+            seq_lens=torch.tensor([5], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+            req_to_token_pool=req_to_token_pool,
+            tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            token_to_kv_pool_allocator=allocator,
+            device=torch.device("cpu"),
+            maybe_evict_swa=mock.Mock(),
+        )
+        physical_slots = torch.tensor([101, 102, 103], dtype=torch.int64)
+        dsv4_state_lens = object()
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocation_module,
+                "alloc_paged_token_slots_extend",
+                return_value=physical_slots,
+            ) as legacy_producer,
+            mock.patch.object(allocation_module, "alloc_token_slots") as direct_producer,
+            mock.patch.object(
+                allocation_module,
+                "_compute_dsv4_state_lens",
+                return_value=dsv4_state_lens,
+            ),
+            mock.patch.object(allocation_module, "write_cache_indices"),
+            mock.patch.object(
+                allocation_module,
+                "gather_out_cache_loc_extend",
+                return_value=physical_slots,
+            ),
+            mock.patch.object(allocation_module, "maybe_write_dsv4_extend"),
+        ):
+            alloc_for_extend(batch)
+
+        validate.assert_not_called()
+        direct_producer.assert_not_called()
+        self.assertEqual(legacy_producer.call_args.kwargs["prefix_lens_cpu"].tolist(), [2])
+        self.assertEqual(legacy_producer.call_args.kwargs["seq_lens_cpu"].tolist(), [5])
+        self.assertEqual(legacy_producer.call_args.kwargs["last_loc"].tolist(), [12])
+        self.assertEqual(legacy_producer.call_args.kwargs["extend_num_tokens"], 3)
+        self.assertEqual(
+            legacy_producer.call_args.kwargs["req_pool_indices"].tolist(),
+            [0],
+        )
+        self.assertIs(
+            legacy_producer.call_args.kwargs["dsv4_state_lens"],
+            dsv4_state_lens,
+        )
+        self.assertIs(legacy_producer.call_args.kwargs["batch"], batch)
+
     def test_decode_direct_allocation_mixes_crossing_and_in_page(self) -> None:
         """Decode allocates one whole page only for the crossing request."""
         batch = _make_decode_batch(
