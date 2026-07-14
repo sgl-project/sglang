@@ -1789,6 +1789,40 @@ class DeepseekV2AttentionMLA(
             and _device_sm >= 90
         )
         self.fused_a_gemm_backend = "auto"
+        # tile_m=32 keeps the fused-A CTA grid to a single SM wave for GLM-5.2's
+        # fused_qkv_a shape (2624, 6144); the DSv3 shape (2112, 7168) and any
+        # other config keep the default tile_m=16 (CUPTI-measured on B300, cold
+        # L2: tile_m=32 wins 1.1-1.3x over both cuBLAS and tile_m=16 for the GLM
+        # shape across M in [1, 16]; unverified elsewhere, so this is an
+        # explicit allowlist rather than a general divisibility check).
+        self.fused_a_gemm_tile_m = (
+            32
+            if self.has_fused_proj
+            and tuple(self.fused_qkv_a_proj_with_mqa.weight.shape) == (2624, 6144)
+            else 16
+        )
+
+        # q_b_proj min-latency GEMM: same fused-A kernel, applied to GLM-5.2's
+        # q_lora_rank -> num_heads*qk_head_dim up-projection. tile_m per shape
+        # is CUPTI-measured on B300 (cold L2, M in [1, 16]): tile_m=16 wins
+        # throughout for the TP8 shape (128 CTAs, single wave); tile_m=32 wins
+        # for TP4 (tile_m=16 there regresses hard past M=8, from 6.4us to
+        # 8.2-8.5us, once the kernel's M<=8 tile_n=8 dispatch switches to
+        # tile_n=16 and the resulting 256-CTA grid straddles two waves).
+        self.has_q_b_proj = hasattr(self, "q_b_proj")
+        q_b_proj_tile_m_by_shape = {(2048, 2048): 16, (4096, 2048): 32}
+        self.q_b_gemm_tile_m = (
+            q_b_proj_tile_m_by_shape.get(tuple(self.q_b_proj.weight.shape))
+            if self.has_q_b_proj
+            else None
+        )
+        self.use_min_latency_q_b_gemm = (
+            self.has_q_b_proj
+            and self.q_b_gemm_tile_m is not None
+            and self.q_b_proj.weight.dtype == torch.bfloat16
+            and _is_cuda
+            and _device_sm >= 90
+        )
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -2016,10 +2050,32 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 self.fused_qkv_a_proj_with_mqa.weight.T,
                 backend=self.fused_a_gemm_backend,
+                tile_m=self.fused_a_gemm_tile_m,
             )
         else:
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         return qkv_latent
+
+    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+        # Same fused-A kernel as prepare_qkv_latent, applied to the q_lora_rank
+        # -> num_heads*qk_head_dim up-projection. See use_min_latency_q_b_gemm /
+        # q_b_gemm_tile_m for the shape allowlist and tile_m choice.
+        lora_active = getattr(self.q_b_proj, "set_lora", False)
+        if (
+            q_lora.shape[0] >= 1
+            and q_lora.shape[0] <= 16
+            and self.use_min_latency_q_b_gemm
+            and not lora_active
+        ):
+            q = dsv3_fused_a_gemm(
+                q_lora,
+                self.q_b_proj.weight.T,
+                backend=self.fused_a_gemm_backend,
+                tile_m=self.q_b_gemm_tile_m,
+            )
+        else:
+            q = self.q_b_proj(q_lora)[0]
+        return q.view(-1, self.num_local_heads, self.qk_head_dim)
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange

@@ -333,7 +333,7 @@ struct MmaComputer {
   static constexpr int k_phase_cnt = per_warp_tile_k / 16;
   static constexpr int m_iter_cnt = (tile_m + 15) / 16;
   static constexpr int n_iter_cnt = (tile_n + 7) / 8;
-  static_assert(m_iter_cnt == 1);
+  static_assert(m_iter_cnt == 1 || m_iter_cnt == 2);
   static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
 
   __device__ MmaComputer(
@@ -357,13 +357,18 @@ struct MmaComputer {
  public:
   __device__ void prepare() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // Fragment addressing is per 16-row ldmatrix tile; m_iter selects the
+    // 16-row half within tile_m.
 #pragma unroll
-    for (int i = 0; i < k_phase_cnt; i++) {
-      int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
-      int m_idx = linear_idx % tile_m;
-      int k_idx = linear_idx / tile_m + warp_k_offset_in_tile_k;
-      k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
-      a_smem_offsets[0][i] = m_idx * tile_k + k_idx;
+    for (int m = 0; m < m_iter_cnt; m++) {
+#pragma unroll
+      for (int i = 0; i < k_phase_cnt; i++) {
+        int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
+        int m_idx = linear_idx % 16 + m * 16;
+        int k_idx = linear_idx / 16 + warp_k_offset_in_tile_k;
+        k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
+        a_smem_offsets[m][i] = m_idx * tile_k + k_idx;
+      }
     }
 #pragma unroll
     for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++) {
@@ -386,10 +391,13 @@ struct MmaComputer {
       wait_barrier(smem_barrier + 0 + stage_idx * 2, phase_bit);
 
 #pragma unroll
-      for (int i = 0; i < k_phase_cnt; i++) {
-        int smem_offset = a_smem_offsets[0][i];
-        bf16_t* smem_ptr_this_iter = smem_a + stage_idx * tile_m * tile_k + smem_offset;
-        ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[0][i]));
+      for (int m = 0; m < m_iter_cnt; m++) {
+#pragma unroll
+        for (int i = 0; i < k_phase_cnt; i++) {
+          int smem_offset = a_smem_offsets[m][i];
+          bf16_t* smem_ptr_this_iter = smem_a + stage_idx * tile_m * tile_k + smem_offset;
+          ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[m][i]));
+        }
       }
 
 #pragma unroll
@@ -406,8 +414,11 @@ struct MmaComputer {
       for (int k_iter_idx = 0; k_iter_idx < k_phase_cnt; k_iter_idx++) {
 #pragma unroll
         for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++) {
-          hmma_16_8_16_f32acc_bf16ab(
-              acc_reg[0][n_iter_idx], a_reg[0][k_iter_idx], b_reg[n_iter_idx][k_iter_idx], acc_reg[0][n_iter_idx]);
+#pragma unroll
+          for (int m = 0; m < m_iter_cnt; m++) {
+            hmma_16_8_16_f32acc_bf16ab(
+                acc_reg[m][n_iter_idx], a_reg[m][k_iter_idx], b_reg[n_iter_idx][k_iter_idx], acc_reg[m][n_iter_idx]);
+          }
         }
       }
       ::arrive_barrier(smem_barrier + 1 + stage_idx * 2);
@@ -421,14 +432,14 @@ struct MmaComputer {
   __device__ void epi() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
-    constexpr int thread_m = 2;
+    constexpr int thread_m = 2 * m_iter_cnt;
     constexpr int thread_n = 2 * n_iter_cnt;
     constexpr int cta_mma_n = n_iter_cnt * 8;
     float acc_reg_reorg[thread_m][thread_n];
 
     for (int i = 0; i < thread_m; i++) {
       for (int j = 0; j < thread_n; j++) {
-        acc_reg_reorg[i][j] = acc_reg[0][j / 2][(j % 2) + (i * 2)];
+        acc_reg_reorg[i][j] = acc_reg[i / 2][j / 2][(j % 2) + (i % 2) * 2];
       }
     }
 
@@ -444,7 +455,7 @@ struct MmaComputer {
     for (int m_idx_thread = 0; m_idx_thread < thread_m; m_idx_thread++) {
 #pragma unroll
       for (int n_idx_thread = 0; n_idx_thread < thread_n; n_idx_thread++) {
-        int m_idx = (lane_idx / 4) + m_idx_thread * 8;
+        int m_idx = (lane_idx / 4) + (m_idx_thread % 2) * 8 + (m_idx_thread / 2) * 16;
         int n_idx = ((lane_idx % 4) * 2) + (n_idx_thread % 2) + (n_idx_thread / 2) * 8;
         smem_c[cosize_smem_c * warp_idx + smem_c_index_func(m_idx, n_idx)] = acc_reg_reorg[m_idx_thread][n_idx_thread];
       }
@@ -472,7 +483,7 @@ struct MmaComputer {
         int m_idx = linear_idx % tile_m;
         int n_idx = linear_idx / tile_m;
         if (m_idx < tile_m && n_idx < gemm_n) {
-          gmem_c[n_idx * gemm_m + m_idx] = acc_final[reg_idx];
+          gmem_c[n_idx * gemm_m + m_idx] = __float2bfloat16(acc_final[reg_idx]);
         }
       }
     }
@@ -510,7 +521,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
   static_assert(gemm_k % tile_k == 0);
   static_assert(gemm_m % tile_m == 0);
   static_assert(tile_k == 128 || tile_k == 256 || tile_k == 512 || tile_k == 1024);
-  static_assert(tile_m == 16);
+  static_assert(tile_m == 16 || tile_m == 32);
   constexpr int g2s_vec_bytes = 16;
   constexpr int a_elem_bytes = 2;
   constexpr int b_elem_bytes = 2;
@@ -558,14 +569,14 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 #endif
 }
 
-template <typename T, int kHdIn, int kHdOut, int kTileN, bool kUsePDL>
+template <typename T, int kHdIn, int kHdOut, int kTileN, int kTileM, bool kUsePDL>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, DLDevice device) {
   constexpr int gemm_m = kHdOut;  // 2112
   int const gemm_n = num_tokens;  // 16
   constexpr int gemm_k = kHdIn;   // 7168
   constexpr int batch_size = 1;
   std::swap(mat_a, mat_b);
-  constexpr int tile_m = 16;
+  constexpr int tile_m = kTileM;
   constexpr int tile_n = kTileN;                        // 8 or 16
   constexpr int tile_k = std::max(256, 1024 / tile_n);  // 256
 #if defined(SGL_CUDA_ARCH) && SGL_CUDA_ARCH >= 1200
@@ -591,8 +602,10 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   host::LaunchKernel(grid, block_size, device, smem_bytes).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
 }
 
-template <int kHdIn, int kHdOut, bool kUsePDL>
+template <int kHdIn, int kHdOut, int kTileM, bool kUsePDL>
 struct DSV3FusedAGemmKernel {
+  static_assert(kHdOut % kTileM == 0, "hd_out must be a multiple of tile_m");
+
   static void
   run(const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b, const tvm::ffi::TensorView output) {
     using namespace host;
@@ -613,7 +626,7 @@ struct DSV3FusedAGemmKernel {
 
     const int num_tokens = static_cast<int>(M.unwrap());
     RuntimeCheck(
-        num_tokens >= 1 && num_tokens <= 16, "dsv3_fused_a_gemm: num_tokens must be in [1, 16], got ", num_tokens);
+        num_tokens >= 1 && num_tokens <= 48, "dsv3_fused_a_gemm: num_tokens must be in [1, 48], got ", num_tokens);
 
     const DLDevice dev = device.unwrap();
     auto* out_ptr = static_cast<bf16_t*>(output.data_ptr());
@@ -621,9 +634,9 @@ struct DSV3FusedAGemmKernel {
     auto* b_ptr = static_cast<bf16_t const*>(mat_b.data_ptr());
 
     if (num_tokens <= 8) {
-      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 8, kUsePDL>(out_ptr, a_ptr, b_ptr, num_tokens, dev);
+      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 8, kTileM, kUsePDL>(out_ptr, a_ptr, b_ptr, num_tokens, dev);
     } else {
-      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 16, kUsePDL>(out_ptr, a_ptr, b_ptr, num_tokens, dev);
+      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 16, kTileM, kUsePDL>(out_ptr, a_ptr, b_ptr, num_tokens, dev);
     }
   }
 };

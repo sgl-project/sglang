@@ -36,6 +36,7 @@ def dsv3_fused_a_gemm(
     mat_b: torch.Tensor,
     output: torch.Tensor | None = None,
     backend: FusedAGemmBackend | str = FusedAGemmBackend.AUTO,
+    tile_m: int = 16,
 ) -> torch.Tensor:
     backend = FusedAGemmBackend(backend)
     if backend == FusedAGemmBackend.AUTO:
@@ -43,10 +44,15 @@ def dsv3_fused_a_gemm(
 
     if backend == FusedAGemmBackend.AOT:
         from sgl_kernel import dsv3_fused_a_gemm as impl
+
+        return impl(mat_a, mat_b, output)
     elif backend == FusedAGemmBackend.JIT:
         from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm as impl
+
+        return impl(mat_a, mat_b, output, tile_m=tile_m)
     else:
         from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
             dsv3_fused_a_gemm as impl,
         )
-    return impl(mat_a, mat_b, output)
+
+        return impl(mat_a, mat_b, output)

@@ -377,9 +377,7 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
+                    q = self.q_b_proj_forward(q)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -397,7 +395,7 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj_forward(q)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
