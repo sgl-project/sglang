@@ -557,19 +557,36 @@ class Indexer(MultiPlatformOp):
         # incorrectly for kv_len > index_topk, so decode skip is gated off during
         # capture and handled separately by graph-variant / eager-fallback (M2).
         fb = forward_batch
-        is_prefill = fb.forward_mode.is_extend_without_speculative()
-        is_decode = fb.forward_mode.is_decode_or_idle() and not get_is_capture_mode()
-        if not (is_prefill or is_decode):
-            return False
-        # seq_lens_cpu can be None on the DSA decode path (needs_cpu_seq_lens=False);
-        # fall back to a GPU reduction (host sync, acceptable in eager).
-        if fb.seq_lens_cpu is not None:
-            max_kv_len = int(fb.seq_lens_cpu.max().item())
-        elif fb.seq_lens is not None:
-            max_kv_len = int(fb.seq_lens.max().item())
-        else:
-            return False
-        return max_kv_len <= self.index_topk
+
+        # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
+        if fb.forward_mode.is_extend_without_speculative():
+            if fb.seq_lens_cpu is None:
+                return False
+            return int(fb.seq_lens_cpu.max().item()) <= self.index_topk
+
+        # Decode/idle.
+        if fb.forward_mode.is_decode_or_idle():
+            if get_is_capture_mode():
+                # Under a captured decode cuda graph the taken branch is frozen at
+                # capture time, so we must NOT branch on a runtime seq_len (also a
+                # host sync would break capture). M2a "static" path: enable only
+                # when the deployment guarantees every request's kv_len<=index_topk
+                # (e.g. i1k/o1k). General/mixed traffic needs the M2b graph-variant
+                # + can_run_graph gating instead.
+                import os
+
+                return os.environ.get("SGLANG_DSA_DECODE_DENSE_GRAPH", "0") == "1"
+            # Eager decode: safe to check per-step (host sync OK); correct for both
+            # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
+            if fb.seq_lens_cpu is not None:
+                max_kv_len = int(fb.seq_lens_cpu.max().item())
+            elif fb.seq_lens is not None:
+                max_kv_len = int(fb.seq_lens.max().item())
+            else:
+                return False
+            return max_kv_len <= self.index_topk
+
+        return False
 
     def _get_q_k_bf16(
         self,
