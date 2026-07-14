@@ -688,11 +688,11 @@ class FlexKVConnector:
             if token_ids_np.ndim != 1 or kv_indices.ndim != 1:
                 raise ValueError("FlexKV store inputs must be one-dimensional")
             if len(token_ids_np) != len(kv_indices):
-                raise ValueError("FlexKV store token ids and indices must have equal length")
+                raise ValueError(
+                    "FlexKV store token ids and indices must have equal length"
+                )
             aligned_len = (
-                len(token_ids_np)
-                // self.storage_page_size
-                * self.storage_page_size
+                len(token_ids_np) // self.storage_page_size * self.storage_page_size
             )
             token_ids_np = token_ids_np[:aligned_len]
             aligned_kv_indices = kv_indices[:aligned_len]
@@ -780,9 +780,7 @@ class FlexKVConnector:
             return -1
         if put_outcome["reason"] is not None:
             if task_id >= 0 and not self._cancel_prelaunch_store(task_id=task_id):
-                self.poison_load_back(
-                    "FlexKV store match failure cancellation failed"
-                )
+                self.poison_load_back("FlexKV store match failure cancellation failed")
             return -1
         if not unmatched_mask.any():
             return -1
@@ -813,9 +811,7 @@ class FlexKVConnector:
         mapping_valid = self._sync_ctx.all_reduce_min(int(local_mapping_valid)) == 1
         if not mapping_valid:
             if not self._cancel_prelaunch_store(task_id=task_id):
-                self.poison_load_back(
-                    "FlexKV store pre-launch cancellation failed"
-                )
+                self.poison_load_back("FlexKV store pre-launch cancellation failed")
             return -1
 
         launch_outcome = {
@@ -915,8 +911,7 @@ class FlexKVConnector:
                     completed_rids: List[str] = []
                     for rid, task_ids in self._inflight_stores.items():
                         statuses = [
-                            normalized_responses[task_id].status
-                            for task_id in task_ids
+                            normalized_responses[task_id].status for task_id in task_ids
                         ]
                         if statuses and all(
                             status is KVResponseStatus.SUCCESS for status in statuses
@@ -1121,8 +1116,7 @@ class FlexKVConnector:
             isinstance(outcome, dict)
             and isinstance(outcome.get("success"), bool)
             and (
-                outcome.get("reason") is None
-                or isinstance(outcome.get("reason"), str)
+                outcome.get("reason") is None or isinstance(outcome.get("reason"), str)
             )
         )
         if self._sync_ctx.all_reduce_min(local_valid) == 0:
