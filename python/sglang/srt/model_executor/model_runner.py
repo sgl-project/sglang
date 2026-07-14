@@ -25,6 +25,10 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mambaish_config,
+)
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -92,6 +96,9 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -112,6 +119,10 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components import misc_utils
+from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
+    compute_post_capture_kv_resize,
+    is_post_capture_kv_active,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
@@ -453,6 +464,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
         )
 
+    def init_kv_cache_configurator(self):
+        self.kv_cache_configurator = KVCacheConfigurator(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            ps=self.ps,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            kv_cache_dtype=self.kv_cache_dtype,
+            page_size=self.page_size,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            post_capture_kv_active=is_post_capture_kv_active(
+                server_args=self.server_args, is_draft_worker=self.is_draft_worker
+            ),
+            dflash_draft_num_layers=self.spec_aux_config.dflash_draft_num_layers,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            use_mla_backend=self.use_mla_backend,
+            mambaish_config=mambaish_config(self.model_config),
+            hybrid_gdn_config=hybrid_gdn_config(self.model_config),
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            num_effective_layers=self.layer_info.num_effective_layers,
+            forward_stream=self.forward_stream,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+        )
+
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -615,6 +655,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
+        self.init_kv_cache_configurator()
         self.init_memory_pool(self.pre_model_load_memory)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
@@ -656,6 +697,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+
+    def post_capture_resize_kv_pool(self):
+        resize = compute_post_capture_kv_resize(self)
+        self.max_total_num_tokens = resize.max_total_num_tokens
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = resize.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = resize.swa_max_total_num_tokens
+        if self.memory_pool_config is not None:
+            self.memory_pool_config.max_total_num_tokens = resize.max_total_num_tokens
+            self.memory_pool_config.full_max_total_num_tokens = (
+                resize.full_max_total_num_tokens
+            )
+            self.memory_pool_config.swa_max_total_num_tokens = (
+                resize.swa_max_total_num_tokens
+            )
+        if resize.capped_max_running_requests is not None:
+            self.max_running_requests = resize.capped_max_running_requests
+            if self.memory_pool_config is not None:
+                self.memory_pool_config.max_running_requests = (
+                    resize.capped_max_running_requests
+                )
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

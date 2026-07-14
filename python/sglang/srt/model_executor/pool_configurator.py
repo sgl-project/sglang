@@ -557,7 +557,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             mr.server_args.disaggregation_decode_extra_slots or 0
         )
-        if mr.enable_hisparse:
+        if mr.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(
