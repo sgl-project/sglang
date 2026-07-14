@@ -152,7 +152,7 @@ class TestHiSparseDirectAllocator(unittest.TestCase):
                 hf_config=SimpleNamespace(
                     model_type="test",
                     architectures=["TestModel"],
-                )
+                ),
             ),
         )
         selected_allocator = object()
@@ -240,9 +240,7 @@ class TestHiSparseDirectAllocator(unittest.TestCase):
         self.assertTrue(SWATokenToKVPoolAllocator.supports_page_aligned_alloc)
         self.assertTrue(SWATokenToKVPoolAllocator.supports_spec_page_aligned_alloc)
         self.assertFalse(PureSWATokenToKVPoolAllocator.supports_page_aligned_alloc)
-        self.assertFalse(
-            PureSWATokenToKVPoolAllocator.supports_spec_page_aligned_alloc
-        )
+        self.assertFalse(PureSWATokenToKVPoolAllocator.supports_spec_page_aligned_alloc)
         pure_swa = object.__new__(PureSWATokenToKVPoolAllocator)
         pure_swa.page_size = 1
         pure_swa.swa_attn_allocator = Mock()

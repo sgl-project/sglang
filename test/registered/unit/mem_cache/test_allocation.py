@@ -186,13 +186,9 @@ class TestNPUAllocationAuthority(unittest.TestCase):
 
         self.assertIs(result, output)
         call_kwargs = paged_entry.call_args.kwargs
-        self.assertTrue(
-            torch.equal(call_kwargs["last_loc"], torch.tensor([5, 42]))
-        )
+        self.assertTrue(torch.equal(call_kwargs["last_loc"], torch.tensor([5, 42])))
         self.assertTrue(torch.equal(call_kwargs["seq_lens"], next_combined_lens))
-        self.assertTrue(
-            torch.equal(call_kwargs["seq_lens_cpu"], next_combined_lens)
-        )
+        self.assertTrue(torch.equal(call_kwargs["seq_lens_cpu"], next_combined_lens))
 
     def test_decode_caller_passes_encoder_offset_combined_endpoints(self) -> None:
         """Encoder-decoder routing passes combined KV endpoints to the NPU entry."""
@@ -266,9 +262,7 @@ class TestNPUAllocationAuthority(unittest.TestCase):
         current_lens = torch.tensor([0, 3], dtype=torch.int64)
         next_lens = torch.tensor([2, 4], dtype=torch.int64)
         batch = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(model_type="test")
-            )
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="test"))
         )
         output = torch.tensor([501, 502, 503], dtype=torch.int64)
 
@@ -291,9 +285,7 @@ class TestNPUAllocationAuthority(unittest.TestCase):
 
         self.assertIs(result, output)
         call_kwargs = paged_entry.call_args.kwargs
-        self.assertTrue(
-            torch.equal(call_kwargs["last_loc"], torch.tensor([-1, 22]))
-        )
+        self.assertTrue(torch.equal(call_kwargs["last_loc"], torch.tensor([-1, 22])))
         self.assertTrue(torch.equal(call_kwargs["prefix_lens"], current_lens))
         self.assertTrue(torch.equal(call_kwargs["prefix_lens_cpu"], current_lens))
         self.assertTrue(torch.equal(call_kwargs["seq_lens"], next_lens))
