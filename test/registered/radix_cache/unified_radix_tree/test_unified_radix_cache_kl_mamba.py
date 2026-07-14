@@ -59,6 +59,8 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
+                "--mamba-max-states-per-path",
+                "3",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
