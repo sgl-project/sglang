@@ -547,12 +547,26 @@ class DeepseekMLAForwardMixin:
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
-        if (
-            self.rotary_emb is not None
-            and (not fuse_rope_for_trtllm_mla)
-            and (not skip_rope_for_dsa_tilelang_fused)
-            and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+
+        force_rope_for_dcp_decode = (
+            get_parallel().dcp_enabled
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and _use_aiter_gfx95
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+        )
+        if self.rotary_emb is not None and (
+            force_rope_for_dcp_decode
+            or (
+                (not fuse_rope_for_trtllm_mla)
+                and (not skip_rope_for_dsa_tilelang_fused)
+                and (not skip_rope_for_aiter_fused_mla)
+                and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+            )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -570,8 +584,20 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if forward_batch.forward_mode.is_decode():
-                # if forward_batch.forward_mode is decode, gather q
+            # aiter spec verify (TARGET_VERIFY, qseqlen>1) uses the same round-robin
+            # CP decode path as plain decode: gather Q across dcp ranks and merge the
+            # per-rank partials via lse (forward_absorb_core), NOT the is_extend()
+            # prefix-KV-gather below. TARGET_VERIFY.is_extend() is True, so it must be
+            # handled before the is_extend() branch.
+            if forward_batch.forward_mode.is_decode() or (
+                _use_aiter
+                and (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            ):
+                # gather q (heads dim); token dim is bs (decode) or bs*qlen (verify/
+                # draft-extend)
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,
@@ -757,6 +783,32 @@ class DeepseekMLAForwardMixin:
                             else {}
                         ),
                     )
+        elif (
+            _use_aiter
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and get_parallel().dcp_enabled
+        ):
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            if llama_4_scaling is not None:
+                q *= llama_4_scaling
+            get_token_to_kv_pool().set_mla_kv_buffer(
+                self.attn_mqa,
+                forward_batch.out_cache_loc,
+                k_nope,
+                k_pe,
+            )
+            attn_output, lse = self.attn_mqa_for_dcp_decode(
+                q,
+                None,
+                None,
+                forward_batch,
+                save_kv_cache=False,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -799,8 +851,18 @@ class DeepseekMLAForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
-        # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+        # correct attn_output with respect to lse from other ranks (decode + aiter
+        # spec verify). The -1 token dim is bs (decode) or bs*draft_num (verify).
+        if (
+            forward_batch.forward_mode.is_decode()
+            or (
+                _use_aiter
+                and (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            )
+        ) and get_parallel().dcp_enabled:
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

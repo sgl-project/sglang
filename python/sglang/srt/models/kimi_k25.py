@@ -682,6 +682,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return
         super().__setattr__(name, value)
 
+    def prepare_context_parallel_metadata_for_dcp(self, *args, **kwargs):
+        return self.language_model.prepare_context_parallel_metadata_for_dcp(
+            *args, **kwargs
+        )
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
