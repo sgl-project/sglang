@@ -3216,6 +3216,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
+        # index_k_with_scale_buffer is page-indexed (dim-0 = num_pages; see
+        # _index_buffer_shape) while tgt_loc/src_loc are per-token locations, so the
+        # per-token copy below is correct only for page_size == 1. Guard fail-fast
+        # (before any move) until the topk>1 tree-draft path needs a page-aware move.
+        if self.page_size != 1:
+            raise NotImplementedError(
+                "DSATokenToKVPool.move_kv_cache does not support page_size > 1 "
+                f"(got page_size={self.page_size}): index_k_with_scale_buffer is "
+                "page-indexed while tgt_loc/src_loc are token locations. Implement a "
+                "page-aware move before enabling tree-drafting (topk>1) on DSA."
+            )
+
         super().move_kv_cache(tgt_loc, src_loc)
 
         if tgt_loc.numel() == 0:
