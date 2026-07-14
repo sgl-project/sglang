@@ -19,10 +19,12 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 logger = logging.getLogger(__name__)
 
 # Ratio of auxiliary-state slots to concurrently running requests on hybrid /
-# linear-attention models. Each running request holds one live slot
-# (MlxAuxiliaryStateReqToTokenPool.alloc), and the headroom covers radix-held
-# snapshots. Used for BOTH the default pool sizing and the concurrency bound
-# in _resolve_max_running_requests so the two cannot drift apart.
+# linear-attention models when the radix cache is enabled. Each running
+# request holds one live slot (MlxAuxiliaryStateReqToTokenPool.alloc); the
+# headroom covers radix-held snapshots and chunk track buffers. Used for BOTH
+# the default pool sizing and the concurrency bound in
+# _resolve_max_running_requests so the two cannot drift apart. See
+# _aux_state_slots_per_request for the radix-disabled case.
 MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 4
 
 
@@ -126,6 +128,20 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
+    def _aux_state_slots_per_request(self) -> int:
+        """Auxiliary-state slots to reserve per concurrently running request.
+
+        Mirrors ``ModelRunnerKVCacheMixin._calculate_mamba_ratio``: with the
+        radix cache disabled there are no radix-held snapshots (the MLX
+        prefill path returns before any tracked-state store), so each live
+        request holds exactly one slot. MLX's auxiliary pool does not support
+        the mamba extra-buffer modes (``enable_mamba_extra_buffer`` is
+        rejected at pool construction), so no additional ratio term applies.
+        """
+        if self.server_args.disable_radix_cache:
+            return 1
+        return MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+
     def _resolve_max_running_requests(self) -> int:
         """Concurrency cap handed to the scheduler.
 
@@ -153,7 +169,7 @@ class MlxModelRunnerStub(ModelRunner):
 
         aux_state_size = self.server_args.max_mamba_cache_size
         if self.mambaish_config is not None and aux_state_size is not None:
-            ratio = MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+            ratio = self._aux_state_slots_per_request()
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
                 raise RuntimeError(
@@ -217,8 +233,7 @@ class MlxModelRunnerStub(ModelRunner):
             auxiliary_state_size = self.server_args.max_mamba_cache_size
             if auxiliary_state_size is None:
                 auxiliary_state_size = (
-                    self.max_running_requests
-                    * MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+                    self.max_running_requests * self._aux_state_slots_per_request()
                 )
             self.req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
                 size=self.max_running_requests,

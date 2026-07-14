@@ -52,6 +52,7 @@ def _stub(
     dp_size=1,
     hybrid=False,
     max_mamba_cache_size=None,
+    disable_radix_cache=False,
 ):
     """A stub carrying only what _resolve_max_running_requests reads."""
     cls = _HybridStub if hybrid else _PlainStub
@@ -59,13 +60,16 @@ def _stub(
     stub.server_args = SimpleNamespace(
         max_running_requests=max_running_requests,
         max_mamba_cache_size=max_mamba_cache_size,
+        disable_radix_cache=disable_radix_cache,
     )
     stub.max_total_num_tokens = max_total_num_tokens
     stub.dp_size = dp_size
     return stub
 
 
-def _hybrid_stub_for_initialize(max_running_requests, max_mamba_cache_size, pool=100):
+def _hybrid_stub_for_initialize(
+    max_running_requests, max_mamba_cache_size, pool=100, disable_radix_cache=False
+):
     """A stub carrying what the real initialize() reads (hybrid path)."""
     stub = _HybridStub.__new__(_HybridStub)
     stub._mlx_pool_size = pool
@@ -74,6 +78,7 @@ def _hybrid_stub_for_initialize(max_running_requests, max_mamba_cache_size, pool
         enable_memory_saver=False,
         max_running_requests=max_running_requests,
         max_mamba_cache_size=max_mamba_cache_size,
+        disable_radix_cache=disable_radix_cache,
     )
     stub.model_config = SimpleNamespace(
         is_hybrid_swa=False,
@@ -173,6 +178,22 @@ class TestMlxHybridAuxStateBound(CustomTestCase):
             8,
         )
 
+    def test_radix_disabled_uses_one_slot_per_request(self):
+        # With --disable-radix-cache there are no radix-held snapshots to
+        # reserve headroom for: each live request holds exactly one auxiliary
+        # slot, so max_mamba_cache_size=8 backs all 8 requests (the fixed
+        # RATIO would wrongly cut this to 8 // RATIO).
+        self.assertEqual(
+            _stub(
+                8,
+                100_000,
+                hybrid=True,
+                max_mamba_cache_size=8,
+                disable_radix_cache=True,
+            )._resolve_max_running_requests(),
+            8,
+        )
+
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxHybridInitializeAllocation(CustomTestCase):
@@ -199,6 +220,33 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "max_mamba_cache_size"):
             stub.initialize()
+
+    def test_radix_disabled_backs_every_request_slot_one_to_one(self):
+        # Reviewer repro: with --disable-radix-cache, size=8 aux slots must
+        # back all 8 request slots (one live slot each) instead of being cut
+        # to 8 // RATIO by snapshot headroom that can never be used.
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=8,
+            max_mamba_cache_size=8,
+            disable_radix_cache=True,
+        )
+        stub.initialize()
+        self.assertEqual(stub.max_running_requests, 8)
+        pool = stub.req_to_token_pool
+        for _ in range(stub.max_running_requests):
+            self.assertIsNotNone(pool.alloc([_fake_req()]))
+
+    def test_radix_disabled_default_sizing_is_one_to_one(self):
+        # Drift guard for the no-radix path: with the flag unset the aux pool
+        # is sized with the same 1x ratio the bound uses.
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=3,
+            max_mamba_cache_size=None,
+            disable_radix_cache=True,
+        )
+        stub.initialize()
+        self.assertEqual(stub.max_running_requests, 3)
+        self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
     def test_default_aux_sizing_uses_shared_ratio(self):
         # Drift guard: with the flag unset, initialize() sizes the aux pool
