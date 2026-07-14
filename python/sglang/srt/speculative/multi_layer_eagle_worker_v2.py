@@ -13,11 +13,13 @@
 # ==============================================================================
 
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import replace
+from typing import TYPE_CHECKING, List
 
 import torch
 
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -92,20 +94,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: int,
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moe_ep_rank = moe_ep_rank
+        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.draft_extend_attn_backend_list = []
@@ -136,12 +132,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,  # spec workers don't support pipeline parallelism
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -665,11 +657,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -695,11 +683,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self._draft_worker = MultiLayerEagleDraftWorker(
             server_args,
             gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
+            ps,
             nccl_port,
             target_worker,
         )
@@ -884,7 +868,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         for i in range(self.speculative_num_steps):
             success, message = self._draft_worker.draft_runner_list[
                 i
-            ].update_weights_from_disk(
+            ].weight_updater.update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
                 recapture_cuda_graph=recv_req.recapture_cuda_graph,
@@ -897,7 +881,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         for i in range(self.speculative_num_steps):
             success, message = self._draft_worker.draft_runner_list[
                 i
-            ].update_weights_from_ipc(recv_req)
+            ].weight_updater.update_weights_from_ipc(recv_req)
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
