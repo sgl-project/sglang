@@ -4509,8 +4509,8 @@ class ServerArgs:
             "GigaChat35ForCausalLM",
             "GigaChat35ForCausalLMNextN",
         ):
-            # EAGLE multi-layer moved to the override registry
-            # (arg_groups/overrides.py: _gigachat35_overrides).
+            # EAGLE multi-layer + shared-experts-fusion disable moved to the
+            # override registry (arg_groups/overrides.py: _gigachat35_overrides).
             pass
         elif (
             model_arch in ("Llama4ForConditionalGeneration", "Llama4ForCausalLM")

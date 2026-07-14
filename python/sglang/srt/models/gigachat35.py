@@ -25,10 +25,6 @@ import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -42,7 +38,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, make_layers
 
 _GATED_NORM_LOW_RANK = 16
@@ -309,8 +305,8 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("attn_gate", prefix),
-                tp_rank=get_attention_tp_rank(),
-                tp_size=get_attention_tp_size(),
+                tp_rank=get_parallel().attn_tp_rank,
+                tp_size=get_parallel().attn_tp_size,
             )
             self.o_proj.register_forward_pre_hook(self._o_proj_gate_hook)
 
@@ -487,15 +483,17 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             hidden_states, residual, forward_batch
         )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion=False,
-            use_reduce_scatter=use_reduce_scatter,
-        )
+        # Unlike deepseek_v2, no moe_output_buffer_ctx here: non-inplace MoE
+        # runners then allocate their output per forward instead of recycling
+        # the layer-input buffer. The default (inplace) runners are unaffected.
+        with get_forward().scoped(
+            fuse_mlp_allreduce=False,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if self.post_feedforward_layernorm is not None:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
@@ -609,7 +607,6 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
-        get_global_server_args().disable_shared_experts_fusion = True
         self.num_fused_shared_experts = 0
 
         self.model = GigaChat35Model(
@@ -621,7 +618,7 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = None

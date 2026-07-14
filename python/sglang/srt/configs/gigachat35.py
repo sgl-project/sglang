@@ -208,7 +208,7 @@ class GigaChat35Config(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.runtime_context import get_parallel
 
         missing = [a for a in _REQUIRED_LINEAR_ATTRS if getattr(self, a, None) is None]
         if missing:
@@ -218,7 +218,7 @@ class GigaChat35Config(PretrainedConfig):
             )
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,
