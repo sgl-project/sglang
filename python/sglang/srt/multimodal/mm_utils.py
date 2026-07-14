@@ -33,7 +33,7 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Literal
+from typing import Callable, Literal, Optional
 
 import numpy as np
 import pybase64
@@ -470,10 +470,13 @@ def run_dp_sharded_vision_model(
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
-    pixel_values: torch.Tensor,
+    pixel_values: Optional[torch.Tensor],
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
+    pixel_values_device: Optional[torch.device] = None,
+    pixel_values_dtype: Optional[torch.dtype] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -497,14 +500,29 @@ def run_dp_sharded_mrope_vision_model(
         ```
         vision_model.out_hidden_size = 64
         vision_model.spatial_merge_size = 2
-        pixel_values.shape = (1350, channel)
+        pixel_values.shape = (1350, channel), or a local loader supplies
+        per-image features after the data-parallel assignment is known.
         grid_thw_list = [[1, 10, 100], [1, 10, 10], [1, 10, 20], [1, 50]]
         tp_size = 2
         ```
 
     """
+    if pixel_values is None and load_local_pixel_values is None:
+        raise ValueError("pixel_values or load_local_pixel_values must be provided")
+
+    input_device = (
+        pixel_values.device if pixel_values is not None else pixel_values_device
+    )
+    input_dtype = pixel_values.dtype if pixel_values is not None else pixel_values_dtype
+    if input_device is None or input_dtype is None:
+        raise ValueError(
+            "pixel_values_device and pixel_values_dtype are required with a local loader"
+        )
+
     tp_size = get_parallel().attn_tp_size
     if tp_size == 1:
+        if pixel_values is None:
+            pixel_values = load_local_pixel_values(list(range(len(grid_thw_list))))
         grid_thw = torch.tensor(
             grid_thw_list,
             # MoonViT's 2D RoPE implementation combines the grid metadata
@@ -560,19 +578,20 @@ def run_dp_sharded_mrope_vision_model(
 
     # Get the pixel values for the local images based on the image_idxs_local
     if len(image_idxs_local) > 0:
-        pixel_values_local = torch.cat(
-            [
-                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
-                for i in image_idxs_local
-            ]
-        )
+        if load_local_pixel_values is not None:
+            pixel_values_local = load_local_pixel_values(image_idxs_local)
+        else:
+            assert pixel_values is not None
+            pixel_values_local = torch.cat(
+                [
+                    pixel_values[
+                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
+                    ]
+                    for i in image_idxs_local
+                ]
+            )
     else:
-        # Handle case where this rank has no images
-        pixel_values_local = torch.empty(
-            (0, pixel_values.shape[1]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        )
+        pixel_values_local = None
     # embed_dim_reduction_factor = 2 * 2
     packed_2d_rope = rope_type in ("rope_2d", "rope_2d_packed")
     if packed_2d_rope:
@@ -593,7 +612,7 @@ def run_dp_sharded_mrope_vision_model(
 
     # Run the vision model on the local pixel_values_local
     if packed_2d_rope:
-        if pixel_values_local.shape[0] > 0:
+        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
             local_grid_thw = torch.tensor(
                 local_grid_thw_list, device=pixel_values_local.device
             )
@@ -611,11 +630,11 @@ def run_dp_sharded_mrope_vision_model(
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
                 (0, embed_dim_reduction_factor, out_dim),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+                device=input_device,
+                dtype=input_dtype,
             )
     else:
-        if pixel_values_local.shape[0] > 0:
+        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
             # print(f"{local_grid_thw_list = }", flush=True)
             image_embeds_local = vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
@@ -629,8 +648,8 @@ def run_dp_sharded_mrope_vision_model(
                 out_dim = vision_model.config.hidden_size
             image_embeds_local = torch.empty(
                 (0, out_dim),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+                device=input_device,
+                dtype=input_dtype,
             )
 
     # Pad the output based on max_len_per_rank

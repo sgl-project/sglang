@@ -19,6 +19,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+)
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -412,6 +415,16 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+
+        # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep
+        # its IPC proxy lazy until that assignment is known, avoiding a full
+        # image copy to every rank. The scheduler only honors this marker once
+        # the processor has already set the item's hash and pad value.
+        if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
+            for item in mm_items:
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

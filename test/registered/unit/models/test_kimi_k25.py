@@ -1,16 +1,25 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    CudaIpcTensorTransportProxy,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -60,6 +69,26 @@ def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
     assert torch.equal(tower.grid_thws, torch.tensor([[1, 2, 2]]))
 
 
+def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
+    tower = _MoonViT3dTower()
+    pixel_values = torch.randn(4, 2)
+    loader = Mock(return_value=pixel_values)
+
+    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+        output = run_dp_sharded_mrope_vision_model(
+            tower,
+            None,
+            [[1, 2, 2]],
+            rope_type="rope_2d_packed",
+            load_local_pixel_values=loader,
+            pixel_values_device=pixel_values.device,
+            pixel_values_dtype=pixel_values.dtype,
+        )
+
+    assert torch.equal(output, pixel_values.reshape(1, 4, 2))
+    loader.assert_called_once_with([0])
+
+
 def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
     class _GatherGroup:
         def all_gather(self, tensor, dim):
@@ -84,6 +113,37 @@ def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
     assert tower.grid_thws is None
 
 
+def test_dp_helper_lazily_loads_only_its_local_image_shard():
+    class _GatherGroup:
+        def all_gather(self, tensor, dim):
+            # Rank one's embedding is irrelevant to this rank's loader call;
+            # retain the expected gathered shape for output reconstruction.
+            return torch.cat([tensor, torch.zeros_like(tensor)], dim=dim)
+
+    tower = _MoonViT3dTower()
+    features = [torch.full((4, 2), 1.0), torch.full((4, 2), 2.0)]
+    loader = Mock(side_effect=lambda indices: torch.cat([features[i] for i in indices]))
+    parallel = SimpleNamespace(
+        attn_tp_size=2,
+        attn_tp_rank=0,
+        attn_tp_group=_GatherGroup(),
+    )
+
+    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
+        output = run_dp_sharded_mrope_vision_model(
+            tower,
+            None,
+            [[1, 2, 2], [1, 2, 2]],
+            rope_type="rope_2d_packed",
+            load_local_pixel_values=loader,
+            pixel_values_device=torch.device("cpu"),
+            pixel_values_dtype=torch.float32,
+        )
+
+    loader.assert_called_once_with([0])
+    assert output.shape == (2, 4, 2)
+
+
 def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
     nn.Module.__init__(model)
@@ -100,7 +160,45 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
         output = model.get_image_feature(items)
 
     assert output is sharded_embeddings
-    assert run_dp.call_args.kwargs == {"rope_type": "rope_2d_packed"}
+    tower, pixel_values, grid_thws = run_dp.call_args.args
+    assert tower is model.vision_tower
+    assert pixel_values is None
+    assert grid_thws == [[1, 2, 2]]
+    assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
+    assert callable(run_dp.call_args.kwargs["load_local_pixel_values"])
+
+
+def test_kimi_lazy_ipc_feature_skips_scheduler_reconstruction():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.reconstruct_on_target_device = Mock()
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=123,
+        pad_value=456,
+        offsets=[(0, 1)],
+        feature=proxy,
+        model_specific_data={DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True},
+    )
+
+    with patch(
+        "sglang.srt.managers.schedule_batch.torch.cuda.current_device", return_value=0
+    ):
+        mm_inputs = MultimodalInputs.from_processor_output(
+            MultimodalProcessorOutput(mm_items=[item])
+        )
+
+    assert mm_inputs.mm_items[0].feature is proxy
+    proxy.reconstruct_on_target_device.assert_not_called()
+
+
+def test_kimi_lazy_ipc_feature_acknowledges_all_tp_consumers():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.reconstruct_on_target_device = Mock(return_value=torch.randn(1, 2))
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.reconstruct(0, ipc_consumer_count=8)
+
+    proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=8)
 
 
 if __name__ == "__main__":

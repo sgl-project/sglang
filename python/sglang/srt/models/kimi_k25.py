@@ -31,7 +31,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -685,30 +685,69 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
-            device=device, dtype=target_dtype
-        )
         image_grid_thws = []
         for item in items:
             grid_thw = item.model_specific_data.get("image_grid_thw")
             if grid_thw is None:
                 grid_thw = item.model_specific_data["grid_thws"]
             image_grid_thws.append(grid_thw)
-        grid_thws = torch.concat(image_grid_thws, dim=0).to(device)
+        grid_thws = torch.concat(image_grid_thws, dim=0)
+
+        def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
+            """Move only this encoder-DP rank's images to its local GPU.
+
+            CUDA IPC features are intentionally reconstructed after the image
+            assignment.  Each image therefore crosses the tokenizer/scheduler
+            boundary once instead of once per TP rank.  The selected consumer
+            acknowledges the entire TP group so the bounded IPC pool remains
+            recyclable.
+            """
+            parallel = get_parallel()
+            server_args = get_server_args()
+            # Match MmItemMemoryPool.try_to_recycle(), which waits for the
+            # server TP size rather than the attention subgroup size.
+            ipc_consumer_count = max(
+                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
+            )
+            device_index = device.index
+            if device.type == "cuda" and device_index is None:
+                device_index = torch.cuda.current_device()
+
+            features = []
+            for image_index in image_indices:
+                item = items[image_index]
+                if device.type == "cuda":
+                    item.reconstruct(
+                        device_index, ipc_consumer_count=ipc_consumer_count
+                    )
+                feature = item.feature
+                if not isinstance(feature, torch.Tensor):
+                    raise TypeError(
+                        "Kimi-K2.5/K2.7 image feature must be a torch.Tensor, "
+                        f"got {type(feature)}"
+                    )
+                features.append(
+                    feature.to(device=device, dtype=target_dtype, non_blocking=True)
+                )
+            return torch.cat(features, dim=0)
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
-                pixel_values,
+                None,
                 grid_thws.tolist(),
                 # MoonViT3d uses 2D RoPE and returns packed patch embeddings.
                 # Its grid metadata is a positional argument, unlike Kimi-VL.
                 rope_type="rope_2d_packed",
+                load_local_pixel_values=materialize_item_features,
+                pixel_values_device=device,
+                pixel_values_dtype=target_dtype,
             )
             image_features = self.mm_projector(image_embeds)
             return image_features
 
-        image_embeds = self.vision_tower(pixel_values, grid_thws)
+        pixel_values = materialize_item_features(list(range(len(items))))
+        image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
         proj_out = mm_projection_auto(self.mm_projector, image_embeds)
         return torch.cat(proj_out, dim=0)
 
