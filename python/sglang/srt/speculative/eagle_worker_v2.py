@@ -1738,18 +1738,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return out
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        success, message = (
+            self._draft_worker.draft_runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
         )
         if not success:
             return success, message
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
-            recv_req
+        success, message = (
+            self._draft_worker.draft_runner.weight_updater.update_weights_from_ipc(
+                recv_req
+            )
         )
         if not success:
             return success, message
@@ -1760,15 +1764,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]
         )
-        success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
+        success, message = (
+            self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
         )
         if not success:
             return success, message
 
-        success, message = self.target_worker.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
+        success, message = (
+            self.target_worker.model_runner.weight_updater.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
         )
         return success, message
