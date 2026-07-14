@@ -10,6 +10,11 @@ from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    kimi_linear_config,
+    linear_attn_model_spec,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -182,9 +187,9 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = full_v_head_dim
             self.swa_v_head_dim = swa_v_head_dim
         elif (
-            model_runner.hybrid_gdn_config is not None
-            or model_runner.kimi_linear_config is not None
-            or model_runner.linear_attn_model_spec is not None
+            hybrid_gdn_config(model_runner.model_config) is not None
+            or kimi_linear_config(model_runner.model_config) is not None
+            or linear_attn_model_spec(model_runner.model_config) is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
@@ -509,7 +514,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
         # V2 draft-extend fills num_draft_tokens per req; num_steps+1 only equals
         # that when topk == 1.
-        num_tokens_per_bs = (
+        num_tokens_per_req = (
             self.num_draft_tokens
             if forward_mode.is_draft_extend_v2()
             else self.speculative_num_steps + 1
@@ -517,8 +522,8 @@ class TritonAttnBackend(AttentionBackend):
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
-            bs * num_tokens_per_bs + 1,
-            step=num_tokens_per_bs,
+            bs * num_tokens_per_req + 1,
+            step=num_tokens_per_req,
             dtype=torch.int32,
             device=self.device,
         )
@@ -536,7 +541,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
-        return qo_indptr, kv_indptr, num_tokens_per_bs
+        return qo_indptr, kv_indptr, num_tokens_per_req
 
     def init_forward_metadata_out_graph(
         self,
@@ -1086,7 +1091,7 @@ class TritonAttnBackend(AttentionBackend):
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                # Must match the per-req query count (num_tokens_per_bs) used to
+                # Must match the per-req query count (num_tokens_per_req) used to
                 # build qo_indptr above, else the extend kernel grid is too small
                 # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
                 # blocks.
