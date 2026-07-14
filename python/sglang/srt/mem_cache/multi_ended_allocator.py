@@ -2242,9 +2242,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedSWAAlloc.alloc"):
             assert need_size >= 0, f"{need_size=}"
-            assert need_size % self.page_size == 0, (
-                f"{need_size=} must be a multiple of {self.page_size=}"
-            )
+            assert (
+                need_size % self.page_size == 0
+            ), f"{need_size=} must be a multiple of {self.page_size=}"
             # Joint pre-check. Both sides are mutual peers (each side's compaction
             # opens gap for the other), so flush BOTH on shortfall.
             if need_size > self.available_size():

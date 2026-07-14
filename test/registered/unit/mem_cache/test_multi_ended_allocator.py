@@ -842,12 +842,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         finally:
             sa.alloc_with_virtual = original
 
-        self.assertEqual(
-            allocator.full_attn_allocator.available_size(), full_available
-        )
-        self.assertEqual(
-            allocator.swa_attn_allocator.available_size(), swa_available
-        )
+        self.assertEqual(allocator.full_attn_allocator.available_size(), full_available)
+        self.assertEqual(allocator.swa_attn_allocator.available_size(), swa_available)
 
     # -- `out=` parameter regression tests for the SWA composite --
 
