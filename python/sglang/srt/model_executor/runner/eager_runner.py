@@ -18,8 +18,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import replace
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
 
@@ -35,14 +34,22 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.utils import is_hip, require_mlp_tp_gather
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
 logger = logging.getLogger(__name__)
@@ -61,12 +68,12 @@ class EagerRunner(BaseRunner):
         sa = mr.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
         # input pool; size to the largest tokens/req across modes the worker hits.
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
             num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
             if mr.is_draft_worker:
-                num_tokens_per_bs = max(
+                num_tokens_per_req = max(
                     sa.speculative_eagle_topk or 1,
                     num_draft_tokens,
                     (
@@ -76,8 +83,8 @@ class EagerRunner(BaseRunner):
                     ),
                 )
             else:
-                num_tokens_per_bs = (
-                    mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                num_tokens_per_req = (
+                    mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
                         num_draft_tokens, mr.is_draft_worker
                     )
                 )
@@ -85,7 +92,7 @@ class EagerRunner(BaseRunner):
             dllm_config = DllmConfig.from_server_args(sa)
             if dllm_config is not None:
                 # dLLM runs block_size tokens/request (DLLM_EXTEND).
-                num_tokens_per_bs = dllm_config.block_size
+                num_tokens_per_req = dllm_config.block_size
         max_bs = mr.max_running_requests
         if (
             mr.is_draft_worker
@@ -101,17 +108,13 @@ class EagerRunner(BaseRunner):
 
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
-        prefill_ceiling = (
-            sa.max_prefill_buffer_tokens()
-            if sa.chunked_prefill_size and sa.chunked_prefill_size > 0
-            else mr.max_total_num_tokens
-        )
-        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
+        prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
+        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
         if require_mlp_sync(sa):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
-        self._eager_num_tokens_per_bs = num_tokens_per_bs
+        self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
             device=mr.device,
@@ -127,92 +130,37 @@ class EagerRunner(BaseRunner):
                 if is_encoder_decoder
                 else 0
             ),
+            encoder_lens_dtype=(
+                torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
+            ),
             dp_size=sa.dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
-        """Adapter over the eager registry for the autotune dummy forward; fills
-        in fields the registry omits (logits buffer, pp_proxy, custom_mask)."""
+        """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
+        flashinfer-autotune forward.
+
+        flashinfer's MoE autotuner times candidate tactics against the buffer it
+        is given, so it must match the live decode shape for the cached tactic to
+        be optimal at decode. The eager input registry spans the prefill token
+        ceiling; the dummy run only needs the decode-sized slice.
+        """
         mr = self.model_runner
-        reg = self._eager_registry
-        max_bs = self._eager_max_bs
-
-        def _slot(name):
-            return reg.get_slot(name).buffer if reg.has_slot(name) else None
-
-        # num_token_non_padded / global_num_tokens_* are not registered on the
-        # eager registry (build_eager_registry passes enable_num_token_non_padded
-        # =False, register_global_num_tokens=False); _dummy_run writes + reads
-        # them unconditionally, so supply tiny fresh tensors here.
-        num_token_non_padded = torch.zeros((1,), dtype=torch.int32, device=mr.device)
-        global_dim = (
-            mr.server_args.dp_size if require_mlp_tp_gather(mr.server_args) else 1
-        )
-        global_num_tokens_gpu = torch.zeros(
-            (global_dim,), dtype=torch.int32, device=mr.device
-        )
-        global_num_tokens_for_logprob_gpu = torch.zeros(
-            (global_dim,), dtype=torch.int32, device=mr.device
-        )
-
-        # custom_mask: only consumed by create_dummy_verify_input (spec). Size it
-        # like the decode path's custom_mask for a spec target worker.
-        custom_mask: Optional[torch.Tensor] = None
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
-            num_tokens_per_bs = self._eager_num_tokens_per_bs
-            max_num_token = reg.max_num_tokens
-            seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
-            custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
-                dtype=torch.bool,
-                device=mr.device,
+            num_tokens_per_req = (
+                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
+                )
             )
-
-        # pp_proxy_tensors: only read when pp_size>1. _dummy_run slices each value
-        # [:pp_hidden_tokens] (pp_hidden_tokens <= num_tokens), so size the first
-        # dim to the registry's token ceiling. Mirror _allocate_decode_buffers'
-        # keys/dtypes (mHC flattens residual into hidden_states of hc_hidden_size).
-        pp_proxy_tensors = None
-        if mr.server_args.pp_size > 1:
-            hidden_size = mr.model_config.hidden_size
-            hc_hidden_size = getattr(mr.model_config, "hc_hidden_size", None)
-            is_mhc = hc_hidden_size is not None
-            hs = hc_hidden_size if is_mhc else hidden_size
-            rows = reg.max_num_tokens
-            pp_proxy_tensors = {
-                "hidden_states": torch.zeros(
-                    (rows, hs), dtype=mr.dtype, device=mr.device
-                ),
-            }
-            if not is_mhc:
-                pp_proxy_tensors["residual"] = torch.zeros(
-                    (rows, hidden_size), dtype=mr.dtype, device=mr.device
-                )
-            pp_proxy_topk_size = mr.get_pp_proxy_topk_size()
-            if pp_proxy_topk_size is not None:
-                pp_proxy_tensors["topk_indices"] = torch.zeros(
-                    (rows, pp_proxy_topk_size), dtype=torch.int32, device=mr.device
-                )
-
-        adapter = SimpleNamespace(
-            input_ids=_slot("input_ids"),
-            positions=_slot("positions"),
-            out_cache_loc=_slot("out_cache_loc"),
-            req_pool_indices=_slot("req_pool_indices"),
-            seq_lens=_slot("seq_lens"),
-            seq_lens_cpu=_slot("seq_lens_cpu"),
-            mrope_positions=_slot("mrope_positions"),
-            encoder_lens=_slot("encoder_lens"),
-            next_token_logits_buffer=None,
-            num_token_non_padded=num_token_non_padded,
-            global_num_tokens_gpu=global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
-            custom_mask=custom_mask,
-            pp_proxy_tensors=pp_proxy_tensors,
+        return (
+            self._alloc_dummy_decode_buffers(
+                self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
+            ),
+            self._eager_max_bs,
         )
-        return adapter, max_bs
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # Eager never runs a cuda graph; callers dispatch on isinstance(...,
@@ -228,7 +176,12 @@ class EagerRunner(BaseRunner):
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
-        raw_num_tokens = forward_batch.input_ids.shape[0]
+        if forward_batch.input_ids is not None:
+            raw_num_tokens = forward_batch.input_ids.shape[0]
+        elif forward_batch.input_embeds is not None:
+            raw_num_tokens = forward_batch.input_embeds.shape[0]
+        else:
+            raw_num_tokens = 0
         registry = self._eager_registry
         registry.fill_from(
             forward_batch,
@@ -263,7 +216,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
         model_runner = self.model_runner
-        if model_runner.server_args.enable_pdmux:
+        if self.enable_pdmux:
             return model_runner.decode_attn_backend, forward_context(
                 ForwardContext(attn_backend=model_runner.decode_attn_backend)
             )
@@ -275,7 +228,7 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = model_runner.server_args.enable_pdmux
+        enable_pdmux = self.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -310,10 +263,27 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not model_runner.server_args.enable_pdmux:
+        if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
+            if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+                # prepare kv cache buffer for dcp to gather kv cache
+                forward_batch.attn_dcp_metadata = (
+                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.req_pool_indices,
+                        get_req_to_token_pool().req_to_token,
+                        forward_batch.seq_lens_sum,
+                        get_token_to_kv_pool().get_kv_buffer_shape()[0],
+                        model_runner.kv_cache_dtype,
+                        model_runner.device,
+                        create_chunked_prefix_cache_kv_indices,
+                    )
+                )
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -335,9 +305,16 @@ class EagerRunner(BaseRunner):
             )
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
+        else:
+            forward_batch.attn_cp_metadata = None
 
+        category = (
+            "target_verify"
+            if forward_batch.forward_mode.is_target_verify()
+            else "extend"
+        )
         ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "extend"})
+            model_runner.device_timer.wrap(metadata={"category": category})
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
@@ -416,7 +393,7 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not model_runner.server_args.enable_pdmux:
+            if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:

@@ -260,6 +260,8 @@ class MockModelRunner:
                 "dsa_prefill_backend": "flashmla_sparse",
                 "dsa_decode_backend": "fa3",
                 "dsa_topk_backend": "sgl-kernel",
+                "dsa_paged_mqa_logits_backend": "auto",
+                "disaggregation_mode": "null",
             },
         )()
         self.hisparse_coordinator = None
@@ -321,8 +323,8 @@ class TestDSAIndexer(CustomTestCase):
         params.update(kwargs)
 
         torch.set_default_dtype(self.dtype)
-        indexer = Indexer(**params)
-        # Move indexer to CUDA device
+        with torch.device(self.device):
+            indexer = Indexer(**params)
         indexer = indexer.to(device=self.device)
 
         # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32
@@ -366,11 +368,9 @@ class TestDSAIndexer(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [total_len - q_len] * batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [total_len - q_len] * batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[total_len - q_len] * batch_size,
                 extend_seq_lens=torch.tensor([q_len] * batch_size, device=self.device),
-                extend_seq_lens_cpu=torch.tensor([q_len] * batch_size, device="cpu"),
+                extend_seq_lens_cpu=[q_len] * batch_size,
             )
         else:  # ForwardMode.DECODE
             decode_len = 1
@@ -639,6 +639,12 @@ class TestDSAIndexer(CustomTestCase):
             )
         ).contiguous()
 
+        # The fused v2 PAGED dispatch requires the per-forward plan to be
+        # preprocessed alongside the metadata (it asserts rather than silently
+        # recomputing it) -- mirror what init_forward_metadata /
+        # _build_forward_metadata_cuda_graph do.
+        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+
         attn_metadata = DSAMetadata(
             page_size=1,
             cache_seqlens_int32=seq_lens_expanded.clone(),
@@ -653,6 +659,7 @@ class TestDSAIndexer(CustomTestCase):
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_extend_seq_lens_list=seq_lens_expanded.cpu().tolist(),
             dsa_seqlens_expanded=seq_lens_expanded,
+            topk_v2_plan=plan_topk_v2(seq_lens_expanded),
             topk_indices_offset=(
                 topk_indices_offset
                 if topk_transform_method == TopkTransformMethod.RAGGED

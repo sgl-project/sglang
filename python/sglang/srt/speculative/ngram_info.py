@@ -4,13 +4,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
-class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
+class NgramVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor = None,

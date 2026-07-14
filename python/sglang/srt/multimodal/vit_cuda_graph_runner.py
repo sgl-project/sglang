@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 
 class ViTCudaGraphRunner:
@@ -116,6 +116,18 @@ class ViTCudaGraphRunner:
         # x_3d: [S, B, H], B=1, S as graph_key
         return x_3d.shape[0]
 
+    def _capture_context(self):
+        # A DP-sharded encoder intentionally lets each rank capture only the
+        # images it owns (and some ranks can own none). Entering the TP
+        # communication capture in that case requires every TP peer to enter
+        # the same collective capture sequence, which deadlocks on an uneven
+        # image assignment. The encoder's output all-gather is outside this
+        # graph, and all layers are local in DP mode, so capture locally.
+        if getattr(self.vit, "use_data_parallel", False):
+            return nullcontext()
+        ca_comm = get_tp_group().ca_comm
+        return ca_comm.capture() if ca_comm is not None else nullcontext()
+
     def _create_graph(
         self,
         graph_key: int,
@@ -139,13 +151,9 @@ class ViTCudaGraphRunner:
         cu_full_kk = self.cu_full_len_kk[graph_key]
         max_full_len = int(cu_full_kk.max().item())
 
-        override_backend = get_global_server_args().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
 
-        tp_group = get_tp_group()
-        ca_comm = tp_group.ca_comm
-        capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
-
-        with capture_ctx, torch.cuda.graph(graph):
+        with self._capture_context(), torch.cuda.graph(graph):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
