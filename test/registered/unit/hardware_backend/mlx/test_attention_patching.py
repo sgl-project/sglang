@@ -226,7 +226,10 @@ class TestMlxAttentionPatching(unittest.TestCase):
                     [20, 21, 22],  # req b (req_pool_idx 2)
                 ],
                 dtype=torch.int32,
-            )
+            ),
+            # No rows reused: every generation still matches what each request
+            # recorded, so the ownership check passes.
+            req_generation=torch.zeros(3, dtype=torch.int64),
         )
         runner._req_caches = {
             "a": [SimpleNamespace(offset=3)],
@@ -234,6 +237,9 @@ class TestMlxAttentionPatching(unittest.TestCase):
         }
         runner._req_pool_idx = {"a": 1, "b": 2}
         runner._req_synced_offset = {"a": 0, "b": 0}
+        # Both requests have all 3 positions committed to req_to_token.
+        runner._req_committed_len = {"a": 3, "b": 3}
+        runner._req_row_generation = {"a": 0, "b": 0}
 
         synced_calls: list[list[int]] = []
         runner._sync_new_kv_to_pool = (
@@ -328,6 +334,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._req_committed_len = {}
+        runner._req_row_generation = {}
         prefix_slots = mx.array([2, 3], dtype=mx.int32)
         k_prefix = mx.stack(
             [
@@ -383,6 +391,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                 runner._req_token_ids = {
                     rid: [idx + 10] for idx, rid in enumerate(req_ids)
                 }
+                runner._req_committed_len = {}
+                runner._req_row_generation = {}
                 calls = []
 
                 def fake_batched(caches, batched_input, helper_req_ids):
@@ -613,6 +623,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req_ids = ["r0", "r1"]
         runner._req_caches = {rid: [object(), object()] for rid in req_ids}
         runner._req_token_ids = {rid: [idx + 20] for idx, rid in enumerate(req_ids)}
+        runner._req_committed_len = {}
+        runner._req_row_generation = {}
         calls = []
 
         def fake_hybrid(caches, batched_input, helper_req_ids):
@@ -736,6 +748,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._req_committed_len = {}
+        runner._req_row_generation = {}
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(
@@ -796,6 +810,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._req_committed_len = {}
+        runner._req_row_generation = {}
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         token_ids = list(range(70))
@@ -853,6 +869,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._req_committed_len = {}
+        runner._req_row_generation = {}
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(

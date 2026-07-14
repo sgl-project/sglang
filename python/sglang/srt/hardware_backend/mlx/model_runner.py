@@ -86,6 +86,7 @@ class MlxPendingExtend:
     req_id: str
     new_token_ids: list[int]
     new_synced_offset: int
+    new_committed_len: int
 
 
 @dataclass
@@ -176,11 +177,20 @@ class MlxModelRunner:
         self._req_to_token_pool: ReqToTokenPool | None = None
         self._req_pool_idx: dict[str, int] = {}
         self._req_synced_offset: dict[str, int] = {}
-        # Requests whose scheduler row (req_pool_idx) has been released via the
-        # pre-release hook. Their KV was flushed while the row was still valid;
-        # the row may now be reused by another request, so it must never be read
-        # for these req_ids again. See sync_and_release_request().
-        self._req_released: set[str] = set()
+        # Number of req_to_token positions the scheduler has committed for each
+        # request. Overlap-chained decode advances the private cache offset past
+        # this (it builds a step ahead of the scheduler writing the matching
+        # slot), so the pool sync must clamp to this bound instead of
+        # cache.offset. Advanced only on scheduler-built forwards (prefill,
+        # extend, decode_batch_start), never on decode_batch_start_chained.
+        self._req_committed_len: dict[str, int] = {}
+        # req_generation of each request's row at the time it was acquired.
+        # ReqToTokenPool bumps the generation whenever a freed row is realloc'd,
+        # so a mismatch means the row was reused by another request and must not
+        # be read for this req_id. Guards the retraction path, which frees the
+        # row without going through the pre-release hook. None when radix cache
+        # is disabled (no pool, no sync).
+        self._req_row_generation: dict[str, int | None] = {}
 
         self._pool_size = self._compute_pool_size(pool_size)
         self._aot_kernels = self._build_aot_kernels()
@@ -229,6 +239,32 @@ class MlxModelRunner:
     def _first_attention_cache(self, cache: list[Any]) -> Any:
         return cache[self._cache_layout.first_attention_layer_index]
 
+    def _current_row_generation(self, req_pool_idx: int) -> int | None:
+        """Read the scheduler's generation counter for a request row.
+
+        Returns ``None`` when there is no real ReqToTokenPool (radix disabled),
+        so ownership checks are skipped on that path (it never syncs anyway).
+        """
+        if self._req_to_token_pool is None:
+            return None
+        return int(self._req_to_token_pool.req_generation[req_pool_idx].item())
+
+    def _record_row_ownership(self, req_id: str, req_pool_idx: int) -> None:
+        """Snapshot the row's generation so later syncs can detect reuse."""
+        self._req_row_generation[req_id] = self._current_row_generation(req_pool_idx)
+
+    def _row_still_owned(self, req_id: str, req_pool_idx: int) -> bool:
+        """Whether ``req_id`` still owns ``req_pool_idx`` (row not reused).
+
+        A generation mismatch means the scheduler freed this request's row and
+        reallocated it to a different request, so ``req_to_token[req_pool_idx]``
+        now holds the new owner's slots and must not be read for ``req_id``.
+        """
+        recorded = self._req_row_generation.get(req_id)
+        if recorded is None:
+            return True
+        return self._current_row_generation(req_pool_idx) == recorded
+
     def _get_auxiliary_state_pool_index(self, req_pool_idx: int) -> Any | None:
         if (
             not self._cache_layout.has_auxiliary_state
@@ -275,20 +311,21 @@ class MlxModelRunner:
         """Final decode-KV flush before the scheduler frees this request's row.
 
         Called from the scheduler's pre-release hook, while
-        ``req_to_token[req_pool_idx]`` still holds *this* request's slots. This
-        is the last point at which the row can be safely read, so any un-synced
-        decode KV is flushed to the shared pool here.
+        ``req_to_token[req_pool_idx]`` still holds *this* request's slots and its
+        generation still matches. This is the last point at which the row can be
+        safely read, so any un-synced decode KV is flushed to the shared pool
+        here (clamped to the committed row length).
 
-        The request is then marked released: the row may be reassigned to
-        another request immediately after, so :meth:`_sync_decode_kv_to_pool`
-        refuses to read it again and :meth:`remove_request` only discards the
-        (now frozen) cache state instead of touching the reused row.
+        After the row is freed, two guards keep later reads safe without any
+        extra bookkeeping here: the sync is already caught up
+        (``synced_offset == committed_len``) so a stale flush is a no-op, and if
+        the row is reused the generation check in
+        :meth:`_sync_decode_kv_to_pool` rejects it.
         """
         if req_id not in self._req_caches:
             return
         if not self.disable_radix_cache:
             self._sync_decode_kv_to_pool(req_id)
-        self._req_released.add(req_id)
 
     def _select_auxiliary_state_track_len(
         self,
@@ -713,20 +750,28 @@ class MlxModelRunner:
         """
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
             return
-        if req_id in self._req_released:
-            # The scheduler already freed this request's row (its final KV sync
-            # happened in the pre-release hook). Reading req_to_token now would
-            # dereference slots that belong to whichever request reused the row.
-            return
         cache = self._req_caches.get(req_id)
         if cache is None:
             return
-        current_offset = self._first_attention_cache(cache).offset
-        synced_offset = self._req_synced_offset.get(req_id, 0)
-        if current_offset <= synced_offset:
-            return
         req_pool_idx = self._req_pool_idx.get(req_id)
         if req_pool_idx is None:
+            return
+        if not self._row_still_owned(req_id, req_pool_idx):
+            # The scheduler freed this request's row and another request reused
+            # it (generation bumped). Reading req_to_token now would dereference
+            # the new owner's slots. Covers retraction, which frees the row
+            # without going through the pre-release hook.
+            return
+        # Clamp the read to the scheduler-committed row length. Overlap-chained
+        # decode advances cache.offset past the positions the scheduler has
+        # written to req_to_token; those uncommitted cells hold the padding slot
+        # (or, on a reused row, another request's slots), so syncing up to
+        # cache.offset would write this request's KV into slots it never owned.
+        cache_offset = self._first_attention_cache(cache).offset
+        committed_len = self._req_committed_len.get(req_id, 0)
+        current_offset = min(cache_offset, committed_len)
+        synced_offset = self._req_synced_offset.get(req_id, 0)
+        if current_offset <= synced_offset:
             return
         # Read slot IDs from scheduler's req_to_token_pool
         slot_ids = (
@@ -903,6 +948,10 @@ class MlxModelRunner:
         self._req_caches[pending.req_id] = pending.cache
         self._req_pool_idx[pending.req_id] = pending.req_pool_idx
         self._req_synced_offset[pending.req_id] = pending.synced_offset
+        # After prefill everything committed is already synced, so the committed
+        # row length equals synced_offset (prefix + newly allocated tokens).
+        self._req_committed_len[pending.req_id] = pending.synced_offset
+        self._record_row_ownership(pending.req_id, pending.req_pool_idx)
         self._store_auxiliary_state(pending.req_pool_idx, pending.cache)
         return next_token
 
@@ -931,11 +980,15 @@ class MlxModelRunner:
         else:
             new_synced_offset = self._req_synced_offset.get(req_id, 0)
 
+        # Each new extend token gets one committed req_to_token slot.
+        new_committed_len = self._req_committed_len.get(req_id, 0) + len(new_slot_ids)
+
         return MlxPendingExtend(
             lazy_token=lazy_token,
             req_id=req_id,
             new_token_ids=list(new_token_ids),
             new_synced_offset=new_synced_offset,
+            new_committed_len=new_committed_len,
         )
 
     def extend_finalize(self, pending: MlxPendingExtend) -> int:
@@ -949,6 +1002,7 @@ class MlxModelRunner:
         prev_tokens.append(next_token)
 
         self._req_synced_offset[pending.req_id] = pending.new_synced_offset
+        self._req_committed_len[pending.req_id] = pending.new_committed_len
         self._store_auxiliary_state(
             self._req_pool_idx[pending.req_id],
             self._req_caches[pending.req_id],
@@ -1217,6 +1271,13 @@ class MlxModelRunner:
                 caches, batched_input, list(req_ids)
             )
 
+        # Scheduler-built decode step: the scheduler committed one new
+        # req_to_token slot per request before this forward, so the committed
+        # row length advances by one. decode_batch_start_chained does NOT do
+        # this — chained steps run ahead of the scheduler's commit.
+        for rid in req_ids:
+            self._req_committed_len[rid] = self._req_committed_len.get(rid, 0) + 1
+
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
             req_ids=list(req_ids),
@@ -1315,7 +1376,8 @@ class MlxModelRunner:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
         self._req_synced_offset.pop(req_id, None)
-        self._req_released.discard(req_id)
+        self._req_committed_len.pop(req_id, None)
+        self._req_row_generation.pop(req_id, None)
 
     def clear(self):
         """Clear all request states."""
@@ -1325,6 +1387,7 @@ class MlxModelRunner:
         self._req_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()
-        self._req_released.clear()
+        self._req_committed_len.clear()
+        self._req_row_generation.clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()
