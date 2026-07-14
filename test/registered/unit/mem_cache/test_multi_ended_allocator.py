@@ -556,6 +556,114 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
+class _AsymmetricTailChildAllocator:
+    def __init__(
+        self,
+        *,
+        free_virtual_pages: list[int],
+        free_physical_pages: list[int],
+        num_pages: int,
+        min_page_index: int,
+        allocated_page_count: int,
+        grow_direction: str,
+        low_frontier: int,
+        high_frontier: int,
+        entry_bytes_per_page: int,
+        low_frontier_after_flush: int | None = None,
+        raise_on_alloc_with_virtual: bool = False,
+    ) -> None:
+        self.free_virtual_ids = torch.tensor(free_virtual_pages, dtype=torch.int64)
+        self._free_phys_pages = free_physical_pages
+        self.num_pages = num_pages
+        self.min_page_index = min_page_index
+        self.allocated_page_count = allocated_page_count
+        self.grow_direction = grow_direction
+        self.low_frontier = low_frontier
+        self.high_frontier = high_frontier
+        self.entry_bytes_per_page = entry_bytes_per_page
+        self.low_frontier_after_flush = low_frontier_after_flush
+        self.raise_on_alloc_with_virtual = raise_on_alloc_with_virtual
+        self.virtual_to_physical = torch.full((16,), -1, dtype=torch.int64)
+        self.alloc_sizes: list[int] = []
+        self.allocated_virtual_pages: list[torch.Tensor] = []
+        self.freed_tokens: list[torch.Tensor] = []
+        self.flush_count = 0
+        self.inverse_history_clear_count = 0
+
+    def _allocated_pages(self) -> int:
+        return self.allocated_page_count
+
+    def _byte_low_frontier(self) -> int:
+        return self.low_frontier
+
+    def _byte_high_frontier(self) -> int:
+        return self.high_frontier
+
+    def _flush(self, *, urgent: bool) -> None:
+        assert urgent
+        self.flush_count += 1
+        if self.low_frontier_after_flush is not None:
+            self.low_frontier = self.low_frontier_after_flush
+
+    def alloc(self, need_size: int) -> torch.Tensor:
+        self.alloc_sizes.append(need_size)
+        return torch.arange(need_size, dtype=torch.int64)
+
+    def alloc_with_virtual(self, virtual_pages: torch.Tensor) -> None:
+        self.allocated_virtual_pages.append(virtual_pages.clone())
+        if self.raise_on_alloc_with_virtual:
+            raise AssertionError("synthetic alloc_with_virtual failure")
+
+    def free(self, token_ids: torch.Tensor) -> None:
+        self.freed_tokens.append(token_ids.clone())
+
+    def clear_inverse_history(self) -> None:
+        self.inverse_history_clear_count += 1
+
+
+def _build_asymmetric_tail_allocator(
+    *,
+    lazy_compaction: bool = False,
+    gap_bytes: int = 6,
+    gap_bytes_after_flush: int | None = None,
+    raise_on_swa_alloc: bool = False,
+) -> tuple[
+    UnifiedSWATokenToKVPoolAllocator,
+    _AsymmetricTailChildAllocator,
+    _AsymmetricTailChildAllocator,
+]:
+    allocator = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+    allocator.page_size = 4
+    allocator.lazy_compaction = lazy_compaction
+    full_allocator = _AsymmetricTailChildAllocator(
+        free_virtual_pages=[1, 2, 3],
+        free_physical_pages=[],
+        num_pages=4,
+        min_page_index=1,
+        allocated_page_count=0,
+        grow_direction="up",
+        low_frontier=0,
+        high_frontier=0,
+        entry_bytes_per_page=2,
+    )
+    swa_allocator = _AsymmetricTailChildAllocator(
+        free_virtual_pages=[],
+        free_physical_pages=[1],
+        num_pages=2,
+        min_page_index=1,
+        allocated_page_count=1,
+        grow_direction="down",
+        low_frontier=gap_bytes,
+        high_frontier=8,
+        entry_bytes_per_page=1,
+        low_frontier_after_flush=gap_bytes_after_flush,
+        raise_on_alloc_with_virtual=raise_on_swa_alloc,
+    )
+    allocator.full_attn_allocator = full_allocator
+    allocator.swa_attn_allocator = swa_allocator
+    return allocator, full_allocator, swa_allocator
+
+
 class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
     """Tests for the SWA composite — joint byte-budget, slot-conservation
     leak invariant, tombstone semantics for `free_swa`, divergent compaction
@@ -844,6 +952,74 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
         self.assertEqual(allocator.full_attn_allocator.available_size(), full_available)
         self.assertEqual(allocator.swa_attn_allocator.available_size(), swa_available)
+
+    def test_alloc_extend_swa_tail_accepts_asymmetric_capacity(self) -> None:
+        """A long full allocation can share capacity with a short SWA tail."""
+        allocator, full_allocator, swa_allocator = (
+            _build_asymmetric_tail_allocator()
+        )
+
+        token_ids = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=12,
+            swa_tail_len=4,
+            swa_tail_end=12,
+        )
+
+        self.assertIsNotNone(token_ids)
+        self.assertEqual(full_allocator.alloc_sizes, [12])
+        self.assertEqual(len(swa_allocator.allocated_virtual_pages), 1)
+        self.assertTrue(
+            torch.equal(
+                swa_allocator.allocated_virtual_pages[0],
+                torch.tensor([3], dtype=torch.int64),
+            )
+        )
+
+    def test_alloc_extend_swa_tail_rechecks_capacity_after_flush(self) -> None:
+        """Lazy compaction rechecks asymmetric capacity after both flushes."""
+        allocator, full_allocator, swa_allocator = (
+            _build_asymmetric_tail_allocator(
+                lazy_compaction=True,
+                gap_bytes=5,
+                gap_bytes_after_flush=6,
+            )
+        )
+
+        token_ids = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=12,
+            swa_tail_len=4,
+            swa_tail_end=12,
+        )
+
+        self.assertIsNotNone(token_ids)
+        self.assertEqual(full_allocator.flush_count, 1)
+        self.assertEqual(swa_allocator.flush_count, 1)
+        self.assertEqual(full_allocator.alloc_sizes, [12])
+
+    def test_alloc_extend_swa_tail_rolls_back_full_on_swa_failure(self) -> None:
+        """A SWA binding failure frees full tokens and clears inverse history."""
+        allocator, full_allocator, swa_allocator = (
+            _build_asymmetric_tail_allocator(raise_on_swa_alloc=True)
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "synthetic alloc_with_virtual failure"
+        ):
+            allocator.alloc_extend_swa_tail(
+                extend_num_tokens=12,
+                swa_tail_len=4,
+                swa_tail_end=12,
+            )
+
+        self.assertEqual(len(swa_allocator.allocated_virtual_pages), 1)
+        self.assertEqual(len(full_allocator.freed_tokens), 1)
+        self.assertTrue(
+            torch.equal(
+                full_allocator.freed_tokens[0],
+                torch.arange(12, dtype=torch.int64),
+            )
+        )
+        self.assertEqual(full_allocator.inverse_history_clear_count, 1)
 
     # -- `out=` parameter regression tests for the SWA composite --
 
