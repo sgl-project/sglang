@@ -92,11 +92,7 @@ class TimestepPreparationStage(PipelineStage):
 
         scheduler_template = self.scheduler
         if batch.rollout:
-            # The rollout SDE/log-prob path may need an RL-capable scheduler
-            # the pipeline does not serve with; the serving->rollout mapping
-            # is owned by post_training and the resolved scheduler by this
-            # request, so a serving-only engine never initializes one.
-            from sglang.multimodal_gen.runtime.post_training.rollout_scheduler_registry import (
+            from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
                 resolve_rollout_scheduler,
             )
 

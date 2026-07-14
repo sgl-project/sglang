@@ -38,18 +38,9 @@ def _kwargs_to_cpu(d: Any) -> Any:
 
 class RolloutDenoisingMixin:
 
-    def _request_scheduler(self, batch: Req):
-        """Scheduler in effect for this request.
-
-        The timestep preparation stage binds per-request schedulers (e.g. the
-        RL rollout scheduler) to ``batch.scheduler``; the stage module is only
-        a fallback for pipelines that never bind one.
-        """
-        return batch.scheduler if batch.scheduler is not None else self.scheduler
-
     def _maybe_prepare_rollout(self, batch: Req):
         """Prepare denoising loop for rollout."""
-        scheduler = self._request_scheduler(batch)
+        scheduler = batch.scheduler
         if not isinstance(scheduler, SchedulerRLMixin):
             if batch.rollout:
                 raise ValueError(
@@ -59,14 +50,13 @@ class RolloutDenoisingMixin:
 
         scheduler.release_rollout_resources(batch)
         if batch.rollout:
-            scheduler.check_rollout_timestep_convention()
             scheduler.prepare_rollout(
                 batch=batch,
                 pipeline_config=self.server_args.pipeline_config,
             )
 
     def _maybe_collect_rollout_log_probs(self, batch: Req):
-        scheduler = self._request_scheduler(batch)
+        scheduler = batch.scheduler
         if not isinstance(scheduler, SchedulerRLMixin):
             if batch.rollout:
                 raise ValueError(
