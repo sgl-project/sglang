@@ -618,6 +618,47 @@ class TestFlexKVPageAlignedLoadBack(unittest.TestCase):
                 ],
             )
 
+    def test_empty_store_drain_skips_terminal_collectives(self) -> None:
+        """A healthy idle store drain returns without synchronization."""
+        with _import_flexkv_modules() as (module, _):
+            connector, sync_context, manager = _make_connector(module)
+            sync_context.needs_sync = True
+            sync_context.scatter = MagicMock(side_effect=sync_context.scatter)
+            sync_context.all_reduce_min = MagicMock(
+                side_effect=sync_context.all_reduce_min
+            )
+
+            result = connector.check_completed_stores()
+
+            self.assertEqual(result, [])
+            sync_context.scatter.assert_not_called()
+            sync_context.all_reduce_min.assert_not_called()
+            manager.wait.assert_not_called()
+
+    def test_empty_store_drain_rejects_stale_owner_tracking(self) -> None:
+        """An owner without inflight state poisons instead of idling."""
+        with _import_flexkv_modules() as (module, _):
+            connector, sync_context, manager = _make_connector(module)
+            connector._store_owner_required.add("request")
+            sync_context.needs_sync = True
+            sync_context.scatter = MagicMock(side_effect=sync_context.scatter)
+            sync_context.all_reduce_min = MagicMock(
+                side_effect=sync_context.all_reduce_min
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ownership exists without inflight state",
+            ):
+                connector.check_completed_stores()
+
+            self.assertIn(
+                "ownership exists without inflight state", connector._poison_reason
+            )
+            sync_context.scatter.assert_not_called()
+            sync_context.all_reduce_min.assert_not_called()
+            manager.wait.assert_not_called()
+
     def test_store_timeout_exception_poison_prevents_retry(self) -> None:
         """An indeterminate terminal wait poisons the store before any retry."""
         with _import_flexkv_modules() as (module, _):

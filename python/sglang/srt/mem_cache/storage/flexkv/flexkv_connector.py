@@ -916,6 +916,13 @@ class FlexKVConnector:
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
         self.ensure_load_back_safe()
+        if not self._inflight_stores:
+            if self._store_owner_required or self._ambiguous_stores:
+                reason = "FlexKV store ownership exists without inflight state"
+                self.poison_load_back(reason)
+                raise RuntimeError(reason)
+            return []
+
         tracked_stores = {
             rid: self._serialize_store_state(state)
             for rid, state in self._inflight_stores.items()
