@@ -848,7 +848,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
-        if model_runner.use_ngram_embedding:
+        if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
 
         if model_runner.model_config.model_is_mrope:

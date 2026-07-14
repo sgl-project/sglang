@@ -38,7 +38,6 @@ import torch.distributed
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -225,7 +224,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -1303,70 +1302,15 @@ class Scheduler(
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
+        self.ngram_embedding_manager = (
+            self.tp_worker.model_runner.ngram_embedding_manager
+        )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.token_table
+            self.token_table = self.tp_worker.model_runner.ngram_embedding_manager.table
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
-
-    def _maybe_prepare_ngram_embedding(
-        self, batch: Optional[ScheduleBatch]
-    ) -> Optional[ScheduleBatch]:
-        """Fill the token table for ngram embedding before a forward pass."""
-        if batch is None or not self.use_ngram_embedding:
-            return batch
-        batch.ne_token_table = self.token_table
-        if batch.forward_mode == ForwardMode.EXTEND:
-            all_tokens = []
-            column_starts = []
-            request_lengths = []
-            for req in batch.reqs:
-                start = len(req.prefix_indices)
-                end = start + req.extend_range.length
-                fill_ids = req.origin_input_ids + req.output_ids
-                if start == 0:
-                    tokens = fill_ids[start:end]
-                    column_starts.append(0)
-                elif start < self.ngram_embedding_n:
-                    tokens = fill_ids[0:end]
-                    column_starts.append(0)
-                else:
-                    # Prepend n-1 tokens before prefix_len for n-gram context
-                    tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
-                    column_starts.append(start - self.ngram_embedding_n + 1)
-                all_tokens.extend(tokens)
-                request_lengths.append(len(tokens))
-            dtype = self.token_table.dtype
-            device = self.token_table.device
-            update_token_table(
-                ne_token_table=self.token_table,
-                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
-                row_indices=batch.req_pool_indices,
-                column_starts=torch.tensor(
-                    column_starts, dtype=torch.int32, device=device
-                ),
-                req_lens=torch.tensor(
-                    request_lengths, dtype=torch.int32, device=device
-                ),
-                ignore_tokens=None,
-            )
-            # Mark the chunked (not-yet-finished) prefill request so sample()
-            # skips writing its pseudo next-token into the ngram token table.
-            # Use self.chunked_req identity (not req.is_chunked) to avoid
-            # overlap-scheduling timing issues.
-            if self.chunked_req is not None:
-                skip_token_table_update = [
-                    req is self.chunked_req for req in batch.reqs
-                ]
-                batch.ne_skip_token_table_update = (
-                    torch.tensor(
-                        skip_token_table_update, dtype=torch.bool, device=device
-                    )
-                    if any(skip_token_table_update)
-                    else None
-                )
-        return batch
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2806,7 +2750,9 @@ class Scheduler(
         )
 
         # Handle ngram embedding
-        ret = self._maybe_prepare_ngram_embedding(ret)
+        ret = self.ngram_embedding_manager.prepare_for_forward(
+            ret, chunked_req=self.chunked_req
+        )
 
         if ret:
             set_schedule_time_batch(ret)
