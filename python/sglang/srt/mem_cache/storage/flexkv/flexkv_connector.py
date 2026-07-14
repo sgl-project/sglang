@@ -553,11 +553,15 @@ class FlexKVConnector:
                                 f"status {response.status}"
                             )
                     outcome["completed_task_ids"] = completed_task_ids
+            except TimeoutError:
+                pass
             except Exception as exc:  # noqa: BLE001
                 outcome["reason"] = f"FlexKV layerwise terminal wait failed: {exc}"
         if self._sync_ctx.needs_sync:
             outcome = self._sync_ctx.scatter(outcome)
 
+        local_valid = True
+        completed_task_ids: set[int] = set()
         try:
             outcome_tracked_ids = tuple(
                 self._normalize_task_ids_allow_empty(outcome["tracked_task_ids"])
@@ -573,16 +577,30 @@ class FlexKVConnector:
                 raise RuntimeError(
                     "FlexKV layerwise drain completed unexpected task ids"
                 )
-        except Exception as exc:  # noqa: BLE001
-            outcome["reason"] = str(exc)
+            if outcome["reason"] is not None and not isinstance(
+                outcome["reason"], str
+            ):
+                raise RuntimeError("FlexKV layerwise drain returned an invalid reason")
+        except Exception:  # noqa: BLE001
+            local_valid = False
             completed_task_ids = set()
+
+        validation_consistent = self.coordinate_load_publication_step(
+            local_success=local_valid
+        )
+        if not validation_consistent:
+            reason = "FlexKV layerwise drain validation differs across ranks"
+            self._poison_reason = reason
+            for task_id in tracked_ids:
+                self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
+            raise RuntimeError(reason)
 
         reason = outcome["reason"]
         if reason is not None:
             self._poison_reason = str(reason)
             for task_id in tracked_ids:
                 self._ambiguous_loads[f"layerwise:{task_id}"] = (task_id,)
-            return
+            raise RuntimeError(str(reason))
 
         self._launched_load_tids = [
             task_id for task_id in tracked_ids if task_id not in completed_task_ids
@@ -608,6 +626,28 @@ class FlexKVConnector:
         if minimum_classification != maximum_classification:
             return None
         return minimum_classification
+
+    def coordinate_load_match_state(
+        self,
+        *,
+        key_length: int,
+        device_length: int,
+        lookup_enabled: bool,
+    ) -> Optional[Tuple[int, int, bool]]:
+        local_state = (key_length, device_length, lookup_enabled)
+        leader_state = local_state
+        if self._sync_ctx.needs_sync:
+            leader_state = self._sync_ctx.scatter(local_state)
+        local_valid = int(
+            isinstance(leader_state, tuple)
+            and len(leader_state) == 3
+            and local_state == leader_state
+            and key_length >= 0
+            and 0 <= device_length <= key_length
+        )
+        if self._sync_ctx.all_reduce_min(local_valid) == 0:
+            return None
+        return leader_state
 
     def coordinate_load_publication_step(self, *, local_success: bool) -> bool:
         return self._sync_ctx.all_reduce_min(int(local_success)) == 1

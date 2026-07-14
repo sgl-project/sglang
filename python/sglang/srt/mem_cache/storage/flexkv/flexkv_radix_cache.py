@@ -219,16 +219,45 @@ class FlexKVRadixCache(RadixCache):
             )
             key = key[:aligned_len]
 
-        base_res = super().match_prefix(params)
+        base_res: Optional[MatchResult] = None
+        try:
+            base_res = super().match_prefix(params)
+            device_length = int(base_res.device_indices.numel())
+        except Exception as exc:  # noqa: BLE001
+            device_length = -1
+            logger.warning(
+                "[FlexKV] device prefix lookup failed: %s",
+                exc,
+                exc_info=True,
+            )
         if len(key) == 0:
+            if base_res is None:
+                raise RuntimeError("FlexKV device prefix lookup failed")
             return base_res
+
+        lookup_enabled = self._mode is FlexKVMode.IP or params.req is not None
+        common_match_state = self.flexkv_connector.coordinate_load_match_state(
+            key_length=len(key),
+            device_length=device_length,
+            lookup_enabled=lookup_enabled,
+        )
+        if common_match_state is None:
+            self.flexkv_connector.poison_load_back(
+                "FlexKV device prefix state differs across ranks"
+            )
+            raise RuntimeError("FlexKV device prefix state differs across ranks")
+        if base_res is None:
+            self.flexkv_connector.poison_load_back(
+                "FlexKV device prefix lookup failed on at least one rank"
+            )
+            raise RuntimeError("FlexKV device prefix lookup failed")
 
         device_value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
+        if device_length == len(key) or not lookup_enabled:
+            return base_res
 
         if self._mode is FlexKVMode.MP:
-            if params.req is None:
-                return base_res
             return self._mp_match_prefix(
                 key, base_res, device_value, last_node, params.req
             )
@@ -246,8 +275,6 @@ class FlexKVRadixCache(RadixCache):
         the scheduler later invokes :meth:`init_load_back`."""
         token_ids = key.raw_token_ids()
         device_len = int(device_value.numel())
-        if device_len >= len(token_ids):
-            return base_res
 
         # token_mask=True for tokens NOT on device — FlexKV decides
         # which of those it can serve.
@@ -288,8 +315,6 @@ class FlexKVRadixCache(RadixCache):
         immediately. Per-layer hook waits during forward."""
         token_ids = key.raw_token_ids()
         device_len = int(device_value.numel())
-        if device_len >= len(token_ids):
-            return base_res
 
         # Quick LOOKUP first to discover how many slots we'd need.
         token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
@@ -371,10 +396,9 @@ class FlexKVRadixCache(RadixCache):
             and value_numel % self._allocator_page_size == 0
             and value_numel + uncached_len <= len(key)
         )
-        token_slots = (
-            self._allocate_load_slots(num_slots=uncached_len)
-            if valid_manifest
-            else None
+        token_slots = self._allocate_load_slots(
+            num_slots=max(0, uncached_len),
+            should_allocate=valid_manifest,
         )
         try:
             retrieve_result = self.flexkv_connector.retrieve_kv(
@@ -424,10 +448,9 @@ class FlexKVRadixCache(RadixCache):
             and value_numel % self._allocator_page_size == 0
             and value_numel + uncached_len <= len(key)
         )
-        token_slots = (
-            self._allocate_load_slots(num_slots=uncached_len)
-            if valid_manifest
-            else None
+        token_slots = self._allocate_load_slots(
+            num_slots=max(0, uncached_len),
+            should_allocate=valid_manifest,
         )
         try:
             num_retrieved, _ = self.flexkv_connector.start_load_kv_layerwise(
@@ -459,15 +482,22 @@ class FlexKVRadixCache(RadixCache):
             loaded_slots=token_slots,
         )
 
-    def _allocate_load_slots(self, *, num_slots: int) -> Optional[torch.Tensor]:
+    def _allocate_load_slots(
+        self,
+        *,
+        num_slots: int,
+        should_allocate: bool,
+    ) -> Optional[torch.Tensor]:
         token_slots: Optional[torch.Tensor] = None
+        required_slots = num_slots if should_allocate else 0
         try:
             local_shortage = max(
                 0,
-                num_slots - self.token_to_kv_pool_allocator.available_size(),
+                required_slots
+                - self.token_to_kv_pool_allocator.available_size(),
             )
         except Exception as exc:  # noqa: BLE001
-            local_shortage = num_slots
+            local_shortage = required_slots
             logger.warning(
                 "[FlexKV] load slot capacity query failed: %s",
                 exc,
@@ -476,6 +506,8 @@ class FlexKVRadixCache(RadixCache):
 
         try:
             self.evict(EvictParams(num_tokens=local_shortage))
+            if not should_allocate:
+                return None
             token_slots = self.token_to_kv_pool_allocator.alloc(num_slots)
             if token_slots is None:
                 return None
