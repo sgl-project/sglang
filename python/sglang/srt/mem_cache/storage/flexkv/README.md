@@ -162,11 +162,14 @@ server log should also show a matching D2H/H2D bandwidth line:
 ### 7. Layerwise mode
 
 Add `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` before `python3 -m
-sglang.launch_server`. Everything else is identical. On the second
-request you'll see `cached_tokens_details: {"device": N, "host": 0}`
-(in IP mode the load happens inside `match_prefix` so sglang accounts
-for it as device-side) and a log line `LAYERWISE transfer request: N
-finished ...`. The startup log will also include
+sglang.launch_server`. This mode is valid only when the active KV allocator
+has page size 1; startup rejects layerwise transfer for a larger allocator
+page. Use the default MP mode for paged allocators. With a page-one allocator,
+the rest of the launch is identical. On the second request you'll see
+`cached_tokens_details: {"device": N, "host": 0}` (in IP mode the load
+happens inside `match_prefix` so sglang accounts for it as device-side) and a
+log line `LAYERWISE transfer request: N finished ...`. The startup log will
+also include
 `[FlexKV] Eventfd handshake complete ... counters=3 layers=<N>`.
 
 ---
@@ -231,16 +234,52 @@ Either flag also sets `FLEXKV_CONFIG_PATH` so you can omit
 
 ## Modes
 
+### Ownership and failure contract
+
+The sglang Radix tree and GPU slot allocator use the allocator page size as
+their ownership unit. FlexKV may use a smaller storage page, but the storage
+page must divide the allocator page. Prefix lookup truncates the candidate key
+to a whole allocator page and accepts only an exact, contiguous prefix of full
+allocator pages. Store publication similarly stops at the last committed
+allocator-page boundary. Consequently, FlexKV never publishes or releases a
+partial allocator page through this integration.
+
+Before a load launches, all participating ranks agree on the held lookup, the
+exact slot count, and the allocator-page starts. A PP stage uses its own exact
+slot mapping: followers compare against that stage's mapping, and a stage that
+owns a remote transfer sends that mapping to FlexKV. Slot numbers are not
+assumed to be identical across PP stages. A pre-launch mismatch requests
+cancellation of the held task and does not publish the allocated slots.
+
+The task IDs returned by `KVManager.launch` are the observation IDs for both
+loads and stores; the pre-launch ID from `get_match` or `put_match` is not used
+as a completion substitute. Once a load launch has been attempted, any result
+that is not proven successful is ambiguous. Its destination slots are
+quarantined, the connector enters fail-stop state, and later lookup, eviction,
+or reset cannot reuse them. Reset is allowed only when every rank reports no
+poison, ambiguous operation, active layerwise load, active store owner, or
+quarantined load slot.
+
+STORE follows an explicit ownership protocol. The Radix source node is locked
+and a provisional per-request owner is installed before launch. The returned
+observation IDs are tracked in versioned state; terminal polling uses
+`wait(..., completely=True)`, retains `TIMEOUT` IDs, and accepts only terminal
+success. Finalization is two phase: first every rank validates a finalization
+plan and releases the same source-node owner, then the connector commits the
+new tracking state. A post-launch error keeps ownership fail-closed and poisons
+the connector instead of guessing that the source or destination is reusable.
+
 ### MP (synchronous, default)
 
 * `match_prefix` calls `FlexKVConnector.lookup_kv` only.
 * When `host_hit_length > 0`, the scheduler later calls
-  `init_load_back`, which allocates the uncached slots and fires
-  `retrieve_kv` (FlexKV `launch` + `wait`).
-* `cache_finished_req` runs `put_match` + `launch` and stashes the
-  in-flight FlexKV task id. Source-node lock is held until
-  `check_completed_stores` (called from `check_hicache_events` /
-  `evict`) signals completion.
+  `init_load_back`, which allocates the exact uncached allocator pages and
+  fires `retrieve_kv` (FlexKV `launch` + a complete terminal wait).
+* `cache_finished_req` runs `put_match`, installs provisional source
+  ownership, and launches the store. The returned observation IDs and
+  versioned terminal state remain attached to that owner. The source-node lock
+  is held until `check_completed_stores` (called from `check_hicache_events` /
+  `evict`) proves success and completes two-phase finalization.
 
 This is the path you'll use under any non-trivial deployment topology
 (DP > 1, multi-instance, multi-node, ...).
@@ -249,6 +288,8 @@ This is the path you'll use under any non-trivial deployment topology
 
 * `match_prefix` allocates the uncached slots and fires
   `start_load_kv_layerwise` immediately.
+* This mode requires allocator page size 1. Page sizes greater than 1 use MP;
+  they are rejected at startup if layerwise transfer is requested.
 * A `FlexKVLayerDoneCounter` is registered onto sglang's KV pool via
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker
@@ -287,8 +328,9 @@ This is the path you'll use under any non-trivial deployment topology
 FlexKV runs one `KVManager` per DP route (=
 `instance_id * dp_size + dp_rank`). Every other rank in the same
 fan-out is the "sync follower" — `FlexKVComm` broadcasts the
-leader's lookup / store decisions via gloo CPU groups so non-leader
-ranks know which task ids and slot mappings to use.
+leader's lookup / store decisions and returned observation IDs via gloo CPU
+groups. Slot mappings remain exact and stage-local; each PP stage validates
+and forwards its own mapping instead of assuming cross-stage slot identity.
 
 Supported:
 
