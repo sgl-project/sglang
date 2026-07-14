@@ -1500,7 +1500,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.host_token_len(req.kv.kv_allocated_len),
             )
         else:
-            uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
+            uses_swa_tail = (
+                self._uses_swa_tail_prealloc()
+                and prefix_len == 0
+                and total_prefix_len == 0
+            )
             swa_tail_len = self._swa_tail_len(fill_len)
             kv_loc = alloc_for_decode_prealloc(
                 allocator,

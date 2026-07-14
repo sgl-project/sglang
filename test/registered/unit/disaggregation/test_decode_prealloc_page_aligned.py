@@ -147,6 +147,59 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
         self.assertEqual(locations.numel(), 2)
         self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [5])
 
+    def test_transferred_prefix_bypasses_zero_based_swa_tail_helper(self) -> None:
+        """A transferred prefix routes through ordinary extend ownership."""
+        fill_len = 510
+        transferred_prefix_len = 64
+        allocator = _Allocator(page_size=64)
+        allocator.available_size = mock.Mock(return_value=512)
+        req = SimpleNamespace(
+            rid="req-0",
+            origin_input_ids=list(range(fill_len)),
+            output_ids=[],
+            kv=None,
+            set_extend_range=mock.Mock(),
+        )
+
+        def alloc_reqs(reqs: list[SimpleNamespace]) -> torch.Tensor:
+            reqs[0].req_pool_idx = 0
+            return torch.tensor([0], dtype=torch.int64)
+
+        req_to_token_pool = SimpleNamespace(
+            alloc=mock.Mock(side_effect=alloc_reqs),
+            write=mock.Mock(),
+        )
+        queue = decode.DecodePreallocQueue.__new__(decode.DecodePreallocQueue)
+        queue.req_to_token_pool = req_to_token_pool
+        queue.token_to_kv_pool_allocator = allocator
+        queue.tree_cache = SimpleNamespace()
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=False,
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=False
+            ),
+        )
+        queue._uses_swa_tail_prealloc = mock.Mock(return_value=True)
+        queue._swa_tail_len = mock.Mock(return_value=126)
+
+        queue._pre_alloc(
+            req,
+            prefix_indices=torch.empty((0,), dtype=torch.int64),
+            prefix_len=0,
+            total_prefix_len=transferred_prefix_len,
+        )
+
+        self.assertEqual(len(allocator.calls), 1)
+        self.assertNotIn("swa_tail_end", allocator.calls[0])
+        self.assertEqual(
+            allocator.calls[0]["prefix_lens_cpu"].tolist(),
+            [transferred_prefix_len],
+        )
+        self.assertEqual(
+            allocator.calls[0]["extend_num_tokens"],
+            512 - transferred_prefix_len,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
