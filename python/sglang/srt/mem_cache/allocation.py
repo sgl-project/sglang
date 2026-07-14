@@ -107,9 +107,7 @@ def gather_out_cache_loc_extend(
 ) -> torch.Tensor:
     num_reqs: int = req_pool_indices_tensor.shape[0]
     if num_reqs == 0 or extend_num_tokens == 0:
-        return torch.empty(
-            (0,), dtype=out_dtype, device=req_to_token_pool.device
-        )
+        return torch.empty((0,), dtype=out_dtype, device=req_to_token_pool.device)
 
     req_to_token: torch.Tensor = req_to_token_pool.req_to_token
     if support_triton(get_server_args().attention_backend):
