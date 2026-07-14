@@ -29,7 +29,7 @@ import enum
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -108,7 +108,7 @@ class FlexKVRadixCache(RadixCache):
         if enable_layerwise and allocator_page_size > 1:
             raise ValueError("FlexKV layerwise transfer requires allocator page size 1")
 
-        super().__init__(params)
+        super().__init__(replace(params, page_size=allocator_page_size))
         self._storage_page_size = storage_page_size
         self._allocator_page_size = allocator_page_size
 
@@ -228,11 +228,6 @@ class FlexKVRadixCache(RadixCache):
         device_len = int(device_value.numel())
         if device_len >= len(token_ids):
             return base_res
-        if device_len % self._allocator_page_size != 0:
-            raise RuntimeError(
-                "FlexKV MP load-back requires an allocator-page-aligned device "
-                "prefix"
-            )
 
         # token_mask=True for tokens NOT on device — FlexKV decides
         # which of those it can serve.
@@ -538,6 +533,11 @@ class FlexKVRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
+        kv_committed_len = (
+            kv_committed_len
+            // self._allocator_page_size
+            * self._allocator_page_size
+        )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:
