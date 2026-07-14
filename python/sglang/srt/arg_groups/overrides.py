@@ -1138,8 +1138,15 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
-        if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, model_arch
+        # extra_buffer relies on the FLA backend, which is only available on
+        # CUDA/MUSA/NPU (see ServerArgs._validate_mamba_extra_buffer). On other
+        # platforms (e.g. ROCm/HIP) it must fall back to no_buffer, otherwise
+        # server startup aborts with "extra_buffer needs CUDA/MUSA/NPU (FLA)".
+        fla_available = is_cuda() or is_musa() or is_npu()
+        if (
+            (wants_overlap or wants_paging)
+            and fla_available
+            and supports_mamba_cache_extra_buffer(view, model_arch)
         ):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
