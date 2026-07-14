@@ -159,19 +159,13 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    from sgl_kernel import fp8_scaled_mm
 
+    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
-
-    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
-    def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
@@ -264,11 +258,6 @@ class Fp8GemmRunnerBackend(Enum):
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
-def _check_cutlass_block_fp8_hardware_support() -> bool:
-    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
-    return is_sm90_supported() or is_blackwell_supported()
-
-
 # --- BaseFusedOp (RFC #29630 / #30044) multi-backend GEMM contract ---------
 #
 # ``--fp8-gemm-backend`` is still surfaced to users as the ``Fp8GemmRunnerBackend``
@@ -297,7 +286,7 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
 
     op = "gemm.fp8_blockwise"
     # Mirrors the auto-selection order previously hardcoded in
-    # `_dispatch_auto_backend`: DeepGEMM > FlashInfer TRTLLM/CUTLASS > CUTLASS > AITER > Triton.
+    # `_dispatch_auto_backend`: DeepGEMM > FlashInfer TRTLLM/CUTLASS > CUTLASS (SM120) > AITER > Triton.
     priority = (
         KernelBackend.DEEPGEMM,
         KernelBackend.FLASHINFER_TRTLLM,
@@ -310,7 +299,8 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
         KernelBackend.FLASHINFER_TRTLLM: "FlashInfer TRTLLM blockwise FP8 GEMM (SM100/SM103).",
         KernelBackend.FLASHINFER_CUTLASS: "FlashInfer CUTLASS blockwise FP8 GEMM (SM120).",
         KernelBackend.FLASHINFER_DEEPGEMM: "FlashInfer DeepGEMM swapAB blockwise FP8 GEMM (SM90).",
-        KernelBackend.CUDA_AOT: "CUTLASS blockwise FP8 GEMM (sgl_kernel wheel).",
+        KernelBackend.CUDA_AOT: "CUTLASS blockwise FP8 GEMM (sgl_kernel wheel, SM120 only; "
+        "deprecated elsewhere in favor of DeepGEMM/FlashInfer TRTLLM).",
         KernelBackend.AITER: "AITER (CK / aiter-triton) blockwise FP8 GEMM (ROCm).",
         KernelBackend.TRITON: "Triton blockwise FP8 GEMM (fallback, widely compatible).",
     }
@@ -325,7 +315,9 @@ class Fp8BlockwiseGemmOp(BaseFusedOp):
         if backend == KernelBackend.FLASHINFER_DEEPGEMM:
             return is_sm90_supported() and is_flashinfer_available()
         if backend == KernelBackend.CUDA_AOT:
-            return _check_cutlass_block_fp8_hardware_support()
+            # CUTLASS blockwise FP8 is deprecated on SM90/SM100 in favor of
+            # DeepGEMM/FlashInfer TRTLLM; only SM120 still uses it.
+            return is_sm120_supported()
         if backend == KernelBackend.AITER:
             return _use_aiter
         return True
@@ -704,8 +696,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
-        # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
-        backend = "triton"
+        backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
 
