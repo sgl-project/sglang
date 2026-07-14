@@ -23,18 +23,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         expected = torch.tensor([8, 9, 10], dtype=torch.int64)
         logical_allocator.alloc_extend_swa_tail.return_value = expected
 
-        prefix_lens = torch.tensor([0], dtype=torch.int64)
-        prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-        seq_lens = torch.tensor([512], dtype=torch.int64)
-        seq_lens_cpu = torch.tensor([512], dtype=torch.int64)
-        last_loc = torch.tensor([-1], dtype=torch.int64)
-
         result = allocator.alloc_extend_swa_tail(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
             extend_num_tokens=512,
             swa_tail_len=128,
             swa_tail_end=512,
@@ -43,11 +32,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertIs(result, expected)
         logical_allocator.alloc_extend_swa_tail.assert_called_once()
         _, kwargs = logical_allocator.alloc_extend_swa_tail.call_args
-        self.assertIs(kwargs["prefix_lens"], prefix_lens)
-        self.assertIs(kwargs["prefix_lens_cpu"], prefix_lens_cpu)
-        self.assertIs(kwargs["seq_lens"], seq_lens)
-        self.assertIs(kwargs["seq_lens_cpu"], seq_lens_cpu)
-        self.assertIs(kwargs["last_loc"], last_loc)
         self.assertEqual(kwargs["extend_num_tokens"], 512)
         self.assertEqual(kwargs["swa_tail_len"], 128)
         self.assertEqual(kwargs["swa_tail_end"], 512)

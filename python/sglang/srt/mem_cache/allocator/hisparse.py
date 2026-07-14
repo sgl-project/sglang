@@ -333,28 +333,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
-    def alloc_logical_only(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
+    def alloc_logical_only(self, *, need_size: int):
         """Allocate only logical indices without hisparse device indices.
 
         Used in the direct-to-host transfer path where KV data is written
         directly to host memory by the prefill node, skipping GPU staging.
         """
-        return self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
+        assert need_size >= 0
+        assert need_size % self.page_size == 0
+        return self.logical_attn_allocator.alloc(need_size)
 
     def alloc_device_buffer(
         self,
@@ -635,42 +622,20 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return logical_indices
 
-    def alloc_logical_only(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
+    def alloc_logical_only(self, *, need_size: int):
         """Allocate decode logical indices without allocating C4 hisparse device pages."""
-        return self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
+        assert need_size >= 0
+        assert need_size % self.page_size == 0
+        return self.logical_attn_allocator.alloc(need_size)
 
     def alloc_extend_swa_tail(
         self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        *,
         extend_num_tokens: int,
         swa_tail_len: int,
         swa_tail_end: int,
     ):
         return self.logical_attn_allocator.alloc_extend_swa_tail(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
             extend_num_tokens=extend_num_tokens,
             swa_tail_len=swa_tail_len,
             swa_tail_end=swa_tail_end,

@@ -21,9 +21,13 @@ class _Allocator:
         self.calls.append(kwargs)
         return torch.arange(int(kwargs["extend_num_tokens"]), dtype=torch.int64)
 
+    def alloc(self, need_size: int) -> torch.Tensor:
+        self.calls.append({"need_size": need_size})
+        return torch.arange(need_size, dtype=torch.int64)
+
     def alloc_logical_only(self, **kwargs: object) -> torch.Tensor:
         self.calls.append(kwargs)
-        return torch.arange(int(kwargs["extend_num_tokens"]), dtype=torch.int64)
+        return torch.arange(int(kwargs["need_size"]), dtype=torch.int64)
 
     def alloc_extend_swa_tail(self, **kwargs: object) -> torch.Tensor:
         self.calls.append(kwargs)
@@ -51,8 +55,7 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
 
         self.assertEqual(req.kv.kv_allocated_len, 8)
         self.assertEqual(locations.numel(), 4)
-        self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
-        self.assertEqual(allocator.calls[0]["extend_num_tokens"], 4)
+        self.assertEqual(allocator.calls[0]["need_size"], 4)
 
     def test_decode_prealloc_rejects_misalignment_before_watermark_write(self) -> None:
         """PD preallocation rejects a partial prefix before mutating request state."""
@@ -97,7 +100,7 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
 
         self.assertEqual(req.kv.kv_allocated_len, 8)
         self.assertEqual(locations.numel(), 8)
-        self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [8])
+        self.assertEqual(allocator.calls[0]["need_size"], 8)
 
     def test_hisparse_host_allocation_uses_real_fill_length(self) -> None:
         """HiSparse host allocation excludes page-alignment padding."""

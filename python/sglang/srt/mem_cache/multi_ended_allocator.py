@@ -2271,6 +2271,37 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                     fa.clear_inverse_history()
             return v_tokens
 
+    def alloc_extend_swa_tail(
+        self,
+        *,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+        swa_tail_end: int,
+    ) -> Optional[torch.Tensor]:
+        assert extend_num_tokens % self.page_size == 0
+        assert 0 <= swa_tail_len <= swa_tail_end <= extend_num_tokens
+        win_start = swa_tail_end - swa_tail_len
+        assert win_start % self.page_size == 0
+        mapped_end = (
+            (swa_tail_end + self.page_size - 1) // self.page_size * self.page_size
+        )
+        assert mapped_end <= extend_num_tokens
+
+        if extend_num_tokens > self.available_size():
+            if not self._flush_both_for_alloc(extend_num_tokens):
+                return None
+
+        full_allocator = self.full_attn_allocator
+        full_page_count = extend_num_tokens // self.page_size
+        virtual_pages = full_allocator.free_virtual_ids[:full_page_count].clone()
+        tail_virtual_pages = virtual_pages[
+            win_start // self.page_size : mapped_end // self.page_size
+        ]
+        virtual_tokens = full_allocator.alloc(extend_num_tokens)
+        assert virtual_tokens is not None
+        self.swa_attn_allocator.alloc_with_virtual(tail_virtual_pages)
+        return virtual_tokens
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

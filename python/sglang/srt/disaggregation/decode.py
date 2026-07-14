@@ -1563,44 +1563,21 @@ def alloc_for_decode_prealloc_hisparse(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
-    prefix_lens_cpu: torch.Tensor = torch.tensor([0], dtype=torch.int64)
-    seq_lens_cpu: torch.Tensor = torch.tensor([alloc_fill_len], dtype=torch.int64)
-    assert_alloc_extend_lens_page_aligned(
-        prefix_lens_cpu=prefix_lens_cpu,
-        seq_lens_cpu=seq_lens_cpu,
-        extend_num_tokens=alloc_fill_len,
-        page_size=allocator.page_size,
-    )
+    assert not _is_npu, "HiSparse decode preallocation is not supported on NPU"
+    alloc_fill_len = ceil_align(fill_len, allocator.page_size)
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
         req.kv.kv_allocated_len = alloc_fill_len
-    device = allocator.device
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-    seq_lens = torch.tensor([alloc_fill_len], dtype=torch.int64, device=device)
-    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
             extend_num_tokens=alloc_fill_len,
             swa_tail_len=swa_tail_len,
             swa_tail_end=fill_len,
         )
         req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
     else:
-        kv_loc = allocator.alloc_logical_only(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
-            extend_num_tokens=alloc_fill_len,
-        )
+        kv_loc = allocator.alloc_logical_only(need_size=alloc_fill_len)
     return kv_loc
 
 
@@ -1630,9 +1607,7 @@ def alloc_for_decode_prealloc(
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
         req.kv.kv_allocated_len = alloc_fill_len
-    if allocator.page_size == 1:
-        kv_loc = allocator.alloc(delta_len)
-    else:
+    if _is_npu:
         device = allocator.device
         last_loc = (
             prefix_indices[-1:].to(dtype=torch.int64, device=device)
@@ -1640,12 +1615,15 @@ def alloc_for_decode_prealloc(
             else torch.tensor([-1], dtype=torch.int64, device=device)
         )
         if uses_swa_tail:
-            # Tail-only SWA allocation: only valid when prefix_len == 0.
-            # When prefix_len > 0 (radix cache hit), we fall back to
-            # alloc_extend which allocates SWA at full page count; the
-            # SWA budget in that case may slightly under-estimate.
-            kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            from sglang.srt.hardware_backend.npu.allocator_npu import (
+                alloc_extend_swa_tail_npu,
+            )
+
+            kv_loc = alloc_extend_swa_tail_npu(
+                allocator,
+                prefix_lens=torch.tensor(
+                    [alloc_prefix_len], dtype=torch.int64, device=device
+                ),
                 prefix_lens_cpu=prefix_lens_cpu,
                 seq_lens=torch.tensor(
                     [alloc_fill_len], dtype=torch.int64, device=device
@@ -1670,6 +1648,18 @@ def alloc_for_decode_prealloc(
                 last_loc=last_loc,
                 extend_num_tokens=alloc_fill_len - total_prefix_len,
             )
+    elif allocator.page_size == 1:
+        kv_loc = allocator.alloc(delta_len)
+    elif not uses_swa_tail:
+        assert total_prefix_len % allocator.page_size == 0
+        kv_loc = allocator.alloc(alloc_fill_len - total_prefix_len)
+    else:
+        kv_loc = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=alloc_fill_len,
+            swa_tail_len=swa_tail_len,
+            swa_tail_end=fill_len,
+        )
+        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
     return kv_loc
 
 
