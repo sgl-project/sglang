@@ -552,7 +552,12 @@ class DeepseekV4HipRadixBackend(
             is_prefill=True,
         )
         self._attach_unified_kv_prefill_meta(
-            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens, num_tokens
+            core_attn_metadata,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            num_tokens,
+            need_compress=need_compress,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1104,6 +1109,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
+        need_compress: bool = True,
     ) -> None:
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1115,13 +1121,20 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens))
-        # Pass output_size to avoid the implicit device->host sync
-        bid = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64),
-            extend_seq_lens,
-            output_size=num_tokens,
-        )
+        # token -> req index (length L = sum(extend_seq_lens)). 
+        # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
+        # target-extend path triggers a GPU memory access fault.
+        if need_compress:
+            bid = torch.repeat_interleave(
+                torch.arange(bs, device=device, dtype=torch.int64),
+                extend_seq_lens,
+            )
+        else:
+            bid = torch.repeat_interleave(
+                torch.arange(bs, device=device, dtype=torch.int64),
+                extend_seq_lens,
+                output_size=num_tokens,
+            )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
         core.unified.pf_state_slot = req_pool_indices[bid]
