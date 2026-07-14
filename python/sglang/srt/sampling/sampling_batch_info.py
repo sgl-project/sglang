@@ -69,6 +69,10 @@ class SamplingBatchInfo:
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
 
+    # Per-request flag for returning sparse sampling support metadata.
+    return_sampling_masks: Optional[List[bool]] = None
+    sampling_mask_max_top_k: int = 0
+
     # Device
     device: str = "cuda"
 
@@ -137,6 +141,11 @@ class SamplingBatchInfo:
             global_server_args.enable_custom_logit_processor
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
+        return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        sampling_mask_max_top_k = max(
+            (r.sampling_params.top_k for r in reqs if r.return_sampling_mask),
+            default=0,
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -201,6 +210,8 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            return_sampling_masks=return_sampling_masks,
+            sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -304,6 +315,10 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+        if self.return_sampling_masks is not None:
+            self.return_sampling_masks = [
+                self.return_sampling_masks[i] for i in keep_indices
+            ]
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
@@ -390,11 +405,24 @@ class SamplingBatchInfo:
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
+        self_len = len(self)
+        other_len = len(other)
+
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).
         self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+            self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
         )
+        if (
+            self.return_sampling_masks is not None
+            or other.return_sampling_masks is not None
+        ):
+            self.return_sampling_masks = (
+                self.return_sampling_masks or [False] * self_len
+            ) + (other.return_sampling_masks or [False] * other_len)
+            self.sampling_mask_max_top_k = max(
+                self.sampling_mask_max_top_k, other.sampling_mask_max_top_k
+            )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
