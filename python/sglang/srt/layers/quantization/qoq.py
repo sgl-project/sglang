@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
@@ -15,7 +16,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()

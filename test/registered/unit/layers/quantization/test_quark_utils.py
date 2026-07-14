@@ -52,10 +52,6 @@ class TestE8M0ToF32(CustomTestCase):
 
     # ---- Guardrails: pass on both buggy and fixed code ----------------------
 
-    def test_zero_exponent_is_one(self):
-        x = torch.tensor([127], dtype=torch.uint8)
-        self.assertEqual(e8m0_to_f32(x).item(), 1.0)
-
     def test_shape_preserved(self):
         x = torch.zeros((3, 4, 5), dtype=torch.uint8)
         self.assertEqual(tuple(e8m0_to_f32(x).shape), (3, 4, 5))

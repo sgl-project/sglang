@@ -674,6 +674,7 @@ class Req(ReqDllmMixin):
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
+        return_sampling_mask: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
@@ -884,6 +885,7 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
+        self.send_output_sampling_mask_offset: int = 0
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -893,6 +895,9 @@ class Req(ReqDllmMixin):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
         )
+        self.temp_scaled_logprobs = False
+        self.top_p_normalized_logprobs = False
+        self.return_sampling_mask = return_sampling_mask
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
@@ -914,10 +919,17 @@ class Req(ReqDllmMixin):
             # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
             self.logprob.output_token_ids_logprobs_val = []
             self.logprob.output_token_ids_logprobs_idx = []
+        if return_sampling_mask:
+            self.output_token_sampling_mask = []
+            self.output_token_sampling_logprobs = []
+        else:
+            self.output_token_sampling_mask = None
+            self.output_token_sampling_logprobs = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        self.output_dsa_topk_indices = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
@@ -961,10 +973,16 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
 
+        self.spec_num_block_accept_tokens = 0
+
+        self.spec_num_cap_tokens = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_correct_drafts_histogram: List[int] = []
+
+        self.spec_cap_lens_histogram: List[int] = []
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
@@ -1009,6 +1027,8 @@ class Req(ReqDllmMixin):
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
+        # Number of optimistic prefill forward passes started. preserved across retracts.
+        self.prefill_attempt_count = 0
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
@@ -1089,6 +1109,14 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def update_spec_cap_lens_histogram(self, cap_len: int):
+        cap_len = int(cap_len)
+        if len(self.spec_cap_lens_histogram) <= cap_len:
+            self.spec_cap_lens_histogram.extend(
+                [0] * (cap_len - len(self.spec_cap_lens_histogram) + 1)
+            )
+        self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -1479,6 +1507,8 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
+        self.temp_input_token_ids_logprobs_val = None
+        self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -1587,6 +1617,7 @@ class Req(ReqDllmMixin):
             f"input_len={len(self.origin_input_ids)}, "
             f"cached_input_len={self.cached_tokens}, "
             f"output_len={len(self.output_ids)}, "
+            f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
         )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
@@ -1860,6 +1891,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
+    spec_verify_tier_num_tokens: int = -1
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1905,6 +1937,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
@@ -2082,6 +2115,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+        server_args = get_server_args()
 
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
@@ -2215,7 +2249,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if get_server_args().enable_mamba_extra_buffer():
+            if server_args.enable_mamba_extra_buffer():
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
@@ -2320,7 +2354,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if get_server_args().enable_mamba_extra_buffer():
+        if server_args.enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2354,7 +2388,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        server_args = get_server_args()
+        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
             assert i % mamba_cache_chunk_size == 0
@@ -2405,7 +2440,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
-            if not get_server_args().enable_mamba_extra_buffer_lazy():
+            if not server_args.enable_mamba_extra_buffer_lazy():
                 req.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
@@ -2728,6 +2763,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        server_args = get_server_args()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2779,15 +2815,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if get_server_args().enable_mamba_extra_buffer():
-            mamba_track_interval = get_server_args().mamba_track_interval
+        if server_args.enable_mamba_extra_buffer():
+            mamba_track_interval = server_args.mamba_track_interval
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                if get_server_args().enable_mamba_extra_buffer_lazy():
+                if server_args.enable_mamba_extra_buffer_lazy():
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 

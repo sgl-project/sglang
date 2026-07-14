@@ -32,7 +32,7 @@ framework-specific optimization workflow.
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
-- `docs/diffusion/performance/attention_backends.md` (repo root)
+- `docs_new/docs/sglang-diffusion/attention_backends.mdx` (repo root)
 
 **Core Fusion Patterns**
 
@@ -121,7 +121,7 @@ framework-specific optimization workflow.
 - ROCm falls back to native.
 
 2. Attention backend selection (FlashAttention, Sage, SDPA)
-- Locations: `platforms/cuda.py`, `attention/selector.py`, `docs/diffusion/performance/attention_backends.md`
+- Locations: `platforms/cuda.py`, `attention/selector.py`, `docs_new/docs/sglang-diffusion/attention_backends.mdx`
 - Behavior: CUDA prefers FlashAttention (FA3/FA4) when supported, otherwise Torch SDPA. Force via `--attention-backend` or `global_force_attn_backend`.
 
 3. FlashInfer RoPE (Q/K inplace)
