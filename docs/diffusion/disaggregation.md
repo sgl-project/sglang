@@ -134,12 +134,12 @@ transferred.
 sglang serve --model-path /home/weights/zai-org/GLM-Image/ --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19001 \
   --num-gpus 2 --base-gpu-id 0 --denoiser-sp 2 \
-  --cfg-parallel-size 1 --batching-max-size 2 --attention-backend fa
+  --cfg-parallel-size 1 --batching-max-size 1 --attention-backend fa
 
 sglang serve --model-path /home/weights/zai-org/GLM-Image/ --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19002 \
   --num-gpus 2 --base-gpu-id 2 --denoiser-sp 2 \
-  --cfg-parallel-size 1 --batching-max-size 2 --attention-backend fa
+  --cfg-parallel-size 1 --batching-max-size 1 --attention-backend fa
 
 # Public head; --encoder-urls and --decoder-urls are intentionally omitted
 sglang serve --model-path /home/weights/zai-org/GLM-Image/ --disagg-role server \
@@ -164,8 +164,9 @@ sglang serve \
 ```
 
 With four compatible requests, the head sends one batch of four to the AR
-endpoint and dispatches two concurrent batches of two to the terminal workers.
-Partial groups are dispatched as `2+1`, `2`, or `1` after the batching delay.
+endpoint, then queues four independent DiT requests. Two terminal workers run
+one request each concurrently and consume the remaining requests as they become
+available.
 
 ## Port Convention
 

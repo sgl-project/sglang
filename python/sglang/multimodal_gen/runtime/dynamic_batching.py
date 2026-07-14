@@ -7,6 +7,8 @@ from copy import deepcopy
 from enum import Enum
 from typing import Any
 
+import torch
+
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
@@ -118,8 +120,8 @@ def slice_generation_req(req: Req, start: int, end: int, total: int) -> Req:
         elif isinstance(value, tuple) and len(value) == total:
             setattr(shard, field.name, deepcopy(value[start:end]))
         elif (
-            hasattr(value, "shape")
-            and len(value.shape) > 0
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
             and value.shape[0] == total
         ):
             setattr(shard, field.name, value[start:end])
@@ -134,8 +136,8 @@ def slice_generation_req(req: Req, start: int, end: int, total: int) -> Req:
         if isinstance(value, list) and len(value) == total:
             setattr(shard, name, deepcopy(value[start:end]))
         elif (
-            hasattr(value, "shape")
-            and len(value.shape) > 0
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
             and value.shape[0] == total
         ):
             setattr(shard, name, value[start:end])

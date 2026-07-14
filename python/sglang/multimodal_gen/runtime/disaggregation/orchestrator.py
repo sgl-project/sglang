@@ -604,45 +604,23 @@ class DiffusionServer:
             except ValueError:
                 pass
 
-        healthy_capacities = [
-            capacity
-            for index, capacity in enumerate(self._glm_worker_batch_sizes)
-            if self._glm_worker_available[index]
-        ]
-        worker_cap = max(healthy_capacities, default=1)
-        if any(
-            client.req.num_outputs_per_prompt > worker_cap for client in clients
-        ):
-            for client in clients:
-                self._complete_with_error(
-                    client.request_id,
-                    "num_outputs_per_prompt exceeds denoiser batch capacity",
-                )
-            return
         total = len(clients)
-        start = 0
         output_start = 0
-        while start < total:
-            end = start
-            output_count = 0
-            while end < total:
-                candidate_count = clients[end].req.num_outputs_per_prompt
-                if output_count and output_count + candidate_count > worker_cap:
-                    break
-                output_count += candidate_count
-                end += 1
+        for start, client in enumerate(clients):
+            end = start + 1
+            output_count = client.req.num_outputs_per_prompt
             output_end = output_start + output_count
             shard_req = slice_generation_req(merged, start, end, total)
             shard_req.prior_token_id = merged.prior_token_id[
                 output_start:output_end
             ]
-            output_paths = shard_req.extra.get("dynamic_batch_output_paths")
+            output_paths = merged.extra.get("dynamic_batch_output_paths")
             if isinstance(output_paths, list):
                 shard_req.extra["dynamic_batch_output_paths"] = output_paths[
                     output_start:output_end
                 ]
             shard_id = shard_req.request_id
-            shard_clients = clients[start:end]
+            shard_clients = [client]
             shard_req.extra["fanout_child_request_ids"] = [
                 client.request_id for client in shard_clients
             ]
@@ -651,7 +629,6 @@ class DiffusionServer:
             )
             self._glm_shards[shard_id] = shard
             self._glm_shard_queue.append(shard)
-            start = end
             output_start = output_end
 
     def _drain_glm_shard_queue(self) -> None:
@@ -708,8 +685,8 @@ class DiffusionServer:
             logger.warning("GLM denoiser[%d] disconnected", worker_idx)
         elif event == zmq.EVENT_CONNECTED:
             registered = worker_idx in self._denoiser_peers
-            self._glm_worker_available[worker_idx] = registered
-            if registered and worker_idx not in self._glm_shard_workers.values():
+            self._glm_worker_available[worker_idx] = True
+            if worker_idx not in self._glm_shard_workers.values():
                 self._denoiser_free_slots[worker_idx] = 1
             logger.info(
                 "GLM denoiser[%d] connected (registered=%s)",

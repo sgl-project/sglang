@@ -394,13 +394,8 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
             {"text_encoder", "tokenizer", "vae", "transformer", "scheduler"},
         )
 
-    def test_glm_fanout_shard_sizes(self):
-        for request_count, expected_sizes in (
-            (1, [1]),
-            (2, [2]),
-            (3, [2, 1]),
-            (4, [2, 2]),
-        ):
+    def test_glm_fanout_request_slices(self):
+        for request_count in (1, 2, 3, 4):
             reqs = [
                 Req(request_id=f"req-{index}", prompt=f"prompt-{index}", seed=index)
                 for index in range(request_count)
@@ -409,12 +404,12 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
             self.assertIsNotNone(merged)
             merged.prior_token_id = torch.arange(request_count).reshape(-1, 1)
             sizes = []
-            for start in range(0, request_count, 2):
-                end = min(request_count, start + 2)
+            for start in range(request_count):
+                end = start + 1
                 shard = slice_generation_req(merged, start, end, request_count)
                 sizes.append(len(shard.prompt))
                 self.assertEqual(shard.prior_token_id.shape[0], end - start)
-            self.assertEqual(sizes, expected_sizes)
+            self.assertEqual(sizes, [1] * request_count)
 
     def test_wan_ti2v_denoiser_keeps_vae(self):
         for pipeline_cls in (WanImageToVideoPipeline, WanImageToVideoDmdPipeline):
