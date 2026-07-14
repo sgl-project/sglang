@@ -99,6 +99,8 @@ def _install_signal_handlers_once() -> None:
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
+    supports_page_aligned_alloc: bool = True
+
     def __init__(
         self,
         *,
@@ -1671,6 +1673,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     of their own (independent) virtual-id spaces.
     """
 
+    supports_page_aligned_alloc: bool = True
+
     def __init__(
         self,
         *,
@@ -1964,6 +1968,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     - `full_available_size()` / `swa_available_size()`: per-side scheduler view
       = min(conserve, schedulable).
     """
+
+    supports_page_aligned_alloc: bool = True
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
     # override with a no-op setter. Reading returns `min(_size_full, _size_swa)`.

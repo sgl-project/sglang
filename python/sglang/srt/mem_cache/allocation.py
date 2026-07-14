@@ -402,6 +402,8 @@ def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
+    *,
+    phase: Optional[str] = None,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -413,8 +415,11 @@ def alloc_token_slots(
     out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
+        error_prefix: str = (
+            f"{phase} out of memory" if phase is not None else "Out of memory"
+        )
         error_msg = (
-            f"Out of memory. Try to lower your batch size.\n"
+            f"{error_prefix}. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
             f"{available_and_evictable_str(tree_cache)}"
         )
@@ -650,6 +655,18 @@ def alloc_for_extend(
         alloc_end_lens_device = batch.seq_lens
         alloc_extend_lens_device = extend_lens_device
     alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    uses_page_aligned_alloc: bool = (
+        not _is_npu
+        and allocator_page > 1
+        and allocator.supports_page_aligned_alloc
+    )
+    assert_alloc_extend_lens_page_aligned(
+        prefix_lens_cpu=alloc_start_lens_cpu,
+        seq_lens_cpu=alloc_end_lens_cpu,
+        extend_num_tokens=alloc_extend_num_tokens,
+        page_size=allocator_page,
+    )
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
@@ -661,6 +678,13 @@ def alloc_for_extend(
     # Allocate KV cache (throws exception on failure)
     if allocator_page == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+    elif uses_page_aligned_alloc:
+        assert allocator_page == allocator.page_size
+        out_cache_loc = alloc_token_slots(
+            tree_cache=batch.tree_cache,
+            num_tokens=alloc_extend_num_tokens,
+            phase="Prefill",
+        )
     else:
         # Paged allocation - build last_loc
         last_loc: list[torch.Tensor] = []
@@ -824,6 +848,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu: torch.Tensor = batch.seq_lens
     bs: int = seq_lens_gpu.shape[0]
     allocator_page: int = _alloc_page_size(batch)
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    out_dtype: torch.dtype = torch.int64
+    out_cache_loc: Optional[torch.Tensor] = None
     locs: torch.Tensor
     locs_cpu: torch.Tensor
     if batch.model_config.is_encoder_decoder:
@@ -839,6 +866,34 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = seq_lens_gpu.clone()
         locs_cpu = batch.seq_lens_cpu.clone()
+
+    uses_page_aligned_alloc: bool = False
+    if allocator_page > 1 and not _is_npu:
+        assert token_per_req == 1
+        allocated_old_cpu: torch.Tensor = torch.tensor(
+            [req.kv.kv_allocated_len for req in batch.reqs],
+            dtype=locs_cpu.dtype,
+            device=locs_cpu.device,
+        )
+        aligned_mask_cpu: torch.Tensor = allocated_old_cpu % allocator_page == 0
+        aligned_end_cpu: torch.Tensor = (
+            (locs_cpu + token_per_req + allocator_page - 1)
+            // allocator_page
+            * allocator_page
+        )
+        crossing_mask_cpu: torch.Tensor = aligned_mask_cpu & (
+            aligned_end_cpu > allocated_old_cpu
+        )
+        transitional_mask_cpu: torch.Tensor = ~aligned_mask_cpu
+        crossing_indices_cpu: torch.Tensor = torch.nonzero(
+            crossing_mask_cpu, as_tuple=False
+        ).flatten()
+        transitional_indices_cpu: torch.Tensor = torch.nonzero(
+            transitional_mask_cpu, as_tuple=False
+        ).flatten()
+        uses_page_aligned_alloc = allocator.supports_page_aligned_alloc and bool(
+            torch.all(aligned_mask_cpu)
+        )
 
     if allocator_page == 1:
         # Non-paged allocation
@@ -859,8 +914,63 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
             batch=batch,
         )
+    elif uses_page_aligned_alloc:
+        assert allocator_page == allocator.page_size
+        assert bool(torch.all(allocated_old_cpu >= locs_cpu)), (
+            f"{allocated_old_cpu=}, {locs_cpu=}"
+        )
+        non_crossing_mask_cpu: torch.Tensor = ~crossing_mask_cpu
+        assert bool(
+            torch.all(
+                allocated_old_cpu[non_crossing_mask_cpu]
+                >= aligned_end_cpu[non_crossing_mask_cpu]
+            )
+        ), f"{allocated_old_cpu=}, {aligned_end_cpu=}"
+        crossing_count: int = crossing_indices_cpu.numel()
+        if crossing_count > 0:
+            assert bool(
+                torch.all(
+                    aligned_end_cpu[crossing_indices_cpu]
+                    - allocated_old_cpu[crossing_indices_cpu]
+                    == allocator_page
+                )
+            )
+            assert torch.equal(
+                locs_cpu[crossing_indices_cpu],
+                allocated_old_cpu[crossing_indices_cpu],
+            )
+            allocated_page_blocks_flat: torch.Tensor = alloc_token_slots(
+                tree_cache=batch.tree_cache,
+                num_tokens=crossing_count * allocator_page,
+                phase="Decode",
+            )
+            assert allocated_page_blocks_flat.dtype == out_dtype
+            assert (
+                allocated_page_blocks_flat.numel()
+                == crossing_count * allocator_page
+            )
+            allocated_page_blocks: torch.Tensor = (
+                allocated_page_blocks_flat.reshape(crossing_count, allocator_page)
+            )
+            crossing_indices: torch.Tensor = crossing_indices_cpu.to(
+                device=batch.device, non_blocking=True
+            )
+            position_offsets: torch.Tensor = torch.arange(
+                allocator_page,
+                dtype=locs.dtype,
+                device=batch.device,
+            )
+            crossing_positions: torch.Tensor = (
+                locs[crossing_indices].unsqueeze(1) + position_offsets
+            )
+            crossing_req_indices: torch.Tensor = batch.req_pool_indices[
+                crossing_indices
+            ].unsqueeze(1)
+            batch.req_to_token_pool.write(
+                (crossing_req_indices, crossing_positions),
+                allocated_page_blocks.to(torch.int32),
+            )
     else:
-        assert token_per_req == 1
         last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, locs - 1
         ]
@@ -877,32 +987,22 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         )
 
     # Write to req_to_token_pool
+    if not uses_page_aligned_alloc:
+        assert out_cache_loc is not None
     if allocator_page == 1 or _is_npu:
         batch.req_to_token_pool.write(
             (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
         )
         for req in batch.reqs:
             req.kv.kv_allocated_len += token_per_req
+    elif uses_page_aligned_alloc:
+        allocated_next_cpu: torch.Tensor = torch.maximum(
+            allocated_old_cpu,
+            aligned_end_cpu,
+        )
+        for req, allocated_len in zip(batch.reqs, allocated_next_cpu.tolist()):
+            req.kv.kv_allocated_len = allocated_len
     else:
-        allocated_old_cpu: torch.Tensor = torch.tensor(
-            [req.kv.kv_allocated_len for req in batch.reqs],
-            dtype=locs_cpu.dtype,
-            device=locs_cpu.device,
-        )
-        aligned_mask_cpu: torch.Tensor = allocated_old_cpu % allocator_page == 0
-        aligned_end_cpu: torch.Tensor = (
-            (locs_cpu + allocator_page) // allocator_page * allocator_page
-        )
-        crossing_mask_cpu: torch.Tensor = aligned_mask_cpu & (
-            aligned_end_cpu > allocated_old_cpu
-        )
-        transitional_mask_cpu: torch.Tensor = ~aligned_mask_cpu
-        crossing_indices_cpu: torch.Tensor = torch.nonzero(
-            crossing_mask_cpu, as_tuple=False
-        ).flatten()
-        transitional_indices_cpu: torch.Tensor = torch.nonzero(
-            transitional_mask_cpu, as_tuple=False
-        ).flatten()
         crossing_indices: torch.Tensor = crossing_indices_cpu.to(
             device=batch.device, non_blocking=True
         )
@@ -960,13 +1060,41 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         for req, allocated_len in zip(batch.reqs, allocated_next_cpu.tolist()):
             req.kv.kv_allocated_len = allocated_len
 
+    gather_dtype: torch.dtype = (
+        out_dtype if uses_page_aligned_alloc else out_cache_loc.dtype
+    )
     gathered: torch.Tensor = batch.req_to_token_pool.req_to_token[
         batch.req_pool_indices, locs
-    ].to(out_cache_loc.dtype)
+    ].to(gather_dtype)
     if envs.SGLANG_DEBUG_MEMORY_POOL.get():
         assert bool(torch.all(gathered != 0))
         if allocator_page == 1 or _is_npu:
             torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+        elif uses_page_aligned_alloc:
+            if crossing_count > 0:
+                written_page_blocks: torch.Tensor = (
+                    batch.req_to_token_pool.req_to_token[
+                        crossing_req_indices, crossing_positions
+                    ].to(out_dtype)
+                )
+                torch.testing.assert_close(
+                    written_page_blocks,
+                    allocated_page_blocks,
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    gathered[crossing_indices],
+                    allocated_page_blocks[:, 0],
+                    rtol=0,
+                    atol=0,
+                )
+            for req in batch.reqs:
+                assert req.kv.kv_allocated_len % allocator_page == 0
+                assert req.kv.kv_allocated_len >= ceil_align(
+                    req.kv_committed_len,
+                    allocator_page,
+                )
         else:
             if transitional_indices.numel() > 0:
                 torch.testing.assert_close(

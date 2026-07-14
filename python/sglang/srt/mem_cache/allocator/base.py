@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    supports_page_aligned_alloc: bool = False
+
     @abc.abstractmethod
     def __init__(
         self,

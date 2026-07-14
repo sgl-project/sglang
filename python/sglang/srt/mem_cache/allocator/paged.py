@@ -112,6 +112,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     TODO: fuse last_loc into the kernel.
     """
 
+    supports_page_aligned_alloc: bool = True
+
     def __init__(
         self,
         size: int,
