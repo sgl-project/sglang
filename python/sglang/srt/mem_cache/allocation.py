@@ -347,6 +347,11 @@ def _validate_main_page_aligned_alloc(batch: ScheduleBatch) -> None:
         allocator.validate_main_page_aligned_alloc()
 
 
+def _validate_spec_decode_alloc(tree_cache: BasePrefixCache) -> None:
+    if not _is_npu:
+        tree_cache.token_to_kv_pool_allocator.validate_spec_decode_alloc()
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -942,7 +947,10 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
-    alloc_page_size: int = tree_cache.token_to_kv_pool_allocator.page_size
+    _validate_spec_decode_alloc(tree_cache)
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    alloc_page_size: int = allocator.page_size
     alloc_nxt_kv_lens_cpu: torch.Tensor
     alloc_nxt_kv_lens: torch.Tensor
     alloc_num_needed_tokens: int
@@ -982,14 +990,13 @@ def alloc_for_spec_decode(
                 tree_cache=tree_cache,
                 num_tokens=alloc_num_needed_tokens,
             )
-        else:
+        elif _is_npu:
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
             device_type = getattr(
                 batch.device, "type", str(batch.device).split(":", 1)[0]
             )
-            # TODO(temporary-inside-chain): Replace the non-NPU page-aligned spec producer with its direct hook.
             out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
                 tree_cache,
                 cur_kv_lens,
@@ -1000,6 +1007,11 @@ def alloc_for_spec_decode(
                 alloc_num_needed_tokens,
                 req_pool_indices=req_pool_indices,
                 batch=batch,
+            )
+        else:
+            out_cache_loc = alloc_token_slots(
+                tree_cache=tree_cache,
+                num_tokens=alloc_num_needed_tokens,
             )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
