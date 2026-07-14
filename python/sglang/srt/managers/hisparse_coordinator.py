@@ -270,13 +270,15 @@ class HiSparseCoordinator:
         """
         self.alloc_device_buffer(req)
 
-        host_len = self.host_token_len(req.kv.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
+        real_host_token_count = self.host_token_len(req.extend_range.end)
+        if real_host_token_count <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
             # TODO(hzh0425): Optimize this.
-            self._preload_to_device_buffer(req)
+            self._preload_to_device_buffer(
+                req, real_host_token_count=real_host_token_count
+            )
         else:
             # Long sequence: reset device_buffer_tokens to -1 so the kernel
             # sees all slots as empty -> every top-k lookup is a miss -> host load.
@@ -293,11 +295,26 @@ class HiSparseCoordinator:
             return kv_allocated_len // self.compress_ratio
         return kv_allocated_len
 
-    def _preload_to_device_buffer(self, req: Req) -> None:
+    def _preload_to_device_buffer(
+        self, req: Req, *, real_host_token_count: int
+    ) -> None:
         """Preload all tokens from host pool into the device buffer."""
-        n = self.host_token_len(req.kv.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        assert real_host_token_count >= 0
+        assert real_host_token_count <= int(
+            self.req_to_host_pool_allocated_len[req.req_pool_idx]
+        )
+        assert real_host_token_count <= int(
+            self.req_device_buffer_size[req.req_pool_idx]
+        )
+        assert real_host_token_count <= self.req_to_host_pool.shape[1]
+        assert real_host_token_count <= self.req_to_device_buffer.shape[1]
+
+        host_indices = self.req_to_host_pool[
+            req.req_pool_idx, :real_host_token_count
+        ]
+        device_locs = self.req_to_device_buffer[
+            req.req_pool_idx, :real_host_token_count
+        ]
 
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
@@ -309,12 +326,15 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
+        real_len = req.extend_range.end
+        allocated_len = req.kv.kv_allocated_len
+        row_width = self.req_to_token_pool.req_to_token.shape[1]
+        assert 0 <= real_len <= allocated_len <= row_width
+
         if self.is_dsv4_hisparse:
-            allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
-            allocated_len = req.kv.kv_allocated_len
-            page_size = self.mem_pool_device.page_size
+            page_size = self.token_to_kv_pool_allocator.hisparse_device_page_size
             # Allocate only enough for current tokens (page-aligned).
             # When prefill already fills device_buffer_size, include the reserved page.
             alloc_size = min(
@@ -323,23 +343,44 @@ class HiSparseCoordinator:
             )
             if alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
+        assert 0 <= alloc_size <= self.req_to_device_buffer.shape[1]
 
-        compressed_logical_indices = (
+        real_full_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :real_len
+        ].to(dtype=torch.int64, copy=True)
+        allocated_full_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :allocated_len
+        ].to(dtype=torch.int64, copy=True)
+        ordered_real_mapping_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
-                self.req_to_token_pool.req_to_token[req.req_pool_idx, :allocated_len]
+                real_full_indices
             )
         )
-        compressed_len = len(compressed_logical_indices)
+        allocated_mapping_indices = (
+            self.mem_pool_device.translate_loc_from_full_to_compressed(
+                allocated_full_indices
+            )
+        )
+
+        assert int(self.req_device_buffer_size[req.req_pool_idx]) == 0
+        buffer_owner_row = self.req_to_device_buffer[req.req_pool_idx]
+        torch._assert_async(
+            torch.all(buffer_owner_row == 0),
+            "HiSparse device buffer must be unowned before admission",
+        )
 
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
-            compressed_logical_indices, alloc_size
+            ordered_real_mapping_indices=ordered_real_mapping_indices,
+            allocated_mapping_indices=allocated_mapping_indices,
+            need_size=alloc_size,
         )
         if buffer_indices is None:
             logger.error(
                 "HiSparse: alloc_device_buffer failed for req %s "
-                "(compressed_len=%d, alloc_size=%d)",
+                "(real_mapping_len=%d, allocated_mapping_len=%d, alloc_size=%d)",
                 req.rid,
-                compressed_len,
+                len(ordered_real_mapping_indices),
+                len(allocated_mapping_indices),
                 alloc_size,
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
@@ -353,6 +394,19 @@ class HiSparseCoordinator:
         ] = self._device_buffer_arange_i32
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
+        )
+        assert int(self.req_device_buffer_size[req.req_pool_idx]) == alloc_size
+        torch._assert_async(
+            torch.all(
+                self.req_to_device_buffer[req.req_pool_idx, :alloc_size] > 0
+            ),
+            "HiSparse admission must publish positive device coordinates",
+        )
+        torch._assert_async(
+            torch.all(
+                self.req_to_device_buffer[req.req_pool_idx, alloc_size:] == 0
+            ),
+            "HiSparse admission must not publish owners beyond its capacity",
         )
 
     def _grow_device_buffers(
@@ -494,11 +548,35 @@ class HiSparseCoordinator:
                 previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
                     compressed_locs
                 )
-                stale_locs = previous_locs[
-                    (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
-                ]
-                if stale_locs.numel() > 0:
-                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+                torch._assert_async(
+                    torch.all(previous_locs >= 0),
+                    "HiSparse decode mapping must not contain negative coordinates",
+                )
+                stale_mask = (previous_locs > 0) & (
+                    previous_locs != reserved_buffer_loc
+                )
+                if (
+                    self.token_to_kv_pool_allocator.hisparse_device_page_size
+                    == 1
+                ):
+                    stale_mapping_indices = compressed_locs[stale_mask]
+                    stale_page_ids = (
+                        self.token_to_kv_pool_allocator.collect_owned_hisparse_page_ids(
+                            mapping_indices=stale_mapping_indices
+                        )
+                    )
+                    self.token_to_kv_pool_allocator.clear_hisparse_mapping(
+                        mapping_indices=stale_mapping_indices
+                    )
+                    self.token_to_kv_pool_allocator.release_owned_hisparse_pages(
+                        owned_page_ids=stale_page_ids
+                    )
+                else:
+                    torch._assert_async(
+                        torch.all(~stale_mask),
+                        "HiSparse page-sized temporary owners require the op29d "
+                        "whole-page retirement lifecycle",
+                    )
 
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
@@ -731,11 +809,32 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = req.extend_range.end
+        allocated_len = req.kv.kv_allocated_len
+        assert 0 <= req.extend_range.end <= allocated_len
+        assert allocated_len <= self.req_to_token_pool.req_to_token.shape[1]
+        assert int(self.req_device_buffer_size[req.req_pool_idx]) == 0
+        torch._assert_async(
+            torch.all(self.req_to_device_buffer[req.req_pool_idx] == 0),
+            "HiSparse staging abort must not observe a published device buffer",
+        )
+
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.req_pool_idx, :allocated_len
         ]
-        self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
+        allocated_mapping_indices = (
+            self.mem_pool_device.translate_loc_from_full_to_compressed(allocated_locs)
+        )
+        owned_page_ids = (
+            self.token_to_kv_pool_allocator.collect_owned_hisparse_page_ids(
+                mapping_indices=allocated_mapping_indices
+            )
+        )
+        self.token_to_kv_pool_allocator.clear_hisparse_mapping(
+            mapping_indices=allocated_mapping_indices
+        )
+        self.token_to_kv_pool_allocator.release_owned_hisparse_pages(
+            owned_page_ids=owned_page_ids
+        )
 
         # Free host memory that was allocated during admit_request_into_staging
         host_indices = self.mem_pool_host.allocated_host_indices(
@@ -762,29 +861,53 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
 
-        # Use kv_allocated_len (not seqlen): under speculative decoding the
-        # allocator can over-allocate beyond the committed seqlen, and those
-        # extra slots may carry stale mapping entries pointing at buffer slots
-        # we just freed via free_hisparse_indices(all_hi). If left set, the
-        # subsequent release_kv_cache -> allocator.free -> free_hisparse path
-        # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
+        assert 0 <= allocated_len <= self.req_to_token_pool.req_to_token.shape[1]
 
-        # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
-
+        assert 0 <= current_cap <= self.req_to_device_buffer.shape[1]
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :allocated_len
         ]
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            allocated_locs
+        allocated_mapping_indices = (
+            self.mem_pool_device.translate_loc_from_full_to_compressed(allocated_locs)
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+        owned_page_ids = (
+            self.token_to_kv_pool_allocator.collect_owned_hisparse_page_ids(
+                mapping_indices=allocated_mapping_indices,
+                extra_owned_coordinates=self.req_to_device_buffer[
+                    req.req_pool_idx, :current_cap
+                ],
+            )
+        )
+
+        self.token_to_kv_pool_allocator.clear_hisparse_mapping(
+            mapping_indices=allocated_mapping_indices
+        )
+
+        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
+        self.req_to_device_buffer[req.req_pool_idx, :] = 0
+        self.req_device_buffer_size[req.req_pool_idx] = 0
+        assert int(self.req_device_buffer_size[req.req_pool_idx]) == 0
+        torch._assert_async(
+            torch.all(self.req_to_device_buffer[req.req_pool_idx] == 0),
+            "HiSparse terminal cleanup must clear device buffer owners",
+        )
+        torch._assert_async(
+            torch.all(self.req_device_buffer_tokens[:, req.req_pool_idx, :] == -1),
+            "HiSparse terminal cleanup must clear device buffer tokens",
+        )
+        torch._assert_async(
+            torch.all(
+                self.req_device_buffer_token_locs[:, req.req_pool_idx, :] == -1
+            ),
+            "HiSparse terminal cleanup must clear device buffer locations",
+        )
+
+        self.token_to_kv_pool_allocator.release_owned_hisparse_pages(
+            owned_page_ids=owned_page_ids
+        )
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
@@ -795,10 +918,6 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)

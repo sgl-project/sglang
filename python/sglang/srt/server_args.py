@@ -2359,7 +2359,7 @@ class ServerArgs:
     ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool,
-        "Enable async KV cache offloading on decode server (PD mode).",
+        "Enable async KV cache offloading on decode server (PD mode). Incompatible with --enable-hisparse.",
     ] = False
     num_reserved_decode_tokens: A[
         int,

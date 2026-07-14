@@ -83,6 +83,13 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     if not server_args.enable_hisparse:
         return
 
+    if server_args.disaggregation_decode_enable_offload_kvcache:
+        raise ValueError(
+            "--enable-hisparse is incompatible with "
+            "--disaggregation-decode-enable-offload-kvcache because decode-side "
+            "KV offload bypasses the HiSparse coordinator ownership lifecycle."
+        )
+
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
         is_deepseek_v4,

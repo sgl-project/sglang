@@ -2,7 +2,7 @@
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode**, is enabled on the **decode instance** only, and cannot be combined with `--disaggregation-decode-enable-offload-kvcache`.
 
 ## Why HiSparse?
 
@@ -63,7 +63,7 @@ Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_t
 
 ## Deployment
 
-HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
+HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**. Do not enable `--disaggregation-decode-enable-offload-kvcache` on a HiSparse decode instance; the two decode-side KV ownership lifecycles are incompatible.
 
 ### Prefill Instance
 
