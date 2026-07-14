@@ -1348,9 +1348,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         """Paged eager and lazy free reject partial input before mapping mutation."""
         for lazy_compaction in (False, True):
             with self.subTest(lazy_compaction=lazy_compaction):
-                _, full_alloc, _, _, _ = self._build(
-                    lazy_compaction=lazy_compaction
-                )
+                _, full_alloc, _, _, _ = self._build(lazy_compaction=lazy_compaction)
                 indices = full_alloc.alloc(self.PAGE_SIZE)
                 virtual_page = indices[0] // self.PAGE_SIZE
                 physical_page = full_alloc.virtual_to_physical[virtual_page].clone()
