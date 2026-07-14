@@ -110,16 +110,14 @@ class LMCRadixCache(RadixCache):
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        self._validate_page_sizes(
+            mode=type(self)._mode,
+            storage_page_size=params.page_size,
+            allocator_page_size=params.token_to_kv_pool_allocator.page_size,
+        )
         super().__init__(params)
 
         self._mode = type(self)._mode
-        if (
-            self._mode is LMCacheMode.IP
-            and self.token_to_kv_pool_allocator.page_size > 1
-        ):
-            raise ValueError(
-                "LMCache layerwise transfer requires allocator page size 1"
-            )
 
         cli_lmc_cfg = get_server_args().lmcache_config_file or ""
 
@@ -177,6 +175,20 @@ class LMCRadixCache(RadixCache):
         self._in_flight_nodes: list[TreeNode] = []
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
+
+    @staticmethod
+    def _validate_page_sizes(
+        *, mode: LMCacheMode, storage_page_size: int, allocator_page_size: int
+    ) -> None:
+        if mode is LMCacheMode.IP and allocator_page_size > 1:
+            raise ValueError(
+                "LMCache layerwise transfer requires allocator page size 1"
+            )
+        if allocator_page_size % storage_page_size != 0:
+            raise ValueError(
+                "LMCache requires the storage page size to divide the allocator "
+                "page size"
+            )
 
     def reset(self):
         super().reset()
@@ -344,12 +356,11 @@ class LMCRadixCache(RadixCache):
         or the load returns no complete allocator page.
         """
         allocator_page_size = self.token_to_kv_pool_allocator.page_size
-        assert self._mode is LMCacheMode.MP or allocator_page_size == 1
-        if allocator_page_size % self.page_size != 0:
-            raise ValueError(
-                "LMCache requires the storage page size to divide the allocator "
-                "page size"
-            )
+        self._validate_page_sizes(
+            mode=self._mode,
+            storage_page_size=self.page_size,
+            allocator_page_size=allocator_page_size,
+        )
         if value_numel % allocator_page_size != 0:
             raise ValueError(
                 "LMCache load-back requires an allocator-page-aligned radix prefix"

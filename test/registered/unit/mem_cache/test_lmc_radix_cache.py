@@ -235,15 +235,15 @@ class TestLMCachePageAlignedLoadBack(unittest.TestCase):
         """Layerwise mode rejects multi-token pages during construction."""
         with _import_lmc_module() as module:
             allocator = MagicMock(page_size=4)
-
-            def initialize_radix(cache: Any, _params: Any) -> None:
-                cache.token_to_kv_pool_allocator = allocator
+            params = SimpleNamespace(
+                page_size=2,
+                token_to_kv_pool_allocator=allocator,
+            )
 
             class IPLMCRadixCache(module.LMCRadixCache):
                 _mode = module.LMCacheMode.IP
 
             with (
-                patch.object(module.RadixCache, "__init__", new=initialize_radix),
                 patch.object(module, "get_server_args") as get_server_args,
                 patch.object(module.torch.cuda, "Stream") as stream,
                 patch.object(module, "LMCacheMPConnector") as mp_connector,
@@ -254,13 +254,34 @@ class TestLMCachePageAlignedLoadBack(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError, "requires allocator page size 1"
                 ):
-                    IPLMCRadixCache(object())
+                    IPLMCRadixCache(params)
 
             get_server_args.assert_not_called()
             allocator.get_kvcache.assert_not_called()
             stream.assert_not_called()
             mp_connector.assert_not_called()
             layerwise_connector.assert_not_called()
+
+    def test_incompatible_page_sizes_reject_before_external_setup(self):
+        """A storage page that cannot divide allocator pages fails early."""
+        with _import_lmc_module() as module:
+            allocator = MagicMock(page_size=4)
+            params = SimpleNamespace(
+                page_size=3,
+                token_to_kv_pool_allocator=allocator,
+            )
+
+            with (
+                patch.object(module.RadixCache, "__init__") as initialize_radix,
+                patch.object(module, "get_server_args") as get_server_args,
+                patch.object(module.torch.cuda, "Stream") as stream,
+            ):
+                with self.assertRaisesRegex(ValueError, "storage page size to divide"):
+                    module.LMCRadixCache(params)
+
+            initialize_radix.assert_not_called()
+            get_server_args.assert_not_called()
+            stream.assert_not_called()
 
 
 if __name__ == "__main__":
