@@ -858,6 +858,10 @@ class WaitingImageRequest:
     def _cleanup_gpu_buffer(self):
         pass
 
+    def release_resources(self):
+        """Free GPU/pool resources on abort/fail/timeout (idempotent)."""
+        self._cleanup_gpu_buffer()
+
 
 class WaitingImageRequestGrpc(WaitingImageRequest):
     def send_encode_request(self):
@@ -937,6 +941,12 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self.embedding_pool = embedding_pool
         self._buffer_from_pool = False
         self._pool_slot_id: Optional[int] = None
+        # Serialize the encode thread's buffer commit vs main-thread cleanup;
+        # _terminal latches when done so a late commit can't orphan a buffer.
+        self._buffer_lock = threading.Lock()
+        self._terminal = False
+        # Set on success (pool buffers) so abort can release the slot now.
+        self._mm_finalizer: Optional[weakref.finalize] = None
 
     def send_encode_request(self):
         self._encode_thread = threading.Thread(
@@ -1043,9 +1053,19 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                         self.recv_socket.close()
                         return
                     pool_view, buffer_address, slot_id = alloc_result
-                    self.embeddings_buffer = pool_view
-                    self._buffer_from_pool = True
-                    self._pool_slot_id = slot_id
+                    # Commit only if not already terminal; otherwise release the
+                    # slot here so the late alloc doesn't leak.
+                    with self._buffer_lock:
+                        if self._terminal:
+                            self.embedding_pool.release(slot_id)
+                            logger.info(
+                                f"Discarding pool slot for already-terminal "
+                                f"rid={self.rid}: slot={slot_id}"
+                            )
+                            return
+                        self.embeddings_buffer = pool_view
+                        self._buffer_from_pool = True
+                        self._pool_slot_id = slot_id
                     logger.info(
                         f"Pool-allocated Mooncake GPU landing buffer: "
                         f"rid={self.rid}, size={total_bytes}, "
@@ -1058,9 +1078,22 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     self.embeddings_engine.register(
                         gpu_buffer.data_ptr(), gpu_buffer.nbytes
                     )
-                    self.embeddings_buffer = gpu_buffer
                     buffer_address = gpu_buffer.data_ptr()
-                    self._buffer_from_pool = False
+                    # Same terminal-state guard as the pool path: deregister and
+                    # drop the buffer if the request already aborted.
+                    with self._buffer_lock:
+                        if self._terminal:
+                            try:
+                                self.embeddings_engine.deregister(buffer_address)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to deregister orphaned GPU buffer "
+                                    "for rid=%s",
+                                    self.rid,
+                                )
+                            return
+                        self.embeddings_buffer = gpu_buffer
+                        self._buffer_from_pool = False
                     logger.info(
                         f"Per-request registered Mooncake GPU landing buffer "
                         f"(pool disabled): rid={self.rid}, size={total_bytes}, "
@@ -1178,41 +1211,61 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             else:
                 self.recv_embedding_data.add(recv_obj)
 
-        # Zero-copy: build per-modality views directly from the pre-registered
-        # GPU buffer. Skips the per-part split + torch.cat round-trip — both
-        # the extra GPU allocation and the D2D copy — so mm_item.precomputed_
-        # embeddings ends up referencing the pool buffer. Slot lifetime is
-        # bound to mm_inputs GC via weakref.finalize below.
-        if self.embeddings_buffer is not None:
-            recv_embedding = _view_pool_buffer_by_modality(
-                self.embeddings_buffer, self.recv_embedding_data, self.dtype
+        # Assemble mm_inputs from the landed embedding. Wrapped so that any
+        # failure (view/reshape/processor error) does not (a) leak the GPU
+        # buffer or (b) escape and skip the TP-wide status all-reduce in
+        # _process_waiting_requests, which would hang the other ranks.
+        try:
+            # Zero-copy: build per-modality views directly from the pre-registered
+            # GPU buffer. Skips the per-part split + torch.cat round-trip — both
+            # the extra GPU allocation and the D2D copy — so mm_item.precomputed_
+            # embeddings ends up referencing the pool buffer. Slot lifetime is
+            # bound to mm_inputs GC via weakref.finalize below.
+            if self.embeddings_buffer is not None:
+                recv_embedding = _view_pool_buffer_by_modality(
+                    self.embeddings_buffer, self.recv_embedding_data, self.dtype
+                )
+            else:
+                recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+            mm_inputs = self.mm_processor.get_mm_data(
+                self.recv_req.input_text,
+                recv_embedding,
+                **self.recv_embedding_data.get_mm_extra_meta(),
             )
-        else:
-            recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
-            recv_embedding,
-            **self.recv_embedding_data.get_mm_extra_meta(),
-        )
-        # Bind slot release to mm_inputs GC
-        if self._buffer_from_pool and mm_inputs is not None:
-            weakref.finalize(mm_inputs, self.embedding_pool.release, self._pool_slot_id)
-            _mark_keep_device_embedding(mm_inputs)
-            # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
-            self._pool_slot_id = None
-            self.embeddings_buffer = None
-            self._buffer_from_pool = False
-        self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
-        self.status = WaitingImageRequestStatus.SUCCESS
-        self._cleanup_gpu_buffer()
-        self.recv_socket.close()
+            # Bind slot release to mm_inputs GC; keep the handle so abort can
+            # release the slot immediately.
+            if self._buffer_from_pool and mm_inputs is not None:
+                self._mm_finalizer = weakref.finalize(
+                    mm_inputs, self.embedding_pool.release, self._pool_slot_id
+                )
+                _mark_keep_device_embedding(mm_inputs)
+                # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
+                self._pool_slot_id = None
+                self.embeddings_buffer = None
+                self._buffer_from_pool = False
+            self.recv_req.mm_inputs = mm_inputs
+            self.recv_req.input_ids = array("q", mm_inputs.input_ids)
+            self.status = WaitingImageRequestStatus.SUCCESS
+            # Deregisters non-pool buffers; no-op for already-detached pool ones.
+            self._cleanup_gpu_buffer()
+        except Exception as e:
+            logger.exception(
+                "Failed to assemble multimodal inputs for rid=%s", self.rid
+            )
+            self.status = WaitingImageRequestStatus.FAIL
+            self.error_msg = f"Failed to assemble multimodal inputs: {e}"
+            self._cleanup_gpu_buffer()
+        finally:
+            self.recv_socket.close()
 
     def _cleanup_gpu_buffer(self):
-        """Deregister and release the GPU buffer."""
-        if self.embeddings_buffer is not None:
-            # Pool-backed views share the pre-registered backing tensor; just
-            # release the slot back to the pool so a queued alloc can proceed.
+        """Release the GPU buffer and latch _terminal under the lock so a late
+        encode-thread commit is discarded instead of orphaned. Idempotent."""
+        with self._buffer_lock:
+            self._terminal = True
+            if self.embeddings_buffer is None:
+                return
+            # Pool views share the backing tensor; just return the slot.
             if self._buffer_from_pool:
                 if self._pool_slot_id is not None and self.embedding_pool is not None:
                     self.embedding_pool.release(self._pool_slot_id)
@@ -1224,6 +1277,15 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             except Exception:
                 logger.exception("Failed to deregister GPU buffer for rid=%s", self.rid)
             self.embeddings_buffer = None
+
+    def release_resources(self):
+        """Free GPU/pool resources on abort/fail/timeout (idempotent); also
+        fires the success-path finalizer so a pool slot is returned now."""
+        self._cleanup_gpu_buffer()
+        finalizer, self._mm_finalizer = self._mm_finalizer, None
+        if finalizer is not None:
+            # Runs release once and marks dead; later GC call becomes a no-op.
+            finalizer()
 
 
 def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts):
@@ -1807,7 +1869,7 @@ class MMReceiverBase(ABC):
             waiting_req._try_recv_mm_data()
             if current_time - waiting_req.start_time > self.wait_timeout:
                 waiting_req.status = WaitingImageRequestStatus.TIMEOUT
-                waiting_req._cleanup_gpu_buffer()
+                waiting_req.release_resources()
                 waiting_req.recv_socket.close()
             local_status.append(waiting_req.status)
 
@@ -1829,6 +1891,9 @@ class MMReceiverBase(ABC):
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
                 )
+                # A peer's FAIL can force-abort this locally PENDING/SUCCESS
+                # rank, so release any buffer/slot it still holds.
+                waiting_req.release_resources()
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
@@ -1840,6 +1905,7 @@ class MMReceiverBase(ABC):
                 logger.error(
                     f"Timed out waiting for image embeddings for request {waiting_req.rid}"
                 )
+                waiting_req.release_resources()
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
