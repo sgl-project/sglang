@@ -2828,14 +2828,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 dsa_indexer = layer.self_attn.indexer
             self.dsa_indexers.append(dsa_indexer)
 
-        if len(self.attention_layers) < self.model_config.num_hidden_layers:
-            # TODO(yuwei): support Non-Standard GQA
-            log_info_on_rank0(
-                logger,
-                "Disable prefill CUDA graph because some layers do not apply Standard GQA",
-            )
-            return
-
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         prefill_backend = self.server_args.cuda_graph_config.prefill.backend
