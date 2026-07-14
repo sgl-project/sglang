@@ -28,14 +28,15 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.qwen3_parser import StreamingParserAdapter
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
-    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
 
+            parser = StreamingParserAdapter()
+            parser.init_request()
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
@@ -316,6 +320,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Generate delta
                 delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
+                
+                # Parse the delta to separate reasoning and content
+                reasoning_delta, parsed_content_delta = parser.process_chunk(delta)
+                content["reasoning_content"] = reasoning_delta
+                content["parsed_content"] = parsed_content_delta
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
