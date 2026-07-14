@@ -6,6 +6,12 @@ import torch
 from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
     flash_block_score_decode as score_decode,
 )
+from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
+    topk_sparse_decode as sparse_decode,
+)
+from sglang.srt.layers.attention.minimax_sparse_backend import (
+    MiniMaxSparseAttnBackend,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -131,7 +137,103 @@ def _legacy_topk_reached(*args, **kwargs):
     raise AssertionError("legacy topk path reached")
 
 
+def _reference_append_local_block(
+    topk_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Reference for the MiniMax decode init=0/local=1 fast path."""
+    num_kv_heads, batch_size, topk = topk_idx.shape
+    query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
+    local = (query_positions // block_size).clamp(min=0, max=num_blocks - 1).to(
+        topk_idx.dtype
+    )
+    out = torch.full(
+        (num_kv_heads, batch_size, topk + 1),
+        -1,
+        dtype=topk_idx.dtype,
+        device=topk_idx.device,
+    )
+    for head_idx in range(num_kv_heads):
+        for batch_idx in range(batch_size):
+            candidates = topk_idx[head_idx, batch_idx]
+            valid = (candidates >= 0) & (candidates < num_blocks)
+            valid = valid & (candidates * block_size <= query_positions[batch_idx])
+            out[head_idx, batch_idx, :topk] = torch.where(
+                valid, candidates, torch.full_like(candidates, -1)
+            )
+            if not ((candidates == local[batch_idx]) & valid).any():
+                out[head_idx, batch_idx, topk] = local[batch_idx]
+    return out
+
+
 class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
+    def test_backend_uses_fused_local_append_only_for_m3_fast_path(self):
+        backend = object.__new__(MiniMaxSparseAttnBackend)
+        backend.topk_blocks = _TOPK
+        backend.block_size_k = _BLOCK_SIZE
+        topk_idx = torch.zeros((1, 2, _TOPK), dtype=torch.int32, device=_DEVICE)
+        seq_lens = torch.tensor([512, 513], dtype=torch.int32, device=_DEVICE)
+        fused = torch.full(
+            (1, 2, _TOPK + 1), -1, dtype=torch.int32, device=_DEVICE
+        )
+
+        backend.init_blocks = 0
+        backend.local_blocks = 1
+        with patch.object(
+            sparse_decode, "append_local_block_to_topk_idx", return_value=fused
+        ) as append_local:
+            actual = backend._prepare_npu_triton_topk_idx(
+                topk_idx, seq_lens, num_idx_heads=1, num_kv_heads=1, max_blocks=5
+            )
+
+        self.assertIs(actual, fused)
+        append_local.assert_called_once_with(topk_idx, seq_lens, _BLOCK_SIZE, 5)
+
+        backend.init_blocks = 1
+        backend.local_blocks = 1
+        with patch.object(
+            sparse_decode, "append_local_block_to_topk_idx"
+        ) as append_local, patch.object(
+            backend, "_merge_sparse_blocks", side_effect=lambda blocks, *_: blocks
+        ):
+            fallback = backend._prepare_npu_triton_topk_idx(
+                topk_idx, seq_lens, num_idx_heads=1, num_kv_heads=1, max_blocks=5
+            )
+
+        append_local.assert_not_called()
+        torch.testing.assert_close(fallback, topk_idx)
+
+    def test_append_local_block_fused_matches_reference(self):
+        topk_idx = torch.full(
+            (2, 2, _TOPK), -1, dtype=torch.int32, device=_DEVICE
+        )
+        topk_idx[0, 0, :5] = torch.tensor(
+            [1, 3, 4, -1, 0], dtype=torch.int32, device=_DEVICE
+        )
+        topk_idx[1, 0, :4] = torch.tensor(
+            [1, 4, 0, -1], dtype=torch.int32, device=_DEVICE
+        )
+        topk_idx[0, 1, :5] = torch.tensor(
+            [0, 2, 5, -1, 1], dtype=torch.int32, device=_DEVICE
+        )
+        topk_idx[1, 1, :5] = torch.tensor(
+            [4, 0, 6, -1, 2], dtype=torch.int32, device=_DEVICE
+        )
+        seq_lens = torch.tensor([512, 513], dtype=torch.int32, device=_DEVICE)
+
+        actual = sparse_decode.append_local_block_to_topk_idx(
+            topk_idx, seq_lens, block_size=_BLOCK_SIZE, num_blocks=5
+        )
+        expected = _reference_append_local_block(
+            topk_idx, seq_lens, block_size=_BLOCK_SIZE, num_blocks=5
+        )
+
+        self.assertEqual(actual.shape, (2, 2, _TOPK + 1))
+        self.assertTrue(actual.is_contiguous())
+        torch.testing.assert_close(actual, expected)
+
     def test_unified_triton_topk_matches_reference_for_serving_contexts(self):
         torch.manual_seed(20260714)
         cases = (

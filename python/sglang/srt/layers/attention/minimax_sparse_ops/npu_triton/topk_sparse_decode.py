@@ -103,6 +103,126 @@ def _normalize_topk_idx_for_gqa(
 
 
 # =============================================================================
+# MiniMax decode local-block postprocess
+# =============================================================================
+
+
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"]),
+    }
+)
+@triton.jit
+def _append_local_block_to_topk_idx_kernel(
+    topk_idx_ptr,  # [num_kv_heads, batch_size, topk]
+    seq_lens_ptr,  # [batch_size]
+    out_ptr,  # [num_kv_heads, batch_size, topk + 1]
+    topk,
+    num_blocks,
+    block_size: tl.constexpr,
+    stride_topk_h,
+    stride_topk_b,
+    stride_topk_t,
+    stride_out_h,
+    stride_out_b,
+    stride_out_t,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """Append the causal local block while preserving MiniMax fallback semantics."""
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offsets_t = tl.arange(0, BLOCK_SIZE_T)
+
+    query_position = tl.maximum(
+        tl.load(seq_lens_ptr + pid_b).to(tl.int32) - 1,
+        0,
+    )
+    local_block = tl.minimum(
+        query_position // block_size,
+        num_blocks - 1,
+    )
+
+    input_offsets = (
+        pid_h * stride_topk_h
+        + pid_b * stride_topk_b
+        + offsets_t * stride_topk_t
+    )
+    candidates = tl.load(
+        topk_idx_ptr + input_offsets,
+        mask=offsets_t < topk,
+        other=-1,
+    ).to(tl.int32)
+    valid = (candidates >= 0) & (candidates < num_blocks)
+    valid = valid & (candidates * block_size <= query_position)
+
+    output_offsets = (
+        pid_h * stride_out_h + pid_b * stride_out_b + offsets_t * stride_out_t
+    )
+    tl.store(
+        out_ptr + output_offsets,
+        tl.where(valid, candidates, -1),
+        mask=offsets_t < topk,
+    )
+
+    local_is_present = (
+        tl.sum(((candidates == local_block) & valid).to(tl.int32), axis=0) > 0
+    )
+    tl.store(
+        out_ptr + pid_h * stride_out_h + pid_b * stride_out_b + topk * stride_out_t,
+        tl.where(local_is_present, -1, local_block),
+    )
+
+
+@torch.no_grad()
+def append_local_block_to_topk_idx(
+    topk_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Fuse MiniMax's ``init=0, local=1`` decode top-k postprocess.
+
+    The generic fallback first permutes candidates to ``[B, KVH, TopK]``, then
+    validates them and appends the causal local block through several PyTorch
+    operators, before permuting back. This NPU path consumes and produces the
+    GQA kernel layout directly. It intentionally preserves candidate order and
+    only removes a local block when that exact valid candidate already exists.
+    """
+    assert topk_idx.ndim == 3
+    assert topk_idx.dtype == torch.int32
+    assert topk_idx.is_contiguous()
+    assert seq_lens.ndim == 1
+    assert seq_lens.shape[0] == topk_idx.shape[1]
+    assert seq_lens.is_contiguous()
+    assert block_size > 0
+    assert num_blocks > 0
+
+    num_kv_heads, batch_size, topk = topk_idx.shape
+    out = torch.empty(
+        (num_kv_heads, batch_size, topk + 1),
+        dtype=topk_idx.dtype,
+        device=topk_idx.device,
+    )
+    _append_local_block_to_topk_idx_kernel[(batch_size, num_kv_heads)](
+        topk_idx,
+        seq_lens,
+        out,
+        topk,
+        num_blocks,
+        block_size=block_size,
+        stride_topk_h=topk_idx.stride(0),
+        stride_topk_b=topk_idx.stride(1),
+        stride_topk_t=topk_idx.stride(2),
+        stride_out_h=out.stride(0),
+        stride_out_b=out.stride(1),
+        stride_out_t=out.stride(2),
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
+# =============================================================================
 # Sparse BNSD Decode Kernel
 # =============================================================================
 

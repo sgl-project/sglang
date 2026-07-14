@@ -505,6 +505,53 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         output.scatter_(2, scatter_index, scatter_src)
         return output[:, :, :total]
 
+    def _prepare_npu_triton_topk_idx(
+        self,
+        topk_idx: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_idx_heads: int,
+        num_kv_heads: int,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Prepare NPU Triton top-k ids in the GQA kernel's native layout.
+
+        MiniMax-M3 under TP=16 has one replicated index head and one KV head per
+        rank. Its only forced block is the causal local block. Avoid the generic
+        ``[KVH, B, K] -> [B, KVH, K]`` transpose, PyTorch append/dedup, and
+        transpose back by directly emitting the GQA input layout on NPU. All
+        other sparse layouts retain the validated generic path.
+        """
+        if (
+            self.init_blocks == 0
+            and self.local_blocks == 1
+            and num_idx_heads == num_kv_heads
+            and topk_idx.shape[0] == num_kv_heads
+            and topk_idx.dtype == torch.int32
+            and topk_idx.is_contiguous()
+            and seq_lens.is_contiguous()
+        ):
+            from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+                append_local_block_to_topk_idx,
+            )
+
+            return append_local_block_to_topk_idx(
+                topk_idx, seq_lens, self.block_size_k, max_blocks
+            )
+
+        if num_idx_heads > num_kv_heads:
+            idx_group_size = num_idx_heads // num_kv_heads
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
+                dim=1,
+            )
+
+        topk_2d = topk_idx.permute(1, 0, 2).contiguous()
+        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
+        topk_merged = self._merge_sparse_blocks(
+            topk_2d, query_positions, max_blocks
+        )
+        return topk_merged.permute(1, 0, 2).contiguous()
+
     def _select_sparse_blocks(
         self,
         idx_q_seq: torch.Tensor,
@@ -959,28 +1006,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_index_value,
         )
 
-        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
-        if num_idx_heads > num_kv_heads:
-            idx_group_size = num_idx_heads // num_kv_heads
-            topk_idx = topk_index_reduce(
-                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
-                dim=1,
-            )
-
-        # 3) Append the forced init/local blocks on top of the pure top-k, using the
-        # SAME concat+dedup semantics as the pure-PyTorch path (_merge_sparse_blocks)
-        # so triton decode attends to the identical block set. `max_blocks` (batch
-        # max) is a safe upper bound here: the indexer already emitted only valid,
-        # causal block ids per request, and _merge_sparse_blocks only uses num_blocks
-        # for clamping/validity masking. The main sparse kernel accepts the wider
-        # topk_idx (max_topk = topk+init+local) and skips the -1 dedup sentinels.
-        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [B, num_kv_heads, topk]
-        # Decode: each query sits at the last token of its sequence.
-        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
-        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
-        topk_idx = topk_merged.permute(
-            1, 0, 2
-        ).contiguous()  # [num_kv_heads, B, topk+init+local]
+        # 2) Reduce heads and append forced blocks. MiniMax-M3 TP=16 uses the
+        # direct NPU local-block path; all other layouts use the generic fallback.
+        topk_idx = self._prepare_npu_triton_topk_idx(
+            topk_idx, seq_lens, num_idx_heads, num_kv_heads, max_blocks
+        )
 
         # 4) main sparse attention over the selected blocks
         o = flash_decode_bnsd_with_gqa_share_sparse(
@@ -1138,21 +1168,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_index_value,
         )
 
-        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
-        if num_idx_heads > num_kv_heads:
-            idx_group_size = num_idx_heads // num_kv_heads
-            topk_idx = topk_index_reduce(
-                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
-                dim=1,
-            )
-
-        # 3) Append the forced init/local blocks on top of pure top-k, SAME
-        # concat+dedup semantics as the PyTorch path. Each verify query sits at
-        # position prefix+j = seq_len-1, so query_positions = seq_lens - 1 holds.
-        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [bs*ndt, num_kv_heads, topk]
-        query_positions = (per_query_seq_lens.to(torch.long) - 1).clamp(min=0)
-        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
-        topk_idx = topk_merged.permute(1, 0, 2).contiguous()
+        # 2) Reduce heads and append forced blocks in the GQA kernel layout.
+        topk_idx = self._prepare_npu_triton_topk_idx(
+            topk_idx,
+            per_query_seq_lens,
+            num_idx_heads,
+            num_kv_heads,
+            max_blocks,
+        )
         # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
         # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
         # indexing block_table past dim-1 if _merge_sparse_blocks appended a local/init block
@@ -1330,21 +1353,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_dim**-0.5, self.score_type,
             )
 
-        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
-        if num_idx_heads > num_kv_heads:
-            idx_group_size = num_idx_heads // num_kv_heads
-            topk_idx = topk_index_reduce(
-                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
-                dim=1,
-            )
-
-        # 3) Append the forced init/local blocks on top of pure top-k, SAME
-        # concat+dedup semantics as the PyTorch path. Each prefill query j sits at
-        # position prefix+j, so query_positions = per_query_seq_lens - 1.
-        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [total_q, num_kv_heads, topk]
-        query_positions = (per_query_seq_lens.to(torch.long) - 1).clamp(min=0)
-        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
-        topk_idx = topk_merged.permute(1, 0, 2).contiguous()
+        # 2) Reduce heads and append forced blocks in the GQA kernel layout.
+        topk_idx = self._prepare_npu_triton_topk_idx(
+            topk_idx,
+            per_query_seq_lens,
+            num_idx_heads,
+            num_kv_heads,
+            max_blocks,
+        )
         # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
         # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
         # indexing block_table_f past its column dim if _merge_sparse_blocks appended a
