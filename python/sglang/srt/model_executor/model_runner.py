@@ -2529,17 +2529,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 HybridAttnBackend,
             )
 
+            self.init_new_workspace = init_new_workspace
             attn_backend = HybridAttnBackend(
                 self,
-                decode_backend=self._get_attention_backend_from_str(
-                    self.decode_attention_backend_str,
-                    init_new_workspace=init_new_workspace,
+                decode_backend=ATTENTION_BACKENDS[self.decode_attention_backend_str](
+                    self
                 ),
-                prefill_backend=self._get_attention_backend_from_str(
-                    self.prefill_attention_backend_str,
-                    init_new_workspace=init_new_workspace,
+                prefill_backend=ATTENTION_BACKENDS[self.prefill_attention_backend_str](
+                    self
                 ),
             )
+            attn_backend = attn_backend_wrapper(self, attn_backend)
             logger.info(
                 f"Using hybrid attention backend for decode and prefill: "
                 f"decode_backend={self.decode_attention_backend_str}, "
