@@ -964,6 +964,31 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
+        # XPU: reduce_scatter == all_reduce and per-rank slice.
+        if _is_xpu:
+            if sizes is not None:
+                assert len(sizes) == world_size
+                assert input_.shape[0] == sum(sizes)
+                chunk_size = sizes[self.rank_in_group]
+                my_offset = sum(sizes[: self.rank_in_group])
+            else:
+                assert input_.shape[0] % world_size == 0
+                chunk_size = input_.shape[0] // world_size
+                my_offset = self.rank_in_group * chunk_size
+            output_shape = (chunk_size,) + input_.shape[1:]
+
+            if output is None:
+                output = torch.empty(
+                    output_shape, dtype=input_.dtype, device=input_.device
+                )
+            else:
+                assert output.shape == output_shape
+
+            reduced = input_.clone()
+            torch.distributed.all_reduce(reduced, group=self.device_group)
+            output.copy_(reduced[my_offset : my_offset + chunk_size])
+            return output
+
         with pynccl_comm.change_state(enable=True):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
@@ -1153,6 +1178,45 @@ class GroupCoordinator:
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
+
+        # XPU: implement as per-rank broadcasts.
+        # Pre-copy input into output slot so all ranks pass same buffer.
+        if _is_xpu:
+            single_input = isinstance(input_, torch.Tensor)
+            if single_input:
+                inputs = [input_]
+                outputs = [output]
+            else:
+                assert isinstance(output, list) and len(output) == len(input_), (
+                    "all_gatherv XCCL path: list input requires matching list output"
+                )
+                inputs = list(input_)
+                outputs = list(output)
+
+            assert sizes is not None and outputs[0] is not None, (
+                "sizes and output required"
+            )
+            assert len(sizes) == world_size
+            my_offset = sum(sizes[: self.rank_in_group])
+            my_size = sizes[self.rank_in_group]
+
+            for inp, out in zip(inputs, outputs):
+                assert inp.shape[0] == my_size
+                assert out is not None
+                out[my_offset : my_offset + my_size].copy_(inp)
+
+            for out in outputs:
+                split_offset = 0
+                for root, split_size in enumerate(sizes):
+                    dst_slice = out[split_offset : split_offset + split_size]
+                    torch.distributed.broadcast(
+                        dst_slice,
+                        src=self.ranks[root],
+                        group=self.device_group,
+                    )
+                    split_offset += split_size
+
+            return outputs
 
         with pynccl_comm.change_state(enable=True):
             assert (
