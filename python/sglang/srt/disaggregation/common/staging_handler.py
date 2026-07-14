@@ -383,11 +383,10 @@ class DecodeStagingHandler:
             sid_b = session_id.encode("ascii")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:
-                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                    with lock:
-                        sock.send_multipart(
-                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
-                        )
+                    receiver._send_multipart_to_bootstrap(
+                        bootstrap_info,
+                        [b"WATERMARK", wm_round_b, wm_tail_b, sid_b],
+                    )
                 except Exception:
                     pass
 
@@ -758,19 +757,18 @@ def handle_staging_req(
     if bootstrap_infos:
         for bi in bootstrap_infos:
             try:
-                sock, lock = receiver._connect_to_bootstrap_server(bi)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            b"STAGING_RSP",
-                            str(room).encode("ascii"),
-                            str(chunk_idx).encode("ascii"),
-                            str(offset).encode("ascii"),
-                            str(rnd).encode("ascii"),
-                            str(end).encode("ascii"),
-                            session_id.encode("ascii"),
-                        ]
-                    )
+                receiver._send_multipart_to_bootstrap(
+                    bi,
+                    [
+                        b"STAGING_RSP",
+                        str(room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(offset).encode("ascii"),
+                        str(rnd).encode("ascii"),
+                        str(end).encode("ascii"),
+                        session_id.encode("ascii"),
+                    ],
+                )
             except Exception:
                 pass
 
