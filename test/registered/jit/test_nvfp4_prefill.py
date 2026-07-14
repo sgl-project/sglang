@@ -1,5 +1,4 @@
-"""
-Unit test for flashinfer batch paged prefill with native NVFP4 KV cache.
+"""Unit test for flashinfer batch paged prefill with native NVFP4 KV cache.
 
 Tests that BatchPrefillWithPagedKVCacheWrapper correctly handles
 float4_e2m1fn_x2 KV cache input, producing attention outputs
@@ -27,7 +26,7 @@ except ImportError:
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -64,7 +63,9 @@ def _quantize_kv_to_nvfp4(
     global_scale_val = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / max(tensor_amax, 1e-6)
     global_scale = torch.tensor(global_scale_val, dtype=torch.float32, device=kv.device)
 
-    kv_fp4_flat, kv_scale_flat = scaled_fp4_quant(kv_flat.to(torch.bfloat16), global_scale)
+    kv_fp4_flat, kv_scale_flat = scaled_fp4_quant(
+        kv_flat.to(torch.bfloat16), global_scale
+    )
     # kv_fp4_flat: [num_tokens*num_heads, head_dim//2] uint8
     # kv_scale_flat: swizzled FP8 scale — reshape after recovering
 
@@ -107,8 +108,22 @@ def _dequantize_kv(
         BF16 tensor of same shape as original (unpacked head_dim)
     """
     E2M1_TO_FLOAT32 = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ]
     lut = torch.tensor(E2M1_TO_FLOAT32, device=kv_fp4.device, dtype=torch.float32)
 
@@ -218,18 +233,37 @@ def test_nvfp4_native_prefill(
 
     # Flat KV pool: [total_slots, num_kv_heads, head_dim] in BF16
     total_slots = total_pages * page_size
-    k_bf16 = torch.randn(total_slots, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device) * 0.1
-    v_bf16 = torch.randn(total_slots, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device) * 0.1
+    k_bf16 = (
+        torch.randn(
+            total_slots, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
+    v_bf16 = (
+        torch.randn(
+            total_slots, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
 
     # Query: [total_qo_tokens, num_qo_heads, head_dim]
     total_qo_tokens = batch_size * qo_len
-    q = torch.randn(total_qo_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device) * 0.1
+    q = (
+        torch.randn(
+            total_qo_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
 
     # Build paged indices: each request occupies contiguous pages starting at page (1 + i*total_pages_per_req)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indptr[1:] = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) * kv_len
+    kv_indptr[1:] = (
+        torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) * kv_len
+    )
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    qo_indptr[1:] = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+    qo_indptr[1:] = (
+        torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+    )
 
     kv_indices_list = []
     for i in range(batch_size):
@@ -260,7 +294,7 @@ def test_nvfp4_native_prefill(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
 
-    sm_scale = head_dim ** -0.5
+    sm_scale = head_dim**-0.5
 
     wrapper.begin_forward(
         qo_indptr,
@@ -290,7 +324,13 @@ def test_nvfp4_native_prefill(
     v_dequant = _dequantize_kv(v_fp4, v_block_scale, v_global_scale)
 
     output_ref = _ref_attention_bfloat16(
-        q, k_dequant, v_dequant, qo_indptr.cpu(), kv_indptr.cpu(), kv_indices.cpu(), sm_scale
+        q,
+        k_dequant,
+        v_dequant,
+        qo_indptr.cpu(),
+        kv_indptr.cpu(),
+        kv_indices.cpu(),
+        sm_scale,
     )
 
     # --- Compare: allow for quantization error ---
