@@ -938,7 +938,8 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_reference"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1204,13 +1205,20 @@
                     ]
                   },
                   {
+                    "group": "LongLive",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
-                    "group": "JoyEcho",
+                    "group": "JoyAI-Echo",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"

@@ -1986,12 +1986,12 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
-    legacy write slots in _handle_a2a_moe: DeepEP Waterfill requires the
+    legacy write slots in _handle_a2a_moe: Waterfill requires the
     fusion enabled; FlashInfer A2A requires it disabled."""
-    if view.moe_a2a_backend == "deepep" and view.enable_deepep_waterfill:
+    if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
-                "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+                "disable_shared_experts_fusion is overridden to False because Waterfill requires shared expert fusion."
             )
             return {"disable_shared_experts_fusion": False}
         return {}
@@ -2027,10 +2027,10 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 def _a2a_backend_overrides(view: Any) -> dict:
 
     moe_a2a_backend = view.moe_a2a_backend
-    if view.enable_deepep_waterfill and moe_a2a_backend != "deepep":
+    if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
-            "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-            "Waterfill requires the DeepEP backend."
+            "moe_a2a_backend is overridden to 'deepep' because Waterfill "
+            "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
     if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":
