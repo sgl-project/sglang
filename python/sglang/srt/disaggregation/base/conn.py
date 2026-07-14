@@ -116,6 +116,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod
@@ -160,6 +161,18 @@ class BaseKVSender(ABC):
         Raise an exception if the kv cache transfer fails.
         """
         ...
+
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
 
 
 class BaseKVReceiver(ABC):
