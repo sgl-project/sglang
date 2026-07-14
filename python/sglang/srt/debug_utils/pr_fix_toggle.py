@@ -27,12 +27,8 @@ patches:
   - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
       - match: |
-          forward_batch.spec_info.hidden_states = hidden_states_backup
           forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
-          return ret
-        replacement: |
-          forward_batch.spec_info.hidden_states = hidden_states_backup
-          return ret
+        replacement: ""
 """
 
 

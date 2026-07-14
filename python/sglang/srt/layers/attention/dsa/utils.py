@@ -65,6 +65,17 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
+def should_use_dsa_fused_topk(
+    server_args, seed_dsa_topk_from_draft_extend: bool
+) -> bool:
+    pd_index_share_seed = (
+        server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+    )
+    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
+    # to decode-local KV slots so fused top-k can remain enabled under PD.
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
+
+
 def is_dsa_enable_prefill_cp():
     return get_server_args().enable_dsa_prefill_context_parallel
 
