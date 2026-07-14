@@ -2,9 +2,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import sglang
 import torch
 
+import sglang
 import sglang.srt.mem_cache.allocator.base as allocator_base
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
