@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -33,16 +34,15 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
-    is_cuda,
     is_hip,
     is_npu,
     next_power_of_2,
     support_triton,
 )
+from sglang.srt.utils.common import ceil_align
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_cuda = is_cuda()
 _is_cpu = is_cpu()
 
 if _is_cpu:
@@ -59,12 +59,14 @@ def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
     req_pool_indices_cpu: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
-    seq_lens_tensor: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    extend_lens_tensor: torch.Tensor,
-    extend_lens_cpu: torch.Tensor,
+    prefix_write_lens_tensor: torch.Tensor,
+    prefix_write_lens_cpu: torch.Tensor,
+    alloc_start_lens_tensor: torch.Tensor,
+    alloc_start_lens_cpu: torch.Tensor,
+    alloc_end_lens_tensor: torch.Tensor,
+    alloc_end_lens_cpu: torch.Tensor,
+    alloc_extend_lens_tensor: torch.Tensor,
+    alloc_extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ) -> None:
@@ -72,12 +74,14 @@ def write_cache_indices(
         req_to_token_pool.req_to_token,
         req_pool_indices=req_pool_indices_tensor,
         req_pool_indices_cpu=req_pool_indices_cpu,
-        prefix_lens=prefix_lens_tensor,
-        prefix_lens_cpu=prefix_lens_cpu,
-        seq_lens=seq_lens_tensor,
-        seq_lens_cpu=seq_lens_cpu,
-        extend_lens=extend_lens_tensor,
-        extend_lens_cpu=extend_lens_cpu,
+        prefix_write_lens=prefix_write_lens_tensor,
+        prefix_write_lens_cpu=prefix_write_lens_cpu,
+        alloc_start_lens=alloc_start_lens_tensor,
+        alloc_start_lens_cpu=alloc_start_lens_cpu,
+        alloc_end_lens=alloc_end_lens_tensor,
+        alloc_end_lens_cpu=alloc_end_lens_cpu,
+        alloc_extend_lens=alloc_extend_lens_tensor,
+        alloc_extend_lens_cpu=alloc_extend_lens_cpu,
         prefix_tensors=prefix_tensors,
         out_cache_loc=out_cache_loc,
         use_triton=support_triton(get_server_args().attention_backend),
@@ -306,12 +310,7 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP swaps in an allocator whose page_size is server_args.page_size *
-    # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
-    # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
-        return batch.tree_cache.token_to_kv_pool_allocator.page_size
-    return batch.tree_cache.page_size
+    return batch.tree_cache.token_to_kv_pool_allocator.page_size
 
 
 def alloc_for_extend(
@@ -327,13 +326,60 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    prefix_tensors: list[torch.Tensor] = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
-    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    prefix_lens_cpu: torch.Tensor = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    extend_lens_cpu: torch.Tensor = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    prefix_lens_device: torch.Tensor = prefix_lens_cpu.to(
+        batch.device, non_blocking=True
+    )
+    extend_lens_device: torch.Tensor = extend_lens_cpu.to(
+        batch.device, non_blocking=True
+    )
+    allocator_page: int = _alloc_page_size(batch)
+    uses_aligned_lens: bool = not _is_npu and allocator_page > 1
+    alloc_start_lens_cpu: torch.Tensor
+    alloc_end_lens_cpu: torch.Tensor
+    alloc_extend_lens_cpu: torch.Tensor
+    alloc_start_lens_device: torch.Tensor
+    alloc_end_lens_device: torch.Tensor
+    alloc_extend_lens_device: torch.Tensor
+    if uses_aligned_lens:
+        alloc_start_lens: list[int] = [
+            max(
+                prefix_len,
+                req.kv.kv_allocated_len if req.kv is not None else 0,
+            )
+            for req, prefix_len in zip(batch.reqs, batch.prefix_lens)
+        ]
+        alloc_end_lens: list[int] = [
+            ceil_align(seq_len, allocator_page)
+            for seq_len in batch.seq_lens_cpu.tolist()
+        ]
+        alloc_extend_lens: list[int] = [
+            alloc_end - alloc_start
+            for alloc_start, alloc_end in zip(alloc_start_lens, alloc_end_lens)
+        ]
+        assert all(extend_len >= 0 for extend_len in alloc_extend_lens)
+        alloc_start_lens_cpu = torch.tensor(alloc_start_lens, dtype=torch.int64)
+        alloc_end_lens_cpu = torch.tensor(alloc_end_lens, dtype=torch.int64)
+        alloc_extend_lens_cpu = torch.tensor(alloc_extend_lens, dtype=torch.int64)
+        alloc_start_lens_device = alloc_start_lens_cpu.to(
+            batch.device, non_blocking=True
+        )
+        alloc_end_lens_device = alloc_end_lens_cpu.to(batch.device, non_blocking=True)
+        alloc_extend_lens_device = alloc_extend_lens_cpu.to(
+            batch.device, non_blocking=True
+        )
+    else:
+        alloc_start_lens_cpu = prefix_lens_cpu
+        alloc_end_lens_cpu = batch.seq_lens_cpu
+        alloc_extend_lens_cpu = extend_lens_cpu
+        alloc_start_lens_device = prefix_lens_device
+        alloc_end_lens_device = batch.seq_lens
+        alloc_extend_lens_device = extend_lens_device
+    alloc_extend_num_tokens: int = int(alloc_extend_lens_cpu.sum().item())
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
@@ -343,22 +389,34 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if _alloc_page_size(batch) == 1:
+    if allocator_page == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
+        last_loc: list[torch.Tensor] = []
+        for index, (req, prefix_tensor, alloc_start) in enumerate(
+            zip(batch.reqs, prefix_tensors, alloc_start_lens_cpu.tolist())
+        ):
+            if uses_aligned_lens and req.kv is not None and alloc_start > 0:
+                req_pool_index = req_pool_indices[index]
+                last_loc.append(
+                    batch.req_to_token_pool.req_to_token[
+                        req_pool_index, alloc_start - 1 : alloc_start
+                    ]
+                )
+            elif len(prefix_tensor) > 0:
+                last_loc.append(prefix_tensor[-1:])
+            else:
+                last_loc.append(torch.tensor([-1], device=batch.device))
+        # TODO(temporary-inside-chain): Replace the legacy continuation producer with direct page allocation.
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            prefix_lens=alloc_start_lens_device,
+            prefix_lens_cpu=alloc_start_lens_cpu,
+            seq_lens=alloc_end_lens_device,
+            seq_lens_cpu=alloc_end_lens_cpu,
             last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
+            extend_num_tokens=alloc_extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
@@ -366,17 +424,19 @@ def alloc_for_extend(
 
     # Write to req_to_token_pool
     write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices_tensor=req_pool_indices_device,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        prefix_write_lens_tensor=prefix_lens_device,
+        prefix_write_lens_cpu=prefix_lens_cpu,
+        alloc_start_lens_tensor=alloc_start_lens_device,
+        alloc_start_lens_cpu=alloc_start_lens_cpu,
+        alloc_end_lens_tensor=alloc_end_lens_device,
+        alloc_end_lens_cpu=alloc_end_lens_cpu,
+        alloc_extend_lens_tensor=alloc_extend_lens_device,
+        alloc_extend_lens_cpu=alloc_extend_lens_cpu,
+        prefix_tensors=prefix_tensors,
+        req_to_token_pool=batch.req_to_token_pool,
     )
 
     gathered: torch.Tensor = gather_out_cache_loc_extend(
@@ -393,7 +453,18 @@ def alloc_for_extend(
         out_dtype=out_cache_loc.dtype,
     )
     if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-        torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
+        assert gathered.numel() == batch.extend_num_tokens
+        assert bool(torch.all(gathered != 0))
+        if uses_aligned_lens:
+            for req_pool_index, alloc_start, alloc_end in zip(
+                req_pool_indices,
+                alloc_start_lens_cpu.tolist(),
+                alloc_end_lens_cpu.tolist(),
+            ):
+                allocated_slots = batch.req_to_token_pool.req_to_token[
+                    req_pool_index, alloc_start:alloc_end
+                ]
+                assert bool(torch.all(allocated_slots != 0))
     out_cache_loc = gathered
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
@@ -407,11 +478,14 @@ def alloc_for_extend(
 
     from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+    for req, allocated_len in zip(batch.reqs, alloc_end_lens_cpu.tolist()):
         if req.kv is None:
-            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+            req.kv = ReqKvInfo(
+                kv_allocated_len=allocated_len,
+                swa_evicted_seqlen=0,
+            )
         else:
-            req.kv.kv_allocated_len = seq_len
+            req.kv.kv_allocated_len = allocated_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -476,21 +550,36 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc: allocated cache locations
     """
 
+    seq_lens_gpu = batch.seq_lens
+    batch_size = seq_lens_gpu.shape[0]
+    allocator_page = _alloc_page_size(batch)
+    write_locs = _compute_decode_write_locs(batch)
+    page_plan: Optional[_PageAlignedDecodePlan] = None
+    if not _is_npu and allocator_page > 1:
+        page_plan = _plan_page_aligned_decode(
+            batch,
+            write_locs=write_locs,
+            token_per_req=token_per_req,
+            allocator_page=allocator_page,
+        )
+
     batch.maybe_evict_swa()
 
-    seq_lens_gpu = batch.seq_lens
-    bs = seq_lens_gpu.shape[0]
-
-    if _alloc_page_size(batch) == 1:
+    page_allocation: Optional[_PageAlignedDecodeAllocation] = None
+    raw_out_cache_loc: Optional[torch.Tensor]
+    if allocator_page == 1:
         # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
-    else:
-        # Paged allocation
+        raw_out_cache_loc = alloc_token_slots(
+            batch.tree_cache,
+            batch_size * token_per_req,
+        )
+    # Paged allocation
+    elif _is_npu:
         last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, seq_lens_gpu - 1
         ]
         seq_lens_next = seq_lens_gpu + token_per_req
-        out_cache_loc = alloc_paged_token_slots_decode(
+        raw_out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
@@ -500,23 +589,49 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
             batch=batch,
         )
-
-    # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = seq_lens_gpu.clone()
+        assert page_plan is not None
+        page_allocation = _allocate_page_aligned_decode(
+            batch,
+            plan=page_plan,
+            allocator_page=allocator_page,
+        )
+        raw_out_cache_loc = None
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    if allocator_page == 1 or _is_npu:
+        assert raw_out_cache_loc is not None
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, write_locs.device),
+            raw_out_cache_loc.to(torch.int32),
+        )
+        for req in batch.reqs:
+            req.kv.kv_allocated_len += token_per_req
+    else:
+        assert page_plan is not None
+        assert page_allocation is not None
+        _publish_page_aligned_decode(
+            batch,
+            plan=page_plan,
+            allocation=page_allocation,
+            allocator_page=allocator_page,
+        )
+
+    out_dtype = (
+        raw_out_cache_loc.dtype if raw_out_cache_loc is not None else torch.int64
     )
-
-    gathered: torch.Tensor = batch.req_to_token_pool.req_to_token[
-        batch.req_pool_indices, locs
-    ].to(out_cache_loc.dtype)
-    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-        torch.testing.assert_close(gathered, out_cache_loc, rtol=0, atol=0)
-    out_cache_loc = gathered
+    out_cache_loc = batch.req_to_token_pool.req_to_token[
+        batch.req_pool_indices,
+        write_locs.device,
+    ].to(out_dtype)
+    _debug_decode_allocation(
+        batch,
+        write_locs=write_locs,
+        out_cache_loc=out_cache_loc,
+        raw_out_cache_loc=raw_out_cache_loc,
+        page_plan=page_plan,
+        page_allocation=page_allocation,
+        allocator_page=allocator_page,
+    )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -526,10 +641,200 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req,
         )
 
-    for req in batch.reqs:
-        req.kv.kv_allocated_len += token_per_req
-
     return out_cache_loc
+
+
+@dataclass(frozen=True)
+class _DecodeWriteLocs:
+    device: torch.Tensor
+    cpu: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PageAlignedDecodePlan:
+    write_locs: _DecodeWriteLocs
+    allocated_old_cpu: torch.Tensor
+    allocated_next_cpu: torch.Tensor
+    crossing_indices_cpu: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PageAlignedDecodeAllocation:
+    crossing_indices: torch.Tensor
+    page_blocks: Optional[torch.Tensor]
+
+
+def _compute_decode_write_locs(batch: ScheduleBatch) -> _DecodeWriteLocs:
+    if batch.model_config.is_encoder_decoder:
+        assert batch.encoder_lens is not None
+        assert batch.encoder_lens_cpu is not None
+        encoder_lens_cpu = torch.tensor(
+            batch.encoder_lens_cpu,
+            dtype=batch.seq_lens_cpu.dtype,
+            device=batch.seq_lens_cpu.device,
+        )
+        return _DecodeWriteLocs(
+            device=batch.encoder_lens + batch.seq_lens,
+            cpu=encoder_lens_cpu + batch.seq_lens_cpu,
+        )
+    return _DecodeWriteLocs(
+        device=batch.seq_lens.clone(),
+        cpu=batch.seq_lens_cpu.clone(),
+    )
+
+
+def _plan_page_aligned_decode(
+    batch: ScheduleBatch,
+    *,
+    write_locs: _DecodeWriteLocs,
+    token_per_req: int,
+    allocator_page: int,
+) -> _PageAlignedDecodePlan:
+    assert token_per_req == 1
+    allocated_old_cpu = torch.tensor(
+        [req.kv.kv_allocated_len for req in batch.reqs],
+        dtype=write_locs.cpu.dtype,
+        device=write_locs.cpu.device,
+    )
+    assert bool(torch.all(allocated_old_cpu % allocator_page == 0)), (
+        f"decode allocation watermarks must be page-aligned: "
+        f"{allocated_old_cpu=}, {allocator_page=}"
+    )
+    assert bool(torch.all(write_locs.cpu <= allocated_old_cpu)), (
+        f"decode write locations exceed allocation watermarks: "
+        f"{write_locs.cpu=}, {allocated_old_cpu=}"
+    )
+
+    crossing_mask_cpu = write_locs.cpu == allocated_old_cpu
+    in_page_mask_cpu = ~crossing_mask_cpu
+    assert bool(
+        torch.all(
+            write_locs.cpu[in_page_mask_cpu] + 1
+            <= allocated_old_cpu[in_page_mask_cpu]
+        )
+    ), (
+        f"decode in-page writes exceed allocation watermarks: "
+        f"{write_locs.cpu=}, {allocated_old_cpu=}"
+    )
+    crossing_indices_cpu = torch.nonzero(
+        crossing_mask_cpu,
+        as_tuple=False,
+    ).flatten()
+    allocated_next_cpu = allocated_old_cpu.clone()
+    allocated_next_cpu[crossing_indices_cpu] += allocator_page
+    return _PageAlignedDecodePlan(
+        write_locs=write_locs,
+        allocated_old_cpu=allocated_old_cpu,
+        allocated_next_cpu=allocated_next_cpu,
+        crossing_indices_cpu=crossing_indices_cpu,
+    )
+
+
+def _allocate_page_aligned_decode(
+    batch: ScheduleBatch,
+    *,
+    plan: _PageAlignedDecodePlan,
+    allocator_page: int,
+) -> _PageAlignedDecodeAllocation:
+    crossing_indices = plan.crossing_indices_cpu.to(
+        device=batch.device,
+        non_blocking=True,
+    )
+    if crossing_indices.numel() == 0:
+        return _PageAlignedDecodeAllocation(
+            crossing_indices=crossing_indices,
+            page_blocks=None,
+        )
+
+    crossing_req_pool_indices = batch.req_pool_indices[crossing_indices]
+    crossing_write_locs = plan.write_locs.device[crossing_indices]
+    crossing_write_locs_cpu = plan.write_locs.cpu[plan.crossing_indices_cpu]
+    last_loc = get_last_loc(
+        batch.req_to_token_pool.req_to_token,
+        crossing_req_pool_indices,
+        crossing_write_locs,
+    )
+    page_starts = alloc_paged_token_slots_decode(
+        tree_cache=batch.tree_cache,
+        seq_lens=crossing_write_locs + 1,
+        seq_lens_cpu=crossing_write_locs_cpu + 1,
+        last_loc=last_loc,
+        req_pool_indices=crossing_req_pool_indices,
+    )
+    page_offsets = torch.arange(
+        allocator_page,
+        dtype=page_starts.dtype,
+        device=batch.device,
+    )
+    return _PageAlignedDecodeAllocation(
+        crossing_indices=crossing_indices,
+        page_blocks=page_starts.unsqueeze(1) + page_offsets,
+    )
+
+
+def _publish_page_aligned_decode(
+    batch: ScheduleBatch,
+    *,
+    plan: _PageAlignedDecodePlan,
+    allocation: _PageAlignedDecodeAllocation,
+    allocator_page: int,
+) -> None:
+    if allocation.page_blocks is not None:
+        position_offsets = torch.arange(
+            allocator_page,
+            dtype=plan.write_locs.device.dtype,
+            device=batch.device,
+        )
+        crossing_positions = (
+            plan.write_locs.device[allocation.crossing_indices].unsqueeze(1)
+            + position_offsets
+        )
+        crossing_req_pool_indices = batch.req_pool_indices[
+            allocation.crossing_indices
+        ].unsqueeze(1)
+        batch.req_to_token_pool.write(
+            (crossing_req_pool_indices, crossing_positions),
+            allocation.page_blocks.to(torch.int32),
+        )
+
+    for req, allocated_len in zip(batch.reqs, plan.allocated_next_cpu.tolist()):
+        req.kv.kv_allocated_len = allocated_len
+
+
+def _debug_decode_allocation(
+    batch: ScheduleBatch,
+    *,
+    write_locs: _DecodeWriteLocs,
+    out_cache_loc: torch.Tensor,
+    raw_out_cache_loc: Optional[torch.Tensor],
+    page_plan: Optional[_PageAlignedDecodePlan],
+    page_allocation: Optional[_PageAlignedDecodeAllocation],
+    allocator_page: int,
+) -> None:
+    if not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        return
+
+    assert bool(torch.all(out_cache_loc != 0))
+    if allocator_page == 1 or _is_npu:
+        assert raw_out_cache_loc is not None
+        torch.testing.assert_close(out_cache_loc, raw_out_cache_loc, rtol=0, atol=0)
+        return
+
+    assert page_plan is not None
+    assert page_allocation is not None
+    if page_allocation.page_blocks is not None:
+        torch.testing.assert_close(
+            out_cache_loc[page_allocation.crossing_indices],
+            page_allocation.page_blocks[:, 0].to(out_cache_loc.dtype),
+            rtol=0,
+            atol=0,
+        )
+    for req in batch.reqs:
+        assert req.kv.kv_allocated_len % allocator_page == 0
+        assert req.kv.kv_allocated_len >= ceil_align(
+            req.kv_committed_len,
+            allocator_page,
+        )
 
 
 @triton.jit
@@ -623,9 +928,39 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
-    if num_needed_tokens > 0:
-        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+    allocator_page: int = tree_cache.token_to_kv_pool_allocator.page_size
+    allocation_nxt_kv_lens_cpu: torch.Tensor
+    allocation_nxt_kv_lens: torch.Tensor
+    allocation_num_needed_tokens: int
+    if not _is_npu and allocator_page > 1:
+        allocation_nxt_kv_lens_cpu = (
+            (nxt_kv_lens_cpu + allocator_page - 1) // allocator_page * allocator_page
+        )
+        allocation_nxt_kv_lens = (
+            (nxt_kv_lens + allocator_page - 1) // allocator_page * allocator_page
+        )
+        allocation_num_needed_tokens = int(
+            (allocation_nxt_kv_lens_cpu - cur_kv_lens_cpu).sum().item()
+        )
+    else:
+        allocation_nxt_kv_lens_cpu = nxt_kv_lens_cpu
+        allocation_nxt_kv_lens = nxt_kv_lens
+        allocation_num_needed_tokens = num_needed_tokens
+
+    if allocation_nxt_kv_lens_cpu.numel() > 0:
+        max_allocated_len: int = int(allocation_nxt_kv_lens_cpu.max().item())
+        row_width: int = req_to_token_pool.req_to_token.shape[1]
+        assert max_allocated_len <= row_width, (
+            f"spec decode allocation endpoint ({max_allocated_len}) exceeds "
+            f"req_to_token row width ({row_width}); page_size={allocator_page}"
+        )
+
+    if allocation_num_needed_tokens > 0:
+        if allocator_page == 1:
+            out_cache_loc = alloc_token_slots(
+                tree_cache=tree_cache,
+                num_tokens=allocation_num_needed_tokens,
+            )
         else:
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
@@ -637,10 +972,10 @@ def alloc_for_spec_decode(
                 tree_cache,
                 cur_kv_lens,
                 cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
+                allocation_nxt_kv_lens,
+                allocation_nxt_kv_lens_cpu,
                 last_loc,
-                num_needed_tokens,
+                allocation_num_needed_tokens,
                 req_pool_indices=req_pool_indices,
                 batch=batch,
             )
@@ -650,10 +985,13 @@ def alloc_for_spec_decode(
             req_pool_indices,
             req_to_token_pool.req_to_token,
             cur_kv_lens,
-            nxt_kv_lens,
+            allocation_nxt_kv_lens,
             out_cache_loc,
             len(reqs),
         )
 
     for i, req in enumerate(reqs):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+        req.kv.kv_allocated_len = max(
+            req.kv.kv_allocated_len,
+            int(allocation_nxt_kv_lens_cpu[i]),
+        )

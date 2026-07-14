@@ -161,12 +161,14 @@ class TestWriteReqToTokenPool(unittest.TestCase):
                 req_to_token,
                 req_pool_indices=empty_device,
                 req_pool_indices_cpu=empty_cpu,
-                prefix_lens=empty_device,
-                prefix_lens_cpu=empty_cpu,
-                seq_lens=empty_device,
-                seq_lens_cpu=empty_cpu,
-                extend_lens=empty_device,
-                extend_lens_cpu=empty_cpu,
+                prefix_write_lens=empty_device,
+                prefix_write_lens_cpu=empty_cpu,
+                alloc_start_lens=empty_device,
+                alloc_start_lens_cpu=empty_cpu,
+                alloc_end_lens=empty_device,
+                alloc_end_lens_cpu=empty_cpu,
+                alloc_extend_lens=empty_device,
+                alloc_extend_lens_cpu=empty_cpu,
                 prefix_tensors=[],
                 out_cache_loc=torch.empty((0,), dtype=torch.int64, device="cuda"),
             )
@@ -237,6 +239,45 @@ class TestWriteReqToTokenPool(unittest.TestCase):
                             ).item()
                         )
 
+    def test_allocated_gap_is_preserved(self):
+        """Writing a new allocation interval preserves earlier allocated slots."""
+        prefix_write_lens_cpu = torch.tensor([1], dtype=torch.int64)
+        alloc_start_lens_cpu = torch.tensor([3], dtype=torch.int64)
+        alloc_end_lens_cpu = torch.tensor([5], dtype=torch.int64)
+        alloc_extend_lens_cpu = torch.tensor([2], dtype=torch.int64)
+        req_pool_indices_cpu = torch.tensor([1], dtype=torch.int64)
+        arguments = dict(
+            req_pool_indices=req_pool_indices_cpu.cuda(),
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            prefix_write_lens=prefix_write_lens_cpu.cuda(),
+            prefix_write_lens_cpu=prefix_write_lens_cpu,
+            alloc_start_lens=alloc_start_lens_cpu.cuda(),
+            alloc_start_lens_cpu=alloc_start_lens_cpu,
+            alloc_end_lens=alloc_end_lens_cpu.cuda(),
+            alloc_end_lens_cpu=alloc_end_lens_cpu,
+            alloc_extend_lens=alloc_extend_lens_cpu.cuda(),
+            alloc_extend_lens_cpu=alloc_extend_lens_cpu,
+            prefix_tensors=[torch.tensor([101], dtype=torch.int64, device="cuda")],
+            out_cache_loc=torch.tensor([201, 202], dtype=torch.int64, device="cuda"),
+        )
+
+        implementations = (
+            WriteReqToTokenPool.vanilla,
+            WriteReqToTokenPool.triton,
+        )
+        for implementation in implementations:
+            with self.subTest(implementation=implementation.__name__):
+                req_to_token = torch.tensor(
+                    [[-7] * 8, [-7, 301, 302, -7, -7, -7, -7, -7]],
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                implementation(req_to_token, **arguments)
+                self.assertEqual(
+                    req_to_token[1].tolist(),
+                    [101, 301, 302, 201, 202, -7, -7, -7],
+                )
+
     @staticmethod
     def _make_write_arguments(
         *,
@@ -246,24 +287,27 @@ class TestWriteReqToTokenPool(unittest.TestCase):
         out_dtype: torch.dtype,
     ) -> dict[str, object]:
         req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        prefix_lens_cpu = torch.tensor(
+        prefix_write_lens_cpu = torch.tensor(
             [len(prefix) for prefix in prefixes],
             dtype=torch.int64,
         )
-        extend_lens_cpu = torch.tensor(
+        alloc_extend_lens_cpu = torch.tensor(
             [len(extension) for extension in extensions],
             dtype=torch.int64,
         )
-        seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
+        alloc_start_lens_cpu = prefix_write_lens_cpu.clone()
+        alloc_end_lens_cpu = alloc_start_lens_cpu + alloc_extend_lens_cpu
         return dict(
             req_pool_indices=req_pool_indices_cpu.cuda(),
             req_pool_indices_cpu=req_pool_indices_cpu,
-            prefix_lens=prefix_lens_cpu.cuda(),
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens_cpu.cuda(),
-            seq_lens_cpu=seq_lens_cpu,
-            extend_lens=extend_lens_cpu.cuda(),
-            extend_lens_cpu=extend_lens_cpu,
+            prefix_write_lens=prefix_write_lens_cpu.cuda(),
+            prefix_write_lens_cpu=prefix_write_lens_cpu,
+            alloc_start_lens=alloc_start_lens_cpu.cuda(),
+            alloc_start_lens_cpu=alloc_start_lens_cpu,
+            alloc_end_lens=alloc_end_lens_cpu.cuda(),
+            alloc_end_lens_cpu=alloc_end_lens_cpu,
+            alloc_extend_lens=alloc_extend_lens_cpu.cuda(),
+            alloc_extend_lens_cpu=alloc_extend_lens_cpu,
             prefix_tensors=[
                 torch.tensor(prefix, dtype=torch.int64, device="cuda")
                 for prefix in prefixes
