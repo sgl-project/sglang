@@ -20,7 +20,7 @@ except ImportError:
     vllm_scaled_mm = None
     VLLM_AVAILABLE = False
 
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton as w8a8_block_fp8_matmul,
 )
 
