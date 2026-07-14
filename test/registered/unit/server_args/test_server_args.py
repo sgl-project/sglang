@@ -1237,6 +1237,23 @@ class TestSessionRadixCacheServerArgs(unittest.TestCase):
             server_args._handle_cache_compatibility()
 
 
+class TestDecodeKVCacheOffloadServerArgs(unittest.TestCase):
+    def test_npu_rejects_decode_kv_cache_offload(self):
+        """NPU startup rejects decode KV cache offload before runtime setup."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            hicache_storage_backend="hf3fs",
+            disaggregation_decode_enable_offload_kvcache=True,
+        )
+
+        with (
+            patch("sglang.srt.server_args.is_npu", return_value=True),
+            self.assertRaisesRegex(ValueError, "not supported on NPU"),
+        ):
+            server_args._handle_cache_compatibility()
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."

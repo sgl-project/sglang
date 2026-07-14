@@ -6037,6 +6037,11 @@ class ServerArgs:
             )
 
         if self.disaggregation_decode_enable_offload_kvcache:
+            if is_npu():
+                raise ValueError(
+                    "--disaggregation-decode-enable-offload-kvcache is not "
+                    "supported on NPU"
+                )
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."

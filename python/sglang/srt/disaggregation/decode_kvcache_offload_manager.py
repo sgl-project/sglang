@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -42,18 +43,28 @@ class DecodeKVCacheOffloadManager:
         tree_cache: BasePrefixCache,
         server_args: ServerArgs,
     ) -> None:
+        if current_platform.is_npu():
+            raise ValueError("Decode KV cache offload is not supported on NPU")
+
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = server_args.page_size
+        self.storage_page_size = server_args.page_size
+        self.allocator_page_size = token_to_kv_pool_allocator.page_size
+        if self.allocator_page_size % self.storage_page_size != 0:
+            raise ValueError(
+                "Decode KV cache offload requires the storage page size to divide "
+                "the allocator page size"
+            )
         self.server_args = server_args
         self.request_counter = 0
         self.tree_cache = tree_cache
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
         if env_stride is None or env_stride <= 0:
-            self.offload_stride = self.page_size
+            self.offload_stride = self.storage_page_size
         else:
             self.offload_stride = max(
-                self.page_size, (env_stride // self.page_size) * self.page_size
+                self.storage_page_size,
+                (env_stride // self.storage_page_size) * self.storage_page_size,
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
@@ -61,7 +72,7 @@ class DecodeKVCacheOffloadManager:
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                self.storage_page_size,
                 server_args.hicache_mem_layout,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
@@ -69,7 +80,7 @@ class DecodeKVCacheOffloadManager:
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                self.storage_page_size,
                 server_args.hicache_mem_layout,
             )
         else:
@@ -92,7 +103,7 @@ class DecodeKVCacheOffloadManager:
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
-            page_size=self.page_size,
+            page_size=self.storage_page_size,
             tp_group=tp_group,
             io_backend=server_args.hicache_io_backend,
             load_cache_event=threading.Event(),
@@ -136,7 +147,9 @@ class DecodeKVCacheOffloadManager:
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
         prefill_offloaded_len = (
-            len(req.origin_input_ids) // self.page_size * self.page_size
+            len(req.origin_input_ids)
+            // self.allocator_page_size
+            * self.allocator_page_size
         )
         state = self.offloaded_state.get(req.rid)
         if state is None:
@@ -227,29 +240,27 @@ class DecodeKVCacheOffloadManager:
                     host_indices,
                     incremental_tokens,
                     start_time,
-                    start,
-                    end,
+                    _start,
+                    _end,
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._mark_offload_finished(req.rid)
-                prior_hash = (
-                    self.offloaded_state[req.rid].last_hash
-                    if req.rid in self.offloaded_state
-                    else None
-                )
+                state = self.offloaded_state.get(req.rid)
+                if state is None:
+                    raise RuntimeError(
+                        f"Missing offload state for acknowledged request {req.rid}"
+                    )
+                prior_hash = state.last_hash
                 last_hash = self._trigger_backup(
                     req, host_indices, incremental_tokens, start_time, prior_hash
                 )
-                if req.rid in self.offloaded_state:
-                    self.offloaded_state[req.rid].last_hash = last_hash
+                state.last_hash = last_hash
 
                 if req.finished() and not self._has_inflight_offload(req.rid):
-                    state = self.offloaded_state.get(req.rid)
-                    start_offset = state.prefill_len if state is not None else start
-                    self._release_finished_req(req, start_offset)
+                    self._release_finished_req(req)
             finish_count -= 1
 
-    def _release_finished_req(self, req: Req, start_offset: int):
+    def _release_finished_req(self, req: Req) -> None:
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
         # non-idempotent side effects (e.g. tree_cache.protected_size_
@@ -257,33 +268,52 @@ class DecodeKVCacheOffloadManager:
         if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
 
-        kv_committed_len = req.effective_kv_committed_len()
-
         # Free the prefill-aligned slots. Previously this was done
         # eagerly in offload_kv_cache (mid-decode), which raced with
         # concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
         state = self.offloaded_state.get(req.rid)
-        if state is not None and state.prefill_len > 0:
+        if state is None:
+            raise RuntimeError(f"Missing offload state for request {req.rid}")
+
+        allocator_page_size = self.allocator_page_size
+        start_offset = state.prefill_len
+        kv_committed_len = req.effective_kv_committed_len()
+        rounded_committed_len = ceil_align(kv_committed_len, allocator_page_size)
+        kv_allocated_len = req.kv.kv_allocated_len
+        if (
+            start_offset < 0
+            or start_offset > kv_committed_len
+            or start_offset % allocator_page_size != 0
+            or rounded_committed_len > kv_allocated_len
+            or kv_allocated_len % allocator_page_size != 0
+        ):
+            raise RuntimeError(
+                "Invalid page-aligned decode KV ownership bounds: "
+                f"start={start_offset}, committed={kv_committed_len}, "
+                f"rounded={rounded_committed_len}, allocated={kv_allocated_len}, "
+                f"page_size={allocator_page_size}"
+            )
+
+        if start_offset > 0:
             prefill_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : state.prefill_len
+                req.req_pool_idx, :start_offset
             ]
             self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = start_offset
-        end = kv_committed_len
+
         # Free the incremental part of the request (DSA-aware)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        if start_offset < rounded_committed_len:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_offset:rounded_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
-        # Without spec v2, start_p == end_p so this is a no-op.
-        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
-        if self.page_size > 1:
-            start_p = ceil_align(start_p, self.page_size)
-        if start_p < end_p:
+        # Without spec v2, rounded_committed_len == kv_allocated_len.
+        if rounded_committed_len < kv_allocated_len:
             overalloc_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, start_p:end_p
+                req.req_pool_idx, rounded_committed_len:kv_allocated_len
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
@@ -323,13 +353,13 @@ class DecodeKVCacheOffloadManager:
     def _compute_prefix_hash(self, tokens, prior_hash=""):
         page_hashes = []
         last_hash = prior_hash
-        for offset in range(0, len(tokens), self.page_size):
-            page_tokens = tokens[offset : offset + self.page_size]
+        for offset in range(0, len(tokens), self.storage_page_size):
+            page_tokens = tokens[offset : offset + self.storage_page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
 
-    def finalize_release_on_finish(self, req: Req):
+    def finalize_release_on_finish(self, req: Req) -> None:
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
         # ReqToTokenPool.free sets req_pool_idx to None on release, so
         # guard against both sentinels here.
@@ -337,11 +367,11 @@ class DecodeKVCacheOffloadManager:
             return
         state = self.offloaded_state.get(req.rid)
         if state is None:
-            prefill_len = len(req.origin_input_ids) // self.page_size * self.page_size
-            inc_len = 0
-        else:
-            prefill_len = state.prefill_len
-            inc_len = state.inc_len
+            prefill_len = (
+                len(req.origin_input_ids)
+                // self.allocator_page_size
+                * self.allocator_page_size
+            )
         # Prefill-aligned slots are freed by _release_finished_req. Make
         # sure state exists so it can find prefill_len.
         if state is None:
@@ -350,5 +380,4 @@ class DecodeKVCacheOffloadManager:
             )
         if self._has_inflight_offload(req.rid):
             return
-        start_offset = prefill_len
-        self._release_finished_req(req, start_offset)
+        self._release_finished_req(req)

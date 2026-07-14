@@ -74,6 +74,8 @@ HiCache works seamlessly with PD Disaggregation. You can choose between two conf
 1. **Prefill-only HiCache**: Enable HiCache only on Prefill nodes, allowing KV cache sharing among Prefill instances
 2. **Full HiCache with async offloading**: Enable HiCache on Prefill nodes and async KV cache offloading on Decode nodes, allowing Prefill nodes to reuse KV caches from Decode nodes in multi-turn dialogue scenarios
 
+Decode-side async KV cache offloading is supported on CUDA and HIP. The server rejects this option on Ascend NPU.
+
 ```bash
 # Prefill node with HiCache enabled for cross-prefill sharing (ideal for SystemPrompt scenarios)
 python3 -m sglang.launch_server \
@@ -97,7 +99,7 @@ python3 -m sglang.launch_server \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend mooncake
 
-# Decode node with async offloading enabled for KV cache reuse by Prefill (ideal for multi-turn conversations)
+# CUDA/HIP Decode node with async offloading enabled for KV cache reuse by Prefill (ideal for multi-turn conversations)
 python3 -m sglang.launch_server \
   --model-path /xxx/DeepSeek-R1/ \
   --tp 8 \
