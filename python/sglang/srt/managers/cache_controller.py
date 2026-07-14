@@ -609,7 +609,8 @@ class HiCacheController:
             # TODO(hzh): Rename is_mla_model to is_rank_replicated.
             is_mla_model=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
-            is_page_first_layout=self.mem_pool_host.layout == "page_first",
+            is_page_first_layout=self.mem_pool_host.layout
+            in ["page_first", "page_blob_direct"],
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
@@ -743,7 +744,7 @@ class HiCacheController:
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
-            elif self.mem_pool_host.layout == "page_first_direct":
+            elif self.mem_pool_host.layout in ["page_first_direct", "page_blob_direct"]:
                 return host_indices, device_indices.cpu()
             else:
                 raise ValueError(

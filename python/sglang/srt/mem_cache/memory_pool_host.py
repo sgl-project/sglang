@@ -107,13 +107,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # This swaps strides without copying data
             transposed = self.kv_buffer.transpose(0, 1)
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
+        elif self.layout == "page_blob_direct":
+            # page_blob_direct keeps each page as one contiguous outer slice; the
+            # per-layer refs below would slice the page dimension instead.
+            self.data_refs = []
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
+        if self.data_refs:
+            self.data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+        else:
+            self.data_ptrs = torch.empty(
+                (0,), dtype=torch.uint64, device=self.device_pool.device
+            )
         self._init_write_back_staging_buffers()
 
     def get_contiguous_buf_infos(self):
@@ -151,7 +160,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ["page_first_direct", "page_blob_direct"]:
             dims = (
                 self.page_num,
                 self.layer_num,
@@ -296,7 +305,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.kv_buffer],
                     dst_ptrs=[device_pool.kv_buffer[layer_id]],
@@ -449,7 +458,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.kv_buffer,
                     dst_ptrs=[self.kv_buffer],
@@ -483,7 +492,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.kv_buffer[index : index + self.page_size, :, :, :]
-        elif self.layout == "page_first_direct":
+        elif self.layout in ["page_first_direct", "page_blob_direct"]:
             real_index = index // self.page_size
             data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
         else:
@@ -520,7 +529,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ["page_first_direct", "page_blob_direct"]:
             real_index = index // self.page_size
             self.kv_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
                 1,
@@ -551,7 +560,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
@@ -584,7 +593,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
         stride must itself be a multiple of the OS page size.
         """
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout not in ("page_first", "page_first_direct", "page_blob_direct"):
             return False
         stride = (
             self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
@@ -609,11 +618,12 @@ class MambaPoolHost(HostKVCache):
         self.page_size = 1
 
         # TODO: Mamba pool is currently incompatible with write-back staging
-        # kernel; only allow 'page_first_direct' + 'direct' for now.
+        # kernel; only allow direct page-first layouts + direct IO for now.
         # Relax this restriction once the staging bug is fixed.
-        if layout != "page_first_direct":
+        if layout not in ("page_first_direct", "page_blob_direct"):
             raise ValueError(
-                f"MambaPoolHost only supports layout='page_first_direct', "
+                "MambaPoolHost only supports layout='page_first_direct' or "
+                f"'page_blob_direct', "
                 f"got '{layout}'."
             )
 
@@ -696,7 +706,7 @@ class MambaPoolHost(HostKVCache):
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
 
-        if self.layout in ["page_first", "page_first_direct"]:
+        if self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
             temporal_dims = (
                 self.size,
@@ -801,7 +811,7 @@ class MambaPoolHost(HostKVCache):
         return [self.temporal_buffer, *self.conv_buffer]
 
     def _iter_page_tensors(self, index: int):
-        if self.layout in ["page_first", "page_first_direct"]:
+        if self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
             yield self.temporal_buffer[index]
             for conv_buf in self.conv_buffer:
                 yield conv_buf[index]
@@ -985,7 +995,7 @@ class MambaPoolHost(HostKVCache):
                 f"MambaPoolHost only supports io_backend='direct', "
                 f"got '{io_backend}'."
             )
-        if self.layout in ["page_first", "page_first_direct"]:
+        if self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
             self._copy_tensor_pf_lf(
                 src=self.temporal_buffer,
                 dst=device_pool.mamba_cache.temporal[layer_id],
@@ -1030,7 +1040,7 @@ class MambaPoolHost(HostKVCache):
                 f"MambaPoolHost only supports io_backend='direct', "
                 f"got '{io_backend}'."
             )
-        if self.layout in ["page_first", "page_first_direct"]:
+        if self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
             self._copy_tensor_all_layers_lf_pf(
                 src_layers=device_pool.mamba_cache.temporal,
                 dst=self.temporal_buffer,
@@ -1110,7 +1120,7 @@ class MambaPoolHost(HostKVCache):
         each page slot in temporal/conv buffers is directly addressable.
         """
         assert len(indices) % self.page_size == 0
-        if self.layout not in ["page_first", "page_first_direct"]:
+        if self.layout not in ["page_first", "page_first_direct", "page_blob_direct"]:
             raise ValueError(
                 f"Mamba storage zero-copy requires page_first layout, got {self.layout}"
             )

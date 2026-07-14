@@ -103,19 +103,32 @@ class MHATokenToKVPoolHost(HostKVCache):
             v_transposed = self.v_buffer.transpose(0, 1)
             self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
             self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
+        elif self.layout == "page_blob_direct":
+            # page_blob_direct keeps each page as one contiguous outer slice; the
+            # per-layer refs below would slice the page dimension instead.
+            self.k_data_refs = []
+            self.v_data_refs = []
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
+        if self.k_data_refs:
+            self.k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+            self.v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.v_data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+        else:
+            self.k_data_ptrs = torch.empty(
+                (0,), dtype=torch.uint64, device=self.device_pool.device
+            )
+            self.v_data_ptrs = torch.empty(
+                (0,), dtype=torch.uint64, device=self.device_pool.device
+            )
         self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
@@ -136,6 +149,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             dims = (
                 2,
                 self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+        elif self.layout == "page_blob_direct":
+            dims = (
+                self.page_num,
+                2,
                 self.layer_num,
                 self.page_size,
                 self.head_num,
@@ -200,10 +222,14 @@ class MHATokenToKVPoolHost(HostKVCache):
 
     @property
     def k_buffer(self):
+        if self.layout == "page_blob_direct":
+            return self.kv_buffer.select(1, 0)
         return self.kv_buffer[0]
 
     @property
     def v_buffer(self):
+        if self.layout == "page_blob_direct":
+            return self.kv_buffer.select(1, 1)
         return self.kv_buffer[1]
 
     def load_to_device_per_layer(
@@ -290,7 +316,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer, self.v_buffer],
                     dst_ptrs=[
@@ -401,7 +427,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
                     dst_ptrs=[self.k_buffer, self.v_buffer],
@@ -436,6 +462,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif self.layout in ["page_first_direct", "page_head"]:
             real_index = index // self.page_size
             data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
+        elif self.layout == "page_blob_direct":
+            real_index = index // self.page_size
+            data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
@@ -472,6 +501,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
                 data_page.reshape(
                     2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
+                )
+            )
+        elif self.layout == "page_blob_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[real_index : real_index + 1, :, :, :, :, :] = (
+                data_page.reshape(
+                    1, 2, self.layer_num, self.page_size, self.head_num, self.head_dim
                 )
             )
         elif self.layout == "page_head":
@@ -569,6 +605,21 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
+        elif self.layout == "page_blob_direct":
+            element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.head_num
+                * self.head_dim
+            )
+            page_blob_size = 2 * element_size
+            for index in range(0, len(indices), self.page_size):
+                page_index = indices[index] // self.page_size
+                page_base_ptr = kv_buffer_data_ptr + page_index * page_blob_size
+                ptr_list.append(page_base_ptr)
+                ptr_list.append(page_base_ptr + element_size)
+            element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct", "page_head"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
@@ -606,15 +657,28 @@ class MHATokenToKVPoolHost(HostKVCache):
         For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
         stride must itself be a multiple of the OS page size.
         """
-        if self.layout not in ("page_first", "page_first_direct", "page_head"):
+        if self.layout not in (
+            "page_first",
+            "page_first_direct",
+            "page_blob_direct",
+            "page_head",
+        ):
             return False
-        stride = (
+        page_bytes = (
             self.page_size
             * self.layer_num
             * self.head_num
             * self.head_dim
             * self.dtype.itemsize
         )
+        if self.layout == "page_blob_direct":
+            stride = 2 * page_bytes
+            return (
+                self.kv_buffer.data_ptr() % page_size_bytes == 0
+                and page_bytes % page_size_bytes == 0
+                and stride % page_size_bytes == 0
+            )
+        stride = page_bytes
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
 

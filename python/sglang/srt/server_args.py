@@ -2129,6 +2129,7 @@ class ServerArgs:
                 "layer_first",
                 "page_first",
                 "page_first_direct",
+                "page_blob_direct",
                 "page_first_kv_split",
                 "page_head",
             ],
@@ -5760,12 +5761,12 @@ class ServerArgs:
 
     def _resolve_layout_io_compatibility(self):
         if (
-            self.hicache_mem_layout == "page_first_direct"
+            self.hicache_mem_layout in ["page_first_direct", "page_blob_direct"]
             and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
-                "Kernel io backend does not support page first direct layout, switching to direct io backend"
+                "Kernel io backend does not support the requested direct page layout, switching to direct io backend"
             )
 
         if (
