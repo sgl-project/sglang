@@ -572,6 +572,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self.schedule_stream.wait_stream(self.forward_stream)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

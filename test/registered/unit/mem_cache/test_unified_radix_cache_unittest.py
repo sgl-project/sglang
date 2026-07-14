@@ -932,6 +932,7 @@ class UnifiedRadixCacheSuite:
         req.last_node = cache.root_node
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
+        req.swa_prefix_lock_released = True
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
         req.set_extend_range(
@@ -975,6 +976,7 @@ class UnifiedRadixCacheSuite:
         self.assertGreater(len(req.prefix_indices), 0)
         self.assertEqual(req.cache_protected_len, len(req.prefix_indices))
         self.assertIsNotNone(req.last_node)
+        self.assertFalse(req.swa_prefix_lock_released)
 
         cache.dec_lock_ref(
             req.last_node,
@@ -4051,6 +4053,171 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
             c, root, window_size=0, should_include=lambda _n: True
         )
         self.assertEqual(self._lru_order(lru), before)
+
+
+class TestUnifiedCacheStreamOrdering(CustomTestCase):
+    page_size = 128
+
+    def _build_fixture(self, *, kv_pages=2):
+        cfg = CacheConfig(
+            page_size=self.page_size,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            num_layers=2,
+            full_attention_layer_ids=(1,),
+            sliding_window_size=self.page_size,
+            kv_size=kv_pages * self.page_size,
+            head_num=1,
+            head_dim=8,
+        )
+        return build_fixture(cfg)
+
+    def _alloc_page(self, allocator):
+        full = allocator.full_attn_allocator.alloc(self.page_size)
+        swa = allocator.swa_attn_allocator.alloc(self.page_size)
+        self.assertIsNotNone(full)
+        self.assertIsNotNone(swa)
+        allocator.set_full_to_swa_mapping(full, swa)
+        return full, swa
+
+    @staticmethod
+    def _kv_buffers(allocator):
+        kvcache = allocator.get_kvcache()
+        return (
+            kvcache.full_kv_pool.get_key_buffer(0),
+            kvcache.swa_kv_pool.get_key_buffer(0),
+        )
+
+    @staticmethod
+    def _write_through_mapping(allocator, full_key, swa_key, captured_full):
+        actual_swa = allocator.translate_loc_from_full_to_swa(captured_full).clone()
+        full_key[captured_full] = 17
+        swa_key[actual_swa.to(torch.int64)] = 19
+        return actual_swa
+
+    @staticmethod
+    def _run_interleaving(*, ordered, capture, run_forward, mutate):
+        """Run the forward before or after the scheduler mutation."""
+        forward_stream = torch.cuda.Stream()
+        schedule_stream = torch.cuda.Stream()
+        captured_event = torch.cuda.Event()
+        forward_done = torch.cuda.Event()
+        mutation_done = torch.cuda.Event()
+
+        with torch.cuda.stream(forward_stream):
+            captured = capture()
+            if ordered:
+                forward_state = run_forward(captured)
+                forward_done.record()
+            else:
+                captured_event.record()
+
+        with torch.cuda.stream(schedule_stream):
+            schedule_stream.wait_event(forward_done if ordered else captured_event)
+            mutation_state = mutate()
+            if not ordered:
+                mutation_done.record()
+
+        if not ordered:
+            with torch.cuda.stream(forward_stream):
+                forward_stream.wait_event(mutation_done)
+                forward_state = run_forward(captured)
+
+        torch.cuda.synchronize()
+        return captured, forward_state, mutation_state
+
+    def _run_locked_recovery_interleaving(self, *, ordered: bool):
+        tree, allocator, req_to_token_pool = self._build_fixture()
+        tokens = list(range(1, self.page_size + 1))
+        key = RadixKey(tokens)
+
+        full_a, _ = self._alloc_page(allocator)
+        tree.insert(InsertParams(key=key, value=full_a))
+        node = tree.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        lock_result = tree.inc_lock_ref(node)
+
+        tree.dec_swa_lock_only(node, lock_result.swa_uuid_for_lock)
+        evict_result = tree.evict(
+            EvictParams(num_tokens=0, swa_num_tokens=self.page_size)
+        )
+        self.assertEqual(evict_result.swa_num_tokens_evicted, self.page_size)
+        torch.cuda.synchronize()
+        self.assertGreater(node.component_data[ComponentType.FULL].lock_ref, 0)
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+
+        full_b, swa_b = self._alloc_page(allocator)
+        req_to_token_pool.write((0, slice(0, self.page_size)), full_b)
+        full_key, swa_key = self._kv_buffers(allocator)
+        full_key[full_b] = 11
+        swa_key[swa_b] = 13
+        torch.cuda.synchronize()
+
+        def capture():
+            return req_to_token_pool.req_to_token[0, : self.page_size].clone()
+
+        def run_forward(captured_full):
+            return self._write_through_mapping(
+                allocator, full_key, swa_key, captured_full
+            )
+
+        def mutate():
+            tree.insert(
+                InsertParams(
+                    key=key,
+                    value=full_b,
+                    prev_prefix_len=0,
+                    swa_evicted_seqlen=0,
+                )
+            )
+            req_to_token_pool.write((0, slice(0, self.page_size)), full_a)
+            mapping_after_clear = allocator.translate_loc_from_full_to_swa(
+                full_b
+            ).clone()
+            full_c, swa_c = self._alloc_page(allocator)
+            full_key[full_c] = 97
+            swa_key[swa_c] = 99
+            return mapping_after_clear, full_c, swa_c
+
+        _, actual_swa, mutation_state = self._run_interleaving(
+            ordered=ordered,
+            capture=capture,
+            run_forward=run_forward,
+            mutate=mutate,
+        )
+        mapping_after_clear, full_c, swa_c = mutation_state
+
+        self.assertTrue(torch.all(mapping_after_clear == 0).item())
+        self.assertTrue(torch.equal(full_c, full_b))
+        self.assertFalse(torch.equal(swa_c, swa_b))
+        self.assertTrue(
+            torch.equal(allocator.translate_loc_from_full_to_swa(full_a), swa_b)
+        )
+        self.assertTrue(
+            torch.equal(allocator.translate_loc_from_full_to_swa(full_c), swa_c)
+        )
+        self.assertTrue(
+            torch.equal(node.component_data[ComponentType.SWA].value, swa_b)
+        )
+
+        if ordered:
+            self.assertTrue(torch.equal(actual_swa.to(torch.int64), swa_b))
+            self.assertTrue(torch.all(full_key[full_c] == 97).item())
+            self.assertTrue(torch.all(swa_key[swa_c] == 99).item())
+            self.assertTrue(torch.all(swa_key[swa_b] == 19).item())
+        else:
+            self.assertTrue(torch.equal(actual_swa.to(torch.int64), swa_c))
+            self.assertTrue(torch.all(full_key[full_c] == 17).item())
+            self.assertTrue(torch.all(swa_key[swa_c] == 19).item())
+            self.assertTrue(torch.all(swa_key[swa_b] == 13).item())
+
+        allocator.free(full_c)
+        tree.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
+        tree.sanity_check()
+
+    def test_locked_recovery_redirects_inflight_write_without_ordering(self):
+        self._run_locked_recovery_interleaving(ordered=False)
+
+    def test_locked_recovery_waits_for_inflight_write(self):
+        self._run_locked_recovery_interleaving(ordered=True)
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):

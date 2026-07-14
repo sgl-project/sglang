@@ -1582,6 +1582,9 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Processing the previous result may rewrite or free cache entries
+                # still used by this forward, so wait for the forward first.
+                self.schedule_stream.wait_stream(self.forward_stream)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
