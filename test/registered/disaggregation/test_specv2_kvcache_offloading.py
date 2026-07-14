@@ -336,9 +336,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
     def test_storage_and_allocator_page_boundaries_remain_independent(self):
         """Storage progress and allocator ownership use their respective pages."""
-        manager, freed = _make_manager(
-            pool_size=16, page_size=4, storage_page_size=2
-        )
+        manager, freed = _make_manager(pool_size=16, page_size=4, storage_page_size=2)
         manager.cache_controller = MagicMock()
         manager.cache_controller.get_hash_str = MagicMock(return_value="prefill_hash")
         manager.cache_controller.write = MagicMock(
