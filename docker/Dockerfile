@@ -799,7 +799,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libcurl4 \
     libczmq4 \
     libfabric1 \
-    libssl3 \
+    libssl-dev \
     # RDMA runtime
     rdma-core \
     infiniband-diags \

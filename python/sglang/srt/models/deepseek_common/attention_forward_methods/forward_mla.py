@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    per_tensor_quant_mla_fp8,
+    per_token_group_quant_mla_deep_gemm_masked_fp8,
+)
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -18,11 +23,6 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    per_tensor_quant_mla_fp8,
-    per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,

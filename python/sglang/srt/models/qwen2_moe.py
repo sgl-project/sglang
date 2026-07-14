@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.layernorm.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -48,7 +49,6 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -392,7 +392,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return topk_output
         shared_weights, shared_scale = shared
 
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 

@@ -41,6 +41,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -50,7 +51,6 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
@@ -1841,7 +1841,7 @@ class MHATokenToKVPool(KVCache):
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
-            from sglang.srt.layers.attention.utils import (
+            from sglang.kernels.ops.attention.utils import (
                 launch_reshape_and_cache_shuffle_5d,
             )
 
