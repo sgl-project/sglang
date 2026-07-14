@@ -121,17 +121,6 @@ class DSparkAttention(MqaAttentionBase):
         kv, _ = self.wkv(x)
         return kv
 
-    def _local_attn_sink(self) -> torch.Tensor:
-        if self.attn_tp_size == 1:
-            return self.attn_sink
-        if self._attn_sink_local is None:
-            rank = self.attn_tp_rank
-            num_heads = self.n_local_heads
-            sink = self.attn_sink.new_zeros(max(num_heads, _PAD_NUM_HEADS))
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
-        return self._attn_sink_local
-
     def _store_block_kv(
         self,
         *,
