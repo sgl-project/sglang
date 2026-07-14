@@ -5,19 +5,18 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.attention.metadata import (
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -48,95 +47,6 @@ from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disable
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
     return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
-
-
-@triton.jit
-def _build_pa_page_table_kernel(
-    req_to_token_ptr,
-    req_pool_indices_ptr,
-    seq_lens_ptr,
-    prefill_lens_ptr,
-    dst_page_table_ptr,
-    kv_lens_ptr,
-    window_size: tl.constexpr,
-    req_to_token_stride,
-    dst_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Build PA-SWA page_table directly from req_to_token.
-
-    For each request, dst row = [0..prefill_len) ∪ [decode_start..seq_len).
-    decode_start = max(prefill_len, seq_len - window_size)
-
-    prefill_lens_ptr is the full pool-sized buffer, prefill_len is loaded
-    via indirect indexing using req_idx.
-    """
-    bid = tl.program_id(0)
-    req_idx = tl.load(req_pool_indices_ptr + bid)
-    sl = tl.load(seq_lens_ptr + bid).to(tl.int32)
-    pf = tl.load(prefill_lens_ptr + req_idx).to(tl.int32)
-
-    decode_start = tl.maximum(pf, sl - window_size)
-    gap = tl.where(decode_start > pf, decode_start - pf, 0)
-    kv_len = sl - gap
-
-    tl.store(kv_lens_ptr + bid, kv_len)
-
-    src_base = req_idx * req_to_token_stride
-    dst_base = bid * dst_stride
-
-    for start in tl.range(0, kv_len, BLOCK_SIZE):
-        offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < kv_len
-        pos = tl.where(offs < pf, offs, offs + gap)
-        kv_loc = tl.load(
-            req_to_token_ptr + src_base + pos,
-            mask=mask,
-            other=0,
-        )
-        tl.store(dst_page_table_ptr + dst_base + offs, kv_loc.to(tl.int32), mask=mask)
-
-
-def _build_pa_page_table(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    prefill_lens: torch.Tensor,
-    window_size: int,
-    bs: int,
-    pa_max_len: int,
-    device: torch.device,
-    dst_page_table: Optional[torch.Tensor] = None,
-    dst_kv_lens: Optional[torch.Tensor] = None,
-):
-    """Build prefill-aware page_table from req_to_token.
-
-    When dst_page_table/dst_kv_lens are None, allocates new tensors (non-CUDA-graph).
-    When provided, writes in-place into existing buffers (CUDA-graph replay).
-
-    prefill_lens is the full pool-sized buffer; the kernel indexes it via
-    req_pool_indices values (indirect indexing, avoids external gather).
-
-    Returns (page_table, kv_lens).
-    """
-    if dst_page_table is None:
-        dst_page_table = torch.zeros(bs, pa_max_len, dtype=torch.int32, device=device)
-    if dst_kv_lens is None:
-        dst_kv_lens = torch.empty(bs, dtype=torch.int32, device=device)
-    if bs > 0 and pa_max_len > 0:
-        _build_pa_page_table_kernel[(bs,)](
-            req_to_token,
-            req_pool_indices.contiguous(),
-            seq_lens.to(torch.int32),
-            prefill_lens,
-            dst_page_table,
-            dst_kv_lens,
-            window_size,
-            req_to_token.stride(0),
-            dst_page_table.stride(0),
-            BLOCK_SIZE=256,
-        )
-    return dst_page_table, dst_kv_lens
 
 
 @dataclass
@@ -262,7 +172,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = model_runner.ps.attn_cp_size
         # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
         # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
@@ -342,10 +252,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.tp_size
+            // model_runner.ps.tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            model_runner.ps.tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
