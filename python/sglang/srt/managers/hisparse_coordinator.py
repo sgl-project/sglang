@@ -20,11 +20,12 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils import get_device_module, is_hip, is_npu
 
 device_module = get_device_module()
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -481,13 +482,14 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        self._rehome_page_boundary_owners(
-            seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            req_pool_indices=req_pool_indices,
-            seq_lens_cpu=seq_lens_cpu,
-            req_pool_indices_cpu=req_pool_indices_cpu,
-        )
+        if not _is_npu and self.token_to_kv_pool_allocator.page_size > 1:
+            self._rehome_page_boundary_owners(
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                req_pool_indices=req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+            )
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
