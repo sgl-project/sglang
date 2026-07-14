@@ -28,7 +28,11 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
@@ -126,6 +130,47 @@ class TestPageAlignedAllocation(unittest.TestCase):
             _validate_main_page_aligned_alloc(page_one_batch)
         with mock.patch.object(allocation_module, "_is_npu", True):
             _validate_main_page_aligned_alloc(npu_batch)
+
+    def test_supported_allocators_expose_spec_decode_capability(self) -> None:
+        """Supported allocators explicitly accept speculative decode allocation."""
+        explicit_allocator_types = (
+            TokenToKVPoolAllocator,
+            PagedTokenToKVPoolAllocator,
+            SWATokenToKVPoolAllocator,
+            MultiEndedAllocator,
+        )
+
+        for allocator_type in explicit_allocator_types:
+            with self.subTest(allocator_type=allocator_type.__name__):
+                self.assertIn("validate_spec_decode_alloc", allocator_type.__dict__)
+                allocator_type.validate_spec_decode_alloc(
+                    object.__new__(allocator_type)
+                )
+
+        self.assertIs(
+            PureSWATokenToKVPoolAllocator.validate_spec_decode_alloc,
+            SWATokenToKVPoolAllocator.validate_spec_decode_alloc,
+        )
+        self.assertIs(
+            UnifiedSWATokenToKVPoolAllocator.validate_spec_decode_alloc,
+            SWATokenToKVPoolAllocator.validate_spec_decode_alloc,
+        )
+
+    def test_hisparse_does_not_inherit_spec_decode_capability(self) -> None:
+        """HiSparse allocators stay fail-closed for speculative decode."""
+        allocator_types = (
+            HiSparseTokenToKVPoolAllocator,
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+
+        for allocator_type in allocator_types:
+            with (
+                self.subTest(allocator_type=allocator_type.__name__),
+                self.assertRaisesRegex(NotImplementedError, allocator_type.__name__),
+            ):
+                allocator_type.validate_spec_decode_alloc(
+                    object.__new__(allocator_type)
+                )
 
     def test_hisparse_rehome_bypasses_page_one_and_npu(self) -> None:
         """HiSparse re-home routing stays exclusive to non-NPU paged allocation."""

@@ -713,6 +713,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def validate_main_page_aligned_alloc(self) -> None:
         return None
 
+    def validate_spec_decode_alloc(self) -> None:
+        return None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         """Allocate `need_size` virtual TOKEN ids (id-owner only). Returns
         token-granular, page-structured ids, or None on shortfall.

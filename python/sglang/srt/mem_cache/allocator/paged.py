@@ -149,6 +149,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def validate_main_page_aligned_alloc(self) -> None:
         return None
 
+    def validate_spec_decode_alloc(self) -> None:
+        return None
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:

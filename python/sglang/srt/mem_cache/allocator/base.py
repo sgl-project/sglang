@@ -102,6 +102,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             f"{type(self).__name__} does not support page-aligned main allocation"
         )
 
+    def validate_spec_decode_alloc(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support speculative decode allocation"
+        )
+
     def resize(self, config) -> None:
         self.size = config.max_total_num_tokens
         if self.page_size > 1:
