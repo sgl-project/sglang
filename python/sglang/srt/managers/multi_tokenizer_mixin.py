@@ -161,6 +161,15 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
+            ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
@@ -223,6 +232,12 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -262,6 +277,15 @@ def _handle_output_by_index(output, i):
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
+            ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -315,6 +339,12 @@ def _handle_output_by_index(output, i):
             ),
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
+            ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False

@@ -7,20 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
-)
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import torch_release
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
-
-from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -29,12 +16,23 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     pack_mxfp8_scales_triton,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import torch_release
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -445,7 +443,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     elif backend.is_triton():
         return triton_mxfp8_blockscaled_linear
     elif _is_hip and _is_gfx95_supported:
-        from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
@@ -461,7 +459,7 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     weight_scale_fallback: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
         w8a8_mxfp8_matmul_deepgemm,
     )
