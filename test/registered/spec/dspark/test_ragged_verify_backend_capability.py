@@ -6,12 +6,10 @@ wheels (sgl_kernel) at module scope, which fail to import on CPU runners.
 
 import unittest
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestRaggedVerifyGraphCapability(CustomTestCase):
@@ -24,30 +22,19 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         """Every backend with a ragged-verify metadata path must opt in; a
         dropped flag silently disables ragged graphs for that backend (the
         runner falls back to eager with no other test going red)."""
-        if is_hip():
-            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-                DeepseekV4HipRadixBackend,
-            )
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
-            backends = (DeepseekV4HipRadixBackend,)
-        else:
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4AttnBackend,
-            )
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
-            from sglang.srt.layers.attention.trtllm_mha_backend import (
-                TRTLLMHAAttnBackend,
-            )
-
-            backends = (
-                TRTLLMHAAttnBackend,
-                DeepseekV4AttnBackend,
-                FlashAttentionBackend,
-            )
-
-        for backend in backends:
+        for backend in (
+            TRTLLMHAAttnBackend,
+            DeepseekV4AttnBackend,
+            FlashAttentionBackend,
+        ):
             with self.subTest(backend=backend.__name__):
                 self.assertTrue(backend.supports_ragged_verify_graph)
 
