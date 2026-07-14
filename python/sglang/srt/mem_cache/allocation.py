@@ -453,9 +453,9 @@ def assert_alloc_extend_lens_page_aligned(
         f"alloc_extend prefix lens must be page-aligned: "
         f"{prefix_lens_cpu=}, {page_size=}"
     )
-    assert bool(torch.all(seq_lens_cpu % page_size == 0)), (
-        f"alloc_extend seq lens must be page-aligned: {seq_lens_cpu=}, {page_size=}"
-    )
+    assert bool(
+        torch.all(seq_lens_cpu % page_size == 0)
+    ), f"alloc_extend seq lens must be page-aligned: {seq_lens_cpu=}, {page_size=}"
     assert extend_num_tokens % page_size == 0, (
         f"alloc_extend token count must be page-aligned: "
         f"{extend_num_tokens=}, {page_size=}"

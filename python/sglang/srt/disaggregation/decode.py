@@ -1521,9 +1521,7 @@ def alloc_for_decode_prealloc(
         prefix_lens_cpu: torch.Tensor = torch.tensor(
             [alloc_prefix_len], dtype=torch.int64
         )
-        seq_lens_cpu: torch.Tensor = torch.tensor(
-            [alloc_fill_len], dtype=torch.int64
-        )
+        seq_lens_cpu: torch.Tensor = torch.tensor([alloc_fill_len], dtype=torch.int64)
         assert_alloc_extend_lens_page_aligned(
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens_cpu=seq_lens_cpu,
