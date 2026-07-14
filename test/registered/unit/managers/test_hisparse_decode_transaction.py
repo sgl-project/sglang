@@ -162,9 +162,7 @@ class TestHiSparseDecodeTransaction(unittest.TestCase):
         )
         self.assertEqual(dsv4_child.alloc_sizes, [])
         self.assertTrue(
-            torch.equal(
-                dsv4_child.freed[0], torch.arange(20, 22, dtype=torch.int64)
-            )
+            torch.equal(dsv4_child.freed[0], torch.arange(20, 22, dtype=torch.int64))
         )
 
     def test_net_extra_failure_preserves_all_owners(self) -> None:
