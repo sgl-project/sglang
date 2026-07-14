@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -316,6 +317,26 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            _evict_until_allocatable(tree_cache, allocator, num_tokens)
+
+
+def _evict_until_allocatable(
+    tree_cache: BasePrefixCache, allocator, num_tokens: int
+) -> None:
+    """Sub-granule KV sharding: evicted tokens may strand in partially-live
+    groups (the allocator reclaims a group only when its last live page dies),
+    so one evict() sized in tokens can yield less allocatable memory than it
+    freed. Iterate — deterministic and mirrored across shard-group ranks —
+    until whole free groups cover the need or the tree runs dry."""
+    if page_interleave_shard_size(allocator) <= 1:
+        return
+    while allocator.available_size() < num_tokens:
+        need = num_tokens - allocator.available_size()
+        result = tree_cache.evict(
+            EvictParams(num_tokens=max(need, allocator.page_size))
+        )
+        if result.num_tokens_evicted == 0:
+            return
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
@@ -348,11 +369,27 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    if page_interleave_shard_size(allocator) > 1:
+        # Sub-granule prefix reuse: each mid-group prefix hit consumes one
+        # fresh group for the adoption prologue below. Counted exactly so
+        # granule-aligned batches keep pre-adoption eviction behavior.
+        n_adopt = int((prefix_lens_cpu % allocator.page_size > 0).sum())
+        num_tokens += n_adopt * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
     if backup_state:
         state = allocator.backup_state()
+
+    if page_interleave_shard_size(allocator) > 1:
+        # Fresh-group adoption: a prefix hit ending mid-group must never
+        # extend in place into the shared boundary group (concurrent
+        # extenders would write the same dead slots, and the group would
+        # straddle the prefix/chunk scratch regions); the first new token
+        # goes to the position-congruent offset of a fresh group instead.
+        # None means the free list could not supply the adopted groups —
+        # flow into the shared OOM error path below.
+        last_loc = allocator.adopt_partial_prefix_groups(prefix_lens_cpu, last_loc)
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
@@ -364,14 +401,18 @@ def alloc_paged_token_slots_extend(
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
+    out = (
+        allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
+        if last_loc is not None
+        else None
     )
 
     if is_dsv4:

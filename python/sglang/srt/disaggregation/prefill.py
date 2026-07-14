@@ -1020,11 +1020,16 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
 
-        # Device-resident prefix only; page-aligned so start_send_idx stays exact.
+        # Device-resident prefix only; page-aligned so start_send_idx stays
+        # exact. Alignment is checked against the KERNEL page: under
+        # logical-page KV sharding the radix tree matches at the physical
+        # page (sub-granule reuse), so a prefix hit need not be
+        # allocator-granule-aligned; send_kv_chunk floors non-last chunks to
+        # the allocator page itself, so nothing is over-sent.
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
             return
-        assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        assert cached_end % self.page_size == 0
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(

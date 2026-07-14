@@ -18,7 +18,9 @@ Pins the pure arithmetic the whole design hangs on:
 1. The placement bijection ``loc = Q*(N*ps) + r*ps + o`` — owner / local-row
    round-trip, disjoint equal partition across ranks.
 2. ``PageInterleavePoolAllocator`` — index-space widening over an un-widened
-   physical page count; atomic whole-group frees.
+   physical page count; per-group liveness (sub-granule frees strand pages
+   until their group drains), tail-padding marking, and fresh-group adoption
+   (``DESIGN_kv_shard_subgranule_reuse.md``).
 3. ``translate_loc_to_scratch`` — the per-batch group->position lookup mapping
    any consumer index vector onto the owner-major ``[prefix | chunk | trash]``
    scratch, checked against a brute-force reference.
@@ -30,6 +32,7 @@ Pins the pure arithmetic the whole design hangs on:
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -39,6 +42,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
     page_interleave_shard_size,
 )
+from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
@@ -62,6 +66,47 @@ def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_groups=8):
         max_prefix_tokens=max_prefix_groups * GS,
         chunk_tokens=chunk_groups * GS,
     )
+
+
+class _NaiveExtendKernelShim:
+    """Stands in for the triton alloc_extend_kernel on CPU: same launch
+    convention (grid ``__getitem__`` then call), same index arithmetic via
+    ``alloc_extend_naive`` — so the tests drive the REAL
+    ``PageInterleavePoolAllocator.alloc_extend`` (free-list accounting and
+    the tail-padding-marking hook included, not a test re-implementation)."""
+
+    def __getitem__(self, grid):
+        def launch(
+            prefix_lens, seq_lens, last_loc, free_pages, out_indices, bs, page_size
+        ):
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                free_pages,
+                out_indices,
+                page_size,
+                device="cpu",
+            )
+
+        return launch
+
+
+def _alloc_extend_cpu(alloc, prefix_len, seq_len, last_loc):
+    """Drive the real alloc_extend on CPU with the triton kernel shimmed."""
+    import sglang.srt.mem_cache.allocator.paged as paged_mod
+
+    with mock.patch.object(paged_mod, "alloc_extend_kernel", _NaiveExtendKernelShim()):
+        out = alloc.alloc_extend(
+            prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
+            prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            last_loc=torch.tensor([last_loc], dtype=torch.int64),
+            extend_num_tokens=seq_len - prefix_len,
+        )
+    assert out is not None
+    return out
 
 
 class TestPlacement(CustomTestCase):
@@ -127,10 +172,195 @@ class TestAllocator(CustomTestCase):
         self.assertGreaterEqual(int(out.min()), GS)
         self.assertEqual(alloc.available_size(), total - 3 * GS)
         alloc.debug_check_equal_allocation()
-        # Freeing ANY index of a group releases the whole group.
-        alloc.free(out[::GS].clone())
+        # Freeing every slot of a group releases the whole group.
+        alloc.free(out)
         self.assertEqual(alloc.available_size(), total)
+        self.assertEqual(alloc.stranded_size(), 0)
         alloc.debug_check_equal_allocation()
+
+    def test_partial_free_strands_until_group_drains(self):
+        """§4.2 of DESIGN_kv_shard_subgranule_reuse.md: with the tree quantum
+        at the physical page, a node split inside one group lets eviction free
+        a sub-group range. The freed pages must NOT release the group (its
+        other pages are live elsewhere in the tree); they strand until the
+        group's last live page dies."""
+        alloc = self._alloc()
+        total = alloc.available_size()
+        out = alloc.alloc(GS)
+        # Free pages 1..3 (a partial in-page coverage of page 1 included:
+        # any touched physical page dies whole — its remaining slots belong
+        # to the same tree free, one level down).
+        alloc.free(out[PS : PS + 3])
+        alloc.free(out[2 * PS :])
+        self.assertEqual(alloc.available_size(), total - GS)  # nothing reclaimed
+        self.assertEqual(alloc.stranded_size(), 3 * PS)
+        alloc.debug_check_equal_allocation()
+        # The last live page drains the group back to the free list.
+        alloc.free(out[:PS])
+        self.assertEqual(alloc.available_size(), total)
+        self.assertEqual(alloc.stranded_size(), 0)
+
+    def test_tail_padding_dead_at_alloc_extend(self):
+        """Whole-group allocation consumes padding slots past the last token,
+        but they never enter req_to_token, so no tree free ever covers them.
+        alloc_extend must mark them dead at birth or the tail group can never
+        drain and leaks permanently."""
+        alloc = self._alloc()
+        total = alloc.available_size()
+        out = _alloc_extend_cpu(alloc, prefix_len=0, seq_len=3 * PS, last_loc=-1)
+        self.assertEqual(alloc.available_size(), total - GS)
+        self.assertEqual(alloc.stranded_size(), PS)  # the padding page
+        # Freeing only the written token slots reclaims the whole group.
+        alloc.free(out)
+        self.assertEqual(alloc.available_size(), total)
+        self.assertEqual(alloc.stranded_size(), 0)
+
+    def test_adoption_worked_example(self):
+        """Appendix A of DESIGN_kv_shard_subgranule_reuse.md, scaled to
+        shard 4 x ps 16: a prefix hit ending mid-group extends into a fresh
+        group at the position-congruent offset (I3), stock page counting
+        stays exact, and everything drains at eviction."""
+        alloc = self._alloc()
+        total = alloc.available_size()
+
+        # Turn 1: request A = 7 pages (112 tokens), no prefix. 2 groups;
+        # the tail group's padding page is dead at birth.
+        a_out = _alloc_extend_cpu(alloc, prefix_len=0, seq_len=112, last_loc=-1)
+        self.assertEqual(alloc.available_size(), total - 2 * GS)
+        self.assertEqual(alloc.stranded_size(), PS)
+        # I3 for a group-aligned start: loc congruent to position mod GS.
+        self.assertTrue(torch.equal(a_out % GS, torch.arange(112) % GS))
+
+        # Turn 2: request B matches all 112 (ps-aligned, mid-group: 112 % 64
+        # = 48) and extends to 176. Adoption pops a fresh group, dead head
+        # 48/16 = 3 pages, and hands back the synthetic continuation point.
+        last_loc = alloc.adopt_partial_prefix_groups(
+            torch.tensor([112]), torch.tensor([int(a_out[111])])
+        )
+        q_f = int(last_loc[0]) // GS
+        self.assertEqual(int(last_loc[0]) % GS, 47)
+        self.assertEqual(int(alloc._live_pages[q_f]), 1)
+
+        b_out = _alloc_extend_cpu(
+            alloc, prefix_len=112, seq_len=176, last_loc=int(last_loc[0])
+        )
+        # Position-slot congruence for every new token (positions 112..175).
+        self.assertTrue(
+            torch.equal(b_out % GS, torch.arange(112, 176, dtype=torch.int64) % GS)
+        )
+        # The first new token continues the adopted group at offset 48.
+        self.assertEqual(int(b_out[0]), q_f * GS + 48)
+        # Free-list consumption is exact: 1 adopted + 1 counted group.
+        self.assertEqual(alloc.available_size(), total - 4 * GS)
+        alloc.debug_check_equal_allocation()
+
+        # Eviction drains everything: adopted dead head + both tail paddings
+        # unstrand as their groups' live pages are freed.
+        alloc.free(b_out)
+        alloc.free(a_out)
+        self.assertEqual(alloc.available_size(), total)
+        self.assertEqual(alloc.stranded_size(), 0)
+
+    def test_adoption_noop_for_aligned_prefix(self):
+        alloc = self._alloc()
+        n_free = len(alloc.free_pages)
+        last_loc = torch.tensor([2 * GS - 1])
+        out = alloc.adopt_partial_prefix_groups(torch.tensor([GS]), last_loc)
+        self.assertIs(out, last_loc)  # bit-identical path, no group popped
+        self.assertEqual(len(alloc.free_pages), n_free)
+
+    def test_adoption_oom_returns_none(self):
+        alloc = self._alloc()
+        alloc.alloc(alloc.num_pages * GS)  # exhaust the free list
+        out = alloc.adopt_partial_prefix_groups(
+            torch.tensor([PS]), torch.tensor([PS - 1])
+        )
+        self.assertIsNone(out)
+
+    def test_alloc_decode_rejected(self):
+        """Decode allocation would resurrect tail-padding pages already marked
+        dead, silently corrupting the liveness table — it must fail loud."""
+        alloc = self._alloc()
+        with self.assertRaises(NotImplementedError):
+            alloc.alloc_decode(
+                torch.tensor([GS + 1]), torch.tensor([GS + 1]), torch.tensor([GS - 1])
+            )
+
+    def test_backup_restore_roundtrip_liveness(self):
+        """restore_state must bring the liveness table back with the free
+        list, or a rolled-back partial free would leave phantom dead pages."""
+        alloc = self._alloc()
+        out = alloc.alloc(GS)
+        state = alloc.backup_state()
+        alloc.free(out[PS:])
+        self.assertEqual(alloc.stranded_size(), 3 * PS)
+        alloc.restore_state(state)
+        self.assertEqual(alloc.stranded_size(), 0)
+        # The restored group is fully live again: freeing all of it reclaims.
+        total_before = alloc.available_size()
+        alloc.free(out)
+        self.assertEqual(alloc.available_size(), total_before + GS)
+
+
+class TestEvictUntilAllocatable(CustomTestCase):
+    """The evict-then-allocate contract under sub-granule stranding: one
+    evict() sized in tokens can reclaim less allocatable memory than it freed
+    (freed pages strand in partially-live groups), so the alloc path iterates.
+    Guards the two termination conditions of _evict_until_allocatable."""
+
+    def _stranded_allocator(self):
+        alloc = PageInterleavePoolAllocator(
+            size=4 * PS,  # 4 groups
+            physical_page_size=PS,
+            shard_size=N,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        outs = [alloc.alloc(GS) for _ in range(4)]
+        # Strand every group: free all but the first page.
+        for out in outs:
+            alloc.free(out[PS:])
+        assert alloc.available_size() == 0
+        return alloc, outs
+
+    def _tree_stub(self, alloc, frees):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+
+        stub = SimpleNamespace(calls=0)
+
+        def evict(params):
+            stub.calls += 1
+            if not frees:
+                return EvictResult(num_tokens_evicted=0)
+            head = frees.pop(0)
+            alloc.free(head)
+            return EvictResult(num_tokens_evicted=head.numel())
+
+        stub.evict = evict
+        return stub
+
+    def test_iterates_until_whole_groups_free(self):
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
+
+        alloc, outs = self._stranded_allocator()
+        # Each eviction round drains one group's last live page: reaching
+        # 2 whole free groups takes 2 rounds beyond the caller's first evict.
+        frees = [out[:PS] for out in outs]
+        tree = self._tree_stub(alloc, frees)
+        _evict_until_allocatable(tree, alloc, 2 * GS)
+        self.assertGreaterEqual(alloc.available_size(), 2 * GS)
+        self.assertEqual(tree.calls, 2)
+
+    def test_terminates_when_tree_dry(self):
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
+
+        alloc, _ = self._stranded_allocator()
+        tree = self._tree_stub(alloc, [])  # nothing evictable
+        _evict_until_allocatable(tree, alloc, GS)
+        self.assertEqual(alloc.available_size(), 0)  # need unmet, but no hang
+        self.assertEqual(tree.calls, 1)
 
 
 def _make_translation_stub(spec, prefix_groups, chunk_groups, num_physical_pages=512):
@@ -229,7 +459,7 @@ class TestScratchTranslation(CustomTestCase):
 
 
 class TestBeginShardExtendPlan(CustomTestCase):
-    def _run_begin(self, prefix_len, seq_len, groups_row):
+    def _run_begin(self, prefix_len, seq_len, groups_row, row_override=None):
         spec = _make_spec()
         stub = SimpleNamespace()
         stub.shard_spec = spec
@@ -243,14 +473,19 @@ class TestBeginShardExtendPlan(CustomTestCase):
         stub.prefetched = []
         stub._prefetch_layer = lambda layer_id: stub.prefetched.append(layer_id)
 
-        # req_to_token row: token loc = groups_row[pos // GS] * GS + pos % GS
-        row = torch.empty(seq_len, dtype=torch.int32)
-        for j, q in enumerate(groups_row):
-            start = j * GS
-            n = min(GS, seq_len - start)
-            if n <= 0:
-                break
-            row[start : start + n] = torch.arange(q * GS, q * GS + n, dtype=torch.int32)
+        if row_override is not None:
+            row = row_override
+        else:
+            # req_to_token row: token loc = groups_row[pos // GS] * GS + pos % GS
+            row = torch.empty(seq_len, dtype=torch.int32)
+            for j, q in enumerate(groups_row):
+                start = j * GS
+                n = min(GS, seq_len - start)
+                if n <= 0:
+                    break
+                row[start : start + n] = torch.arange(
+                    q * GS, q * GS + n, dtype=torch.int32
+                )
         req_to_token = row.unsqueeze(0)
 
         PageInterleaveKVPoolMixin.begin_shard_extend(
@@ -288,8 +523,104 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertEqual(int(stub._group_pos[9]), 1)
 
     def test_unaligned_prefix_rejected(self):
+        # The tree quantum is the PHYSICAL page: a prefix that is not a
+        # ps-multiple can never come out of match_prefix.
         with self.assertRaises(AssertionError):
-            self._run_begin(GS + PS, 2 * GS, [3, 9])
+            self._run_begin(GS + 3, 2 * GS, [3, 9])
+
+    def _adopted_row(self, boundary_group, adopted_group, tail_groups, seq_len):
+        """A req_to_token row after fresh-group adoption at prefix 112 =
+        GS + 3*PS: positions 0..63 in group g0, 64..111 at offsets 0..47 of
+        the boundary group, 112..127 at offsets 48..63 of the ADOPTED group
+        (position-slot congruence), then aligned groups from 128."""
+        g0 = 5
+        row = torch.empty(seq_len, dtype=torch.int32)
+        row[0:GS] = torch.arange(g0 * GS, (g0 + 1) * GS, dtype=torch.int32)
+        row[GS : GS + 3 * PS] = torch.arange(
+            boundary_group * GS, boundary_group * GS + 3 * PS, dtype=torch.int32
+        )
+        n = min(seq_len, 2 * GS) - (GS + 3 * PS)
+        row[GS + 3 * PS : GS + 3 * PS + n] = torch.arange(
+            adopted_group * GS + 3 * PS,
+            adopted_group * GS + 3 * PS + n,
+            dtype=torch.int32,
+        )
+        pos = 2 * GS
+        for q in tail_groups:
+            k = min(GS, seq_len - pos)
+            if k <= 0:
+                break
+            row[pos : pos + k] = torch.arange(q * GS, q * GS + k, dtype=torch.int32)
+            pos += k
+        return row
+
+    def test_plan_with_adopted_prefix(self):
+        """§4.4 of DESIGN_kv_shard_subgranule_reuse.md: the chunk of a
+        mid-group prefix hit needs the two-part extraction. The naive
+        stride-gs sample from prefix_len sits at offset (prefix % gs) inside
+        each group, so a trailing group holding fewer tokens than that offset
+        has no sample point and would silently translate to the trash page."""
+        prefix_len = GS + 3 * PS  # 112: boundary group shared mid-group
+        # Trailing group g2 holds only PS tokens (16 < 48) — the naive
+        # stride sample from 112 (112, 176, ...) misses it entirely.
+        seq_len = 2 * GS + PS
+        row = self._adopted_row(
+            boundary_group=9, adopted_group=7, tail_groups=[2], seq_len=seq_len
+        )
+        stub = self._run_begin(prefix_len, seq_len, None, row_override=row)
+        # Prefix: stride-gs sampling ceils — the partial boundary group ships.
+        self.assertEqual(stub._n_prefix_groups, 2)
+        self.assertEqual(int(stub._group_pos[5]), 0)
+        self.assertEqual(int(stub._group_pos[9]), 1)
+        # Chunk: adopted group + the trailing group the naive stride misses.
+        self.assertEqual(int(stub._group_pos[7]), 2)
+        self.assertEqual(int(stub._group_pos[2]), 3)
+        # Send rows cover exactly the prefix groups (boundary group whole —
+        # its dead tail pages ship but are never referenced).
+        expect = torch.cat([torch.arange(q * PS, (q + 1) * PS) for q in [5, 9]])
+        self.assertTrue(torch.equal(stub._send_rows, expect))
+
+    def test_plan_prefix_with_interior_adoption_seam(self):
+        """Regression: a cached prefix CONTAINING an adoption seam (turn 3
+        reusing turn 2's cache across its adoption boundary, or chunk 2 of a
+        request that adopted at admission) has one gs-window of positions
+        spanning TWO groups. Stride-gs prefix sampling missed the adopted
+        group entirely, so its positions translated to the trash page and
+        attention silently read garbage KV."""
+        # Granule-aligned prefix 192 with a seam at position 112: positions
+        # 112..127 live in adopted group 7 at offsets 48..63 (I3).
+        seq_len = 3 * GS + PS  # one chunk group after the prefix
+        row = self._adopted_row(
+            boundary_group=9, adopted_group=7, tail_groups=[2, 11], seq_len=seq_len
+        )
+        stub = self._run_begin(3 * GS, seq_len, None, row_override=row)
+        # A 3-granule prefix spans FOUR groups (the seam adds one), in order.
+        self.assertEqual(stub._n_prefix_groups, 4)
+        for j, q in enumerate([5, 9, 7, 2]):
+            self.assertEqual(int(stub._group_pos[q]), j)
+        self.assertEqual(int(stub._group_pos[11]), 4)  # the chunk group
+        # The gather ships the adopted group's stripe like any other.
+        expect = torch.cat([torch.arange(q * PS, (q + 1) * PS) for q in [5, 9, 7, 2]])
+        self.assertTrue(torch.equal(stub._send_rows, expect))
+        # Seam positions land in the prefix scratch region, never the trash.
+        seam_rows = PageInterleaveKVPoolMixin.translate_loc_to_scratch(
+            stub, row[112:128].long()
+        )
+        self.assertTrue(bool((seam_rows < stub.shard_spec.max_prefix_tokens).all()))
+
+    def test_plan_chunk_within_adopted_group(self):
+        """Two-part extraction, degenerate case: the whole chunk fits inside
+        the adopted group (no aligned trailing part)."""
+        prefix_len = GS + 3 * PS
+        seq_len = prefix_len + PS  # chunk = one page inside the adopted group
+        row = self._adopted_row(
+            boundary_group=9, adopted_group=7, tail_groups=[], seq_len=seq_len
+        )
+        stub = self._run_begin(prefix_len, seq_len, None, row_override=row)
+        self.assertEqual(stub._n_prefix_groups, 2)
+        self.assertEqual(int(stub._group_pos[7]), 2)
+        # No spurious extra chunk group.
+        self.assertEqual(int((stub._group_pos >= 0).sum()), 3)
 
 
 class TestWritePlan(CustomTestCase):

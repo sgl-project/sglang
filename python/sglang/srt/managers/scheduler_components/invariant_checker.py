@@ -111,14 +111,26 @@ class SchedulerInvariantChecker:
             or self.server_args.enable_kv_cache_sharding
         ) and allocator.page_size > 1
         if widened_page_alloc:
-            # DCP / logical-page KV sharding store logical tokens in widened
-            # allocator pages.  Prefix cache counters are logical-token based,
-            # while the allocator frees whole pages, so round cached tokens up
-            # to allocator page units.
+            from sglang.srt.mem_cache.allocator.page_interleave import (
+                page_interleave_shard_size,
+            )
+
+            if page_interleave_shard_size(allocator) > 1:
+                # Logical-page KV sharding: the tree quantizes at the PHYSICAL
+                # page (sub-granule reuse), so round cached tokens up to
+                # physical pages, and count dead pages stranded inside
+                # partially-live groups — they are neither allocatable nor
+                # evictable until their group drains.
+                round_to = allocator.physical_page_size
+                full_evictable_size += allocator.stranded_size()
+            else:
+                # DCP stores logical tokens in widened allocator pages. Prefix
+                # cache counters are logical-token based, while the allocator
+                # frees whole pages, so round cached tokens up to allocator
+                # page units.
+                round_to = allocator.page_size
             full_evictable_size = (
-                (full_evictable_size + allocator.page_size - 1)
-                // allocator.page_size
-                * allocator.page_size
+                (full_evictable_size + round_to - 1) // round_to * round_to
             )
         leak, msg = self._check_pool_invariant(
             "full",

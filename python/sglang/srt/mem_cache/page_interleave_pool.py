@@ -210,15 +210,31 @@ class PageInterleaveKVPoolMixin:
         chunk_group_list = []
         for i in range(len(prefix_lens_cpu)):
             prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
-            assert prefix_len % gs == 0, (
-                f"sharded prefill requires logical-page-aligned prefixes, got "
-                f"prefix_len={prefix_len}, logical_page_size={gs}"
+            assert prefix_len % ps == 0, (
+                f"sharded prefill requires physical-page-aligned prefixes "
+                f"(the radix-tree match quantum), got prefix_len={prefix_len}, "
+                f"page_size={ps}"
             )
             row = req_to_token[req_pool_indices[i]]
+            # Sample every ps-th position, then collapse runs. Stride-gs
+            # sampling would be wrong on both sides once fresh-group adoption
+            # exists: an adoption seam makes one gs-window of positions span
+            # TWO groups (the old boundary group, then the adopted group at
+            # the position-congruent offset), and a cached prefix can carry a
+            # seam per past turn boundary — any group with no sample point
+            # would silently translate to the trash page. Every group's
+            # positions in a request form ONE contiguous run starting at a
+            # ps-aligned position with ps-multiple length (I3 + the ps tree
+            # quantum), so ps-stride sampling hits every run and
+            # unique_consecutive keeps one entry per group, in plan order.
             if prefix_len > 0:
-                prefix_group_list.append(row[:prefix_len:gs].long() // gs)
+                prefix_group_list.append(
+                    torch.unique_consecutive(row[:prefix_len:ps].long() // gs)
+                )
             if seq_len > prefix_len:
-                chunk_group_list.append(row[prefix_len:seq_len:gs].long() // gs)
+                chunk_group_list.append(
+                    torch.unique_consecutive(row[prefix_len:seq_len:ps].long() // gs)
+                )
 
         def _cat(parts):
             if not parts:

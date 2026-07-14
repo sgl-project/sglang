@@ -45,6 +45,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Extra prefix-region scratch capacity, in logical groups, for adoption
+# seams: each cached turn boundary that hit mid-group (fresh-group adoption,
+# DESIGN_kv_shard_subgranule_reuse.md §4.3) leaves a seam in the cached
+# chain, and a request reusing that prefix needs one plan group per seam
+# beyond ceil(prefix / granule). Chains carrying more live seams than this
+# trip the plan-capacity assert in begin_shard_extend (fail-loud, never
+# silent corruption).
+KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS = 64
+
+
 class PageShardSpec(msgspec.Struct, frozen=True):
     """Everything both sides of any transfer need to reproduce the layout."""
 
@@ -56,7 +66,8 @@ class PageShardSpec(msgspec.Struct, frozen=True):
 
     @property
     def logical_page_size(self) -> int:
-        """The allocation granule and radix-tree match quantum."""
+        """The allocation granule. (The radix-tree match quantum stays at the
+        physical ``page_size`` — see DESIGN_kv_shard_subgranule_reuse.md.)"""
         return self.shard_size * self.page_size
 
 
@@ -146,9 +157,15 @@ def compute_page_shard_scratch_bytes(model_runner: ModelRunner) -> int:
 
     model_config = model_runner.model_config
     granule = shard_size * model_runner.page_size
+    # The prefix region carries a seam allowance (one group per cached
+    # mid-group turn boundary in a reused chain); the chunk region one extra
+    # granule (a mid-group prefix hit shifts the chunk's group span by up to
+    # one group).
     rows = (
         ceil_align(model_config.context_len, granule)
+        + KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS * granule
         + ceil_align(model_runner.server_args.chunked_prefill_size, granule)
+        + granule
         + model_runner.page_size
     )
     kv_size = torch._utils._element_size(model_runner.kv_cache_dtype)

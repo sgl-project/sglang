@@ -747,6 +747,7 @@ class ModelRunnerKVCacheMixin:
         kv_shard_spec = kv_shard_group = None
         if kv_shard_rank is not None:
             from sglang.srt.mem_cache.page_interleave import (
+                KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS,
                 PageShardSpec,
                 get_kv_shard_group,
             )
@@ -758,8 +759,14 @@ class ModelRunnerKVCacheMixin:
                 shard_rank=kv_shard_rank,
                 shard_size=kv_shard_size,
                 page_size=self.page_size,
-                max_prefix_tokens=ceil_align(self.model_config.context_len, granule),
-                chunk_tokens=ceil_align(self.server_args.chunked_prefill_size, granule),
+                # The seam allowance covers adoption seams inside reused
+                # prefixes (one plan group per cached mid-group turn
+                # boundary); the extra chunk granule covers a mid-group
+                # prefix hit shifting the chunk's group span by one.
+                max_prefix_tokens=ceil_align(self.model_config.context_len, granule)
+                + KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS * granule,
+                chunk_tokens=ceil_align(self.server_args.chunked_prefill_size, granule)
+                + granule,
             )
 
         # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,

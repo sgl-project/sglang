@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -201,14 +200,17 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # When DCP or logical-page KV sharding is enabled, the allocator's
-        # page_size is widened (page_size * group size). TreeCache.page_size
-        # must follow the allocator's page so match/insert/evict quantize on
-        # whole allocator pages and never free a partially-shared group.
+        # Under DCP the allocator's page_size is widened (page_size * group
+        # size) and TreeCache.page_size must follow it so match/insert/evict
+        # quantize on whole allocator pages and never free a partially-shared
+        # group. Logical-page KV sharding widens the allocator the same way
+        # but deliberately keeps the tree at the PHYSICAL page: its allocator
+        # tracks per-group liveness so sub-group frees are safe, recovering
+        # prefix reuse at physical-page granularity
+        # (DESIGN_kv_shard_subgranule_reuse.md).
         page_size=(
             token_to_kv_pool_allocator.page_size
             if get_parallel().dcp_enabled
-            or page_interleave_shard_size(token_to_kv_pool_allocator) > 1
             else page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
