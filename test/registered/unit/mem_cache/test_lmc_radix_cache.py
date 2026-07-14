@@ -344,7 +344,12 @@ class TestLMCachePageAlignedLoadBack(unittest.TestCase):
 
 
 class TestLMCacheCanonicalStore(unittest.TestCase):
-    def _make_store_cache(self, module: types.ModuleType) -> tuple[Any, Any, Any]:
+    def _make_store_cache(
+        self,
+        module: types.ModuleType,
+        *,
+        is_eagle: bool = False,
+    ) -> tuple[Any, Any, Any]:
         req_to_token_pool = MagicMock()
         req_to_token_pool.req_to_token = torch.tensor(
             [[200, 201, 202, 203, 204, 205, 206, 207]], dtype=torch.int64
@@ -358,6 +363,7 @@ class TestLMCacheCanonicalStore(unittest.TestCase):
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=allocator,
                 page_size=4,
+                is_eagle=is_eagle,
             ),
         )
         cache._mode = module.LMCacheMode.MP
@@ -371,9 +377,15 @@ class TestLMCacheCanonicalStore(unittest.TestCase):
         cache.store_stream = MagicMock()
         cache.lmcache_connector = MagicMock()
         canonical_indices = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+        canonical_token_ids = (
+            [10, 11, 12, 13, 14] if is_eagle else [10, 11, 12, 13]
+        )
         cache.insert(
             InsertParams(
-                key=module.RadixKey(array("q", [10, 11, 12, 13])),
+                key=module.RadixKey(
+                    array("q", canonical_token_ids),
+                    is_bigram=is_eagle,
+                ),
                 value=canonical_indices,
             )
         )
@@ -409,6 +421,25 @@ class TestLMCacheCanonicalStore(unittest.TestCase):
             )
             cache.lmcache_connector.end_session.assert_called_once_with("request")
             self.assertNotIn("request", cache._mp_load_back_markers)
+
+    def test_eagle_store_rematches_with_boundary_token(self):
+        """Eagle canonical rematch retains its final raw boundary token."""
+        with _import_lmc_module() as module:
+            cache, allocator, req = self._make_store_cache(module, is_eagle=True)
+            with patch.object(module.torch.cuda, "stream", return_value=MagicMock()):
+                result = cache.cache_finished_req(
+                    req,
+                    kv_len_to_handle=5,
+                )
+
+            store_metadata = cache.lmcache_connector.store_kv.call_args.args[0]
+            self.assertEqual(result.unhandled_kv_start, 4)
+            self.assertEqual(store_metadata.token_ids, [10, 11, 12, 13])
+            self.assertEqual(store_metadata.kv_indices.tolist(), [100, 101, 102, 103])
+            self.assertEqual(
+                allocator.free.call_args.args[0].tolist(), [200, 201, 202, 203]
+            )
+            cache.lmcache_connector.end_session.assert_called_once_with("request")
 
     def test_zero_handoff_ends_mp_session_without_store(self):
         """A subpage base handoff closes its MP session without storing."""

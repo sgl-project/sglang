@@ -516,10 +516,13 @@ class LMCRadixCache(RadixCache):
                 raise ValueError("LMCache store ownership boundary is invalid")
             token_ids = all_token_ids[:store_len]
             if store_len > 0:
+                match_token_count = store_len + int(self.is_eagle)
+                if match_token_count > len(all_token_ids):
+                    raise ValueError("LMCache store ownership boundary is invalid")
                 match_result = super().match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
-                            token_ids,
+                            all_token_ids[:match_token_count],
                             req.extra_key,
                             is_bigram=self.is_eagle,
                         )
