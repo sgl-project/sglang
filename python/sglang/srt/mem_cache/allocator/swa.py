@@ -8,86 +8,8 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
-
-if _is_npu:
-    import torch_npu
-
-
-# TODO(temporary-inside-chain): Move this legacy NPU helper to the NPU backend in op30.
-def alloc_extend_swa_tail_legacy_npu(
-    allocator: "SWATokenToKVPoolAllocator",
-    *,
-    prefix_lens: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
-    seq_lens: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    last_loc: torch.Tensor,
-    extend_num_tokens: int,
-    swa_tail_len: int,
-    swa_tail_end: int,
-) -> torch.Tensor | None:
-    assert allocator.page_size > 1
-    assert len(seq_lens_cpu) == 1
-    assert len(prefix_lens_cpu) == 1
-    assert 0 <= swa_tail_len <= swa_tail_end <= extend_num_tokens
-    win_start = swa_tail_end - swa_tail_len
-    assert win_start % allocator.page_size == 0
-
-    num_full_pages = get_num_new_pages(
-        seq_lens=seq_lens_cpu,
-        page_size=allocator.page_size,
-        prefix_lens=prefix_lens_cpu,
-    )
-    num_swa_pages = (swa_tail_len + allocator.page_size - 1) // allocator.page_size
-    if not allocator.new_pages_available(num_full_pages, num_swa_pages):
-        return None
-
-    alloc_full_indices = allocator.full_attn_allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        num_new_pages=num_full_pages,
-    )
-    assert alloc_full_indices is not None
-    if swa_tail_len == 0:
-        return alloc_full_indices
-
-    swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=allocator.device)
-    swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-    swa_seq_lens = torch.tensor(
-        [swa_tail_len], dtype=torch.int64, device=allocator.device
-    )
-    swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-    swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=allocator.device)
-    alloc_swa_indices = allocator.swa_attn_allocator.alloc_extend(
-        swa_prefix_lens,
-        swa_prefix_lens_cpu,
-        swa_seq_lens,
-        swa_seq_lens_cpu,
-        swa_last_loc,
-        swa_tail_len,
-        num_new_pages=num_swa_pages,
-    )
-    assert alloc_swa_indices is not None
-
-    allocator.set_full_to_swa_mapping(
-        alloc_full_indices[win_start:swa_tail_end], alloc_swa_indices
-    )
-    if win_start > 0:
-        allocator.full_to_swa_index_mapping[
-            alloc_full_indices[:win_start].to(torch.int64)
-        ] = 0
-    if swa_tail_end < extend_num_tokens:
-        allocator.full_to_swa_index_mapping[
-            alloc_full_indices[swa_tail_end:].to(torch.int64)
-        ] = 0
-    return alloc_full_indices
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -259,50 +181,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             <= self.swa_attn_allocator.available_size() // self.page_size
         )
 
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-        extend_num_tokens: int,
-    ):
-        assert self.page_size > 1
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        if not self.new_pages_available(num_new_pages, num_new_pages):
-            return None
-
-        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
-
-        alloc_full_indices = self.full_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
-        )
-        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            swa_last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
-        )
-        assert alloc_full_indices is not None
-        assert alloc_swa_indices is not None
-
-        self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
-
-        return alloc_full_indices
-
     def alloc_extend_swa_tail(
         self,
         *,
@@ -352,37 +230,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.set_full_to_swa_mapping(
             alloc_full_indices[win_start:mapped_end], alloc_swa_indices
         )
-        return alloc_full_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-    ):
-        assert self.page_size > 1
-        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
-
-        alloc_full_indices = self.full_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-        alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, swa_last_loc
-        )
-
-        if alloc_full_indices is None or alloc_swa_indices is None:
-            return None
-
-        if _is_npu:
-            indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
-            torch_npu.npu_scatter_nd_update_(
-                self.full_to_swa_index_mapping,
-                indices_2d,
-                alloc_swa_indices.to(torch.int64),
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
