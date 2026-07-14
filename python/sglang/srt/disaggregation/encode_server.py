@@ -16,7 +16,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
 from multiprocessing import Queue
-from typing import Dict, List, Optional, Set, Tuple, Union
 from typing import Annotated, Any, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
@@ -1565,7 +1564,9 @@ class MMEncoder:
 
         return normalized
 
-    async def _process_mm_items(self, mm_items, modality, preloaded_items=None, log_metrics: bool = True):
+    async def _process_mm_items(
+        self, mm_items, modality, preloaded_items=None, log_metrics: bool = True
+    ):
         model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
 
         preprocess_start = time.perf_counter()
