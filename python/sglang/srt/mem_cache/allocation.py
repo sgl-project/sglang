@@ -341,6 +341,12 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.token_to_kv_pool_allocator.page_size
 
 
+def _validate_main_page_aligned_alloc(batch: ScheduleBatch) -> None:
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if not _is_npu and allocator.page_size > 1:
+        allocator.validate_main_page_aligned_alloc()
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -351,6 +357,8 @@ def alloc_for_extend(
     (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
+    _validate_main_page_aligned_alloc(batch)
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
@@ -420,34 +428,9 @@ def alloc_for_extend(
     if alloc_page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
-        # Paged allocation - build last_loc
-        last_loc: list[torch.Tensor] = []
-        for index, (req, prefix_tensor, alloc_start) in enumerate(
-            zip(batch.reqs, prefix_tensors, alloc_start_lens_cpu.tolist())
-        ):
-            if uses_aligned_lens and req.kv is not None and alloc_start > 0:
-                req_pool_index = req_pool_indices[index]
-                last_loc.append(
-                    batch.req_to_token_pool.req_to_token[
-                        req_pool_index, alloc_start - 1 : alloc_start
-                    ]
-                )
-            elif len(prefix_tensor) > 0:
-                last_loc.append(prefix_tensor[-1:])
-            else:
-                last_loc.append(torch.tensor([-1], device=batch.device))
-        # TODO(temporary-inside-chain): Replace the legacy continuation producer with direct page allocation.
-        out_cache_loc = alloc_paged_token_slots_extend(
+        out_cache_loc = alloc_token_slots(
             tree_cache=batch.tree_cache,
-            prefix_lens=alloc_start_lens_device,
-            prefix_lens_cpu=alloc_start_lens_cpu,
-            seq_lens=alloc_end_lens_device,
-            seq_lens_cpu=alloc_end_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=alloc_extend_num_tokens,
-            req_pool_indices=req_pool_indices_device,
-            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
-            batch=batch,
+            num_tokens=alloc_extend_num_tokens,
         )
 
     # Write to req_to_token_pool
@@ -577,6 +560,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
+    _validate_main_page_aligned_alloc(batch)
 
     seq_lens_gpu = batch.seq_lens
     batch_size = seq_lens_gpu.shape[0]
@@ -773,30 +757,13 @@ def _allocate_page_aligned_decode(
             page_blocks=None,
         )
 
-    crossing_req_pool_indices = batch.req_pool_indices[crossing_indices]
-    crossing_write_locs = plan.write_locs.device[crossing_indices]
-    crossing_write_locs_cpu = plan.write_locs.cpu[plan.crossing_indices_cpu]
-    last_loc = get_last_loc(
-        batch.req_to_token_pool.req_to_token,
-        crossing_req_pool_indices,
-        crossing_write_locs,
-    )
-    # TODO(temporary-inside-chain): Replace this legacy crossing-page producer with direct page allocation.
-    page_starts = alloc_paged_token_slots_decode(
+    page_blocks = alloc_token_slots(
         tree_cache=batch.tree_cache,
-        seq_lens=crossing_write_locs + 1,
-        seq_lens_cpu=crossing_write_locs_cpu + 1,
-        last_loc=last_loc,
-        req_pool_indices=crossing_req_pool_indices,
-    )
-    page_offsets = torch.arange(
-        alloc_page_size,
-        dtype=page_starts.dtype,
-        device=batch.device,
+        num_tokens=crossing_indices.numel() * alloc_page_size,
     )
     return _PageAlignedDecodeAllocation(
         crossing_indices=crossing_indices,
-        page_blocks=page_starts.unsqueeze(1) + page_offsets,
+        page_blocks=page_blocks.reshape(-1, alloc_page_size),
     )
 
 
