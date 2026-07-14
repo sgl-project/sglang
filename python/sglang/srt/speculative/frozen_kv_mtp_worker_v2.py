@@ -46,7 +46,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, _get_plan_stream
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
@@ -64,6 +64,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
+    get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -705,7 +706,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:

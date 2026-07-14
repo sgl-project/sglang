@@ -381,7 +381,7 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
 
     from deep_gemm import transform_sf_into_required_layout
 
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
 
     assert column_major_scales
     assert scale_tma_aligned
