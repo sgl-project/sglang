@@ -87,7 +87,7 @@ class MlaBmmFusionPlan:
 
 
 if _is_cuda:
-    from sglang.srt.layers.quantization.fp8_utils import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 
 if _use_aiter:

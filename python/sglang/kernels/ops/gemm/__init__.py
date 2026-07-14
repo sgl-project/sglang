@@ -32,6 +32,19 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.bmm_fp8",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
+        capability=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn", "float8_e5m2"),
+            description="batched (3D) per-tensor-scale FP8 matmul: D = A_fp8 @ B_fp8 * A_scale * B_scale",
+        ),
+        description="Batched FP8 matmul (flashinfer cuBLAS backend, torch.compile-safe wrapper).",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.CUDA_AOT,
         target="sgl_kernel:dsv3_fused_a_gemm",
@@ -84,6 +97,20 @@ def fp8_scaled_mm(
     )
 
 
+def bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
+    return get_kernel("gemm.bmm_fp8", KernelBackend.FLASHINFER)(
+        A, B, A_scale, B_scale, dtype, out
+    )
+
+
 def dsv3_fused_a_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -108,7 +135,7 @@ def dsv3_router_gemm(
     return impl(hidden_states, router_weights, out_dtype, output)
 
 
-__all__ = ["fp8_scaled_mm", "dsv3_fused_a_gemm", "dsv3_router_gemm"]
+__all__ = ["fp8_scaled_mm", "bmm_fp8", "dsv3_fused_a_gemm", "dsv3_router_gemm"]
 
 
 # LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);

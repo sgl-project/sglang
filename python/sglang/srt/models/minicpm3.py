@@ -43,7 +43,7 @@ from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 if is_cuda():
-    from sglang.srt.layers.quantization.fp8_utils import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 
 class MiniCPM3MLP(nn.Module):
