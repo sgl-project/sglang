@@ -568,25 +568,30 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def free(self, free_index: torch.Tensor):
-        sanitized_free_index = free_index[free_index > 0]
         _validate_page_aligned_free(
-            sanitized_free_index,
+            free_index,
             page_size=self.page_size,
+            ignore_non_positive=True,
         )
+        if free_index.numel() == 0:
+            return
+        if not self.is_not_in_free_group:
+            self.free_group.append(free_index)
+            return
+
+        sanitized_free_index = free_index[free_index > 0]
         if sanitized_free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
-            self.swa_attn_allocator.free(sanitized_free_index)
-        else:
-            self.free_group.append(sanitized_free_index)
+        self.swa_attn_allocator.free(sanitized_free_index)
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
-        sanitized_free_index = free_index[free_index > 0]
         _validate_page_aligned_free(
-            sanitized_free_index,
+            free_index,
             page_size=self.page_size,
+            ignore_non_positive=True,
         )
+        sanitized_free_index = free_index[free_index > 0]
         if sanitized_free_index.numel() == 0:
             return
         self.swa_attn_allocator.free(sanitized_free_index)

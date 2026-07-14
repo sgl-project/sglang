@@ -33,6 +33,7 @@ def _validate_page_aligned_free(
     free_index: torch.Tensor,
     *,
     page_size: int,
+    ignore_non_positive: bool = False,
 ) -> None:
     assert free_index.numel() % page_size == 0, (
         f"free requires complete page blocks: "
@@ -40,6 +41,11 @@ def _validate_page_aligned_free(
     )
     if free_index.numel() == 0 or not _DEBUG_MEMORY_POOL:
         return
+
+    if ignore_non_positive:
+        free_index = free_index[free_index > 0]
+        if free_index.numel() == 0:
+            return
 
     page_blocks = free_index.reshape(-1, page_size).to(dtype=torch.int64)
     page_starts = page_blocks[:, 0]

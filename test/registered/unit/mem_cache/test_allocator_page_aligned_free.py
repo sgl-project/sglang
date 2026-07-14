@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -7,6 +8,7 @@ import torch
 import sglang
 import sglang.srt.mem_cache.allocator.base as allocator_base
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -127,6 +129,54 @@ class TestAllocatorPageAlignedFree(unittest.TestCase):
             "torch.unique(free_index.cpu() // self.page_size)",
             source,
         )
+
+    def test_pure_swa_group_defers_sentinel_normalization(self) -> None:
+        """PureSWA groups raw fragments and normalizes sentinels once at merge."""
+        allocator = object.__new__(PureSWATokenToKVPoolAllocator)
+        allocator.page_size = 1
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator.swa_attn_allocator = mock.Mock(size=8)
+        allocator.swa_attn_allocator.available_size.return_value = 8
+        first_fragment = torch.tensor([0, 1, -1, 0], dtype=torch.int64)
+        second_fragment = torch.tensor([2, 0, 3, -1], dtype=torch.int64)
+
+        allocator.free_group_begin()
+        with mock.patch.object(allocator_base, "_DEBUG_MEMORY_POOL", True):
+            allocator.free(first_fragment)
+            allocator.free(second_fragment)
+
+            self.assertIs(allocator.free_group[0], first_fragment)
+            self.assertIs(allocator.free_group[1], second_fragment)
+            allocator.free_group_end()
+
+        allocator.swa_attn_allocator.free.assert_called_once()
+        released = allocator.swa_attn_allocator.free.call_args.args[0]
+        self.assertEqual(released.tolist(), [1, 2, 3])
+        source = inspect.getsource(PureSWATokenToKVPoolAllocator.free)
+        self.assertEqual(source.count("free_index[free_index > 0]"), 1)
+        self.assertLess(
+            source.index("self.free_group.append(free_index)"),
+            source.index("sanitized_free_index ="),
+        )
+
+    def test_pure_swa_debug_rejects_duplicate_positive_tokens(self) -> None:
+        """PureSWA debug validation ignores sentinels but rejects positive reuse."""
+        allocator = object.__new__(PureSWATokenToKVPoolAllocator)
+        allocator.page_size = 1
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator.swa_attn_allocator = mock.Mock(size=8)
+        allocator.swa_attn_allocator.available_size.return_value = 8
+        free_index = torch.tensor([0, 4, -1, 0, 4], dtype=torch.int64)
+
+        with (
+            mock.patch.object(allocator_base, "_DEBUG_MEMORY_POOL", True),
+            self.assertRaisesRegex(RuntimeError, "unique, aligned"),
+        ):
+            allocator.free(free_index)
+
+        allocator.swa_attn_allocator.free.assert_not_called()
 
 
 if __name__ == "__main__":
