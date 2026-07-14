@@ -163,6 +163,10 @@ class CommonKVManager(BaseKVManager):
             or hybrid_decode_pulls_all_ranks
         )
 
+        self.enable_cp_ranks_follow_bootstrap_for_transfer = (
+            envs.SGLANG_DISAGGREGATION_CP_RANKS_TRANSFER_FOLLOW_BOOTSTRAP_POLICY.get()
+        )
+
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
@@ -180,11 +184,11 @@ class CommonKVManager(BaseKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
-            self.is_dummy_cp_rank = (
-                not self.enable_all_cp_ranks_for_transfer
-                and self.attn_cp_size > 1
-                and self.attn_cp_rank != 0
-            )
+            # self.is_dummy_cp_rank = (
+            #     not self.enable_all_cp_ranks_for_transfer
+            #     and self.attn_cp_size > 1
+            #     and self.attn_cp_rank != 0
+            # )
             # Sync the leader's bootstrap port to every rank before
             # registering: in multi-node prefill, registration targets
             # `dist_init_addr` (rank 0) but each rank's local port may
@@ -238,6 +242,16 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+        
+    def is_dummy_cp_rank(self, bootstrap_room: int) -> bool:
+        if self.enable_all_cp_ranks_for_transfer or self.attn_cp_size == 1:
+            return False
+        if self.enable_cp_ranks_follow_bootstrap_for_transfer:
+            send_cp_rank = bootstrap_room % self.attn_cp_size
+            return send_cp_rank != self.attn_cp_rank
+        else:
+            # default cp_ranke
+            return self.attn_cp_rank != 0
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -513,8 +527,11 @@ class CommonKVManager(BaseKVManager):
                 or info.enable_dsa_cache_layer_split
             )
             if not pull_from_all_cp_ranks:
-                # Only retrieve from prefill CP rank 0 when not using all ranks
-                target_cp_ranks = target_cp_ranks[:1]
+                if self.enable_cp_ranks_follow_bootstrap_for_transfer:
+                    target_cp_ranks = None  
+                else:
+                    # Only retrieve from prefill CP rank 0 when not using all ranks
+                    target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
@@ -970,7 +987,7 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
-        if self.kv_mgr.is_dummy_cp_rank:
+        if self.kv_mgr.is_dummy_cp_rank(self.bootstrap_room):
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
@@ -1072,7 +1089,7 @@ class CommonKVSender(BaseKVSender):
                 index_slice,
                 total_pages=self.num_kv_indices,
             )
-        elif self.kv_mgr.is_dummy_cp_rank:
+        elif self.kv_mgr.is_dummy_cp_rank(self.bootstrap_room):
             if not is_last_chunk:
                 return kv_indices, index_slice, is_last_chunk, True
             else:
@@ -1166,6 +1183,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
         self.target_cp_ranks = self.prefill_info.target_cp_ranks
+        if self.target_cp_ranks is None:
+            self.target_cp_ranks = [self.bootstrap_room % self.prefill_info.attn_cp_size]
         self.target_pp_ranks = self.prefill_info.target_pp_ranks
         self.required_dst_info_num = self.prefill_info.required_dst_info_num
         self.required_prefill_response_num = (
