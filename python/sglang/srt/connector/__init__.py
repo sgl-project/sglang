@@ -8,6 +8,7 @@ from sglang.srt.connector.base_connector import (
     BaseFileConnector,
     BaseKVConnector,
 )
+from sglang.srt.connector.mooncake_store import MooncakeStoreConnector
 from sglang.srt.connector.redis import RedisConnector
 from sglang.srt.connector.remote_instance import RemoteInstanceConnector
 from sglang.srt.connector.s3 import S3Connector
@@ -41,6 +42,8 @@ def create_remote_connector(url, device=None, **kwargs) -> BaseConnector:
         return S3Connector(url)
     elif connector_type == "instance":
         return RemoteInstanceConnector(url, device)
+    elif connector_type == "mooncake":
+        return MooncakeStoreConnector(url)
     elif _is_azure_blob_url(url, connector_type):
         # Imported lazily so the optional ``blobfile`` dependency is only
         # required when an Azure URL is actually used.
@@ -69,6 +72,7 @@ __all__ = [
     "RedisConnector",
     "RemoteInstanceConnector",
     "S3Connector",
+    "MooncakeStoreConnector",
     "ConnectorType",
     "create_remote_connector",
     "get_connector_type",

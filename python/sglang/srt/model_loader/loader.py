@@ -70,7 +70,7 @@ from sglang.srt.connector import (
     create_remote_connector,
     get_connector_type,
 )
-from sglang.srt.connector.utils import parse_model_name
+from sglang.srt.connector.utils import COMMON_REMOTE_MODEL_FILES, parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
@@ -2464,16 +2464,38 @@ class RemoteModelLoader(BaseModelLoader):
             model_name = parse_model_name(url)
             rank = get_parallel().tp_rank
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-            for key, tensor in state_dict.items():
-                r_key = f"{model_name}/keys/rank_{rank}/{key}"
-                client.set(r_key, tensor)
+
+            if hasattr(client, "batch_put_from"):
+                # TODO: make it configurable
+                SAVE_MODEL_DEFAULT_BATCH_SIZE = 256
+                batchify_r_keys = []
+                batchify_tensors = []
+                for key, tensor in state_dict.items():
+                    r_key = f"{model_name}/keys/rank_{rank}/{key}"
+                    batchify_r_keys.append(r_key)
+                    batchify_tensors.append(tensor)
+                    if len(batchify_r_keys) == SAVE_MODEL_DEFAULT_BATCH_SIZE:
+                        client.batch_put_from(batchify_r_keys, batchify_tensors)
+                        batchify_r_keys.clear()
+                        batchify_tensors.clear()
+
+                if batchify_r_keys:
+                    client.batch_put_from(batchify_r_keys, batchify_tensors)
+
+            else:
+                for key, tensor in state_dict.items():
+                    r_key = f"{model_name}/keys/rank_{rank}/{key}"
+                    client.set(r_key, tensor)
 
             for root, _, files in os.walk(model_path):
                 for file_name in files:
                     # ignore hidden files
                     if file_name.startswith("."):
                         continue
-                    if os.path.splitext(file_name)[1] in (".json", ".py"):
+                    if (
+                        os.path.splitext(file_name)[1] in (".json", ".py")
+                        or file_name in COMMON_REMOTE_MODEL_FILES
+                    ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
@@ -2487,28 +2509,46 @@ class RemoteModelLoader(BaseModelLoader):
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module)
-        weights_iterator = self._get_weights_iterator_kv(client)
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-        for key, tensor in weights_iterator:
-            # If loading with LoRA enabled, additional padding may
-            # be added to certain parameters. We only load into a
-            # narrowed view of the parameter data.
-            param_data = state_dict[key].data
-            param_shape = state_dict[key].shape
-            for dim, size in enumerate(tensor.shape):
-                if size < param_shape[dim]:
-                    param_data = param_data.narrow(dim, 0, size)
-            if tensor.shape != param_shape:
-                logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
-                    tensor.shape,
-                    key,
-                    param_shape,
-                )
-            param_data.copy_(tensor)
-            state_dict.pop(key)
-        if state_dict:
-            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        if hasattr(client, "batch_get_into"):
+            LOAD_MODEL_DEFAULT_BATCH_SIZE = 256
+            rank = get_tensor_model_parallel_rank()
+            batchify_r_keys = []
+            batchify_tensors = []
+            for key, tensor in state_dict.items():
+                r_key = f"keys/rank_{rank}/{key}"
+                batchify_r_keys.append(r_key)
+                batchify_tensors.append(tensor)
+                if len(batchify_r_keys) == LOAD_MODEL_DEFAULT_BATCH_SIZE:
+                    client.batch_get_into(batchify_r_keys, batchify_tensors)
+                    batchify_r_keys.clear()
+                    batchify_tensors.clear()
+
+            if batchify_r_keys:
+                client.batch_get_into(batchify_r_keys, batchify_tensors)
+        else:
+            weights_iterator = self._get_weights_iterator_kv(client)
+            for key, tensor in weights_iterator:
+                # If loading with LoRA enabled, additional padding may
+                # be added to certain parameters. We only load into a
+                # narrowed view of the parameter data.
+                param_data = state_dict[key].data
+                param_shape = state_dict[key].shape
+                for dim, size in enumerate(tensor.shape):
+                    if size < param_shape[dim]:
+                        param_data = param_data.narrow(dim, 0, size)
+                if tensor.shape != param_shape:
+                    logger.warning(
+                        "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                        tensor.shape,
+                        key,
+                        param_shape,
+                    )
+                param_data.copy_(tensor)
+                state_dict.pop(key)
+            if state_dict:
+                raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
         _post_load_weights(model)
 
