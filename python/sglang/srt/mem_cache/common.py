@@ -149,7 +149,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
-    tree_cache.cache_finished_req(
+    allocated_end = req.kv.kv_allocated_len
+    allocator_page = tree_cache.token_to_kv_pool_allocator.page_size
+    result = tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
@@ -161,8 +163,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None and req.kv is None:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    _release_overallocated_kv_indices(
+        req=req,
+        tree_cache=tree_cache,
+        effective_committed_len=effective_kv_committed_len,
+        unhandled_kv_start=result.unhandled_kv_start,
+        allocated_end=allocated_end,
+        allocator_page=allocator_page,
+    )
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
@@ -179,32 +187,54 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 
 def _release_overallocated_kv_indices(
-    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+    req: Req,
+    tree_cache: BasePrefixCache,
+    effective_committed_len: int,
+    unhandled_kv_start: int,
+    allocated_end: int,
+    allocator_page: int,
 ) -> None:
     global_server_args = get_server_args()
-    alloc_page_size = tree_cache.token_to_kv_pool_allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
+
+    assert 0 <= effective_committed_len <= allocated_end, (
+        f"Unexpected KV cache lengths, {effective_committed_len=}, "
+        f"{allocated_end=}"
+    )
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         if _is_npu:
-            assert start_p == end_p, (
+            assert effective_committed_len == allocated_end, (
                 f"Unexpected overallocated KV cache, {req.kv_committed_len=}, "
                 f"{req.kv.kv_allocated_len=}"
             )
         else:
-            assert start_p <= end_p <= ceil_align(start_p, alloc_page_size), (
+            assert effective_committed_len <= allocated_end <= ceil_align(
+                effective_committed_len, allocator_page
+            ), (
                 f"Unexpected overallocated KV cache, {req.kv_committed_len=}, "
                 f"{req.kv.kv_allocated_len=}"
             )
 
-    if alloc_page_size > 1:
-        start_p = ceil_align(start_p, alloc_page_size)
+    assert 0 <= unhandled_kv_start <= effective_committed_len, (
+        f"unhandled_kv_start out of range, {unhandled_kv_start=}, "
+        f"{effective_committed_len=}"
+    )
+    assert unhandled_kv_start % allocator_page == 0, (
+        f"unhandled_kv_start must be allocator-page aligned, "
+        f"{unhandled_kv_start=}, {allocator_page=}"
+    )
+    if not tree_cache.is_chunk_cache():
+        assert req.cache_protected_len <= unhandled_kv_start, (
+            f"unhandled_kv_start precedes protected KV, {unhandled_kv_start=}, "
+            f"{req.cache_protected_len=}"
+        )
 
-    if start_p < end_p:
+    if unhandled_kv_start < allocated_end:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
+            unhandled_kv_start:allocated_end
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 

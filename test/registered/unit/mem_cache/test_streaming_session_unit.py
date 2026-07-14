@@ -140,9 +140,10 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
     req.finished_reason = FINISH_ABORT("input too long")
 
-    tree_cache.cache_finished_req(req)
+    result = tree_cache.cache_finished_req(req)
 
     # Slot must NOT be created.
+    assert result.unhandled_kv_start == 0
     assert "session-a" not in tree_cache.slots
     # Transient pool slot freed.
     assert req.req_pool_idx is None
@@ -175,9 +176,10 @@ def test_nth_mid_abort_nukes_session_slot():
     req = _FakeReq("session-a", req_pool_idx=0, committed=60, allocated=65)
     req.finished_reason = FINISH_ABORT("client disconnected")
 
-    tree_cache.cache_finished_req(req)
+    result = tree_cache.cache_finished_req(req)
 
     # Slot wiped — deleted from slots dict.
+    assert result.unhandled_kv_start == 0
     assert "session-a" not in tree_cache.slots
     # All KV freed: [0, 65) from release_session (slot extended to req's allocated).
     assert len(allocator.freed) == 1

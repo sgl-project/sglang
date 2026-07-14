@@ -199,7 +199,7 @@ Unlock a previously locked node path.
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int)`
+### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int) → CacheFinishedReqResult`
 
 Cache a completed request's KV data into the tree.
 
@@ -207,17 +207,18 @@ Cache a completed request's KV data into the tree.
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
 | **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
-| **Output** | `None` |
-| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
+| **Output** | `CacheFinishedReqResult(unhandled_kv_start)` — the allocator-page-aligned boundary from which the caller owns KV release |
+| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. The tree owns the inserted prefix; the caller releases the contiguous suffix starting at `unhandled_kv_start`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
 1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: sets `swa_evicted_seqlen`; Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen` as truncation hint)
-2. Truncates if `effective_cache_len < len(token_ids)`: frees excess pool indices
+2. Truncates the insert view if `effective_cache_len < len(token_ids)` without releasing the suffix in the backend
 3. Converts token IDs (bigram if EAGLE), page-aligns keys, then calls `insert()`
-4. Frees unaligned tail KV indices beyond page boundary
+4. Computes `unhandled_kv_start = max(page_aligned_key_length, req.cache_protected_len)` for inserts, or `req.cache_protected_len` for non-inserts
 5. Calls `dec_lock_ref()` on the previous `req.last_node`
 6. `cleanup_after_caching_req()` per component (Mamba: frees forked mamba_value based on `mamba_exist`, handles ping-pong buffer cleanup)
+7. Returns the ownership boundary; `release_kv_cache` releases `[unhandled_kv_start, kv_allocated_len)` exactly once
 
 ---
 

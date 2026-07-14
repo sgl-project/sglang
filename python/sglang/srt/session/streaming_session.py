@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -374,10 +375,12 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.match_prefix(params)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, **kwargs
+    ) -> CacheFinishedReqResult:
         if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return
-        self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
+            return CacheFinishedReqResult(unhandled_kv_start=0)
+        return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if self.try_cache_unfinished_req(req, **kwargs):

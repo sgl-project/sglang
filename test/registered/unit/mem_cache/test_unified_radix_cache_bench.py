@@ -651,13 +651,22 @@ def bench_cache_finished(
     if not req_items:
         return BenchResult("cache_finished", 0, 0, 0, [])
 
+    def finish_req(req):
+        result = env.tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+        )
+        if result.unhandled_kv_start < req.kv_committed_len:
+            env.alloc.free(
+                env.rtp.req_to_token[req.req_pool_idx][
+                    result.unhandled_kv_start : req.kv_committed_len
+                ]
+            )
+
     warmup = min(20, len(req_items) // 10)
     return bench_api(
         "cache_finished",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
-        ),
+        finish_req,
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,

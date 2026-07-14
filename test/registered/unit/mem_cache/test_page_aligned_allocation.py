@@ -296,18 +296,21 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
     def test_release_accepts_only_the_committed_partial_page(self) -> None:
         """Release permits over-allocation only through the committed page."""
+        free = mock.Mock()
         tree_cache = SimpleNamespace(
             token_to_kv_pool_allocator=SimpleNamespace(
                 page_size=4,
-                free=lambda _: None,
+                free=free,
             ),
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(16, dtype=torch.int32).reshape(1, 16)
             ),
+            is_chunk_cache=lambda: False,
         )
         req = SimpleNamespace(
             req_pool_idx=0,
             kv_committed_len=5,
+            cache_protected_len=4,
             kv=SimpleNamespace(kv_allocated_len=8),
         )
         server_args = SimpleNamespace(
@@ -325,18 +328,114 @@ class TestPageAlignedAllocation(unittest.TestCase):
             ),
         ):
             mem_cache_common._release_overallocated_kv_indices(
-                req,
-                5,
-                8,
-                tree_cache,
+                req=req,
+                tree_cache=tree_cache,
+                effective_committed_len=5,
+                unhandled_kv_start=4,
+                allocated_end=8,
+                allocator_page=4,
             )
             with self.assertRaisesRegex(AssertionError, "Unexpected overallocated"):
                 mem_cache_common._release_overallocated_kv_indices(
-                    req,
-                    5,
-                    9,
-                    tree_cache,
+                    req=req,
+                    tree_cache=tree_cache,
+                    effective_committed_len=5,
+                    unhandled_kv_start=4,
+                    allocated_end=9,
+                    allocator_page=4,
                 )
+
+        free.assert_called_once()
+        self.assertEqual(free.call_args.args[0].tolist(), [4, 5, 6, 7])
+
+    def test_release_rejects_invalid_handoff_before_caller_free(self) -> None:
+        """Release rejects malformed cache ownership before freeing its suffix."""
+        free = mock.Mock()
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=4, free=free),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(16, dtype=torch.int32).reshape(1, 16)
+            ),
+            is_chunk_cache=lambda: False,
+        )
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            kv_committed_len=5,
+            cache_protected_len=4,
+            kv=SimpleNamespace(kv_allocated_len=8),
+        )
+        server_args = SimpleNamespace(
+            speculative_algorithm=None,
+            strip_thinking_cache=False,
+        )
+
+        invalid_handoffs: list[tuple[int, str]] = [
+            (3, "allocator-page aligned"),
+            (8, "out of range"),
+            (0, "precedes protected KV"),
+        ]
+        for unhandled_kv_start, error_pattern in invalid_handoffs:
+            with (
+                self.subTest(unhandled_kv_start=unhandled_kv_start),
+                mock.patch.object(mem_cache_common, "_is_npu", False),
+                mock.patch.object(
+                    mem_cache_common,
+                    "get_server_args",
+                    return_value=server_args,
+                ),
+                self.assertRaisesRegex(AssertionError, error_pattern),
+            ):
+                mem_cache_common._release_overallocated_kv_indices(
+                    req=req,
+                    tree_cache=tree_cache,
+                    effective_committed_len=5,
+                    unhandled_kv_start=unhandled_kv_start,
+                    allocated_end=8,
+                    allocator_page=4,
+                )
+
+        free.assert_not_called()
+
+    def test_release_allows_chunk_cache_zero_handoff(self) -> None:
+        """ChunkCache may hand the entire allocation back to the caller."""
+        free = mock.Mock()
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=4, free=free),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(16, dtype=torch.int32).reshape(1, 16)
+            ),
+            is_chunk_cache=lambda: True,
+        )
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            kv_committed_len=5,
+            cache_protected_len=4,
+            kv=SimpleNamespace(kv_allocated_len=8),
+        )
+        server_args = SimpleNamespace(
+            speculative_algorithm=None,
+            strip_thinking_cache=False,
+        )
+
+        with (
+            mock.patch.object(mem_cache_common, "_is_npu", False),
+            mock.patch.object(
+                mem_cache_common,
+                "get_server_args",
+                return_value=server_args,
+            ),
+        ):
+            mem_cache_common._release_overallocated_kv_indices(
+                req=req,
+                tree_cache=tree_cache,
+                effective_committed_len=5,
+                unhandled_kv_start=0,
+                allocated_end=8,
+                allocator_page=4,
+            )
+
+        free.assert_called_once()
+        self.assertEqual(free.call_args.args[0].tolist(), list(range(8)))
 
 
 def _make_batch(allocated_lens: list[int]) -> SimpleNamespace:

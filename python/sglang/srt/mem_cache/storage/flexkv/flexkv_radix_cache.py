@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -380,14 +381,14 @@ class FlexKVRadixCache(RadixCache):
 
     def cache_finished_req(  # type: ignore[override]
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """Base cache_finished_req then fire an async FlexKV store."""
-        super().cache_finished_req(
+        result = super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         if not is_insert:
             self._load_markers.pop(req.rid, None)
-            return
+            return result
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
         from sglang.srt.runtime_context import get_server_args
@@ -404,7 +405,7 @@ class FlexKVRadixCache(RadixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:
-            return
+            return result
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
@@ -416,7 +417,7 @@ class FlexKVRadixCache(RadixCache):
         )
         new_last_node = match_result.last_device_node
         if new_last_node is None:
-            return
+            return result
 
         self.inc_lock_ref(new_last_node)
         try:
@@ -434,10 +435,12 @@ class FlexKVRadixCache(RadixCache):
             # Nothing to write back (either everything already in
             # FlexKV, or put_match failed / returned None).
             self.dec_lock_ref(new_last_node)
-            return
+            return result
 
         with self._node_lock:
             self._inflight_store_nodes[req.rid] = new_last_node
+
+        return result
 
     # ------------------------------------------------------------------
     # evict + completion draining

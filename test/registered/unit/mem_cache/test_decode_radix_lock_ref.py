@@ -46,6 +46,7 @@ def _make_cache_with_pools(page_size=1):
     """Create a RadixCache with mock pools sufficient for cache_unfinished/finished_req."""
     mock_allocator = MagicMock()
     mock_allocator.device = torch.device("cpu")
+    mock_allocator.page_size = page_size
 
     # req_to_token pool: stores kv indices per request slot
     max_seq_len = 64
@@ -144,12 +145,15 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+        finished_result = cache.cache_finished_req(
+            req, kv_len_to_handle=req.kv_committed_len
+        )
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
         self.assertEqual(cache.root_node.lock_ref, 1)
         self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(finished_result.unhandled_kv_start, len(full_ids))
         # The evictable size should equal total inserted tokens
         self.assertEqual(cache.evictable_size(), len(full_ids))
 

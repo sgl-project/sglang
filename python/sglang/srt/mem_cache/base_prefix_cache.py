@@ -13,6 +13,7 @@ from typing import (
     runtime_checkable,
 )
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -37,6 +38,10 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+class CacheFinishedReqResult(msgspec.Struct, frozen=True, kw_only=True):
+    unhandled_kv_start: int
 
 
 @dataclasses.dataclass
@@ -248,7 +253,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, **kwargs
+    ) -> CacheFinishedReqResult:
         pass
 
     @abstractmethod
