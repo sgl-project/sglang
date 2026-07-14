@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
@@ -80,6 +81,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -157,11 +159,26 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            # PREFIX_AFFINITY's overload guard compares per-rank load against the
+            # fleet average, so it needs the same fresh snapshots the load-aware
+            # methods rely on.
+            LoadBalanceMethod.PREFIX_AFFINITY,
+        )
+
+        # prefix_affinity routing config (only consulted when that method is active).
+        self._affinity_fallback = LoadBalanceMethod.from_str(
+            server_args.prefix_affinity_fallback
+        )
+        self._affinity_max_load_skew = server_args.prefix_affinity_max_load_skew
+        self._affinity_hash_tokens = server_args.prefix_affinity_hash_tokens
+        self._affinity_disable_token_fallback = (
+            server_args.prefix_affinity_disable_token_fallback
         )
 
         # Load balance budget
@@ -650,6 +667,136 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def prefix_affinity_scheduler(self, req: Req):
+        """Routing-key/session-affinity routing for single-instance DP attention.
+
+        Routes requests that share a routing key to the same DP rank so the radix
+        cache is reused, while a load guard prevents any one rank from becoming
+        a hotspot. The routing key is, in priority order:
+
+          1. ``req.routing_key`` (set by the caller, e.g. the ``x-smg-routing-key``
+             header) -- the intended per-agent/session/project affinity key.
+          2. a hash of the first N input tokens, as a fallback when no explicit
+             key is provided (disable-able via config).
+
+        Unlike a plain ``hash(key) % dp_size`` scheme, we use rendezvous (HRW)
+        hashing over the *live* ranks: when a rank drops or ``dp_size`` changes,
+        only the keys that mapped to the affected rank move, so everyone else
+        keeps their cache affinity. The load guard walks the HRW-ranked
+        candidates and picks the best rank that is not overloaded, preserving
+        affinity under load instead of collapsing onto a single rank.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        route_key = req.routing_key
+        if not route_key and not self._affinity_disable_token_fallback:
+            route_key = self._token_prefix_key(req, self._affinity_hash_tokens)
+
+        if not route_key:
+            # No usable key (e.g. empty input and no routing_key): defer to a
+            # pure load-balancing method rather than pinning arbitrarily.
+            self._affinity_fallback_dispatch(req)
+            return
+
+        live = self._live_ranks()
+        ranked = self._rendezvous_ranked(route_key, live)
+
+        if len(live) <= 1:
+            # A single live rank can never be "overloaded" relative to itself.
+            rank = ranked[0]
+            self._increment_rank_budget(rank, req)
+            sock_send(self.workers[rank], req)
+            return
+
+        # Compute the overload ceiling once per dispatch rather than on every
+        # candidate: a rank is skipped if its load exceeds ``max_load_skew``
+        # times the live-rank average load.
+        loads = [self._rank_load(r) for r in live]
+        threshold = self._affinity_max_load_skew * max(sum(loads) / len(loads), 1.0)
+        for rank in ranked:
+            if self._rank_load(rank) <= threshold:
+                self._increment_rank_budget(rank, req)
+                sock_send(self.workers[rank], req)
+                return
+
+        # Defensive: the least-loaded live rank can never exceed the skew
+        # threshold (its load is <= the average), so the loop above always
+        # dispatches. This guards the critical path against future changes to
+        # the overload heuristic so a request is never silently dropped.
+        self._affinity_fallback_dispatch(req)
+
+    def _affinity_fallback_dispatch(self, req: Req):
+        """Dispatch via the configured load-aware fallback method.
+
+        Reuses the existing schedulers so budget accounting and status handling
+        stay identical to those methods.
+        """
+        if self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
+            self.total_requests_scheduler(req)
+        elif self._affinity_fallback == LoadBalanceMethod.ROUND_ROBIN:
+            self.round_robin_scheduler(req)
+        else:
+            self.total_tokens_scheduler(req)
+
+    def _live_ranks(self) -> List[int]:
+        """Ranks currently marked active; fall back to all ranks if none are."""
+        ranks = [i for i in range(len(self.workers)) if self.status[i]]
+        return ranks or list(range(len(self.workers)))
+
+    @staticmethod
+    def _hash64(data: bytes) -> int:
+        return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
+
+    def _rendezvous_ranked(self, key: str, ranks: List[int]) -> List[int]:
+        """Rendezvous (HRW) order of ``ranks`` for ``key``, best score first."""
+        key_b = key.encode("utf-8", errors="surrogatepass")
+        scores = {
+            rank: self._hash64(key_b + b"\x00" + str(rank).encode("ascii"))
+            for rank in ranks
+        }
+        return sorted(ranks, key=scores.__getitem__, reverse=True)
+
+    @staticmethod
+    def _token_prefix_key(req: Req, prefix_len: int) -> Optional[str]:
+        """Stable key from the first ``prefix_len`` input tokens (or None)."""
+        if prefix_len <= 0:
+            return None
+        input_ids = getattr(req, "input_ids", None)
+        if not input_ids:
+            return None
+        h = hashlib.blake2b(digest_size=16)
+        sliced = input_ids[:prefix_len]
+        tobytes = getattr(sliced, "tobytes", None)
+        if callable(tobytes):
+            # Fast path for array-like input_ids (e.g. numpy arrays): hash the
+            # raw buffer in one shot instead of per-token int conversions.
+            h.update(tobytes())
+        else:
+            for token in sliced:
+                h.update(int(token).to_bytes(8, "little", signed=True))
+        return "token-prefix:" + h.hexdigest()
+
+    @staticmethod
+    def _estimated_tokens(req: Req) -> int:
+        input_ids = getattr(req, "input_ids", None)
+        return len(input_ids) if input_ids else 0
+
+    def _increment_rank_budget(self, rank: int, req: Req):
+        """Speculatively record the dispatch, mirroring ``DPBudget.dispatch``.
+
+        The affinity scheduler picks the rank itself instead of going through
+        ``DPBudget.dispatch``, so it must apply the same +1 request / +tokens
+        increment to keep the load estimate accurate between snapshot refreshes.
+        """
+        self.dp_budget.total_requests[rank] += 1
+        self.dp_budget.total_tokens[rank] += self._estimated_tokens(req)
+
+    def _rank_load(self, rank: int) -> float:
+        if self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
+            return float(self.dp_budget.total_requests[rank])
+        return float(self.dp_budget.total_tokens[rank])
 
     def event_loop(self):
         while True:

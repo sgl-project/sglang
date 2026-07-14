@@ -912,9 +912,37 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when it cannot honor "
+                "affinity (no routing key, or all live ranks over the load-skew "
+                "threshold)."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
+        "this multiple of the average load across live ranks, at which point routing "
+        "skips it to keep load balanced. Must be >= 1.0.",
+    ] = 1.5
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed for the "
+        "token-prefix fallback key when a request has no routing key.",
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
+        "without an explicit routing key go straight to the fallback load-balance method.",
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
@@ -3088,6 +3116,15 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+        if (
+            self.load_balance_method == "prefix_affinity"
+            and self.prefix_affinity_max_load_skew < 1.0
+        ):
+            raise ValueError(
+                "--prefix-affinity-max-load-skew must be >= 1.0, got "
+                f"{self.prefix_affinity_max_load_skew}"
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""

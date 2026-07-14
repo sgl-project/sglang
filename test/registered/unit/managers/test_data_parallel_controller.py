@@ -278,5 +278,196 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
         ctl.workers[2].send_pyobj.assert_called_once()
 
 
+# ==== prefix_affinity tests (feat/dp-prefix-affinity) ====
+#
+# Same fixture philosophy as above: bypass __init__ via __new__ and inject only
+# what prefix_affinity_scheduler reads. Beyond the base attrs it also reads the
+# four _affinity_* config attrs and req.routing_key, so _make_affinity_controller
+# and _areq add those. Update them if the scheduler starts reading more.
+
+
+def _make_affinity_controller(
+    dp_size: int,
+    fallback: str = "total_tokens",
+    max_load_skew: float = 1.5,
+    hash_tokens: int = 4096,
+    disable_token_fallback: bool = False,
+) -> DataParallelController:
+    ctl = _make_controller(dp_size)
+    ctl._affinity_fallback = LoadBalanceMethod.from_str(fallback)
+    ctl._affinity_max_load_skew = max_load_skew
+    ctl._affinity_hash_tokens = hash_tokens
+    ctl._affinity_disable_token_fallback = disable_token_fallback
+    return ctl
+
+
+def _areq(routing_key=None, input_ids=None, routed_dp_rank=None):
+    """Req stand-in that also carries routing_key (read by prefix_affinity)."""
+    return SimpleNamespace(
+        routed_dp_rank=routed_dp_rank,
+        bootstrap_room=None,
+        input_ids=input_ids or [],
+        routing_key=routing_key,
+    )
+
+
+def _dispatched_rank(ctl) -> int:
+    """Index of the single worker whose send_pyobj was called once."""
+    called = [i for i, w in enumerate(ctl.workers) if w.send_pyobj.call_count == 1]
+    assert len(called) == 1, f"expected exactly one dispatch, got {called}"
+    return called[0]
+
+
+class TestPrefixAffinityRoutingKey(CustomTestCase):
+    def test_same_routing_key_pins_to_same_rank(self):
+        """Cache-affinity: identical routing_key must always co-locate."""
+        ctl = _make_affinity_controller(dp_size=8)
+        ranks = set()
+        for _ in range(20):
+            c = _make_affinity_controller(dp_size=8)
+            c.prefix_affinity_scheduler(_areq(routing_key="session-A"))
+            ranks.add(_dispatched_rank(c))
+        self.assertEqual(len(ranks), 1, "same routing_key must be deterministic")
+
+    def test_distinct_routing_keys_spread_across_ranks(self):
+        """The headline fix: many sessions sharing a giant prefix but with
+        distinct routing_keys must spread across ranks, NOT collapse to one
+        (the failure mode of first-N-token hashing in #26612)."""
+        ctl = _make_affinity_controller(dp_size=8)
+        shared_prefix = list(range(8192))  # identical huge system prompt
+        used = set()
+        for i in range(256):
+            ctl.prefix_affinity_scheduler(
+                _areq(routing_key=f"session-{i}", input_ids=shared_prefix)
+            )
+            # find which worker got THIS req (cumulative counts)
+        used = {i for i, w in enumerate(ctl.workers) if w.send_pyobj.call_count > 0}
+        self.assertEqual(
+            used, set(range(8)), "distinct routing_keys must cover all live ranks"
+        )
+
+    def test_identical_key_under_load_spills_instead_of_hotspotting(self):
+        """The overload guard's reason for existing: even when every request
+        maps to the SAME key (here via the token-prefix fallback, no
+        routing_key), accumulating load on the preferred rank makes the guard
+        spill subsequent requests to other ranks instead of hotspotting one --
+        the concurrency failure mode of plain hash routing (#26612)."""
+        ctl = _make_affinity_controller(dp_size=8)
+        shared_prefix = list(range(8192))
+        for _ in range(64):
+            ctl.prefix_affinity_scheduler(_areq(input_ids=shared_prefix))
+        used = {i for i, w in enumerate(ctl.workers) if w.send_pyobj.call_count > 0}
+        self.assertGreater(
+            len(used), 1, "overload guard must spill a hot shared key across ranks"
+        )
+        # ...but the first request (no load yet) lands on the HRW-preferred rank,
+        # so affinity still holds at low load.
+        fresh = _make_affinity_controller(dp_size=8)
+        fresh.prefix_affinity_scheduler(_areq(input_ids=shared_prefix))
+        preferred = ctl._rendezvous_ranked(
+            ctl._token_prefix_key(_areq(input_ids=shared_prefix), 4096), list(range(8))
+        )[0]
+        self.assertEqual(_dispatched_rank(fresh), preferred)
+
+
+class TestPrefixAffinityHRWStability(CustomTestCase):
+    def test_dropping_a_rank_only_moves_its_keys(self):
+        """Rendezvous hashing invariant: taking one rank offline must not
+        remap keys that were not on it (unlike hash % dp_size)."""
+        keys = [f"session-{i}" for i in range(500)]
+
+        full = _make_affinity_controller(dp_size=8)
+        before = {}
+        for k in keys:
+            c = _make_affinity_controller(dp_size=8)
+            c.prefix_affinity_scheduler(_areq(routing_key=k))
+            before[k] = _dispatched_rank(c)
+
+        dropped = 3
+        after = {}
+        for k in keys:
+            c = _make_affinity_controller(dp_size=8)
+            c.status[dropped] = False
+            c.prefix_affinity_scheduler(_areq(routing_key=k))
+            after[k] = _dispatched_rank(c)
+
+        for k in keys:
+            if before[k] != dropped:
+                self.assertEqual(
+                    after[k], before[k], f"key {k} moved but its rank was up"
+                )
+            else:
+                self.assertNotEqual(after[k], dropped, "dropped rank still used")
+
+
+class TestPrefixAffinityOverloadGuard(CustomTestCase):
+    def test_overloaded_preferred_rank_spills_to_next_candidate(self):
+        """When the HRW-preferred rank is over the load-skew threshold, the
+        request must go to the next-best rank, not hotspot the preferred one."""
+        ctl = _make_affinity_controller(dp_size=4, max_load_skew=1.5)
+        key = "session-hot"
+        order = ctl._rendezvous_ranked(key, [0, 1, 2, 3])
+        preferred = order[0]
+        # Make only the preferred rank overloaded (>1.5x average).
+        loads = [0, 0, 0, 0]
+        loads[preferred] = 100
+        ctl.dp_budget.total_tokens = list(loads)
+        ctl.dp_budget.total_requests = [0, 0, 0, 0]
+
+        ctl.prefix_affinity_scheduler(_areq(routing_key=key, input_ids=[1, 2, 3]))
+
+        ctl.workers[preferred].send_pyobj.assert_not_called()
+        chosen = _dispatched_rank(ctl)
+        self.assertEqual(chosen, order[1], "should spill to the next HRW candidate")
+        self.assertEqual(
+            ctl.dp_budget.total_requests[chosen], 1, "budget must record the dispatch"
+        )
+
+    def test_single_live_rank_is_never_overloaded(self):
+        """Overload guard must not deadlock when only one rank is live."""
+        ctl = _make_affinity_controller(dp_size=4)
+        for r in (1, 2, 3):
+            ctl.status[r] = False
+        ctl.dp_budget.total_tokens = [10_000, 0, 0, 0]
+        ctl.prefix_affinity_scheduler(_areq(routing_key="k", input_ids=[1]))
+        ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestPrefixAffinityFallback(CustomTestCase):
+    def test_token_prefix_fallback_is_deterministic(self):
+        """No routing_key but token fallback enabled: identical leading tokens
+        must co-locate."""
+        prefix = list(range(4096))
+        ranks = set()
+        for _ in range(10):
+            c = _make_affinity_controller(dp_size=8)
+            c.prefix_affinity_scheduler(_areq(input_ids=prefix))
+            ranks.add(_dispatched_rank(c))
+        self.assertEqual(len(ranks), 1)
+
+    def test_keyless_with_token_fallback_disabled_uses_load_balancer(self):
+        """No key + token fallback disabled -> defer to the load-aware fallback
+        (total_tokens picks the least-loaded rank) rather than pinning."""
+        ctl = _make_affinity_controller(
+            dp_size=4, fallback="total_tokens", disable_token_fallback=True
+        )
+        ctl.dp_budget.total_tokens = [5, 1, 3, 4]
+        ctl.dp_budget.total_requests = [0, 0, 0, 0]
+        ctl.prefix_affinity_scheduler(_areq(input_ids=[]))
+        ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_external_routed_dp_rank_bypasses_affinity(self):
+        ctl = _make_affinity_controller(dp_size=4)
+        ctl.prefix_affinity_scheduler(
+            _areq(routed_dp_rank=2, routing_key="ignored", input_ids=[1, 2])
+        )
+        ctl.workers[2].send_pyobj.assert_called_once()
+        self.assertEqual(
+            ctl.dp_budget.total_requests,
+            [0, 0, 0, 0],
+            "external routing must not touch affinity budget",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
