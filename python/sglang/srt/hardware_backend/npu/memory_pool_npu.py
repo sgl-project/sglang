@@ -63,7 +63,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
-        post_capture_active: bool = False,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         super().__init__(
@@ -83,7 +82,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=enable_kv_cache_copy,
-            post_capture_active=post_capture_active,
         )
 
     def _create_buffers(self):
