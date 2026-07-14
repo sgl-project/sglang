@@ -370,16 +370,28 @@ class DSparkVerifyPlanner:
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not get_schedule().disable_overlap_schedule:
-            return draft_input.verify_token_budget
+            budget = draft_input.verify_token_budget
+        else:
+            budget = self.compute_budget_sync(
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_pool_indices,
+            )
+        budget = self._sync_verify_token_budget(budget)
+        draft_input.verify_token_budget = budget
+        return budget
 
-        # No collective: the budget derives only from the broadcast draft tokens
-        # (via confidence), replicated req_generation, and the static sps table.
-        draft_input.verify_token_budget = self.compute_budget_sync(
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=req_pool_indices,
+    def _sync_verify_token_budget(self, budget: Optional[int]) -> Optional[int]:
+        """Use TP0's budget to keep compact verify graph tiers identical."""
+        budget_tensor = torch.tensor(
+            [-1 if budget is None else budget], dtype=torch.int64
         )
-        return draft_input.verify_token_budget
+        self._tp_sync.sync_cpu(
+            SpecTpSyncSite.DSPARK_PLAN,
+            budget_tensor,
+        )
+        synced_budget = int(budget_tensor.item())
+        return None if synced_budget < 0 else synced_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
