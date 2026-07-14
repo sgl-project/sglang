@@ -110,10 +110,6 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
     @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
-
-    @property
     def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
         # NGRAM has no draft model; drafts come from the CPU-side corpus.
         return None
