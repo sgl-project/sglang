@@ -547,9 +547,7 @@ class CompressorBackendMixin:
                 layer_id=layer_id,
                 compressor=compressor,
                 kv_score_input=kv_score_input,
-                logical_forward_mode=getattr(
-                    forward_batch, "_original_forward_mode", None
-                )
+                logical_forward_mode=forward_batch._original_forward_mode
                 or forward_batch.forward_mode,
             )
 

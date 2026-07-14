@@ -560,8 +560,8 @@ class FlashInferAttnBackend(AttentionBackend):
         if precomputed_indices is None:
             return MultiItemScoringParams()
 
-        prefix_cache_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-        extend_seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        prefix_cache_lens = forward_batch.extend_prefix_lens_cpu
+        extend_seq_lens = forward_batch.extend_seq_lens_cpu
         prefix_len_ptr, token_pos_in_items_ptr = [], []
         token_pos_in_items_len = 0
         device = forward_batch.input_ids.device

@@ -49,7 +49,7 @@ class TboAttnBackend(AttentionBackend):
         )
         if not self._children_use_cuda_graph():
             return
-        tbo_children = getattr(forward_batch, "tbo_children", None)
+        tbo_children = forward_batch.tbo_children
         if tbo_children is not None:
             for child, forward_batch_child in zip(
                 self.children, tbo_children, strict=True
@@ -115,7 +115,7 @@ class TboAttnBackend(AttentionBackend):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
         if not self._children_use_cuda_graph():
             return
-        tbo_children = getattr(forward_batch, "tbo_children", None)
+        tbo_children = forward_batch.tbo_children
         if tbo_children is not None:
             for child, forward_batch_child in zip(
                 self.children, tbo_children, strict=True

@@ -93,10 +93,7 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
     if forward_batch.forward_mode.is_idle():
         return forward_batch.forward_mode
-    return (
-        getattr(forward_batch, "_original_forward_mode", None)
-        or forward_batch.forward_mode
-    )
+    return forward_batch._original_forward_mode or forward_batch.forward_mode
 
 
 def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
@@ -106,7 +103,7 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
     if actual_forward_mode.is_idle():
         return 0
 
-    spec_info = getattr(forward_batch, "spec_info", None)
+    spec_info = forward_batch.spec_info
     draft_token_num = getattr(spec_info, "draft_token_num", 0)
     draft_token = getattr(spec_info, "draft_token", None)
     if draft_token is None:
@@ -2030,14 +2027,14 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             actual_forward_mode=getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             ),
-            input_ids=getattr(forward_batch, "input_ids", None),
-            positions=getattr(forward_batch, "positions", None),
+            input_ids=forward_batch.input_ids,
+            positions=forward_batch.positions,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            out_cache_loc=forward_batch.out_cache_loc,
             spec_info=forward_batch.spec_info,
         )
         if in_capture:

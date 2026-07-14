@@ -213,7 +213,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
-        self.is_prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
+        self.is_prefill_aware_swa = model_runner.prefill_aware_swa
         if self.is_prefill_aware_swa:
             assert self.page_size == 1, (
                 "Prefill-aware SWA requires page_size=1, "
@@ -354,7 +354,7 @@ class FlashAttentionBackend(AttentionBackend):
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        out_cache_loc = forward_batch.out_cache_loc
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()

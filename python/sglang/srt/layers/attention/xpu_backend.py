@@ -1058,7 +1058,7 @@ class XPUAttentionBackend(AttentionBackend):
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 

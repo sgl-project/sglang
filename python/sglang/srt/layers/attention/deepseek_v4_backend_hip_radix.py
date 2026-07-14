@@ -1687,14 +1687,14 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
             actual_forward_mode=getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             ),
-            input_ids=getattr(forward_batch, "input_ids", None),
-            positions=getattr(forward_batch, "positions", None),
+            input_ids=forward_batch.input_ids,
+            positions=forward_batch.positions,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            out_cache_loc=forward_batch.out_cache_loc,
             spec_info=forward_batch.spec_info,
         )
         if in_capture:

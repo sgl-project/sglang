@@ -240,7 +240,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             k_pe=k_pe,
             cos_sin_cache=layer.rotary_emb.cos_sin_cache,
             positions=positions,
-            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+            is_neox=layer.rotary_emb.is_neox_style,
             qk_nope_head_dim=layer.qk_nope_head_dim,
             qk_rope_head_dim=layer.qk_rope_head_dim,
         )
