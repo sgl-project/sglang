@@ -2338,9 +2338,7 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            # Keep the framework-wide DSA top-k contract as [T, K]. Ascend
-            # sparse attention restores its required singleton N dimension at
-            # the operator boundary.
+            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices[0].squeeze(1)
 
     def do_npu_cp_balance_indexer(

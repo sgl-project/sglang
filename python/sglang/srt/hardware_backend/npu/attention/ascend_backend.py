@@ -45,7 +45,7 @@ FULL_ATTENTION_WINDOW = 2147483647
 
 
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
-    """Restore the singleton N dimension required by Ascend sparse attention."""
+    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
     if topk_indices.dim() == 2:
         return topk_indices.unsqueeze(-2)
     return topk_indices
