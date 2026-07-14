@@ -1203,10 +1203,15 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
-    allocator_page: int = tree_cache.token_to_kv_pool_allocator.page_size
+    allocator = tree_cache.token_to_kv_pool_allocator
+    allocator_page: int = allocator.page_size
+    uses_page_aligned_alloc: bool = (
+        not _is_npu
+        and allocator_page > 1
+        and allocator.supports_page_aligned_alloc
+    )
     allocation_nxt_kv_lens_cpu: torch.Tensor
     allocation_nxt_kv_lens: torch.Tensor
-    allocation_num_needed_tokens: int
     if not _is_npu and allocator_page > 1:
         allocation_nxt_kv_lens_cpu = (
             (nxt_kv_lens_cpu + allocator_page - 1) // allocator_page * allocator_page
@@ -1214,31 +1219,134 @@ def alloc_for_spec_decode(
         allocation_nxt_kv_lens = (
             (nxt_kv_lens + allocator_page - 1) // allocator_page * allocator_page
         )
-        allocation_num_needed_tokens = int(
-            (allocation_nxt_kv_lens_cpu - cur_kv_lens_cpu).sum().item()
-        )
     else:
         allocation_nxt_kv_lens_cpu = nxt_kv_lens_cpu
         allocation_nxt_kv_lens = nxt_kv_lens
-        allocation_num_needed_tokens = num_needed_tokens
 
-    if allocation_nxt_kv_lens_cpu.numel() > 0:
-        max_allocated_len: int = int(allocation_nxt_kv_lens_cpu.max().item())
-        row_width: int = req_to_token_pool.req_to_token.shape[1]
-        assert max_allocated_len <= row_width, (
-            f"spec decode allocation endpoint ({max_allocated_len}) exceeds "
-            f"req_to_token row width ({row_width}); page_size={allocator_page}"
+    req_to_token: torch.Tensor = req_to_token_pool.req_to_token
+    batch_size: int = len(reqs)
+    device_inputs: tuple[torch.Tensor, ...] = (
+        req_pool_indices,
+        cur_kv_lens,
+        allocation_nxt_kv_lens,
+    )
+    cpu_inputs: tuple[torch.Tensor, ...] = (
+        cur_kv_lens_cpu,
+        allocation_nxt_kv_lens_cpu,
+    )
+    all_inputs: tuple[torch.Tensor, ...] = device_inputs + cpu_inputs
+    supported_integer_dtypes: tuple[torch.dtype, ...] = (torch.int32, torch.int64)
+
+    assert req_to_token.ndim == 2, f"{req_to_token.shape=}"
+    assert req_to_token.dtype == torch.int32, f"{req_to_token.dtype=}"
+    assert req_to_token.is_contiguous(), f"{req_to_token.stride()=}"
+    assert all(tensor.ndim == 1 for tensor in all_inputs), (
+        f"shapes={[tensor.shape for tensor in all_inputs]}"
+    )
+    assert all(tensor.numel() == batch_size for tensor in all_inputs), (
+        f"{batch_size=}, numels={[tensor.numel() for tensor in all_inputs]}"
+    )
+    assert all(tensor.is_contiguous() for tensor in all_inputs), (
+        f"strides={[tensor.stride() for tensor in all_inputs]}"
+    )
+    assert all(tensor.device == req_to_token.device for tensor in device_inputs), (
+        f"{req_to_token.device=}, devices={[tensor.device for tensor in device_inputs]}"
+    )
+    assert all(
+        tensor.dtype in supported_integer_dtypes for tensor in device_inputs
+    ), f"dtypes={[tensor.dtype for tensor in device_inputs]}"
+    assert all(tensor.device.type == "cpu" for tensor in cpu_inputs), (
+        f"devices={[tensor.device for tensor in cpu_inputs]}"
+    )
+    assert all(tensor.dtype == torch.int32 for tensor in cpu_inputs), (
+        f"dtypes={[tensor.dtype for tensor in cpu_inputs]}"
+    )
+
+    row_count: int = req_to_token.shape[0]
+    row_width: int = req_to_token.shape[1]
+    allocation_nxt_kv_lens_values: list[int] = []
+    allocation_deltas: list[int] = []
+    for index, req in enumerate(reqs):
+        req_pool_idx: Optional[int] = req.req_pool_idx
+        assert req_pool_idx is not None
+        assert 1 <= req_pool_idx < row_count, (
+            f"{req_pool_idx=}, {row_count=}, {index=}"
+        )
+        assert req.kv is not None, f"missing kv allocation state for request {index}"
+        cur_kv_len: int = int(cur_kv_lens_cpu[index])
+        allocation_nxt_kv_len: int = int(allocation_nxt_kv_lens_cpu[index])
+        assert req.kv.kv_allocated_len == cur_kv_len, (
+            f"request {index} allocation watermark mismatch: "
+            f"host={req.kv.kv_allocated_len}, cpu_mirror={cur_kv_len}"
+        )
+        assert 0 <= cur_kv_len <= allocation_nxt_kv_len <= row_width, (
+            f"request {index} invalid spec allocation interval: "
+            f"{cur_kv_len=}, {allocation_nxt_kv_len=}, {row_width=}"
+        )
+        allocation_delta: int = allocation_nxt_kv_len - cur_kv_len
+        if uses_page_aligned_alloc:
+            assert cur_kv_len % allocator_page == 0, (
+                f"request {index} current watermark is not page-aligned: "
+                f"{cur_kv_len=}, {allocator_page=}"
+            )
+            assert allocation_nxt_kv_len % allocator_page == 0, (
+                f"request {index} allocation endpoint is not page-aligned: "
+                f"{allocation_nxt_kv_len=}, {allocator_page=}"
+            )
+            assert allocation_delta % allocator_page == 0, (
+                f"request {index} allocation delta is not page-aligned: "
+                f"{allocation_delta=}, {allocator_page=}"
+            )
+        allocation_nxt_kv_lens_values.append(allocation_nxt_kv_len)
+        allocation_deltas.append(allocation_delta)
+
+    allocation_num_needed_tokens: int = sum(allocation_deltas)
+    if allocator_page == 1 or _is_npu:
+        assert allocation_num_needed_tokens == num_needed_tokens, (
+            f"spec allocation total mismatch: {allocation_num_needed_tokens=}, "
+            f"{num_needed_tokens=}"
+        )
+    if batch_size == 0:
+        assert allocation_num_needed_tokens == 0
+    if uses_page_aligned_alloc:
+        assert allocation_num_needed_tokens % allocator_page == 0, (
+            f"{allocation_num_needed_tokens=}, {allocator_page=}"
         )
 
     if allocation_num_needed_tokens > 0:
+        out_cache_loc: torch.Tensor
         if allocator_page == 1:
             out_cache_loc = alloc_token_slots(
                 tree_cache=tree_cache,
                 num_tokens=allocation_num_needed_tokens,
             )
+        elif uses_page_aligned_alloc:
+            allocated_page_blocks: torch.Tensor = alloc_token_slots(
+                tree_cache=tree_cache,
+                num_tokens=allocation_num_needed_tokens,
+                phase="Spec decode",
+            )
+            assert allocated_page_blocks.ndim == 1, (
+                f"{allocated_page_blocks.shape=}"
+            )
+            assert allocated_page_blocks.is_contiguous(), (
+                f"{allocated_page_blocks.stride()=}"
+            )
+            assert allocated_page_blocks.dtype == torch.int64, (
+                f"{allocated_page_blocks.dtype=}"
+            )
+            assert allocated_page_blocks.device == req_to_token.device, (
+                f"{allocated_page_blocks.device=}, {req_to_token.device=}"
+            )
+            assert allocated_page_blocks.numel() == allocation_num_needed_tokens, (
+                f"allocated={allocated_page_blocks.numel()}, "
+                f"expected={allocation_num_needed_tokens}"
+            )
+            out_cache_loc = allocated_page_blocks
         else:
+            assert batch is not None
             last_loc = get_last_loc(
-                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+                req_to_token, req_pool_indices, cur_kv_lens
             )
             device_type = getattr(
                 batch.device, "type", str(batch.device).split(":", 1)[0]
@@ -1258,15 +1366,15 @@ def alloc_for_spec_decode(
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(
             req_pool_indices,
-            req_to_token_pool.req_to_token,
+            req_to_token,
             cur_kv_lens,
             allocation_nxt_kv_lens,
             out_cache_loc,
-            len(reqs),
+            batch_size,
         )
 
-    for i, req in enumerate(reqs):
+    for req, allocation_nxt_kv_len in zip(reqs, allocation_nxt_kv_lens_values):
         req.kv.kv_allocated_len = max(
             req.kv.kv_allocated_len,
-            int(allocation_nxt_kv_lens_cpu[i]),
+            allocation_nxt_kv_len,
         )
