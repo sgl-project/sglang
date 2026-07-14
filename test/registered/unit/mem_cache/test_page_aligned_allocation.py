@@ -18,6 +18,10 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_spec_decode,
     alloc_paged_token_slots_extend,
 )
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -25,10 +29,6 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocation_sizing import (
-    get_alloc_len_per_decode,
-    get_req_to_token_extra_context_len,
-)
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
