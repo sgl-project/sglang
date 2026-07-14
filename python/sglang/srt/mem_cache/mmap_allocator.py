@@ -6,6 +6,7 @@ import mmap
 import os
 import weakref
 
+import psutil
 import torch
 
 from sglang.srt.environ import envs
@@ -39,6 +40,62 @@ _MAP_HUGETLB = 0x40000
 _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
+
+HUGEPAGE_BYTES_2MB = 2 * 1024 * 1024
+HUGEPAGE_BYTES_1GB = 1024 * 1024 * 1024
+
+
+def hugepage_size_requested() -> int:
+    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    if hugepage_size == "2MB":
+        return HUGEPAGE_BYTES_2MB
+    elif hugepage_size == "1GB":
+        return HUGEPAGE_BYTES_1GB
+    else:
+        return 0
+
+
+def hugepage_available_bytes(hugepage_size: int) -> int:
+    if hugepage_size == HUGEPAGE_BYTES_2MB:
+        sysfs_path = "/sys/kernel/mm/hugepages/hugepages-2048kB"
+    elif hugepage_size == HUGEPAGE_BYTES_1GB:
+        sysfs_path = "/sys/kernel/mm/hugepages/hugepages-1048576kB"
+    else:
+        return 0
+    try:
+        with open(os.path.join(sysfs_path, "free_hugepages")) as f:
+            return int(f.read().strip()) * hugepage_size
+    except (OSError, ValueError) as e:
+        logger.warning("Failed to read free_hugepages from %s: %s", sysfs_path, e)
+        return 0
+
+
+def memory_available_bytes() -> int:
+    """Bytes available for HiCache host pool preflight.
+
+    Without ``SGLANG_HUGEPAGE_SIZE``, uses free host RAM.
+    With hugepages requested, uses ``max(RAM, free hugetlb)``.
+    """
+    available_bytes = psutil.virtual_memory().available
+    hugepage_size = hugepage_size_requested()
+    if hugepage_size > 0:
+        available_bytes = max(available_bytes, hugepage_available_bytes(hugepage_size))
+    return available_bytes
+
+
+def _mmap_page_size_and_flags() -> tuple[int, int]:
+    hugepage_bytes = hugepage_size_requested()
+    if hugepage_bytes == HUGEPAGE_BYTES_2MB:
+        return hugepage_bytes, _MAP_HUGETLB | _MAP_HUGE_2MB
+    elif hugepage_bytes == HUGEPAGE_BYTES_1GB:
+        return hugepage_bytes, _MAP_HUGETLB | _MAP_HUGE_1GB
+    elif (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip():
+        logger.warning(
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Falling back to plain page-size mmap.",
+            envs.SGLANG_HUGEPAGE_SIZE.get(),
+        )
+    return mmap.PAGESIZE, 0
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -74,22 +131,8 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """
     # Re-read per call (not cached) so that envs.SGLANG_HUGEPAGE_SIZE.override()
     # works correctly in tests.
-    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    page_size, extra_flags = _mmap_page_size_and_flags()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
-
-    if hugepage_size == "":
-        page_size, extra_flags = mmap.PAGESIZE, 0
-    elif hugepage_size == "2MB":
-        page_size, extra_flags = 2 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_2MB
-    elif hugepage_size == "1GB":
-        page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
-    else:
-        logger.warning(
-            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
-            "Falling back to plain page-size mmap.",
-            envs.SGLANG_HUGEPAGE_SIZE.get(),
-        )
-        page_size, extra_flags = mmap.PAGESIZE, 0
 
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
 
@@ -98,7 +141,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
             logger.error(
                 "Hugepage mmap requested but libc.so.6 could not be loaded; "
                 "falling back to plain mmap. SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
-                hugepage_size,
+                envs.SGLANG_HUGEPAGE_SIZE.get(),
             )
         else:
             try:
@@ -111,7 +154,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
                     "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
                     "SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
                     e,
-                    hugepage_size,
+                    envs.SGLANG_HUGEPAGE_SIZE.get(),
                 )
         alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
 
