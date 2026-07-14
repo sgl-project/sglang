@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -219,3 +220,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     )
 
     assert torch.equal(actual, expected)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
