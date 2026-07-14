@@ -473,7 +473,7 @@ def run_dp_sharded_mrope_vision_model(
     pixel_values: torch.Tensor,
     grid_thw_list: list,
     *,
-    rope_type: Literal["rope_3d", "rope_2d"],
+    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -487,7 +487,9 @@ def run_dp_sharded_mrope_vision_model(
         rope_type: Type of rope used in the vision model.
                    Different rope types have different dimension to do ViT.
                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
-                   "rope_2d" for 2D rope (e.g., Kimi-VL)
+                   "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
+                   "rope_2d_packed" for packed 2D rope outputs that accept
+                   ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -519,6 +521,11 @@ def run_dp_sharded_mrope_vision_model(
             # MoonViT returns one tensor per image. The multi-GPU path below
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
+            if isinstance(image_embeds, list):
+                return torch.cat(image_embeds, dim=0)
+            return image_embeds
+        if rope_type == "rope_2d_packed":
+            image_embeds = vision_model(pixel_values, grid_thw)
             if isinstance(image_embeds, list):
                 return torch.cat(image_embeds, dim=0)
             return image_embeds
@@ -567,7 +574,8 @@ def run_dp_sharded_mrope_vision_model(
             dtype=pixel_values.dtype,
         )
     # embed_dim_reduction_factor = 2 * 2
-    if rope_type == "rope_2d":
+    packed_2d_rope = rope_type in ("rope_2d", "rope_2d_packed")
+    if packed_2d_rope:
         embed_dim_reduction_factor = (
             vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
         )
@@ -584,16 +592,19 @@ def run_dp_sharded_mrope_vision_model(
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
     # Run the vision model on the local pixel_values_local
-    if rope_type == "rope_2d":
+    if packed_2d_rope:
         if pixel_values_local.shape[0] > 0:
             local_grid_thw = torch.tensor(
                 local_grid_thw_list, device=pixel_values_local.device
             )
-            image_embeds_local = vision_model(
-                pixel_values_local,
-                grid_hw=local_grid_thw,
-                max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
-            )
+            if rope_type == "rope_2d":
+                image_embeds_local = vision_model(
+                    pixel_values_local,
+                    grid_hw=local_grid_thw,
+                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
+                )
+            else:
+                image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
         else:
@@ -609,10 +620,15 @@ def run_dp_sharded_mrope_vision_model(
             image_embeds_local = vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
             )
+            if isinstance(image_embeds_local, list):
+                image_embeds_local = torch.cat(image_embeds_local, dim=0)
         else:
             # Handle empty case
+            out_dim = getattr(vision_model, "out_hidden_size", None)
+            if out_dim is None:
+                out_dim = vision_model.config.hidden_size
             image_embeds_local = torch.empty(
-                (0, vision_model.out_hidden_size),
+                (0, out_dim),
                 device=pixel_values.device,
                 dtype=pixel_values.dtype,
             )
@@ -622,7 +638,7 @@ def run_dp_sharded_mrope_vision_model(
     current_len = image_embeds_local.shape[0]
     if current_len < max_len_per_rank:
         padding_size = max_len_per_rank - current_len
-        if rope_type == "rope_2d":
+        if packed_2d_rope:
             padding = torch.empty(
                 (
                     padding_size,
