@@ -16,8 +16,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
-from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,

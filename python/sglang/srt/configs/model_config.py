@@ -452,6 +452,9 @@ class ModelConfig:
         self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
             is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
+        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -1345,6 +1348,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "humming",
             "quark_mxfp4",
         ]
         compatible_quantization_methods = {
@@ -1757,6 +1761,13 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
     "MiniMaxM3SparseForConditionalGeneration",
 ]
 
+# Multimodal archs whose LM prefill is validated under breakable CUDA graph;
+# embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+multimodal_breakable_cuda_graph_supported_model_archs = [
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1823,6 +1834,14 @@ def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str])
     )
 
 
+def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill breakable CUDA graph enabled."""
+    return any(
+        arch in multimodal_breakable_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
 # SequenceClassification models that use CrossEncodingPooler
 _cross_encoding_pooler_archs = [
     "BertForSequenceClassification",
@@ -1882,6 +1901,7 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "MellumForCausalLM",
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
@@ -1953,15 +1973,9 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
+        or "LagunaForCausalLM" in model_architectures
+        or "MellumForCausalLM" in model_architectures
     ):
-        layer_types = getattr(hf_text_config, "layer_types", [])
-        swa_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "sliding_attention"
-        ]
-        full_attention_layer_ids = [
-            i for i, x in enumerate(layer_types) if x == "full_attention"
-        ]
-    elif "LagunaForCausalLM" in model_architectures:
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"

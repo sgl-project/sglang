@@ -973,12 +973,12 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 4)
 
 
-class TestDeepEPWaterfillArgs(CustomTestCase):
+class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -995,7 +995,7 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="none",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
@@ -1006,11 +1006,27 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
+    def test_waterfill_keeps_megamoe_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="megamoe",
+            enable_waterfill=True,
+            disable_shared_experts_fusion=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_deepep_waterfill=True,
+            enable_waterfill=True,
             deepep_mode="low_latency",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -1179,6 +1195,64 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
 
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
+
+
+class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
+    """The BCG "multimodal model" rule exempts archs on the BCG multimodal
+    opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""
+
+    def _handled_args(self, *, architectures, is_multimodal, allowlisted):
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=architectures),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=is_multimodal,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+            is_multimodal_breakable_cuda_graph_supported=allowlisted,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_multimodal_arch_disables_prefill_breakable(self):
+        args = self._handled_args(
+            architectures=["Qwen3VLForConditionalGeneration"],
+            is_multimodal=True,
+            allowlisted=False,
+        )
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_allowlisted_multimodal_arch_keeps_prefill_breakable(self):
+        args = self._handled_args(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            is_multimodal=True,
+            allowlisted=True,
+        )
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_allowlist_membership(self):
+        from sglang.srt.configs.model_config import (
+            is_multimodal_breakable_cuda_graph_supported,
+        )
+
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3_5MoeForConditionalGeneration"]
+            )
+        )
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3_5ForConditionalGeneration"]
+            )
+        )
+        self.assertFalse(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Qwen3VLForConditionalGeneration"]
+            )
+        )
 
 
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
@@ -1452,7 +1526,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestDeepEPWaterfillArgs)."""
+    directly (same pattern as TestWaterfillArgs)."""
 
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")
