@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import create_device_stream, device_stream_context
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -54,18 +55,6 @@ class _LMCacheLoadBackMarker:
 class LMCacheMode(enum.Enum):
     MP = enum.auto()  # multi-process mode
     IP = enum.auto()  # in-process mode
-
-
-def _create_device_stream(device):
-    """Create a device stream for the given device type."""
-    if not isinstance(device, torch.device):
-        device = torch.device(device)
-    return torch.get_device_module(device).Stream(device=device)
-
-
-def _device_stream_context(stream):
-    """Return the appropriate stream context manager for ``stream``."""
-    return torch.get_device_module(stream.device).stream(stream)
 
 
 class LayerTransferCounter:
@@ -143,8 +132,8 @@ class LMCRadixCache(RadixCache):
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
-        self.load_stream = _create_device_stream(self.device)
-        self.store_stream = _create_device_stream(self.device)
+        self.load_stream = create_device_stream(self.device)
+        self.store_stream = create_device_stream(self.device)
 
         # MP (multi-process) is the default. XPU defaults to IP (in-process
         # layerwise) because the MP connector shares the KV cache via CUDA IPC
@@ -409,7 +398,7 @@ class LMCRadixCache(RadixCache):
         """
         current_stream = torch.get_device_module(self.device).current_stream()
         self.load_stream.wait_stream(current_stream)
-        with _device_stream_context(self.load_stream):
+        with device_stream_context(self.load_stream):
             n = self.lmcache_connector.retrieve_kv(
                 LoadMetadata(
                     token_ids=marker.key.token_ids,
@@ -435,7 +424,7 @@ class LMCRadixCache(RadixCache):
         ``start_load_kv`` enqueues the first layer's transfer; the
         ``LayerTransferCounter`` hook drives the rest during forward.
         """
-        with _device_stream_context(self.load_stream):
+        with device_stream_context(self.load_stream):
             return self.lmcache_connector.start_load_kv(
                 LoadMetadata(
                     token_ids=token_ids,
@@ -491,7 +480,7 @@ class LMCRadixCache(RadixCache):
             self.dec_lock_ref(new_last_node)
             self.lmcache_connector.end_session(req.rid)
         elif self._mode is LMCacheMode.IP:
-            with _device_stream_context(self.store_stream):
+            with device_stream_context(self.store_stream):
                 self.lmcache_connector.store_kv(store_md)
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:

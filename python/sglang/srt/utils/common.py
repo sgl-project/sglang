@@ -559,6 +559,18 @@ def get_device_module():
     return torch.get_device_module()
 
 
+def create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Stream(device=device)
+
+
+def device_stream_context(stream):
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
