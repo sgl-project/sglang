@@ -74,12 +74,7 @@ from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
-from sglang.srt.layers.attention.attention_registry import (
-    ATTENTION_BACKENDS,
-    attn_backend_wrapper,
-)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
@@ -115,6 +110,11 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components import misc_utils
+from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+    build_attention_backends,
+    configure_aux_hidden_state_capture,
+    get_attention_backend,
+)
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
     is_post_capture_kv_active,
@@ -192,7 +192,6 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
-    init_cublas,
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
@@ -728,31 +727,22 @@ class ModelRunner:
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
-        # TODO: Refactor device-specific init branches into platform interface (separate PR).
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
         # runs with aux hidden state capture enabled.
-        self.init_aux_hidden_state_capture()
-
-        if self.device == "cuda" or self.device == "musa":
-            init_cublas()
-            self.init_attention_backend()
-        elif self.device in ["cpu", "xpu"]:
-            self.init_attention_backend()
-        elif self.device == "npu":
-            self.init_attention_backend()
-            # lazy init for zbal with mix mode (before graph capture when enable_cuda_graph)
-            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
-                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
-
-                lazy_init_zbal_gva_mem(
-                    self.device,
-                    self.gpu_id,
-                    get_world_group().rank_in_group,
-                    get_world_group().world_size,
-                    get_world_group().cpu_group,
-                )
-        else:
-            self.init_attention_backend()
+        configure_aux_hidden_state_capture(
+            model=self.model,
+            eagle_use_aux_hidden_state=self.spec_aux_config.eagle_use_aux_hidden_state,
+            eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
+            dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
+            dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
+            is_dspark=self.spec_algorithm.is_dspark(),
+        )
+        backends = build_attention_backends(model_runner=self)
+        self.attn_backend = backends.attn_backend
+        self.decode_attn_backend = backends.decode_attn_backend
+        self.decode_attn_backend_group = backends.decode_attn_backend_group
+        self.prefill_attention_backend_str = backends.prefill_attention_backend_str
+        self.decode_attention_backend_str = backends.decode_attention_backend_str
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
@@ -834,34 +824,6 @@ class ModelRunner:
                 device=self.device,
             )
         )
-
-    def init_aux_hidden_state_capture(self):
-        """Configure auxiliary hidden state capture for speculative decoding.
-
-        Must be called before CUDA graph capture so the captured graphs
-        include aux hidden state output paths.
-        """
-        if self.spec_aux_config.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.spec_aux_config.eagle_aux_hidden_state_layer_ids
-            )
-        if self.spec_aux_config.dflash_use_aux_hidden_state:
-            if self.spec_algorithm.is_dspark() and hasattr(
-                self.model, "set_dspark_layers_to_capture"
-            ):
-                self.model.set_dspark_layers_to_capture(
-                    self.spec_aux_config.dflash_target_layer_ids
-                )
-            elif hasattr(self.model, "set_dflash_layers_to_capture"):
-                self.model.set_dflash_layers_to_capture(
-                    self.spec_aux_config.dflash_target_layer_ids
-                )
-            else:
-                raise ValueError(
-                    f"Model {self.model.__class__.__name__} implements neither "
-                    "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
-                    "one of which is required for DFLASH/DSPARK."
-                )
 
     def check_quantized_moe_compatibility(self):
         check_quantized_moe_compatibility(
@@ -1125,88 +1087,10 @@ class ModelRunner:
         if resolved_kv_cache_dtype is not None:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
 
-    def init_attention_backend(self):
-        """Init attention kernel backend."""
-        if self.server_args.enable_pdmux:
-            self.attn_backend = self._get_attention_backend(init_new_workspace=True)
-            self.decode_attn_backend_group = []
-            for _ in range(self.server_args.sm_group_num):
-                self.decode_attn_backend_group.append(self._get_attention_backend())
-            self.decode_attn_backend = self.decode_attn_backend_group[0]
-        elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
-            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
-        else:
-            self.attn_backend = self._get_attention_backend()
-
-        # Record resolved per-mode backends on the backend for model dispatch.
-        self.attn_backend.prefill_attention_backend_str = (
-            self.prefill_attention_backend_str
-        )
-        self.attn_backend.decode_attention_backend_str = (
-            self.decode_attention_backend_str
-        )
-
     def _get_attention_backend(self, init_new_workspace: bool = False):
-        """Init attention kernel backend."""
-        draft_attn_backend = self.server_args.speculative_draft_attention_backend
-        if self.is_draft_worker and draft_attn_backend:
-            logger.warning(
-                f"Overriding draft attention backend to {draft_attn_backend}."
-            )
-            # Single backend for all draft modes (no prefill/decode split).
-            self.prefill_attention_backend_str = draft_attn_backend
-            self.decode_attention_backend_str = draft_attn_backend
-            return self._get_attention_backend_from_str(
-                draft_attn_backend,
-                init_new_workspace=init_new_workspace,
-            )
-
-        (
-            self.prefill_attention_backend_str,
-            self.decode_attention_backend_str,
-        ) = self.server_args.get_attention_backends()
-
-        if self.decode_attention_backend_str != self.prefill_attention_backend_str:
-            from sglang.srt.layers.attention.hybrid_attn_backend import (
-                HybridAttnBackend,
-            )
-
-            attn_backend = HybridAttnBackend(
-                self,
-                decode_backend=self._get_attention_backend_from_str(
-                    self.decode_attention_backend_str,
-                    init_new_workspace=init_new_workspace,
-                ),
-                prefill_backend=self._get_attention_backend_from_str(
-                    self.prefill_attention_backend_str,
-                    init_new_workspace=init_new_workspace,
-                ),
-            )
-            logger.info(
-                f"Using hybrid attention backend for decode and prefill: "
-                f"decode_backend={self.decode_attention_backend_str}, "
-                f"prefill_backend={self.prefill_attention_backend_str}."
-            )
-            logger.warning(
-                "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
-                "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
-            )
-        else:
-            attn_backend = self._get_attention_backend_from_str(
-                self.server_args.attention_backend,
-                init_new_workspace=init_new_workspace,
-            )
-
-        return attn_backend
-
-    def _get_attention_backend_from_str(
-        self, backend_str: str, init_new_workspace: bool = False
-    ):
-        if backend_str not in ATTENTION_BACKENDS:
-            raise ValueError(f"Invalid attention backend: {backend_str}")
-        self.init_new_workspace = init_new_workspace
-        full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
-        return attn_backend_wrapper(self, full_attention_backend)
+        return get_attention_backend(
+            model_runner=self, init_new_workspace=init_new_workspace
+        )
 
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
