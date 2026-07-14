@@ -954,7 +954,9 @@ class FlexKVConnector:
                     )
                 except Exception as exc:  # noqa: BLE001
                     registration_state = (
-                        "applied" if counter_registration_applied else "partially applied"
+                        "applied"
+                        if counter_registration_applied
+                        else "partially applied"
                     )
                     local_reason = (
                         f"FlexKV layerwise {registration_state} registration rollback "
