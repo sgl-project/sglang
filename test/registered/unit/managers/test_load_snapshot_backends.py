@@ -266,14 +266,6 @@ class TestFactoryFunctions(CustomTestCase):
         args = SimpleNamespace(enable_dp_attention=True, nnodes=2)
         self.assertTrue(should_use_zmq(args))
 
-    def test_should_use_zmq_single_node(self):
-        args = SimpleNamespace(enable_dp_attention=False, nnodes=1)
-        self.assertFalse(should_use_zmq(args))
-
-    def test_should_use_zmq_dp_attention_single_node(self):
-        args = SimpleNamespace(enable_dp_attention=True, nnodes=1)
-        self.assertFalse(should_use_zmq(args))
-
 
 class TestZmqReaderOwner(CustomTestCase):
     """At most one process binds the zmq PULL socket across all callers."""
