@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 
 class MultimodalCache(abc.ABC):

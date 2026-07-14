@@ -22,7 +22,7 @@ if TYPE_CHECKING:
         SchedulerPoolStatsObserver,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
