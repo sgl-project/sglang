@@ -20,6 +20,8 @@ _TRITON_KERNELS = [
     ("dense.kv_b_lora_absorbed", "step_b_q_fwd"),
     ("dense.kv_b_lora_absorbed", "step_a_v_fwd"),
     ("dense.kv_b_lora_absorbed", "step_b_v_fwd"),
+    ("dense.kv_b_lora_absorbed", "q_side_fused_fwd"),
+    ("dense.kv_b_lora_absorbed", "v_side_fused_fwd"),
     ("moe.fused_moe_lora_kernel", "fused_moe_lora"),
     ("moe.virtual_experts", "merged_experts_fused_moe_lora_add"),
 ]
