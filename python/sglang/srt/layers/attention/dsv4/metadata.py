@@ -166,7 +166,7 @@ class PagedIndexerMetadata:
                     deep_gemm.get_num_sms(),
                 )
 
-            assert self.deep_gemm_metadata is not None
+            assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
