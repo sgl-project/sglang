@@ -18,12 +18,14 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
+from functools import cached_property
 from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -287,6 +289,14 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+
+        rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
+            self.hf_text_config, "rope_scaling", {}
+        )
+        self.model_is_mrope = (
+            rope_scaling is not None and "mrope_section" in rope_scaling
+        )
+
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -684,6 +694,10 @@ class ModelConfig:
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
         ]
+
+    @cached_property
+    def linear_attn_registry_result(self) -> Any:
+        return get_linear_attn_config(self.hf_config)
 
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
