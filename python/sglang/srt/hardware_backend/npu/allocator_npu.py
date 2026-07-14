@@ -71,18 +71,18 @@ def alloc_for_extend_npu(
 def alloc_for_decode_npu(
     batch: "ScheduleBatch",
     *,
-    next_seq_lens: torch.Tensor,
-    next_seq_lens_cpu: torch.Tensor,
+    next_combined_lens: torch.Tensor,
+    next_combined_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> torch.Tensor:
-    current_seq_lens = next_seq_lens - token_per_req
+    current_combined_lens = next_combined_lens - token_per_req
     last_loc = batch.req_to_token_pool.req_to_token[
-        batch.req_pool_indices, current_seq_lens - 1
+        batch.req_pool_indices, current_combined_lens - 1
     ]
     return _alloc_paged_token_slots_decode_npu(
         tree_cache=batch.tree_cache,
-        seq_lens=next_seq_lens,
-        seq_lens_cpu=next_seq_lens_cpu,
+        seq_lens=next_combined_lens,
+        seq_lens_cpu=next_combined_lens_cpu,
         last_loc=last_loc,
         token_per_req=token_per_req,
         req_pool_indices=batch.req_pool_indices,

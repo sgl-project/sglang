@@ -1,7 +1,13 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu import allocator_npu
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    DSV4NPUTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
@@ -104,6 +110,153 @@ def _make_dsv4_allocator(
 
 
 class TestHiSparseDirectAllocator(unittest.TestCase):
+    def test_npu_hybrid_swa_pool_selection_uses_npu_allocator(self) -> None:
+        """Ordinary NPU hybrid SWA initialization selects the NPU allocator."""
+        from sglang.srt.model_executor import model_runner_kv_cache_mixin
+
+        runner = SimpleNamespace(
+            max_running_requests=2,
+            server_args=SimpleNamespace(
+                enable_unified_memory=False,
+                disaggregation_mode="null",
+                attention_backend="ascend",
+                prefill_only_disable_kv_cache=False,
+                max_speculative_num_draft_tokens=0,
+                speculative_algorithm=None,
+                enable_memory_saver=False,
+                enable_page_major_kv_layout=False,
+            ),
+            req_to_token_pool=None,
+            token_to_kv_pool=None,
+            token_to_kv_pool_allocator=None,
+            mambaish_config=None,
+            is_hybrid_swa=True,
+            is_hybrid_swa_compress=False,
+            is_draft_worker=False,
+            enable_hisparse=False,
+            hybrid_gdn_config=None,
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            page_size=4,
+            kv_cache_dtype=torch.bfloat16,
+            device="cpu",
+            dcp_size=1,
+            post_capture_kv_active=False,
+            _validate_prefill_only_disable_kv_cache_pool_family=Mock(),
+            model_config=SimpleNamespace(
+                context_len=128,
+                head_dim=64,
+                swa_attention_layer_ids=[1],
+                full_attention_layer_ids=[0],
+                get_num_kv_heads=lambda tp_size: 2,
+                hf_config=SimpleNamespace(
+                    model_type="test",
+                    architectures=["TestModel"],
+                )
+            ),
+        )
+        selected_allocator = object()
+        req_to_token_pool = SimpleNamespace()
+        token_to_kv_pool = SimpleNamespace()
+
+        with patch.object(
+            model_runner_kv_cache_mixin,
+            "_is_npu",
+            True,
+        ), patch.object(
+            model_runner_kv_cache_mixin.current_platform,
+            "is_out_of_tree",
+            return_value=False,
+        ), patch.object(
+            model_runner_kv_cache_mixin,
+            "get_req_to_token_extra_context_len",
+            return_value=0,
+        ), patch.object(
+            model_runner_kv_cache_mixin,
+            "ReqToTokenPool",
+            return_value=req_to_token_pool,
+        ), patch.object(
+            model_runner_kv_cache_mixin,
+            "SWAKVPool",
+            return_value=token_to_kv_pool,
+        ) as swa_pool_class, patch.object(
+            model_runner_kv_cache_mixin,
+            "get_attention_tp_size",
+            return_value=1,
+        ), patch.object(
+            allocator_npu,
+            "NPUSWATokenToKVPoolAllocator",
+            return_value=selected_allocator,
+        ) as npu_swa_class:
+            model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin._init_pools(runner)
+
+        self.assertIs(runner.req_to_token_pool, req_to_token_pool)
+        self.assertIs(runner.token_to_kv_pool, token_to_kv_pool)
+        self.assertIs(runner.token_to_kv_pool_allocator, selected_allocator)
+        swa_pool_class.assert_called_once()
+        npu_swa_class.assert_called_once_with(
+            64,
+            32,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=runner.token_to_kv_pool,
+            need_sort=False,
+        )
+
+    def test_dsv4_allocator_reuses_npu_swa_extend(self) -> None:
+        """DSV4 allocation layers compressed pools over the NPU SWA parent."""
+        allocator = object.__new__(DSV4NPUTokenToKVPoolAllocator)
+        allocator.translate_loc_from_full_to_swa = Mock(
+            return_value=torch.tensor([41], dtype=torch.int64)
+        )
+        bundle = object()
+        allocator._alloc_c_and_state = Mock(return_value=bundle)
+        prefix_lens = torch.tensor([0], dtype=torch.int64)
+        seq_lens = torch.tensor([1], dtype=torch.int64)
+        last_loc = torch.tensor([-1], dtype=torch.int64)
+
+        with patch.object(
+            allocator_npu.NPUSWATokenToKVPoolAllocator,
+            "alloc_extend",
+            return_value=torch.tensor([31], dtype=torch.int64),
+        ) as npu_swa_extend:
+            result = allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens.clone(),
+                seq_lens,
+                seq_lens.clone(),
+                last_loc,
+                1,
+                req_pool_indices=torch.tensor([2], dtype=torch.int64),
+            )
+
+        self.assertIs(result, bundle)
+        npu_swa_extend.assert_called_once()
+        allocator._alloc_c_and_state.assert_called_once()
+
+    def test_main_and_pure_swa_capability_boundary_is_explicit(self) -> None:
+        """Main SWA supports pages while PureSWA remains a page-one boundary."""
+        self.assertTrue(SWATokenToKVPoolAllocator.supports_page_aligned_alloc)
+        self.assertTrue(SWATokenToKVPoolAllocator.supports_spec_page_aligned_alloc)
+        self.assertFalse(PureSWATokenToKVPoolAllocator.supports_page_aligned_alloc)
+        self.assertFalse(
+            PureSWATokenToKVPoolAllocator.supports_spec_page_aligned_alloc
+        )
+        pure_swa = object.__new__(PureSWATokenToKVPoolAllocator)
+        pure_swa.page_size = 1
+        pure_swa.swa_attn_allocator = Mock()
+        pure_swa.swa_attn_allocator.alloc.return_value = torch.tensor(
+            [7], dtype=torch.int64
+        )
+
+        result = pure_swa.alloc(1)
+
+        self.assertTrue(torch.equal(result, torch.tensor([7], dtype=torch.int64)))
+        pure_swa.swa_attn_allocator.alloc.assert_called_once_with(1)
+        with self.assertRaisesRegex(NotImplementedError, "page_size > 1"):
+            pure_swa.alloc_extend_swa_tail()
+
     def test_page_aligned_spec_capability_matrix_is_explicit(self) -> None:
         """Spec direct capability remains disabled only for unsupported allocators."""
         supported_classes = (

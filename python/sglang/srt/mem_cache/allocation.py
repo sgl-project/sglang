@@ -778,8 +778,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
         out_cache_loc = alloc_for_decode_npu(
             batch,
-            next_seq_lens=seq_lens_gpu + token_per_req,
-            next_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            next_combined_lens=locs + token_per_req,
+            next_combined_lens_cpu=locs_cpu + token_per_req,
             token_per_req=token_per_req,
         )
     elif uses_page_aligned_alloc:

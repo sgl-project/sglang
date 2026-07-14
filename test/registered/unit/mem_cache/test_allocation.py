@@ -97,6 +97,210 @@ def _call_spec(inputs) -> None:
     )
 
 
+class TestNPUAllocationAuthority(unittest.TestCase):
+    def test_get_last_loc_handles_fresh_rows_and_preserves_length_dtype(self) -> None:
+        """NPU endpoint lookup returns fresh sentinels and table slots in lens dtype."""
+        req_to_token = torch.tensor(
+            [[11, 12, 13, 14], [21, 22, 23, 24]],
+            dtype=torch.int32,
+        )
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
+
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+                prefix_lens = torch.tensor([0, 3], dtype=dtype)
+
+                result = allocator_npu.get_last_loc(
+                    req_to_token,
+                    req_pool_indices,
+                    prefix_lens,
+                )
+
+                self.assertEqual(result.dtype, dtype)
+                self.assertTrue(
+                    torch.equal(result, torch.tensor([-1, 23], dtype=dtype))
+                )
+
+    def test_extend_entry_uses_ragged_prefix_endpoints(self) -> None:
+        """NPU extend derives anchors only from ragged prefix tensors."""
+        tree_cache = SimpleNamespace()
+        batch = SimpleNamespace(device=torch.device("cpu"))
+        prefix_tensors = [
+            torch.tensor([101, 102], dtype=torch.int64),
+            torch.empty((0,), dtype=torch.int64),
+        ]
+        prefix_lens = torch.tensor([2, 0], dtype=torch.int64)
+        seq_lens = torch.tensor([4, 3], dtype=torch.int64)
+        output = torch.tensor([201, 202, 203, 204, 205], dtype=torch.int64)
+
+        with patch.object(
+            allocator_npu,
+            "_alloc_paged_token_slots_extend_npu",
+            return_value=output,
+        ) as paged_entry:
+            result = allocator_npu.alloc_for_extend_npu(
+                tree_cache,
+                prefix_tensors=prefix_tensors,
+                prefix_lens=prefix_lens,
+                prefix_lens_cpu=prefix_lens.clone(),
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens.clone(),
+                extend_num_tokens=5,
+                req_pool_indices=torch.tensor([4, 9], dtype=torch.int64),
+                dsv4_state_lens=None,
+                batch=batch,
+            )
+
+        self.assertIs(result, output)
+        self.assertTrue(
+            torch.equal(
+                paged_entry.call_args.kwargs["last_loc"],
+                torch.tensor([102, -1], dtype=torch.int64),
+            )
+        )
+
+    def test_decode_entry_uses_combined_endpoint_anchor_and_next_lens(self) -> None:
+        """NPU decode anchors at the current combined endpoint before allocation."""
+        req_to_token = torch.arange(64, dtype=torch.int32).reshape(2, 32)
+        batch = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            tree_cache=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            reqs=[],
+        )
+        next_combined_lens = torch.tensor([8, 13], dtype=torch.int64)
+        output = torch.tensor([301, 302], dtype=torch.int64)
+
+        with patch.object(
+            allocator_npu,
+            "_alloc_paged_token_slots_decode_npu",
+            return_value=output,
+        ) as paged_entry:
+            result = allocator_npu.alloc_for_decode_npu(
+                batch,
+                next_combined_lens=next_combined_lens,
+                next_combined_lens_cpu=next_combined_lens.clone(),
+                token_per_req=2,
+            )
+
+        self.assertIs(result, output)
+        call_kwargs = paged_entry.call_args.kwargs
+        self.assertTrue(
+            torch.equal(call_kwargs["last_loc"], torch.tensor([5, 42]))
+        )
+        self.assertTrue(torch.equal(call_kwargs["seq_lens"], next_combined_lens))
+        self.assertTrue(
+            torch.equal(call_kwargs["seq_lens_cpu"], next_combined_lens)
+        )
+
+    def test_decode_caller_passes_encoder_offset_combined_endpoints(self) -> None:
+        """Encoder-decoder routing passes combined KV endpoints to the NPU entry."""
+        req_to_token = torch.zeros((2, 32), dtype=torch.int32)
+
+        def write(indices, values) -> None:
+            req_to_token[indices] = values
+
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([3, 5], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int64),
+            encoder_lens=torch.tensor([7, 11], dtype=torch.int64),
+            encoder_lens_cpu=[7, 11],
+            model_config=SimpleNamespace(is_encoder_decoder=True),
+            tree_cache=SimpleNamespace(
+                token_to_kv_pool_allocator=SimpleNamespace(page_size=4)
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token,
+                write=write,
+            ),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            reqs=[
+                SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=10)),
+                SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=16)),
+            ],
+            device=torch.device("cpu"),
+            maybe_evict_swa=Mock(),
+        )
+        output = torch.tensor([401, 402], dtype=torch.int64)
+
+        with patch.object(allocation, "_is_npu", True), patch.object(
+            allocation,
+            "_alloc_page_size",
+            return_value=4,
+        ), patch.object(
+            allocator_npu,
+            "alloc_for_decode_npu",
+            return_value=output,
+        ) as npu_entry, patch.object(
+            allocation,
+            "maybe_write_dsv4_decode",
+        ):
+            allocation.alloc_for_decode(batch, token_per_req=1)
+
+        npu_entry.assert_called_once()
+        call_args = npu_entry.call_args
+        self.assertIs(call_args.args[0], batch)
+        self.assertTrue(
+            torch.equal(
+                call_args.kwargs["next_combined_lens"],
+                torch.tensor([11, 17], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                call_args.kwargs["next_combined_lens_cpu"],
+                torch.tensor([11, 17], dtype=torch.int64),
+            )
+        )
+        self.assertEqual(call_args.kwargs["token_per_req"], 1)
+
+    def test_spec_entry_uses_current_endpoints_and_forwards_lens(self) -> None:
+        """NPU spec allocation derives anchors from current endpoints and forwards lenses."""
+        req_to_token = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]],
+            dtype=torch.int32,
+        )
+        tree_cache = SimpleNamespace()
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        current_lens = torch.tensor([0, 3], dtype=torch.int64)
+        next_lens = torch.tensor([2, 4], dtype=torch.int64)
+        batch = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="test")
+            )
+        )
+        output = torch.tensor([501, 502, 503], dtype=torch.int64)
+
+        with patch.object(
+            allocator_npu,
+            "_alloc_paged_token_slots_extend_npu",
+            return_value=output,
+        ) as paged_entry:
+            result = allocator_npu.alloc_for_spec_decode_npu(
+                tree_cache,
+                req_to_token_pool,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                cur_kv_lens=current_lens,
+                cur_kv_lens_cpu=current_lens.clone(),
+                nxt_kv_lens=next_lens,
+                nxt_kv_lens_cpu=next_lens.clone(),
+                num_needed_tokens=3,
+                batch=batch,
+            )
+
+        self.assertIs(result, output)
+        call_kwargs = paged_entry.call_args.kwargs
+        self.assertTrue(
+            torch.equal(call_kwargs["last_loc"], torch.tensor([-1, 22]))
+        )
+        self.assertTrue(torch.equal(call_kwargs["prefix_lens"], current_lens))
+        self.assertTrue(torch.equal(call_kwargs["prefix_lens_cpu"], current_lens))
+        self.assertTrue(torch.equal(call_kwargs["seq_lens"], next_lens))
+        self.assertTrue(torch.equal(call_kwargs["seq_lens_cpu"], next_lens))
+        self.assertEqual(call_kwargs["extend_num_tokens"], 3)
+
+
 class TestSpecPageAlignedAllocation(unittest.TestCase):
     def _assert_failure_without_mutation(
         self,
