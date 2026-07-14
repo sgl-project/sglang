@@ -164,9 +164,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
     def test_overallocation_with_page_alignment(self):
         """The committed tail and reservation are split at an allocator page."""
         page_size = 4
-        manager, freed = _make_manager(
-            pool_size=32, allocator_page_size=page_size
-        )
+        manager, freed = _make_manager(pool_size=32, allocator_page_size=page_size)
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=10,  # not page-aligned
@@ -191,9 +189,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
     def test_overallocation_page_aligned_noop(self):
         """No reservation free is emitted when rounded committed equals allocated."""
         page_size = 4
-        manager, freed = _make_manager(
-            pool_size=32, allocator_page_size=page_size
-        )
+        manager, freed = _make_manager(pool_size=32, allocator_page_size=page_size)
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=10,  # ceil_align(10, 4) = 12
@@ -298,9 +294,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
     def test_finalize_release_creates_state_so_prefill_is_freed(self):
         """Finalize materializes the missing state before releasing all pages."""
         page_size = 4
-        manager, freed = _make_manager(
-            pool_size=32, allocator_page_size=page_size
-        )
+        manager, freed = _make_manager(pool_size=32, allocator_page_size=page_size)
         rid = "req-finalize-no-state"
         req = _make_mock_req(
             req_pool_idx=0,
@@ -394,9 +388,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [
-            (None, _FinishedEvent(), [10])
-        ]
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [10])]
         manager._trigger_backup = MagicMock()
 
         with self.assertRaisesRegex(RuntimeError, "Missing offload state"):
