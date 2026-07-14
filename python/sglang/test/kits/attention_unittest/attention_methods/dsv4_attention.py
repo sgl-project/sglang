@@ -35,6 +35,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -410,6 +411,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self._kernel_warmed_up = True
 
     @property

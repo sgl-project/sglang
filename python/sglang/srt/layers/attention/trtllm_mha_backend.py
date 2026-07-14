@@ -487,13 +487,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = num_tokens // bs
+            num_tokens_per_req = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
             metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][: bs + 1]
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][: bs + 1]
-            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.max_seq_len_q = num_tokens_per_req
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
                 metadata,
@@ -567,9 +567,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Static per-request query width, fixed by the captured graph shape.
             # Do not inspect replay-time tensors here; this body is recorded into
             # the CUDA graph.
-            num_tokens_per_bs = metadata.max_seq_len_q
+            num_tokens_per_req = metadata.max_seq_len_q
             cu_seqlens_q = metadata.cu_seqlens_q
-            q_stride = num_tokens_per_bs
+            q_stride = num_tokens_per_req
             q_mode = Q_MODE_STRIDED
         else:
             raise ValueError(
