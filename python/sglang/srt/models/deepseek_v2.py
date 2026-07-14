@@ -587,6 +587,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -1205,6 +1206,15 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        is_dsv4_npu_multistream = (
+            self.is_deepseek_v4
+            and _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        )
+        use_alt_stream = self.alt_stream is not None and (
+            not is_dsv4_npu_multistream
+            or forward_batch.forward_mode.is_cuda_graph()
+        )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1217,9 +1227,10 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
-                    self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self.alt_stream):
+                if use_alt_stream:
+                    device_module = torch.get_device_module(hidden_states.device)
+                    self.alt_stream.wait_stream(device_module.current_stream())
+                    with device_module.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
@@ -1405,9 +1416,10 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
-            and self.alt_stream is not None
+            and use_alt_stream
         ):
-            torch.cuda.current_stream().wait_event(shared_event)
+            device_module = torch.get_device_module(hidden_states.device)
+            device_module.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             x = shared_output

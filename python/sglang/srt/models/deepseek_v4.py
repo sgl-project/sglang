@@ -1100,6 +1100,7 @@ class MQALayer(MqaAttentionBase):
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
+            and not _is_npu
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
@@ -1316,7 +1317,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams[0]
             if (
                 alt_streams is not None
-                and (_is_cuda or envs.SGLANG_ROCM_USE_MULTI_STREAM.get())
+                and (
+                    _is_cuda
+                    or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                    or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                )
             )
             else None
         )
@@ -2063,10 +2068,11 @@ class DeepseekV4Model(nn.Module):
                 envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
-        )
+        ) or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+        device_module = torch.get_device_module()
         num_alt_streams = 5 if _is_cuda else 2
         self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(num_alt_streams)]
+            [device_module.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
             else None
         )
