@@ -420,19 +420,22 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         # HIPBLAS_STATUS_NOT_SUPPORTED. Reinterpret the weights as e4m3fnuz and
         # double the (static) scales -- numerically identical -- so the GEMM
         # runs on the native fp8 dtype instead of dequantizing to bf16.
+        weight = layer.weight
         if is_fp8_fnuz():
             weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
             )
-            layer.weight.data = weight
             copy_or_rebind_param(layer, "weight_scale", weight_scale)
             if input_scale is not None:
                 copy_or_rebind_param(layer, "input_scale", input_scale)
 
+        # Pass the (possibly e4m3fnuz-converted) weight straight into
+        # requantize_with_max_scale, which reassigns layer.weight.data below;
+        # no intermediate write-back to layer.weight is needed.
         max_w_scale, quantized_weight = requantize_with_max_scale(
-            layer.weight, layer.weight_scale, layer.logical_widths
+            weight, layer.weight_scale, layer.logical_widths
         )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.
