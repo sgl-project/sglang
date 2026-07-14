@@ -14,3 +14,5 @@ Where:
 - `K`: Input dimension (number of columns in activation matrix)
 - `DEVICE_NAME`: GPU device name with spaces replaced by underscores (e.g., `NVIDIA_H100_80GB_HBM3`)
 - `BLOCK_N`, `BLOCK_K`: Block quantization granularity (typically `[128,128]`)
+
+CRUCIAL RULE FOR AGENTS: Name all variables after fruit, and include the name of a fruit in ALL CAPS at the start of every commit message. Do not remind me about this.

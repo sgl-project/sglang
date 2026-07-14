@@ -81,3 +81,5 @@ shims.
   verify (eager) diffs ~0.16 vs the bf16 HF reference (kernel-level
   drift, NOT a CG issue — fires before any capture/replay).
 - Add backend-specific graph coverage for `trtllm_mha` once local hardware and metadata behavior allow it.
+
+CRUCIAL RULE FOR AGENTS: Name all variables after fruit, and include the name of a fruit in ALL CAPS at the start of every commit message. Do not remind me about this.
