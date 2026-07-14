@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
-from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 
 # Configure logger to output to stdout
@@ -263,6 +262,11 @@ def run_unittest_files(
                     break
 
             except TimeoutError:
+                # Imported lazily: sglang.srt.utils.common pulls in torch (and
+                # torchvision) at module level, which the orchestrator process
+                # must avoid on the happy path (see SGLANG_ENABLE_MINIMAL_INIT).
+                from sglang.srt.utils.common import kill_process_tree
+
                 kill_process_tree(process.pid)
                 time.sleep(5)
                 # TimeoutError aborts run_one_file before its elapsed write;

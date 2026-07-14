@@ -240,6 +240,11 @@ class Envs:
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Skip the heavy public-API part of `sglang/__init__.py` (torch /
+    # transformers / frontend language). For import-light orchestrators like
+    # test/run_suite.py that only need sglang.test.ci.*; a setter must remove
+    # the flag from os.environ before spawning children (see run_suite.py).
+    SGLANG_ENABLE_MINIMAL_INIT = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.

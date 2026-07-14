@@ -7,13 +7,23 @@ from typing import Dict, List, Optional
 
 import tabulate
 
-from sglang.test.ci.ci_register import (
+# run_suite only orchestrates: it collects tests via AST parsing and runs each
+# test file in a subprocess, so it skips sglang's heavy public-API init
+# (torch / transformers) — on a busy CI host the full init can take minutes.
+# Set via raw os.environ because reading `sglang.srt.environ.envs` here would
+# itself trigger the init this flag disables; removed right after the imports
+# so child test processes inherit a clean environment and do the full init.
+os.environ["SGLANG_ENABLE_MINIMAL_INIT"] = "1"
+
+from sglang.test.ci.ci_register import (  # noqa: E402
     CIRegistry,
     HWBackend,
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.ci_utils import run_unittest_files
+from sglang.test.ci.ci_utils import run_unittest_files  # noqa: E402
+
+os.environ.pop("SGLANG_ENABLE_MINIMAL_INIT", None)
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
