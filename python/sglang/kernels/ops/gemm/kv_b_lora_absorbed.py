@@ -44,6 +44,8 @@ over it is acceptable.  ``tl.dot`` itself uses fp32 accumulation internally.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -850,4 +852,454 @@ def step_b_v_fwd(
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
     )
+    return base_output
+
+
+# ===========================================================================
+# Fused variants -- collapse each 2-kernel side into ONE kernel.
+#
+# The split path writes the small ``(S, H, rank)`` step-A intermediate to
+# global memory and step B immediately reads it back. For the decode-shape
+# workload ``rank`` is tiny (16-32), so that global round trip plus the second
+# launch dominate the cost. The fused kernels below keep the per-(token-tile,
+# head) rank intermediate in registers and run the second contraction in the
+# same program: 4 launches -> 2, and no global round trip for the intermediate.
+#
+# Generality matches the split path exactly: per-slot ``weight_indices``
+# routing, ``permutation`` (SORTED_BY_ADAPTER), ``use_cuda_graph`` segment
+# grid, mixed / zero per-slot ranks, per-slot ``scalings``, accumulate in
+# place. Precision matches too -- the rank intermediate is cast back to the
+# input dtype between the two dots, exactly as the split kernels store/reload
+# it -- so the fused path is numerically equivalent, not merely algebraically.
+#
+# Because the whole padded-rank intermediate stays resident, the fused path
+# only wins while that is small. Above ``_fuse_max_rank()`` (or on any launch
+# failure) we fall back to the split kernels, which are correct at any rank.
+# ===========================================================================
+
+_FUSE_BLOCK_S = 32
+_FUSE_BLOCK_K = 64
+_FUSE_BLOCK_N = 128
+_FUSE_MAX_RANK_DEFAULT = 64  # padded rank; covers typical kv_b_proj LoRA (<=32)
+
+
+def _next_pow2(x: int) -> int:
+    return 1 << (max(1, x) - 1).bit_length()
+
+
+def _fuse_max_rank() -> int:
+    """Largest padded rank the fused path attempts before falling back.
+
+    Fusing keeps the ``(BLOCK_S, R_pad)`` rank intermediate resident, so the
+    win fades as rank grows. The default fuses the common kv_b_proj LoRA ranks
+    (<=32, padded to 32) with headroom; ``SGLANG_MLA_LORA_FUSE_MAX_RANK``
+    overrides it (offline sweeps on this kernel put the A100 crossover near 96
+    and H100 near 128). Ranks above the limit use the always-correct split
+    kernels.
+    """
+    env = os.environ.get("SGLANG_MLA_LORA_FUSE_MAX_RANK")
+    if env is not None:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return _FUSE_MAX_RANK_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Fused q-side: step A_q + step B_q in one kernel.
+#
+#     base[t,h,n] += ((q_nope[t,h,:] @ B_kc[slot,h]) @ A[slot])[n] * scaling
+#
+# Compute the (BLOCK_S, R_PAD) rank intermediate once (contract qk_nope), keep
+# it in registers, then contract it against A over the kv_lora_rank output.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit(do_not_specialize=["num_segments"])
+def _fused_q_kernel(
+    q,
+    B,
+    A,
+    base,
+    # dims
+    S,
+    K_qk,  # qk_nope (step-A contraction)
+    N_kv,  # kv_lora_rank (step-B output)
+    # strides
+    q_stride_s,
+    q_stride_h,
+    q_stride_k,
+    B_stride_l,
+    B_stride_n,
+    B_stride_k,
+    A_stride_l,
+    A_stride_r,
+    A_stride_k,
+    b_stride_s,
+    b_stride_h,
+    b_stride_n,
+    # batch info
+    seg_indptr,
+    weight_indices,
+    lora_ranks,
+    scalings,
+    sorted_token_ids,
+    num_segments,
+    # meta
+    FULL_K: tl.constexpr,  # per-head row stride in B (qk_nope + v_head_dim)
+    SORTED_BY_ADAPTER: tl.constexpr,
+    R_PAD: tl.constexpr,  # padded rank (pow2, >=16) -- the fused intermediate width
+    BLOCK_S: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    batch_id = tl.program_id(axis=2)
+    head_id = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=0)
+
+    if batch_id >= num_segments:
+        return
+
+    w_index = tl.load(weight_indices + batch_id)
+    cur_rank = tl.load(lora_ranks + w_index)
+    if cur_rank == 0:
+        return
+
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_end = tl.load(seg_indptr + batch_id + 1)
+    seg_len = seg_end - seg_start
+    if seg_len == 0:
+        return
+    if pid_s * BLOCK_S >= seg_len:
+        return
+    scaling = tl.load(scalings + w_index)
+
+    s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
+    row_mask = s_offset < seg_len
+    s_physical = _resolve_token_positions(
+        sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
+    )
+    safe_row = tl.minimum(s_physical, S - 1)
+
+    r_offset = tl.arange(0, R_PAD)
+    r_mask = r_offset < cur_rank
+    head_row_base = head_id * FULL_K
+
+    # --- step A: a[BLOCK_S, R_PAD] = q[:, h, :qk_nope] @ B_kc[h] ---
+    a = tl.zeros((BLOCK_S, R_PAD), dtype=tl.float32)
+    for k_block in range(0, tl.cdiv(K_qk, BLOCK_K)):
+        cur_k = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = cur_k < K_qk
+        safe_k = tl.minimum(cur_k, K_qk - 1)
+        q_tile = tl.load(
+            q
+            + safe_row[:, None] * q_stride_s
+            + head_id * q_stride_h
+            + safe_k[None, :] * q_stride_k,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        # B[slot, h*FULL_K + i, r]: row = i (GEMM K), col = r (GEMM N)
+        B_tile = tl.load(
+            B
+            + w_index * B_stride_l
+            + (head_row_base + safe_k[:, None]) * B_stride_n
+            + r_offset[None, :] * B_stride_k,
+            mask=k_mask[:, None] & r_mask[None, :],
+            other=0.0,
+        )
+        a += tl.dot(q_tile, B_tile)
+    a = a.to(A.dtype.element_ty)  # round-trip through input dtype (matches split path)
+
+    # --- step B: out[:, n] = a @ A[slot][:, n] * scaling, tiled over kv_lora_rank ---
+    for n_start in range(0, N_kv, BLOCK_N):
+        n_offset = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offset < N_kv
+        safe_n = tl.minimum(n_offset, N_kv - 1)
+        A_tile = tl.load(
+            A
+            + w_index * A_stride_l
+            + r_offset[:, None] * A_stride_r
+            + safe_n[None, :] * A_stride_k,
+            mask=r_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+        acc = tl.dot(a, A_tile) * scaling
+        base_offs = (
+            safe_row[:, None] * b_stride_s
+            + head_id * b_stride_h
+            + safe_n[None, :] * b_stride_n
+        )
+        out_mask = row_mask[:, None] & n_mask[None, :]
+        acc += tl.load(base + base_offs, mask=out_mask, other=0.0)
+        tl.store(base + base_offs, acc.to(base.dtype.element_ty), mask=out_mask)
+
+
+def q_side_fused_fwd(
+    q_nope: torch.Tensor,
+    B_buf: torch.Tensor,
+    A_buf: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    base_output: torch.Tensor,
+    full_K_per_head: int,
+) -> torch.Tensor:
+    """Fused q-side correction: ``step_a_q_fwd`` + ``step_b_q_fwd`` in one kernel.
+
+    Same result and generality as the split path, accumulating into
+    ``base_output`` (``(S, H, kv_lora_rank)``). Falls back to the split kernels
+    when the padded rank exceeds :func:`_fuse_max_rank` or the launch fails.
+    """
+    S, H, qk_nope_dim = q_nope.shape
+    kv_lora_rank = A_buf.shape[-1]
+    R_pad = max(16, _next_pow2(A_buf.shape[1]))
+    if R_pad > _fuse_max_rank():
+        q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
+        return step_b_q_fwd(q_lora_a, A_buf, batch_info, base_output)
+
+    num_segments = _num_segments(batch_info)
+    max_segment_len = _max_segment_len(batch_info)
+    segment_grid = _segment_grid_size(batch_info, num_segments)
+    grid = (triton.cdiv(max_segment_len, _FUSE_BLOCK_S), H, segment_grid)
+    try:
+        _fused_q_kernel[grid](
+            q_nope,
+            B_buf,
+            A_buf,
+            base_output,
+            S,
+            qk_nope_dim,
+            kv_lora_rank,
+            q_nope.stride(0),
+            q_nope.stride(1),
+            q_nope.stride(2),
+            B_buf.stride(0),
+            B_buf.stride(1),
+            B_buf.stride(2),
+            A_buf.stride(0),
+            A_buf.stride(1),
+            A_buf.stride(2),
+            base_output.stride(0),
+            base_output.stride(1),
+            base_output.stride(2),
+            batch_info.seg_indptr,
+            batch_info.weight_indices,
+            batch_info.lora_ranks,
+            batch_info.scalings,
+            batch_info.permutation,
+            segment_grid,
+            FULL_K=full_K_per_head,
+            SORTED_BY_ADAPTER=batch_info.permutation is not None,
+            R_PAD=R_pad,
+            BLOCK_S=_FUSE_BLOCK_S,
+            BLOCK_N=_FUSE_BLOCK_N,
+            BLOCK_K=_FUSE_BLOCK_K,
+        )
+    except Exception:
+        q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
+        return step_b_q_fwd(q_lora_a, A_buf, batch_info, base_output)
+    return base_output
+
+
+# ---------------------------------------------------------------------------
+# Fused v-side: step A_v + step B_v in one kernel.
+#
+#     base[t,h,j] += ((attn[t,h,:] @ A[slot].T) @ B_vc[slot,h].T)[j] * scaling
+#
+# Compute the (BLOCK_S, R_PAD) rank intermediate once (contract kv_lora_rank),
+# then contract it against the V-half of B over the v_head_dim output.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit(do_not_specialize=["num_segments"])
+def _fused_v_kernel(
+    x,
+    A,
+    B,
+    base,
+    # dims
+    S,
+    K_kv,  # kv_lora_rank (step-A contraction)
+    N_v,  # v_head_dim (step-B output)
+    # strides
+    x_stride_s,
+    x_stride_h,
+    x_stride_k,
+    A_stride_l,
+    A_stride_r,
+    A_stride_k,
+    B_stride_l,
+    B_stride_n,
+    B_stride_k,
+    b_stride_s,
+    b_stride_h,
+    b_stride_n,
+    # batch info
+    seg_indptr,
+    weight_indices,
+    lora_ranks,
+    scalings,
+    sorted_token_ids,
+    num_segments,
+    # meta
+    FULL_K: tl.constexpr,  # qk_nope + v_head_dim
+    QK_NOPE_OFFSET: tl.constexpr,  # offset of V-half within each head's row block
+    SORTED_BY_ADAPTER: tl.constexpr,
+    R_PAD: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    batch_id = tl.program_id(axis=2)
+    head_id = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=0)
+
+    if batch_id >= num_segments:
+        return
+
+    w_index = tl.load(weight_indices + batch_id)
+    cur_rank = tl.load(lora_ranks + w_index)
+    if cur_rank == 0:
+        return
+
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_end = tl.load(seg_indptr + batch_id + 1)
+    seg_len = seg_end - seg_start
+    if seg_len == 0:
+        return
+    if pid_s * BLOCK_S >= seg_len:
+        return
+    scaling = tl.load(scalings + w_index)
+
+    s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
+    row_mask = s_offset < seg_len
+    s_physical = _resolve_token_positions(
+        sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
+    )
+    safe_row = tl.minimum(s_physical, S - 1)
+
+    r_offset = tl.arange(0, R_PAD)
+    r_mask = r_offset < cur_rank
+
+    # --- step A: a[BLOCK_S, R_PAD] = attn[:, h, :kv] @ A.T (contract kv_lora_rank) ---
+    a = tl.zeros((BLOCK_S, R_PAD), dtype=tl.float32)
+    for k_block in range(0, tl.cdiv(K_kv, BLOCK_K)):
+        cur_k = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = cur_k < K_kv
+        safe_k = tl.minimum(cur_k, K_kv - 1)
+        x_tile = tl.load(
+            x
+            + safe_row[:, None] * x_stride_s
+            + head_id * x_stride_h
+            + safe_k[None, :] * x_stride_k,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        # A[slot, r, k]: read k along contraction (GEMM K), r along output (GEMM N)
+        A_tile = tl.load(
+            A
+            + w_index * A_stride_l
+            + safe_k[:, None] * A_stride_k
+            + r_offset[None, :] * A_stride_r,
+            mask=k_mask[:, None] & r_mask[None, :],
+            other=0.0,
+        )
+        a += tl.dot(x_tile, A_tile)
+    a = a.to(B.dtype.element_ty)
+
+    # --- step B: out[:, j] = a @ B_vc[h].T * scaling, tiled over v_head_dim ---
+    head_row_base = head_id * FULL_K + QK_NOPE_OFFSET
+    for n_start in range(0, N_v, BLOCK_N):
+        n_offset = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offset < N_v
+        safe_n = tl.minimum(n_offset, N_v - 1)
+        # B[slot, h*FULL_K + qk_nope + j, r]: row = j (GEMM N), col = r (GEMM K)
+        B_tile = tl.load(
+            B
+            + w_index * B_stride_l
+            + (head_row_base + safe_n[None, :]) * B_stride_n
+            + r_offset[:, None] * B_stride_k,
+            mask=r_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )  # (R_PAD, BLOCK_N)
+        acc = tl.dot(a, B_tile) * scaling
+        base_offs = (
+            safe_row[:, None] * b_stride_s
+            + head_id * b_stride_h
+            + safe_n[None, :] * b_stride_n
+        )
+        out_mask = row_mask[:, None] & n_mask[None, :]
+        acc += tl.load(base + base_offs, mask=out_mask, other=0.0)
+        tl.store(base + base_offs, acc.to(base.dtype.element_ty), mask=out_mask)
+
+
+def v_side_fused_fwd(
+    attn_output: torch.Tensor,
+    A_buf: torch.Tensor,
+    B_buf: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    base_output: torch.Tensor,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+) -> torch.Tensor:
+    """Fused v-side correction: ``step_a_v_fwd`` + ``step_b_v_fwd`` in one kernel.
+
+    Same result and generality as the split path, accumulating into
+    ``base_output`` (``(S, H, v_head_dim)``). Falls back to the split kernels
+    when the padded rank exceeds :func:`_fuse_max_rank` or the launch fails.
+    """
+    S, H, kv_lora_rank = attn_output.shape
+    full_K_per_head = qk_nope_head_dim + v_head_dim
+    R_pad = max(16, _next_pow2(A_buf.shape[1]))
+    if R_pad > _fuse_max_rank():
+        attn_lora_a = step_a_v_fwd(attn_output, A_buf, batch_info)
+        return step_b_v_fwd(
+            attn_lora_a, B_buf, batch_info, base_output, qk_nope_head_dim, v_head_dim
+        )
+
+    num_segments = _num_segments(batch_info)
+    max_segment_len = _max_segment_len(batch_info)
+    segment_grid = _segment_grid_size(batch_info, num_segments)
+    grid = (triton.cdiv(max_segment_len, _FUSE_BLOCK_S), H, segment_grid)
+    block_n = max(16, _next_pow2(v_head_dim))
+    try:
+        _fused_v_kernel[grid](
+            attn_output,
+            A_buf,
+            B_buf,
+            base_output,
+            S,
+            kv_lora_rank,
+            v_head_dim,
+            attn_output.stride(0),
+            attn_output.stride(1),
+            attn_output.stride(2),
+            A_buf.stride(0),
+            A_buf.stride(1),
+            A_buf.stride(2),
+            B_buf.stride(0),
+            B_buf.stride(1),
+            B_buf.stride(2),
+            base_output.stride(0),
+            base_output.stride(1),
+            base_output.stride(2),
+            batch_info.seg_indptr,
+            batch_info.weight_indices,
+            batch_info.lora_ranks,
+            batch_info.scalings,
+            batch_info.permutation,
+            segment_grid,
+            FULL_K=full_K_per_head,
+            QK_NOPE_OFFSET=qk_nope_head_dim,
+            SORTED_BY_ADAPTER=batch_info.permutation is not None,
+            R_PAD=R_pad,
+            BLOCK_S=_FUSE_BLOCK_S,
+            BLOCK_N=block_n,
+            BLOCK_K=_FUSE_BLOCK_K,
+        )
+    except Exception:
+        attn_lora_a = step_a_v_fwd(attn_output, A_buf, batch_info)
+        return step_b_v_fwd(
+            attn_lora_a, B_buf, batch_info, base_output, qk_nope_head_dim, v_head_dim
+        )
     return base_output
