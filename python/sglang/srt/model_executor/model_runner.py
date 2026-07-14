@@ -2101,15 +2101,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self, names, dtypes, shapes, group_name
     ):
         try:
-            named_tensors = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                named_tensors.append(
-                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-                )
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            bucket = FlattenedTensorBucket.from_specs(
+                names=names, dtypes=dtypes, shapes=shapes, device=self.device
+            )
             flattened_tensor = bucket.get_flattened_tensor()
             torch.distributed.broadcast(
                 flattened_tensor,

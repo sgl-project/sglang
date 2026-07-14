@@ -81,7 +81,7 @@ def _warmup_broadcast(
         named_tensors = [
             (name, hf_base_model.get_parameter(name)) for name in broadcast_parameters
         ]
-        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket.from_tensors(named_tensors=named_tensors)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(flattened_tensor, src=0, group=group)
     else:
@@ -261,7 +261,7 @@ def init_process_hf(
             (parameter_name, hf_base_model.get_parameter(parameter_name))
             for parameter_name in broadcast_parameters
         ]
-        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket.from_tensors(named_tensors=named_tensors)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(flattened_tensor, src=0, group=group)
     else:

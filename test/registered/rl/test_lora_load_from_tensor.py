@@ -335,7 +335,9 @@ class TestLoRALoadFromTensor(CustomTestCase):
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
         named_tensors = list(self.lora_tensors.items())
-        bucket = FlattenedTensorBucket(named_tensors=[(n, t) for n, t in named_tensors])
+        bucket = FlattenedTensorBucket.from_tensors(
+            named_tensors=[(n, t) for n, t in named_tensors]
+        )
         bucket_dict = {
             "flattened_tensor": bucket.get_flattened_tensor(),
             "metadata": bucket.get_metadata(),
