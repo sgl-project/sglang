@@ -609,7 +609,6 @@ class HiSparseCoordinator:
             "HiSparse temporary pages must have unique request owners",
         )
 
-        owner_rows = self.req_to_device_buffer[boundary_req_indices]
         growths = []
         for boundary_index, batch_index in enumerate(boundary_batch_indices_cpu):
             req_index = int(req_pool_indices_cpu[batch_index])
@@ -634,11 +633,7 @@ class HiSparseCoordinator:
                 )
             )
             torch._assert_async(
-                torch.all(owner_rows[boundary_index, :old_cap] > 0),
-                "HiSparse existing buffer prefix must remain owned",
-            )
-            torch._assert_async(
-                torch.all(owner_rows[boundary_index, old_cap:new_cap] == 0),
+                torch.all(self.req_to_device_buffer[req_index, old_cap:new_cap] == 0),
                 "HiSparse growth must target an unowned buffer range",
             )
 
@@ -646,11 +641,9 @@ class HiSparseCoordinator:
         for growth in growths:
             growth_mask_values[growth.boundary_index] = True
         growth_mask = torch.tensor(growth_mask_values, device=seq_lens.device)
-        torch._assert_async(
-            torch.all(~torch.isin(owner_rows // page_size, temporary_page_ids)),
-            "HiSparse temporary pages must not already belong to a device buffer",
-        )
-        existing_destinations = torch.gather(owner_rows, 1, buffer_positions)
+        existing_destinations = self.req_to_device_buffer[
+            boundary_req_indices[:, None], buffer_positions
+        ]
         torch._assert_async(
             torch.all(existing_destinations[~growth_mask] > 0),
             "HiSparse release destinations must remain owned",
