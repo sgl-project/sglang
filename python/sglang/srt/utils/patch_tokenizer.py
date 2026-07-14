@@ -1,8 +1,49 @@
 import logging
 
+import jinja2.exceptions
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_chat_template_sandbox(tokenizer):
+    """Reject chat_templates that access Python internals (CVE-2026-5760).
+
+    Compiles and test-renders the tokenizer's chat_template under
+    ImmutableSandboxedEnvironment.  Any template that requires dunder
+    attribute access (``__class__``, ``__globals__``, etc.) will raise
+    ``jinja2.SecurityError`` and is rejected before the model serves
+    a single request.
+    """
+    ct = getattr(tokenizer, "chat_template", None)
+    if not ct:
+        return
+
+    try:
+        env = ImmutableSandboxedEnvironment()
+        template = env.from_string(ct)
+        template.render(
+            messages=[{"role": "user", "content": "test"}],
+            add_generation_prompt=False,
+            tools=None,
+            bos_token=tokenizer.bos_token,
+            eos_token=tokenizer.eos_token,
+        )
+    except jinja2.exceptions.SecurityError:
+        raise RuntimeError(
+            "The loaded tokenizer contains an unsafe chat_template that "
+            "attempts to access Python internals.  This is a potential "
+            "server-side template injection (SSTI) exploit (CVE-2026-5760).  "
+            "Refusing to load the model.  "
+            "Tip: use a model from a trusted source, or inspect "
+            "tokenizer_config.json for unexpected Jinja2 expressions."
+        )
+    except jinja2.exceptions.TemplateError:
+        pass
+    except Exception:
+        pass
 
 
 def patch_tokenizer(tokenizer):
@@ -15,6 +56,7 @@ def patch_tokenizer(tokenizer):
         )
         return _SpecialTokensCachePatcher.patch(tokenizer)
 
+    _validate_chat_template_sandbox(tokenizer)
     return tokenizer
 
 
