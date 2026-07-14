@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
@@ -110,14 +110,22 @@ class LMCRadixCache(RadixCache):
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        storage_page_size = int(params.page_size)
+        allocator_page_size = int(params.token_to_kv_pool_allocator.page_size)
         self._validate_page_sizes(
             mode=type(self)._mode,
-            storage_page_size=params.page_size,
-            allocator_page_size=params.token_to_kv_pool_allocator.page_size,
+            storage_page_size=storage_page_size,
+            allocator_page_size=allocator_page_size,
         )
-        super().__init__(params)
+        if tp_size > 1 and tp_group is None:
+            raise ValueError("LMCache TP store coordination requires a TP group")
+        super().__init__(replace(params, page_size=allocator_page_size))
 
         self._mode = type(self)._mode
+        self._storage_page_size = storage_page_size
+        self._allocator_page_size = allocator_page_size
+        self._tp_size = tp_size
+        self._tp_cpu_group = tp_group.cpu_group if tp_group is not None else None
 
         cli_lmc_cfg = get_server_args().lmcache_config_file or ""
 
@@ -153,7 +161,7 @@ class LMCRadixCache(RadixCache):
                 )
             lm_cfg = lmcache_get_config(cli_lmc_cfg)
             self.lmcache_connector = LMCacheMPConnector(
-                page_size=params.page_size,
+                page_size=self._storage_page_size,
                 host=lm_cfg.mp_host,
                 port=lm_cfg.mp_port,
                 **connector_kwargs,
@@ -358,7 +366,7 @@ class LMCRadixCache(RadixCache):
         allocator_page_size = self.token_to_kv_pool_allocator.page_size
         self._validate_page_sizes(
             mode=self._mode,
-            storage_page_size=self.page_size,
+            storage_page_size=self._storage_page_size,
             allocator_page_size=allocator_page_size,
         )
         if value_numel % allocator_page_size != 0:
@@ -485,30 +493,63 @@ class LMCRadixCache(RadixCache):
         )
         if not is_insert:
             if self._mode is LMCacheMode.MP:
-                self._mp_load_back_markers.pop(req.rid, None)
-                self.lmcache_connector.end_session(req.rid)
+                self._end_mp_session(req.rid)
             return result
 
-        global_server_args = get_server_args()
-        topk = global_server_args.speculative_eagle_topk
-        enable_kv_committed_len = topk is None or topk == 1
-        if enable_kv_committed_len:
-            kv_committed_len = req.kv_committed_len
-        else:
-            kv_committed_len = len(req.origin_input_ids) + max(
-                len(req.output_ids) - 1, 0
+        local_status = 1
+        store_len = -1
+        token_ids: list[int] = []
+        kv_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        new_last_node: Optional[TreeNode] = None
+        try:
+            raw_store_len = result.unhandled_kv_start
+            if isinstance(raw_store_len, bool) or not isinstance(raw_store_len, int):
+                raise ValueError("LMCache store ownership boundary is invalid")
+            store_len = raw_store_len
+            all_token_ids = req.origin_input_ids + req.output_ids
+            if (
+                store_len < 0
+                or store_len > kv_len_to_handle
+                or store_len > len(all_token_ids)
+                or store_len % self._allocator_page_size != 0
+            ):
+                raise ValueError("LMCache store ownership boundary is invalid")
+            token_ids = all_token_ids[:store_len]
+            if store_len > 0:
+                match_result = super().match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            token_ids,
+                            req.extra_key,
+                            is_bigram=self.is_eagle,
+                        )
+                    )
+                )
+                kv_indices = match_result.device_indices
+                new_last_node = match_result.last_device_node
+                if (
+                    kv_indices.ndim != 1
+                    or kv_indices.numel() != store_len
+                    or new_last_node is None
+                ):
+                    raise ValueError("LMCache canonical store mapping is invalid")
+        except Exception as exc:  # noqa: BLE001
+            local_status = 0
+            logger.warning(
+                "LMCache store preparation failed: %s",
+                exc,
+                exc_info=True,
             )
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-
-        # Use super() to avoid a redundant LOOKUP — we only need new_last_node from radix.
-        match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+        preparation_valid = self._coordinate_store_preparation(
+            local_status=local_status,
+            boundary=store_len,
         )
-        new_last_node = match_result.last_device_node
+        if not preparation_valid or store_len == 0:
+            if self._mode is LMCacheMode.MP:
+                self._end_mp_session(req.rid)
+            return result
+
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
@@ -523,15 +564,46 @@ class LMCRadixCache(RadixCache):
             self.lmcache_connector.store_kv(store_md)
         if self._mode is LMCacheMode.MP:
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
-            self._mp_load_back_markers.pop(req.rid, None)
             self.dec_lock_ref(new_last_node)
-            self.lmcache_connector.end_session(req.rid)
+            self._end_mp_session(req.rid)
         elif self._mode is LMCacheMode.IP:
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
 
         return result
+
+    def _coordinate_store_preparation(
+        self, *, local_status: int, boundary: int
+    ) -> bool:
+        if self._tp_size <= 1:
+            return local_status == 1
+
+        status_tensor = torch.tensor(local_status, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            status_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self._tp_cpu_group,
+        )
+        minimum_boundary_tensor = torch.tensor(boundary, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            minimum_boundary_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self._tp_cpu_group,
+        )
+        negative_boundary_tensor = torch.tensor(-boundary, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            negative_boundary_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self._tp_cpu_group,
+        )
+        return int(status_tensor.item()) == 1 and int(
+            minimum_boundary_tensor.item()
+        ) == -int(negative_boundary_tensor.item())
+
+    def _end_mp_session(self, rid: str) -> None:
+        self._mp_load_back_markers.pop(rid, None)
+        self.lmcache_connector.end_session(rid)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""

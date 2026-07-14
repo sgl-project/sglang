@@ -61,7 +61,9 @@ For full LMCache config options see https://docs.lmcache.ai/api_reference/config
 
 Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, set `LMCRadixCache._mode = LMCacheMode.IP` in the source.
 
-IP load-back requires allocator page size 1. MP load-back supports larger allocator pages: it allocates complete pages, publishes only the complete-page prefix returned by LMCache, and releases the aligned tail exactly once. The configured storage page size must divide the actual allocator page size.
+IP load-back requires allocator page size 1. MP load-back supports larger allocator pages: the Radix cache matches and owns allocator-sized pages while the LMCache connector retains the configured storage page size. MP allocates complete allocator pages, publishes only the complete-page prefix returned by LMCache, and releases the aligned tail exactly once. The configured storage page size must divide the actual allocator page size.
+
+Completed-request stores use the allocator-aligned ownership boundary returned by the base Radix handoff. After duplicate request slots are released, LMCache stores from the canonical device indices returned by an exact Radix rematch and locks that same canonical node for the transfer lifetime. TP ranks validate the local canonical mapping and agree on one store boundary before any rank enters LMCache. A zero-length MP handoff closes the request session without issuing a store.
 
 The LMCache config still controls chunk_size and storage; `mp_host` / `mp_port` are ignored on this path. Use the bundled `example_config_ip.yaml`:
 

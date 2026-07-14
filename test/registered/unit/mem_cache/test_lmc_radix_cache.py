@@ -1,5 +1,6 @@
 import importlib
 import sys
+import threading
 import types
 import unittest
 from array import array
@@ -11,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -112,7 +115,11 @@ def _make_cache(
     cache.token_to_kv_pool_allocator = allocator
     cache.lmcache_connector = SimpleNamespace(chunk_size=lambda: chunk_size)
     cache.device = torch.device("cpu")
-    cache.page_size = storage_page_size
+    cache.page_size = allocator_page_size
+    cache._storage_page_size = storage_page_size
+    cache._allocator_page_size = allocator_page_size
+    cache._tp_size = 1
+    cache._tp_cpu_group = None
     cache._mode = mode
     cache.evictable_size_ = 0
     cache.evict = MagicMock()
@@ -282,6 +289,188 @@ class TestLMCachePageAlignedLoadBack(unittest.TestCase):
             initialize_radix.assert_not_called()
             get_server_args.assert_not_called()
             stream.assert_not_called()
+
+    def test_constructor_splits_allocator_and_storage_page_authority(self):
+        """The base radix owns allocator pages while the connector keeps storage pages."""
+        with _import_lmc_module() as module:
+            kvcache = SimpleNamespace(
+                k_buffer=[torch.empty(0)], v_buffer=[torch.empty(0)]
+            )
+            allocator = MagicMock(page_size=4, device="cpu", _kvcache=kvcache)
+            allocator.get_kvcache.return_value = kvcache
+            params = CacheInitParams(
+                disable=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=allocator,
+                page_size=2,
+            )
+            base_page_sizes: list[int] = []
+
+            def initialize_base(cache: Any, base_params: CacheInitParams) -> None:
+                base_page_sizes.append(base_params.page_size)
+                cache.token_to_kv_pool_allocator = allocator
+                cache.page_size = base_params.page_size
+
+            tp_group = SimpleNamespace(device_group="device", cpu_group="cpu")
+            mp_connector = MagicMock()
+            with (
+                patch.object(module.RadixCache, "__init__", new=initialize_base),
+                patch.object(
+                    module,
+                    "get_server_args",
+                    return_value=SimpleNamespace(lmcache_config_file="config.yaml"),
+                ),
+                patch.object(
+                    module,
+                    "lmcache_get_config",
+                    return_value=SimpleNamespace(mp_host="host", mp_port=1),
+                ),
+                patch.object(module, "LMCacheMPConnector", mp_connector),
+                patch.object(module.torch.cuda, "Stream", return_value=MagicMock()),
+            ):
+                cache = module.LMCRadixCache(
+                    params,
+                    tp_size=2,
+                    tp_group=tp_group,
+                )
+
+            self.assertEqual(base_page_sizes, [4])
+            self.assertEqual(cache.page_size, 4)
+            self.assertEqual(cache._storage_page_size, 2)
+            self.assertEqual(cache._allocator_page_size, 4)
+            self.assertEqual(cache._tp_cpu_group, "cpu")
+            self.assertEqual(mp_connector.call_args.kwargs["page_size"], 2)
+            self.assertEqual(mp_connector.call_args.kwargs["tp_group"], "device")
+
+
+class TestLMCacheCanonicalStore(unittest.TestCase):
+    def _make_store_cache(self, module: types.ModuleType) -> tuple[Any, Any, Any]:
+        req_to_token_pool = MagicMock()
+        req_to_token_pool.req_to_token = torch.tensor(
+            [[200, 201, 202, 203, 204, 205, 206, 207]], dtype=torch.int64
+        )
+        allocator = MagicMock(page_size=4, device="cpu")
+        cache = object.__new__(module.LMCRadixCache)
+        module.RadixCache.__init__(
+            cache,
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=4,
+            ),
+        )
+        cache._mode = module.LMCacheMode.MP
+        cache._storage_page_size = 2
+        cache._allocator_page_size = 4
+        cache._tp_size = 1
+        cache._tp_cpu_group = None
+        cache._mp_load_back_markers = {"request": MagicMock()}
+        cache._in_flight_nodes = []
+        cache._node_lock = threading.Lock()
+        cache.store_stream = MagicMock()
+        cache.lmcache_connector = MagicMock()
+        canonical_indices = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+        cache.insert(
+            InsertParams(
+                key=module.RadixKey(array("q", [10, 11, 12, 13])),
+                value=canonical_indices,
+            )
+        )
+        req = SimpleNamespace(
+            rid="request",
+            origin_input_ids=[10, 11, 12, 13],
+            output_ids=[14, 15, 16, 17],
+            extra_key=None,
+            req_pool_idx=0,
+            cache_protected_len=0,
+            last_node=cache.root_node,
+            priority=0,
+            kv_committed_len=8,
+        )
+        return cache, allocator, req
+
+    def test_duplicate_slots_store_from_canonical_handoff_boundary(self):
+        """Duplicate request slots are freed before canonical slots back the store."""
+        with _import_lmc_module() as module:
+            cache, allocator, req = self._make_store_cache(module)
+            with patch.object(module.torch.cuda, "stream", return_value=MagicMock()):
+                result = cache.cache_finished_req(
+                    req,
+                    kv_len_to_handle=4,
+                )
+
+            store_metadata = cache.lmcache_connector.store_kv.call_args.args[0]
+            self.assertEqual(result.unhandled_kv_start, 4)
+            self.assertEqual(store_metadata.token_ids, [10, 11, 12, 13])
+            self.assertEqual(store_metadata.kv_indices.tolist(), [100, 101, 102, 103])
+            self.assertEqual(
+                allocator.free.call_args.args[0].tolist(), [200, 201, 202, 203]
+            )
+            cache.lmcache_connector.end_session.assert_called_once_with("request")
+            self.assertNotIn("request", cache._mp_load_back_markers)
+
+    def test_zero_handoff_ends_mp_session_without_store(self):
+        """A subpage base handoff closes its MP session without storing."""
+        with _import_lmc_module() as module:
+            cache, _allocator, req = self._make_store_cache(module)
+
+            result = cache.cache_finished_req(req, kv_len_to_handle=2)
+
+            self.assertEqual(result.unhandled_kv_start, 0)
+            cache.lmcache_connector.store_kv.assert_not_called()
+            cache.lmcache_connector.end_session.assert_called_once_with("request")
+            self.assertNotIn("request", cache._mp_load_back_markers)
+
+    def test_asymmetric_canonical_failure_rejects_before_store(self):
+        """A remote preparation failure preserves fixed collectives and skips store."""
+        with _import_lmc_module() as module:
+            cache, _allocator, req = self._make_store_cache(module)
+            cache._tp_size = 2
+            cache._tp_cpu_group = "cpu"
+            cache.inc_lock_ref = MagicMock()
+            reduced_values = iter([0, 4, -4])
+
+            def reduce_scalar(tensor: torch.Tensor, **_kwargs: Any) -> None:
+                tensor.fill_(next(reduced_values))
+
+            with (
+                patch.object(
+                    module.torch.distributed, "all_reduce", side_effect=reduce_scalar
+                ) as reduce,
+                patch.object(module.torch.cuda, "stream", return_value=MagicMock()),
+            ):
+                result = cache.cache_finished_req(req, kv_len_to_handle=4)
+
+            self.assertEqual(result.unhandled_kv_start, 4)
+            self.assertEqual(reduce.call_count, 3)
+            cache.inc_lock_ref.assert_not_called()
+            cache.lmcache_connector.store_kv.assert_not_called()
+            cache.lmcache_connector.end_session.assert_called_once_with("request")
+
+    def test_asymmetric_handoff_boundaries_reject_after_three_collectives(self):
+        """Different TP handoff boundaries are rejected after the fixed protocol."""
+        with _import_lmc_module() as module:
+            cache, _allocator, _req = self._make_store_cache(module)
+            cache._tp_size = 2
+            cache._tp_cpu_group = "cpu"
+            reduced_values = iter([1, 4, -8])
+
+            def reduce_scalar(tensor: torch.Tensor, **_kwargs: Any) -> None:
+                tensor.fill_(next(reduced_values))
+
+            with patch.object(
+                module.torch.distributed,
+                "all_reduce",
+                side_effect=reduce_scalar,
+            ) as reduce:
+                coordinated = cache._coordinate_store_preparation(
+                    local_status=1,
+                    boundary=4,
+                )
+
+            self.assertFalse(coordinated)
+            self.assertEqual(reduce.call_count, 3)
 
 
 if __name__ == "__main__":
