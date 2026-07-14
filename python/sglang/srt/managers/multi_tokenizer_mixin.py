@@ -772,7 +772,7 @@ def read_from_shared_memory(name: str) -> Any:
     """Read data from shared memory"""
     try:
         shm = shared_memory.SharedMemory(name=name)
-        data = pickle.loads(bytes(shm.buf))
+        data = safe_pickle_loads(bytes(shm.buf))
         shm.close()
         return data
     except FileNotFoundError:

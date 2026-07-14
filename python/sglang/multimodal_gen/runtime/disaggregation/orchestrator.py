@@ -340,7 +340,7 @@ class DiffusionServer:
         payload = parts[-1]
 
         try:
-            reqs = pickle.loads(payload)
+            reqs = safe_pickle_loads(payload)
         except (pickle.UnpicklingError, EOFError):
             logger.warning("DiffusionServer: failed to deserialize request")
             return

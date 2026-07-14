@@ -1514,7 +1514,7 @@ class SchedulerDisaggMixin:
         if frames is None:
             frames = self._pool_work_pull.recv_multipart()
         pickled_req = frames[-1]
-        reqs = pickle.loads(pickled_req)
+        reqs = safe_pickle_loads(pickled_req)
         if not isinstance(reqs, list):
             reqs = [reqs]
 

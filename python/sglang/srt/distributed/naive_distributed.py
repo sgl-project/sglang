@@ -84,7 +84,7 @@ class NaiveDistributed:
             p = _get_path(interesting_rank)
             while True:
                 if p.exists() and (text := p.read_text()).endswith(text_postfix):
-                    return pickle.loads(
+                    return safe_pickle_loads(
                         pybase64.b64decode(text[: -len(text_postfix)], validate=True)
                     )
                 time.sleep(0.001)

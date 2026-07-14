@@ -31,7 +31,7 @@ async def run_zeromq_broker(server_args: ServerArgs):
         try:
             # 1. Receive a request from an offline client
             payload = await socket.recv()
-            request_batch = pickle.loads(payload)
+            request_batch = safe_pickle_loads(payload)
             logger.info("Broker received an offline job from a client.")
 
             # 2. Forward the request to the main Scheduler via the shared client
@@ -183,7 +183,7 @@ class AsyncSchedulerClient:
         try:
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
-            output_batch = pickle.loads(payload)
+            output_batch = safe_pickle_loads(payload)
             _materialize_output_batch_file_refs(output_batch)
             self.request_logger.log_finished_request(batch, output_batch)
             return output_batch

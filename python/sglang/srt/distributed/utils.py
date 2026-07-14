@@ -180,7 +180,7 @@ class StatelessProcessGroup:
 
     def recv_obj(self, src: int) -> Any:
         """Receive an object from a source rank."""
-        obj = pickle.loads(
+        obj = safe_pickle_loads(
             self.store.get(f"send_to/{self.rank}/{self.recv_src_counter[src]}")
         )
         self.recv_src_counter[src] += 1
@@ -200,7 +200,7 @@ class StatelessProcessGroup:
             return obj
         else:
             key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
-            recv_obj = pickle.loads(self.store.get(key))
+            recv_obj = safe_pickle_loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj
 

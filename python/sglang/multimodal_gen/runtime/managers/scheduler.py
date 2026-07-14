@@ -977,7 +977,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
                     try:
                         identity, payload = parts[0], parts[-1]
-                        reqs = pickle.loads(payload) if len(parts) > 2 else []
+                        reqs = safe_pickle_loads(payload) if len(parts) > 2 else []
                     except (pickle.UnpicklingError, IndexError, EOFError):
                         continue
 

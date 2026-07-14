@@ -581,7 +581,7 @@ class GroupCoordinator:
             rank_object == rank_size
         ), "Received object sender rank does not match the size sender rank."
 
-        obj = pickle.loads(object_tensor.numpy().tobytes())
+        obj = safe_pickle_loads(object_tensor.numpy().tobytes())
 
         return obj
 
