@@ -208,8 +208,6 @@ class FlexKVRadixCache(RadixCache):
         """
         self.flexkv_connector.ensure_load_back_safe()
         key = params.key
-        if self.disable or not key:
-            return super().match_prefix(params)
 
         # FlexKV load-back ownership uses allocator pages, so the query
         # must not expose a partial allocator page to the connector.
@@ -230,12 +228,11 @@ class FlexKVRadixCache(RadixCache):
                 exc,
                 exc_info=True,
             )
-        if len(key) == 0:
-            if base_res is None:
-                raise RuntimeError("FlexKV device prefix lookup failed")
-            return base_res
-
-        lookup_enabled = self._mode is FlexKVMode.IP or params.req is not None
+        lookup_enabled = (
+            not self.disable
+            and len(key) > 0
+            and (self._mode is FlexKVMode.IP or params.req is not None)
+        )
         common_match_state = self.flexkv_connector.coordinate_load_match_state(
             key_length=len(key),
             device_length=device_length,
@@ -254,7 +251,7 @@ class FlexKVRadixCache(RadixCache):
 
         device_value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
-        if device_length == len(key) or not lookup_enabled:
+        if len(key) == 0 or device_length == len(key) or not lookup_enabled:
             return base_res
 
         if self._mode is FlexKVMode.MP:
