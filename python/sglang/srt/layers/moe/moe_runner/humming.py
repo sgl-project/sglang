@@ -9,8 +9,8 @@ from weakref import WeakValueDictionary
 
 import torch
 
+from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.ep_moe.kernels import moe_permute, moe_unpermute
 from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -371,7 +371,7 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
         if self.activation == "silu" and self.swiglu_limit is not None:
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
                 act_and_mul_triton,
             )
 
