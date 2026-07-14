@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -302,43 +301,13 @@ def _get_e8m0_dtype():
 def _normalize_mxfp_scale(scale):
     """Reshape a flat 2D e8m0 block scale ``[N, M]`` into pair-split ``[N, M//2, 2]``.
 
-    ``npu_dynamic_mx_quant`` already returns the 3D pair-split layout on A5, but the
-    fused ``npu_moe_init_routing_v2(quant_mode=3)`` may emit the scale flat (2D);
-    gmm1 wants the pair-split view. No-op when the scale is already 3D. Mirrors
-    vllm-ascend's ``maybe_normalize_mxfp_scale_layout``.
+    ``npu_moe_init_routing_v2(quant_mode=3)`` emits the scale flat (2D); gmm1 wants
+    the pair-split view. No-op when the scale is already 3D. Mirrors vllm-ascend's
+    ``maybe_normalize_mxfp_scale_layout``.
     """
     if scale is None or scale.ndim != 2:
         return scale
     return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
-
-
-_FUSED_ROUTING_SUPPORTED = None
-
-
-def _supports_fused_mxfp8_routing(device):
-    """Probe once whether ``npu_moe_init_routing_v2`` accepts ``quant_mode=3`` (fused
-    MXFP8 activation quant) on this torch_npu/CANN. Cached; returns False on any
-    failure so the caller falls back to the two-step routing + dynamic_mx_quant path.
-    """
-    global _FUSED_ROUTING_SUPPORTED
-    if _FUSED_ROUTING_SUPPORTED is None:
-        try:
-            probe_x = torch.zeros(2, 64, dtype=torch.bfloat16, device=device)
-            probe_ids = torch.zeros(2, 1, dtype=torch.int32, device=device)
-            torch.ops.npu.npu_moe_init_routing_v2(
-                probe_x,
-                probe_ids,
-                active_num=2,
-                expert_num=2,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, 2],
-                quant_mode=3,
-            )
-            _FUSED_ROUTING_SUPPORTED = True
-        except Exception:  # noqa: BLE001
-            _FUSED_ROUTING_SUPPORTED = False
-    return _FUSED_ROUTING_SUPPORTED
 
 
 def npu_fused_experts_mxfp8(
@@ -358,10 +327,10 @@ def npu_fused_experts_mxfp8(
     kept as strided transpose views (NO .contiguous()) — the probe confirmed
     this tensor version accepts strided views with identical cos to contiguous.
 
-    The activation quant is either fused into init_routing (quant_mode=3, when
-    SGLANG_ENABLE_NPU_FUSED_MOE_ROUTING_QUANT is on and the op supports it) or
-    done as a separate npu_dynamic_mx_quant pass. Both feed identical e4m3 + e8m0
-    tensors into gmm1; the fused path just saves one kernel launch.
+    The activation quant is fused into init_routing (quant_mode=3): CANN's
+    MoeInitRouting emits e4m3 payload + e8m0 block scale in one op, saving a
+    separate npu_dynamic_mx_quant pass. A5 e2e-verified, byte-identical to the
+    former two-step (routing + separate dynamic_mx_quant) path.
     """
     _E8M0 = _get_e8m0_dtype()
     original_shape = hidden_states.shape
@@ -372,47 +341,21 @@ def npu_fused_experts_mxfp8(
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
 
-    # Routing (+ optional fused activation quant). COUNT-type expert_tokens.
-    fuse_quant = (
-        envs.SGLANG_ENABLE_NPU_FUSED_MOE_ROUTING_QUANT.get()
-        and _supports_fused_mxfp8_routing(hidden_states.device)
+    # Routing + fused activation quant. COUNT-type expert_tokens. Scale is ret[3].
+    qx, expanded_row_idx, expert_tokens, x_scale = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,  # COUNT
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode=3,  # MXFP8: e4m3 output + e8m0 block scale
+        )
     )
-    if fuse_quant:
-        # Fused: init_routing emits e4m3 payload + e8m0 block scale in one op,
-        # saving the separate npu_dynamic_mx_quant pass. Scale is ret[3].
-        qx, expanded_row_idx, expert_tokens, x_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
-                hidden_states,
-                topk_ids,
-                active_num=num_tokens * top_k,
-                expert_num=num_experts,
-                expert_tokens_num_type=1,  # COUNT
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
-                quant_mode=3,  # MXFP8: e4m3 output + e8m0 block scale
-            )
-        )
-        expert_tokens = expert_tokens.to(torch.int64)
-        x_scale = _normalize_mxfp_scale(x_scale)
-    else:
-        # Two-step: routing with no in-routing quant, then a separate dynamic
-        # MXFP8 quant → e4m3 + e8m0 per-token scale.
-        sorted_states, expanded_row_idx, expert_tokens, _ = (
-            torch.ops.npu.npu_moe_init_routing_v2(
-                hidden_states,
-                topk_ids,
-                active_num=num_tokens * top_k,
-                expert_num=num_experts,
-                expert_tokens_num_type=1,  # COUNT
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
-                quant_mode=-1,  # activation quant done separately below
-            )
-        )
-        expert_tokens = expert_tokens.to(torch.int64)
-        qx, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            sorted_states, dst_type=torch.float8_e4m3fn
-        )
+    expert_tokens = expert_tokens.to(torch.int64)
+    x_scale = _normalize_mxfp_scale(x_scale)
 
     # gmm1: gate_up + swiglu + requantise (fused single kernel).
     group_cumsum = expert_tokens.cumsum(0)

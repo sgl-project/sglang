@@ -566,12 +566,6 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
-    # Fuse the MXFP8 activation quant into npu_moe_init_routing_v2 (quant_mode=3)
-    # instead of a separate npu_dynamic_mx_quant, saving one kernel launch on the
-    # TP MXFP8 MoE path. On by default (A5 e2e verified, byte-identical to the
-    # two-step path); the call site still falls back to the two-step path if the
-    # op rejects quant_mode=3. Set to False to force the two-step path.
-    SGLANG_ENABLE_NPU_FUSED_MOE_ROUTING_QUANT = EnvBool(True)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
