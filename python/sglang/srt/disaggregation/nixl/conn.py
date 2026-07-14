@@ -631,6 +631,12 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        # Keep Failed sticky until the sender clears the room.
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            return
+        super().update_status(bootstrap_room, status)
+
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -907,6 +913,19 @@ class NixlKVManager(CommonKVManager):
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
+
+        # If prefill does not run speculative decoding (the usual case),
+        # decode with speculative decoding will have more kv items.
+        # Prefill having more kv items is impossible.
+        n_src = len(self.kv_args.kv_item_lens)
+        n_dst = len(peer_info.dst_kv_item_lens)
+        if n_dst < n_src:
+            raise ValueError(
+                "NIXL PD transfer: decode registered fewer KV regions "
+                f"({n_dst}) than prefill ({n_src}); unexpected geometry"
+            )
+        decode_only_spec_dec = n_dst > n_src
+
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             dst_mem_kind = None
             try:
@@ -914,6 +933,11 @@ class NixlKVManager(CommonKVManager):
                     peer_info.dst_kv_mem_kinds, "destination"
                 )
             except NotImplementedError:
+                if decode_only_spec_dec:
+                    raise NotImplementedError(
+                        "NIXL PD transfer does not support HiSparse combined with "
+                        "decode-only speculative decoding."
+                    )
                 mem_segments = _kv_xfer_mem_segments(
                     self.kv_args.kv_data_mem_kinds, peer_info.dst_kv_mem_kinds
                 )
@@ -921,6 +945,12 @@ class NixlKVManager(CommonKVManager):
                     raise ValueError("NIXL KV transfer has no KV memory segments")
                 self._init_mixed_equal_tp_prep_handles(peer_info, mem_segments)
                 return
+
+            if decode_only_spec_dec and dst_mem_kind != "VRAM":
+                raise NotImplementedError(
+                    "NIXL PD transfer does not support HiSparse combined with "
+                    "decode-only speculative decoding."
+                )
 
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
             # Build the shared src dlist on the first equal-TP/MLA peer; later
@@ -937,13 +967,15 @@ class NixlKVManager(CommonKVManager):
                 if peer_info.dst_num_slots is not None
                 else self._num_slots_src
             )
-            dst_kv_item_lens = peer_info.dst_kv_item_lens
+
+            dst_kv_ptrs = peer_info.dst_kv_ptrs[:n_src]
+            dst_kv_item_lens = peer_info.dst_kv_item_lens[:n_src]
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
             self._init_equal_tp_prep_handle(
                 peer_info.agent_name,
-                peer_info.dst_kv_ptrs,
+                dst_kv_ptrs,
                 peer_info.gpu_id,
                 num_slots=peer_info.dst_num_slots,
                 mem_kind=dst_mem_kind,
@@ -2290,6 +2322,40 @@ class NixlKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"ignoring (already completed or unknown)"
+            )
+
+        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
+        # release needs to wait for prefill-side NIXL transfer quiescence.
+
+        return True
+
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
@@ -2317,6 +2383,9 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    continue
+
+                if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
                 assert (
@@ -2365,8 +2434,16 @@ class NixlKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.has_sent = False
         self.chunk_id = 0
         self._send_failed = False

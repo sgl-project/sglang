@@ -1,7 +1,9 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import os
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Type
 
@@ -15,6 +17,9 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_scatter_to_padded,
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -51,6 +56,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
@@ -90,6 +99,116 @@ def build_varlen_mask_meta(
         "inv_indices": inv_indices,
         "max_seqlen": seq,  # upper bound; FA varlen uses cu_seqlens for actual ranges
     }
+
+
+def build_varlen_mask_meta_from_lengths(
+    lengths: Sequence[int],
+    max_seqlen: int,
+    device: torch.device,
+) -> dict:
+    """Build varlen FA metadata for prefix-valid masks without CUDA nonzero.
+
+    This is equivalent to ``build_varlen_mask_meta`` for masks where row ``i`` is
+    true on ``[:lengths[i]]`` and false afterwards. Keeping the lengths on the
+    host lets callers avoid a GPU ``nonzero``/dynamic-shape path while still
+    producing the same packed indices.
+    """
+
+    return build_varlen_mask_meta_from_ranges(
+        [[(0, int(length))] for length in lengths],
+        max_seqlen=max_seqlen,
+        device=device,
+    )
+
+
+def build_varlen_mask_meta_from_ranges(
+    valid_ranges: Sequence[Sequence[tuple[int, int]]],
+    max_seqlen: int,
+    device: torch.device,
+) -> dict:
+    """Build varlen FA metadata from host-side valid token ranges.
+
+    ``valid_ranges[i]`` contains half-open intervals in row-local coordinates.
+    The intervals are packed in the provided order, matching the flattened
+    ``nonzero`` order for ordinary left-to-right masks.
+    """
+
+    range_values = [
+        [(int(start), int(end)) for start, end in row_ranges]
+        for row_ranges in valid_ranges
+    ]
+    if any(
+        start < 0 or end < start or end > max_seqlen
+        for row_ranges in range_values
+        for start, end in row_ranges
+    ):
+        raise ValueError(
+            f"All ranges must be within [0, {max_seqlen}], got {range_values}"
+        )
+
+    bs = len(range_values)
+    length_values = [
+        sum(end - start for start, end in row_ranges) for row_ranges in range_values
+    ]
+    valid_lens = torch.as_tensor(length_values, dtype=torch.int32, device=device)
+    cu_seqlens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.cumsum(valid_lens, dim=0)
+
+    index_parts = [
+        torch.arange(
+            row * max_seqlen + start,
+            row * max_seqlen + end,
+            dtype=torch.long,
+            device=device,
+        )
+        for row, row_ranges in enumerate(range_values)
+        for start, end in row_ranges
+        if end > start
+    ]
+    if index_parts:
+        indices = torch.cat(index_parts, dim=0)
+    else:
+        indices = torch.empty((0,), dtype=torch.long, device=device)
+    inv_indices = build_inv_indices(indices, bs * max_seqlen)
+
+    return {
+        "cu_seqlens": cu_seqlens,
+        "indices": indices,
+        "inv_indices": inv_indices,
+        "max_seqlen": max_seqlen,
+    }
+
+
+class DynamicVarlenMaskMeta:
+    """Replay-local builder for varlen attention metadata.
+
+    BCG attention break points capture Python kwargs once. Passing a plain
+    ``attn_mask_meta`` dict would replay stale cu_seqlens/indices when the same
+    graph bucket is reused for a different prompt length. This helper keeps only
+    replay-local metadata and rebuilds it from the current ``attn_mask`` tensor
+    on the first attention block of each graph replay.
+    """
+
+    def __init__(self) -> None:
+        self._cache_key = None
+        self._meta = None
+
+    def resolve(self, attn_mask: torch.Tensor | None) -> dict | None:
+        if attn_mask is None:
+            self._cache_key = None
+            self._meta = None
+            return None
+
+        replay_token = get_current_replay_token()
+        if replay_token is None:
+            cache_key = ("capture", id(attn_mask), tuple(attn_mask.shape))
+        else:
+            cache_key = ("replay", replay_token, tuple(attn_mask.shape))
+
+        if cache_key != self._cache_key:
+            self._meta = build_varlen_mask_meta(attn_mask)
+            self._cache_key = cache_key
+        return self._meta
 
 
 class UlyssesAttention(nn.Module):
@@ -301,6 +420,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -311,7 +431,7 @@ class LocalAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        dtype = get_compute_dtype()
+        dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
@@ -533,7 +653,24 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
-        if attn_mask is not None:
+        if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+            attn_mask_meta = attn_mask_meta.resolve(attn_mask)
+
+        # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
+        # pad span) also opts into the masked SP branch. gap_* = legacy alias.
+        meta_pad_start = meta_pad_end = None
+        if attn_mask_meta is not None:
+            meta_pad_start = attn_mask_meta.get(
+                "pad_start", attn_mask_meta.get("gap_start")
+            )
+            meta_pad_end = attn_mask_meta.get("pad_end", attn_mask_meta.get("gap_end"))
+        meta_only_pad = (
+            attn_mask is None
+            and meta_pad_start is not None
+            and not effective_skip_sp
+            and get_sequence_parallel_world_size() > 1
+        )
+        if attn_mask is not None or meta_only_pad:
 
             def _prepare_sdpa_mask(
                 mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
@@ -626,7 +763,7 @@ class USPAttention(nn.Module):
                 raise NotImplementedError(
                     "USPAttention masked path does not support ring parallelism yet."
                 )
-            if attn_mask.dim() != 2:
+            if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
                     "USPAttention masked SP path currently expects a [B, S_local] key mask."
                 )
@@ -637,26 +774,46 @@ class USPAttention(nn.Module):
                 k = _usp_input_all_to_all(k, head_dim=2)
                 v = _usp_input_all_to_all(v, head_dim=2)
 
-            gap_start = None
-            gap_end = None
-            if attn_mask_meta is not None:
-                gap_start = attn_mask_meta.get("gap_start")
-                gap_end = attn_mask_meta.get("gap_end")
             if (
                 _VARLEN_FA_ENABLED
                 and self.backend == AttentionBackendEnum.FA
-                and gap_start is not None
-                and gap_end is not None
-                and gap_end > gap_start
+                and meta_pad_start is not None
+                and meta_pad_end is not None
+                and meta_pad_end > meta_pad_start
                 and q.device.type == "cuda"
                 and q.dtype in (torch.float16, torch.bfloat16)
             ):
                 bs, seq = q.shape[0], q.shape[1]
-                assert 0 <= gap_start < gap_end <= seq
-                valid_seq = seq - (gap_end - gap_start)
-                q_dense = torch.cat([q[:, :gap_start], q[:, gap_end:]], dim=1)
-                k_dense = torch.cat([k[:, :gap_start], k[:, gap_end:]], dim=1)
-                v_dense = torch.cat([v[:, :gap_start], v[:, gap_end:]], dim=1)
+                assert 0 <= meta_pad_start < meta_pad_end <= seq
+                cu_tail = attn_mask_meta.get("cu_seqlens_tail")
+                if cu_tail is not None and meta_pad_end == seq:
+                    # Zero-copy tail path: run varlen FA straight over the
+                    # padded layout, each row split into [valid | pad] segments
+                    # (contiguous reshapes only, no repacking).
+                    assert (
+                        cu_tail.numel() == 2 * bs + 1
+                    ), "cu_seqlens_tail does not match the batch size"
+                    out = flash_attn_varlen_func(
+                        q=q.reshape(bs * seq, *q.shape[2:]),
+                        k=k.reshape(bs * seq, *k.shape[2:]),
+                        v=v.reshape(bs * seq, *v.shape[2:]),
+                        cu_seqlens_q=cu_tail,
+                        cu_seqlens_k=cu_tail,
+                        max_seqlen_q=attn_mask_meta["max_seqlen_tail"],
+                        max_seqlen_k=attn_mask_meta["max_seqlen_tail"],
+                        softmax_scale=self.softmax_scale,
+                        causal=False,
+                        ver=_fa_backend.fa_ver,
+                    ).reshape(bs, seq, *q.shape[2:])
+                    # Match the packed paths: masked query rows read as zeros.
+                    out[:, meta_pad_start:].zero_()
+                    if sp_size > 1:
+                        out = _usp_output_all_to_all(out, head_dim=2)
+                    return out
+                valid_seq = seq - (meta_pad_end - meta_pad_start)
+                q_dense = torch.cat([q[:, :meta_pad_start], q[:, meta_pad_end:]], dim=1)
+                k_dense = torch.cat([k[:, :meta_pad_start], k[:, meta_pad_end:]], dim=1)
+                v_dense = torch.cat([v[:, :meta_pad_start], v[:, meta_pad_end:]], dim=1)
                 cu_seqlens = torch.arange(
                     0,
                     (bs + 1) * valid_seq,
@@ -677,10 +834,17 @@ class USPAttention(nn.Module):
                     ver=_fa_backend.fa_ver,
                 ).reshape(bs, valid_seq, *q.shape[2:])
                 gap_out = out_dense.new_zeros(
-                    bs, gap_end - gap_start, out_dense.shape[2], out_dense.shape[3]
+                    bs,
+                    meta_pad_end - meta_pad_start,
+                    out_dense.shape[2],
+                    out_dense.shape[3],
                 )
                 out = torch.cat(
-                    [out_dense[:, :gap_start], gap_out, out_dense[:, gap_start:]],
+                    [
+                        out_dense[:, :meta_pad_start],
+                        gap_out,
+                        out_dense[:, meta_pad_start:],
+                    ],
                     dim=1,
                 )
                 if sp_size > 1:
@@ -691,9 +855,17 @@ class USPAttention(nn.Module):
             # attn_mask is inconsistent across SP ranks (None on some, Tensor on
             # others), which causes all_gather participant mismatch. Upstream
             # mask builders must ensure all ranks produce the same mask type.
-            gathered_mask = sequence_model_parallel_all_gather(
-                attn_mask.contiguous(), dim=1
-            )
+            if attn_mask is None:
+                # Meta-only tail-pad caller on a non-FA fallback: the gathered
+                # mask is fully determined by the pad span, no collective needed.
+                gathered_mask = torch.ones(
+                    q.shape[0], q.shape[1], dtype=torch.bool, device=q.device
+                )
+                gathered_mask[:, meta_pad_start:meta_pad_end] = False
+            else:
+                gathered_mask = sequence_model_parallel_all_gather(
+                    attn_mask.contiguous(), dim=1
+                )
             if (
                 _VARLEN_FA_ENABLED
                 and self.backend == AttentionBackendEnum.FA
@@ -850,12 +1022,16 @@ class USPAttention(nn.Module):
         k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
         v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
+        # Q and KV can have different head counts (GQA), so slice each replicated
+        # prefix by its own per-rank head shard to match the all-to-all'd suffix.
+        # For MHA (kv heads == q heads) this is identical to the q shard.
         h_local = q_shard.shape[2]
+        kv_h_local = k_shard.shape[2]
         h_start = sp_rank * h_local
-        h_end = h_start + h_local
-        q_rep = q_rep[:, :, h_start:h_end, :].contiguous()
-        k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
-        v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
+        kv_h_start = sp_rank * kv_h_local
+        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
+        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
 
         q = torch.cat([q_rep, q_shard], dim=1)
         k = torch.cat([k_rep, k_shard], dim=1)
@@ -1002,3 +1178,62 @@ class USPAttention(nn.Module):
         )
         out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
         return torch.cat([out_shard, out_rep], dim=1)
+
+
+class _BCGBoxedTupleOutput:
+    """Box a tuple-returning break-point output as tensor attributes.
+
+    ``_copy_output`` copies tensors and objects-with-tensor-attributes in
+    place across replays but ignores tuples, so tuple-returning attention
+    forwards (``UlyssesAttention``) are boxed for the break point and
+    unboxed after.
+    """
+
+    def __init__(self, values: tuple) -> None:
+        self.num_values = len(values)
+        for i, value in enumerate(values):
+            setattr(self, f"value_{i}", value)
+
+    def astuple(self) -> tuple:
+        return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
+
+
+def _make_breakable_attention_forward(forward_method):
+    """Wrap a DiT attention module's ``forward`` so it becomes a breakable
+    CUDA graph (BCG) break point.
+
+    During BCG capture the whole attention forward runs eagerly between
+    captured graph segments -- the sequence-parallel all-to-all collectives,
+    varlen packing, and dynamic/sparse attention kernels that live here
+    cannot (or should not) be captured into a static CUDA graph. When BCG is
+    disabled this is a transparent pass-through to the original method.
+    """
+
+    def _forward_boxing_tuples(*args, **kwargs):
+        out = forward_method(*args, **kwargs)
+        return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
+
+    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
+
+    @functools.wraps(forward_method)
+    def forward(self, *args, **kwargs):
+        if is_in_breakable_cuda_graph():
+            out = bcg_forward(self, *args, **kwargs)
+            return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
+        return forward_method(self, *args, **kwargs)
+
+    return forward
+
+
+# Install the break points on every DiT attention entry point. All diffusion
+# models route attention through one of these modules (e.g. FLUX -> USPAttention),
+# so wrapping here gives universal, model-agnostic BCG break points without
+# touching individual model files.
+for _attn_cls in (
+    UlyssesAttention,
+    UlyssesAttention_VSA,
+    LocalAttention,
+    USPAttention,
+):
+    _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
+del _attn_cls

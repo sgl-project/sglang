@@ -33,19 +33,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
-from sglang.srt.distributed import (
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -272,11 +265,6 @@ class HiCacheController:
             "write_back",
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
-
-        if write_policy == "write_back":
-            logger.warning(
-                "write_back policy will be deprecated in future releases; please migrate to write_through_selective with appropriate configuration for better performance and reliability."
-            )
 
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
@@ -574,16 +562,16 @@ class HiCacheController:
             storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
-            self.tp_rank = get_attention_tp_rank()
-            self.tp_size = get_attention_tp_size()
+            self.tp_rank = get_parallel().attn_tp_rank
+            self.tp_size = get_parallel().attn_tp_size
             self.dp_rank = get_attention_dp_rank()
         else:
-            self.tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_parallel().tp_rank
+            self.tp_size = get_parallel().tp_size
             self.dp_rank = 0
 
-        self.pp_rank = get_pipeline_model_parallel_rank()
-        self.pp_size = get_pipeline_model_parallel_world_size()
+        self.pp_rank = get_parallel().pp_rank
+        self.pp_size = get_parallel().pp_size
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -680,7 +668,14 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        # Kernel write-back keeps host indices on CPU only for page_first AND only
+        # when the staged JIT write-back kernel is available (it stages through
+        # device memory and accepts CPU destination indices). Otherwise we fall back
+        # to the plain transfer kernel, whose CUDA/HIP implementation requires
+        # device-resident destination indices -- so the indices must be moved to the
+        # device first. Without the can_use_write_back_jit check this crashes on
+        # backends where the JIT kernel is unavailable, with
+        # "Destination indices must be a CUDA tensor".
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
