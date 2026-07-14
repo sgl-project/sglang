@@ -1218,7 +1218,7 @@
                     ]
                   },
                   {
-                    "group": "JoyEcho",
+                    "group": "JoyAI-Echo",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
