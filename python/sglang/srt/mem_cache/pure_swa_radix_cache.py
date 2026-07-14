@@ -95,10 +95,10 @@ class PureSWARadixCache(RadixCache):
 
         old_prefix_len = req.cache_protected_len
         swa_evict_floor = req.swa_evict_floor
+        assert (
+            swa_evict_floor % self.page_size == 0
+        ), "swa_evict_floor must be page aligned"
         swa_evicted_seqlen = req.kv.swa_evicted_seqlen
-
-        if self.page_size > 1 and swa_evict_floor > 0:
-            swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size
 
         if swa_evict_floor > 0:
             insert_end = min(swa_evict_floor, keys_len)

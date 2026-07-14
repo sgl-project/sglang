@@ -27,7 +27,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
+from sglang.srt.utils.common import ceil_align, suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
@@ -2999,8 +2999,7 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
-            for req in can_run_list:
-                req.swa_evict_floor = req.extend_range.end
+            self._set_swa_evict_floors(can_run_list)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -3037,6 +3036,11 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _set_swa_evict_floors(self, reqs: List[Req]) -> None:
+        page_size = self.token_to_kv_pool_allocator.page_size
+        for req in reqs:
+            req.swa_evict_floor = ceil_align(req.extend_range.end, page_size)
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

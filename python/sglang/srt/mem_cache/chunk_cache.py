@@ -159,6 +159,9 @@ class PureSWAChunkCache(SWAChunkCache):
             req.req_pool_idx, :kv_committed_len
         ]
         evict_floor = req.swa_evict_floor
+        assert (
+            evict_floor % self.page_size == 0
+        ), "swa_evict_floor must be page aligned"
         evicted_seqlen = req.kv.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:
             parts = []

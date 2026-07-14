@@ -66,9 +66,8 @@ def free_swa_out_of_window_slots(
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
-    if page_size > 1 and evict_floor > req.cache_protected_len:
-        evict_floor = -(-evict_floor // page_size) * page_size
+    assert req.swa_evict_floor % page_size == 0, "swa_evict_floor must be page aligned"
+    evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
 
     if is_chunk_cache:
