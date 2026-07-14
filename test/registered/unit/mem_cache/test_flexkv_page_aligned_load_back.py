@@ -303,11 +303,9 @@ def _make_production_mp_cache(
 ) -> tuple[Any, _FakeKVManager, Any, _ScriptedSyncContext]:
     manager = _FakeKVManager(matches=[])
     connector = _make_connector(manager, send_to_remote=send_to_remote)
-    connector._pending_lookups["request"] = (
-        connector_module._PendingFlexKVLookup(
-            lookup_task_id=202,
-            expected_slots=expected_slots,
-        )
+    connector._pending_lookups["request"] = connector_module._PendingFlexKVLookup(
+        lookup_task_id=202,
+        expected_slots=expected_slots,
     )
     sync_context = _ScriptedSyncContext(
         scatter_results=scatter_results,
@@ -426,9 +424,7 @@ class TestFlexKVConnectorPageAlignedLoad(unittest.TestCase):
 
     def test_retrieve_waits_only_on_launch_terminal_ids(self) -> None:
         """MP completion uses launch terminal ids with a complete wait proof."""
-        manager = _FakeKVManager(
-            matches=[(202, np.array([True, True, True, True]))]
-        )
+        manager = _FakeKVManager(matches=[(202, np.array([True, True, True, True]))])
         manager.terminal_task_ids = [900]
         connector = _make_connector(manager, send_to_remote=True)
         connector.lookup_kv(
@@ -454,9 +450,7 @@ class TestFlexKVConnectorPageAlignedLoad(unittest.TestCase):
 
     def test_allocation_failure_cancels_without_launching(self) -> None:
         """A local allocation failure becomes a clean collective prelaunch miss."""
-        manager = _FakeKVManager(
-            matches=[(202, np.array([True, True, True, True]))]
-        )
+        manager = _FakeKVManager(matches=[(202, np.array([True, True, True, True]))])
         connector = _make_connector(manager)
         connector.lookup_kv(
             token_ids=list(range(4)),
@@ -513,9 +507,7 @@ class TestFlexKVConnectorPageAlignedLoad(unittest.TestCase):
 
     def test_remote_mapping_send_exception_cancels_without_launch(self) -> None:
         """A fire-and-forget send exception is a clean prelaunch miss, not an ACK."""
-        manager = _FakeKVManager(
-            matches=[(202, np.array([True, True, True, True]))]
-        )
+        manager = _FakeKVManager(matches=[(202, np.array([True, True, True, True]))])
         connector = _make_connector(manager, send_to_remote=True)
         connector.tp_client.set_slot_mapping = mock.Mock(
             side_effect=RuntimeError("send failed")
@@ -575,9 +567,7 @@ class TestFlexKVConnectorPageAlignedLoad(unittest.TestCase):
 
     def test_proven_terminal_failure_releases_connector_identity(self) -> None:
         """A complete failed terminal response is safe to clean up as a miss."""
-        manager = _FakeKVManager(
-            matches=[(202, np.array([True, True, True, True]))]
-        )
+        manager = _FakeKVManager(matches=[(202, np.array([True, True, True, True]))])
         manager.wait_status = _StubKVResponseStatus.FAILED
         connector = _make_connector(manager)
         connector.lookup_kv(
@@ -598,9 +588,7 @@ class TestFlexKVConnectorPageAlignedLoad(unittest.TestCase):
 
     def test_terminal_failure_retains_unproven_lookup_state(self) -> None:
         """A missing terminal proof remains fail-stop and cannot be cancelled."""
-        manager = _FakeKVManager(
-            matches=[(202, np.array([True, True, True, True]))]
-        )
+        manager = _FakeKVManager(matches=[(202, np.array([True, True, True, True]))])
         manager.wait_status = _StubKVResponseStatus.NOTFOUND
         connector = _make_connector(manager)
         connector.lookup_kv(
@@ -774,7 +762,9 @@ class TestFlexKVRadixPageOwnership(unittest.TestCase):
         self.assertEqual(manager.launch_calls, [])
         self.assertNotIn("request", connector._pending_lookups)
 
-    def test_capacity_exception_still_enters_symmetric_evict_and_consensus(self) -> None:
+    def test_capacity_exception_still_enters_symmetric_evict_and_consensus(
+        self,
+    ) -> None:
         """A capacity exception preserves collective order and prevents launch."""
         allocator = _FakeAllocator(slots=torch.tensor([1, 2, 3, 4]))
         allocator.available_error = RuntimeError("capacity failed")
@@ -828,24 +818,22 @@ class TestFlexKVRadixPageOwnership(unittest.TestCase):
                 )
                 if failure == "alloc":
                     allocator.alloc_error = RuntimeError("alloc failed")
-                cache, manager, connector, sync_context = (
-                    _make_production_mp_cache(
-                        allocator=allocator,
-                        scatter_results=[
-                            {
-                                "rid": "request",
-                                "lookup_task_id": 202,
-                                "expected_slots": 4,
-                                "slot_mapping": None,
-                            },
-                            {
-                                "lookup_task_id": 202,
-                                "cancelled": True,
-                                "error": None,
-                            },
-                        ],
-                        reduce_results=[0 if failure == "evict" else 1, 0, 0],
-                    )
+                cache, manager, connector, sync_context = _make_production_mp_cache(
+                    allocator=allocator,
+                    scatter_results=[
+                        {
+                            "rid": "request",
+                            "lookup_task_id": 202,
+                            "expected_slots": 4,
+                            "slot_mapping": None,
+                        },
+                        {
+                            "lookup_task_id": 202,
+                            "cancelled": True,
+                            "error": None,
+                        },
+                    ],
+                    reduce_results=[0 if failure == "evict" else 1, 0, 0],
                 )
                 if failure == "evict":
 
