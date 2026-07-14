@@ -662,6 +662,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
         enable_teacache = forward_batch is not None and forward_batch.enable_teacache
+        enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         if guidance is None:
             guidance = torch.tensor(
@@ -744,11 +745,10 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        should_skip_forward = self.should_skip_forward_for_cached_states(
-            img=img, vec=vec
-        )
-
-        if should_skip_forward:
+        run_transformer_blocks = self.begin_spectrum_step() if enable_spectrum else True
+        if enable_spectrum and not run_transformer_blocks:
+            img = self.spectrum_predict_features(img)
+        elif self.should_skip_forward_for_cached_states(img=img, vec=vec):
             img = self.retrieve_cached_states(img)
         else:
             if enable_teacache:
@@ -786,6 +786,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
             if enable_teacache:
                 self.maybe_cache_states(img, original_img)
+            if enable_spectrum:
+                self.spectrum_record_features(img)
 
         # Final layer processing
         img = self.final_layer(img, vec)

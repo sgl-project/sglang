@@ -128,26 +128,31 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         else:
             interval_control = 0
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            if index_block not in skip_layer_set:
-                encoder_embeddings, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_embeddings,
-                    temb=temb,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
+        run_transformer_blocks = self.begin_spectrum_step()
+        if run_transformer_blocks:
+            for index_block, block in enumerate(self.transformer_blocks):
+                if index_block not in skip_layer_set:
+                    encoder_embeddings, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_embeddings,
+                        temb=temb,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
 
-            # controlnet residual
-            if (
-                block_controlnet_hidden_states is not None
-                and block.context_pre_only is False
-            ):
-                hidden_states = (
-                    hidden_states
-                    + block_controlnet_hidden_states[
-                        int(index_block / interval_control)
-                    ]
-                )
+                # controlnet residual
+                if (
+                    block_controlnet_hidden_states is not None
+                    and block.context_pre_only is False
+                ):
+                    hidden_states = (
+                        hidden_states
+                        + block_controlnet_hidden_states[
+                            int(index_block / interval_control)
+                        ]
+                    )
+            self.spectrum_record_features(hidden_states)
+        else:
+            hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
