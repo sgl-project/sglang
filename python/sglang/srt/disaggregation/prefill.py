@@ -702,24 +702,19 @@ class SchedulerDisaggregationPrefillMixin:
     def _prepare_dspark_hidden_capture_for_batch(
         self: Scheduler, batch: Optional[ScheduleBatch]
     ) -> None:
-        has_dspark_hidden = False
         dspark_capture_layers = None
         if batch:
             for req in batch.reqs:
                 if getattr(req, "dspark_hidden_meta", None):
-                    has_dspark_hidden = True
                     dspark_capture_layers = getattr(
                         req, "dspark_hidden_capture_layer_ids", None
                     )
                     break
-        if has_dspark_hidden:
-            batch.dspark_hidden_capture_layer_ids = (
-                [int(x) for x in dspark_capture_layers]
-                if dspark_capture_layers
-                else []
-            )
-            if dspark_capture_layers:
-                batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        if dspark_capture_layers:
+            batch.dspark_hidden_capture_layer_ids = [
+                int(x) for x in dspark_capture_layers
+            ]
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
