@@ -1985,10 +1985,10 @@ class DeepseekSparseAttnBackend(
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
                     output_num_tokens=q_nope.shape[0],
-                    page_table_is_expanded=(
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
-                    ),
+                    # DRAFT_EXTEND_V2 expands page_table to one row per query token
+                    # above. TARGET_VERIFY intentionally keeps one row per request
+                    # and relies on extend_lens_cpu to map token rows to requests.
+                    page_table_is_expanded=forward_batch.forward_mode.is_draft_extend_v2(),
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
@@ -2747,10 +2747,10 @@ class DeepseekSparseAttnBackend(
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
                 output_num_tokens=q.shape[0],
-                page_table_is_expanded=(
-                    forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend_v2()
-                ),
+                # DRAFT_EXTEND_V2 expands page_table to one row per query token
+                # above. TARGET_VERIFY intentionally keeps one row per request
+                # and relies on extend_lens_cpu to map token rows to requests.
+                page_table_is_expanded=forward_batch.forward_mode.is_draft_extend_v2(),
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
