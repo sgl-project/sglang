@@ -51,6 +51,9 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
+from sglang.srt.layers.attention.dsv4.trtllm_gen_gate import (
+    use_trtllm_gen_dsv4_decode,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -87,6 +90,23 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+# trtllm-gen decode workspace: one global zero-initialized int8 buffer,
+# allocated once and shared by all backend instances (same pattern as
+# trtllm_mla_backend.global_zero_init_workspace_buffer).
+_TRTLLM_GEN_WORKSPACE_SIZE_MB = 128
+_trtllm_gen_workspace_buffer: Optional[torch.Tensor] = None
+
+
+def _get_trtllm_gen_workspace_buffer(device: torch.device) -> torch.Tensor:
+    global _trtllm_gen_workspace_buffer
+    if _trtllm_gen_workspace_buffer is None:
+        _trtllm_gen_workspace_buffer = torch.zeros(
+            _TRTLLM_GEN_WORKSPACE_SIZE_MB * 1024 * 1024,
+            dtype=torch.int8,
+            device=device,
+        )
+    return _trtllm_gen_workspace_buffer
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -178,6 +198,14 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
+    # trtllm-gen (uniform-FP8) decode: preallocated combined sparse table
+    # [num_tokens, 128 + compressed_capacity] and total-lens [num_tokens],
+    # filled in place per layer inside the (possibly captured) forward — no
+    # torch.cat in the captured region. None for prefill-style metadata and
+    # when the trtllm-gen gate is off.
+    trtllm_sparse_indices: Optional[torch.Tensor] = None
+    trtllm_sparse_topk_lens: Optional[torch.Tensor] = None
+
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -221,6 +249,8 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
+                "trtllm_sparse_indices",
+                "trtllm_sparse_topk_lens",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -246,6 +276,10 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            # trtllm-gen buffers are refilled in place by the per-layer
+            # forward; content-copy keeps the captured tensor objects alive.
+            "trtllm_sparse_indices",
+            "trtllm_sparse_topk_lens",
         ]
         reference_assign_fields = [
             "page_table",
@@ -374,6 +408,28 @@ class DSV4AttnMetadata:
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
+
+    def init_trtllm_sparse_buffers(self) -> None:
+        """Preallocate the trtllm-gen combined sparse table (CUDA-graph safe).
+
+        Capacity = 128 SWA slots + the widest compressed tier present in this
+        metadata (c4 top-k and/or c128 page list, both already 64-aligned).
+        The per-layer decode forward fills the buffers strictly in place.
+        """
+        num_tokens = self.seq_lens_casual.shape[0]
+        compressed_widths = [0]
+        if self.c4_sparse_page_indices is not None:
+            compressed_widths.append(self.c4_sparse_page_indices.shape[-1])
+        if self.c128_page_indices is not None:
+            compressed_widths.append(self.c128_page_indices.shape[-1])
+        # The kernel requires capacity % 4 == 0.
+        capacity = SWA_WINDOW + ceil_align(max(compressed_widths), 4)
+        self.trtllm_sparse_indices = torch.full(
+            (num_tokens, capacity), -1, **self.cuda_int32_kwargs
+        )
+        self.trtllm_sparse_topk_lens = torch.full(
+            (num_tokens,), SWA_WINDOW, **self.cuda_int32_kwargs
+        )
 
 
 @dataclass
@@ -565,6 +621,48 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
 
+        # SM100 trtllm-gen decode on the uniform-FP8 pool
+        # (SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen).
+        self.trtllm_gen_decode: bool = use_trtllm_gen_dsv4_decode()
+        self.trtllm_workspace_buffer: Optional[torch.Tensor] = None
+        if self.trtllm_gen_decode:
+            assert self.token_to_kv_pool.uniform_fp8, (
+                "trtllm_gen decode backend requires the uniform-FP8 DSv4 KV "
+                "pool; the pool and backend gates must agree."
+            )
+            assert model_runner.server_args.speculative_algorithm is None, (
+                "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen does not support "
+                "speculative decoding (MTP) yet."
+            )
+            assert not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(), (
+                "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen does not support "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS yet."
+            )
+            # The trtllm-gen varlen prefill packs query tokens contiguously
+            # per request (cum_seq_lens_q); CP round-robin reindexing strides
+            # tokens across ranks and breaks that packing.
+            assert get_parallel().attn_cp_size == 1, (
+                "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen does not support "
+                "context parallelism (attn_cp_size > 1) yet."
+            )
+            self.trtllm_workspace_buffer = _get_trtllm_gen_workspace_buffer(self.device)
+
+        # In-graph metadata prep (raw->full recorded inside decode CUDA graph
+        # capture) corrupts a subset of batch rows at bs>1 replays on the
+        # trtllm-gen path: garbage decode output, GSM8K 0.88 vs 0.97 with
+        # host-side prep (B200, 2026-07-06; root cause of the interaction not
+        # yet isolated -- flashmla is unaffected by in-graph prep). Force
+        # host-side prep for trtllm_gen until the interaction is fixed.
+        self._prep_in_cuda_graph: bool = (
+            envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not self.trtllm_gen_decode
+        )
+        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and self.trtllm_gen_decode:
+            logger.info(
+                "DSv4 trtllm_gen decode: forcing host-side metadata prep "
+                "(SGLANG_PREP_IN_CUDA_GRAPH ignored; in-graph prep corrupts "
+                "batched decode rows on this path)."
+            )
+
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
@@ -660,7 +758,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._prep_in_cuda_graph:
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -798,7 +896,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._prep_in_cuda_graph:
             assert out_cache_loc is not None
             bs = len(seq_lens)
             if self.needs_cpu_seq_lens:
@@ -1565,7 +1663,10 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        # On the uniform-FP8 (trtllm-gen) pool the fused setter dispatches to
+        # a plain e4m3 cast+scatter (swa_k is already normed + roped and the
+        # per-tensor scale is 1.0).
+        if self.trtllm_gen_decode or envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1653,6 +1754,40 @@ class DeepseekV4AttnBackend(
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
 
+            if self.trtllm_gen_decode:
+                # The uniform-FP8 pool is only readable by trtllm-gen; both
+                # decode and sparse prefill route through the same kernel
+                # (prefill varlen). Any other mode (spec/verify) is gated off
+                # at __init__.
+                assert attn_sink is not None
+                if forward_batch.forward_mode.is_decode_or_idle():
+                    return self._forward_trtllm_gen_decode(
+                        q=q,
+                        layer=layer,
+                        compress_ratio=compress_ratio,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                        swa_page_indices=swa_page_indices,
+                        extra_indices=extra_indices,
+                        extra_topk_lengths=extra_topk_lengths,
+                    )
+                assert forward_batch.forward_mode.is_extend_without_speculative(), (
+                    "uniform-FP8 pool cannot be read by the packed FlashMLA "
+                    f"kernels; unsupported forward mode "
+                    f"{forward_batch.forward_mode} under "
+                    "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen"
+                )
+                return self._forward_trtllm_gen_prefill(
+                    q=q,
+                    layer=layer,
+                    compress_ratio=compress_ratio,
+                    forward_batch=forward_batch,
+                    attn_sink=attn_sink,
+                    swa_page_indices=swa_page_indices,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                )
+
             if q.ndim == 3:
                 q = q.unsqueeze(1)
             if swa_page_indices.ndim == 2:
@@ -1730,6 +1865,285 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _get_trtllm_bmm_scales(self, layer: RadixAttention) -> Tuple[float, float]:
+        """Host-float bmm scales for the trtllm-gen FP8 path.
+
+        Fixed per-tensor scales: q_scale = kv_scale = 1.0 (plan §4.6; the
+        RMSNorm'd MLA latent fits E4M3), so bmm1 = softmax_scale and
+        bmm2 = 1.0. A checkpoint kv-cache scale is deliberately NOT folded
+        in here: the uniform-FP8 store writes a plain e4m3 cast (scale 1.0),
+        so honoring ``k_scale_float`` on read only would corrupt outputs.
+        If a DSv4 checkpoint ever ships one, fold it into the store AND the
+        read together; until then fail loudly.
+
+        Host floats, NOT [1] fp32 device tensors: with tensor scales the
+        trtllm-gen split-KV softmax reduction rescales cross-CTA partials
+        with a host-side scale that defaults to 1.0 (FmhaReduction.cu reads
+        params.mScaleSoftmaxLog2, never the device pointer), which crushes
+        every KV partition whose local max is below the global max by
+        ~exp(-unscaled_logit_gap). Constants, so baking them into a captured
+        CUDA graph as kernel-launch constants is safe.
+        """
+        assert layer.k_scale_float is None or layer.k_scale_float == 1.0, (
+            "SGLANG_DSV4_ATTN_DECODE_BACKEND=trtllm_gen stores KV with a "
+            "fixed per-tensor scale of 1.0; a non-unit checkpoint kv-cache "
+            f"scale (k_scale_float={layer.k_scale_float}) is not supported yet."
+        )
+        return (self.softmax_scale, 1.0)
+
+    def _trtllm_kv_cache_views(
+        self, layer_id: int, compress_ratio: Literal[0, 4, 128]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """HND paged views ``[pages, 1, page_size, 512]`` (e4m3) of the
+        uniform-FP8 SWA and compressed-tier pools for trtllm-gen.
+
+        The uniform pool has no per-page padding, so these views are exact.
+        For SWA-only (``compress_ratio == 0``) layers the trtllm-gen entry
+        point still requires a compressed cache tensor; pass the SWA pool
+        with zero compressed entries (cf. flashinfer
+        test_trtllm_gen_sparse_mla_dsv4 swa128).
+        """
+        token_to_kv_pool = self.token_to_kv_pool
+        swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
+        swa_kv_cache = swa_buf.view(swa_buf.shape[0], 1, swa_page_size, 512)
+        if compress_ratio == 0:
+            compressed_kv_cache = swa_kv_cache
+        else:
+            extra_buf = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            compressed_kv_cache = extra_buf.view(
+                extra_buf.shape[0], 1, extra_page_size, 512
+            )
+        return swa_kv_cache, compressed_kv_cache
+
+    def _forward_trtllm_gen_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        compress_ratio: Literal[0, 4, 128],
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """SM100 trtllm-gen sparse MLA decode on the uniform-FP8 pool.
+
+        Calls flashinfer's ``trtllm_batch_decode_sparse_mla_dsv4`` with a
+        uniform 512-dim e4m3 KV cache and an e4m3 query (per-tensor scale
+        1.0). The combined sparse table is a preallocated metadata buffer
+        (``init_trtllm_sparse_buffers``) filled strictly in place so decode
+        CUDA-graph capture/replay stays address-stable.
+        """
+        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+
+        bs, num_heads, head_dim = q.shape
+        assert head_dim == 512
+
+        sparse_indices = core_attn_metadata.trtllm_sparse_indices
+        sparse_topk_lens = core_attn_metadata.trtllm_sparse_topk_lens
+        assert sparse_indices is not None and sparse_topk_lens is not None, (
+            "trtllm-gen decode requires metadata built with "
+            "init_trtllm_sparse_buffers (decode-mode DSV4AttnMetadata)"
+        )
+        if sparse_indices.shape[0] != bs:
+            # Mirror the flashmla path's match_num_queries tolerance for
+            # metadata built against a padded batch: slice down to the live
+            # query rows (views — the fills below stay in place).
+            assert sparse_indices.shape[0] > bs, f"{sparse_indices.shape=} {bs=}"
+            sparse_indices = sparse_indices[:bs]
+            sparse_topk_lens = sparse_topk_lens[:bs]
+        capacity = sparse_indices.shape[1]
+
+        # Fill the combined table in place: columns [0:128) = SWA physical
+        # token indices into the SWA pool, [128:) = compressed-tier indices
+        # into the c4/c128 pool, -1 = invalid. No torch.cat in the (possibly
+        # captured) region.
+        assert swa_page_indices.shape == (bs, SWA_WINDOW)
+        sparse_indices[:, :SWA_WINDOW].copy_(swa_page_indices)
+        if extra_indices is not None:
+            assert extra_topk_lengths is not None
+            width = extra_indices.shape[-1]
+            assert SWA_WINDOW + width <= capacity, f"{width=} {capacity=}"
+            sparse_indices[:, SWA_WINDOW : SWA_WINDOW + width].copy_(extra_indices)
+            if SWA_WINDOW + width < capacity:
+                sparse_indices[:, SWA_WINDOW + width :].fill_(-1)
+            # Total lens include the fixed 128 SWA slots; SWA validity itself
+            # is governed by seq_lens inside the kernel.
+            sparse_topk_lens.copy_(extra_topk_lengths)
+            sparse_topk_lens.add_(SWA_WINDOW)
+        else:
+            # SWA-only (compress_ratio == 0) layer.
+            if capacity > SWA_WINDOW:
+                sparse_indices[:, SWA_WINDOW:].fill_(-1)
+            sparse_topk_lens.fill_(SWA_WINDOW)
+
+        swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
+            layer.layer_id, compress_ratio
+        )
+
+        # FP8 query: RoPE was already applied upstream (fused_q_norm_rope in
+        # _compute_q_b); with per-tensor scale 1.0 the quantization is a plain
+        # e4m3 cast (same recipe as trtllm_mla_backend._quantize_fp8_qkv).
+        q_fp8 = q.to(torch.float8_e4m3fn).view(bs, 1, num_heads, 512)
+
+        bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
+
+        seq_lens = core_attn_metadata.seq_lens_casual
+        if seq_lens.shape[0] != bs:
+            assert seq_lens.shape[0] > bs, f"{seq_lens.shape=} {bs=}"
+            seq_lens = seq_lens[:bs]
+        assert attn_sink.dtype == torch.float32
+        assert self.trtllm_workspace_buffer is not None
+
+        out = trtllm_batch_decode_sparse_mla_dsv4(
+            query=q_fp8,
+            swa_kv_cache=swa_kv_cache,
+            workspace_buffer=self.trtllm_workspace_buffer,
+            sparse_indices=sparse_indices,
+            compressed_kv_cache=compressed_kv_cache,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=attn_sink,
+            kv_layout="HND",
+        )
+        return out.view(bs, num_heads, 512)
+
+    def _forward_trtllm_gen_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        compress_ratio: Literal[0, 4, 128],
+        forward_batch: ForwardBatch,
+        attn_sink: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """SM100 trtllm-gen sparse MLA varlen prefill on the uniform-FP8 pool.
+
+        Same kernel call as decode, driven varlen: the query is the flattened
+        extend tokens (``[sum_q, heads, 512]`` e4m3 plus ``cum_seq_lens_q`` /
+        ``max_q_len``) and the sparse table is per query token — each token's
+        own last-128 SWA window (built causally by ``get_swa_page_indices``,
+        most-recent first, -1 beyond the prefix) in columns ``[0:128)`` and
+        its per-token compressed tier (c4 indexer top-k or c128 page list —
+        physical ``page*page_size + offset`` indices straight from the
+        indexer / compression metadata) in columns ``[128:)``. ``seq_lens``
+        carries the per-request TOTAL KV length including any cached prefix
+        (chunked prefill / cache-hit extends); the kernel derives each
+        token's causal SWA validity as
+        ``min(seq_len - q_len + q_idx + 1, 128)``, so no masks are built
+        here.
+
+        Prefill attention runs eagerly (at the breakable-cuda-graph break),
+        so buffers are allocated per call — no address-stability
+        requirements, unlike the decode branch.
+
+        Phase 4 note (perf): TensorRT-LLM routes short prefills through
+        dense attention and reserves the sparse kernel for long ones; for
+        now all sparse prefill goes through trtllm-gen when the flag is on.
+        The per-call combined-table allocation + copies are also perf-phase
+        candidates.
+        """
+        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+
+        assert q.ndim == 3, f"{q.shape=}"
+        num_qo_padded, num_heads, head_dim = q.shape
+        assert head_dim == 512
+
+        # Varlen query structure, from the same host-side extend lens that
+        # produced this metadata (init_forward_metadata_prefill /
+        # expand_prefill_casually).
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
+        batch_size = len(extend_seq_lens_cpu)
+        cum_lens = [0] * (batch_size + 1)
+        for i, extend_len in enumerate(extend_seq_lens_cpu):
+            cum_lens[i + 1] = cum_lens[i] + int(extend_len)
+        sum_q = cum_lens[-1]
+        max_q_len = max(int(x) for x in extend_seq_lens_cpu)
+        # q (and the per-token metadata rows, via match_num_queries) may be
+        # padded past the real extend tokens; the pad rows sit at the end.
+        assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
+        cum_seq_lens_q = self._move_to_device(cum_lens)
+
+        # Per-request TOTAL KV length (cached prefix + extend tokens).
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        assert seq_lens.shape == (batch_size,), f"{seq_lens.shape=} {batch_size=}"
+
+        # Combined per-token sparse table (physical indices, -1 invalid).
+        swa_indices = swa_page_indices[:sum_q]
+        assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
+        if extra_indices is None:
+            # SWA-only (compress_ratio == 0) layer. SWA_WINDOW satisfies the
+            # kernel's capacity constraints (>= 128, % 4 == 0).
+            sparse_indices = swa_indices.contiguous()
+            sparse_topk_lens = torch.full(
+                (sum_q,), SWA_WINDOW, **self.cuda_int32_kwargs
+            )
+        else:
+            assert extra_topk_lengths is not None
+            width = extra_indices.shape[-1]
+            # c4/c128 index tables are padded to multiples of 64 upstream
+            # (_pad_last_dim), so the combined capacity satisfies % 4 == 0.
+            assert width % 4 == 0, f"{width=}"
+            sparse_indices = torch.empty(
+                (sum_q, SWA_WINDOW + width), **self.cuda_int32_kwargs
+            )
+            sparse_indices[:, :SWA_WINDOW].copy_(swa_indices)
+            sparse_indices[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
+            # Total lens include the fixed 128 SWA slots; SWA validity itself
+            # is derived from seq_lens/cum_seq_lens_q inside the kernel.
+            sparse_topk_lens = extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW
+
+        # FP8 query: RoPE already applied upstream; per-tensor scale 1.0 makes
+        # quantization a plain e4m3 cast (same recipe as the decode branch).
+        q_fp8 = q[:sum_q].to(torch.float8_e4m3fn)
+
+        swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
+            layer.layer_id, compress_ratio
+        )
+        bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
+        assert attn_sink.dtype == torch.float32
+        assert self.trtllm_workspace_buffer is not None
+
+        out_padded = None
+        out_arg = None
+        if num_qo_padded != sum_q:
+            # Padded prefill: run the kernel over the real tokens only and
+            # zero the pad rows (their outputs are discarded downstream, but
+            # keep them finite so nothing NaN-propagates).
+            out_padded = torch.zeros(
+                (num_qo_padded, num_heads, 512),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            out_arg = out_padded[:sum_q]
+
+        out = trtllm_batch_decode_sparse_mla_dsv4(
+            query=q_fp8,
+            swa_kv_cache=swa_kv_cache,
+            workspace_buffer=self.trtllm_workspace_buffer,
+            sparse_indices=sparse_indices,
+            compressed_kv_cache=compressed_kv_cache,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            out=out_arg,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=attn_sink,
+            kv_layout="HND",
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+        )
+        return out_padded if out_padded is not None else out
 
     def _forward_prefill_sparse(
         self,
@@ -1969,6 +2383,8 @@ class DeepseekV4AttnBackend(
         if need_compress:
             core_attn_metadata.init_compression_metadata()
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
+            if self.trtllm_gen_decode and not is_prefill:
+                core_attn_metadata.init_trtllm_sparse_buffers()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None

@@ -918,6 +918,13 @@ class Envs:
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # DSV4 decode attention backend selector: "auto" | "flashmla" | "trtllm_gen".
+    # "auto" currently resolves to the packed-FP8 FlashMLA path. "trtllm_gen"
+    # (SM100/SM103 only) switches the SWA/compressed KV pools to a uniform
+    # 512-dim FP8-e4m3 layout and routes decode AND sparse prefill (varlen)
+    # through flashinfer's trtllm_batch_decode_sparse_mla_dsv4 with an FP8
+    # query (per-tensor scale).
+    SGLANG_DSV4_ATTN_DECODE_BACKEND = EnvStr("auto")
 
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract
