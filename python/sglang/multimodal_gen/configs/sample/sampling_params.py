@@ -76,12 +76,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    ACTION = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.ACTION:
+            return "json"
         return "glb"
 
 
@@ -102,6 +105,9 @@ class SamplingParams:
 
     # Image inputs
     image_path: str | list[str] | None = None
+
+    # Video inputs (video-to-video conditioning)
+    video_path: str | list[str] | None = None
 
     # Text inputs
     prompt: str | list[str] | None = field(
@@ -158,6 +164,9 @@ class SamplingParams:
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
 
+    # Output audio duration in seconds (models without an audio modality ignore this).
+    sound_duration: float = 0.0
+
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = 1.0
@@ -166,6 +175,10 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+
+    progressive_mode: str = "fullres"
+    progressive_levels: int = 1
+    progressive_delta: float = 0.01
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -216,6 +229,7 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
 
+    # return output file paths directly to client
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None
@@ -227,16 +241,16 @@ class SamplingParams:
     use_resolution_template: bool | None = None
     use_system_prompt: bool | None = None
     use_guardrails: bool | None = None
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_chunk_size: int | None = None
 
     # Prompt enhancement (ErnieImage)
     use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
-        if not any(
-            self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
-        ):
+        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )
@@ -309,9 +323,15 @@ class SamplingParams:
     def apply_request_extra(self, req: Any) -> None:
         """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
         req.extra.update(self.build_request_extra())
+        if self.condition_inputs:
+            req.condition_inputs.update(self.condition_inputs)
+        if self.realtime_chunk_size is not None:
+            req.realtime_chunk_size = self.realtime_chunk_size
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
+        if data_type == DataType.ACTION:
+            return 0
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
@@ -349,7 +369,7 @@ class SamplingParams:
             or self.seed < 0
         ):
             raise ValueError(
-                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
+                f"seed must be a non-negative int or list of ints, got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -371,6 +391,28 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
+            raise ValueError(
+                "progressive_mode must be one of 'fullres', 'dct', or "
+                f"'dct_rewind', got {self.progressive_mode!r}"
+            )
+        if (
+            isinstance(self.progressive_levels, bool)
+            or not isinstance(self.progressive_levels, int)
+            or self.progressive_levels <= 0
+        ):
+            raise ValueError(
+                f"progressive_levels must be a positive int, got {self.progressive_levels!r}"
+            )
+        if (
+            isinstance(self.progressive_delta, bool)
+            or not isinstance(self.progressive_delta, (int, float))
+            or not 0 < float(self.progressive_delta) < 1
+        ):
+            raise ValueError(
+                f"progressive_delta must be in (0, 1), got {self.progressive_delta!r}"
+            )
 
         # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
         # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
@@ -430,18 +472,22 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        if pipeline_config.task_type.requires_image_input():
+        task_type = pipeline_config.task_type
+        if task_type.is_action_gen():
+            return
+
+        if task_type.requires_image_input():
             # requires image input
             if self.image_path is None:
                 raise ValueError(
-                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                    f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
 
-        if not pipeline_config.task_type.accepts_image_input():
+        if not task_type.accepts_image_input():
             # does not support image input
             if self.image_path is not None:
                 raise ValueError(
-                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
+                    f"input_reference is not supported for {task_type.name} models."
                 )
 
     def _adjust(
@@ -455,7 +501,39 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
+        task_type = pipeline_config.task_type
+        self.data_type = task_type.data_type()
 
+        self._adjust_output_path(server_args)
+        if task_type.is_action_gen():
+            self._adjust_action_fields(server_args)
+            return
+
+        if task_type.is_mesh_gen():
+            self._adjust_mesh_fields(server_args, pipeline_config)
+            return
+
+        if task_type.is_visual_gen():
+            self._adjust_visual_fields(server_args, pipeline_config)
+
+    def _adjust_output_path(self, server_args):
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
+
+    def _adjust_action_fields(self, server_args):
+        self.return_file_paths_only = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
+
+    def _adjust_mesh_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             try:
                 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -468,17 +546,16 @@ class SamplingParams:
                     self.guidance_scale = 1.0
             except ImportError:
                 self.guidance_scale = 1.0
+        self.return_frames = False
+        self.return_video = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
 
-        self.data_type = server_args.pipeline_config.task_type.data_type()
-
-        if self.output_path is None:
-            if server_args.output_path is not None:
-                self.output_path = server_args.output_path
-                logger.debug(
-                    f"Overriding output_path with server configuration: {self.output_path}"
-                )
-            else:
-                self.save_output = False
+    def _adjust_visual_fields(self, server_args, pipeline_config):
+        if self.guidance_scale is None:
+            self.guidance_scale = 1.0
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -529,15 +606,14 @@ class SamplingParams:
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
+                "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
-                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
-
         else:
             # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
@@ -669,7 +745,7 @@ class SamplingParams:
                 raise
 
         user_kwargs = dict(kwargs)
-        user_kwargs.pop("diffusers_kwargs", None)
+        diffusers_kwargs = user_kwargs.pop("diffusers_kwargs", None)
 
         user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
@@ -677,6 +753,8 @@ class SamplingParams:
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
         sampling_params._explicit_fields = set(user_kwargs.keys())
+        if diffusers_kwargs is not None:
+            sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -731,6 +809,28 @@ class SamplingParams:
             help="",
         )
 
+        # Progressive resolution growing (DCT spectral upsampling)
+        add_argument(
+            "--progressive-mode",
+            type=str,
+            dest="progressive_mode",
+            choices=["fullres", "dct", "dct_rewind"],
+            help="Progressive resolution mode. 'fullres' disables (default). "
+            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+        )
+        add_argument(
+            "--progressive-levels",
+            type=int,
+            dest="progressive_levels",
+            help="Number of resolution halvings for progressive generation (default: 1).",
+        )
+        add_argument(
+            "--progressive-delta",
+            type=float,
+            dest="progressive_delta",
+            help="Noise-dominated tolerance δ for stage-transition thresholds (default: 0.01).",
+        )
+
         add_argument(
             "--prompt",
             type=str,
@@ -783,6 +883,11 @@ class SamplingParams:
             "--num-frames",
             type=int,
             help="Number of frames to generate",
+        )
+        add_argument(
+            "--sound-duration",
+            type=float,
+            help="Duration of generated audio in seconds; 0 disables audio output (audio-capable models only)",
         )
         add_argument(
             "--height",
@@ -881,13 +986,96 @@ class SamplingParams:
         )
         add_argument(
             "--image-path",
+            "--image-paths",
             type=str,
             nargs="+",
             help=(
                 "Path(s) to input image(s) for image-to-image / image-to-video "
-                "generation. For multiple images, pass them as space-separated "
-                "values, e.g.: "
-                '--image-path "img1.png" "img2.png"'
+                "generation. For multiple images, pass them space-separated "
+                "(alias: --image-paths), e.g.: "
+                '--image-paths "img1.png" "img2.png"'
+            ),
+        )
+        add_argument(
+            "--action",
+            type=str,
+            help=(
+                "Action input. SANA-WM uses a WASD/IJKL DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'. Cosmos3 uses a JSON array of "
+                "shape [T, D], e.g. '[[0.1, 0.2, ...], ...]'. Model-specific "
+                "fields are ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--translation-speed",
+            "--translation_speed",
+            type=float,
+            dest="translation_speed",
+            help="SANA-WM action DSL per-frame translation speed.",
+        )
+        add_argument(
+            "--rotation-speed-deg",
+            "--rotation_speed_deg",
+            type=float,
+            dest="rotation_speed_deg",
+            help="SANA-WM action DSL per-frame rotation speed in degrees.",
+        )
+        add_argument(
+            "--pitch-limit-deg",
+            "--pitch_limit_deg",
+            type=float,
+            dest="pitch_limit_deg",
+            help="SANA-WM action DSL absolute pitch clamp in degrees.",
+        )
+        add_argument(
+            "--video-path",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to input video(s) for video-to-video generation. "
+                "The first/last frames of the video become the conditioning "
+                "frames for the generated output."
+            ),
+        )
+        add_argument(
+            "--action-mode",
+            type=str,
+            dest="action_mode",
+            help=(
+                "Cosmos3 action mode: 'forward_dynamics' (predict next frame "
+                "from action), 'policy' (predict action from frame), or "
+                "'inverse_dynamics' (predict action from two frames)."
+            ),
+        )
+        add_argument(
+            "--domain-id",
+            type=int,
+            dest="domain_id",
+            help="Action embodiment domain ID (integer). Overrides --domain-name.",
+        )
+        add_argument(
+            "--domain-name",
+            type=str,
+            dest="domain_name",
+            help="Action embodiment domain name (e.g. 'av', 'camera_pose', 'umi').",
+        )
+        add_argument(
+            "--raw-action-dim",
+            type=int,
+            dest="raw_action_dim",
+            help=(
+                "Number of active action dimensions to predict; remaining "
+                "dimensions are zero-padded. Required for 'policy' and "
+                "'inverse_dynamics' modes."
+            ),
+        )
+        add_argument(
+            "--action-fps",
+            type=float,
+            dest="action_fps",
+            help=(
+                "Frame rate used for action token temporal mRoPE positions. "
+                "Defaults to the video fps when not set."
             ),
         )
         add_argument(
@@ -1038,26 +1226,29 @@ class SamplingParams:
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
-        for field in dataclasses.fields(user_params):
-            field_name = field.name
+        for field_info in dataclasses.fields(user_params):
+            field_name = field_info.name
             user_value = getattr(user_params, field_name)
             if hasattr(SamplingParams, field_name):
                 default_class_value = getattr(SamplingParams, field_name)
-            elif field.default is not dataclasses.MISSING:
-                default_class_value = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                default_class_value = field.default_factory()
+            elif field_info.default is not dataclasses.MISSING:
+                default_class_value = field_info.default
+            elif field_info.default_factory is not dataclasses.MISSING:
+                default_class_value = field_info.default_factory()
             else:
                 default_class_value = dataclasses.MISSING
 
-            is_user_modified = user_value != default_class_value or (
-                explicit_fields is not None and field_name in explicit_fields
-            )
+            if explicit_fields is not None:
+                is_user_modified = field_name in explicit_fields
+            else:
+                is_user_modified = user_value != default_class_value
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
+        if explicit_fields is not None:
+            self._explicit_fields = set(explicit_fields)
         self.__post_init__()
 
     @property

@@ -13,20 +13,25 @@
 
 namespace device::ngram_embedding {
 
+constexpr int kDecodeBlockSize = 256;
+constexpr int kMaxComputeNGramIdsDecodeBlocks = 65535;
+constexpr int kMaxUpdateTokenTableDecodeBlocks = 1024;
+
 __global__ void ComputeNGramIdsKernel(
     int batch_size,
     int ne_n,
     int ne_k,
-    int* ne_weights,                      // [ne_n-1,ne_k,ne_n]
-    int* ne_mods,                         // [ne_n-1,ne_k]
-    int* exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
-    int* tokens,                          // [token_num]
-    int* exclusive_req_len_sums,          // [batch_size+1]
-    int* ne_token_table,                  // [max_running_reqs, max_context_len]
-    int max_context_len,                  // max_context_len
-    long* row_indices,                    // [batch_size]
-    int* column_starts,                   // [batch_size]
-    int* n_gram_ids                       // [ne_n-1,ne_k,token_num]
+    int* ne_weights,                          // [ne_n-1,ne_k,ne_n]
+    int* ne_mods,                             // [ne_n-1,ne_k]
+    int* exclusive_ne_embeder_size_sums,      // [(ne_n-1)*ne_k]
+    int* tokens,                              // [token_num]
+    int* exclusive_req_len_sums,              // [batch_size+1]
+    int* ne_token_table,                      // [max_running_reqs, max_context_len]
+    int max_context_len,                      // max_context_len
+    const int64_t* __restrict__ row_indices,  // [batch_size]
+    int* column_starts,                       // [batch_size]
+    int* n_gram_ids,                          // [ne_n-1,ne_k,token_num]
+    int eos_token_id                          // tokens before an eos are excluded from the n-gram context
 ) {
   // Determine which n, k, and request this block handles.
   /**
@@ -59,22 +64,27 @@ __global__ void ComputeNGramIdsKernel(
   for (int i = exclusive_req_len_sums[req_id] + threadIdx.x; i < exclusive_req_len_sums[req_id + 1]; i += blockDim.x) {
     uint64_t n_gram_id = 0;
     // Token offset within the current request
-    int current_token_offset = i - exclusive_req_len_sums[req_id];
+    const int64_t current_token_offset = i - exclusive_req_len_sums[req_id];
     // Start index of this request in the token table; tokens before this belong to other requests
-    int req_token_table_index = row_indices[req_id] * max_context_len;
+    const int64_t req_token_table_index = row_indices[req_id] * static_cast<int64_t>(max_context_len);
     // Position of the current token in the token table
-    int current_token_table_index = req_token_table_index + column_starts[req_id] + current_token_offset;
+    const int64_t current_token_table_index = req_token_table_index + column_starts[req_id] + current_token_offset;
     for (int j = 0; j < n + 2; j++) {
       if (current_token_table_index - j < req_token_table_index) {
         // Out of this request's range, stop computing n_gram_id
         break;
       }
-      if (ne_token_table[current_token_table_index - j] < 0) {
+      const int table_token = ne_token_table[current_token_table_index - j];
+      if (table_token < 0) {
         // Token was marked as ignored during write
         break;
       }
-      const uint64_t term =
-          (uint64_t)ne_token_table[current_token_table_index - j] * (uint64_t)ne_weights[ne_weight_base_idx + j];
+      if (table_token == eos_token_id && j > 0) {
+        // Don't let the n-gram context cross an eos boundary. j==0 (the
+        // current token) is allowed; only break when looking back.
+        break;
+      }
+      const uint64_t term = (uint64_t)table_token * (uint64_t)ne_weights[ne_weight_base_idx + j];
       n_gram_id += term % ne_mod;
     }
     n_gram_id %= ne_mod;
@@ -84,16 +94,67 @@ __global__ void ComputeNGramIdsKernel(
   }
 }
 
+__global__ void ComputeNGramIdsDecodeKernel(
+    int batch_size,
+    int ne_n,
+    int ne_k,
+    const int* __restrict__ ne_weights,                      // [ne_n-1,ne_k,ne_n]
+    const int* __restrict__ ne_mods,                         // [ne_n-1,ne_k]
+    const int* __restrict__ exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
+    const int* __restrict__ ne_token_table,                  // [max_running_reqs, max_context_len]
+    int max_context_len,                                     // max_context_len
+    const int64_t* __restrict__ row_indices,                 // [batch_size]
+    const int* __restrict__ column_starts,                   // [batch_size]
+    int* __restrict__ n_gram_ids,                            // [batch_size, (ne_n-1)*ne_k]
+    int eos_token_id  // tokens before an eos are excluded from the n-gram context
+) {
+  const int num_configs = (ne_n - 1) * ne_k;
+  const int total_outputs = batch_size * num_configs;
+
+  for (int output_idx = blockIdx.x * blockDim.x + threadIdx.x; output_idx < total_outputs;
+       output_idx += blockDim.x * gridDim.x) {
+    const int req_id = output_idx / num_configs;
+    const int config_idx = output_idx - req_id * num_configs;
+    const int k_idx = config_idx % ne_k;
+    const int n_idx = config_idx / ne_k;
+    const int weight_offset = n_idx * ne_k * ne_n + k_idx * ne_n;
+    const int ne_mod = ne_mods[n_idx * ne_k + k_idx];
+
+    uint64_t n_gram_id = 0;
+    const int64_t req_token_table_offset = row_indices[req_id] * static_cast<int64_t>(max_context_len);
+    const int64_t current_token_table_offset = req_token_table_offset + column_starts[req_id];
+    for (int j = 0; j < n_idx + 2; j++) {
+      if (current_token_table_offset - j < req_token_table_offset) {
+        break;
+      }
+      const int token = ne_token_table[current_token_table_offset - j];
+      if (token < 0) {
+        break;
+      }
+      if (token == eos_token_id && j > 0) {
+        // Don't let the n-gram context cross an eos boundary. j==0 (the
+        // current token) is allowed; only break when looking back.
+        break;
+      }
+      const uint64_t term = static_cast<uint64_t>(token) * static_cast<uint64_t>(ne_weights[weight_offset + j]);
+      n_gram_id += term % ne_mod;
+    }
+    n_gram_id %= ne_mod;
+    n_gram_id += exclusive_ne_embeder_size_sums[n_idx * ne_k + k_idx];
+    n_gram_ids[output_idx] = static_cast<int>(n_gram_id);
+  }
+}
+
 __global__ void UpdateTokenTableKernel(
     int batch_size,
-    int* tokens,           // [token_num]
-    int* ne_token_table,   // [max_running_reqs, max_context_len]
-    int max_context_len,   // max_context_len
-    long* row_indices,     // [batch_size]
-    int* column_starts,    // [batch_size]
-    int* req_lens,         // [batch_size]
-    int ignore_token_num,  // number of tokens to ignore
-    int* ignore_tokens     // [ignore_token_num]
+    int* tokens,                              // [token_num]
+    int* ne_token_table,                      // [max_running_reqs, max_context_len]
+    int max_context_len,                      // max_context_len
+    const int64_t* __restrict__ row_indices,  // [batch_size]
+    int* column_starts,                       // [batch_size]
+    int* req_lens,                            // [batch_size]
+    int ignore_token_num,                     // number of tokens to ignore
+    int* ignore_tokens                        // [ignore_token_num]
 ) {
   // Each block processes one request.
   const int req_id = blockIdx.x % batch_size;
@@ -106,11 +167,11 @@ __global__ void UpdateTokenTableKernel(
   // stride loop
   for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
     // Token offset within the current request
-    int current_token_offset = i - start;
+    const int64_t current_token_offset = i - start;
     // Start index of this request in the token table
-    int req_token_table_index = row_indices[req_id] * max_context_len;
+    const int64_t req_token_table_index = row_indices[req_id] * static_cast<int64_t>(max_context_len);
     // Position of the current token in the token table
-    int current_token_table_index = req_token_table_index + column_starts[req_id] + current_token_offset;
+    const int64_t current_token_table_index = req_token_table_index + column_starts[req_id] + current_token_offset;
     ne_token_table[current_token_table_index] = tokens[i];
     for (int j = 0; j < ignore_token_num; j++) {
       if (ignore_tokens[j] == tokens[i]) {
@@ -118,6 +179,21 @@ __global__ void UpdateTokenTableKernel(
         break;
       }
     }
+  }
+}
+
+__global__ void UpdateTokenTableDecodeKernel(
+    int batch_size,
+    const int* __restrict__ tokens,           // [batch_size]
+    int* __restrict__ ne_token_table,         // [max_running_reqs, max_context_len]
+    int max_context_len,                      // max_context_len
+    const int64_t* __restrict__ row_indices,  // [batch_size]
+    const int* __restrict__ column_starts     // [batch_size]
+) {
+  for (int req_id = blockIdx.x * blockDim.x + threadIdx.x; req_id < batch_size; req_id += blockDim.x * gridDim.x) {
+    const int64_t token_table_offset =
+        row_indices[req_id] * static_cast<int64_t>(max_context_len) + column_starts[req_id];
+    ne_token_table[token_table_offset] = tokens[req_id];
   }
 }
 
@@ -137,7 +213,8 @@ struct NgramEmbeddingKernel {
       const tvm::ffi::TensorView ne_token_table,
       const tvm::ffi::TensorView row_indices,
       const tvm::ffi::TensorView column_starts,
-      const tvm::ffi::TensorView n_gram_ids) {
+      const tvm::ffi::TensorView n_gram_ids,
+      const int64_t eos_token_id) {
     using namespace host;
 
     auto device_ = SymbolicDevice{};
@@ -145,47 +222,47 @@ struct NgramEmbeddingKernel {
     // Verify tensor shapes and types using -1 (kAnySize) for dynamic dimensions
     TensorMatcher({-1, -1, -1})  // [ne_n-1, ne_k, ne_n]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(ne_weights);
 
     TensorMatcher({-1, -1})  // [ne_n-1, ne_k]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_mods);
 
     TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(exclusive_ne_embeder_size_sums);
 
     TensorMatcher({-1})  // [token_num]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(tokens);
 
     TensorMatcher({-1})  // [batch_size+1]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(exclusive_req_len_sums);
 
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_token_table);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(row_indices);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(column_starts);
 
     TensorMatcher({-1, -1})  // [token_num, (ne_n-1)*ne_k]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(n_gram_ids);
 
     const int batch_size = static_cast<int>(exclusive_req_len_sums.size(0) - 1);
@@ -208,9 +285,92 @@ struct NgramEmbeddingKernel {
         static_cast<int*>(exclusive_req_len_sums.data_ptr()),
         static_cast<int*>(ne_token_table.data_ptr()),
         max_context_len,
-        static_cast<long*>(row_indices.data_ptr()),
+        static_cast<const int64_t*>(row_indices.data_ptr()),
         static_cast<int*>(column_starts.data_ptr()),
-        static_cast<int*>(n_gram_ids.data_ptr()));
+        static_cast<int*>(n_gram_ids.data_ptr()),
+        static_cast<int>(eos_token_id));
+  }
+
+  static void compute_n_gram_ids_decode(
+      const int64_t ne_n,
+      const int64_t ne_k,
+      const tvm::ffi::TensorView ne_weights,
+      const tvm::ffi::TensorView ne_mods,
+      const tvm::ffi::TensorView exclusive_ne_embeder_size_sums,
+      const tvm::ffi::TensorView ne_token_table,
+      const tvm::ffi::TensorView row_indices,
+      const tvm::ffi::TensorView column_starts,
+      const tvm::ffi::TensorView n_gram_ids,
+      const int64_t eos_token_id) {
+    using namespace host;
+
+    auto device_ = SymbolicDevice{};
+    auto batch_size = SymbolicSize{"batch_size"};
+
+    TensorMatcher({-1, -1, -1})  // [ne_n-1, ne_k, ne_n]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>(device_)
+        .verify(ne_weights);
+
+    TensorMatcher({-1, -1})  // [ne_n-1, ne_k]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(ne_mods);
+
+    TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(exclusive_ne_embeder_size_sums);
+
+    TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(ne_token_table);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int64_t>()
+        .with_device<kDLGPU>()
+        .verify(row_indices);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(column_starts);
+
+    TensorMatcher({batch_size, -1})  // [batch_size, (ne_n-1)*ne_k]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(n_gram_ids);
+
+    const int bs = static_cast<int>(batch_size.unwrap());
+    if (bs <= 0) {
+      return;
+    }
+
+    const int max_context_len = static_cast<int>(ne_token_table.size(1));
+    const int num_configs = (static_cast<int>(ne_n) - 1) * static_cast<int>(ne_k);
+    const int total_outputs = bs * num_configs;
+    const auto stream = LaunchKernel::resolve_device(device_.unwrap());
+
+    constexpr int kBlockSize = device::ngram_embedding::kDecodeBlockSize;
+    const int grid_size = std::min(
+        device::ngram_embedding::kMaxComputeNGramIdsDecodeBlocks,
+        static_cast<int>(div_ceil(total_outputs, kBlockSize)));
+
+    LaunchKernel(grid_size, kBlockSize, stream)(
+        device::ngram_embedding::ComputeNGramIdsDecodeKernel,
+        bs,
+        static_cast<int>(ne_n),
+        static_cast<int>(ne_k),
+        static_cast<const int*>(ne_weights.data_ptr()),
+        static_cast<const int*>(ne_mods.data_ptr()),
+        static_cast<const int*>(exclusive_ne_embeder_size_sums.data_ptr()),
+        static_cast<const int*>(ne_token_table.data_ptr()),
+        max_context_len,
+        static_cast<const int64_t*>(row_indices.data_ptr()),
+        static_cast<const int*>(column_starts.data_ptr()),
+        static_cast<int*>(n_gram_ids.data_ptr()),
+        static_cast<int>(eos_token_id));
   }
 
   static void update_token_table(
@@ -227,27 +387,27 @@ struct NgramEmbeddingKernel {
     // Verify tensor shapes and types using -1 (kAnySize) for dynamic dimensions
     TensorMatcher({-1})  // [token_num]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(tokens);
 
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_token_table);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(row_indices);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(column_starts);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(req_lens);
 
     // ignore_tokens can be empty or have values
@@ -256,7 +416,7 @@ struct NgramEmbeddingKernel {
     if (has_ignore_tokens) {
       TensorMatcher({-1})  // [ignore_token_num]
           .with_dtype<int32_t>()
-          .with_device<kDLCUDA>()
+          .with_device<kDLGPU>()
           .verify(ignore_tokens);
     }
 
@@ -284,11 +444,63 @@ struct NgramEmbeddingKernel {
         static_cast<int*>(tokens.data_ptr()),
         static_cast<int*>(ne_token_table.data_ptr()),
         max_context_len,
-        static_cast<long*>(row_indices.data_ptr()),
+        static_cast<const int64_t*>(row_indices.data_ptr()),
         static_cast<int*>(column_starts.data_ptr()),
         static_cast<int*>(req_lens.data_ptr()),
         ignore_token_num,
         ignore_tokens_typed_ptr);
+  }
+
+  static void update_token_table_decode(
+      const tvm::ffi::TensorView tokens,
+      const tvm::ffi::TensorView ne_token_table,
+      const tvm::ffi::TensorView row_indices,
+      const tvm::ffi::TensorView column_starts) {
+    using namespace host;
+
+    auto batch_size = SymbolicSize{"batch_size"};
+    auto device_ = SymbolicDevice{};
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>(device_)
+        .verify(tokens);
+
+    TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(ne_token_table);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int64_t>()
+        .with_device<kDLGPU>()
+        .verify(row_indices);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int32_t>()
+        .with_device<kDLGPU>()
+        .verify(column_starts);
+
+    const int bs = static_cast<int>(batch_size.unwrap());
+    if (bs <= 0) {
+      return;
+    }
+
+    const int max_context_len = static_cast<int>(ne_token_table.size(1));
+    const auto stream = LaunchKernel::resolve_device(device_.unwrap());
+
+    constexpr int kBlockSize = device::ngram_embedding::kDecodeBlockSize;
+    const int grid_size = std::min(
+        device::ngram_embedding::kMaxUpdateTokenTableDecodeBlocks, static_cast<int>(host::div_ceil(bs, kBlockSize)));
+
+    LaunchKernel(grid_size, kBlockSize, stream)(
+        device::ngram_embedding::UpdateTokenTableDecodeKernel,
+        bs,
+        static_cast<const int*>(tokens.data_ptr()),
+        static_cast<int*>(ne_token_table.data_ptr()),
+        max_context_len,
+        static_cast<const int64_t*>(row_indices.data_ptr()),
+        static_cast<const int*>(column_starts.data_ptr()));
   }
 };
 

@@ -6,33 +6,26 @@ import torch.nn.functional as F
 from torch import nn
 
 # Patch TP world size / rank before importing modules that read them at __init__.
-import sglang.srt.distributed as _distributed
-import sglang.srt.layers.attention.mamba.mamba as _mamba_mod
-import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as _norm_mod
 import sglang.srt.layers.linear as _linear_mod
-from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.runtime_context import get_context, get_parallel
 
-_distributed.get_tensor_model_parallel_world_size = lambda: 1
-_distributed.get_tensor_model_parallel_rank = lambda: 0
-_mamba_mod.get_tensor_model_parallel_world_size = lambda: 1
-_mamba_mod.get_tensor_model_parallel_rank = lambda: 0
-_norm_mod.get_tensor_model_parallel_world_size = lambda: 1
-_norm_mod.get_tensor_model_parallel_rank = lambda: 0
-_linear_mod.get_tensor_model_parallel_world_size = lambda: 1
-_linear_mod.get_tensor_model_parallel_rank = lambda: 0
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+)
+_parallel_override.__enter__()
 
 # RowParallelLinear.forward calls get_tp_group() to manage symmetric memory.
 # Provide a stub group with world_size=1 so use_symmetric_memory short-circuits.
 _linear_mod.get_tp_group = lambda: SimpleNamespace(world_size=1)
 
+from sglang.srt.configs.falcon_h1 import FalconH1Config  # noqa: E402
 from sglang.srt.configs.mamba_utils import (  # noqa: E402
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch  # noqa: E402
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import (  # noqa: E402
     ATTENTION_BACKENDS,
 )
@@ -44,6 +37,11 @@ from sglang.srt.mem_cache.memory_pool import (  # noqa: E402
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardBatch,
     ForwardMode,
@@ -53,8 +51,6 @@ from sglang.srt.model_executor.forward_context import (  # noqa: E402
     forward_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
-
-from ..mock_server_args import make_mock_server_args
 
 # Tiny dims chosen to be the minimum that satisfies MambaMixer2's TP/chunk asserts:
 #   - num_heads % tp_size == 0  (tp_size=1)
@@ -279,18 +275,19 @@ class TinyMamba2ModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
-        # Mamba2AttnBackend reads mamba2_config.mamba_chunk_size; expose it
-        # through a SimpleNamespace-as-hf_config so runner.mamba2_config returns
-        # something non-None with the expected attribute.
-        self.hf_config = SimpleNamespace(
+        # Mamba2AttnBackend reads mamba2_config(model_config).mamba_chunk_size; expose it
+        self.hf_config = FalconH1Config(
             architectures=["TinyMamba2ForCausalLM"],
             mamba_chunk_size=case.mamba_chunk_size,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -315,6 +312,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.ps = ParallelState.trivial()
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
@@ -324,26 +322,37 @@ class MockMamba2ModelRunner(ModelRunner):
         # `intermediate_ssm` / `intermediate_conv_window` buffers when
         # `speculative_num_draft_tokens is not None`, so auto-derive the
         # count from `case.extend_lens` for the speculative modes.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = (
                 max(case.extend_lens) if case.extend_lens else 1
             )
         else:
             speculative_num_draft_tokens = 0
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
             enable_mis=False,
             # `RowParallelLinear.forward` (called by the production
             # `MambaMixer2.out_proj`) consults
-            # `get_global_server_args().enable_symm_mem` to decide whether
+            # `get_server_args().enable_symm_mem` to decide whether
             # to wrap allocations in a symmetric-memory context. With
             # `world_size=1` the wrapper short-circuits, but the
             # attribute read still happens, so it must exist on the mock
@@ -359,9 +368,7 @@ class MockMamba2ModelRunner(ModelRunner):
             # `MambaMixer2.forward_decode` calls into. Set it explicitly so
             # the DECODE fixture path becomes reachable.
             mamba_backend="triton",
-            mamba_cache_chunk_size=64,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=0,
@@ -369,17 +376,14 @@ class MockMamba2ModelRunner(ModelRunner):
             speculative_num_steps=0,
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
-        # Install this fixture's `server_args` as the global so that
-        # `is_symmetric_memory_enabled()` (called from
-        # `RowParallelLinear.forward`) reads our `enable_symm_mem=False`
-        # value. Without this, a previous test in the discover sweep
-        # whose fixture *did* call `set_global_server_args_for_scheduler`
-        # would leave a SimpleNamespace without `enable_symm_mem` as the
-        # global, and the mamba2 forward would AttributeError.
-        from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-        set_global_server_args_for_scheduler(self.server_args)
+        # install() publishes this fixture's config, so production reads
+        # like `is_symmetric_memory_enabled()` (RowParallelLinear.forward)
+        # see our `enable_symm_mem=False` for the fixture's lifetime.
+        self.server_args = self._server_args_override.install()
 
         # Install the selective-state-update backend that
         # `MambaMixer2.forward_decode` requires. In production the
@@ -447,6 +451,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):
@@ -551,7 +556,7 @@ class ProjectedMamba2Attention(nn.Module):
         # state support. The dense-extend path leaves it False.
         use_triton_causal_conv = (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
         self.backend.forward(
             self.mixer,
@@ -1003,22 +1008,18 @@ def expected_mamba2_verify_output_from_inputs(
 ) -> torch.Tensor:
     """Reference output for chain (topk=1) target-verify cases.
 
-    Mamba2's SSM kernel does not consume the tree mask: under any topk it
-    processes the per-request draft tokens linearly through the chunked-scan
-    recurrence, just like EXTEND. For `topk == 1` this matches the
-    chain semantics the EAGLE verifier expects, so the eager SSM
-    reference (`_pure_torch_mamba2_reference`) doubles as the verify
-    reference. For `topk > 1` the production kernel still processes
-    siblings as a chain — this is documented at the call site as
-    structurally unsupported rather than wired through a tree-aware
-    reference.
+    This reference (`_pure_torch_mamba2_reference`) is a chain recurrence.
+    For `topk == 1` it matches the chain semantics the EAGLE verifier
+    expects, so it doubles as the verify reference. For `topk > 1` the
+    production SSM kernel DOES follow the draft tree (it consumes the
+    parent-indices plumbing), but this test has no tree-aware reference to
+    compare against, so tree verify is skipped here rather than validated.
     """
     if topk != 1:
         raise ValueError(
-            "Mamba2 tree verify (topk>1) is not exercised: the SSM kernel "
-            "ignores the tree mask and processes draft tokens linearly. "
-            "Wiring a parent-indices-aware reference here would not match "
-            "production behavior. Only chain (topk=1) is supported."
+            "Mamba2 tree verify (topk>1) is not exercised here: this "
+            "reference is chain-only. The production kernel supports tree "
+            "verify; a tree-aware reference is future work."
         )
     del inputs
     # `state` is the (ssm_states, conv_states) snapshot captured before

@@ -42,7 +42,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B-A17B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NVIDIA NVFP4: [nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)<br/>AMD MXFP4: [amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-122B-A10B</td>
@@ -103,13 +103,15 @@ uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=pytho
 docker pull lmsysorg/sglang:latest
 
 # Or use Docker (AMD MI300X/MI325X)
-docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
+docker pull lmsysorg/sglang-rocm:v0.5.12.post1-rocm720-mi30x-20260604
 
 # Or use Docker (AMD MI355X)
-docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
+docker pull lmsysorg/sglang-rocm:v0.5.12.post1-rocm720-mi35x-20260604
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
 
 ## 3. Model Deployment
 
@@ -124,7 +126,8 @@ This section provides deployment configurations optimized for different hardware
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
-- **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `--attention-backend triton`. Both the full attention layers and the Gated Delta Net (linear attention) layers use Triton-based kernels on ROCm. Example: `SGLANG_USE_AITER=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3.5-397B-A17B --tp 8 --attention-backend triton --trust-remote-code`. See [AMD's Day-0 support article](https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-qwen-3-5-on-amd-instinct-gpus.html) for details.
+- **H100 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings.
+- **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `SGLANG_USE_AITER_UNIFIED_ATTN=1` with `--attention-backend aiter`, which requires `--page-size 16` and can also enable `--enable-aiter-allreduce-fusion`. Additionally set `AITER_FLYDSL_FORCE=1` to force the AITER FlyDSL MoE kernels and `SGLANG_MAMBA_SSM_DTYPE=bfloat16` to store the Mamba SSM state in bfloat16 (instead of the default float32).
 - **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
@@ -153,9 +156,10 @@ This section provides deployment configurations optimized for different hardware
         - **MI300X (192GB)** runs with tp=4.
         - **MI325X (256GB)** runs with tp=2.
         - **MI355X (288GB)** runs with tp=2.
-    - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. Only compatible with B200/B300 (Blackwell architecture).
-        - **B200 (183GB)** runs with tp=4.
-        - **B300 (275GB)** runs with tp=2.
+    - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. NVFP4 ([nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)) requires B200/B300 (Blackwell architecture); AMD provides an MXFP4 checkpoint ([amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)) for MI355X.
+        - **B200 (183GB)** runs with tp=4. (NVFP4)
+        - **B300 (275GB)** runs with tp=2. (NVFP4)
+        - **MI355X (288GB)** runs with tp=2 (use tp=4 for low concurrency). (MXFP4)
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -215,7 +219,7 @@ This section provides deployment configurations optimized for different hardware
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>288GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 / 4 (MXFP4)</td>
     </tr>
   </tbody>
 </table>
@@ -223,6 +227,8 @@ This section provides deployment configurations optimized for different hardware
 <Warning>
 **FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.
 </Warning>
+
+- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
@@ -250,17 +256,26 @@ sglang serve \
 Deploy Qwen3.5-397B-A17B with the following command (MI300X/MI325X/MI355X):
 
 ```shell Command
-sglang serve \
+SGLANG_USE_AITER=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+AITER_FLYDSL_FORCE=1 \
+SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
+python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-397B-A17B \
   --tp 8 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
+  --trust-remote-code \
+  --page-size 16 \
   --mem-fraction-static 0.8 \
-  --attention-backend triton \
+  --attention-backend aiter \
+  --enable-aiter-allreduce-fusion \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
   --host 0.0.0.0 \
   --port 30000
 ```
-> **Note:** TP8 works on all MI GPUs. For MI325X/MI355X, you can use --tp 4 as the minimum requirement.
+> **Note:** To enable MTP (speculative decoding), append `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
 
 ### 4.1 Basic Usage
 

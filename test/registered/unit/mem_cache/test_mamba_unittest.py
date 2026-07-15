@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MambaPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -27,6 +31,10 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
 
 
 class TestMamba(unittest.TestCase):
@@ -56,7 +64,6 @@ class TestMamba(unittest.TestCase):
             head_num=head_num,
             head_dim=head_dim,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=None,
@@ -109,7 +116,7 @@ class TestMamba(unittest.TestCase):
         )
 
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
+        assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         sampling_params = SamplingParams(
             temperature=0,
@@ -125,34 +132,96 @@ class TestMamba(unittest.TestCase):
         # alloc req
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
 
         # free req
         req_to_token_pool.free_mamba_cache(req)
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
+        assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
         req.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
 
         # alloc again
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
+
+    def test_mamba_pool_deduplicated_conv_window_axis(self):
+        class WindowFirstMambaPool(MambaPool):
+            conv_window_axis = 0
+
+        num_mamba_layers = 2
+        spec_state_size = 3
+        speculative_num_draft_tokens = 4
+        window_size = 3
+        conv_dim = 5
+
+        pool = object.__new__(WindowFirstMambaPool)
+        physical, view = pool._allocate_deduplicated_conv_window(
+            conv_shape=(window_size, conv_dim),
+            num_mamba_layers=num_mamba_layers,
+            spec_state_size=spec_state_size,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            conv_dtype=torch.float32,
+        )
+
+        shared_window_size = speculative_num_draft_tokens + window_size - 1
+        self.assertEqual(
+            physical.shape,
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                shared_window_size,
+                conv_dim,
+            ),
+        )
+        self.assertEqual(
+            view.shape,
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                speculative_num_draft_tokens,
+                window_size,
+                conv_dim,
+            ),
+        )
+
+        physical.copy_(
+            torch.arange(
+                physical.numel(), dtype=physical.dtype, device=physical.device
+            ).reshape_as(physical)
+        )
+        for step in range(speculative_num_draft_tokens):
+            torch.testing.assert_close(
+                view[:, :, step],
+                physical[:, :, step : step + window_size],
+            )
+        torch.testing.assert_close(view[:, :, :-1, 1:], view[:, :, 1:, :-1])
+
+        view[0, 0, 0, 1, 0] = -1
+        self.assertEqual(view[0, 0, 1, 0, 0].item(), -1)
 
     def test_mamba_radix_cache_1(self):
         tree, allocator, req_to_token_pool, make_dummy_req = (
             self._setup_tree_and_allocator()
         )
+        mamba_allocator = req_to_token_pool.mamba_allocator
         mamba_pool = req_to_token_pool.mamba_pool
         # test
         print(
-            f"[Start] allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"[Start] allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req1 = make_dummy_req()
         req1_token_ids, req1_kv_indices = [1, 2, 3], allocator.alloc(3)
@@ -170,7 +239,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req2 = make_dummy_req()
         req2_token_ids, req2_kv_indices = [1, 2, 3, 4, 5, 6, 7], allocator.alloc(7)
@@ -188,7 +257,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
 
         req3 = make_dummy_req()
@@ -207,7 +276,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req4 = make_dummy_req()
         req4_token_ids, req4_kv_indices = [1, 2, 3, 4, 5, 60, 70], allocator.alloc(7)
@@ -225,7 +294,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
 
         tree.pretty_print()
@@ -367,9 +436,9 @@ class TestMamba(unittest.TestCase):
         result = tree.evict(EvictParams(num_tokens=1))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
         events = tree.take_events()
-        removed_hashes = [
-            e.block_hashes[0] for e in events if isinstance(e, BlockRemoved)
-        ]
+        removed_hashes = _event_hashes(
+            [e for e in events if isinstance(e, BlockRemoved)]
+        )
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_mamba_radix_cache_kv_events_split_hash(self):
@@ -464,7 +533,6 @@ class TestMamba(unittest.TestCase):
             head_num=head_num,
             head_dim=head_dim,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
@@ -553,7 +621,7 @@ class TestMamba(unittest.TestCase):
         _, _, req_to_token_pool, _ = self._setup_tree_and_allocator()
         mamba_pool = req_to_token_pool.mamba_pool
         n = 3
-        indices = mamba_pool.alloc(n)
+        indices = req_to_token_pool.mamba_allocator.alloc(n)
         self.assertIsNotNone(indices)
 
         # Write known sentinel values at the allocated slots.
@@ -608,7 +676,7 @@ class TestMamba(unittest.TestCase):
         n_tokens = 4
         kv_indices = allocator.alloc(n_tokens)
         self.assertIsNotNone(kv_indices)
-        mamba_indices = mamba_pool.alloc(1)
+        mamba_indices = req_to_token_pool.mamba_allocator.alloc(1)
         self.assertIsNotNone(mamba_indices)
 
         # Write sentinel values into KV buffers (all full-attention layers).

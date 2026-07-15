@@ -9,25 +9,6 @@ from sglang.srt.environ import envs
 
 _PR_REVERT_YAML_25015 = """
 patches:
-  - target: sglang.srt.speculative.eagle_worker.EAGLEWorker.draft_forward
-    edits:
-      - match: |
-          forward_batch.out_cache_loc = out_cache_loc[i]
-          spec_info.hidden_states = hidden_states
-        replacement: |
-          forward_batch.out_cache_loc = out_cache_loc[i]
-          forward_batch.positions.add_(1)
-          spec_info.hidden_states = hidden_states
-      - match: |
-          hidden_states = logits_output.hidden_states
-          maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
-          maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
-          forward_batch.positions.add_(1)
-        replacement: |
-          hidden_states = logits_output.hidden_states
-          maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
-          maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
-
   - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward
     edits:
       - match: |
@@ -43,15 +24,11 @@ patches:
         replacement: |
           hidden_states = logits_output.hidden_states
 
-  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_batch_size
+  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
       - match: |
-          forward_batch.spec_info.hidden_states = hidden_states_backup
           forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
-          return ret
-        replacement: |
-          forward_batch.spec_info.hidden_states = hidden_states_backup
-          return ret
+        replacement: ""
 """
 
 
@@ -66,9 +43,60 @@ patches:
 """
 
 
+_PR_REVERT_YAML_27338 = """
+patches:
+  - target: sglang.srt.layers.attention.flashinfer_backend.FlashInferMultiStepDraftBackend.init_cuda_graph_state
+    edits:
+      - match: |
+          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+        replacement: |
+          (self.speculative_num_steps, max_bs * self.max_context_len),
+"""
+
+
+_PR_REVERT_YAML_27360 = """
+patches:
+  - target: sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend._apply_cuda_graph_metadata
+    edits:
+      - match: |
+          cache_loc = cache_loc[:, :decode_length]
+        replacement: ""
+"""
+
+
+_PR_REVERT_YAML_26972 = """
+patches:
+  - target: sglang.srt.mem_cache.common.get_req_to_token_extra_context_len
+    edits:
+      - match: |
+          if (
+              server_args.speculative_algorithm is not None
+              and server_args.page_size > 1
+              and (server_args.speculative_eagle_topk or 1) > 1
+          ):
+              extra = max(extra, get_alloc_reserve_per_decode(server_args))
+        replacement: ""
+"""
+
+
+_PR_REVERT_YAML_27460 = """
+patches:
+  - target: sglang.srt.layers.attention.flashinfer_mla_backend.FlashInferMLAMultiStepDraftBackend.init_cuda_graph_state
+    edits:
+      - match: |
+          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+        replacement: |
+          (self.speculative_num_steps, max_bs * self.max_context_len),
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
+    27338: _PR_REVERT_YAML_27338,
+    27360: _PR_REVERT_YAML_27360,
+    26972: _PR_REVERT_YAML_26972,
+    27460: _PR_REVERT_YAML_27460,
 }
 
 
