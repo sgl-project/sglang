@@ -362,6 +362,13 @@ class PrefillBootstrapQueue:
 
         pp_slices = dspark_meta.get("pp_slices") or {}
         local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        if pp_slices and local_pp_slice is None:
+            message = (
+                "DSpark hidden metadata is missing PP slice for prefill rank: "
+                f"pp_rank={self.pp_rank}, available_pp_slices={sorted(pp_slices.keys())}"
+            )
+            self._abort_dspark_hidden_bootstrap(req, message)
+            return False
         dst_indices = [
             int(x)
             for x in (

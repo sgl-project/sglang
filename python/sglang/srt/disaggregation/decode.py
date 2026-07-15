@@ -1443,14 +1443,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     slice_len = len(local_layer_ids) * int(
                         self.scheduler.model_config.hidden_size
                     )
-                    if slice_len > 0:
-                        pp_slices[pp_rank] = {
-                            "pp_rank": int(pp_rank),
-                            "layer_ids": [int(x) for x in local_layer_ids],
-                            "slice_start": int(slice_start),
-                            "slice_len": int(slice_len),
-                            "dst_indices": None,
-                        }
+                    pp_slices[pp_rank] = {
+                        "pp_rank": int(pp_rank),
+                        "layer_ids": [int(x) for x in local_layer_ids],
+                        "slice_start": int(slice_start),
+                        "slice_len": int(slice_len),
+                        "dst_indices": [],
+                    }
                     slice_start += slice_len
                 if slice_start != len(target_layer_ids) * int(
                     self.scheduler.model_config.hidden_size
@@ -1512,6 +1511,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 for pp_rank, pp_slice in pp_slices.items():
                     cur_indices = [int(x) for x in range(dspark_hidden_len)]
                     slice_len = int(pp_slice.get("slice_len", 0))
+                    if slice_len <= 0:
+                        pp_slice["dst_indices"] = []
+                        continue
                     item_len = int(slice_len * dtype_itemsize)
                     transfer_plan = DSparkHiddenTransferPlan.build(
                         dspark_hidden_len, item_len
