@@ -297,6 +297,13 @@ class MambaPoolHost(HostKVCache):
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
+        # clone(): alloc otherwise returns a view into free_slots' arange-backed
+        # storage, so the allocated indices alias the pool's free list. A prefetch
+        # abort frees/re-allocs (rewriting free_slots) on the scheduler thread
+        # while the storage IO thread still reads the returned indices, racing on
+        # the shared storage -> segfault. Owning storage decouples the returned
+        # indices' lifetime from pool structural mutation. Index tensors are tiny,
+        # so the copy is negligible.
         select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -696,6 +703,9 @@ class LogicalHostPool:
             )
         if need_size > self.available_size():
             return None
+        # clone(): see MambaPoolHost.alloc — decouple returned indices from
+        # free_slots' shared storage so a concurrent prefetch abort can't dangle
+        # indices still being read by the storage IO thread.
         select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -908,9 +918,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ) * self.slot_page_size
         if need_size > self.available_size():
             return None
-        # clone(): see MHATokenToKVPoolHost.alloc — decouple from free_slots'
-        # shared storage so a concurrent prefetch abort can't dangle indices
-        # still being read by the storage IO thread.
+        # clone(): see MambaPoolHost.alloc — decouple returned indices from
+        # free_slots' shared storage so a concurrent prefetch abort can't dangle
+        # indices still being read by the storage IO thread.
         select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
