@@ -29,7 +29,7 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import psutil
 import setproctitle
@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     async_sock_send,
     sock_recv,
     sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
@@ -122,17 +124,29 @@ def _extract_field_by_index(
     if field is None:
         return None
 
+    should_wrap_result = field_name in ("customized_info", "time_stats")
+    if should_wrap_result:
+        field = unwrap_from_pickle(field)
+        if field is None:
+            return None
+
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            new_field[k] = v[index] if len(v) > index else None
+            if len(v) > index:
+                new_field[k] = [v[index]] if should_wrap_result else v[index]
+            else:
+                new_field[k] = [None] if should_wrap_result else None
+        if should_wrap_result:
+            return wrap_as_pickle(new_field) if new_field else None
         return new_field
 
     if check_length:
         if len(field) <= index:
             return None
 
-    return [field[index]]
+    new_field = [field[index]]
+    return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
 def _handle_output_by_index(output, i):
@@ -146,6 +160,15 @@ def _handle_output_by_index(output, i):
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
+            ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -209,6 +232,12 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -248,6 +277,15 @@ def _handle_output_by_index(output, i):
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
+            ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -301,6 +339,12 @@ def _handle_output_by_index(output, i):
             ),
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
+            ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
@@ -585,16 +629,24 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+        import torch
+
+        torch.set_num_threads(1)
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
+        server_args.override(
+            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
+        )
         super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
-        self.server_args.disaggregation_mode = disaggregation_mode
+        self.server_args.override(
+            "tokenizer_worker.restore_disaggregation_mode",
+            disaggregation_mode=disaggregation_mode,
+        )
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -660,6 +712,19 @@ class TokenizerWorker(TokenizerManager):
             self._pause_continue_future = None
 
 
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerWorker
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
+            f"subclass, got {worker_class!r}"
+        )
+
+    return worker_class
+
+
 async def print_exception_wrapper(func):
     """
     Sometimes an asyncio function does not print exception.
@@ -679,9 +744,7 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """
-    Get the main process ID.
-    """
+    """Get the main process ID."""
     return multiprocessing.current_process()._parent_pid
 
 

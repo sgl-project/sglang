@@ -12,8 +12,8 @@ import torch
 from sglang.jit_kernel.minimax_decode_topk import minimax_decode_topk
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=40, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=40, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=15, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 

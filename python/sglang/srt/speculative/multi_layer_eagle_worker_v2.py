@@ -12,22 +12,22 @@
 # limitations under the License.
 # ==============================================================================
 
-import contextlib
+from __future__ import annotations
+
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from dataclasses import replace
+from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
 )
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
-from sglang.srt.managers.io_struct import (
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromIPCReqInput,
-)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -49,24 +49,26 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     build_tree_kernel_efficient,
+    default_tree_mask_mode,
     eagle_prepare_for_verify,
     eagle_sample,
+    get_draft_recurrent_hidden_state_spec,
 )
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids_triton
+from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
+    get_plan_stream,
     record_stream_each,
     record_stream_for_v2_verify,
+    sample_draft_proposal,
     select_top_k_tokens,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cpu, is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -75,6 +77,8 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import empty_context, fast_topk
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -83,36 +87,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_plan_stream(
-    device: str,
-) -> Tuple[any, contextlib.AbstractContextManager]:
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
-        return plan_stream, plan_stream_ctx
-    else:
-        return None, contextlib.nullcontext()
-
-
 class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: int,
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moe_ep_rank = moe_ep_rank
+        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.draft_extend_attn_backend_list = []
@@ -123,6 +110,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.use_rejection_sampling = server_args.speculative_use_rejection_sampling
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
             "multi-layer EAGLE requires speculative_num_draft_tokens == "
             "speculative_num_steps + 1, "
@@ -142,12 +130,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,  # spec workers don't support pipeline parallelism
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -155,8 +139,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
-        # Match `EagleDraftWorker.draft_runner` so `_draft_runner_of(self)` works
-        # for the EagleDraftInput shape classmethods.
+        # Match `EagleDraftWorker.draft_runner` for generic draft-runner access.
         self.draft_runner: ModelRunner = self.draft_runner_list[0]
 
         # Chain-style MTP: each step propagates its own output hidden states to the
@@ -166,8 +149,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.tree_mask_mode = default_tree_mask_mode()
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    @property
+    def draft_runners(self) -> List[ModelRunner]:
+        # One runner per draft step (len == speculative_num_steps).
+        return self.draft_runner_list
 
     def alloc_memory_pool(
         self,
@@ -186,15 +174,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
     def init_attention_backends(self):
-        with self.draft_tp_context(
-            self.draft_runner_list[0].tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_attention_backends()
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(
-            self.draft_runner_list[0].tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_cuda_graphs()
 
     def mtp_model_runner(self, step: int):
@@ -228,7 +218,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            return
+
+        if envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get():
             return
 
         if not _is_npu:
@@ -260,6 +253,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                self.device,
             )
 
         # Build tree mask
@@ -267,6 +261,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+
+        # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
+        # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                max_context_len = (
+                    self.target_worker.model_runner.attn_backend.max_context_len
+                )
+                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+            else:
+                # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+                seq_lens_sum = 0
+
         (
             tree_mask,
             position,
@@ -280,7 +288,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -303,6 +311,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+            draft_probs=draft_input.draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -343,7 +352,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                             (tree_info[2].size(0), 1),
                             i,
                             dtype=torch.long,
-                            device="cuda",
+                            device=tree_info[2].device,
                         )
                     )
 
@@ -423,14 +432,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             draft_capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Run forward
-        batch.capture_hidden_mode = draft_capture_hidden_mode
-        batch.return_hidden_states_before_norm = True
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_runner_list[0],
+            capture_hidden_mode=draft_capture_hidden_mode,
+            return_hidden_states_before_norm=True,
+        )
 
         # Construct input_ids
         # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
-            rotate_input_ids_triton(
+            rotate_input_ids(
                 forward_batch.input_ids,
                 forward_batch.extend_start_loc,
                 forward_batch.extend_seq_lens,
@@ -439,6 +451,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         topk_p_list = []
         topk_index_list = []
+        draft_probs_list = []
         for step in range(self.speculative_num_steps):
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
@@ -451,8 +464,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
-            probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.use_rejection_sampling and self.topk == 1:
+                # Sample X ~ q and stash q for the first verify's Leviathan step.
+                probs, topk_p, topk_index = sample_draft_proposal(
+                    output.logits_output.next_token_logits,
+                    forward_batch.sampling_info.temperatures,
+                )
+                draft_probs_list.append(probs)
+            else:
+                probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
@@ -465,7 +486,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     output.logits_output.hidden_states
                 )
             if forward_batch.extend_seq_lens is not None:
-                rotate_input_ids_triton(
+                rotate_input_ids(
                     forward_batch.input_ids,
                     forward_batch.extend_start_loc,
                     forward_batch.extend_seq_lens,
@@ -482,6 +503,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
+        # q [bs, num_steps, vocab] for the first verify's Leviathan step (RS only).
+        next_draft_input.draft_probs = (
+            torch.stack(draft_probs_list, dim=1)
+            if self.use_rejection_sampling and draft_probs_list
+            else None
+        )
 
         return next_draft_input
 
@@ -491,6 +518,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            # Actual width: the multi-layer chain fills num_steps + 1 rows/req.
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=1,
         )
@@ -505,8 +533,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner_list[0],
                 self.cuda_graph_runner_for_draft_extend,
+                return_hidden_states_before_norm=True,
             )
-            forward_batch.return_hidden_states_before_norm = True
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -524,6 +552,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
         ret_topk_p_list = []
         ret_topk_index_list = []
+        ret_draft_probs_list = []
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
         if can_cuda_graph:
@@ -532,13 +561,22 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # against it and the chain is advanced in place between steps.
             cgr.prepare(forward_batch)
             for step in range(self.speculative_num_steps):
-                _, ret_topk_p, ret_topk_index = cgr.replay(step)
+                _out, ret_topk_p, ret_topk_index = cgr.replay(step)
+                if self.use_rejection_sampling and self.topk == 1:
+                    # Re-pick X ~ q worker-side so the chain rotation carries it
+                    # to step N+1 (per-step graph does not sample in-graph).
+                    sel = cgr.buffers.select_index[: cgr.raw_bs]
+                    probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                        _out.next_token_logits[sel],
+                        forward_batch.sampling_info.temperatures,
+                    )
+                    ret_draft_probs_list.append(probs)
                 ret_topk_p_list.append(ret_topk_p.clone())
                 ret_topk_index_list.append(ret_topk_index.clone())
                 # Advance the draft chain by rotating the shared input_ids window
                 # in place; step N+1's graph then reads the rotated values.
                 if step < self.speculative_num_steps - 1:
-                    rotate_input_ids_triton(
+                    rotate_input_ids(
                         cgr.buffers.input_ids[: cgr.raw_num_tokens],
                         cgr.buffers.extend_start_loc[: cgr.raw_bs],
                         cgr.buffers.extend_seq_lens[: cgr.raw_bs],
@@ -570,11 +608,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
-                probs = torch.softmax(
-                    draft_logits_output.logits_output.next_token_logits[select_index],
-                    dim=-1,
-                )
-                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                logits_sel = draft_logits_output.logits_output.next_token_logits[
+                    select_index
+                ]
+                if self.use_rejection_sampling and self.topk == 1:
+                    probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                        logits_sel, forward_batch.sampling_info.temperatures
+                    )
+                    ret_draft_probs_list.append(probs)
+                else:
+                    probs = torch.softmax(logits_sel, dim=-1)
+                    ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
                 # Chain-style: use this step's output hidden_states as next step's input
                 if (
                     self.chain_mtp_hidden_states
@@ -585,7 +629,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         draft_logits_output.logits_output.hidden_states
                     )
                 if forward_batch.extend_seq_lens is not None:
-                    rotate_input_ids_triton(
+                    rotate_input_ids(
                         forward_batch.input_ids,
                         forward_batch.extend_start_loc,
                         forward_batch.extend_seq_lens,
@@ -607,6 +651,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             torch.cat(ret_topk_index_list, dim=1).clone(),
             None,
         )
+        # q [bs, num_steps, vocab] carries the per-chain-step draft distributions
+        # to the next verify's Leviathan step (accept iff coin*q < p). None
+        # otherwise (default target-only tree sampling).
+        next_draft_input.draft_probs = (
+            torch.stack(ret_draft_probs_list, dim=1) if ret_draft_probs_list else None
+        )
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
@@ -614,11 +664,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -636,16 +682,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
         # Override the context length of the draft model to be the same as the target model.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         self._draft_worker = MultiLayerEagleDraftWorker(
             server_args,
             gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
+            ps,
             nccl_port,
             target_worker,
         )
@@ -656,33 +701,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-
-    def alloc_memory_pool(
-        self,
-        memory_pool_config=None,
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
-    ):
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
-        )
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-
-    def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
-
-    def init_cuda_graphs(self):
-        self._draft_worker.init_cuda_graphs()
-
-    @property
-    def target_worker(self):
-        return self._target_worker
-
-    @property
-    def draft_worker(self):
-        return self._draft_worker
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -697,10 +716,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             ),
         )
 
-    def clear_cache_pool(self):
-        # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
-        pass
-
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -709,8 +724,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=target_capture_mode
+            )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -734,10 +750,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     if self.speculative_algorithm.is_standalone()
                     else CaptureHiddenMode.LAST
                 )
+                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                    self.draft_worker.draft_runner
+                )
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
-                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                    hidden_size=hidden_size,
+                    dtype=hidden_dtype,
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )
@@ -821,11 +840,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1].
-            fill_bonus_tokens[(bs,)](
+            fill_bonus_tokens_func(
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
                 accept_index.shape[1],
+                bs,
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
@@ -851,25 +871,3 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
         )
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for i in range(self.speculative_num_steps):
-            success, message = self._draft_worker.draft_runner_list[
-                i
-            ].update_weights_from_disk(
-                recv_req.model_path,
-                recv_req.load_format,
-                recapture_cuda_graph=recv_req.recapture_cuda_graph,
-            )
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        for i in range(self.speculative_num_steps):
-            success, message = self._draft_worker.draft_runner_list[
-                i
-            ].update_weights_from_ipc(recv_req)
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."

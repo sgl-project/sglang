@@ -11,7 +11,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 
 - [EAGLE Decoding](#eagle-decoding)
   - [EAGLE-2 Decoding](#eagle-2-decoding)
-  - [EAGLE-2 Decoding with torch.compile](#eagle-2-decoding-with-torchcompile)
+  - [EAGLE-2 Decoding with torch.compile](#eagle-2-decoding-with-torch-compile)
   - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
@@ -242,7 +242,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 4 \
     --speculative-num-draft-tokens 16 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --log-level warning
 ```
 
@@ -326,7 +326,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 16 \
     --speculative-token-map thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --dtype float16 \
     --log-level warning
 ```
@@ -365,7 +365,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 4 \
     --speculative-num-draft-tokens 16 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --dtype float16 \
     --log-level warning
 ```
@@ -405,7 +405,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 2 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --log-level warning
 ```
 
@@ -557,7 +557,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 2 \
     --speculative-num-draft-tokens 7 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --log-level warning
 ```
 
@@ -600,7 +600,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --log-level warning
 ```
 
@@ -695,7 +695,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 16 \
     --speculative-ngram-max-bfs-breadth 10 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --log-level warning
 ```
 
@@ -972,10 +972,10 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 ```bash Command
 # Fewer CUDA graph captures = less memory reserved
---cuda-graph-max-bs 4   # or even 2 for tight memory situations
+--cuda-graph-max-bs-decode 4   # or even 2 for tight memory situations
 ```
 
-- If omitted, `--cuda-graph-max-bs` is auto-selected based on GPU memory and TP size, and can be much larger on high-memory GPUs.
+- If omitted, `--cuda-graph-max-bs-decode` is auto-selected based on GPU memory and TP size, and can be much larger on high-memory GPUs.
 
 ### Step 3: Reduce draft tree size
 
@@ -1008,13 +1008,13 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --cuda-graph-max-bs 2 \
+    --cuda-graph-max-bs-decode 2 \
     --mem-fraction-static 0.5 \
     --max-running-requests 4 \
     --log-level warning
 ```
 
-Then gradually increase `--speculative-num-draft-tokens`, `--speculative-eagle-topk`, and `--cuda-graph-max-bs`. Increase `--mem-fraction-static` last, only after the run is stable.
+Then gradually increase `--speculative-num-draft-tokens`, `--speculative-eagle-topk`, and `--cuda-graph-max-bs-decode`. Increase `--mem-fraction-static` last, only after the run is stable.
 
 ---
 

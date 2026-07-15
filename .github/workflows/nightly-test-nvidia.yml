@@ -26,9 +26,14 @@ on:
           - 'nightly-test-specialized-8-gpu-b200'
           - 'nightly-test-perf-4-gpu-gb300'
           - 'nightly-test-kernel-1-gpu-h100'
-          - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-diffusion'
           - 'nightly-test-kernel-8-gpu-h200'
           - 'nightly-test-precision-8-gpu-h200'
+      force_baseline_update:
+        description: 'precision job only: refresh the rolling baseline instead of comparing (sets SGLANG_PRECISION_FORCE_UPDATE=1). Dispatch once after an intentional forward-path dtype/precision change stales the baseline; later scheduled runs compare against it and go green.'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -140,7 +145,9 @@ jobs:
         timeout-minutes: 90
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error
+          # Full grids run ~7x the in-CI parametrizations per world size; the
+          # default 1200s per-file budget only fits the reduced PR sweep.
+          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -628,9 +635,9 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
 
-  # Diffusion cross-framework comparison
-  nightly-test-diffusion-comparison:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
+  # SGLang-Diffusion nightly benchmark
+  nightly-test-diffusion:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion')
     runs-on: 4-gpu-h100
     timeout-minutes: 300
     steps:
@@ -643,7 +650,7 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run cross-framework comparison
+      - name: Run diffusion benchmark
         env:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -676,11 +683,11 @@ jobs:
             --dashboard dashboard.md \
             --charts-dir comparison-charts
 
-      - name: Upload comparison artifacts
+      - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-comparison-${{ github.run_id }}
+          name: diffusion-benchmark-${{ github.run_id }}
           path: |
             comparison-results.json
             dashboard.md
@@ -718,6 +725,8 @@ jobs:
           SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
           HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
           SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+          # '0' on scheduled runs (input unset); '1' only on a manual baseline-refresh dispatch.
+          SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.force_baseline_update && '1' || '0' }}
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
@@ -783,7 +792,7 @@ jobs:
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
       - nightly-test-perf-4-gpu-gb300
-      - nightly-test-diffusion-comparison
+      - nightly-test-diffusion
       - nightly-test-precision-8-gpu-h200
       - consolidate-metrics
     runs-on: ubuntu-latest

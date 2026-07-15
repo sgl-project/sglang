@@ -12,7 +12,7 @@ pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_ima
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
-3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
+3. insert or override the corresponding scenario in the platform JSON under `perf_baselines/`
 
 
 """
@@ -33,6 +33,7 @@ from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -166,7 +167,7 @@ class DiffusionServerArgs:
     """Configuration for a single model/scenario test case."""
 
     model_path: str  # HF repo or local path
-    modality: str | None = None  # auto-inferred: "image" or "video" or "3d"
+    modality: str | None = None  # auto-inferred: "image", "video", "3d", or "action"
 
     custom_validator: str | None = None  # auto-derived unless explicitly overridden
     # resources
@@ -207,6 +208,8 @@ class DiffusionServerArgs:
             self.custom_validator = "video"
         elif self.modality == "3d":
             self.custom_validator = "mesh"
+        elif self.modality == "action":
+            self.custom_validator = "action"
 
 
 @lru_cache(maxsize=None)
@@ -218,6 +221,8 @@ def _infer_modality_from_model_path(model_path: str) -> str:
     task_type = model_info.pipeline_config_cls.task_type
     if task_type == ModelTaskType.I2M:
         return "3d"
+    if task_type.is_action_gen():
+        return "action"
     if task_type.is_image_gen():
         return "image"
     return "video"
@@ -310,7 +315,13 @@ class DiffusionTestCase:
             )
 
 
-LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+_REALTIME_MODEL_COMMON_EXTRAS = {
+    "seed": 42,
+    "num_inference_steps": 4,
+    "guidance_scale": 1.0,
+}
+
+REALTIME_MODEL_sampling_params = DiffusionSamplingParams(
     prompt=(
         "A slow aerial orbit around a pastel floating island hotel in the open "
         "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
@@ -331,9 +342,7 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
     },
     realtime_perf_ignore_initial_chunks=2,
     extras={
-        "seed": 42,
-        "num_inference_steps": 4,
-        "guidance_scale": 1.0,
+        **_REALTIME_MODEL_COMMON_EXTRAS,
         "realtime_causal_sink_size": 9,
         "realtime_causal_kv_cache_num_frames": 18,
         "condition_inputs": {
@@ -352,6 +361,23 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
                 [],
             ]
         },
+    },
+)
+
+
+PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="pick up the blue block",
+    extras={
+        "action_horizon": 50,
+        "action_dim": 32,
+        "state_dim": 32,
+        "image_size": 64,
+        "num_inference_steps": 2,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        "enable_cuda_graph": True,
+        "action_max_abs_diff_threshold": 0.05,
+        "action_mean_abs_diff_threshold": 0.005,
     },
 )
 
@@ -474,6 +500,21 @@ IDEOGRAM4_CI_PROMPT = json.dumps(
     ensure_ascii=False,
 )
 
+COSMOS3_NANO_CI_sampling_params = DiffusionSamplingParams(
+    prompt="A red cube on a white table, product photo.",
+    output_size="832x480",
+    output_format="png",
+    extras={
+        "num_inference_steps": 35,
+        "seed": 0,
+        "max_sequence_length": 128,
+        "extra_args": {
+            "guardrails": False,
+            "use_resolution_template": False,
+        },
+    },
+)
+
 IDEOGRAM4_CI_sampling_params = replace(
     T2I_sampling_params,
     prompt=IDEOGRAM4_CI_PROMPT,
@@ -536,6 +577,17 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    num_frames=33,
+    extras={
+        "num_inference_steps": 8,
+        "seed": 42,
+        "enable_memory_bank": False,
+    },
+)
+
 MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
@@ -557,6 +609,28 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     output_size="384x640",
     num_frames=17,
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
+)
+
+LONGLIVE2_T2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    image_path=None,
+    num_frames=61,
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
+)
+
+LONGLIVE2_I2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    output_size="960x928",
+    num_frames=61,
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
@@ -619,6 +693,8 @@ def get_default_sampling_params_for_model_task(
         return TI2V_sampling_params
     if task_type == ModelTaskType.I2M:
         return HUNYUAN3D_SHAPE_sampling_params
+    if task_type.is_action_gen():
+        return PI05_ACTION_CI_sampling_params
     raise ValueError(f"No default sampling params for model task {task_type!r}")
 
 
@@ -645,6 +721,57 @@ MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sgl
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
 MODELOPT_NVFP4_B200_ENV_VARS = {}
 MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
+
+PERF_BASELINE_PLATFORM_ENV = "SGLANG_DIFFUSION_PERF_BASELINE_PLATFORM"
+PERF_BASELINE_DIR = Path(__file__).with_name("perf_baselines")
+PERF_BASELINE_FILE_BY_PLATFORM = {
+    "h100": "h100.json",
+    "b200": "b200.json",
+    "5090": "5090.json",
+}
+PERF_BASELINE_PLATFORM_ALIASES = {
+    "sm90": "h100",
+    "hopper": "h100",
+    "h100": "h100",
+    "sm100": "b200",
+    "blackwell": "b200",
+    "b200": "b200",
+    "sm120": "5090",
+    "rtx5090": "5090",
+    "5090": "5090",
+}
+
+
+def _normalize_perf_baseline_platform(platform: str) -> str:
+    normalized = platform.strip().lower().replace("_", "-")
+    normalized = normalized.replace("-", "")
+    if normalized not in PERF_BASELINE_PLATFORM_ALIASES:
+        valid = ", ".join(sorted(PERF_BASELINE_FILE_BY_PLATFORM))
+        raise ValueError(
+            f"Invalid diffusion perf baseline platform {platform!r}. "
+            f"Expected one of: {valid}"
+        )
+    return PERF_BASELINE_PLATFORM_ALIASES[normalized]
+
+
+def get_perf_baseline_platform() -> str:
+    override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
+    if override:
+        return _normalize_perf_baseline_platform(override)
+    if current_platform.is_sm120():
+        return "5090"
+    if current_platform.is_blackwell():
+        return "b200"
+    return "h100"
+
+
+def get_perf_baseline_path(platform: str | None = None) -> Path:
+    baseline_platform = (
+        _normalize_perf_baseline_platform(platform)
+        if platform is not None
+        else get_perf_baseline_platform()
+    )
+    return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
 
 
 def _make_modelopt_ci_case(
@@ -683,7 +810,7 @@ def _with_default_num_gpus(
 
 # Load global configuration
 BASELINE_CONFIG = (
-    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    BaselineConfig.load(get_perf_baseline_path())
     .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
     .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
 )

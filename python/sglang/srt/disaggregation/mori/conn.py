@@ -507,6 +507,7 @@ class MoriKVManager(CommonKVManager):
                 infos[transfer_info.engine_key] = transfer_info
 
                 if len(infos) >= transfer_info.required_dst_info_num:
+                    self.resolve_kv_replica_factor(infos)
                     # All decode peers reported their dst metadata; pick a
                     # non-None decode_prefix_len if any peer set it (they
                     # should all agree, but be defensive). 0 means "no
@@ -1140,7 +1141,7 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring"):
+            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1267,19 +1268,35 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
+        if state_type == "minimax_index_k":
+            if self.pp_size is not None and self.pp_size > 1:
+                raise RuntimeError(
+                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                )
+            if peer_info.decode_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "PD disagg: heterogeneous TP not supported for MiniMax sparse index yet."
+                )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
+        if (
+            state_type == "c128_state"
+            and common_len == 0
+            and src_state_indices.size == 0
+            and dst_state_indices.size == 0
+        ):
+            return []
         if common_len == 0 and max(src_state_indices.size, dst_state_indices.size) > 0:
             raise RuntimeError(
                 f"No overlapping state indices for state_type={state_type}"
             )
         if src_state_indices.size != dst_state_indices.size:
-            # SWA_RING is positional: truncating silently misaligns rows and
-            # corrupts KV, so fail loud. Paged swa/dsa tolerate a 1-page drift
-            # -> keep truncation.
-            if state_type == "swa_ring":
+            # These components are position- or request-indexed: truncating
+            # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
+            # a 1-page drift -> keep truncation.
+            if state_type in ("swa_ring", "c128_state"):
                 raise RuntimeError(
-                    "SWA_RING state index length mismatch: "
+                    f"{state_type.upper()} state index length mismatch: "
                     f"src={src_state_indices.size}, dst={dst_state_indices.size}"
                 )
             logger.warning(
@@ -1428,8 +1445,16 @@ class MoriKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.conclude_state: Optional[KVPoll] = None

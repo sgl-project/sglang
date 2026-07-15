@@ -44,8 +44,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -321,8 +320,11 @@ class MossVLVisionModel(nn.Module):
             wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        max_grid_size = int(grid_thw[:, 1:].max())
+        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        rotary_pos_emb_full = self.rotary_pos_emb(
+            torch.arange(max_grid_size, device=self.device)
+        )
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -986,7 +988,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(

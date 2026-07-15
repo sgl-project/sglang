@@ -6,6 +6,8 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for Qwen3.6-27B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.6-27B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_27b).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### High Throughput
@@ -14,11 +16,11 @@ This page focuses on optimal configuration and benchmark results for Qwen3.6-27B
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 16K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 64k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in64k-out1k-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 128k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 16k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -73,9 +75,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_NPU_PROFILING=1
-export SGLANG_NPU_PROFILING_STAGE=prefill
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=150
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -105,14 +104,16 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --mm-enable-dp-encoder
+    --mm-enable-dp-encoder \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -172,9 +173,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_NPU_PROFILING=1
-export SGLANG_NPU_PROFILING_STAGE=prefill
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=150
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -204,14 +202,16 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --mm-enable-dp-encoder
+    --mm-enable-dp-encoder \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -236,7 +236,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: BF16
 
-**Dataset**: 64K+1K (90% prefix cache hit rate)
+**Dataset**: 64k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -272,7 +272,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -288,18 +287,20 @@ python3 -m sglang.launch_server \
     --mamba-scheduler-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 20 \
-    --max-mamba-cache-size 108 \
-    --mem-fraction-static 0.7 \
-    --cuda-graph-bs 1 2 4 8 12 15 17 19 20 \
+    --max-mamba-cache-size 160 \
+    --mem-fraction-static 0.82 \
+    --cuda-graph-bs 1 2 5 10 15 17 19 20 \
     --enable-prefill-delayer \
-    --prefill-delayer-queue-min-ratio 0.8 \
-    --prefill-delayer-max-delay-ms 30000 \
+    --prefill-delayer-queue-min-ratio 0.7 \
+    --prefill-delayer-max-delay-ms 20000 \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -309,7 +310,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -337,7 +338,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -372,7 +373,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=130
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -401,14 +401,16 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -418,6 +420,97 @@ python -m sglang.bench_serving \
     --random-input-len 3500 \
     --random-output-len 1500 \
     --num-prompts 216 \
+    --random-range-ratio 1
+```
+
+### Qwen3.6-27B W8A8 1P IN64K OUT1K 50ms
+
+**Model**: Qwen3.6-27B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 1
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 64k+1k
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --tp-size 2 \
+    --nnodes 1 \
+    --attention-backend ascend \
+    --device npu \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 48000 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 6 \
+    --max-mamba-cache-size 16 \
+    --mem-fraction-static 0.6 \
+    --cuda-graph-bs 1 2 4 5 6 \
+    --quantization modelslim \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```bash Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 6 \
+    --random-input-len 64000 \
+    --random-output-len 1000 \
+    --num-prompts 12 \
     --random-range-ratio 1
 ```
 
@@ -433,7 +526,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 50ms
 
@@ -468,7 +561,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=20
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -493,14 +585,16 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
-    --mamba-ssm-dtype bfloat16
+    --mamba-ssm-dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -525,7 +619,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 16K+1K
+**Dataset**: 16k+1k
 
 **TPOT**: 50ms
 
@@ -560,7 +654,6 @@ export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -587,14 +680,16 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -604,101 +699,5 @@ python -m sglang.bench_serving \
     --random-input-len 16000 \
     --random-output-len 1000 \
     --num-prompts 116 \
-    --random-range-ratio 1
-```
-
-### Qwen3.6-27B W8A8 2P IN64K OUT1K 50ms
-
-**Model**: Qwen3.6-27B
-
-**Hardware**: Atlas 800I A3
-
-**Cards**: 2
-
-**Deploy Mode**: PD Mixed
-
-**Quantization**: W8A8 INT8
-
-**Dataset**: 64K+1K
-
-**TPOT**: 50ms
-
-#### Model Deployment
-
-```bash Command
-# ============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
-# ============================================================
-
-MODEL_PATH=/path/to/model-weights
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
-export SGLANG_SET_CPU_AFFINITY=1
-export STREAMS_PER_DEVICE=32
-
-python3 -m sglang.launch_server \
-    --model-path $MODEL_PATH \
-    --host 127.0.0.1 --port 6688 \
-    --tp-size 4 \
-    --nnodes 1 \
-    --attention-backend ascend \
-    --device npu \
-    --chunked-prefill-size -1 \
-    --max-prefill-tokens 50000 \
-    --disable-radix-cache \
-    --trust-remote-code \
-    --max-running-requests 28 \
-    --max-mamba-cache-size 50 \
-    --mem-fraction-static 0.7 \
-    --cuda-graph-bs 2 4 6 \
-    --enable-multimodal \
-    --quantization modelslim \
-    --mm-attention-backend ascend_attn \
-    --dtype bfloat16 \
-    --mamba-ssm-dtype bfloat16 \
-    --speculative-algorithm NEXTN \
-    --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
-```
-
-#### Benchmark
-
-We tested it based on the `RANDOM` dataset.
-
-```shell Command
-python -m sglang.bench_serving \
-    --dataset-name random \
-    --backend sglang \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --max-concurrency 6 \
-    --random-input-len 64000 \
-    --random-output-len 1000 \
-    --num-prompts 24 \
     --random-range-ratio 1
 ```
