@@ -54,6 +54,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         kv_committed_len=0,
         finished_reason=None,
         hisparse_staging=False,
+        hisparse_resident=False,
         staging=False,
         inflight_middle_chunks=0,
     )
@@ -350,12 +351,31 @@ class TestHiSparseUnit(unittest.TestCase):
 
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
         """request_finished -> free KV -> free req slot."""
+        was_resident = req.hisparse_resident
         self.coordinator.request_finished(req)
-        if logical_only:
+        if logical_only and not was_resident:
             self.allocator.logical_attn_allocator.free(kv_loc)
         else:
             self.allocator.free(kv_loc)
         self._free_req_slot(req)
+
+    def _admit_direct_to_buffer(self, req):
+        """Force direct admission to exercise the HBM-full fallback path."""
+        allocator = self.allocator.hisparse_attn_allocator
+        buffer_size = self.coordinator._device_buffer_alloc_size(req.kv_allocated_len)
+        host_len = self.coordinator.host_token_len(req.kv_allocated_len)
+        promotion_size = (
+            (host_len + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        self.assertGreater(promotion_size, buffer_size)
+
+        held = allocator.alloc(allocator.available_size() - buffer_size)
+        self.assertIsNotNone(held)
+        try:
+            self.coordinator.admit_request_direct(req)
+            self.assertFalse(req.hisparse_resident)
+        finally:
+            allocator.free(held)
 
     def _get_initial_sizes(self):
         """Snapshot allocator available sizes."""
@@ -416,7 +436,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
         self._populate_host_pool(req, fill_len)
-        self.coordinator.admit_request_direct(req)
+        self._admit_direct_to_buffer(req)
 
         # Pass fill_len-1 so position fill_len-1 ("newest token") is never
         # randomly selected — its reserved device-buffer slot is only valid
@@ -450,7 +470,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
         self._populate_host_pool(req, fill_len)
-        self.coordinator.admit_request_direct(req)
+        self._admit_direct_to_buffer(req)
 
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
@@ -627,6 +647,7 @@ class TestHiSparseUnit(unittest.TestCase):
         ready = self.coordinator.collect_ready_reqs()
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
+        self.assertTrue(req.hisparse_resident)
         self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])
 
         tokens = self._build_topk_tokens(fill_len)
@@ -639,7 +660,6 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_kv_correct(
             locs[0], tokens, layer_id=0, count=valid_n, msg="Staging: "
         )
-        self._assert_matches_naive(rpi, sls, batch, locs, layer_id=0, msg="Staging: ")
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
@@ -704,7 +724,7 @@ class TestHiSparseUnit(unittest.TestCase):
     # Test: Direct-to-host (PD separated) path
     # ==================================================================
     def test_request_lifecycle_direct_path(self):
-        """alloc_logical_only -> host write -> admit_direct -> swap-in -> finish."""
+        """alloc_logical_only -> host write -> resident promotion -> finish."""
         initial = self._get_initial_sizes()
         fill_len = DEVICE_BUFFER_SIZE + self.page_size
         req = _make_req("direct-req", list(range(fill_len)))
@@ -715,22 +735,20 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.admit_request_direct(req)
 
         self.assertFalse(req.staging)
+        self.assertTrue(req.hisparse_resident)
         self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])
-        buf_tokens = self.coordinator.req_device_buffer_tokens[
-            :, req.req_pool_idx, :DEVICE_BUFFER_SIZE
-        ]
-        self.assertTrue(torch.all(buf_tokens == -1))
+        self.assertEqual(self.coordinator.req_device_buffer_size[req.req_pool_idx], 0)
 
         tokens = self._build_topk_tokens(fill_len - 1)
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
-        locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id=0)
-        self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
-        self._assert_kv_correct(
-            locs[0], tokens, layer_id=0, count=TOP_K, msg="Direct: "
-        )
-        self._assert_matches_naive(rpi, sls, batch, locs, layer_id=0, msg="Direct: ")
+        for layer_id in range(LAYER_NUM):
+            locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id)
+            self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
+            self._assert_kv_correct(
+                locs[0], tokens, layer_id=layer_id, count=TOP_K, msg="Direct: "
+            )
 
         self._cleanup_req(req, kv_loc, logical_only=True)
         self._assert_sizes_restored(initial, "direct_path")

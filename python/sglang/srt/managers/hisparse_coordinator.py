@@ -413,8 +413,10 @@ class HiSparseCoordinator:
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
 
-        Skips staging DMA entirely. Only allocates a small device buffer
-        (4KB) for decode-time swap-in, then marks the request as ready.
+        Skips staging backup entirely. If the HiSparse device pool has room,
+        promotes the complete host KV into it and admits the request as
+        resident. Otherwise, allocates a small device buffer for decode-time
+        swap-in.
         Host indices were already written to req_to_host_pool.
 
         Metadata fixups after alloc_device_buffer():
@@ -423,26 +425,81 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
-        self.alloc_device_buffer(req)
-
         host_len = self.host_token_len(req.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
-            # Short sequences (seq_len <= device_buffer_size): the kernel fast path
-            # returns device_buffer_locs directly without any host loading, so we
-            # must preload all tokens from host pool into the device buffer
-            # TODO(hzh0425): Optimize this.
-            self._preload_to_device_buffer(req)
-        else:
-            # Long sequence: reset device_buffer_tokens to -1 so the kernel
-            # sees all slots as empty -> every top-k lookup is a miss -> host load.
-            self.req_device_buffer_tokens[
-                :, req.req_pool_idx, : self.device_buffer_size
-            ] = -1
+        if not self._try_promote_from_host(req):
+            buffer_size = self._device_buffer_alloc_size(req.kv_allocated_len)
+            if not self.demote_until_hisparse_available(buffer_size):
+                raise RuntimeError("HiSparse direct admission allocation failed")
+            self.alloc_device_buffer(req)
+
+            if host_len <= self.device_buffer_size:
+                # Short sequences take the kernel fast path, so preload the
+                # complete host KV into their device buffer.
+                self._preload_to_device_buffer(req)
+            else:
+                # The direct-path buffer starts empty. Every top-k lookup is a
+                # miss until the swap-in kernel populates it.
+                self.req_device_buffer_tokens[
+                    :, req.req_pool_idx, : self.device_buffer_size
+                ] = -1
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         self.active_hisparse_reqs[req.req_pool_idx] = req
-        logger.debug("HiSparse: admitting request %s directly", req.rid)
+        logger.debug(
+            "HiSparse: admitting request %s directly (%s)",
+            req.rid,
+            "resident" if req.hisparse_resident else "device-buffered",
+        )
+
+    def _try_promote_from_host(self, req: Req) -> bool:
+        """Promote a PD-disaggregated request using only currently free HBM."""
+        logical_locs = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : req.kv_allocated_len
+        ]
+        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            logical_locs
+        )
+        host_len = self.host_token_len(req.kv_allocated_len)
+        assert len(compressed_locs) == host_len
+
+        page_size = self.mem_pool_device.page_size
+        alloc_size = ((host_len + page_size - 1) // page_size) * page_size
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        num_pages = alloc_size // page_size
+        can_promote = torch.tensor(
+            int(self._has_free_hisparse_pages(allocator, num_pages)),
+            dtype=torch.int,
+            device="cpu",
+        )
+        # All TP ranks must choose the same admission path.
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                can_promote,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        if not bool(can_promote.item()):
+            return False
+
+        device_locs = allocator.alloc(alloc_size)
+        assert device_locs is not None
+        mapped_device_locs = device_locs[:host_len]
+
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
+            mapped_device_locs
+        )
+        try:
+            self._load_host_kv(req, mapped_device_locs)
+        except Exception:
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
+            self.token_to_kv_pool_allocator.free_hisparse_indices(device_locs)
+            raise
+
+        req.hisparse_resident = True
+        return True
 
     def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
@@ -452,13 +509,16 @@ class HiSparseCoordinator:
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        self._load_host_kv(req, device_locs)
 
+    def _load_host_kv(self, req: Req, device_locs: torch.Tensor) -> None:
+        host_len = self.host_token_len(req.kv_allocated_len)
+        host_locs = self.req_to_host_pool[req.req_pool_idx, :host_len]
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
-                host_indices,
+                host_locs,
                 device_locs,
                 layer_id,
                 io_backend="kernel",
