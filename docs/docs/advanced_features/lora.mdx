@@ -549,6 +549,6 @@ Flat mode may be preferable when:
 
 ### Performance
 
-Paged LoRA delivers +5.0% decode throughput and -5.2% TPOT on single GPU (TP=1), and +2.8% throughput with -1.4% TPOT on 4-GPU TP=4, compared to flat mode. The P99 TPOT improvement is -6.8% (TP=1) and -16.6% (TP=4), indicating significantly better tail latency.
+Paged LoRA delivers +5.6% decode throughput and -5.3% TPOT on single GPU (TP=1), and +1.4% throughput with comparable TPOT on 4-GPU TP=4, compared to flat mode. The P99 TPOT improvement is -4.6% (TP=1) and -5.4% (TP=4), indicating significantly better tail latency.
 
 Results are from 3-run median benchmarks on NVIDIA H200 with Llama-3.1-8B-Instruct, mixed r=8/r=64 adapters, auto-tuned Triton kernel block sizes.

@@ -2,7 +2,7 @@
 
 Current LoRA weight storage allocates `max_lora_rank` (e.g., 64) for every adapter, regardless of actual rank. An adapter with rank=8 wastes 56/64 = 87.5% of its allocated weight memory to zero-padding. This wastes GPU memory bandwidth and hurts L2 cache efficiency, especially under multi-tenant LoRA serving where many adapters of different ranks coexist.
 
-This PR introduces **paged LoRA**: weight storage organized into fixed-size pages (`page_rank_size=8` ranks per page), mapped to physical pages via a `page_table`. An r=8 adapter uses 1 page; an r=64 adapter uses 8 pages — no zero-padding waste. Pages are allocated/evicted individually, similar to paged attention. The result is a smaller GPU working set, better cache utilization, and +5.0% decode throughput on single GPU (TP=1) and +2.8% on 4-GPU (TP=4).
+This PR introduces **paged LoRA**: weight storage organized into fixed-size pages (`page_rank_size=8` ranks per page), mapped to physical pages via a `page_table`. An r=8 adapter uses 1 page; an r=64 adapter uses 8 pages — no zero-padding waste. Pages are allocated/evicted individually, similar to paged attention. The result is a smaller GPU working set, better cache utilization, and +5.6% decode throughput on single GPU (TP=1) and +1.4% on 4-GPU (TP=4).
 
 ## Usage
 
