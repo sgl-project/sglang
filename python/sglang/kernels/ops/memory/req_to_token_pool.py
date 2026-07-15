@@ -57,24 +57,8 @@ class WriteReqToTokenPool:
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> None:
-        num_reqs = cls._validate_inputs(
-            req_to_token,
-            req_pool_indices=req_pool_indices,
-            req_pool_indices_cpu=req_pool_indices_cpu,
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            extend_lens=extend_lens,
-            extend_lens_cpu=extend_lens_cpu,
-            prefix_tensors=prefix_tensors,
-            out_cache_loc=out_cache_loc,
-        )
-        if num_reqs == 0:
-            return
-
         out_cache_offset = 0
-        for index in range(num_reqs):
+        for index in range(req_pool_indices_cpu.shape[0]):
             req_pool_index = int(req_pool_indices_cpu[index].item())
             prefix_len = int(prefix_lens_cpu[index].item())
             seq_len = int(seq_lens_cpu[index].item())
@@ -101,22 +85,6 @@ class WriteReqToTokenPool:
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> None:
-        num_reqs = cls._validate_inputs(
-            req_to_token,
-            req_pool_indices=req_pool_indices,
-            req_pool_indices_cpu=req_pool_indices_cpu,
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            extend_lens=extend_lens,
-            extend_lens_cpu=extend_lens_cpu,
-            prefix_tensors=prefix_tensors,
-            out_cache_loc=out_cache_loc,
-        )
-        if num_reqs == 0:
-            return
-
         supported_accelerator_types = ("cuda", "npu", "xpu", "musa")
         assert (
             req_to_token.device.type in supported_accelerator_types
@@ -127,7 +95,7 @@ class WriteReqToTokenPool:
             dtype=torch.uint64,
             pin_memory=is_pin_memory_available(req_to_token.device),
         ).to(req_to_token.device, non_blocking=True)
-        _write_req_to_token_pool_kernel[(num_reqs,)](
+        _write_req_to_token_pool_kernel[(req_pool_indices.shape[0],)](
             req_to_token,
             req_pool_indices,
             prefix_pointers,

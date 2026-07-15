@@ -1,5 +1,4 @@
 import unittest
-from unittest import mock
 
 import torch
 
@@ -13,39 +12,80 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton parity")
 class TestWriteReqToTokenPool(CustomTestCase):
 
-    def test_empty_batch_returns_without_launching(self):
-        """Empty batches return before pointer materialization or kernel launch."""
-        req_to_token = torch.full(
-            (2, 8),
-            -7,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        req_to_token_before = req_to_token.clone()
+    def test_empty_batch_writes_nothing(self) -> None:
+        """Empty batches launch a zero-program grid and leave the pool untouched."""
         empty_cpu = torch.empty((0,), dtype=torch.int64)
         empty_device = empty_cpu.cuda()
 
-        with mock.patch(
-            "sglang.kernels.ops.memory.req_to_token_pool._write_req_to_token_pool_kernel"
-        ) as kernel:
-            WriteReqToTokenPool.triton(
-                req_to_token,
-                req_pool_indices=empty_device,
-                req_pool_indices_cpu=empty_cpu,
-                prefix_lens=empty_device,
-                prefix_lens_cpu=empty_cpu,
-                seq_lens=empty_device,
-                seq_lens_cpu=empty_cpu,
-                extend_lens=empty_device,
-                extend_lens_cpu=empty_cpu,
-                prefix_tensors=[],
-                out_cache_loc=torch.empty((0,), dtype=torch.int64, device="cuda"),
-            )
+        for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
+            with self.subTest(implementation=implementation.__name__):
+                req_to_token = torch.full((2, 8), -7, dtype=torch.int32, device="cuda")
+                req_to_token_before = req_to_token.clone()
 
-        kernel.__getitem__.assert_not_called()
-        self.assertTrue(torch.equal(req_to_token, req_to_token_before))
+                implementation(
+                    req_to_token,
+                    req_pool_indices=empty_device,
+                    req_pool_indices_cpu=empty_cpu,
+                    prefix_lens=empty_device,
+                    prefix_lens_cpu=empty_cpu,
+                    seq_lens=empty_device,
+                    seq_lens_cpu=empty_cpu,
+                    extend_lens=empty_device,
+                    extend_lens_cpu=empty_cpu,
+                    prefix_tensors=[],
+                    out_cache_loc=torch.empty((0,), dtype=torch.int64, device="cuda"),
+                )
 
-    def test_triton_vanilla_and_scalar_oracle_match_ragged_cases(self):
+                self.assertTrue(torch.equal(req_to_token, req_to_token_before))
+
+    def test_host_resident_empty_prefix_tensor_is_accepted(self) -> None:
+        """ChunkCache hands back a CPU empty prefix tensor; a zero prefix must not deref it."""
+        req_to_token = torch.full((3, 16), -7, dtype=torch.int32, device="cuda")
+        lens_cpu = torch.tensor([0], dtype=torch.int64)
+        extend_lens_cpu = torch.tensor([3], dtype=torch.int64)
+        # Exactly what ChunkCache.match_prefix returns: empty, and on the host.
+        chunk_cache_prefix = torch.empty((0,), dtype=torch.int64)
+        self.assertEqual(chunk_cache_prefix.device.type, "cpu")
+
+        for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
+            with self.subTest(implementation=implementation.__name__):
+                implementation(
+                    req_to_token,
+                    req_pool_indices=torch.tensor([1], dtype=torch.int64).cuda(),
+                    req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+                    prefix_lens=lens_cpu.cuda(),
+                    prefix_lens_cpu=lens_cpu,
+                    seq_lens=extend_lens_cpu.cuda(),
+                    seq_lens_cpu=extend_lens_cpu,
+                    extend_lens=extend_lens_cpu.cuda(),
+                    extend_lens_cpu=extend_lens_cpu,
+                    prefix_tensors=[chunk_cache_prefix],
+                    out_cache_loc=torch.tensor(
+                        [11, 12, 13], dtype=torch.int64, device="cuda"
+                    ),
+                )
+
+                self.assertEqual(req_to_token[1, :3].tolist(), [11, 12, 13])
+
+    def test_validate_inputs_returns_batch_size_and_rejects_malformed_batch(
+        self,
+    ) -> None:
+        """The opt-in validator accepts a well-formed batch and rejects a short prefix."""
+        arguments = self._make_write_arguments(
+            req_pool_indices=[1, 4],
+            prefixes=[[301, 302], []],
+            extensions=[[501], [601, 602]],
+            out_dtype=torch.int64,
+        )
+        pool = torch.full((7, 1100), -7, dtype=torch.int32, device="cuda")
+
+        self.assertEqual(WriteReqToTokenPool._validate_inputs(pool, **arguments), 2)
+
+        arguments["prefix_tensors"][0] = arguments["prefix_tensors"][0][:1]
+        with self.assertRaises(AssertionError):
+            WriteReqToTokenPool._validate_inputs(pool, **arguments)
+
+    def test_triton_vanilla_and_scalar_oracle_match_ragged_cases(self) -> None:
         """Triton, vanilla, and scalar writes match across ragged edge cases."""
         cases = (
             ([1], [[]], [[101, 102, 103]]),
