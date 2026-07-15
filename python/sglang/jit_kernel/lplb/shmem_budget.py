@@ -19,6 +19,9 @@ Dynamic shared-memory cap per block (with opt-in via
     H200   SM_90   227 KB
     H20    SM_90   227 KB
     B200   SM_100  228 KB   practical 224 KB
+    SM120           99 KB   (consumer Blackwell -- not in the table below;
+                             this is exactly why the budget is read live off
+                             the device, see ``_budget_bytes_for_device``)
 """
 
 from __future__ import annotations
@@ -37,7 +40,13 @@ _RUNTIME_PAD_BYTES = 256
 # fp32
 _BYTES_PER_ELEM = 4
 
-# Practical per-block dynamic shmem caps (bytes)
+# Practical per-block dynamic shmem caps (bytes) -- FALLBACK ONLY. Production
+# code reads the budget live off the device via `_budget_bytes_for_device`,
+# so this table can't silently go stale for an arch it has no entry for (as
+# happened for SM120: absent here, `_gpu_key_for_device` fell back to
+# "h100"'s 223 KiB against a real 99 KiB cap, so a launch that passed the
+# pre-flight check still crashed). Kept for old torch builds that predate
+# `shared_memory_per_block_optin`, and as a documented reference table.
 GPU_BUDGETS_BYTES: dict[str, int] = {
     "a100": 160 * 1024,  # unreachable today: LPLB gates on SM >= 9 (Hopper+)
     "h100": 223 * 1024,
@@ -48,6 +57,11 @@ GPU_BUDGETS_BYTES: dict[str, int] = {
 
 # H100/H200/H20 share a budget, so SM major 9 covers all three.
 _SM_MAJOR_TO_GPU_KEY = {8: "a100", 9: "h100", 10: "b200"}
+
+# `shared_memory_per_block_optin` minus this margin reproduces
+# `GPU_BUDGETS_BYTES`'s existing "practical" values (e.g. H100:
+# 232448 - 4096 = 223 KiB), confirmed against live device properties.
+_PRACTICAL_MARGIN_BYTES = 4096
 
 
 # Not on the torch.compile trace path (unlike `cache_once`'s users in
@@ -66,22 +80,45 @@ def _gpu_key_for_device(device) -> str:
     return key
 
 
-def resolve_gpu_key(device: torch.device | int | str | None = None) -> str:
-    """Map ``device``'s SM major version to a ``GPU_BUDGETS_BYTES`` key.
-
-    ``device`` is canonicalized to an integer index before hitting the cache:
-    a generic ``"cuda"`` / index-less ``torch.device`` resolves to the
-    *current* device, which may change between calls via ``set_device``.
+def _canonicalize_device_index(device: torch.device | int | str | None) -> int:
+    """Resolve `device` to a concrete CUDA index, shared by every lookup
+    below that caches on the index: a generic ``"cuda"`` / index-less
+    ``torch.device`` is NOT cached as given, since it tracks the *current*
+    device and a later ``torch.cuda.set_device()`` would otherwise read a
+    stale cached entry for it.
     """
     if device is None:
-        index = torch.cuda.current_device()
-    else:
-        if not isinstance(device, torch.device):
-            device = torch.device(device)
-        index = (
-            device.index if device.index is not None else torch.cuda.current_device()
+        return torch.cuda.current_device()
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+@functools.lru_cache(maxsize=None)
+def _budget_bytes_for_device(index: int) -> int:
+    """Shmem budget in bytes for device `index`, read directly from device
+    properties -- the primary path, immune to a static table missing an
+    arch's entry. Falls back to `GPU_BUDGETS_BYTES` via `_gpu_key_for_device`
+    if the running torch build predates `shared_memory_per_block_optin`.
+    """
+    optin = getattr(
+        torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", None
+    )
+    if optin is None:
+        logger.warning(
+            "LPLB shmem budget: torch build lacks "
+            f"shared_memory_per_block_optin (device {index}); falling back "
+            "to the static per-GPU table."
         )
-    return _gpu_key_for_device(index)
+        return GPU_BUDGETS_BYTES[_gpu_key_for_device(index)]
+    return optin - _PRACTICAL_MARGIN_BYTES
+
+
+def budget_bytes_for_device(device: torch.device | int | str | None = None) -> int:
+    """Shmem budget in bytes for `device` (default: current device). See
+    `_budget_bytes_for_device` for the live-property/fallback split.
+    """
+    return _budget_bytes_for_device(_canonicalize_device_index(device))
 
 
 @dataclass(frozen=True)
@@ -136,6 +173,10 @@ def breakdown(
 
 
 def gpu_budget_bytes(gpu: str) -> int:
+    """Look up a named budget in the static `GPU_BUDGETS_BYTES` table --
+    fallback/documentation path; production code should get its cap from
+    `budget_bytes_for_device` instead (see its module-docstring rationale).
+    """
     key = gpu.lower()
     if key not in GPU_BUDGETS_BYTES:
         raise ValueError(
@@ -144,31 +185,35 @@ def gpu_budget_bytes(gpu: str) -> int:
     return GPU_BUDGETS_BYTES[key]
 
 
-def fits(nc: int, nv: int, gpu: str = "h100") -> bool:
-    return shmem_bytes(nc, nv) <= gpu_budget_bytes(gpu)
+# Default cap for callers that don't pass one explicitly (e.g. quick checks
+# from a REPL); production call sites always pass the device's actual
+# `budget_bytes_for_device(...)`.
+_DEFAULT_BUDGET_BYTES = GPU_BUDGETS_BYTES["h100"]
 
 
-def assert_fits(nc: int, nv: int, gpu: str = "h100") -> None:
-    """Raise if the fused kernel will not fit on the target GPU."""
+def fits(nc: int, nv: int, budget_bytes: int = _DEFAULT_BUDGET_BYTES) -> bool:
+    return shmem_bytes(nc, nv) <= budget_bytes
+
+
+def assert_fits(nc: int, nv: int, budget_bytes: int = _DEFAULT_BUDGET_BYTES) -> None:
+    """Raise if the fused kernel will not fit in `budget_bytes` of shared memory."""
     used = shmem_bytes(nc, nv)
-    cap = gpu_budget_bytes(gpu)
-    if used > cap:
+    if used > budget_bytes:
         raise ValueError(
             f"fused IPM kernel needs {used/1024:.1f} KiB of shared memory for "
-            f"NC={nc}, NV={nv}, but {gpu} allows {cap/1024:.1f} KiB/block. "
-            f"Either reduce problem size or switch to a tiled design."
+            f"NC={nc}, NV={nv}, but the device budget is {budget_bytes/1024:.1f} "
+            f"KiB/block. Either reduce problem size or switch to a tiled design."
         )
 
 
-def max_nc_for_nv(nv: int, gpu: str = "h100") -> int:
+def max_nc_for_nv(nv: int, budget_bytes: int = _DEFAULT_BUDGET_BYTES) -> int:
     """Largest NC that fits for a given NV. Solves
-        4 * (NC^2 + (NV+1)*NC + 3*NV) + pad <= cap
+        4 * (NC^2 + (NV+1)*NC + 3*NV) + pad <= budget_bytes
     via the quadratic formula (monotone in NC). Returns 0 if even NC=1 overflows.
     """
-    cap = gpu_budget_bytes(gpu)
     b = _BYTES_PER_ELEM
-    # cap - pad >= b * (NC^2 + (NV+1)*NC + 3*NV)
-    rhs = (cap - _RUNTIME_PAD_BYTES) / b - 3 * nv
+    # budget_bytes - pad >= b * (NC^2 + (NV+1)*NC + 3*NV)
+    rhs = (budget_bytes - _RUNTIME_PAD_BYTES) / b - 3 * nv
     if rhs <= 0:
         return 0
     # NC^2 + (NV+1)*NC - rhs <= 0
@@ -176,20 +221,19 @@ def max_nc_for_nv(nv: int, gpu: str = "h100") -> int:
 
     disc = (nv + 1) ** 2 + 4 * rhs
     nc_max = int((-(nv + 1) + math.sqrt(disc)) / 2.0)
-    while nc_max > 0 and shmem_bytes(nc_max, nv) > cap:
+    while nc_max > 0 and shmem_bytes(nc_max, nv) > budget_bytes:
         nc_max -= 1
     return max(nc_max, 0)
 
 
-def report(nc: int, nv: int, gpu: str = "h100") -> str:
+def report(nc: int, nv: int, budget_bytes: int = _DEFAULT_BUDGET_BYTES) -> str:
     """Human-readable summary — used by kernels on init for logging."""
     bd = breakdown(nc, nv)
-    cap = gpu_budget_bytes(gpu)
-    status = "FITS" if bd.total_bytes <= cap else "OVER BUDGET"
+    status = "FITS" if bd.total_bytes <= budget_bytes else "OVER BUDGET"
     return (
-        f"[shmem] NC={nc} NV={nv} gpu={gpu} | "
+        f"[shmem] NC={nc} NV={nv} | "
         f"A={bd.a_bytes/1024:.1f}K "
         f"ata={bd.ata_bytes/1024:.1f}K "
         f"rest={(bd.c_bytes+bd.x_bytes+bd.rhs_bytes+bd.d_bytes)/1024:.1f}K | "
-        f"total={bd.total_bytes/1024:.1f}K / {cap/1024:.1f}K  {status}"
+        f"total={bd.total_bytes/1024:.1f}K / {budget_bytes/1024:.1f}K  {status}"
     )
