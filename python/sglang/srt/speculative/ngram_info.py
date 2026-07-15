@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -33,6 +33,8 @@ class NgramVerifyInput(SpecInput):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
+        self.num_tokens_per_req = draft_token_num
+        self.num_tokens_for_logprob_per_req = draft_token_num
         self.grammar = grammar
 
         # Inputs for V2 overlap worker
@@ -56,9 +58,6 @@ class NgramVerifyInput(SpecInput):
     def tree_topk(self) -> int:
         # Irregular tree: per-level branching follows the corpus matches.
         return -1
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
 
     def generate_attn_arg_prefill(
         self,

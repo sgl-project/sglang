@@ -13,6 +13,10 @@ if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import (
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromIPCReqInput,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -81,6 +85,12 @@ class EagleDraftWorkerBase(ABC):
     @abstractmethod
     def draft_extend():
         pass
+
+    @property
+    def draft_runners(self) -> list[ModelRunner]:
+        """All draft model runners; multi-layer eagle overrides with its
+        per-step runner list."""
+        return [self.draft_runner]
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -279,6 +289,7 @@ class EagleDraftWorkerBase(ABC):
                 )
 
         # Get a forward batch
+        # Actual width of the next draft-decode forward: topk tokens per req.
         draft_input.num_tokens_per_req = topk
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
@@ -352,6 +363,24 @@ class BaseSpecWorker(ABC):
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
