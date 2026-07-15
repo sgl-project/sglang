@@ -1566,9 +1566,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 decoder_current_lens_cpu=torch.tensor([4, 6], dtype=torch.int64),
                 decoder_next_lens_cpu=torch.tensor([5, 7], dtype=torch.int64),
                 combined_current_lens=torch.tensor([7, 10], dtype=torch.int64),
-                combined_current_lens_cpu=torch.tensor(
-                    [7, 10], dtype=torch.int64
-                ),
+                combined_current_lens_cpu=torch.tensor([7, 10], dtype=torch.int64),
                 combined_next_lens=torch.tensor([8, 11], dtype=torch.int64),
                 combined_next_lens_cpu=torch.tensor([8, 11], dtype=torch.int64),
                 num_needed_tokens=2,
@@ -1578,9 +1576,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         self.assertIs(result, expected)
         self.assertEqual(producer.call_args.kwargs["last_loc"].tolist(), [41, 73])
-        self.assertEqual(
-            producer.call_args.kwargs["prefix_lens"].tolist(), [7, 10]
-        )
+        self.assertEqual(producer.call_args.kwargs["prefix_lens"].tolist(), [7, 10])
         self.assertEqual(producer.call_args.kwargs["seq_lens"].tolist(), [8, 11])
 
     def test_npu_spec_decode_uses_direct_dsv4_reserve_authority(self) -> None:
@@ -1849,9 +1845,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
             mock.patch.object(
                 allocation_module, "assign_req_to_token_pool_func"
             ) as writer,
-            mock.patch.object(
-                allocation_module, "maybe_write_dsv4_extend"
-            ) as hook,
+            mock.patch.object(allocation_module, "maybe_write_dsv4_extend") as hook,
             self.assertRaisesRegex(RuntimeError, "out of memory"),
         ):
             alloc_for_spec_decode(
