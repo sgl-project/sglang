@@ -5,13 +5,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.op import safe_exp
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import safe_exp
+from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_tf32_supported,
 )
-from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.

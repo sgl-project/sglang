@@ -163,7 +163,7 @@ def chunk_kda_cutedsl(
     # injected through the cutedsl KKT/Aqk MMAs as an identity-right-operand pass:
     # with kL'=M (M in the first 64 K-slots) and kR'=onehot(chunk-pos), the MMA
     # kL'@kR'.T == M, so kkt_inv_uw/kernel_o see the correct matrix without overflow.
-    from sglang.srt.layers.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 
     ones_beta = q.new_ones(1, T, Hv, dtype=torch.float32)
     M_kk, M_qk = chunk_kda_scaled_dot_kkt_fwd(

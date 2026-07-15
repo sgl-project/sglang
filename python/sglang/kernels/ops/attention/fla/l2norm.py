@@ -9,7 +9,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.utils import input_guard
+from sglang.kernels.ops.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
 

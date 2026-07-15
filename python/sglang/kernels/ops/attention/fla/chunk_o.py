@@ -8,9 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.op import exp, safe_exp
-from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import exp, safe_exp
+from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
