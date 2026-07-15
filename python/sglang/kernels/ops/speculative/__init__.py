@@ -28,12 +28,4 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
-register_kernel(
-    KernelSpec(
-        op="speculative.assign_extend_cache_locs_func",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.memory.req_to_token_pool:assign_extend_cache_locs_func",
-    )
-)
-
 __all__ = []

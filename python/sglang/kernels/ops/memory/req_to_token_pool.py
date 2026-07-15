@@ -280,8 +280,127 @@ def _write_req_to_token_pool_kernel(
         )
 
 
+class AssignExtendCacheLocs:
+
+    @classmethod
+    def execute(
+        cls,
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if _is_cuda or _is_hip or _is_musa or _is_xpu:
+            out_cache_loc = torch.empty(
+                (batch_size * draft_token_num,),
+                dtype=torch.int64,
+                device=device,
+            )
+            cls.triton(
+                req_to_token,
+                req_pool_indices=req_pool_indices,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                out_cache_loc=out_cache_loc,
+                batch_size=batch_size,
+            )
+
+            return out_cache_loc
+
+        elif _is_npu:
+            out_cache_loc = torch.empty(
+                (batch_size * draft_token_num,),
+                dtype=torch.int32,
+                device=device,
+            )
+            cls.npu(
+                req_to_token,
+                req_pool_indices=req_pool_indices,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                out_cache_loc=out_cache_loc,
+            )
+
+            return out_cache_loc
+
+        elif _is_cpu:
+            out_cache_loc = torch.empty(
+                (batch_size * draft_token_num,),
+                dtype=torch.int64,
+                device=device,
+            )
+            cls.cpu(
+                req_to_token,
+                req_pool_indices=req_pool_indices,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                out_cache_loc=out_cache_loc,
+            )
+
+            return out_cache_loc
+
+    @staticmethod
+    def triton(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        _assign_extend_cache_locs_kernel[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
+
+    @staticmethod
+    def npu(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        torch.ops.npu.cache_loc_update(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+        )
+
+    @staticmethod
+    def cpu(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        assign_extend_cache_locs_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+
+
 @triton.jit
-def assign_extend_cache_locs(
+def _assign_extend_cache_locs_kernel(
     req_pool_indices,
     req_to_token,
     start_offset,
@@ -313,64 +432,3 @@ def assign_extend_cache_locs(
         tl.store(out_cache_ptr + save_offset, data, mask=mask)
         load_offset += BLOCK_SIZE
         save_offset += BLOCK_SIZE
-
-
-def assign_extend_cache_locs_func(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int,
-    device,
-) -> torch.Tensor:
-    if _is_cuda or _is_hip or _is_musa or _is_xpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-
-        return out_cache_loc
-
-    elif _is_npu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int32,
-            device=device,
-        )
-        torch.ops.npu.cache_loc_update(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
-
-        return out_cache_loc
-
-    elif _is_cpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs_cpu(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-        )
-
-        return out_cache_loc

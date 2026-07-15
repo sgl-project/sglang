@@ -33,6 +33,13 @@ register_kernel(
         target="sglang.kernels.ops.memory.req_to_token_pool:WriteReqToTokenPool.triton",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="memory.assign_extend_cache_locs",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:AssignExtendCacheLocs.triton",
+    )
+)
 
 __all__ = []
 

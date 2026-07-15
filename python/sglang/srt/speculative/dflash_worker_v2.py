@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.memory.req_to_token_pool import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
@@ -1369,9 +1369,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     out=positions_2d,
                 )
                 end_offset = prefix_lens + block_size
-                verify_out_cache_loc = assign_extend_cache_locs_func(
+                verify_out_cache_loc = AssignExtendCacheLocs.execute(
+                    self.model_runner.req_to_token_pool.req_to_token,
                     req_pool_indices=batch.req_pool_indices,
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                     start_offset=prefix_lens,
                     end_offset=end_offset,
                     batch_size=bs,
@@ -1388,9 +1388,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out=positions_2d,
             )
             end_offset = prefix_lens + block_size
-            verify_out_cache_loc = assign_extend_cache_locs_func(
+            verify_out_cache_loc = AssignExtendCacheLocs.execute(
+                self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=batch.req_pool_indices,
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 start_offset=prefix_lens,
                 end_offset=end_offset,
                 batch_size=bs,

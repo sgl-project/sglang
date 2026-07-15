@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.memory.req_to_token_pool import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -97,9 +97,9 @@ def build_ragged_verify_window(
         prefix_lens.to(torch.int64)[safe_req] + within,
         torch.zeros_like(within),
     )
-    real_cache_loc = assign_extend_cache_locs_func(
+    real_cache_loc = AssignExtendCacheLocs.execute(
+        model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
         batch_size=bs,
@@ -174,9 +174,9 @@ def build_ragged_verify_window_triton(
     req_id, within, _valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
-    real_cache_loc = assign_extend_cache_locs_func(
+    real_cache_loc = AssignExtendCacheLocs.execute(
+        model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
         batch_size=bs,
@@ -662,9 +662,7 @@ def build_commit_inject_layout(
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
-    from sglang.kernels.ops.memory.req_to_token_pool import (
-        assign_extend_cache_locs_func,
-    )
+    from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
@@ -672,9 +670,9 @@ def build_commit_inject_layout(
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
 
-    cache_loc = assign_extend_cache_locs_func(
+    cache_loc = AssignExtendCacheLocs.execute(
+        req_to_token,
         req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + stride,
         batch_size=bs,
