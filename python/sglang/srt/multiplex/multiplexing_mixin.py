@@ -37,7 +37,7 @@ class SchedulerMultiplexMixin:
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
-        initialize_stream_groups(self.gpu_id, self.pdmux_config)
+        initialize_stream_groups(self.ps.gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
@@ -206,12 +206,16 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    if flags.item() == self.tp_size:
+                    if flags.item() == self.ps.tp_size:
                         self.process_batch_result(
                             self.split_prefill_batch, prefill_result
                         )
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
+                            # merge batch on prefill stream, decode stream wait for prefill stream to finish
+                            prefill_commit_done = torch.cuda.Event()
+                            prefill_commit_done.record(prefill_stream)
+                            decode_stream.wait_event(prefill_commit_done)
                         else:
                             self.running_batch = self.split_prefill_batch
 
