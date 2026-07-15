@@ -359,7 +359,18 @@ class PrefillBootstrapQueue:
             self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
-        self._align_dspark_hidden_prefill_to_decode_prefix(req, hidden_start)
+        prefill_radix_enabled = not bool(self.scheduler.server_args.disable_radix_cache)
+        decode_radix_enabled = bool(dspark_meta.get("decode_radix_cache_enabled", False))
+        if prefill_radix_enabled != decode_radix_enabled:
+            message = (
+                "DSpark hidden PD requires prefill and decode radix cache policies "
+                "to match. Launch both sides with radix cache enabled, or launch "
+                "both sides with radix cache disabled. "
+                f"prefill_radix_enabled={prefill_radix_enabled}, "
+                f"decode_radix_enabled={decode_radix_enabled}, rid={req.rid}"
+            )
+            self._abort_dspark_hidden_bootstrap(req, message)
+            return False
 
         pp_slices = dspark_meta.get("pp_slices") or {}
         local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
@@ -446,34 +457,6 @@ class PrefillBootstrapQueue:
         req.dspark_hidden_dst_indices = dst_indices
         req.dspark_hidden_written = [False] * hidden_len
         return True
-
-    def _align_dspark_hidden_prefill_to_decode_prefix(
-        self, req: Req, decode_prefix_len: int
-    ) -> None:
-        """Do not let prefill-local radix hits hide hidden rows decode needs."""
-        decode_prefix_len = max(0, int(decode_prefix_len))
-        local_prefix_len = int(len(req.prefix_indices)) + int(req.host_hit_length)
-        if local_prefix_len <= decode_prefix_len:
-            return
-
-        logger.info(
-            "Aligning DSpark hidden prefill prefix to decode prefix: rid=%s, "
-            "prefill_prefix_len=%s, decode_prefix_len=%s",
-            req.rid,
-            local_prefix_len,
-            decode_prefix_len,
-        )
-
-        if len(req.prefix_indices) > decode_prefix_len:
-            req.prefix_indices = req.prefix_indices[:decode_prefix_len]
-            req.host_hit_length = 0
-        else:
-            req.host_hit_length = decode_prefix_len - len(req.prefix_indices)
-        req.swa_host_hit_length = min(req.swa_host_hit_length, req.host_hit_length)
-        req.mamba_host_hit_length = min(req.mamba_host_hit_length, req.host_hit_length)
-        req.mamba_branching_seqlen = min(req.mamba_branching_seqlen, decode_prefix_len)
-        req.cache_protected_len = min(req.cache_protected_len, decode_prefix_len)
-        req.num_matched_prefix_tokens = decode_prefix_len
 
     def _configure_dspark_hidden_capture(
         self,
@@ -587,12 +570,6 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
-                # DSpark hidden transfer semantics are defined by decode metadata
-                # (decode radix prefix, hidden window, PP slices). Do not run
-                # optimistic prefill before that metadata arrives, otherwise
-                # prefill-local radix hits can skip hidden rows that decode needs.
-                if getattr(self.metadata_buffers, "dspark_hidden_pool", None) is not None:
-                    continue
                 if (
                     req.prefill_attempt_count
                     < self.scheduler.server_args.optimistic_prefill_attempts

@@ -1781,6 +1781,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 spec_metadata = {
                     "dspark_hidden": True,
+                    "decode_radix_cache_enabled": bool(
+                        self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+                    ),
                     "hidden_start": int(dspark_hidden_start),
                     "hidden_len": int(dspark_hidden_len),
                     "dst_indices": (
