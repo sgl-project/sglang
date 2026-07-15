@@ -3,7 +3,15 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+try:
+    from sgl_kernel.speculative import (
+        reconstruct_indices_from_tree_mask as _reconstruct_indices_kernel,
+    )
+except ImportError:
+    # Stale / CPU-only sgl_kernel wheels may not ship this op. Fall back to the
+    # pure-torch implementation below.
+    _reconstruct_indices_kernel = None
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -36,6 +44,111 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+
+
+def _reconstruct_indices_from_tree_mask_torch(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    # Pure-torch, device-agnostic port of the CUDA/CPU
+    # reconstruct_indices_from_tree_mask kernel. Runs natively on any device
+    # (e.g. XPU) where the compiled op is unavailable. Mutates positions /
+    # retrieve_* in place to match the kernel contract.
+    device = tree_mask.device
+    n = draft_token_num
+    mask = tree_mask.reshape(batch_size, n, n)
+    # Strictly-lower-triangular ancestor mask: entry [b, tid, i] with i < tid.
+    lower = torch.tril(torch.ones((n, n), dtype=torch.bool, device=device), -1)
+    anc = mask & lower  # [bs, n, n]
+
+    # depth = number of ancestors; parent = nearest ancestor (largest i < tid).
+    depth = anc.sum(dim=-1)  # [bs, n]
+    idx = torch.arange(n, device=device)
+    parent = torch.where(
+        anc, idx.view(1, 1, n), torch.full_like(anc, -1, dtype=torch.long)
+    ).amax(dim=-1)
+
+    positions_2d = depth + verified_seq_len.view(batch_size, 1)
+
+    ri = torch.arange(
+        batch_size * n, device=device, dtype=retrieve_index.dtype
+    ).reshape(batch_size, n)
+
+    # first child: smallest row j > tid whose ancestor set includes tid, i.e.
+    # mask[b, j, tid] with j > tid. This is the same lower-triangular ancestor
+    # relation (anc), reduced over rows j for each column tid.
+    child = anc  # [b, j, tid] with j > tid
+    has_child = child.any(dim=1)  # [bs, n] over tid
+    first_child = torch.where(
+        child, idx.view(1, n, 1), torch.full_like(child, n, dtype=torch.long)
+    ).amin(dim=1)
+    next_token = torch.where(has_child, first_child, torch.full_like(first_child, -1))
+
+    # next sibling: smallest j > tid sharing the same parent as tid.
+    j = idx.view(1, n, 1)
+    tid = idx.view(1, 1, n)
+    same_parent = (parent.unsqueeze(1) == parent.unsqueeze(2)) & (
+        j > tid
+    )  # [bs, j, tid]
+    has_parent = parent >= 0  # [bs, n] over tid
+    first_sibling = torch.where(
+        same_parent, j, torch.full_like(same_parent, n, dtype=torch.long)
+    ).amin(dim=1)
+    next_sibling = torch.where(
+        has_parent & (first_sibling < n),
+        first_sibling,
+        torch.full_like(first_sibling, -1),
+    )
+
+    positions.copy_(positions_2d.reshape(-1).to(positions.dtype))
+    retrieve_index.copy_(ri.to(retrieve_index.dtype))
+    retrieve_next_token.copy_(next_token.to(retrieve_next_token.dtype))
+    retrieve_next_sibling.copy_(next_sibling.to(retrieve_next_sibling.dtype))
+
+
+def reconstruct_indices_from_tree_mask(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    # Use the compiled kernel on CPU / CUDA where it exists; otherwise (e.g. XPU
+    # or a stale wheel) fall back to the pure-torch implementation.
+    if _reconstruct_indices_kernel is not None and (
+        tree_mask.is_cpu or tree_mask.is_cuda
+    ):
+        _reconstruct_indices_kernel(
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            batch_size,
+            draft_token_num,
+        )
+        return
+
+    _reconstruct_indices_from_tree_mask_torch(
+        tree_mask,
+        verified_seq_len,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        batch_size,
+        draft_token_num,
+    )
 
 
 class NGRAMWorker(BaseSpecWorker):
