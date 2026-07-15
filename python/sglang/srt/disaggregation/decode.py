@@ -1239,7 +1239,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         dspark_active_full_prefix_counts = Counter()
-        dspark_full_prefix_limit = 1
+        dspark_full_prefix_limit = 0
         dspark_active_hidden_transfer_reqs = 0
         dspark_active_hidden_transfer_bytes = 0
         dspark_hidden_transfer_queue_limit = 0
@@ -1251,9 +1251,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             configured_prefix_limit = (
                 envs.SGLANG_DSPARK_PD_FULL_HIDDEN_PREFIX_LIMIT.get()
             )
-            dspark_full_prefix_limit = (
-                configured_prefix_limit if configured_prefix_limit > 0 else 1
-            )
+            dspark_full_prefix_limit = max(configured_prefix_limit, 0)
             dspark_hidden_transfer_queue_limit = (
                 envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_LIMIT.get()
             )
@@ -1393,7 +1391,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 dspark_prefix_key = self._dspark_prefix_fingerprint(decode_req.req)
                 if (
-                    total_prefix_len == 0
+                    dspark_full_prefix_limit > 0
+                    and total_prefix_len == 0
                     and dspark_prefix_key is not None
                     and dspark_active_full_prefix_counts[dspark_prefix_key]
                     >= dspark_full_prefix_limit
@@ -1638,6 +1637,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
+                dspark_active_hidden_transfer_reqs += 1
+                dspark_active_hidden_transfer_bytes += dspark_hidden_transfer_bytes
+                if total_prefix_len == 0 and dspark_prefix_key is not None:
+                    dspark_active_full_prefix_counts[dspark_prefix_key] += 1
 
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
