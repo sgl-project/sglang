@@ -11,8 +11,8 @@ import triton.language as tl
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
-    write_req_to_token_pool_triton,
 )
+from sglang.kernels.ops.memory.req_to_token_pool import WriteReqToTokenPool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -35,7 +35,6 @@ from sglang.srt.utils import (
     next_power_of_2,
     support_triton,
 )
-from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -64,41 +63,21 @@ def write_cache_indices(
     extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
-):
-    if support_triton(get_server_args().attention_backend):
-        prefix_pointers = torch.tensor(
-            [t.data_ptr() for t in prefix_tensors],
-            dtype=torch.uint64,
-            pin_memory=is_pin_memory_available(req_to_token_pool.device),
-        ).to(req_to_token_pool.device, non_blocking=True)
-        # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-        write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
-            req_to_token_pool.req_to_token,
-            req_pool_indices_tensor,
-            prefix_pointers,
-            prefix_lens_tensor,
-            seq_lens_tensor,
-            extend_lens_tensor,
-            out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-        )
-    else:
-        pt = 0
-        for i in range(req_pool_indices_cpu.shape[0]):
-            req_idx = req_pool_indices_cpu[i].item()
-            prefix_len = prefix_lens_cpu[i].item()
-            seq_len = seq_lens_cpu[i].item()
-            extend_len = extend_lens_cpu[i].item()
-
-            req_to_token_pool.write(
-                (req_idx, slice(0, prefix_len)),
-                prefix_tensors[i],
-            )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
-            pt += extend_len
+) -> None:
+    WriteReqToTokenPool.execute(
+        req_to_token_pool.req_to_token,
+        req_pool_indices=req_pool_indices_tensor,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        prefix_lens=prefix_lens_tensor,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens=seq_lens_tensor,
+        seq_lens_cpu=seq_lens_cpu,
+        extend_lens=extend_lens_tensor,
+        extend_lens_cpu=extend_lens_cpu,
+        prefix_tensors=prefix_tensors,
+        out_cache_loc=out_cache_loc,
+        use_triton=support_triton(get_server_args().attention_backend),
+    )
 
 
 def get_last_loc(
