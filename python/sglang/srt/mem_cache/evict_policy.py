@@ -46,6 +46,22 @@ class PriorityStrategy(EvictionStrategy):
         return (node.priority, node.last_access_time)
 
 
+class SessionAwareEvictionStrategy(EvictionStrategy):
+    """Session-aware eviction: node with less session_ref evict first, then normal priority."""
+
+    def __init__(self, base: EvictionStrategy):
+        self.base = base
+
+    def get_priority(self, node: TreeNode) -> Tuple:
+        from sglang.srt.mem_cache.session_radix_cache import _classify_node_tier
+
+        return (
+            _classify_node_tier(node),
+            node.session_ref,
+            self.base.get_priority(node),
+        )
+
+
 class SLRUStrategy(EvictionStrategy):
     def __init__(self, protected_threshold: int = 2):
         self.protected_threshold = protected_threshold
