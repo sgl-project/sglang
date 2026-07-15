@@ -1,9 +1,15 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -11,6 +17,19 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def test_auto_backend_is_resolved_before_weight_setup(self):
+        with patch(
+            "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+            return_value=MoeRunnerBackend.AUTO,
+        ), patch(
+            "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+            return_value=True,
+        ):
+            method = ModelOptNvFp4FusedMoEMethod(ModelOptFp4Config())
+
+        self.assertEqual(method._moe_runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM)
+        self.assertTrue(method.enable_flashinfer_trtllm_moe)
+
     def _make_layer(self):
         return MergedColumnParallelLinear(
             input_size=16,

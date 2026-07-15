@@ -661,8 +661,25 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.bfloat16, torch.half]
 
-    @classmethod
-    def get_min_capability(cls) -> int:
+    @staticmethod
+    def _is_routed_expert_key(prefix: str) -> bool:
+        parts = prefix.split(".")
+        return (
+            "experts" in parts
+            and "shared_expert" not in parts
+            and "shared_experts" not in parts
+        )
+
+    def _has_mxfp8_linear_layers(self) -> bool:
+        return any(
+            str(info.get("quant_algo", "")).upper() == "MXFP8"
+            and not self._is_routed_expert_key(prefix)
+            for prefix, info in self.quantized_layers.items()
+        )
+
+    def get_min_capability(self) -> int:
+        if self._has_mxfp8_linear_layers():
+            return 100
         return ModelOptFp4Config.get_min_capability()
 
     @classmethod
@@ -833,7 +850,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "MXFP8":
-                return Fp8LinearMethod(self.mxfp8_config)
+                return ModelOptMxfp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -1959,11 +1976,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
-            capability = get_device_capability()
-            use_marlin_fallback = (8, 0) <= capability < (10, 0)
-        else:
-            use_marlin_fallback = moe_runner_backend.is_marlin()
+        if moe_runner_backend.is_auto():
+            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+                moe_runner_backend = MoeRunnerBackend.MARLIN
+            else:
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+        self._moe_runner_backend = moe_runner_backend
+        use_marlin_fallback = moe_runner_backend.is_marlin()
         if not is_blackwell_supported() and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
@@ -1971,8 +1990,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
 
@@ -2521,17 +2540,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-
-        self._moe_runner_backend = moe_runner_backend
+        moe_runner_backend = self._moe_runner_backend
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -2716,3 +2725,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             f"Unsupported moe_runner_backend for NVFP4 MoE: {moe_runner_backend}. "
             "Use --moe-runner-backend flashinfer_cutlass instead."
         )
+
+
+class ModelOptMxfp8LinearMethod(Fp8LinearMethod):
+    """Shared MXFP8 linear path with ModelOpt checkpoint tensor names."""
+
+    def __init__(self, quant_config: Fp8Config):
+        super().__init__(quant_config, weight_scale_name="weight_scale")
