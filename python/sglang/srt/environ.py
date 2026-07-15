@@ -1,4 +1,5 @@
 import functools
+import json
 import os
 import subprocess
 import warnings
@@ -109,6 +110,16 @@ class EnvTuple(EnvField):
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
+
+
+class EnvJSON(EnvField):
+    def parse(self, value: str | None) -> list | dict | None:
+        if not value:
+            return None
+        if os.path.exists(value):
+            with open(value) as f:
+                return json.load(f)
+        return json.loads(value)
 
 
 class EnvBool(EnvField):
@@ -234,6 +245,8 @@ class Envs:
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    # Expand jit_kernel test grids to their full parameter ranges (nightly).
+    SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
 
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
@@ -582,6 +595,12 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+
+    # Quantization (Humming)
+    SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
+    SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
+    SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
+    SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
