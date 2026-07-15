@@ -972,7 +972,12 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                # Skip transfer if the controller already terminated this op
+                # while it sat in prefetch_buffer (abort-before-dispatch). Running
+                # the backend on a doomed op wastes IO and risks writing pages the
+                # scheduler is about to reclaim/reassign.
+                if not operation.is_terminated():
+                    self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]

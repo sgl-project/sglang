@@ -297,7 +297,7 @@ class MambaPoolHost(HostKVCache):
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
@@ -696,7 +696,7 @@ class LogicalHostPool:
             )
         if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
@@ -908,7 +908,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ) * self.slot_page_size
         if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
+        # clone(): see MHATokenToKVPoolHost.alloc — decouple from free_slots'
+        # shared storage so a concurrent prefetch abort can't dangle indices
+        # still being read by the storage IO thread.
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
