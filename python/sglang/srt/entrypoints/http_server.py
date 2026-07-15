@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import ssl
 import tempfile
 import threading
 import time
@@ -39,6 +40,7 @@ from typing import (
     Union,
 )
 
+import aiohttp
 import numpy as np
 import requests
 import uvicorn
@@ -2015,6 +2017,46 @@ def _admin_api_key_missing_response(
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
+async def _send_disaggregation_warmup_requests(
+    server_args: ServerArgs,
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    timeout: int,
+) -> List[int]:
+    ssl_context = (
+        ssl_verify
+        if isinstance(ssl_verify, bool)
+        else ssl.create_default_context(cafile=ssl_verify)
+    )
+
+    async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
+        json_data = {
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": 8,
+                "ignore_eos": True,
+            },
+            "bootstrap_host": FAKE_BOOTSTRAP_HOST,
+            "bootstrap_room": dp_rank,
+            "input_ids": [10, 11, 12, 13],
+            "routed_dp_rank": dp_rank,
+        }
+        async with session.post(
+            url + "/generate", json=json_data, ssl=ssl_context
+        ) as response:
+            await response.read()
+            return response.status
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers=headers,
+    ) as session:
+        return await asyncio.gather(
+            *(send_request(session, dp_rank) for dp_rank in range(server_args.dp_size))
+        )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2129,42 +2171,28 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
-            request_name = "/generate"
-            json_data = {
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 8,
-                    "ignore_eos": True,
-                },
-                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                # This is a hack to ensure fake transfer is enabled during prefill warmup
-                # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                    for i in range(server_args.dp_size)
-                ],
-                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
-            }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=(
-                    warmup_timeout if warmup_timeout > 0 else 1800
-                ),  # because of deep gemm precache is very long if not precache.
-                verify=ssl_verify,
+            status_codes = asyncio.run(
+                _send_disaggregation_warmup_requests(
+                    server_args=server_args,
+                    url=url,
+                    headers=headers,
+                    ssl_verify=ssl_verify,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 1800,
+                )
             )
-            if res.status_code == 200:
+            failed_status_codes = [code for code in status_codes if code != 200]
+            if not failed_status_codes:
                 logger.info(
-                    f"Disaggregation warmup request completed with status {res.status_code}, resp: {res.json()}"
+                    "Disaggregation warmup requests completed for all %s DP ranks",
+                    server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Disaggregation warmup failed (mode=%s), status code: %s",
+                    "Disaggregation warmup failed (mode=%s), status codes: %s",
                     server_args.disaggregation_mode,
-                    res.status_code,
+                    failed_status_codes,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
@@ -2174,8 +2202,6 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    # Debug print
-    # logger.info(f"warmup request returns: {res.json()=}")
     return success
 
 
