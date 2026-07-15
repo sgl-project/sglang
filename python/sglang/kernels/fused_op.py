@@ -61,6 +61,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
+    KernelBackend.TORCH_NPU: "forward_npu",
 }
 
 # best -> fallback. ``torch_compile`` is deliberately absent: auto-selection
@@ -73,6 +74,7 @@ DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.DEEPGEMM,
     KernelBackend.CUTE_DSL,
     KernelBackend.AITER,
+    KernelBackend.TORCH_NPU,
     KernelBackend.TRITON,
     KernelBackend.TORCH,
 )
@@ -257,6 +259,9 @@ class BaseFusedOp(ABC):
 
     def forward_aiter(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no aiter backend")
+
+    def forward_npu(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no npu backend")
 
     # --- selection ---
 

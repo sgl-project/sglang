@@ -153,6 +153,8 @@ class TestBaseFusedOp(unittest.TestCase):
                 KernelBackend.TORCH_COMPILE,
                 KernelBackend.JIT,
                 KernelBackend.AOT,
+                KernelBackend.AITER,
+                KernelBackend.TORCH_NPU,
             },
         )
         # Dotted targets resolve to the bound backend methods.

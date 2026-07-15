@@ -33,7 +33,8 @@ class KernelBackend(str, Enum):
     (the ``sgl_kernel`` wheel, built for CUDA *and* ROCm) are both cross-device;
     which devices a given op supports is expressed by its
     :class:`CapabilityRequirement` list. Platform-specific libraries (e.g.
-    ``aiter`` on AMD) are just additional provenance values.
+    ``aiter`` on AMD, ``torch_npu`` on Ascend) are just additional provenance
+    values, each pinned to its device by its ``CapabilityRequirement``.
     """
 
     TORCH = "torch"  # pure-torch reference (forward_native)
@@ -45,7 +46,8 @@ class KernelBackend(str, Enum):
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)
-    # TODO(RFC #29630): more provenance as needed (npu / cpu-avx, ...)
+    TORCH_NPU = "torch_npu"  # Ascend NPU vendor runtime (device=NPU)
+    # TODO(RFC #29630): more provenance as needed (cpu-avx, sgl_kernel_npu, ...)
 
 
 class DeviceType(str, Enum):
@@ -53,8 +55,9 @@ class DeviceType(str, Enum):
 
     CUDA = "cuda"
     HIP = "hip"
+    NPU = "npu"  # Ascend NPU (torch_npu / sgl_kernel_npu)
     CPU = "cpu"
-    # TODO(RFC #29630): NPU / XPU / ... as backends land.
+    # TODO(RFC #29630): XPU / MUSA / ... as backends land.
 
 
 class PlatformInfo(msgspec.Struct, frozen=True):
@@ -98,6 +101,9 @@ class PlatformInfo(msgspec.Struct, frozen=True):
         try:
             if torch.version.hip is not None and torch.cuda.is_available():
                 return cls(device_type="hip")
+            npu = getattr(torch, "npu", None)
+            if npu is not None and npu.is_available():
+                return cls(device_type="npu")
             if torch.cuda.is_available():
                 major, minor = torch.cuda.get_device_capability()
                 return cls(
