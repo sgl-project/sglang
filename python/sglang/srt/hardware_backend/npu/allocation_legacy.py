@@ -1,0 +1,448 @@
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from sglang.kernels.ops.memory.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+)
+from sglang.kernels.ops.memory.req_to_token_pool import AssignReqToTokenPool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_write_dsv4_decode,
+    maybe_write_dsv4_extend,
+)
+from sglang.srt.mem_cache.allocation import alloc_req_slots, write_cache_indices
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    evict_from_tree_cache,
+)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import is_cuda, is_hip, is_npu
+
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_cuda = is_cuda()
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
+
+logger = logging.getLogger(__name__)
+
+
+def alloc_for_extend_legacy(
+    batch: ScheduleBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Allocate KV cache for extend batch and write to req_to_token_pool.
+
+    Returns ``(out_cache_loc, req_pool_indices_device, req_pool_indices_cpu)``
+    (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
+    if the pool can't satisfy the batch (fail-loud — see its docstring).
+    """
+    # free out-of-window swa tokens
+    batch.maybe_evict_swa()
+
+    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+
+    # Create tensors for allocation
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate req slots (raises RuntimeError if the pool is exhausted)
+    req_pool_indices = alloc_req_slots(
+        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+    )
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate KV cache (throws exception on failure)
+    if _alloc_page_size(batch) == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+    else:
+        # Paged allocation - build last_loc
+        last_loc = [
+            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            for t in prefix_tensors
+        ]
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache,
+            prefix_lens=prefix_lens_device,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            last_loc=torch.cat(last_loc),
+            extend_num_tokens=batch.extend_num_tokens,
+            req_pool_indices=req_pool_indices_device,
+            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
+            batch=batch,
+        )
+
+    # Write to req_to_token_pool
+    write_cache_indices(
+        out_cache_loc,
+        req_pool_indices_device,
+        req_pool_indices_cpu,
+        prefix_lens_device,
+        prefix_lens_cpu,
+        prefix_lens_device,
+        prefix_lens_cpu,
+        batch.seq_lens,
+        batch.seq_lens_cpu,
+        prefix_tensors,
+        batch.req_to_token_pool,
+    )
+
+    # DSV4-NPU hook: no-op on non-DSV4 paths.
+    if _is_npu:
+        maybe_write_dsv4_extend(
+            batch,
+            req_pool_indices_cpu,
+            prefix_lens_cpu,
+            batch.seq_lens_cpu,
+        )
+
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+        if req.kv is None:
+            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = seq_len
+
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+def alloc_for_decode_legacy(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    """
+    Allocate KV cache for decode batch and write to req_to_token_pool.
+
+    Returns:
+        out_cache_loc: allocated cache locations
+    """
+
+    batch.maybe_evict_swa()
+
+    seq_lens_gpu = batch.seq_lens
+    bs = seq_lens_gpu.shape[0]
+
+    if _alloc_page_size(batch) == 1:
+        # Non-paged allocation
+        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+    else:
+        # Paged allocation
+        last_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, seq_lens_gpu - 1
+        ]
+        seq_lens_next = seq_lens_gpu + token_per_req
+        out_cache_loc = alloc_paged_token_slots_decode(
+            tree_cache=batch.tree_cache,
+            seq_lens=seq_lens_next,
+            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            last_loc=last_loc,
+            token_per_req=token_per_req,
+            req_pool_indices=batch.req_pool_indices,
+            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
+            batch=batch,
+        )
+
+    # Write to req_to_token_pool
+    if batch.model_config.is_encoder_decoder:
+        locs = batch.encoder_lens + seq_lens_gpu
+    else:
+        locs = seq_lens_gpu.clone()
+
+    batch.req_to_token_pool.write(
+        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    )
+
+    # DSV4-NPU hook: no-op on non-DSV4 paths.
+    if _is_npu:
+        maybe_write_dsv4_decode(
+            batch,
+            batch.seq_lens_cpu + token_per_req,
+            token_per_req,
+        )
+
+    for req in batch.reqs:
+        req.kv.kv_allocated_len += token_per_req
+
+    return out_cache_loc
+
+
+def alloc_for_spec_decode_legacy(
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    reqs: list[Req],
+    req_pool_indices: torch.Tensor,
+    cur_kv_lens: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+    batch: Optional[ScheduleBatch] = None,
+) -> None:
+    num_needed_tokens = int((nxt_kv_lens_cpu - cur_kv_lens_cpu).sum())
+    if num_needed_tokens > 0:
+        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+            )
+            device_type = getattr(
+                batch.device, "type", str(batch.device).split(":", 1)[0]
+            )
+            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                tree_cache,
+                cur_kv_lens,
+                cur_kv_lens_cpu,
+                nxt_kv_lens,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                req_pool_indices=req_pool_indices,
+                batch=batch,
+            )
+        # Updating req_to_token is a write to a shared tensor: it must not overlap
+        # with the previous batch's forward, which also reads req_to_token.
+        AssignReqToTokenPool.execute(
+            req_to_token_pool.req_to_token,
+            req_pool_indices=req_pool_indices,
+            start_offset=cur_kv_lens,
+            end_offset=nxt_kv_lens,
+            out_cache_loc=out_cache_loc,
+            batch_size=len(reqs),
+        )
+
+    for i, req in enumerate(reqs):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+
+
+def get_last_loc(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    attn_backend = get_server_args().attention_backend
+    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+
+    if _is_hip and uses_triton_dispatch:
+        # HIP-only: the legacy get_last_loc_triton kernel emits a
+        # mixed-width int32->int64 store that Triton mis-compiles on HIP,
+        # producing out-of-range last_loc values under EAGLE +
+        # page_size>1 (e.g. with aiter unified attention or the triton
+        # attention backend). The bug is in the Triton HIP codegen, not
+        # in any particular attention backend, so route every HIP path
+        # that would otherwise use get_last_loc_triton through the
+        # int32-safe variant. Non-HIP hardware keeps the original
+        # dispatcher below.
+        return get_last_loc_triton_safe(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+        )
+
+    if uses_triton_dispatch:
+        impl = get_last_loc_triton
+    else:
+        impl = get_last_loc_torch
+
+    return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
+def get_last_loc_torch(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    return torch.where(
+        prefix_lens_tensor > 0,
+        req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
+        torch.full_like(prefix_lens_tensor, -1),
+    )
+
+
+def alloc_token_slots(
+    tree_cache: BasePrefixCache,
+    num_tokens: int,
+    backup_state: bool = False,
+):
+    allocator = tree_cache.token_to_kv_pool_allocator
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    state = None
+    if backup_state:
+        state = allocator.backup_state()
+
+    out_cache_loc = allocator.alloc(num_tokens)
+
+    if out_cache_loc is None:
+        error_msg = (
+            f"Out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
+
+    return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def alloc_paged_token_slots_extend(
+    tree_cache: BasePrefixCache,
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    extend_num_tokens: int,
+    backup_state: bool = False,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_lens: Optional[DSV4StateLens] = None,
+    batch=None,
+):
+    # Over estimate the number of tokens: assume each request needs a new page.
+    allocator = tree_cache.token_to_kv_pool_allocator
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    state = None
+    if backup_state:
+        state = allocator.backup_state()
+
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
+    extra_alloc_kwargs = {}
+    if is_dsv4:
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        # Per-call per-req tables for the c-pool / state last_loc lookup.
+        if batch is not None:
+            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if dsv4_state_lens is not None:
+            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+
+    out = allocator.alloc_extend(
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        extend_num_tokens,
+        **extra_alloc_kwargs,
+    )
+
+    if is_dsv4:
+        bundle = out
+        out_cache_loc = None if bundle is None else bundle.out_full_loc
+        if batch is not None:
+            batch.out_cache_loc_dsv4 = bundle
+    else:
+        out_cache_loc = out
+
+    if out_cache_loc is None:
+        error_msg = (
+            f"Prefill out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {extend_num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
+
+    return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def alloc_paged_token_slots_decode(
+    tree_cache: BasePrefixCache,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    token_per_req: int = 1,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_lens: Optional[DSV4StateLens] = None,
+    batch=None,
+) -> torch.Tensor:
+    """Allocate paged KV cache for decode batch."""
+    allocator = tree_cache.token_to_kv_pool_allocator
+    # Over estimate the number of tokens: assume each request needs a new page.
+    num_tokens = len(seq_lens) * allocator.page_size
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    # DSV4-NPU allocator also needs req_pool_indices + per-req state lens and
+    # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
+    extra_alloc_kwargs = {}
+    if is_dsv4:
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        # Per-call per-req tables for the last_loc lookup.
+        if batch is not None:
+            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if dsv4_state_lens is not None:
+            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+
+    out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs)
+
+    if is_dsv4:
+        bundle = out
+        out_cache_loc = None if bundle is None else bundle.out_full_loc
+        if batch is not None:
+            batch.out_cache_loc_dsv4 = bundle
+    else:
+        out_cache_loc = out
+
+    if out_cache_loc is None:
+        error_msg = (
+            f"Decode out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
+
+    return out_cache_loc
+
+
+def _compute_dsv4_state_lens(batch, *, is_decode: bool):
+    """Per-req c{4,128}_state pool alloc lens (``DSV4StateLens``) for this step.
+    None on CUDA / non-V4 paths (allocator has no ``compute_dsv4_state_lens_*``).
+    """
+    allocator = batch.token_to_kv_pool_allocator
+    if not hasattr(allocator, "compute_dsv4_state_lens_extend"):
+        return None
+    if is_decode:
+        return allocator.compute_dsv4_state_lens_decode(batch.reqs)
+    return allocator.compute_dsv4_state_lens_extend(
+        batch.reqs, batch.seq_lens_cpu.tolist()
+    )
+
+
+def _alloc_page_size(batch: ScheduleBatch) -> int:
+    # DCP swaps in an allocator whose page_size is server_args.page_size *
+    # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
+    # the real allocator's page_size there. Elsewhere the two are equal.
+    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
+        return batch.tree_cache.token_to_kv_pool_allocator.page_size
+    return batch.tree_cache.page_size
+
+
+def _alloc_paged_token_slots_extend_npu(*args, **kwargs):
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+        alloc_paged_token_slots_extend_npu,
+    )
+
+    return alloc_paged_token_slots_extend_npu(*args, **kwargs)
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {"npu": _alloc_paged_token_slots_extend_npu},
+)
