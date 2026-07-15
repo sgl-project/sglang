@@ -323,6 +323,18 @@ class PrefillBootstrapQueue:
         req.pending_bootstrap = False
         return True
 
+    def _abort_dspark_hidden_bootstrap(self, req: Req, message: str) -> None:
+        logger.error(message)
+        prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        sender = getattr(req, "disagg_kv_sender", None)
+        kv_mgr = getattr(sender, "kv_mgr", None)
+        if sender is not None and kv_mgr is not None:
+            kv_mgr.record_failure(getattr(sender, "bootstrap_room", req.bootstrap_room), message)
+            kv_mgr.update_status(
+                getattr(sender, "bootstrap_room", req.bootstrap_room), KVPoll.Failed
+            )
+            sender.conclude_state = KVPoll.Failed
+
     def _finalize_dspark_hidden_bootstrap(
         self, req: Req, dspark_meta: dict, decode_prefix_len: int
     ) -> bool:
@@ -332,8 +344,7 @@ class PrefillBootstrapQueue:
                 "Decode requested DSpark hidden metadata, but prefill did not "
                 "initialize a DSpark hidden row pool."
             )
-            logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
         hidden_start = int(dspark_meta.get("hidden_start", 0))
@@ -344,8 +355,7 @@ class PrefillBootstrapQueue:
                 f"hidden_start={hidden_start}, decode_prefix_len={decode_prefix_len}, "
                 f"rid={req.rid}"
             )
-            logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
         self._align_dspark_hidden_prefill_to_decode_prefix(req, hidden_start)
@@ -387,8 +397,7 @@ class PrefillBootstrapQueue:
                 f"hidden_len={hidden_len}, dst_indices={len(dst_indices)}, "
                 f"pp_rank={self.pp_rank}"
             )
-            logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
         if (
             hidden_start < 0
@@ -400,12 +409,19 @@ class PrefillBootstrapQueue:
                 f"hidden_start={hidden_start}, hidden_len={hidden_len}, "
                 f"prompt_len={len(req.origin_input_ids)}"
             )
-            logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
         src_indices = pool.alloc(hidden_len)
         if src_indices is None:
+            if hidden_len > pool.size:
+                message = (
+                    "DSpark hidden rows exceed prefill hidden pool capacity: "
+                    f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}. "
+                    "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
+                    "maximum prompt/hidden transfer length."
+                )
+                self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
         try:
@@ -415,8 +431,7 @@ class PrefillBootstrapQueue:
         except Exception as exc:
             pool.free(src_indices)
             message = f"Failed to configure DSpark hidden capture: {exc}"
-            logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
         req.dspark_hidden_meta = dict(dspark_meta)
         req.dspark_hidden_src_indices = src_indices
@@ -1214,10 +1229,11 @@ class SchedulerDisaggregationPrefillMixin:
         elif poll == KVPoll.WaitingForInput:
             if should_force_retry(req):  # test hook
                 return False
-            # Metadata buffer was allocated in pop_bootstrapped before
-            # the request entered the waiting queue, so finalize should not fail.
-            assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-            return True
+            if self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
+                return True
+            if is_aborted(req):
+                self.handle_bootstrap_failure(req)
+            return False
         else:
             raise RuntimeError(
                 f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
@@ -1408,10 +1424,14 @@ class SchedulerDisaggregationPrefillMixin:
                 written = getattr(req, "dspark_hidden_written", None)
                 if written is not None and not all(written):
                     missing = [i for i, ok in enumerate(written) if not ok][:8]
-                    raise RuntimeError(
+                    message = (
                         "DSpark hidden rows are incomplete before PD transfer: "
                         f"rid={req.rid}, missing_offsets={missing}"
                     )
+                    self.disagg_prefill_bootstrap_queue._abort_dspark_hidden_bootstrap(
+                        req, message
+                    )
+                    return None
                 return np.asarray(src_indices, dtype=np.int32)
 
             state_types = (
@@ -1434,7 +1454,10 @@ class SchedulerDisaggregationPrefillMixin:
                 elif st == StateType.C128_STATE:
                     state_indices.append(_c128_state_payload())
                 elif st == StateType.DSPARK_HIDDEN:
-                    state_indices.append(_dspark_hidden_payload())
+                    dspark_payload = _dspark_hidden_payload()
+                    if dspark_payload is None:
+                        return
+                    state_indices.append(dspark_payload)
                 else:
                     state_indices.append(None)
 

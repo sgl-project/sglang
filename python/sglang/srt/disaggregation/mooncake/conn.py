@@ -1053,7 +1053,7 @@ class MooncakeKVManager(CommonKVManager):
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
-                    st == StateType.C128_STATE
+                    st in (StateType.C128_STATE, StateType.DSPARK_HIDDEN)
                     and len(src_indices) == 0
                     and len(dst_indices_local) == 0
                 ):
