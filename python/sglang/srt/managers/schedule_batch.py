@@ -705,18 +705,18 @@ class ReqKvInfo:
             f"swa_evicted_seqlen={self._swa_evicted_seqlen})"
         )
 
-    def __copy__(self) -> "ReqKvInfo":
+    def __copy__(self) -> ReqKvInfo:
         return ReqKvInfo(
             kv_allocated_len=self.kv_allocated_len,
             swa_evicted_seqlen=self.swa_evicted_seqlen,
         )
 
-    def __deepcopy__(self, memo: Dict[int, Any]) -> "ReqKvInfo":
+    def __deepcopy__(self, memo: Dict[int, Any]) -> ReqKvInfo:
         return self.__copy__()
 
     def __reduce__(
         self,
-    ) -> Tuple[Callable[[int, int], "ReqKvInfo"], Tuple[int, int]]:
+    ) -> Tuple[Callable[[int, int], ReqKvInfo], Tuple[int, int]]:
         return (
             _rebuild_req_kv_info,
             (self.kv_allocated_len, self.swa_evicted_seqlen),

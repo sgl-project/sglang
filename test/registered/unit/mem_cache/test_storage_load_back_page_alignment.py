@@ -270,7 +270,9 @@ class TestLMCacheBlockingLoadBackPageAlignment(CustomTestCase):
         self.assertEqual(node.value.tolist(), list(range(100, 104)))
         self.assertEqual(len(node.key), 4)
         self.assertEqual(cache.evictable_size_, 4)
-        self.assertEqual(cache.token_to_kv_pool_allocator.freed, [list(range(104, 116))])
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(104, 116))]
+        )
 
     def test_blocking_load_accepts_a_chunk_size_that_does_not_divide_the_page(self):
         """A chunk size that does not divide the page can still land an aligned fetch, and must load."""
@@ -305,7 +307,9 @@ class TestLMCacheBlockingLoadBackPageAlignment(CustomTestCase):
         slot_values, _ = result
         self.assertEqual(slot_values.numel(), 0)
         self.assertEqual(cache.evictable_size_, 0)
-        self.assertEqual(cache.token_to_kv_pool_allocator.freed, [list(range(100, 116))])
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(100, 116))]
+        )
 
     def test_blocking_load_handles_a_fetch_shorter_than_the_prefix_pad(self):
         """A fetch below prefix_pad must not produce a negative slice, size or node."""
@@ -323,7 +327,9 @@ class TestLMCacheBlockingLoadBackPageAlignment(CustomTestCase):
         slot_values, _ = result
         self.assertEqual(slot_values.numel(), 0)
         self.assertEqual(cache.evictable_size_, 0)
-        self.assertEqual(cache.token_to_kv_pool_allocator.freed, [list(range(100, 116))])
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(100, 116))]
+        )
 
     def test_blocking_load_floors_on_the_allocator_page_not_the_cache_page(self):
         """The floor serves the alloc/free contract, so it reads the allocator's page, not the cache's."""

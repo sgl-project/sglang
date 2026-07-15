@@ -16,9 +16,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
-    def __init__(
-        self, page_size: int = 1, uses_legacy_real_length_alloc: bool = False
-    ):
+    def __init__(self, page_size: int = 1, uses_legacy_real_length_alloc: bool = False):
         self.freed = []
         self.page_size = page_size
         self.uses_legacy_real_length_alloc = uses_legacy_real_length_alloc

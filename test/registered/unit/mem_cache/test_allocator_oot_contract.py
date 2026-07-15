@@ -65,9 +65,7 @@ class TestOutOfTreePagedAllocatorContract(CustomTestCase):
 
     def test_out_of_tree_paged_subclass_inherits_the_page_aligned_declaration(self):
         """Inheriting legacy by accident would route a whole platform down the wrong path."""
-        self.assertIs(
-            _FakeOutOfTreePagedAllocator.uses_legacy_real_length_alloc, False
-        )
+        self.assertIs(_FakeOutOfTreePagedAllocator.uses_legacy_real_length_alloc, False)
 
 
 class TestLegacyDispatchReadsTheDeclarationOnly(CustomTestCase):

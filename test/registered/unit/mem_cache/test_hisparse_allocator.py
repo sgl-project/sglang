@@ -57,7 +57,9 @@ class TestHiSparseLegacyEntriesSurvive(CustomTestCase):
         )
         allocator.alloc_logical_only_legacy = MagicMock(return_value=expected)
         allocator.alloc_logical_only = MagicMock(
-            side_effect=AssertionError("the aligned entry must not serve a legacy caller")
+            side_effect=AssertionError(
+                "the aligned entry must not serve a legacy caller"
+            )
         )
         req = SimpleNamespace(rid="req-0", kv=None, req_pool_idx=0)
         req_to_token_pool = SimpleNamespace(write=MagicMock())
@@ -156,7 +158,9 @@ class TestDeepSeekV4HiSparseCompositeAlloc(CustomTestCase):
             int(allocator.full_to_hisparse_device_index_mapping.count_nonzero()), 0
         )
 
-    def test_alloc_leaves_the_c4_pool_untouched_when_the_logical_pool_is_exhausted(self):
+    def test_alloc_leaves_the_c4_pool_untouched_when_the_logical_pool_is_exhausted(
+        self,
+    ):
         """Reserving C4 slots for a range that was never allocated would leak them."""
         hisparse_alloc = MagicMock()
         allocator = _make_dsv4_allocator(

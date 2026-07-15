@@ -210,9 +210,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
 
         for req_pool_indices, prefixes, alloc_starts, alloc_ends in cases:
             with self.subTest(alloc_starts=alloc_starts, alloc_ends=alloc_ends):
-                vanilla_pool = torch.full(
-                    (7, 32), -7, dtype=torch.int32, device="cuda"
-                )
+                vanilla_pool = torch.full((7, 32), -7, dtype=torch.int32, device="cuda")
                 triton_pool = vanilla_pool.clone()
                 arguments = self._make_interval_arguments(
                     req_pool_indices=req_pool_indices,
@@ -326,9 +324,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
 
     def _make_pool(self) -> torch.Tensor:
         generator = torch.Generator(device="cpu").manual_seed(0)
-        pool = torch.randint(
-            0, 100000, (8, 64), dtype=torch.int32, generator=generator
-        )
+        pool = torch.randint(0, 100000, (8, 64), dtype=torch.int32, generator=generator)
         return pool.cuda()
 
     def _gather_oracle(

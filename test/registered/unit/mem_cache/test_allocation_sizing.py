@@ -199,12 +199,8 @@ class TestDecodeReserveTracksTheAllocatorPage(CustomTestCase):
         """The reserve models the allocator's page-aligned footprint, so it must follow the real page."""
         server_args = self._eagle_args(page_size=16, dcp_size=4)
 
-        self.assertEqual(
-            get_alloc_reserve_per_decode(server_args, page_size=16), 256
-        )
-        self.assertEqual(
-            get_alloc_reserve_per_decode(server_args, page_size=64), 1024
-        )
+        self.assertEqual(get_alloc_reserve_per_decode(server_args, page_size=16), 256)
+        self.assertEqual(get_alloc_reserve_per_decode(server_args, page_size=64), 1024)
 
     def test_reserve_defaults_to_the_bare_page_size(self):
         """SWA / HiSparse keep page_size under DCP, so the default must not inflate to the upper bound."""

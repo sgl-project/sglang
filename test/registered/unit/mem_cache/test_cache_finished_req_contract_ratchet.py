@@ -139,7 +139,9 @@ class TestCacheFinishedReqContractRatchet(CustomTestCase):
         super().setUp()
         self.classes = _collect_classes()
         self.subclasses = {
-            name for name in self.classes if _ROOT_CLASS in _linearize(name, self.classes)
+            name
+            for name in self.classes
+            if _ROOT_CLASS in _linearize(name, self.classes)
         }
 
     def _class_node(self, name: str) -> ast.ClassDef:

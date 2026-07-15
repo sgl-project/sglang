@@ -171,7 +171,11 @@ def build_kv_cache(
             tp_worker.get_tokens_per_layer_info()
         )
 
-    if server_args.strip_thinking_cache and is_hybrid_swa and full_tokens_per_layer == 0:
+    if (
+        server_args.strip_thinking_cache
+        and is_hybrid_swa
+        and full_tokens_per_layer == 0
+    ):
         raise ValueError(
             "--strip-thinking-cache is incompatible with all-SWA (pure sliding "
             "window attention) models"

@@ -104,7 +104,8 @@ class TestUsesLegacyRealLengthAlloc(CustomTestCase):
             with self.subTest(allocator=name):
                 source = _forwarding_source(class_node)
                 self.assertTrue(
-                    source, f"{name} never defines {_FLAG}; it inherits the base default"
+                    source,
+                    f"{name} never defines {_FLAG}; it inherits the base default",
                 )
                 wrapped = _wrapped_allocator_params(class_node)
                 self.assertTrue(

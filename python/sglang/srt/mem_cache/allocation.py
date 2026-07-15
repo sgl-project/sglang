@@ -101,9 +101,7 @@ def alloc_for_extend(
         device=batch.device,
     )
 
-    _record_extend_allocation(
-        reqs=batch.reqs, alloc_ends=plan.alloc_ends_cpu.tolist()
-    )
+    _record_extend_allocation(reqs=batch.reqs, alloc_ends=plan.alloc_ends_cpu.tolist())
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 

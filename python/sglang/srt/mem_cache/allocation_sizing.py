@@ -11,9 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 
-def publish_kv_bookkeeping_page_size(
-    *, allocator: BaseTokenToKVPoolAllocator
-) -> None:
+def publish_kv_bookkeeping_page_size(*, allocator: BaseTokenToKVPoolAllocator) -> None:
     uses_legacy = allocator.uses_legacy_real_length_alloc
     assert isinstance(uses_legacy, bool), (
         f"{type(allocator).__name__}.uses_legacy_real_length_alloc is "

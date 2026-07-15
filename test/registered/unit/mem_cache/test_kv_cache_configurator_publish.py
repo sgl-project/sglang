@@ -189,7 +189,9 @@ class TestPublishSiteCoversEveryPoolPath(CustomTestCase):
             and call.func.id == "TokenToKVPoolAllocator",
             what="TokenToKVPoolAllocator construction",
         )
-        publish_at = self._unnested_publish_index(initialize.body, what="MLX initialize")
+        publish_at = self._unnested_publish_index(
+            initialize.body, what="MLX initialize"
+        )
 
         self.assertGreater(publish_at, allocator_at)
 

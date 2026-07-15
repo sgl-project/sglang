@@ -55,6 +55,7 @@ class TestDSV4AllocIsFailLoud(CustomTestCase):
 
         self.assertNotIsInstance(result, torch.Tensor)
 
+
 class TestDSV4LegacySwaTailEntry(CustomTestCase):
     """The legacy module preallocates the SWA tail with the old real-length call.
 
@@ -82,12 +83,8 @@ class TestDSV4LegacySwaTailEntry(CustomTestCase):
 
     def test_the_legacy_entry_is_not_the_page_aligned_one(self):
         """Aliasing the two names would feed batch tensors to the seq_len/swa_tail_len entry."""
-        aligned = inspect.signature(
-            DSV4NPUTokenToKVPoolAllocator.alloc_extend_swa_tail
-        )
-        self.assertEqual(
-            list(aligned.parameters), ["self", "seq_len", "swa_tail_len"]
-        )
+        aligned = inspect.signature(DSV4NPUTokenToKVPoolAllocator.alloc_extend_swa_tail)
+        self.assertEqual(list(aligned.parameters), ["self", "seq_len", "swa_tail_len"])
         self.assertNotEqual(
             list(aligned.parameters),
             list(
@@ -101,15 +98,11 @@ class TestDSV4LegacySwaTailEntry(CustomTestCase):
 class TestDSV4LegacyDeclaration(CustomTestCase):
     def test_uses_legacy_real_length_alloc_is_true(self):
         """DSV4-NPU is the one allocator driven with real lengths; nothing else declares it."""
-        self.assertIs(
-            DSV4NPUTokenToKVPoolAllocator.uses_legacy_real_length_alloc, True
-        )
+        self.assertIs(DSV4NPUTokenToKVPoolAllocator.uses_legacy_real_length_alloc, True)
 
     def test_the_base_default_stays_false(self):
         """Flipping the default would route every allocator down the legacy path."""
-        self.assertIs(
-            BaseTokenToKVPoolAllocator.uses_legacy_real_length_alloc, False
-        )
+        self.assertIs(BaseTokenToKVPoolAllocator.uses_legacy_real_length_alloc, False)
 
 
 if __name__ == "__main__":
