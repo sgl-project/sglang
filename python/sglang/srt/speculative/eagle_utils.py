@@ -815,7 +815,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
-    num_needed_tokens = 0
     max_alloc_len = 0
     for i, r in enumerate(batch.reqs):
         cur = r.kv.kv_allocated_len
@@ -825,7 +824,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         nxt = max(cur, r.kv_committed_len + double_alloc)
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
-        num_needed_tokens += nxt - cur
         max_alloc_len = max(max_alloc_len, nxt)
         r.decode_batch_idx += 1
 
@@ -859,6 +857,5 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens_cpu=cur_kv_lens_cpu,
         nxt_kv_lens=nxt_kv_lens,
         nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-        num_needed_tokens=num_needed_tokens,
         batch=batch,
     )

@@ -46,6 +46,8 @@ _RESOLVE = (
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
 )
 _SS = "session/streaming_session.py"
+_ALLOC = "mem_cache/allocation.py"
+_ALLOC_LEGACY = "hardware_backend/npu/allocation_legacy.py"
 _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
@@ -53,20 +55,23 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
-    ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
+    (_ALLOC, "alloc_for_extend", "evict"): 1,
+    (_ALLOC, "_record_extend_allocation", "kv_allocated_len"): 1,
+    (_ALLOC, "alloc_for_decode", "evict"): 1,
+    (_ALLOC, "alloc_for_decode", "kv_allocated_len"): 1,
+    # Allocators that keep the legacy real-length semantics are dispatched to
+    # allocation_legacy, which settles the same watermarks the same way.
+    (_ALLOC_LEGACY, "alloc_for_extend_legacy", "evict"): 1,
+    (_ALLOC_LEGACY, "alloc_for_extend_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_legacy", "evict"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_spec_decode_legacy", "kv_allocated_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
     (*_EAGLE_DECODE, "decode_batch_idx"): 1,
     (*_EAGLE_DECODE, "evict"): 1,
-    (
-        "mem_cache/allocation.py",
-        "alloc_for_spec_decode",
-        "kv_allocated_len",
-    ): 1,
+    (_ALLOC, "alloc_for_spec_decode", "kv_allocated_len"): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
