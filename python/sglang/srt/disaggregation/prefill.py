@@ -1059,11 +1059,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1096,15 +1091,13 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
+                return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                return kv_to_page_indices(kv_indices_full, page_size)
 
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
@@ -1157,6 +1150,9 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     state_indices.append(None)
 
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start_idx:end_idx
+        ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return

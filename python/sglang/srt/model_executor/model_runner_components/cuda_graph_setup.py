@@ -269,12 +269,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
     role = "draft" if model_runner.is_draft_worker else "target"
     if model_runner.spec_algorithm.is_speculative():
         capture_name = f"{role} verify"
-        num_tokens_per_req = (
-            model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                model_runner.server_args.speculative_num_draft_tokens,
-                model_runner.is_draft_worker,
-            )
-        )
+        num_tokens_per_req = model_runner.decode_num_tokens_per_req()
     else:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1

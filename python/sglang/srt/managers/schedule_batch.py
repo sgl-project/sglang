@@ -1896,6 +1896,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
+    # Rank-consistent forward mode for the recv skipper, derived from the MLP
+    # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
+    recv_skipper_forward_mode: Optional[ForwardMode] = None
     spec_verify_tier_num_tokens: int = -1
 
     # For processing logprobs
