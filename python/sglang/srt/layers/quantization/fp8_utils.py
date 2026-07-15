@@ -78,6 +78,8 @@ _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 
 _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
     (2560, 4096): 2048,
     (4096, 1024): 4096,
+    (2560, 2048): 2048,
+    (2048, 2048): 4096,
 }
 
 
