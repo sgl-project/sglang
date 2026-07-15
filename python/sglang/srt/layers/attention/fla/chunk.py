@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -21,6 +22,7 @@ from sglang.srt.layers.attention.fla.utils import (
     input_guard,
     is_intel,
 )
+from sglang.srt.utils import is_hip
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -31,6 +33,71 @@ if is_intel:
     )
 
 CHUNK_SIZE = 64
+
+# Optional FlyDSL (aiter) prefill state-matrix kernel. Drop-in for the Triton
+# `chunk_gated_delta_rule_fwd_h` (`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`),
+# ~1.5x faster at Qwen3.5 shapes on gfx950. Enable with SGLANG_GDN_PREFILL_FLYDSL=1
+# (HIP only). Numerically bit-exact vs the Triton kernel incl. in-place state
+# writeback (validated at the fwd_h level). Falls back to Triton silently when
+# unavailable.
+_GDN_PREFILL_FLYDSL = os.environ.get("SGLANG_GDN_PREFILL_FLYDSL", "0") == "1"
+_flydsl_fwd_h = None
+_flydsl_probed = False
+
+
+def _get_flydsl_fwd_h():
+    global _flydsl_fwd_h, _flydsl_probed
+    if _flydsl_probed:
+        return _flydsl_fwd_h
+    _flydsl_probed = True
+    if _GDN_PREFILL_FLYDSL and is_hip():
+        try:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                chunk_gated_delta_rule_fwd_h_flydsl,
+            )
+            from aiter.ops.flydsl.utils import is_flydsl_available
+
+            if is_flydsl_available():
+                _flydsl_fwd_h = chunk_gated_delta_rule_fwd_h_flydsl
+        except Exception:
+            _flydsl_fwd_h = None
+    return _flydsl_fwd_h
+
+
+def _chunk_gated_delta_rule_fwd_h_flydsl(
+    k, w, u, g, initial_state, initial_state_indices, cu_seqlens, fwd_h_flydsl
+):
+    """FlyDSL drop-in for `chunk_gated_delta_rule_fwd_h`.
+
+    Converts to FlyDSL's layout (head-major w/u, [T, H] cumulative g,
+    VK-ordered [N, H, V, K] state), gathers the requested state slots, and
+    mirrors the Triton kernel's in-place final-state writeback. Returns
+    (h, v_new) in the Triton layout.
+    """
+    g_flat = g.squeeze(0) if g.dim() == 3 else g
+    w_c = w.permute(0, 2, 1, 3).contiguous()
+    u_c = u.permute(0, 2, 1, 3).contiguous()
+    if initial_state_indices is not None:
+        h0 = initial_state[initial_state_indices].contiguous()
+    else:
+        h0 = initial_state
+    h, v_new_hm, final_state = fwd_h_flydsl(
+        k,
+        w_c,
+        u_c,
+        g=g_flat,
+        initial_state=h0,
+        output_final_state=True,
+        chunk_size=CHUNK_SIZE,
+        cu_seqlens=cu_seqlens,
+    )
+    # Mirror Triton INPLACE_UPDATE=True: persist final state to the pool slots.
+    if initial_state_indices is not None:
+        initial_state[initial_state_indices] = final_state.to(initial_state.dtype)
+    else:
+        initial_state.copy_(final_state.to(initial_state.dtype))
+    v_new = v_new_hm.permute(0, 2, 1, 3).contiguous() if v_new_hm is not None else None
+    return h, v_new
 
 
 def chunk_gated_delta_rule_fwd(
@@ -59,16 +126,29 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
-    h, v_new = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    fwd_h_flydsl = _get_flydsl_fwd_h()
+    if fwd_h_flydsl is not None:
+        h, v_new = _chunk_gated_delta_rule_fwd_h_flydsl(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            fwd_h_flydsl=fwd_h_flydsl,
+        )
+    else:
+        h, v_new = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
     o = chunk_fwd_o(
         q=q,
         k=k,
