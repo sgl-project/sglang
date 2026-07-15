@@ -48,8 +48,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
