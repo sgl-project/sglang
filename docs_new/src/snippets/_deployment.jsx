@@ -13,7 +13,15 @@
 //                      (nodesOptions id is `single` or `multi-N` → --nnodes N)
 //   cells              {match, verified?, env, flags}[] — one per
 //                      (hw × variant × quant × strategy × nodes); env/flags are
-//                      flat literals, only {{PLACEHOLDER}} subst applied
+//                      flat literals, only {{PLACEHOLDER}} subst applied.
+//                      PD-disaggregated cells carry `roles` instead of env/flags:
+//                      [{title, notes?, env, flags} | {title, notes?, raw}] —
+//                      one serve command per role (prefill / decode / router),
+//                      rendered in a single blurb separated by `#` headings.
+//                      Role flags include their own --nnodes/--node-rank/
+//                      --dist-init-addr literals (each worker group has its own
+//                      head node), so the auto-injected multi-node trio and the
+//                      generic multi-node header are skipped.
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
@@ -484,30 +492,17 @@ export const Deployment = ({ config, benchmarks }) => {
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
     const multinode = nnodes > 1;
-    const cellEnv = cell.env || [];
-    const flags = [...(cell.flags || [])];
-    if (multinode) {
-      // Insert the multi-node trio after the last parallelism flag,
-      // falling back to right after --model-path.
-      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp"];
-      let i = -1;
-      for (const anchor of PARALLELISM_ANCHORS) {
-        i = flags.findIndex((f) => f.split(/[\s=]/)[0] === anchor);
-        if (i !== -1) break;
-      }
-      if (i === -1) i = flags.findIndex((f) => f.startsWith("--model-path"));
-      flags.splice(i + 1, 0,
-        `--nnodes ${nnodes}`,
-        `--node-rank {{NODE_RANK}}`,
-        `--dist-init-addr {{NODE0_IP}}:20000`);
-    }
 
-    let cmd;
-    if (mode === "docker") {
+    const buildServe = (envList, flagList) => {
+      if (mode !== "docker") {
+        const flagBlock = flagList.map((f) => "  " + f).join(" \\\n");
+        const envBlock = envList.length ? envList.join(" \\\n") + " \\\n" : "";
+        return `${envBlock}sglang serve \\\n${flagBlock}`;
+      }
       // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
       const di = config.dockerImages || {};
       const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
-      const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
+      const portFlag = flagList.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
         for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
@@ -538,18 +533,48 @@ export const Deployment = ({ config, benchmarks }) => {
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
-        ...cellEnv.map((e) => `  --env ${e}`),
+        ...envList.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
         "  sglang serve",
-        ...flags.map((f) => "    " + f),
+        ...flagList.map((f) => "    " + f),
       ];
-      cmd = dockerLines.join(" \\\n");
-    } else {
-      const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
-      const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
-      cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+      return dockerLines.join(" \\\n");
+    };
+
+    if (cell.roles) {
+      // PD-disaggregated cell: one command block per role (prefill / decode /
+      // router), separated by `#` heading comments. Role flags carry their own
+      // --nnodes/--node-rank/--dist-init-addr literals (each worker group has
+      // its own head node), so the auto-injected trio and generic multi-node
+      // header don't apply. `raw` roles (e.g. the router) render verbatim.
+      const blocks = cell.roles.map((role) => {
+        const heading = [role.title, ...(role.notes || [])]
+          .map((line) => (line.length ? "# " + line : "#")).join("\n");
+        const body = role.raw != null ? role.raw : buildServe(role.env || [], role.flags || []);
+        return `${heading}\n${body}`;
+      });
+      return interpolate(blocks.join("\n\n"), envValues, modelName);
     }
+
+    const flags = [...(cell.flags || [])];
+    if (multinode) {
+      // Insert the multi-node trio after the last parallelism flag,
+      // falling back to right after --model-path.
+      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp"];
+      let i = -1;
+      for (const anchor of PARALLELISM_ANCHORS) {
+        i = flags.findIndex((f) => f.split(/[\s=]/)[0] === anchor);
+        if (i !== -1) break;
+      }
+      if (i === -1) i = flags.findIndex((f) => f.startsWith("--model-path"));
+      flags.splice(i + 1, 0,
+        `--nnodes ${nnodes}`,
+        `--node-rank {{NODE_RANK}}`,
+        `--dist-init-addr {{NODE0_IP}}:20000`);
+    }
+
+    let cmd = buildServe(cell.env || [], flags);
 
     if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
       const hint = config.multiNodeHints[sel.hw]

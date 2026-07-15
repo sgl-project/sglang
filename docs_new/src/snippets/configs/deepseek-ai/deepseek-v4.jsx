@@ -1,5 +1,6 @@
 // Single `export const config` literal — no spreads/calls/IIFE (Mintlify re-evals at hydration).
 // Cells are denormalized: no `--nnodes`/`--node-rank`/`--dist-init-addr`/`--host`/`--port` literals — engine injects them.
+// Exception: PD-disaggregated cells (`roles`) DO carry per-worker `--nnodes` literals — each worker group has its own head node.
 
 export const config = {
   modelName: "DeepSeek-V4",
@@ -34,7 +35,9 @@ export const config = {
     { id: "balanced",       label: "Balanced"       },
     { id: "high-throughput", label: "High-Throughput" },
   ],
-  // `multi-N` id carries the node count for `--nnodes N`.
+  // `multi-N` id carries the node count for `--nnodes N`. PD-disaggregated
+  // cells (`roles`) also live under `multi-2`; their roles carry the
+  // per-worker `--nnodes` literals instead of the injected trio.
   nodesOptions: [
     { id: "single",  label: "Single Node" },
     { id: "multi-2", label: "Multi-Nodes" },
@@ -989,6 +992,325 @@ sgl-eval run aime25 \\
         "--max-running-requests 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
+      ],
+    },
+
+    // ==== GB300 + FP4 multi-node: PD-disaggregated (MTP + HiCache KV offload).
+    // Adapted from SemiAnalysisAI/InferenceX#2157 (GB300 DeepSeek-V4 agentic
+    // Pareto recipes). All prefill workers are 2-node DEP8; low-latency was
+    // tuned at concurrency 8 (2P1D), balanced at 256 (4P4D), high-throughput
+    // at 1024 (12P4D).
+    {
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      verified: true,
+      roles: [
+        {
+          title: "Prefill worker — 1 worker × 2 nodes (8 GPUs, DEP8).",
+          notes: ["Run the same command on both prefill nodes (<node-rank> 0/1)."],
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+            "SGLANG_DSV4_MHC_PREWARM=1",
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=9216",
+          ],
+          flags: [
+            "--trust-remote-code",
+            "--model-path {{MODEL_NAME}}",
+            "--disaggregation-mode prefill",
+            "--disaggregation-transfer-backend mooncake",
+            "--tp 8",
+            "--dp 8",
+            "--ep-size 8",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
+            "--nnodes 2",
+            "--node-rank <node-rank>",
+            "--dist-init-addr <prefill-head-ip>:20000",
+            "--moe-dense-tp-size 1",
+            "--moe-a2a-backend megamoe",
+            "--load-balance-method total_tokens",
+            "--mem-fraction-static 0.9",
+            "--swa-full-tokens-ratio 0.02",
+            "--chunked-prefill-size 32768",
+            "--max-running-requests 128",
+            "--cuda-graph-max-bs-decode 128",
+            "--disable-flashinfer-autotune",
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--enable-hierarchical-cache",
+            "--hicache-ratio 1",
+            "--hicache-write-policy write_back",
+            "--hicache-io-backend direct",
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+        },
+        {
+          title: "Decode worker — 1 node (4 GPUs, TP4).",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+          ],
+          flags: [
+            "--trust-remote-code",
+            "--model-path {{MODEL_NAME}}",
+            "--disaggregation-mode decode",
+            "--disaggregation-transfer-backend mooncake",
+            "--tp 4",
+            "--moe-runner-backend flashinfer_mxfp4",
+            "--mem-fraction-static 0.9",
+            "--swa-full-tokens-ratio 0.02",
+            "--max-running-requests 128",
+            "--cuda-graph-max-bs-decode 128",
+            "--disable-flashinfer-autotune",
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+        },
+        {
+          title: "Router — fronts the prefill and decode workers (run on any node).",
+          raw:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-head-ip>:{{PORT}} \\
+  --decode http://<decode-ip>:{{PORT}} \\
+  --host 0.0.0.0 --port 8000`,
+        },
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      roles: [
+        {
+          title: "Prefill workers — 2 workers × 2 nodes each (8 GPUs, DEP8).",
+          notes: ["Launch one instance per worker; run its command on both of the worker's nodes (<node-rank> 0/1)."],
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+            "SGLANG_DSV4_MHC_PREWARM=1",
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=9216",
+          ],
+          flags: [
+            "--trust-remote-code",
+            "--model-path {{MODEL_NAME}}",
+            "--disaggregation-mode prefill",
+            "--disaggregation-transfer-backend mooncake",
+            "--tp 8",
+            "--dp 8",
+            "--ep-size 8",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
+            "--nnodes 2",
+            "--node-rank <node-rank>",
+            "--dist-init-addr <prefill-worker-head-ip>:20000",
+            "--moe-dense-tp-size 1",
+            "--moe-a2a-backend megamoe",
+            "--load-balance-method total_tokens",
+            "--mem-fraction-static 0.9",
+            "--swa-full-tokens-ratio 0.02",
+            "--chunked-prefill-size 32768",
+            "--max-running-requests 256",
+            "--cuda-graph-max-bs-decode 256",
+            "--disable-flashinfer-autotune",
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--enable-hierarchical-cache",
+            "--hicache-ratio 1",
+            "--hicache-write-policy write_back",
+            "--hicache-io-backend direct",
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+        },
+        {
+          title: "Decode worker — 1 worker × 4 nodes (16 GPUs, DEP16).",
+          notes: ["Run the same command on all 4 decode nodes (<node-rank> 0-3)."],
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+          ],
+          flags: [
+            "--trust-remote-code",
+            "--model-path {{MODEL_NAME}}",
+            "--disaggregation-mode decode",
+            "--disaggregation-transfer-backend mooncake",
+            "--tp 16",
+            "--dp 16",
+            "--ep-size 16",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
+            "--nnodes 4",
+            "--node-rank <node-rank>",
+            "--dist-init-addr <decode-head-ip>:20000",
+            "--moe-dense-tp-size 1",
+            "--moe-a2a-backend megamoe",
+            "--load-balance-method total_tokens",
+            "--mem-fraction-static 0.9",
+            "--swa-full-tokens-ratio 0.02",
+            "--max-running-requests 3072",
+            "--cuda-graph-max-bs-decode 256",
+            "--disable-flashinfer-autotune",
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+        },
+        {
+          title: "Router — fronts the prefill and decode workers (run on any node).",
+          raw:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-worker-0-head-ip>:{{PORT}} \\
+  --prefill http://<prefill-worker-1-head-ip>:{{PORT}} \\
+  --decode http://<decode-head-ip>:{{PORT}} \\
+  --host 0.0.0.0 --port 8000`,
+        },
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      verified: true,
+      roles: [
+        {
+          title: "Prefill workers — 6 workers × 2 nodes each (8 GPUs, DEP8).",
+          notes: ["Launch one instance per worker; run its command on both of the worker's nodes (<node-rank> 0/1)."],
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+            "SGLANG_DSV4_MHC_PREWARM=1",
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=9216",
+          ],
+          flags: [
+            "--trust-remote-code",
+            "--model-path {{MODEL_NAME}}",
+            "--disaggregation-mode prefill",
+            "--disaggregation-transfer-backend mooncake",
+            "--tp 8",
+            "--dp 8",
+            "--ep-size 8",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
+            "--nnodes 2",
+            "--node-rank <node-rank>",
+            "--dist-init-addr <prefill-worker-head-ip>:20000",
+            "--moe-dense-tp-size 1",
+            "--moe-a2a-backend megamoe",
+            "--load-balance-method total_tokens",
+            "--mem-fraction-static 0.9",
+            "--swa-full-tokens-ratio 0.02",
+            "--chunked-prefill-size 32768",
+            "--max-running-requests 1024",
+            "--cuda-graph-max-bs-decode 1024",
+            "--disable-flashinfer-autotune",
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--enable-hierarchical-cache",
+            "--hicache-ratio 1",
+            "--hicache-write-policy write_back",
+            "--hicache-io-backend direct",
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+        },
+        {
+          title: "Decode worker — 1 worker × 4 nodes (16 GPUs, DEP16).",
+          notes: ["Run the same command on all 4 decode nodes (<node-rank> 0-3)."],
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+          ],
+          flags: [
+            "--trust-remote-code",
+            "--model-path {{MODEL_NAME}}",
+            "--disaggregation-mode decode",
+            "--disaggregation-transfer-backend mooncake",
+            "--tp 16",
+            "--dp 16",
+            "--ep-size 16",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
+            "--nnodes 4",
+            "--node-rank <node-rank>",
+            "--dist-init-addr <decode-head-ip>:20000",
+            "--moe-dense-tp-size 1",
+            "--moe-a2a-backend megamoe",
+            "--load-balance-method total_tokens",
+            "--mem-fraction-static 0.9",
+            "--swa-full-tokens-ratio 0.02",
+            "--max-running-requests 3072",
+            "--cuda-graph-max-bs-decode 1024",
+            "--disable-flashinfer-autotune",
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+        },
+        {
+          title: "Router — fronts the prefill and decode workers (run on any node).",
+          raw:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-worker-0-head-ip>:{{PORT}} \\
+  --prefill http://<prefill-worker-1-head-ip>:{{PORT}} \\
+  --prefill http://<prefill-worker-2-head-ip>:{{PORT}} \\
+  --prefill http://<prefill-worker-3-head-ip>:{{PORT}} \\
+  --prefill http://<prefill-worker-4-head-ip>:{{PORT}} \\
+  --prefill http://<prefill-worker-5-head-ip>:{{PORT}} \\
+  --decode http://<decode-head-ip>:{{PORT}} \\
+  --host 0.0.0.0 --port 8000`,
+        },
       ],
     },
     // ====================================================================
