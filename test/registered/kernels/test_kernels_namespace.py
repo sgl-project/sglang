@@ -67,6 +67,7 @@ EXPECTED_OPS = {
     # representative migrated Triton kernels (inventory)
     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
     "memory.alloc_extend_kernel": {"triton"},
+    "memory.write_req_to_token_pool": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
@@ -179,6 +180,101 @@ class TestKernelsNamespace(unittest.TestCase):
             module_path, sep, attr = spec.target.partition(":")
             self.assertEqual(sep, ":", f"bad target for {spec.op}: {spec.target}")
             self.assertTrue(module_path and attr, spec.target)
+
+    def test_every_in_tree_spec_target_names_a_symbol_that_exists(self):
+        checked = 0
+        for spec in self.K.registry.all_specs():
+            module_path, _, attr = spec.target.partition(":")
+            if not module_path.startswith("sglang.kernels.ops."):
+                continue
+            head, _, sub_attr = attr.partition(".")
+
+            source = self._module_source(module_path)
+            self.assertIsNotNone(source, f"{spec.op}: no source for {module_path}")
+            checked += 1
+            self.assertIn(
+                head,
+                self._top_level_names(source),
+                f"{spec.op}: stale target {spec.target} "
+                f"({head} is not defined in {module_path})",
+            )
+
+            if sub_attr:
+                methods = self._class_methods(source, head)
+                if methods is not None:
+                    self.assertIn(
+                        sub_attr,
+                        methods,
+                        f"{spec.op}: stale target {spec.target} "
+                        f"({head} has no {sub_attr})",
+                    )
+
+        self.assertGreaterEqual(checked, 30, "in-tree targets unexpectedly few")
+
+    def _module_source(self, module_path: str):
+        import ast
+        import importlib.util
+        import pathlib
+
+        cache = self.__dict__.setdefault("_source_cache", {})
+        if module_path in cache:
+            return cache[module_path]
+
+        try:
+            spec = importlib.util.find_spec(module_path)
+        except (ImportError, AttributeError, ValueError):
+            spec = None
+        origin = getattr(spec, "origin", None) if spec is not None else None
+        tree = None
+        if origin and origin.endswith(".py"):
+            tree = ast.parse(pathlib.Path(origin).read_text())
+        cache[module_path] = tree
+        return tree
+
+    @staticmethod
+    def _top_level_names(tree) -> set:
+        import ast
+
+        names = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, (ast.If, ast.Try)):
+                for inner in ast.walk(node):
+                    if isinstance(
+                        inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    ):
+                        names.add(inner.name)
+                    elif isinstance(inner, (ast.Import, ast.ImportFrom)):
+                        for alias in inner.names:
+                            names.add((alias.asname or alias.name).split(".")[0])
+                    elif isinstance(inner, ast.Assign):
+                        for target in inner.targets:
+                            if isinstance(target, ast.Name):
+                                names.add(target.id)
+        return names
+
+    @staticmethod
+    def _class_methods(tree, class_name: str):
+        import ast
+
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                return {
+                    item.name
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+        return None
 
     def test_wrappers_exposed_and_callable(self):
         for module_name, names in EXPECTED_WRAPPERS.items():
