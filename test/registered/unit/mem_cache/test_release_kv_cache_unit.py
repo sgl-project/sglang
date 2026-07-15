@@ -1,5 +1,3 @@
-"""Unit tests for release_kv_cache's page-aligned free contract."""
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -23,7 +21,7 @@ _KV_BASE = 100
 
 
 class _FakeAllocator:
-    def __init__(self, page_size: int):
+    def __init__(self, page_size: int) -> None:
         self.page_size = page_size
         self.freed: list[torch.Tensor] = []
 
@@ -32,7 +30,7 @@ class _FakeAllocator:
 
 
 class _FakeReqToTokenPool:
-    def __init__(self, req_to_token: torch.Tensor):
+    def __init__(self, req_to_token: torch.Tensor) -> None:
         self.req_to_token = req_to_token
         self.freed_reqs: list[object] = []
 
@@ -47,7 +45,7 @@ class _FakeTreeCache:
         page_size: int,
         result: Optional[CacheFinishedReqResult],
         take_over_kv: bool = False,
-    ):
+    ) -> None:
         self.token_to_kv_pool_allocator = _FakeAllocator(page_size)
         self.req_to_token_pool = _FakeReqToTokenPool(
             torch.arange(_KV_BASE, _KV_BASE + 32, dtype=torch.int64).unsqueeze(0)
@@ -57,7 +55,7 @@ class _FakeTreeCache:
         self.handled_kv_lens: list[int] = []
 
     def cache_finished_req(
-        self, req, is_insert: bool = True, *, kv_len_to_handle: int
+        self, req: "_FakeReq", is_insert: bool = True, *, kv_len_to_handle: int
     ) -> Optional[CacheFinishedReqResult]:
         self.handled_kv_lens.append(kv_len_to_handle)
         if self.take_over_kv:
@@ -67,7 +65,7 @@ class _FakeTreeCache:
 
 
 class _FakeReq:
-    def __init__(self, *, committed: int, allocated: int, protected: int = 0):
+    def __init__(self, *, committed: int, allocated: int, protected: int = 0) -> None:
         self.req_pool_idx = 0
         self.cache_protected_len = protected
         self.kv_committed_len = committed
@@ -86,13 +84,19 @@ def _freed_indices(tree_cache: _FakeTreeCache) -> list[int]:
 
 
 class TestReleaseKvCache(CustomTestCase):
-    def setUp(self):
-        self._override = get_context().override_server_args(page_size=_PAGE_SIZE)
-        self._override.install()
-        self.addCleanup(self._override.restore)
+    def setUp(self) -> None:
+        super().setUp()
+        override = get_context().override_server_args(page_size=_PAGE_SIZE)
+        override.install()
+        self.addCleanup(override.restore)
 
     def _release(self, *, tree_cache: _FakeTreeCache, req: _FakeReq) -> None:
         release_kv_cache(req, tree_cache, is_insert=True)
+
+    def _override(self, **fields: object) -> None:
+        override = get_context().override_server_args(page_size=_PAGE_SIZE, **fields)
+        override.install()
+        self.addCleanup(override.restore)
 
     def test_release_frees_exactly_from_unhandled_kv_start_to_allocated_len(self):
         """The caller frees [unhandled_kv_start, kv_allocated_len), not the ceil of committed."""
@@ -138,11 +142,7 @@ class TestReleaseKvCache(CustomTestCase):
 
     def test_release_allows_overallocated_tail_under_speculative_decoding(self):
         """Speculative decoding legitimately over-allocates, so the exactness check is gated off."""
-        override = get_context().override_server_args(
-            page_size=_PAGE_SIZE, speculative_algorithm="EAGLE"
-        )
-        override.install()
-        self.addCleanup(override.restore)
+        self._override(speculative_algorithm="EAGLE")
         tree_cache = _FakeTreeCache(
             page_size=_PAGE_SIZE, result=CacheFinishedReqResult(unhandled_kv_start=8)
         )
@@ -210,11 +210,7 @@ class TestReleaseKvCache(CustomTestCase):
 
     def test_release_falls_back_to_ceil_for_legacy_backends_returning_none(self):
         """External backends on the deprecated contract keep their previous ceil behavior."""
-        override = get_context().override_server_args(
-            page_size=_PAGE_SIZE, speculative_algorithm="EAGLE"
-        )
-        override.install()
-        self.addCleanup(override.restore)
+        self._override(speculative_algorithm="EAGLE")
         tree_cache = _FakeTreeCache(page_size=_PAGE_SIZE, result=None)
         req = _FakeReq(committed=10, allocated=20)
 
@@ -222,10 +218,24 @@ class TestReleaseKvCache(CustomTestCase):
 
         self.assertEqual(_freed_indices(tree_cache), list(range(112, 120)))
 
+    def test_release_ceils_legacy_backends_on_the_allocator_page_under_dcp(self):
+        """The legacy ceil moved onto the allocator page too, correcting a DCP double-free."""
+        self._override(speculative_algorithm="EAGLE")
+        tree_cache = _FakeTreeCache(page_size=8, result=None)
+        req = _FakeReq(committed=10, allocated=24)
+
+        self._release(tree_cache=tree_cache, req=req)
+
+        self.assertEqual(
+            _freed_indices(tree_cache),
+            list(range(116, 124)),
+            "server_args' page of 4 ceils to 12, re-freeing the real page [8, 16) "
+            "the legacy backend already released; the allocator's page of 8 must "
+            "ceil to 16 instead. This is a deliberate behavior change under DCP.",
+        )
+
 
 class TestReleaseKvCacheFreesEachPageExactlyOnce(CustomTestCase):
-    """Every page is either still live or freed exactly once, over the real release path."""
-
     def _run(self, *, need_sort: bool) -> None:
         override = get_context().override_server_args(page_size=_PAGE_SIZE)
         override.install()
@@ -241,6 +251,15 @@ class TestReleaseKvCacheFreesEachPageExactlyOnce(CustomTestCase):
             need_sort=need_sort,
         )
         all_pages = set(allocator.free_pages.tolist())
+
+        free_calls: list[torch.Tensor] = []
+        real_free = allocator.free
+
+        def recording_free(free_index: torch.Tensor) -> None:
+            free_calls.append(free_index.detach().cpu().clone())
+            return real_free(free_index)
+
+        allocator.free = recording_free
 
         cache = RadixCache.create_simulated(
             mock_allocator=allocator, page_size=_PAGE_SIZE
@@ -261,6 +280,23 @@ class TestReleaseKvCacheFreesEachPageExactlyOnce(CustomTestCase):
 
         release_kv_cache(req, cache, is_insert=True)
 
+        nonempty = [call for call in free_calls if call.numel() > 0]
+        raw_slice_hint = (
+            "the allocator must receive whole pages. The old code freed [16, 18) "
+            "from inside the backend -- a partial page the allocator rounds up to "
+            "the same page as [16, 20), so the page-set assertions below cannot "
+            "tell the two apart. Pin the raw slice instead."
+        )
+        self.assertEqual(len(nonempty), 1, f"{need_sort=}: {raw_slice_hint}")
+        self.assertEqual(
+            nonempty[0].tolist(),
+            kv_indices[16:20].tolist(),
+            f"{need_sort=}: {raw_slice_hint}",
+        )
+        for call in nonempty:
+            self.assertEqual(call.numel() % _PAGE_SIZE, 0, f"{need_sort=}")
+            self.assertEqual(int(call[0]) % _PAGE_SIZE, 0, f"{need_sort=}")
+
         live_pages = set((kv_indices[:16] // _PAGE_SIZE).tolist())
         freed_pages = allocator.free_pages.tolist() + allocator.release_pages.tolist()
 
@@ -276,11 +312,11 @@ class TestReleaseKvCacheFreesEachPageExactlyOnce(CustomTestCase):
         )
 
     def test_each_page_is_freed_exactly_once_without_sorting(self):
-        """Free-list pages stay unique and complementary when free() appends to free_pages."""
+        """Every page is live or freed exactly once when free() appends to free_pages."""
         self._run(need_sort=False)
 
     def test_each_page_is_freed_exactly_once_with_sorting(self):
-        """Free-list pages stay unique and complementary when free() appends to release_pages."""
+        """Every page is live or freed exactly once when free() appends to release_pages."""
         self._run(need_sort=True)
 
 
