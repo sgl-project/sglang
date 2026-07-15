@@ -870,11 +870,13 @@ def step_b_v_fwd(
 # grid, mixed / zero per-slot ranks, per-slot ``scalings``, accumulate in
 # place. Rounding mirrors the split path too: the rank intermediate is cast to
 # the activation dtype between the two dots (as step-A does), and the scaled
-# delta is rounded to the output dtype *before* it is added to the base value
-# (as step-B does). The only remaining difference is that the low-rank
-# contraction is a single ``tl.dot`` here vs. the split step-B's tiled
-# accumulation, so the two agree to within fp32 reassociation (a few ULPs),
-# not bitwise.
+# delta is rounded to the activation dtype *before* it is added to the base
+# value (as step-B does). These fused kernels use different tile shapes than
+# the split kernels, and the low-rank (rank) contraction is a single ``tl.dot``
+# here vs. the split step-B's tiled accumulation, so the fp32 reduction order
+# differs: the result matches the split path within the per-dtype tolerance and
+# is bit-identical on the tested shapes, but bitwise equality is not guaranteed
+# in general.
 #
 # Because the whole padded-rank intermediate stays resident, the fused path
 # only wins while that is small. Above ``_fuse_max_rank()`` (or on any launch
@@ -1031,9 +1033,11 @@ def _fused_q_kernel(
             mask=r_mask[:, None] & n_mask[None, :],
             other=0.0,
         )
-        # Mirror the split step-B rounding: round the scaled delta to the output
-        # dtype BEFORE adding the base value (step_b_q casts partial_sum then += base).
-        delta = (tl.dot(a, A_tile) * scaling).to(base.dtype.element_ty)
+        # Mirror the split step-B rounding: round the scaled delta to the
+        # activation dtype BEFORE adding the base value (step_b_q casts
+        # partial_sum to x.dtype -- the step-A intermediate / activation dtype --
+        # then += base), which may differ from the base-output dtype.
+        delta = (tl.dot(a, A_tile) * scaling).to(q.dtype.element_ty)
         base_offs = (
             safe_row[:, None] * b_stride_s
             + head_id * b_stride_h
@@ -1231,8 +1235,9 @@ def _fused_v_kernel(
             mask=r_mask[:, None] & n_mask[None, :],
             other=0.0,
         )  # (R_PAD, BLOCK_N)
-        # Mirror the split step-B rounding: round the scaled delta before += base.
-        delta = (tl.dot(a, B_tile) * scaling).to(base.dtype.element_ty)
+        # Mirror the split step-B rounding: round the scaled delta to the
+        # activation dtype (x.dtype) before adding the base value, as step_b_v does.
+        delta = (tl.dot(a, B_tile) * scaling).to(x.dtype.element_ty)
         base_offs = (
             safe_row[:, None] * b_stride_s
             + head_id * b_stride_h
