@@ -49,10 +49,10 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
             raise RuntimeError(
                 f"CuTe DSL KDA prefill requires head_k_dim=128, got {head_k_dim}."
             )
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
         from sglang.kernels.ops.attention.linear.kda_blackwell import (
             chunk_kda_cutedsl,
         )
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 
         self._extend_fn = chunk_kda_cutedsl
         self._l2norm_fn = l2norm_fwd
