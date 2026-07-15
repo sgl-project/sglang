@@ -39,32 +39,34 @@ class TestWriteReqToTokenPool(CustomTestCase):
                 self.assertTrue(torch.equal(req_to_token, req_to_token_before))
 
     def test_host_resident_empty_prefix_tensor_is_accepted(self) -> None:
-        """ChunkCache hands back a CPU empty prefix tensor; a zero prefix must not deref it."""
+        """ChunkCache hands back a CPU empty prefix tensor; both backends and the validator take it."""
         req_to_token = torch.full((3, 16), -7, dtype=torch.int32, device="cuda")
         lens_cpu = torch.tensor([0], dtype=torch.int64)
         extend_lens_cpu = torch.tensor([3], dtype=torch.int64)
         chunk_cache_prefix = torch.empty((0,), dtype=torch.int64)
         self.assertEqual(chunk_cache_prefix.device.type, "cpu")
+        arguments = dict(
+            req_pool_indices=torch.tensor([1], dtype=torch.int64).cuda(),
+            req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+            prefix_lens=lens_cpu.cuda(),
+            prefix_lens_cpu=lens_cpu,
+            seq_lens=extend_lens_cpu.cuda(),
+            seq_lens_cpu=extend_lens_cpu,
+            extend_lens=extend_lens_cpu.cuda(),
+            extend_lens_cpu=extend_lens_cpu,
+            prefix_tensors=[chunk_cache_prefix],
+            out_cache_loc=torch.tensor([11, 12, 13], dtype=torch.int64, device="cuda"),
+        )
 
         for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
             with self.subTest(implementation=implementation.__name__):
-                implementation(
-                    req_to_token,
-                    req_pool_indices=torch.tensor([1], dtype=torch.int64).cuda(),
-                    req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
-                    prefix_lens=lens_cpu.cuda(),
-                    prefix_lens_cpu=lens_cpu,
-                    seq_lens=extend_lens_cpu.cuda(),
-                    seq_lens_cpu=extend_lens_cpu,
-                    extend_lens=extend_lens_cpu.cuda(),
-                    extend_lens_cpu=extend_lens_cpu,
-                    prefix_tensors=[chunk_cache_prefix],
-                    out_cache_loc=torch.tensor(
-                        [11, 12, 13], dtype=torch.int64, device="cuda"
-                    ),
-                )
+                implementation(req_to_token, **arguments)
 
                 self.assertEqual(req_to_token[1, :3].tolist(), [11, 12, 13])
+
+        self.assertEqual(
+            WriteReqToTokenPool._validate_inputs(req_to_token, **arguments), 1
+        )
 
     def test_validate_inputs_returns_batch_size_and_rejects_malformed_batch(
         self,
