@@ -1237,7 +1237,7 @@ class ServerArgs:
     )
     crash_dump_folder: A[
         Optional[str],
-        "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
+        "Folder for crash diagnostics. Stores requests completed in the last 5 minutes plus in-flight requests, and configures CUDA device coredumps under this folder. Existing CUDA coredump environment variables take precedence. If not specified, request crash dumping and automatic CUDA coredump configuration are disabled.",
     ] = None
     show_time_cost: A[bool, "Show time cost of custom marks."] = False
     enable_metrics: A[bool, "Enable log prometheus metrics."] = False

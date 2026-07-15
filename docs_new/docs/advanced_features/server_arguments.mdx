@@ -840,7 +840,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--crash-dump-folder`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Folder for crash diagnostics. Stores requests completed in the last 5 minutes plus in-flight requests, and configures CUDA device coredumps under this folder. Existing CUDA coredump environment variables take precedence. If not specified, request crash dumping and automatic CUDA coredump configuration are disabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
