@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -244,6 +246,9 @@ class AssignExtendCacheLocs:
         batch_size: int,
         draft_token_num: int,
         device: torch.device,
+        req_pool_indices_cpu: Optional[torch.Tensor] = None,
+        start_offset_cpu: Optional[torch.Tensor] = None,
+        end_offset_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_cuda or _is_hip or _is_musa or _is_xpu:
             out_cache_loc = torch.empty(
@@ -293,6 +298,45 @@ class AssignExtendCacheLocs:
             )
 
             return out_cache_loc
+
+        assert req_pool_indices_cpu is not None, "vanilla gather needs host mirrors"
+        assert start_offset_cpu is not None, "vanilla gather needs host mirrors"
+        assert end_offset_cpu is not None, "vanilla gather needs host mirrors"
+
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int32,
+            device=device,
+        )
+        cls.vanilla(
+            req_to_token,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            start_offset_cpu=start_offset_cpu,
+            end_offset_cpu=end_offset_cpu,
+            out_cache_loc=out_cache_loc,
+        )
+
+        return out_cache_loc.to(torch.int64)
+
+    @staticmethod
+    def vanilla(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        start_offset_cpu: torch.Tensor,
+        end_offset_cpu: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        out_cache_offset = 0
+        for index in range(req_pool_indices_cpu.shape[0]):
+            req_pool_index = int(req_pool_indices_cpu[index].item())
+            start_index = int(start_offset_cpu[index].item())
+            end_index = int(end_offset_cpu[index].item())
+            gather_len = end_index - start_index
+            out_cache_loc[out_cache_offset : out_cache_offset + gather_len] = (
+                req_to_token[req_pool_index, start_index:end_index]
+            )
+            out_cache_offset += gather_len
 
     @staticmethod
     def triton(
