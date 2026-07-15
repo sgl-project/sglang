@@ -18,9 +18,19 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.kernels.ops.attention.dsa.transform_index import (
+    transform_index_page_table_decode,
+    transform_index_page_table_prefill,
+)
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+    seqlens_expand_triton,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -30,11 +40,6 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
-)
-from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
-from sglang.srt.layers.attention.dsa.transform_index import (
-    transform_index_page_table_decode,
-    transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
@@ -46,11 +51,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
-)
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    mla_quantize_and_rope_for_fp8,
-    seqlens_expand_triton,
 )
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -104,8 +104,8 @@ def _all_gather_dsa_trtllm_fp8_kv(
 _is_hip = is_hip()
 
 if _is_hip:
+    from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-    from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
 
     try:
         from aiter import (  # noqa: F401
@@ -1961,7 +1961,7 @@ class DeepseekSparseAttnBackend(
                     and page_table_1.shape[-1] == 2048
                     and q_nope.shape[0] >= 512
                 ):
-                    from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+                    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                         triton_sparse_mla_fwd,
                     )
 
@@ -2426,7 +2426,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         return tilelang_sparse_fwd(
             q=q_all,
