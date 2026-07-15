@@ -486,6 +486,7 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    defer_war_read_done_until_after_replay: bool = True
 
     def __init__(
         self,
@@ -1894,6 +1895,9 @@ class DeepseekV4AttnBackend(
         seq_lens_casual = seq_lens[:, None] + torch.arange(
             -qo_len + 1, 1, **self.cuda_int32_kwargs
         )
+        # Graph-padded requests use seq_len=1 even when qo_len is wider. Keep
+        # their causal rows on reserved slot 0 instead of producing negatives.
+        seq_lens_casual.clamp_min_(1)
         seq_lens_casual = seq_lens_casual.flatten()
         idx_to_req_repeated = torch.arange(
             bs, **self.cuda_int32_kwargs

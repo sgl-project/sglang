@@ -596,12 +596,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
@@ -613,10 +607,26 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self._replay_graph(shape_key, forward_batch)
+            out = self._replay_graph_with_war_read_done(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
             hidden_states=out.hidden_states[:num_tokens],
         )
         return out
+
+    def _replay_graph_with_war_read_done(self, shape_key, forward_batch):
+        defer_read_done = (
+            self.draft_extend_attn_backend.defer_war_read_done_until_after_replay
+        )
+        if not defer_read_done:
+            self._record_war_fastpath_read_done()
+        out = self._replay_graph(shape_key, forward_batch)
+        if defer_read_done:
+            self._record_war_fastpath_read_done()
+        return out
+
+    def _record_war_fastpath_read_done(self) -> None:
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done

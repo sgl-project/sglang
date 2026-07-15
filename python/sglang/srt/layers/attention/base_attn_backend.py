@@ -98,6 +98,10 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Defer the scheduler WAR read-done event when CUDA graph replay still reads
+    # scheduler-owned shared buffers after out-of-graph metadata preparation.
+    defer_war_read_done_until_after_replay: bool = False
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
