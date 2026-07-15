@@ -1,7 +1,7 @@
 import torch
 
 from sglang.jit_kernel.benchmark import marker
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     post_reorder_deepgemm,
     post_reorder_triton_kernel,
 )

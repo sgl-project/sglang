@@ -1,11 +1,13 @@
 import contextlib
 import logging
 import time
+from dataclasses import replace
 from typing import List, Optional
 
 import torch
 
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -15,7 +17,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -124,24 +125,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: int,
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moe_ep_rank = moe_ep_rank
+        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
 
         # Args for easy access
         self.device = server_args.device
@@ -170,12 +163,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,  # spec workers don't support pipeline parallelism
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
             )
@@ -369,6 +358,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
         # Initialize decode attention backend
@@ -515,6 +505,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            can_cuda_graph
+            and not forward_batch.forward_mode.is_idle()
+            and self.seed_dsa_topk_from_draft_extend
+            and draft_input.dsa_topk_indices is None
+        ):
+            can_cuda_graph = False
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -813,11 +810,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Seed the first draft-decode loop from each request's last prefill
         # position. Gather last-per-req before the copy (prefill can be long).
-        # Skipped under context-parallel prefill (token layout wouldn't match).
         seed_from_extend = (
             self.seed_dsa_topk_from_draft_extend
             and not forward_batch.forward_mode.is_idle()
-            and not dsa_use_prefill_cp(forward_batch)
         )
         if seed_from_extend:
             bs = forward_batch.batch_size
@@ -1039,11 +1034,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -1052,7 +1043,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.tp_rank = tp_rank
+        self.ps = ps
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -1070,11 +1061,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._draft_worker = EagleDraftWorker(
             server_args,
             gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
+            ps,
             nccl_port,
             target_worker,
         )
@@ -1546,7 +1533,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             if (
                 _is_npu
-                and self._target_worker.model_runner.model_is_mrope
+                and self._target_worker.model_runner.model_config.model_is_mrope
                 and batch.spec_info is not None
                 and getattr(batch.spec_info, "positions", None) is not None
                 and not batch.forward_mode.is_idle()
@@ -1731,17 +1718,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.tp_rank]
+            recv_req.serialized_named_tensors[self.ps.tp_rank]
         )
-        success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
+        success, message = (
+            self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
         )
         if not success:
             return success, message
 
-        success, message = self.target_worker.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
+        success, message = (
+            self.target_worker.model_runner.weight_updater.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
         )
         return success, message
