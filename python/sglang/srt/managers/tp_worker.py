@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
@@ -627,6 +628,47 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+    def forward_batch_generation_split_init(
+        self,
+        batch: ScheduleBatch,
+    ) -> ForwardBatch:
+        """Initialize a ForwardBatch for layer-pipelined split prefill."""
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch.forward_mode = ForwardMode.SPLIT_PREFILL
+        forward_batch.split_index = 0
+        return forward_batch
+
+    def forward_batch_generation_split_layer(
+        self,
+        forward_batch: ForwardBatch,
+        forward_count: int = 1,
+    ) -> tuple:
+        """Run forward_count layers of split prefill and return (logits_or_none, event).
+
+        The CUDA event is recorded right after the layer forward completes.
+        Returns (None, event) for intermediate groups.
+        Returns (LogitsProcessorOutput, event) for the final group
+        (when split_index reaches num_hidden_layers).
+        """
+        # Route through ModelRunner.forward to preserve the common forward
+        # bookkeeping before it dispatches to forward_split_prefill.
+        out = self.model_runner.forward(
+            forward_batch,
+            reinit_attn_backend=(forward_batch.split_index == 0),
+            split_forward_count=forward_count,
+        )
+        event = torch.cuda.Event()
+        event.record()
+        return out.logits_output, event
+
+    def forward_batch_generation_split_sample(
+        self,
+        logits_output,
+        forward_batch: ForwardBatch,
+    ):
+        """Sample next tokens from logits after split prefill completes."""
+        return self.model_runner.sample(logits_output, forward_batch)
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

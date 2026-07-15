@@ -1299,12 +1299,18 @@ class ModelRunner:
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        ctx = (
+        timer_ctx = (
             self.device_timer.wrap(metadata={"category": "split_prefill"})
             if self.device_timer
             else contextlib.nullcontext()
         )
-        with ctx:
+        # Publish forward context so attention layers can access attn_backend
+        # via get_forward_context(). Honor outer context if already set.
+        if has_forward_context():
+            fwd_ctx = contextlib.nullcontext()
+        else:
+            fwd_ctx = forward_context(ForwardContext(attn_backend=self.attn_backend))
+        with fwd_ctx, timer_ctx:
             ret = self.model.forward_split_prefill(
                 forward_batch.input_ids,
                 forward_batch.positions,

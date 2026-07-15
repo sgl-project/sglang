@@ -228,7 +228,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -3580,6 +3584,122 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def run_batch_pipelined(
+        self, batch: ScheduleBatch, group_size: int
+    ) -> GenerationBatchResult:
+        """Run a batch with layer-pipelined KV transfer.
+
+        Instead of computing all layers then transferring all KV at once,
+        this runs layers in groups and enqueues KV transfer after each group.
+        Transfer of group N overlaps with GPU compute of group N+1.
+
+        group_size is computed adaptively by _get_pipeline_group_size().
+        """
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        self.profiler_manager._profile_batch_predicate(batch)
+
+        # Match run_batch(): ForwardBatch.init_new borrows batch.input_ids, so
+        # materialize deferred prefill inputs before initializing split prefill.
+        resolve_forward_inputs(batch, self.future_map)
+
+        num_layers = self.model_config.num_hidden_layers
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        # Prepare KV page indices for requests that can be sent per-layer.
+        req_page_indices_list = []
+        for req in batch.reqs:
+            req.pipelined_kv_sent = False
+            start_idx = req.start_send_idx
+            end_idx = min(req.fill_len, len(req.origin_input_ids))
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+                .cpu()
+                .numpy()
+            )
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            req_page_indices_list.append(page_indices)
+
+        # Pre-compute state indices for hybrid models (Mamba/SWA/DSA).
+        # Attached to req so the final metadata send can pass them through.
+        self._prepare_pipelined_state_indices(batch)
+
+        # Initialize split prefill
+        forward_batch = self.tp_worker.forward_batch_generation_split_init(batch)
+
+        logits_output = None
+        # Grouped layer forward + per-group KV transfer
+        for group_start in range(0, num_layers, group_size):
+            group_end = min(group_start + group_size, num_layers)
+            forward_count = group_end - group_start
+
+            ret, cuda_event = self.tp_worker.forward_batch_generation_split_layer(
+                forward_batch, forward_count=forward_count
+            )
+            if ret is not None:
+                logits_output = ret
+
+            # Enqueue KV transfer for all layers in this group. Requests with
+            # no pages, or with unfinished chunked-prefill chunks, fall back to
+            # send_kv_chunk in process_batch_result so their final metadata is
+            # still sent.
+            is_last_group = group_end == num_layers
+            for req, page_indices in zip(batch.reqs, req_page_indices_list):
+                if len(page_indices) == 0 or req.inflight_middle_chunks > 0:
+                    continue
+                for layer_id in range(group_start, group_end):
+                    is_last = is_last_group and layer_id == num_layers - 1
+                    req.disagg_kv_sender.send_layer(
+                        page_indices,
+                        layer_id=layer_id,
+                        cuda_event=cuda_event,
+                        is_last=is_last,
+                    )
+                if is_last_group:
+                    req.pipelined_kv_sent = True
+                    req.start_send_idx = min(req.fill_len, len(req.origin_input_ids))
+
+        # Sample next tokens unless this is a logprob-only/prefill-only batch.
+        assert (
+            logits_output is not None
+        ), "forward_split_prefill should return logits after the last layer"
+        if not forward_batch.is_prefill_only:
+            next_token_ids = self.tp_worker.forward_batch_generation_split_sample(
+                logits_output, forward_batch
+            )
+        else:
+            next_token_ids = torch.zeros(
+                len(forward_batch.seq_lens),
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
+            )
+            if (
+                forward_batch.return_logprob
+                and logits_output.next_token_logits is not None
+            ):
+                self.tp_worker.model_runner.compute_logprobs_only(
+                    logits_output, forward_batch
+                )
+
+        batch.output_ids = next_token_ids
+
+        if batch.return_logprob:
+            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            extend_logprob_start_len_per_req = [
+                req.extend_logprob_start_len for req in batch.reqs
+            ]
+        else:
+            extend_input_len_per_req = None
+            extend_logprob_start_len_per_req = None
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=False,
+        )
+
     @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
@@ -4515,6 +4635,20 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
+            logger.info(
+                "Layer-pipelined KV transfer enabled "
+                "(dispatched per-batch in normal event loop)"
+            )
+            # Pipelining uses its own compute/transfer overlap mechanism via
+            # per-layer-group CUDA events, which is incompatible with the
+            # overlap scheduler's batch-level overlap. Force the normal loop.
+            if scheduler.enable_overlap:
+                logger.info(
+                    "Disabling overlap schedule (incompatible with "
+                    "layer-pipelined transfer)"
+                )
+                scheduler.enable_overlap = False
         if server_args.pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:

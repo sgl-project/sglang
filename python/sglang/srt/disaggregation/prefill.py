@@ -435,6 +435,34 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def _batch_needs_staging_for_heterogeneous_tp(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> bool:
+        if not getattr(self, "enable_staging", False):
+            return False
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        transfer_infos = getattr(kv_mgr, "transfer_infos", {})
+        decode_kv_args_table = getattr(kv_mgr, "decode_kv_args_table", {})
+        attn_tp_size = getattr(kv_mgr, "attn_tp_size", self.ps.attn_tp_size)
+
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            if room is None:
+                continue
+            for transfer_info in transfer_infos.get(room, {}).values():
+                if transfer_info.is_dummy:
+                    continue
+                register_info = decode_kv_args_table.get(
+                    transfer_info.mooncake_session_id
+                )
+                if (
+                    register_info is not None
+                    and register_info.dst_attn_tp_size != attn_tp_size
+                ):
+                    return True
+        return False
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -502,6 +530,176 @@ class SchedulerDisaggregationPrefillMixin:
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
+    def _prepare_pipelined_state_indices(self: Scheduler, batch) -> None:
+        """Pre-compute state indices for hybrid models and attach to each req.
+
+        Mirrors the state_indices computation in send_kv_chunk, but stores
+        the result on req.pipelined_state_indices so the final metadata send
+        can pass it through after KV data is enqueued.
+        """
+        page_size = self.token_to_kv_pool_allocator.page_size
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+
+        for req in batch.reqs:
+            state_indices = None
+            if state_types:
+                seq_len = min(req.fill_len, len(req.origin_input_ids))
+
+                def _mamba_payload():
+                    return [
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                        .cpu()
+                        .numpy()
+                    ]
+
+                def _swa_payload():
+                    window_size = self.sliding_window_size
+                    window_start = max(0, seq_len - window_size)
+                    window_start = (window_start // page_size) * page_size
+                    window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, window_start:seq_len
+                    ]
+                    window_kv_indices_swa = (
+                        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            window_kv_indices_full
+                        )
+                    )
+                    return kv_to_page_indices(
+                        window_kv_indices_swa.cpu().numpy(), page_size
+                    )
+
+                def _dsa_payload():
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :seq_len
+                    ]
+                    return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+                state_indices = []
+                for st in state_types:
+                    if st == StateType.MAMBA:
+                        state_indices.append(_mamba_payload())
+                    elif st == StateType.SWA:
+                        state_indices.append(_swa_payload())
+                    elif st == StateType.DSA:
+                        state_indices.append(_dsa_payload())
+                    else:
+                        state_indices.append(None)
+
+            req.pipelined_state_indices = state_indices
+
+    def _get_pipeline_group_size(self: Scheduler, batch) -> int:
+        """Return adaptive group_size, or 0 if pipelining should not be used."""
+        # group_size == 0 is the sentinel for "fall back to non-pipelined path".
+        if not envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
+            return 0
+
+        # Layer-pipelined transfer currently requires the mooncake backend.
+        if self.transfer_backend not in (
+            TransferBackend.MOONCAKE,
+            TransferBackend.FAKE,
+        ):
+            return 0
+
+        # PP (pipeline parallelism) is not yet supported — send_kvcache_layer
+        # indexes kv_data_ptrs with global layer_id which is incompatible with
+        # PP's per-stage pointer slicing.
+        if self.ps.pp_size > 1:
+            return 0
+
+        # Models without split-prefill support safely fall back to the normal path.
+        model_runner = self.tp_worker.model_runner
+        model = model_runner.model
+        if not hasattr(model, "forward_split_prefill"):
+            return 0
+
+        # Layer-pipelined transfer sends KV during forward, so optimistic requests
+        # must wait until bootstrap finalizes sender metadata and prefix offsets.
+        if any(req.pending_bootstrap for req in batch.reqs):
+            return 0
+
+        # Multimodal split-prefill support is not covered by this path yet.
+        if any(req.multimodal_inputs is not None for req in batch.reqs):
+            return 0
+
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        # Compressed MLA uses a bucketed KV pointer layout rather than a simple
+        # per-layer layout; keep it on the normal transfer path for now.
+        if getattr(kv_args, "mla_compression_ratios", None):
+            return 0
+
+        # DP attention requires prepare_mlp_sync_batch() which forward_split_prefill
+        # bypasses — DP buffers would be uninitialized, causing incorrect results.
+        if self.server_args.enable_dp_attention:
+            return 0
+
+        # EPLB (Expert Parallelism Load Balancing) requires the forward pass to be
+        # wrapped with expert_distribution_recorder.with_forward_pass() context and
+        # experts_capturer.on_forward_end() call, which forward_split_prefill bypasses.
+        # Without this, EPLB loses routing statistics and makes suboptimal decisions.
+        if self.server_args.enable_eplb:
+            return 0
+
+        # Speculative decoding (EAGLE) appends draft-model KV layers beyond
+        # num_hidden_layers. Pipelined mode only iterates target layers, so
+        # draft KV would never be transferred to the decode side.
+        if self.draft_worker is not None:
+            return 0
+
+        # input_embeds (custom embeddings via API) are not forwarded through
+        # forward_split_prefill — it always calls embed_tokens(input_ids).
+        # Fall back to normal path to avoid silently ignoring user embeddings.
+        if any(req.input_embeds is not None for req in batch.reqs):
+            return 0
+
+        # The layer path bypasses staging gather/scatter. When staging is needed
+        # for heterogeneous TP, use the normal chunk path.
+        if self._batch_needs_staging_for_heterogeneous_tp(batch):
+            return 0
+
+        # If user explicitly set group_size, it takes priority over all heuristics.
+        if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
+            return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
+
+        num_layers = self.model_config.num_hidden_layers
+
+        # Models with very few layers gain nothing from pipelining — the per-group
+        # overhead (event sync, queue enqueue, RDMA doorbell) outweighs any overlap.
+        if num_layers <= 4:
+            return 0
+
+        min_tokens = max(1, envs.SGLANG_PIPELINE_MIN_TOKENS.get())  # guard div-by-zero
+        if len(batch.reqs) == 0:
+            return 0  # Empty batch — fallback to non-pipelined
+        avg_tokens = sum(req.extend_range.length for req in batch.reqs) // len(
+            batch.reqs
+        )
+        if avg_tokens < min_tokens:
+            return 0
+
+        # Adaptive group_size via continuous formula:
+        #   target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX)
+        #   where t = (avg_tokens - min_tokens) / (sat_tokens - min_tokens)
+        #
+        # Pipeline total time:
+        #   Good bandwidth (T<C): total = C + T/N  (last group's xfer exposed)
+        #   Poor bandwidth (T>C): total = C/N + T  (first group's compute exposed)
+        #
+        # Short prompts: T/C ratio is high (attention is O(n²), xfer is O(n)),
+        #   need more groups to reduce exposed time (T/N or C/N).
+        # Long prompts: compute dominates (T<<C), even few groups hide most
+        #   transfer; extra groups only add per-group overhead for little gain.
+        max_iters = envs.SGLANG_PIPELINE_MAX_ITERS.get()
+        min_iters = envs.SGLANG_PIPELINE_MIN_ITERS.get()
+        if min_iters > max_iters:
+            min_iters, max_iters = max_iters, min_iters
+        sat_tokens = min_tokens * max(1.01, envs.SGLANG_PIPELINE_SAT_MULTIPLIER.get())
+        t = min(1.0, max(0.0, (avg_tokens - min_tokens) / (sat_tokens - min_tokens)))
+        target_iters = max(min_iters, round(max_iters - t * (max_iters - min_iters)))
+
+        return max(1, num_layers // target_iters)
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -528,10 +726,15 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
-                if self.enable_staging:
-                    self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                group_size = self._get_pipeline_group_size(batch)
+                if group_size > 0:
+                    result = self.run_batch_pipelined(batch, group_size=group_size)
+                    self.process_batch_result(batch, result)
+                else:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
             else:
                 self.on_idle()
 
@@ -598,8 +801,12 @@ class SchedulerDisaggregationPrefillMixin:
         result: GenerationBatchResult,
     ) -> None:
         """
-        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        Adapted from process_batch_result_prefill
+        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.
+        Adapted from process_batch_result_prefill.
+
+        Requests with req.pipelined_kv_sent set by run_batch_pipelined already
+        sent KV data per-layer, so this writes metadata before sending the final
+        metadata/status transfer.
         """
         (
             logits_output,
@@ -691,7 +898,15 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if not req.pending_bootstrap:
+                if getattr(req, "pipelined_kv_sent", False):
+                    # KV data was already sent per-layer. Write metadata first,
+                    # then enqueue the final metadata/status transfer so the
+                    # worker cannot race ahead and send stale aux buffers.
+                    self.disagg_metadata_buffers.set_buf(req)
+                    req.disagg_kv_sender.send_final_metadata(
+                        getattr(req, "pipelined_state_indices", None)
+                    )
+                elif not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
