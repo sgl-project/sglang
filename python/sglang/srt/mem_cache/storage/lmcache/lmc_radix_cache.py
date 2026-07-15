@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -430,17 +431,17 @@ class LMCRadixCache(RadixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(
+        cache_finished_req_result = super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)
                 self.lmcache_connector.end_session(req.rid)
-            return
+            return cache_finished_req_result
 
         global_server_args = get_server_args()
         topk = global_server_args.speculative_eagle_topk
@@ -483,6 +484,8 @@ class LMCRadixCache(RadixCache):
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
+
+        return cache_finished_req_result
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""

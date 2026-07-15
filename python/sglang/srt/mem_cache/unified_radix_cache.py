@@ -17,6 +17,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -714,18 +715,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return
+            return CacheFinishedReqResult(unhandled_kv_start=0)
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
-            return
+            return CacheFinishedReqResult(unhandled_kv_start=0)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -755,8 +752,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Truncate if needed
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -770,10 +765,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            unhandled_kv_start = max(page_aligned_len, req.cache_protected_len)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            unhandled_kv_start = req.cache_protected_len
 
         self.dec_lock_ref(
             req.last_node,
@@ -786,6 +780,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        return CacheFinishedReqResult(unhandled_kv_start=unhandled_kv_start)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):

@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -171,7 +172,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -189,7 +190,9 @@ class RadixCacheCpp(BasePrefixCache):
                 RadixKey(token_ids, req.extra_key), kv_indices
             )
             # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
-            assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
+            assert (
+                old_prefix_len <= new_prefix_len <= page_aligned_overall_len
+            ), f"{old_prefix_len=} {new_prefix_len=} {page_aligned_overall_len=}"
             # Free duplicates that were already in the pool
             if old_prefix_len < new_prefix_len:
                 self.token_to_kv_pool_allocator.free(
@@ -200,13 +203,10 @@ class RadixCacheCpp(BasePrefixCache):
                 kv_indices[old_prefix_len:page_aligned_overall_len]
             )
 
-        # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < kv_len_to_handle:
-            # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
-
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
+
+        return CacheFinishedReqResult(unhandled_kv_start=page_aligned_overall_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

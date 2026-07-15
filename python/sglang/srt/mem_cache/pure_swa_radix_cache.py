@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
     EvictParams,
     EvictResult,
     InsertParams,
@@ -64,7 +65,7 @@ class PureSWARadixCache(RadixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes.
 
         Only inserts the prefill portion [0, evict_floor) into the radix tree.
@@ -77,11 +78,7 @@ class PureSWARadixCache(RadixCache):
 
         kv_committed_len = kv_len_to_handle
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return CacheFinishedReqResult(unhandled_kv_start=0)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -130,10 +127,15 @@ class PureSWARadixCache(RadixCache):
             if swa_evicted_seqlen > 0 and alive_start < keys_len:
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
 
-        self.token_to_kv_pool_allocator.free(kv_indices[keys_len:])
-
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+        unhandled_kv_start = max(keys_len, old_prefix_len)
+        assert swa_evicted_seqlen <= unhandled_kv_start, (
+            f"{swa_evicted_seqlen=} {unhandled_kv_start=} {keys_len=} "
+            f"{old_prefix_len=} {kv_committed_len=}"
+        )
+        return CacheFinishedReqResult(unhandled_kv_start=unhandled_kv_start)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
