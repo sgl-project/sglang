@@ -526,6 +526,11 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
     # MoRI KV Transfer
+    # Data-plane backend used by the MoRI PD-disaggregation connector.
+    SGLANG_MORI_BACKEND = EnvStr("rdma")
+    # Number of streams and events in the MoRI fabric backend pools.
+    SGLANG_MORI_FABRIC_STREAMS = EnvInt(64)
+    SGLANG_MORI_FABRIC_EVENTS = EnvInt(64)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
@@ -547,8 +552,8 @@ class Envs:
     # Poll cadence (ms) at which a transfer worker wakes to check the SLA while
     # waiting for completion; real completion still wakes it immediately.
     SGLANG_MORI_WAIT_POLL_MS = EnvInt(1000)
-    # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
-    # and relies on the RDMA retry-exceeded timeout only.
+    # Per-transfer SLA (ms) for polling backends; 0 disables the SLA and relies
+    # on the RDMA retry-exceeded timeout. Fabric uses an untimed event wait.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
 
     # AMD & ROCm

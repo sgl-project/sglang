@@ -46,7 +46,7 @@ def init_mooncake_custom_mem_pool(
 
     if enable_custom_mem_pool:
         try:
-            # TODO(shangming): abstract custom allocator class for more backends
+            # Keep optional allocator imports local to the Mooncake provider.
             if custom_mem_pool_type == "NVLINK":
                 from mooncake.allocator import NVLinkAllocator
 

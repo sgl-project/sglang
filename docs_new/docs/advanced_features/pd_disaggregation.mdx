@@ -18,7 +18,7 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
 
 For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
 
-Currently, we support Mooncake and NIXL as the transfer engine.
+Currently, we support Mooncake, NIXL, and Mori as transfer engines.
 
 ## Profiling in PD Disaggregation Mode
 
@@ -303,6 +303,54 @@ python -m sglang_router.launch_router \
   --decode http://127.0.0.1:30001 \
   --host 0.0.0.0 --port 8000
 ```
+
+## Mori
+
+Mori is available for PD disaggregation on ROCm. The default Mori data-plane
+backend is RDMA:
+
+```bash
+export SGLANG_MORI_BACKEND=rdma
+```
+
+On systems where the prefill and decode GPUs share a UALink vPOD, a
+fabric-capable Mori build can transfer GPU KV/state buffers over the scale-up
+fabric:
+
+```bash
+# Set this on both the prefill and decode servers.
+export SGLANG_MORI_BACKEND=fabric
+
+# Optional fabric resource tuning (defaults shown).
+export SGLANG_MORI_FABRIC_STREAMS=64
+export SGLANG_MORI_FABRIC_EVENTS=64
+
+python -m sglang.launch_server \
+  --model-path <model> \
+  --disaggregation-mode prefill \
+  --port 30000 \
+  --disaggregation-transfer-backend mori
+
+python -m sglang.launch_server \
+  --model-path <model> \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --base-gpu-id 1 \
+  --disaggregation-transfer-backend mori
+
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://127.0.0.1:30000 \
+  --decode http://127.0.0.1:30001 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Fabric mode requires GPUs in the same ready UALink vPOD and a Mori build with
+fabric backend and allocator support. Auxiliary CPU metadata remains on the TCP
+control path; `SGLANG_MORI_SEND_AUX_RDMA=1` is ignored in fabric mode. Fabric
+completion uses an untimed GPU-event wait, so
+`SGLANG_MORI_TRANSFER_TIMEOUT_MS` is not enforced.
 
 ## NIXL
 ### Requirements

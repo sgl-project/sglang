@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.disaggregation.custom_mem_pool import maybe_init_custom_mem_pool
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -10,7 +11,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     unwrap_write_loc,
 )
-from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -52,7 +52,7 @@ class SWAKVPool(BaseSWAKVPool):
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
 
-        # for disagg with nvlink
+        # For disaggregation transports that require exportable GPU memory.
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )

@@ -52,6 +52,7 @@ from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.custom_mem_pool import maybe_init_custom_mem_pool
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -68,7 +69,6 @@ from sglang.srt.mem_cache.layout.page_major import (
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
-    maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -488,7 +488,7 @@ class MambaPool:
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
         _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
 
-        # for disagg with nvlink
+        # For disaggregation transports that require exportable GPU memory.
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
@@ -1617,7 +1617,7 @@ class KVCache(abc.ABC):
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
 
-        # for disagg with nvlink
+        # For disaggregation transports that require exportable GPU memory.
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )

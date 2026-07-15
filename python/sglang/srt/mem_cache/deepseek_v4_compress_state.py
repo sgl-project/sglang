@@ -7,7 +7,7 @@ from math import gcd
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.disaggregation.custom_mem_pool import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -154,9 +154,21 @@ class CompressStatePool:
         to be set already.
         """
         if _is_hip:
-            self.kv_score_buffer = KVAndScore(
-                torch.empty((self._size, self.last_dim), dtype=dtype, device=device)
+            self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+                maybe_init_custom_mem_pool(device=device)
             )
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_score_buffer = KVAndScore(
+                    torch.empty(
+                        (self._size, self.last_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                )
         else:
             self.memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=enable_memory_saver
