@@ -1032,6 +1032,21 @@ def is_gfx942_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_rdna_supported():
+    """
+    Returns whether the current platform is AMD RDNA (gfx11xx / gfx12xx).
+
+    Covers consumer Radeon parts, including gfx1151 (Strix Halo). AITER kernels
+    are CDNA/wave64-only, so RDNA relies on the Triton backends.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx11", "gfx12"])
+    else:
+        return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))

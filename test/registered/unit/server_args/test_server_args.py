@@ -1555,5 +1555,46 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestRocmDefaultAttentionBackend(CustomTestCase):
+    # AITER attention is CDNA/wave64-only, so RDNA (gfx11xx/gfx12xx, e.g. gfx1151
+    # Strix Halo) must default to triton -- otherwise the server picks aiter and
+    # every RDNA user has to pass --attention-backend triton by hand. The CDNA
+    # cases guard the other direction: an over-broad RDNA check would silently
+    # steal MI300/MI325 away from aiter.
+    @staticmethod
+    def _default_backend(use_mla_backend, is_rdna, num_kv_heads=128):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            get_num_kv_heads=lambda _tp_size: num_kv_heads,
+        )
+        with (
+            patch(
+                "sglang.srt.server_args.current_platform.is_out_of_tree",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.server_args.is_hopper_with_cuda_12_3", return_value=False
+            ),
+            patch("sglang.srt.server_args.is_sm100_supported", return_value=False),
+            patch("sglang.srt.server_args.is_hip", return_value=True),
+            patch("sglang.srt.server_args.is_rdna_supported", return_value=is_rdna),
+        ):
+            return ServerArgs._get_default_attn_backend(
+                SimpleNamespace(tp_size=1), use_mla_backend, model_config
+            )
+
+    def test_mha_defaults_to_triton_on_rdna(self):
+        self.assertEqual(self._default_backend(False, is_rdna=True), "triton")
+
+    def test_mha_defaults_to_aiter_on_cdna(self):
+        self.assertEqual(self._default_backend(False, is_rdna=False), "aiter")
+
+    def test_mla_defaults_to_triton_on_rdna(self):
+        self.assertEqual(self._default_backend(True, is_rdna=True), "triton")
+
+    def test_mla_defaults_to_aiter_on_cdna(self):
+        self.assertEqual(self._default_backend(True, is_rdna=False), "aiter")
+
+
 if __name__ == "__main__":
     unittest.main()

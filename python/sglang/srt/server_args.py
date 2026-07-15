@@ -79,6 +79,7 @@ from sglang.srt.utils.common import (
     is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
+    is_rdna_supported,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
@@ -4751,7 +4752,9 @@ class ServerArgs:
             ):
                 return "trtllm_mha"
             elif is_hip():
-                return "aiter"
+                # AITER attention is CDNA/wave64-only; RDNA (e.g. gfx1151) has no
+                # AITER support, so Triton is the working default there.
+                return "triton" if is_rdna_supported() else "aiter"
             elif is_mps():
                 return "torch_native"
             else:
@@ -4766,6 +4769,10 @@ class ServerArgs:
             elif is_sm100_supported():
                 return "flashinfer"
             elif is_hip():
+                # AITER attention is CDNA/wave64-only; RDNA (e.g. gfx1151) has no
+                # AITER support.
+                if is_rdna_supported():
+                    return "triton"
                 head_num = model_config.get_num_kv_heads(self.tp_size)
                 # TODO current aiter only support head number 16 or 128 head number
                 if head_num == 128 or head_num == 16:
