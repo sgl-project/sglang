@@ -22,7 +22,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_DRAFT_BACKENDS = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+_SUPPORTED_DRAFT_BACKENDS = (
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "trtllm_mha",
+    "ascend",
+)
 
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
