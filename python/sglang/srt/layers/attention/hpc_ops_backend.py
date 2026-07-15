@@ -133,8 +133,9 @@ class HPCOpsAttnBackend(AttentionBackend):
         self.use_fp8 = model_runner.kv_cache_dtype == torch.float8_e4m3fn
         if self.use_fp8:
             heads = (
-                model_runner.model_config.num_attention_heads // model_runner.tp_size,
-                model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+                model_runner.model_config.num_attention_heads
+                // model_runner.ps.tp_size,
+                model_runner.model_config.get_num_kv_heads(model_runner.ps.tp_size),
             )
             if heads not in FP8_ROPE_SUPPORTED_HEAD_CONFIGS:
                 raise ValueError(
@@ -147,8 +148,8 @@ class HPCOpsAttnBackend(AttentionBackend):
 
         config = model_runner.model_config
         head_dim = config.head_dim
-        num_q_heads = config.num_attention_heads // model_runner.tp_size
-        num_kv_heads = config.get_num_kv_heads(model_runner.tp_size)
+        num_q_heads = config.num_attention_heads // model_runner.ps.tp_size
+        num_kv_heads = config.get_num_kv_heads(model_runner.ps.tp_size)
         gqa_group_size = num_q_heads // num_kv_heads
         if head_dim != _SUPPORTED_HEAD_DIM or gqa_group_size not in (
             _SUPPORTED_GQA_GROUP_SIZES
