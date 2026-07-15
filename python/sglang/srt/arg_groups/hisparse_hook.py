@@ -107,7 +107,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
         # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 

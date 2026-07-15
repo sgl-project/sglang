@@ -1613,7 +1613,7 @@ class Indexer(MultiPlatformOp):
             "piecewise/breakable CUDA graph"
         )
         if not _is_npu:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
         if _is_xpu:
@@ -1798,13 +1798,13 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if _is_hip:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif _is_xpu:
             from sglang.srt.hardware_backend.xpu.kernels.dsa.act_quant import (
                 act_quant,
             )
         elif not _is_npu:
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -2487,7 +2487,7 @@ def pcg_dsa_indexer_prefill_split(
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
     assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch
