@@ -2059,6 +2059,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _get_hpc_ops_quant_info(self, layer: torch.nn.Module):
         from sglang.srt.layers.moe.moe_runner.hpc_ops import HpcOpsMoeQuantInfo
 
+        # The HPC-Ops fused kernels take no per-expert GEMM bias; refuse
+        # instead of silently dropping it.
+        if (
+            getattr(layer, "w13_weight_bias", None) is not None
+            or getattr(layer, "w2_weight_bias", None) is not None
+        ):
+            raise ValueError(
+                "The hpc_ops MoE runner backend does not support MoE GEMM "
+                "biases (w13_weight_bias / w2_weight_bias); use another "
+                "--moe-runner-backend for this model."
+            )
+
         if self.block_quant:
             return HpcOpsMoeQuantInfo(
                 w13_weight=layer.w13_weight,

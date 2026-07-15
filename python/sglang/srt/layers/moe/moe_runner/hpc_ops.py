@@ -7,8 +7,9 @@ Tencent Hunyuan AI Infra team.
 
 The backend wraps the monolithic FP8 fused-MoE kernels ``fuse_moe_blockwise``
 (128x128 block-quantized weights + per-token-group-128 activations, e.g.
-Qwen3-FP8 / Hy3-FP8 style checkpoints) and ``fuse_moe`` (per-tensor weight and
-static per-tensor activation quantization). Both kernels fuse
+Qwen3-FP8 style checkpoints) and ``fuse_moe`` (per-tensor weight and static
+per-tensor activation quantization, e.g. Hy3-FP8 style checkpoints). Both
+kernels fuse
 gather -> grouped gate_up GEMM -> SiLU-and-mul -> grouped down GEMM -> weighted
 reduce into one call and consume *global* top-k expert ids together with
 ``rank_ep`` / ``num_expert_total``, so expert parallelism with contiguous
@@ -115,10 +116,11 @@ def _check_runner_config_supported(runner_config: MoeRunnerConfig) -> None:
     if (
         runner_config.gemm1_alpha is not None
         or runner_config.gemm1_clamp_limit is not None
+        or runner_config.swiglu_limit is not None
     ):
         raise ValueError(
-            "The hpc_ops MoE runner backend does not support gemm1_alpha / "
-            "gemm1_clamp_limit."
+            "The hpc_ops MoE runner backend runs a plain SiLU-and-mul; it does "
+            "not support gemm1_alpha / gemm1_clamp_limit / swiglu_limit."
         )
 
 
@@ -136,6 +138,20 @@ def fused_experts_none_to_hpc_ops(
         sglang_per_token_group_quant_fp8,
     )
 
+    if not isinstance(quant_info, HpcOpsMoeQuantInfo):
+        raise ValueError(
+            "The hpc_ops MoE runner backend only supports FP8-quantized MoE "
+            "models (Fp8MoEMethod); got quant info "
+            f"{type(quant_info).__name__}. Note that with expert parallelism "
+            "this backend also expects global top-k ids, so other quant "
+            "methods must not run with --moe-runner-backend hpc_ops."
+        )
+    assert (
+        quant_info.w13_weight.dtype == torch.float8_e4m3fn
+    ), f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
+    assert (
+        quant_info.w2_weight.dtype == torch.float8_e4m3fn
+    ), f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
     _check_runner_config_supported(runner_config)
 
     x = dispatch_output.hidden_states
