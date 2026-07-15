@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,58 @@ def alloc_for_decode_npu(
         last_loc=last_loc,
         token_per_req=token_per_req,
         req_pool_indices=batch.req_pool_indices,
+        dsv4_state_lens=dsv4_state_lens,
+        dsv4_allocator=dsv4_allocator,
+        batch=batch,
+    )
+
+
+def alloc_for_spec_decode_npu(
+    tree_cache: "BasePrefixCache",
+    *,
+    req_to_token_pool: "ReqToTokenPool",
+    req_pool_indices: torch.Tensor,
+    decoder_current_lens_cpu: torch.Tensor,
+    decoder_next_lens_cpu: torch.Tensor,
+    combined_current_lens: torch.Tensor,
+    combined_current_lens_cpu: torch.Tensor,
+    combined_next_lens: torch.Tensor,
+    combined_next_lens_cpu: torch.Tensor,
+    num_needed_tokens: int,
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"],
+    batch: "ScheduleBatch",
+) -> torch.Tensor:
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if allocator.page_size == 1:
+        return _alloc_token_slots_npu(
+            tree_cache=tree_cache,
+            num_tokens=num_needed_tokens,
+            operation="Speculative decode",
+        )
+
+    last_loc = get_last_loc(
+        req_to_token_pool.req_to_token,
+        req_pool_indices,
+        combined_current_lens,
+    )
+    dsv4_state_lens = (
+        dsv4_allocator.compute_dsv4_state_lens_reserve(
+            batch.reqs,
+            decoder_current_lens_cpu,
+            decoder_next_lens_cpu,
+        )
+        if dsv4_allocator is not None
+        else None
+    )
+    return _alloc_paged_token_slots_extend_npu(
+        tree_cache=tree_cache,
+        prefix_lens=combined_current_lens,
+        prefix_lens_cpu=combined_current_lens_cpu,
+        seq_lens=combined_next_lens,
+        seq_lens_cpu=combined_next_lens_cpu,
+        last_loc=last_loc,
+        extend_num_tokens=num_needed_tokens,
+        req_pool_indices=req_pool_indices,
         dsv4_state_lens=dsv4_state_lens,
         dsv4_allocator=dsv4_allocator,
         batch=batch,

@@ -987,6 +987,7 @@ def alloc_for_spec_decode(
         )
 
         dsv4_allocator = resolve_dsv4_npu_allocator(allocator)
+        assert batch is not None
     alloc_page_size: int = allocator.page_size
     alloc_nxt_kv_lens_cpu: torch.Tensor
     alloc_nxt_kv_lens: torch.Tensor
@@ -1013,8 +1014,25 @@ def alloc_for_spec_decode(
         page_size=alloc_page_size,
     )
 
-    if alloc_nxt_kv_lens_cpu.numel() > 0:
-        max_allocated_len: int = int(alloc_nxt_kv_lens_cpu.max().item())
+    combined_cur_kv_lens = cur_kv_lens
+    combined_cur_kv_lens_cpu = cur_kv_lens_cpu
+    combined_nxt_kv_lens = alloc_nxt_kv_lens
+    combined_nxt_kv_lens_cpu = alloc_nxt_kv_lens_cpu
+    if _is_npu and batch.model_config.is_encoder_decoder:
+        assert batch.encoder_lens is not None
+        assert batch.encoder_lens_cpu is not None
+        encoder_lens_cpu = torch.tensor(
+            batch.encoder_lens_cpu,
+            dtype=cur_kv_lens_cpu.dtype,
+            device=cur_kv_lens_cpu.device,
+        )
+        combined_cur_kv_lens = cur_kv_lens + batch.encoder_lens
+        combined_cur_kv_lens_cpu = cur_kv_lens_cpu + encoder_lens_cpu
+        combined_nxt_kv_lens = alloc_nxt_kv_lens + batch.encoder_lens
+        combined_nxt_kv_lens_cpu = alloc_nxt_kv_lens_cpu + encoder_lens_cpu
+
+    if combined_nxt_kv_lens_cpu.numel() > 0:
+        max_allocated_len: int = int(combined_nxt_kv_lens_cpu.max().item())
         row_width: int = req_to_token_pool.req_to_token.shape[1]
         assert max_allocated_len <= row_width, (
             f"spec decode allocation endpoint ({max_allocated_len}) exceeds "
@@ -1022,29 +1040,29 @@ def alloc_for_spec_decode(
         )
 
     if alloc_num_needed_tokens > 0:
-        if alloc_page_size == 1:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.allocator_npu import (
+                alloc_for_spec_decode_npu,
+            )
+
+            out_cache_loc = alloc_for_spec_decode_npu(
+                tree_cache=tree_cache,
+                req_to_token_pool=req_to_token_pool,
+                req_pool_indices=req_pool_indices,
+                decoder_current_lens_cpu=cur_kv_lens_cpu,
+                decoder_next_lens_cpu=alloc_nxt_kv_lens_cpu,
+                combined_current_lens=combined_cur_kv_lens,
+                combined_current_lens_cpu=combined_cur_kv_lens_cpu,
+                combined_next_lens=combined_nxt_kv_lens,
+                combined_next_lens_cpu=combined_nxt_kv_lens_cpu,
+                num_needed_tokens=alloc_num_needed_tokens,
+                dsv4_allocator=dsv4_allocator,
+                batch=batch,
+            )
+        elif alloc_page_size == 1:
             out_cache_loc = alloc_token_slots(
                 tree_cache=tree_cache,
                 num_tokens=alloc_num_needed_tokens,
-            )
-        elif _is_npu:
-            last_loc = get_last_loc(
-                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
-            )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                alloc_nxt_kv_lens,
-                alloc_nxt_kv_lens_cpu,
-                last_loc,
-                alloc_num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                dsv4_allocator=dsv4_allocator,
-                batch=batch,
             )
         else:
             out_cache_loc = alloc_token_slots(
@@ -1056,11 +1074,21 @@ def alloc_for_spec_decode(
         assign_req_to_token_pool_func(
             req_pool_indices,
             req_to_token_pool.req_to_token,
-            cur_kv_lens,
-            alloc_nxt_kv_lens,
+            combined_cur_kv_lens,
+            combined_nxt_kv_lens,
             out_cache_loc,
             len(reqs),
         )
+
+        if _is_npu:
+            maybe_write_dsv4_extend(
+                batch,
+                batch.req_pool_indices_cpu,
+                cur_kv_lens_cpu,
+                alloc_nxt_kv_lens_cpu,
+                c4_state_alloc_offsets=cur_kv_lens_cpu,
+                c128_state_alloc_offsets=cur_kv_lens_cpu,
+            )
 
     for i, req in enumerate(reqs):
         req.kv.kv_allocated_len = max(
