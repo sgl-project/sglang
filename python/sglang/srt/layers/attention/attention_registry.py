@@ -43,7 +43,9 @@ def create_flashinfer_backend(runner):
     import torch
 
     if not runner.use_mla_backend:
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
 
         # Init streams
         if runner.server_args.speculative_algorithm == "EAGLE":
@@ -219,7 +221,9 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
 
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
@@ -279,7 +283,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if cfg := mambaish_config(runner.model_config):
-        from sglang.srt.layers.attention.fla.utils import check_environments
+        from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,

@@ -5,7 +5,7 @@
 import torch
 import triton
 
-from sglang.srt.layers.attention.fla.utils import tensor_cache
+from sglang.kernels.ops.attention.fla.utils import tensor_cache
 
 
 @tensor_cache
