@@ -285,8 +285,9 @@ def _handle_ddtree(server_args: ServerArgs) -> None:
     server_args.disable_overlap_schedule = True
 
     block_size = server_args.speculative_num_draft_tokens
+    verify_token_num = server_args.speculative_ddtree_budget + 1
     is_full_tree = server_args.speculative_ddtree_budget > block_size - 1
-    if is_full_tree:
+    if verify_token_num != block_size:
         from sglang.srt.arg_groups.overrides import (
             attention_backends_of,
             resolved_view,
@@ -297,12 +298,14 @@ def _handle_ddtree(server_args: ServerArgs) -> None:
         )
         if prefill_backend != "triton" or decode_backend != "triton":
             raise ValueError(
-                "DDTREE full-tree mode currently supports only the triton "
-                "attention backend because it forwards tree_budget + 1 verify "
-                "tokens per request. Please set --attention-backend triton, or "
-                "use --speculative-ddtree-budget <= --speculative-num-draft-tokens - 1. "
+                "DDTREE currently supports non-triton attention backends only when "
+                "--speculative-ddtree-budget == --speculative-num-draft-tokens - 1. "
+                "Please set --attention-backend triton, or use matching DDTree "
+                "budget/block-size values. "
                 f"Got prefill_attention_backend={prefill_backend!r}, "
-                f"decode_attention_backend={decode_backend!r}."
+                f"decode_attention_backend={decode_backend!r}, "
+                f"speculative_ddtree_budget={server_args.speculative_ddtree_budget}, "
+                f"speculative_num_draft_tokens={block_size}."
             )
     from sglang.srt.model_executor.cuda_graph_config import Backend
 

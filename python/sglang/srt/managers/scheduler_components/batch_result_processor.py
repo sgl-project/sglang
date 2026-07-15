@@ -554,6 +554,8 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        num_proposed_drafts_per_req = max(stride - 1, 0)
+        result.num_proposed_drafts = len(batch.reqs) * num_proposed_drafts_per_req
 
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -577,6 +579,7 @@ class SchedulerBatchResultProcessor:
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
+                req.spec_num_proposed_drafts += num_proposed_drafts_per_req
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
             predict_tokens.append(accept_tokens)
@@ -656,7 +659,9 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                batch.batch_size(),
+                result.num_correct_drafts,
+                result.num_proposed_drafts,
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
