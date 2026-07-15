@@ -1892,6 +1892,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         quant_config: NVFP4 Quant Config
     """
 
+    _moe_runner_backend: MoeRunnerBackend
+
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
@@ -2127,9 +2129,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         """
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
+        moe_runner_backend = self.get_moe_runner_backend()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -2441,17 +2441,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-
-        self._moe_runner_backend = moe_runner_backend
+        moe_runner_backend = self.get_moe_runner_backend()
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -2465,6 +2455,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if not moe_runner_backend.is_cutlass():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
+    def get_moe_runner_backend(self) -> MoeRunnerBackend:
+        """Resolve and cache the concrete MoE runner backend."""
+        if not hasattr(self, "_moe_runner_backend"):
+            moe_runner_backend = get_moe_runner_backend()
+
+            if moe_runner_backend.is_auto():
+                if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+                    moe_runner_backend = MoeRunnerBackend.MARLIN
+                else:
+                    # TRTLLM is currently the most performant and tested FP4 MoE
+                    # backend, so use it as the default.
+                    moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+            self._moe_runner_backend = moe_runner_backend
+
+        return self._moe_runner_backend
+
     def apply(
         self,
         layer: FusedMoE,
@@ -2477,9 +2484,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
+        moe_runner_backend = self.get_moe_runner_backend()
 
         assert (
             activation in _SUPPORTED_ACT_STRS
