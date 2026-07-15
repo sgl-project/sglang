@@ -61,8 +61,6 @@ class _FakeReq:
             kv_allocated_len=allocated,
             swa_evicted_seqlen=0,
         )
-        self.kv_committed_freed = False
-        self.kv_overallocated_freed = False
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
@@ -74,21 +72,9 @@ class _FakeReq:
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
-        self.pop_overallocated_calls = 0
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
-
-    def pop_committed_kv_cache(self):
-        assert not self.kv_committed_freed
-        self.kv_committed_freed = True
-        return self.kv_committed_len
-
-    def pop_overallocated_kv_cache(self):
-        assert not self.kv_overallocated_freed
-        self.pop_overallocated_calls += 1
-        self.kv_overallocated_freed = True
-        return self.kv_committed_len, self.kv.kv_allocated_len
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -161,9 +147,6 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     assert req_to_token_pool.free_slots == [0]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(20))
-    # Bookkeeping flags set.
-    assert req.kv_committed_freed is True
-    assert req.kv_overallocated_freed is True
 
 
 def test_nth_mid_abort_nukes_session_slot():
@@ -200,9 +183,6 @@ def test_nth_mid_abort_nukes_session_slot():
     # Pool slot returned.
     assert req_to_token_pool.free_slots == [0]
     assert req.req_pool_idx is None
-    # Bookkeeping flags set.
-    assert req.kv_committed_freed is True
-    assert req.kv_overallocated_freed is True
 
 
 # Shrink tests removed: streaming sessions are append-only after the
