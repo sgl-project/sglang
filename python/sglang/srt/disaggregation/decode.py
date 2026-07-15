@@ -394,15 +394,16 @@ class _DSparkHiddenPageEntry:
     capacity_rows: int
     hidden_size: int
     dtype: torch.dtype
+    device: torch.device
     pp_rank: int
 
 
 class _DSparkHiddenPagePool:
-    """Reusable registered CPU tensors for DSpark PD hidden row chunks."""
+    """Reusable registered tensors for DSpark PD hidden row chunks."""
 
     def __init__(self):
-        self.free_entries: Dict[Tuple[int, int, int, str, int], deque] = {}
-        self.entry_counts: Dict[Tuple[int, int, int, str, int], int] = {}
+        self.free_entries: Dict[Tuple[int, int, int, str, str, int], deque] = {}
+        self.entry_counts: Dict[Tuple[int, int, int, str, str, int], int] = {}
 
     @staticmethod
     def _capacity_rows(row_count: int) -> int:
@@ -415,15 +416,24 @@ class _DSparkHiddenPagePool:
         pp_rank: int,
         hidden_size: int,
         dtype: torch.dtype,
+        device: torch.device,
         capacity_rows: int,
-    ) -> Tuple[int, int, int, str, int]:
+    ) -> Tuple[int, int, int, str, str, int]:
         return (
             id(kv_manager),
             int(pp_rank),
             int(hidden_size),
             str(dtype),
+            str(device),
             int(capacity_rows),
         )
+
+    @staticmethod
+    def _device(kv_manager: CommonKVManager) -> torch.device:
+        gpu_id = getattr(getattr(kv_manager, "kv_args", None), "gpu_id", 0)
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{int(gpu_id)}")
+        return torch.device("cpu")
 
     def acquire(
         self,
@@ -434,7 +444,8 @@ class _DSparkHiddenPagePool:
         dtype: torch.dtype,
     ) -> Tuple[Optional[_DSparkHiddenPageEntry], bool]:
         capacity_rows = self._capacity_rows(row_count)
-        key = self._key(kv_manager, pp_rank, hidden_size, dtype, capacity_rows)
+        device = self._device(kv_manager)
+        key = self._key(kv_manager, pp_rank, hidden_size, dtype, device, capacity_rows)
         entries = self.free_entries.get(key)
         if entries:
             return entries.pop(), True
@@ -444,7 +455,7 @@ class _DSparkHiddenPagePool:
             if self.entry_counts.get(key, 0) >= int(limit):
                 return None, False
 
-        tensor = torch.empty((capacity_rows, hidden_size), dtype=dtype, device="cpu")
+        tensor = torch.empty((capacity_rows, hidden_size), dtype=dtype, device=device)
         handle = _register_dspark_dynamic_buffer(kv_manager, tensor)
         self.entry_counts[key] = self.entry_counts.get(key, 0) + 1
         return (
@@ -454,6 +465,7 @@ class _DSparkHiddenPagePool:
                 capacity_rows=capacity_rows,
                 hidden_size=hidden_size,
                 dtype=dtype,
+                device=device,
                 pp_rank=int(pp_rank),
             ),
             False,
@@ -467,6 +479,7 @@ class _DSparkHiddenPagePool:
             entry.pp_rank,
             entry.hidden_size,
             entry.dtype,
+            entry.device,
             entry.capacity_rows,
         )
         self.free_entries.setdefault(key, deque()).append(entry)
@@ -530,7 +543,10 @@ class _DSparkHiddenPagePool:
         slice_len: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        slice_hidden = torch.empty((hidden_len, slice_len), dtype=dtype, device="cpu")
+        device = buffers[0].device if buffers else torch.device("cpu")
+        slice_hidden = torch.empty(
+            (hidden_len, slice_len), dtype=dtype, device=device
+        )
         single_contiguous_buffer = len(buffers) == 1 and len(row_chunks) > 1
         if single_contiguous_buffer:
             buffers = buffers * len(row_chunks)
@@ -2372,10 +2388,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 full_hidden_size = sum(
                     int(pp_slice.get("slice_len", 0)) for pp_slice in pp_slices.values()
                 )
+                hidden_device = torch.device(
+                    getattr(dspark_pool, "device", "cpu")
+                )
+                for dynamic_buffers in (
+                    decode_req.dspark_hidden_dynamic_buffers_by_pp or {}
+                ).values():
+                    if dynamic_buffers:
+                        hidden_device = dynamic_buffers[0].device
+                        break
                 hidden = torch.zeros(
                     (hidden_len, full_hidden_size),
                     dtype=dspark_pool.dtype,
-                    device="cpu",
+                    device=hidden_device,
                 )
                 for (
                     pp_rank,
@@ -2426,7 +2451,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if valid_dspark_hidden:
                     decode_req.req.prefill_tail_hidden_states_tensor = hidden
                     decode_req.req.prefill_tail_valid_mask = torch.ones(
-                        (hidden.shape[0],), dtype=torch.bool, device="cpu"
+                        (hidden.shape[0],), dtype=torch.bool, device=hidden.device
                     )
                     decode_req.req.prefill_tail_hidden_start = received_hidden_start
                 else:

@@ -293,9 +293,11 @@ class DSparkHiddenRowPool:
 
     def read(self, indices: List[int]) -> torch.Tensor:
         if not indices:
-            return torch.empty((0, self.hidden_size), dtype=self.dtype, device="cpu")
+            return torch.empty(
+                (0, self.hidden_size), dtype=self.dtype, device=self.device
+            )
         index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
-        return self.buffer[index_tensor].cpu().clone()
+        return self.buffer[index_tensor].clone()
 
     def get_state_buf_infos(self):
         if self.size <= 0:
@@ -405,6 +407,7 @@ class MetadataBuffers:
         dspark_prefill_tail_len: int = 0,
         dspark_hidden_pool_size: int = 0,
         dspark_hidden_size: int = 0,
+        dspark_hidden_device: str = "cpu",
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
@@ -415,7 +418,7 @@ class MetadataBuffers:
                 dspark_hidden_pool_size,
                 dspark_hidden_size,
                 hidden_states_dtype,
-                device="cpu",
+                device=dspark_hidden_device,
             )
         if max_sampling_mask_tokens is None:
             max_sampling_mask_tokens = (
@@ -730,13 +733,14 @@ class MetadataBuffers:
         size: int,
         hidden_size: int,
         dtype: torch.dtype,
+        device: str = "cpu",
     ) -> DSparkHiddenRowPool:
         if self.dspark_hidden_pool is None:
             self.dspark_hidden_pool = DSparkHiddenRowPool(
                 size=size,
                 hidden_size=hidden_size,
                 dtype=dtype,
-                device="cpu",
+                device=device,
             )
         elif self.dspark_hidden_pool.hidden_size != int(hidden_size):
             raise ValueError(

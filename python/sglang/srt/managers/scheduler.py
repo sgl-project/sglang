@@ -1198,14 +1198,22 @@ class Scheduler(
                         )
                     ),
                 )
+                dspark_hidden_device = (
+                    f"cuda:{self.ps.gpu_id}" if torch.cuda.is_available() else "cpu"
+                )
                 logger.info(
                     "Initialized DSpark PD metadata buffers: mode=%s, "
-                    "target_layer_ids=%s, hidden_size=%s, pool_rows=%s",
+                    "target_layer_ids=%s, hidden_size=%s, pool_rows=%s, device=%s",
                     self.disaggregation_mode,
                     dspark_target_layer_ids,
                     dspark_hidden_size,
                     dspark_hidden_pool_size,
+                    dspark_hidden_device,
                 )
+            else:
+                dspark_hidden_device = "cpu"
+        else:
+            dspark_hidden_device = "cpu"
 
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
@@ -1232,6 +1240,7 @@ class Scheduler(
                 dspark_prefill_tail_len=dspark_prefill_tail_len,
                 dspark_hidden_pool_size=dspark_hidden_pool_size,
                 dspark_hidden_size=dspark_hidden_size,
+                dspark_hidden_device=dspark_hidden_device,
             )
 
             # The decode requests polling kv cache
@@ -1281,6 +1290,7 @@ class Scheduler(
                 dspark_prefill_tail_len=dspark_prefill_tail_len,
                 dspark_hidden_pool_size=dspark_hidden_pool_size,
                 dspark_hidden_size=dspark_hidden_size,
+                dspark_hidden_device=dspark_hidden_device,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
