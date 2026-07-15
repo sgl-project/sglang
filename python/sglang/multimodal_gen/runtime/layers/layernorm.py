@@ -1041,15 +1041,15 @@ def apply_qk_norm_rope(
         and rope_dim in (32, 64, 128, 256)
         and rope_dim % (head_dim // 32) == 0
     ):
-        # The fused kernel needs contiguous q/k. Callers that pass a chunked/non-contiguous view
-        # (e.g. from `qkv.chunk(...)`) still get the fused path without a model-side copy.
-        q = q.contiguous()
-        k = k.contiguous()
-
-        # Keep the fused kernel contract 3D; q/k are flattened without copying.
+        # The fused kernel reads token/head strides directly and only needs the last
+        # dim (head_dim) contiguous, so a chunked/strided view (e.g. from `qkv.chunk(...)`)
+        # goes through the fused path with no model-side copy.
+        assert (
+            q.stride(-1) == 1 and k.stride(-1) == 1
+        ), "fused qk-norm+rope requires head_dim-contiguous q/k (stride(-1) == 1)"
         fused_qk_norm_rope_with_cos_sin_cache_inplace(
-            q=q.view(-1, q.shape[-2], head_dim),
-            k=k.view(-1, k.shape[-2], head_dim),
+            q=q,
+            k=k,
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             cos_sin_cache=cos_sin_cache,
