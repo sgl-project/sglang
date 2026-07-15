@@ -699,7 +699,10 @@ impl Proxy {
                     "upstream dropped connection mid-body",
                 );
                 breaker.record_failure();
-                return Err(ApiError::UpstreamStatus { status });
+                return Err(ApiError::UpstreamStatus {
+                    status,
+                    worker: worker_url,
+                });
             }
         };
         match breaker_outcome(status) {
