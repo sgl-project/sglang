@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -48,9 +48,7 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_req == -1:
             self.num_tokens_per_req = int(self.draft_token_num)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
+        self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
     def prepare_for_verify(
         self,
@@ -71,8 +69,12 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = self.capture_hidden_mode
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        verify_forward_batch = ForwardBatch.init_new(
+            batch,
+            target_worker.model_runner,
+            capture_hidden_mode=self.capture_hidden_mode,
+            return_hidden_states_before_norm=False,
+        )
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner

@@ -36,6 +36,11 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa.quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -45,11 +50,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
@@ -102,21 +102,19 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
-    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
-    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
-    the overlapping physical columns hold identical values. Under EAGLE *tree*
-    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
-    columns can need different values from different parent chains -> fall back to
-    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
-    contiguous per-step windows). See ``MambaPool.__init__``.
+    It is safe for CUDA linear draft chains whose kernels consume the window raw.
+    Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
+    windows, platform kernels expect contiguous steps, and KDA transposes the window
+    before conv so the overlapping ``as_strided`` layout would corrupt stores.
     """
     return (
         not is_npu
         and not is_cpu
+        and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
 
@@ -576,7 +574,7 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:

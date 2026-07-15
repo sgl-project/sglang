@@ -1937,7 +1937,9 @@ class FlashInferIndicesUpdaterPrefill:
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.
         paged_plan_kwargs = {}
-        num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", None)
+        num_tokens_per_req = (
+            spec_info.num_tokens_per_req if spec_info is not None else None
+        )
         uses_fast_prefill = (
             hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
