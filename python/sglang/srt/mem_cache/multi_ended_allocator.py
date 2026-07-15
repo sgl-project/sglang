@@ -36,13 +36,8 @@ from sglang.srt.mem_cache.allocator.base import (
     BaseTokenToKVPoolAllocator,
     _validate_page_aligned_free,
 )
-from sglang.srt.mem_cache.allocator.paged import (
-    alloc_decode_kernel,
-    alloc_extend_kernel,
-)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -777,142 +772,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
                 "physical room (the composite's byte-budget check should have caught this)"
             )
-
-    # -- paged alloc surface --
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        num_new_pages: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        """Allocate ``extend_num_tokens`` new tokens across ``bs`` requests,
-        preserving the tail-page-reuse contract.
-
-        Runs the kernel in VIRTUAL space (``free_page_ptr == free_virtual_ids``),
-        so ``out_indices`` are virtual token ids. Each consumed virtual page is
-        then bound to a physical page on THIS sub-allocator; without that binding
-        v2p stays -1 and translation yields negative ids → CUDA OOB.
-        """
-        with record_function("MultiEndedAlloc.alloc_extend"):
-            assert (
-                self.is_id_owner
-            ), f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
-            if num_new_pages is None:
-                num_new_pages = get_num_new_pages(
-                    seq_lens=seq_lens_cpu,
-                    page_size=self.page_size,
-                    prefix_lens=prefix_lens_cpu,
-                )
-            if num_new_pages > len(self.free_virtual_ids):
-                return None
-            # Lazy: physical-capacity pre-check; on shortfall flush the PEER (own
-            # compaction is internal — see `alloc`).
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not self._flush_peer_for_alloc(need_tokens):
-                    return None
-            bs = len(prefix_lens)
-            if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-                self.free_virtual_ids
-            ):
-                self.merge_and_sort_free()
-
-            # Snapshot the virtual pages the kernel will consume, to bind them to
-            # physical pages afterward (else v2p stays -1 → CUDA OOB).
-            if num_new_pages > 0:
-                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
-            else:
-                new_virtual_pages = None
-
-            out_indices = torch.empty(
-                (extend_num_tokens,), dtype=torch.int64, device=self.device
-            )
-            # `free_virtual_ids` passed as `free_page_ptr`: the kernel does
-            # `page_id * page_size + offset` regardless of virtual vs physical.
-            with record_function("MultiEndedAlloc.alloc_extend.kernel"):
-                alloc_extend_kernel[(bs,)](
-                    prefix_lens,
-                    seq_lens,
-                    last_loc,
-                    self.free_virtual_ids,
-                    out_indices,
-                    next_power_of_2(bs),
-                    self.page_size,
-                )
-
-            # Bind the consumed virtual pages to fresh physical pages here. The
-            # peer (swa side) binds the same pages via `alloc_with_virtual`.
-            if new_virtual_pages is not None:
-                phys_pages = self._alloc_bind_fast_or_slow(
-                    new_virtual_pages, num_new_pages
-                )
-                if phys_pages is None:
-                    return None  # defensive; pre-check should have prevented it
-
-            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
-            return out_indices  # virtual token ids
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Allocate one new token per request (decode), preserving the
-        tail-page-reuse contract. Runs in virtual space; binds each consumed
-        virtual page on THIS sub-allocator (else v2p stays -1 → CUDA OOB).
-        """
-        with record_function("MultiEndedAlloc.alloc_decode"):
-            assert (
-                self.is_id_owner
-            ), f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
-            bs = len(seq_lens)
-            # CPU-only count BEFORE the kernel, to snapshot the exact slice the
-            # kernel will consume.
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-            )
-            if num_new_pages > len(self.free_virtual_ids):
-                return None
-            # Lazy: physical-capacity pre-check; on shortfall flush PEER.
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not self._flush_peer_for_alloc(need_tokens):
-                    return None
-            if self.need_sort and bs > len(self.free_virtual_ids):
-                self.merge_and_sort_free()
-
-            # Most decode steps reuse the prefix's tail page → num_new_pages == 0.
-            if num_new_pages > 0:
-                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
-            else:
-                new_virtual_pages = None
-
-            out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-            with record_function("MultiEndedAlloc.alloc_decode.kernel"):
-                alloc_decode_kernel[(bs,)](
-                    seq_lens,
-                    last_loc,
-                    self.free_virtual_ids,
-                    out_indices,
-                    next_power_of_2(bs),
-                    self.page_size,
-                )
-
-            if new_virtual_pages is not None:
-                phys_pages = self._alloc_bind_fast_or_slow(
-                    new_virtual_pages, num_new_pages
-                )
-                if phys_pages is None:
-                    return None
-
-            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
-            return out_indices  # virtual token ids
 
     # -- free with eager compaction --
 
@@ -1820,41 +1679,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         with record_function("UnifiedMambaAlloc.alloc"):
             return self.full_attn_allocator.alloc(need_size)
 
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        num_new_pages: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        """Paged extend. Mamba state is per-request (doesn't advance per-token),
-        so forward only to the full sub-allocator."""
-        with record_function("UnifiedMambaAlloc.alloc_extend"):
-            return self.full_attn_allocator.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-                num_new_pages=num_new_pages,
-            )
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Paged decode. Mamba side stays untouched per-decode."""
-        with record_function("UnifiedMambaAlloc.alloc_decode"):
-            return self.full_attn_allocator.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc
-            )
-
     def translate_kv_loc(
         self,
         loc: torch.Tensor,
@@ -2385,84 +2209,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             + max(0, swa_page_count - swa_holes) * swa_allocator.entry_bytes_per_page
         )
         return required_bytes <= gap_bytes
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ) -> Optional[torch.Tensor]:
-        """Paged extend. Runs the kernel ONCE in virtual space, then binds the
-        consumed virtual PAGES on the swa side via `alloc_with_virtual`. Returns
-        virtual TOKEN ids respecting the tail-page-reuse contract and the
-        cross-sub-pool identity (same virtual page maps to full- and swa-physical).
-        """
-        with record_function("UnifiedSWAAlloc.alloc_extend"):
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
-            )
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not self._flush_both_for_alloc(need_tokens):
-                    return None
-
-            # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
-            # its view after the slice is consumed.
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-                num_new_pages=num_new_pages,
-            )
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_extend: full.alloc_extend returned None "
-                "after joint pre-check passed — internal-state inconsistency"
-            )
-            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-            return out_indices  # virtual TOKEN ids
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Paged decode. One new token per request (a page is consumed iff the
-        decode wraps). Same one-kernel-in-virtual-space discipline as ``alloc_extend``.
-        """
-        with record_function("UnifiedSWAAlloc.alloc_decode"):
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-            )
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not self._flush_both_for_alloc(need_tokens):
-                    return None
-
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
-                "after joint pre-check passed — internal-state inconsistency"
-            )
-
-            if new_virtual_pages.numel() > 0:
-                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-
-            return out_indices  # virtual TOKEN ids
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the full side (which owns the virtual ids)."""

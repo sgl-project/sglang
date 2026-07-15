@@ -397,16 +397,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         assert self.page_size == 1
         return self.swa_attn_allocator.alloc(need_size)
 
-    def alloc_extend(self, *args, **kwargs):
-        raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
-        )
-
-    def alloc_decode(self, *args, **kwargs):
-        raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
-        )
-
     def alloc_extend_swa_tail(self, *args, **kwargs):
         raise NotImplementedError(
             "PureSWATokenToKVPoolAllocator does not support page_size > 1."

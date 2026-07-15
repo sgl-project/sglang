@@ -10,10 +10,6 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [
-    ("allocator", "alloc_extend_kernel"),
-    ("allocator", "alloc_decode_kernel"),
-    ("common", "get_last_loc_triton"),
-    ("common", "get_last_loc_triton_safe"),
     ("virtual_slot", "alloc_bind_inplace"),
 ]
 for _mod, _fn in _TRITON_KERNELS:

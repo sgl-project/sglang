@@ -5,10 +5,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from sglang.kernels.ops.memory.common import (
-    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
-)
-from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
 )

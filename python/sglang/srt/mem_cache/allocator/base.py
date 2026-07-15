@@ -140,12 +140,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
-    def alloc_extend(self, *args, **kwargs):
-        raise NotImplementedError("alloc_extend is only for paged allocator")
-
-    def alloc_decode(self, *args, **kwargs):
-        raise NotImplementedError("alloc_decode is only for paged allocator")
-
     def validate_main_page_aligned_alloc(self) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} does not support page-aligned main allocation"
