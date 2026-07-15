@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# TODO(allocator-page-aligned): Finish the full op30 audit before treating this migration as complete.
+
 
 def resolve_dsv4_npu_allocator(
     allocator: BaseTokenToKVPoolAllocator,
