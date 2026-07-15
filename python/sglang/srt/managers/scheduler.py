@@ -166,6 +166,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -4064,6 +4065,7 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
@@ -4102,16 +4104,24 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
+        if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
                 # Decode-side retract always rebootstraps (recomputes the KV from
                 # the prefill), so skip the device->host KV offload that release_req
                 # would otherwise do; the offloaded copy would be immediately
                 # discarded. Non-decode modes ignore offload_kv (they never offload).
-                retracted_reqs = self.running_batch.retract_all(
-                    self.server_args, offload_kv=False
+                retracted_reqs = self.running_batch.reqs
+                retract_all(
+                    reqs=retracted_reqs,
+                    server_args=self.server_args,
+                    req_to_token_pool=self.running_batch.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,
+                    tree_cache=self.running_batch.tree_cache,
+                    hisparse_coordinator=self.running_batch.hisparse_coordinator,
+                    offload_kv=False,
                 )
+                self.running_batch.reqs = []
                 for req in retracted_reqs:
                     if self.disaggregation_mode == DisaggregationMode.DECODE:
                         if req.output_ids:
