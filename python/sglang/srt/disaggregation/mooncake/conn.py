@@ -1560,6 +1560,7 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.resolve_kv_replica_factor(self.transfer_infos[room])
                         self.req_to_decode_prefix_len[room] = next(
                             (
                                 info.decode_prefix_len
@@ -1751,8 +1752,16 @@ class MooncakeKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
