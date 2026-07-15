@@ -7,7 +7,7 @@ against a bf16 einsum reference. sm100 (Blackwell) uses ue8m0 scales + recipe
 (1,1,128); sm90 (Hopper) uses fp32 scales + recipe (1,128,128). Covers the Flash
 (G=8) and Pro (G=16) shapes for both prefill (T=1024) and decode (small T).
 
-    CUDA_VISIBLE_DEVICES=0 python3 test/manual/dsv4/wo_a_fp8_sm90_correctness.py
+    CUDA_VISIBLE_DEVICES=0 python3 test/manual/dsv4/test_wo_a_fp8_sm90.py
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+from sglang.srt.layers import deep_gemm_wrapper
 
 
 @dataclass(frozen=True)
@@ -58,7 +60,7 @@ def run_wo_a_einsum(
     """Mirror models/deepseek_v4.py MQALayer wo_a fp8 einsum path."""
     import deep_gemm
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
@@ -115,8 +117,6 @@ def main() -> None:
     parser.add_argument("--cos-gate", type=float, default=0.999)
     parser.add_argument("--decode-tokens", type=int, default=16)
     args = parser.parse_args()
-
-    from sglang.srt.layers import deep_gemm_wrapper
 
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         print(
