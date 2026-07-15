@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.trtllm_mha_graph_metadata import (
     update_trtllm_mha_graph_metadata,
@@ -43,6 +44,15 @@ from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -318,20 +328,79 @@ class HPCOpsAttnBackend(AttentionBackend):
         head_dim]. The subsequent ``self.attn(...)`` call must pass
         ``save_kv_cache=False`` (K/V are already written here).
 
+        Under a captured prefill graph (breakable / tc_piecewise) this routes
+        through a graph-splitting op — like attention itself — so the Python
+        Q-scale hand-off between this op and attention stays alive at replay.
+
         Note: the HPC-Ops RMSNorm hard-codes eps=1e-6; checkpoints with a
         slightly different rms_norm_eps (e.g. HunYuan V3's 1e-5) accept this
         approximation, matching the reference HPC-Ops integration.
         """
-        import hpc
-
         assert self.use_fp8, "fused_qk_rope_store_kv_fp8 requires fp8 KV cache"
+
+        is_extend = not forward_batch.forward_mode.is_decode_or_idle()
+        out_q = torch.empty(
+            (qkv.shape[0], layer.tp_q_head_num, layer.head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=qkv.device,
+        )
+
+        if is_extend and get_tc_piecewise_forward_context() is not None:
+            # Captured prefill graph: run through the splitting op (eager at
+            # capture AND at replay, keeping the metadata hand-off alive).
+            if is_in_breakable_cuda_graph():
+                breakable_hpc_ops_fp8_rope_store_kv(
+                    qkv,
+                    cos_sin_cache,
+                    out_q,
+                    layer.layer_id,
+                    qk_norm_policy,
+                    q_norm_weight=q_norm_weight,
+                    k_norm_weight=k_norm_weight,
+                )
+            else:
+                hpc_ops_fp8_rope_store_kv(
+                    qkv,
+                    cos_sin_cache,
+                    out_q,
+                    layer.layer_id,
+                    qk_norm_policy,
+                    q_norm_weight=q_norm_weight,
+                    k_norm_weight=k_norm_weight,
+                )
+        else:
+            self._run_fp8_rope_store_kv(
+                layer=layer,
+                forward_batch=forward_batch,
+                qkv=qkv,
+                cos_sin_cache=cos_sin_cache,
+                q_norm_weight=q_norm_weight,
+                k_norm_weight=k_norm_weight,
+                qk_norm_policy=qk_norm_policy,
+                is_extend=is_extend,
+                out_q=out_q,
+            )
+        return out_q
+
+    def _run_fp8_rope_store_kv(
+        self,
+        layer: RadixAttention,
+        forward_batch: Optional[ForwardBatch],
+        qkv: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        q_norm_weight: Optional[torch.Tensor],
+        k_norm_weight: Optional[torch.Tensor],
+        qk_norm_policy: int,
+        is_extend: bool,
+        out_q: torch.Tensor,
+    ) -> None:
+        """Invoke the fused kernel and stash the Q scales in the metadata."""
+        import hpc
 
         metadata = self.forward_metadata
         k_cache, v_cache = self._paged_kv_buffers(layer)
         k_scale, v_scale = self._layer_kv_scales(layer)
-        is_extend = not forward_batch.forward_mode.is_decode_or_idle()
 
-        num_tokens = qkv.shape[0]
         if is_extend:
             q_index = metadata.cu_seqlens_q
             max_seqlens = metadata.max_seq_len_q
@@ -339,11 +408,6 @@ class HPCOpsAttnBackend(AttentionBackend):
             q_index = self._decode_qo_indptr[: forward_batch.batch_size + 1]
             max_seqlens = 1
 
-        out_q = torch.empty(
-            (num_tokens, layer.tp_q_head_num, layer.head_dim),
-            dtype=torch.float8_e4m3fn,
-            device=qkv.device,
-        )
         # QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR: dynamic per-token-per-head
         # Q quant, static per-tensor K/V quant.
         quant_policy = hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR.value
@@ -367,7 +431,6 @@ class HPCOpsAttnBackend(AttentionBackend):
         )
         metadata.hpc_q_scale = q_scale
         metadata.hpc_split_k_flag = split_k_flag
-        return out_q
 
     def _take_fp8_scales(self, metadata: HPCOpsMetadata):
         """Pop the per-layer FP8 scales written by the fused RoPE op."""
@@ -496,3 +559,45 @@ class HPCOpsAttnBackend(AttentionBackend):
                 splitk=True,
             )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+
+@register_custom_op(mutates_args=["out_q"])
+@register_split_op()
+def hpc_ops_fp8_rope_store_kv(
+    qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    out_q: torch.Tensor,
+    layer_id: int,
+    qk_norm_policy: int,
+    *,
+    q_norm_weight: Optional[torch.Tensor] = None,
+    k_norm_weight: Optional[torch.Tensor] = None,
+) -> None:
+    """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
+
+    Like ``unified_attention_with_output``, this runs eagerly between captured
+    prefill-graph segments (at capture and at every replay), so the Python
+    hand-off of the dynamic Q scales to the following attention op stays
+    alive. ``out_q`` is preallocated by the captured segment and mutated in
+    place, which is what stitches the surrounding graph segments together.
+    """
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    backend = get_attn_backend()
+    backend._run_fp8_rope_store_kv(
+        layer=attention_layer,
+        forward_batch=forward_batch,
+        qkv=qkv[:real_num_tokens],
+        cos_sin_cache=cos_sin_cache,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
+        is_extend=True,
+        out_q=out_q[:real_num_tokens],
+    )
+
+
+breakable_hpc_ops_fp8_rope_store_kv = eager_on_graph(True)(hpc_ops_fp8_rope_store_kv)
