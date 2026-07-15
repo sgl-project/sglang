@@ -353,7 +353,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         if not self.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
+                if self.use_cuda_ipc:
                     pass
                 else:
                     if feature_name in result and isinstance(
