@@ -19,6 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
@@ -35,6 +36,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -281,7 +283,9 @@ class TinyDSV4ModelConfig:
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
 
 class MockDSV4ModelRunner:
@@ -331,6 +335,7 @@ class MockDSV4ModelRunner:
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -410,6 +415,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self._kernel_warmed_up = True
 
     @property
@@ -1484,6 +1490,7 @@ def run_dsv4_target_verify_attention_case(
     fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    testcase.assertEqual(fixture.backend.max_context_len, max_context_len)
 
     _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
     if case.compress_ratio in (4, 128):
@@ -1524,6 +1531,7 @@ def run_dsv4_draft_extend_attention_case(
     *,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ) -> None:
     """Math-faithful EAGLE `DRAFT_EXTEND` test for DSV4.
 
@@ -1561,6 +1569,10 @@ def run_dsv4_draft_extend_attention_case(
         fixture.forward_batch,
         device=device,
     )
+    if force_gpu_only_seq_lens:
+        fixture.forward_batch.seq_lens_cpu = None
+        fixture.forward_batch.seq_lens_sum = None
+        fixture.forward_batch.spec_info.seq_lens_cpu = None
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):

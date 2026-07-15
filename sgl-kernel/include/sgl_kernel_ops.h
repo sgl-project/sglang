@@ -235,12 +235,6 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
-torch::Tensor fp8_blockwise_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype);
 void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
@@ -294,7 +288,8 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor cumsum_buffer,
-    bool pad_sorted_token_ids);
+    bool pad_sorted_token_ids,
+    bool ignore_invalid_expert);
 
 void topk_softmax(
     torch::Tensor& topk_weights,

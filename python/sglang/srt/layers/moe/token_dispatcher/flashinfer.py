@@ -115,7 +115,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # The workspace must fit both:
         #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
         #  (b) the largest decode batch (bounded by max_running_requests, which
-        #      _resolve_max_num_reqs caps at 4096 per DP worker).
+        #      resolve_max_num_reqs caps at 4096 per DP worker).
         # max_running_requests is not yet resolved at model-construction time,
         # so we use 4096 as a floor to cover decode batches and _dummy_run
         # (which warms up at batch_size = req_to_token_pool.size).

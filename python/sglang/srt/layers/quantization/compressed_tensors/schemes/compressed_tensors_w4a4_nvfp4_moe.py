@@ -11,7 +11,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -278,19 +277,18 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
-            layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
-                layer.w13_weight.device,
-                num_experts=layer.num_experts,
-                intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,
-                hidden_size=layer.w13_weight.shape[2] * 2,
-            )
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        if self.use_flashinfer_trtllm:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        else:
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401 – triggers @register_fused_func
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
+            )
 
     def apply_weights(
         self,
@@ -385,24 +383,33 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 output=symm_output,
             )[0]
         else:
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
+            )
 
-            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            assert (
+                not self.moe_runner_config.apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
 
-            output = cutlass_moe_fp4(
-                a=x,
-                a1_gscale=layer.w13_input_scale_quant,
-                w1_fp4=layer.w13_weight,
-                w1_blockscale=layer.w13_weight_scale,
-                w1_alphas=layer.g1_alphas,
-                a2_gscale=layer.w2_input_scale_quant,
-                w2_fp4=layer.w2_weight,
-                w2_blockscale=layer.w2_weight_scale,
-                w2_alphas=layer.g2_alphas,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                params=layer.cutlass_moe_params,
-                apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
-            ).to(x.dtype)
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="fp4",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                output_dtype=x.dtype,
+                quant_scales=[
+                    layer.w13_input_scale_quant,
+                    layer.w13_weight_scale,
+                    layer.g1_alphas,
+                    layer.w2_input_scale_quant,
+                    layer.w2_weight_scale,
+                    layer.g2_alphas,
+                ],
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                apply_routed_scaling_factor=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         return StandardCombineInput(hidden_states=output)

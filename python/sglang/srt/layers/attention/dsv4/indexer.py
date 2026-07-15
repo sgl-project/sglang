@@ -32,7 +32,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -668,6 +668,12 @@ class C4IndexerBackendMixin:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
+        elif is_xpu():
+            from sgl_kernel import fp8_paged_mqa_logits_triton
+
+            # TODO: switch from triton to SYCL when OOM is resolved
+
+            fn = fp8_paged_mqa_logits_triton
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
