@@ -2,10 +2,13 @@
 Unit tests for JIT CUDA arch-suffix defaulting (`_init_jit_cuda_arch_once`).
 
 Covers sgl-project/sglang#19963: JIT compiles only for the physically
-present device, so Hopper+ (CC >= 9.0) should default to the arch-specific
-"a" target (a strict superset of plain/"f"), matching FlashInfer's
-autodetection. HIP/MUSA capability numbers are not CUDA SM versions and
-must stay unsuffixed.
+present device, so Hopper+ (CC >= 9.0) should default to an arch-specific
+target, mirroring FlashInfer's own `_normalize_cuda_arch`
+(`flashinfer/compilation_context.py`) -- "a" for 9.x/10.x+, except SM 12.x
+carves out "f" for .0 (SM120) vs "a" for .1+ (CUDA >= 12.9 only), since
+SM120 and SM121 need separate cubins to avoid `cudaErrorIllegalInstruction`.
+HIP/MUSA capability numbers are not CUDA SM versions and must stay
+unsuffixed.
 
 Pure CPU logic (monkeypatched `torch.cuda`), no GPU required.
 """
@@ -33,13 +36,16 @@ def _assert_arch_not_leaked():
     assert after is before, "utils._CUDA_ARCH leaked past test teardown"
 
 
-def _init_arch(monkeypatch, capability, *, hip=False, musa=False):
+def _init_arch(monkeypatch, capability, *, hip=False, musa=False, cuda_version=(13, 0)):
     monkeypatch.setattr(
         utils.torch.cuda, "get_device_capability", lambda device=None: capability
     )
     monkeypatch.setattr(utils.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(utils, "is_hip_runtime", lambda: hip)
     monkeypatch.setattr(utils, "is_musa_runtime", lambda: musa)
+    # Only the major==12 branch reads this; default (13, 0) keeps every
+    # other capability's expectation independent of the toolkit version.
+    monkeypatch.setattr(utils, "get_cuda_version", lambda: cuda_version)
     # `_init_jit_cuda_arch_once` writes the module-level `utils._CUDA_ARCH`
     # global directly, so bypassing @cache_once via __wrapped__() leaves it
     # mutated for the rest of the process (see `_assert_arch_not_leaked`
@@ -62,13 +68,29 @@ def _init_arch(monkeypatch, capability, *, hip=False, musa=False):
     [
         ((9, 0), "9.0a"),  # Hopper
         ((10, 0), "10.0a"),  # Blackwell datacenter
-        ((12, 0), "12.0a"),  # Blackwell consumer
+        ((10, 3), "10.3a"),  # Blackwell datacenter family variant (SM103)
         ((8, 0), "8.0"),  # Ampere: below threshold, unsuffixed
         ((7, 5), "7.5"),  # Turing: below threshold, unsuffixed
     ],
 )
 def test_default_cuda_arch_suffix(monkeypatch, capability, expected):
+    # Default cuda_version=(13, 0): irrelevant here except as a control for
+    # the SM 12.x cases below, which vary it explicitly.
     assert _init_arch(monkeypatch, capability) == expected
+
+
+@pytest.mark.parametrize(
+    "capability,cuda_version,expected",
+    [
+        ((12, 0), (13, 0), "12.0f"),  # SM120: carved out of "a" to avoid
+        # cudaErrorIllegalInstruction on SM121 (DGX Spark) running SM120 cubin
+        ((12, 1), (13, 0), "12.1a"),  # SM121: not carved out, "a" like 10.x+
+        ((12, 0), (12, 4), "12.0"),  # pre-12.9 toolkit: no family/"f" cubin
+        # support -- fall back to plain instead of FlashInfer's RuntimeError
+    ],
+)
+def test_sm12x_cuda_arch_suffix(monkeypatch, capability, cuda_version, expected):
+    assert _init_arch(monkeypatch, capability, cuda_version=cuda_version) == expected
 
 
 def test_hip_runtime_stays_unsuffixed(monkeypatch):

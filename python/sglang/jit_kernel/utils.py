@@ -24,6 +24,7 @@ from typing import (
 
 import torch
 
+from sglang.srt.utils.common import get_cuda_version
 from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
@@ -344,6 +345,26 @@ class ArchInfo:
         return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
 
 
+def _cuda_arch_suffix(major: int, minor: int) -> str:
+    """Mirror FlashInfer's `_normalize_cuda_arch`
+    (`flashinfer/compilation_context.py`): 9.x -> "a"; 12.x -> "0f" carved out
+    from "a" (needs CUDA >= 12.9, since SM120 and SM121 need separate cubins
+    to avoid `cudaErrorIllegalInstruction`); 10.x+ -> "a"; below 9.0 -> plain.
+    Only divergence: pre-12.9 CUDA falls back to plain here instead of
+    FlashInfer's RuntimeError, preserving this function's pre-existing
+    behavior for an undetected/old toolkit.
+    """
+    if major == 9:
+        return "a"
+    if major == 12:
+        if get_cuda_version() < (12, 9):
+            return ""
+        return "f" if minor == 0 else "a"
+    if major >= 10:
+        return "a"
+    return ""
+
+
 @cache_once
 def _init_jit_cuda_arch_once():
     global _CUDA_ARCH
@@ -354,10 +375,13 @@ def _init_jit_cuda_arch_once():
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
     # JIT compiles only for the physically present device, so the
-    # arch-specific "a" target (strict superset of plain/"f") is always
-    # correct on Hopper+. HIP/MUSA capability numbers aren't CUDA SM
-    # versions and stay unsuffixed.
-    suffix = "a" if major >= 9 and not (is_hip_runtime() or is_musa_runtime()) else ""
+    # arch-specific "a"/"f" targets are always correct on Hopper+. HIP/MUSA
+    # capability numbers aren't CUDA SM versions and stay unsuffixed.
+    suffix = (
+        ""
+        if (is_hip_runtime() or is_musa_runtime())
+        else _cuda_arch_suffix(major, minor)
+    )
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
