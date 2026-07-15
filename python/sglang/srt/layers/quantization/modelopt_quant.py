@@ -644,6 +644,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        self.mxfp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            use_mxfp8=True,
+        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -853,6 +857,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptMxfp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
+            if quant_algo == "MXFP8":
+                return ModelOptMxfp8LinearMethod(self.mxfp8_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
             return UnquantizedLinearMethod()
@@ -869,6 +875,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            if quant_algo == "MXFP8":
+                raise NotImplementedError(
+                    "ModelOpt MIXED_PRECISION does not support MXFP8 routed "
+                    f"FusedMoE experts at {prefix}. MXFP8 is supported for "
+                    "shared-expert linear layers; routed FusedMoE experts must "
+                    "use a supported MoE quantization such as NVFP4."
+                )
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
             return None
