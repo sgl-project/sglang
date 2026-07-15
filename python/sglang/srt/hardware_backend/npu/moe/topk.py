@@ -16,6 +16,20 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
 
 
+def _apply_routed_scaling_after_renorm(
+    topk_weights: torch.Tensor,
+    topk_config: "TopKConfig",
+) -> torch.Tensor:
+    """Mirror GPU post-renorm scaling when apply_routed_scaling_factor_on_output is set."""
+    if (
+        topk_config.renormalize
+        and topk_config.apply_routed_scaling_factor_on_output
+        and topk_config.routed_scaling_factor is not None
+    ):
+        return topk_weights * topk_config.routed_scaling_factor
+    return topk_weights
+
+
 def fused_topk_npu(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -60,8 +74,7 @@ def fused_topk_npu(
         topk_weights = scores.gather(1, topk_ids)
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        else:
-            topk_weights = topk_weights * topk_config.routed_scaling_factor
+            topk_weights = _apply_routed_scaling_after_renorm(topk_weights, topk_config)
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
@@ -84,9 +97,11 @@ def fused_topk_npu(
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
             # 1 for sigmoid, 0 for softmax
-            norm_type=1,
+            norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(
-                1 if renormalize else topk_config.routed_scaling_factor
+                topk_config.routed_scaling_factor
+                if topk_config.apply_routed_scaling_factor_on_output
+                else 1
             ),
             eps=float(1e-20),
         )
