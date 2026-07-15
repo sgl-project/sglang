@@ -134,6 +134,7 @@ def _generate(
     return_logprob=False,
     logprob_start_len=-1,
     temperature=0.0,
+    routed_dp_rank=None,
 ):
     """Send generate request and return results."""
     json_data = {
@@ -152,11 +153,19 @@ def _generate(
                 "logprob_start_len": logprob_start_len,
             }
         )
+    if routed_dp_rank is not None:
+        json_data["routed_dp_rank"] = routed_dp_rank
     response = requests.post(base_url + "/generate", json=json_data)
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
+def _get_input_logprobs(
+    base_url,
+    new_input_ids,
+    output_logprobs,
+    temperature=0.0,
+    routed_dp_rank=None,
+):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -166,6 +175,7 @@ def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.
         return_logprob=True,
         logprob_start_len=0,
         temperature=temperature,
+        routed_dp_rank=routed_dp_rank,
     )
     assert len(results) == len(new_input_ids)
 

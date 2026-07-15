@@ -33,6 +33,9 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
     prompt_len = 1024
     max_total_tokens = 4096
     kl_threshold = 0.005
+    # DP ranks own independent radix trees, so cache pressure and load-back must
+    # target the same rank instead of following the round-robin default.
+    routed_dp_rank = 0
 
     @classmethod
     def setUpClass(cls):
@@ -106,6 +109,7 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
             max_new_tokens=max_new_tokens,
             return_logprob=return_logprob,
             temperature=0,
+            routed_dp_rank=self.routed_dp_rank,
         )
         self.assertEqual(len(results), 1)
         return results[0]
@@ -144,6 +148,7 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
             replay_input_ids,
             output_logprobs,
             temperature=0,
+            routed_dp_rank=self.routed_dp_rank,
         )
         compare_kl_divergence(
             input_logprobs,
