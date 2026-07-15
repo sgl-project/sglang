@@ -104,13 +104,11 @@ test = [
   "accelerate",
   "pymupdf",
   "expecttest",
-  "human-eval",
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft",
-  "polars",
   "peft>=0.18.0",
+  "polars",
   "sentence_transformers",
 ]
 all = []
