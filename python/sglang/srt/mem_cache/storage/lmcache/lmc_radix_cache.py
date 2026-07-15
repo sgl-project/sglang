@@ -4,7 +4,7 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
@@ -106,7 +106,7 @@ class LMCRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    ):
+    ) -> None:
         super().__init__(params)
 
         cli_lmc_cfg = get_server_args().lmcache_config_file or ""
@@ -327,7 +327,7 @@ class LMCRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
-        load_fn,  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
+        load_fn: Callable[[torch.Tensor, int], int],
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Alloc slots, run ``load_fn``, attach a TreeNode for what was loaded.
 
@@ -355,32 +355,32 @@ class LMCRadixCache(RadixCache):
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
-        if num_retrieved > 0:
-            self.token_to_kv_pool_allocator.free(
-                token_slots[(num_retrieved - prefix_pad) :]
-            )
-        else:
+        alloc_page_size = self.token_to_kv_pool_allocator.page_size
+        fetched = (
+            max(num_retrieved - prefix_pad, 0) // alloc_page_size * alloc_page_size
+        )
+
+        if fetched <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
+            return None
 
-        if num_retrieved > 0:
-            fetched = num_retrieved - prefix_pad
-            new_node = TreeNode(priority=last_node.priority)
-            start = value_numel
-            end = start + fetched
-            new_node.key = key[start:end]
-            new_node.value = token_slots[:fetched]
-            new_node.parent = last_node
-            last_node.children[new_node.key.child_key(self.page_size)] = new_node
-            self.evictable_size_ += fetched
-            self._update_leaf_status(last_node)
-            self._update_leaf_status(new_node)
+        self.token_to_kv_pool_allocator.free(token_slots[fetched:])
 
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
+        new_node = TreeNode(priority=last_node.priority)
+        start = value_numel
+        end = start + fetched
+        new_node.key = key[start:end]
+        new_node.value = token_slots[:fetched]
+        new_node.parent = last_node
+        last_node.children[new_node.key.child_key(self.page_size)] = new_node
+        self.evictable_size_ += fetched
+        self._update_leaf_status(last_node)
+        self._update_leaf_status(new_node)
 
-            return token_slots[:fetched], new_node
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
 
-        return None
+        return token_slots[:fetched], new_node
 
     def _mp_load_back(
         self,

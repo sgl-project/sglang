@@ -29,7 +29,7 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
@@ -322,7 +322,7 @@ class FlexKVRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
-        load_fn,
+        load_fn: Callable[[torch.Tensor], int],
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Shared allocator + post-load bookkeeping for MP/IP.
 
@@ -350,6 +350,11 @@ class FlexKVRadixCache(RadixCache):
         if num_retrieved <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
             return None
+
+        assert num_retrieved % self.token_to_kv_pool_allocator.page_size == 0, (
+            f"FlexKV retrieval must be page-aligned: {num_retrieved=}, "
+            f"page_size={self.token_to_kv_pool_allocator.page_size}"
+        )
 
         # Free the tail of the over-allocation when FlexKV returned
         # fewer than expected.
